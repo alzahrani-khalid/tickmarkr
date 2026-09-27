@@ -1,4 +1,5 @@
 import { parseArgs } from "node:util";
+import { readDoctor } from "../../adapters/registry.js";
 import { loadConfig } from "../../config/config.js";
 import { classifyHost, parseDriverOverride, pickDriver, preflightHostDriver } from "../../drivers/index.js";
 import { loadGraph } from "../../graph/graph.js";
@@ -33,9 +34,10 @@ export async function resume(argv: string[], cwd = process.cwd()): Promise<{ out
   // v1.87 T3 (OBS-162, twice-carried workaround): the preflight runs AFTER the graph is read and
   // sees only the shapes the resumed graph carries. A deny∩prefer collision on a shape no resumed
   // task uses is a config fact the run would never resolve — it must not refuse the only
-  // crash-recovery path. doctor still walks the whole map.
+  // crash-recovery path. doctor still walks the whole map. OBS-1143: aliases are judged by the
+  // identity doctor cached — the same one the daemon's discovery routes with.
   const graph = loadGraph(cwd);
-  const collisions = denyPreferCollisions(cfg, graph.tasks.map((t) => t.shape));
+  const collisions = denyPreferCollisions(cfg, graph.tasks.map((t) => t.shape), readDoctor(cwd));
   if (collisions.length) {
     throw new Error(collisions.map(denyPreferCollisionLine).join("; "));
   }

@@ -1,8 +1,8 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { expect, test } from "vitest";
-import { parse } from "yaml";
+import { parse, stringify } from "yaml";
 
 import * as registry from "../../src/adapters/registry.js";
 import { channelsFromConfig, type WorkerAdapter } from "../../src/adapters/types.js";
@@ -12,6 +12,7 @@ import {
   fleetRepoOverlayFromDelta,
   loadConfig,
   loadConfigWithMode,
+  lowerLayerModelOverrides,
   renderFleetOverlayWrite,
   type FleetEditable,
 } from "../../src/config/config.js";
@@ -805,4 +806,59 @@ test("test: an untouched entry's inline comment keeps the exact whitespace befor
     edited: editable({ tiers: { fake: { one: { tier: "mid", provenance: "note" } } } }),
   });
   expect(fresh).toContain("one: mid  # note");
+});
+
+const effortOverlayCases = ["absent", "value", "field tombstone", "whole-model tombstone"].flatMap((lower) =>
+  ["absent", "value", "tombstone"].flatMap((repo) =>
+    ["set effort", "clear effort", "set-then-clear"].map((op) => ({ lower, repo, op }))));
+
+test.each(effortOverlayCases)("effort overlay validates and preserves vendor/channel: lower=$lower repo=$repo op=$op", ({ lower, repo, op }) => {
+  const root = mkdtempSync(join(tmpdir(), "tickmarkr-effort-matrix-"));
+  const globalDir = join(root, "global");
+  const fixtureRepo = join(root, "repo");
+  mkdirSync(globalDir);
+  mkdirSync(join(fixtureRepo, ".tickmarkr"), { recursive: true });
+  const path = join(fixtureRepo, ".tickmarkr", "config.yaml");
+  try {
+    for (const [adapter, model] of [["claude-code", "fable"], ["codex", "gpt-5.6-sol"]]) {
+      for (const inheritedEffort of [false, true]) {
+        const effort = inheritedEffort ? { effort: "high" } : {};
+        const lowerValue = lower === "absent" ? undefined
+          : lower === "whole-model tombstone" ? null
+          : { vendor: lower === "field tombstone" ? null : "azure", channel: "api", ...effort };
+        const repoValue = repo === "absent" ? undefined : repo === "tombstone" ? null
+          : { vendor: "openai", channel: "sub", effort: "medium" };
+        const overlay = (value: unknown) => stringify({ tiers: { [adapter]: {
+          modelOverrides: value === undefined ? {} : { [model]: value },
+        } } });
+        writeFileSync(join(globalDir, "config.yaml"), overlay(lowerValue));
+        writeFileSync(path, overlay(repoValue));
+        const load = () => loadConfig(fixtureRepo, { globalDir });
+        const channel = () => channelsFromConfig(adapter, load()).find((c) => c.model === model)!;
+        const { effort: _initialEffort, ...before } = channel();
+        const save = (next: "low" | undefined) => {
+          const initial = fleetEditableFromConfig(load());
+          const edited = structuredClone(initial);
+          edited.efforts ??= {};
+          edited.efforts[adapter] ??= {};
+          if (next === undefined) delete edited.efforts[adapter][model];
+          else edited.efforts[adapter][model] = next;
+          writeFleetOverlay(path, (bytes) => renderFleetOverlayWrite(bytes, {
+            initial, edited, lowerOverrides: lowerLayerModelOverrides({ globalDir }),
+          }));
+          // loadConfig validates every merged model override, including the nonempty refinement.
+          const { effort: actual, ...after } = channel();
+          expect(actual).toBe(next);
+          expect(after).toEqual(before);
+        };
+        if (op !== "clear effort") save("low");
+        if (op !== "set effort") save(undefined);
+        if (op === "set-then-clear" && repo === "tombstone" && lowerValue != null) {
+          expect(parse(readFileSync(path, "utf8")).tiers[adapter].modelOverrides[model]).toBeNull();
+        }
+      }
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });

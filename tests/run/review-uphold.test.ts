@@ -24,19 +24,24 @@ const ev = (event: string, taskId: string, data: Record<string, unknown> = {}): 
   ({ ts: "2026-07-28T00:00:00.000Z", event, taskId, data });
 
 describe("reviewRoundsSinceApproval — engagement-scoped review rounds (OBS-189)", () => {
-  test("counts failed review rounds and resets on every operator approval", () => {
+  test("counts failed review rounds and resets on every effective operator approval, never on a refused one", () => {
     const events = [
       ev("gate-result", "T1", { gate: "review", pass: false, details: "r1" }),
       ev("gate-result", "T1", { gate: "review", pass: false, details: "r2" }),
       ev("gate-result", "T2", { gate: "review", pass: false, details: "other task" }),
       ev("gate-result", "T1", { gate: "review", pass: true, details: "approved" }),
+      ev("task-human", "T1", { kind: "gate-fail", reason: "review round cap" }),
     ];
     expect(reviewRoundsSinceApproval(events, "T1")).toBe(2);
-    events.push(ev("task-approved", "T1", { by: "op", release: "review-upheld", gate: "review" }));
+    // OBS-1178: bound to the park it answers (line 5 of this in-memory journal), the uphold opens an engagement…
+    events.push(ev("task-approved", "T1", { by: "op", release: "review-upheld", gate: "review", park: { line: 5, ts: events[4]!.ts } }));
     expect(reviewRoundsSinceApproval(events, "T1")).toBe(0);
     events.push(ev("gate-result", "T1", { gate: "review", pass: false, details: "r3" }));
     expect(reviewRoundsSinceApproval(events, "T1")).toBe(1);
     expect(reviewRoundsSinceApproval(events, "T2")).toBe(1); // untouched by T1's approval
+    // …while an unbound approval the daemon refused resets nothing.
+    events.push(ev("task-approved", "T1", { by: "racer", release: "review-upheld", gate: "review" }), ev("approval-refused", "T1", { lines: [events.length + 1] }));
+    expect(reviewRoundsSinceApproval(events, "T1")).toBe(1);
   });
 });
 
@@ -49,7 +54,7 @@ describe("replayResumeState — the review-upheld release (OBS-189)", () => {
     j.append("task-dispatch", "T1", { assignment, attempt: 0 });
     j.append("gate-result", "T1", { gate: "review", pass: false, details: "reviewer: stat tile mislabeled" });
     j.append("task-human", "T1", { kind: "gate-fail", reason: "review round cap" });
-    j.append("task-approved", "T1", { by: "op", via: "cli", release: "review-upheld", gate: "review" });
+    j.append("task-approved", "T1", { by: "op", via: "cli", release: "review-upheld", gate: "review", park: j.newestBinding("T1") }); // OBS-1178: bound
     const rs = j.replayResumeState().get("T1");
     expect(rs).toBeDefined();
     expect(rs!.attempts).toBe(0);

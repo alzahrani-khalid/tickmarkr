@@ -19,12 +19,8 @@ const splitGateCommands = [
 const publicGateCommands = [
   "npm run build",
   "npm run lint",
-  `set -o pipefail
-npm run test:coverage -- --project suite 2>&1 | tee "$RUNNER_TEMP/tickmarkr-test-output.log"
-`,
-  `set -o pipefail
-npx vitest run --project sync-heavy --project keys-ledger --project built-cli --project signal-reaper 2>&1 | tee "$RUNNER_TEMP/tickmarkr-test-output-singlefork.log"
-`,
+  `bash scripts/run-ci-vitest.sh "$RUNNER_TEMP/tickmarkr-test-output.log" npm run test:coverage -- --project suite`,
+  `bash scripts/run-ci-vitest.sh "$RUNNER_TEMP/tickmarkr-test-output-singlefork.log" npx vitest run --project sync-heavy --project keys-ledger --project built-cli --project signal-reaper`,
   `sh scripts/assert-test-file-count.sh "$RUNNER_TEMP/tickmarkr-test-output.log" "$RUNNER_TEMP/tickmarkr-test-output-singlefork.log"`,
 ];
 const gateCommandsFor = (path: string): string[] =>
@@ -46,10 +42,11 @@ function runCommands(job: WorkflowJob): string[] {
 }
 
 // Match runner entry points, not one known script or step: the workflows invoke the suite through
-// npm's test scripts and through vitest directly, and the export context changes which definitions
-// are present. Keeping the workflow/job/step coordinates makes failures identify the parsed source.
+// npm's test scripts and through vitest directly — in the public workflow behind the shared-classifier
+// wrapper (OBS-1184) — and the export context changes which definitions are present. Keeping the
+// workflow/job/step coordinates makes failures identify the parsed source.
 const invokesTestRunner = (run: string): boolean =>
-  /(?:^|\n)\s*(?:npm(?:\s+run)?\s+test(?:[\w:-]*)\b|npx\s+(?:--[^\s]+\s+)*vitest\b)/m.test(run);
+  /(?:^|\n)\s*(?:bash\s+scripts\/run-ci-vitest\.sh\s+\S+\s+)?(?:npm(?:\s+run)?\s+test(?:[\w:-]*)\b|npx\s+(?:--[^\s]+\s+)*vitest\b)/m.test(run);
 
 const testRunnerSteps = workflowPaths.flatMap((path) =>
   Object.entries(jobsFor(path)).flatMap(([jobName, job]) =>

@@ -840,7 +840,8 @@ test("test: status renders for each current task its recorded phase last evidenc
   const evidence = (id: string) => lines[lines.indexOf(row(out, id)) + 1]!;
   expect(evidence("T1")).toBe("    phase preparing · last evidence 2026-09-20T08:00:00.000Z · responsible implementer / agent-one · blocker none · next action unrecorded · human-decision no");
   expect(evidence("T2")).toContain("phase awaiting merge phase");
-  expect(evidence("T3")).toBe("    phase terminal · last evidence 2026-09-20T08:00:00.000Z · responsible reviewer · blocker human-decision · next action Choose a decision: approve · human-decision yes");
+  const parkLine = Journal.open(repo, "run-projection").readSourced().lines.at(-1)!; // OBS-1178: the park's token
+  expect(evidence("T3")).toBe(`    phase terminal · last evidence 2026-09-20T08:00:00.000Z · responsible reviewer · blocker human-decision · next action Choose a decision: approve (--park ${parkLine}@2026-09-20T08:00:00.000Z) · human-decision yes`);
   expect(out).not.toMatch(/gate \w+ running|\bmerging\b|in flight/);
   const watch = await withStatusSurface(false, 120, () => status(["--watch"], repo, { iterations: 1 }));
   for (const id of ["T1", "T2", "T3"]) expect(watch).toContain(evidence(id));

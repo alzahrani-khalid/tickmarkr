@@ -80,12 +80,14 @@ describe("OBS-1158 — approved rechecks share one bounded priority across plan 
     expect([...resumed.done].sort()).toEqual(["D", "DC", "F0", "F1", "T1"]);
     expect(admissions(afterResume(journal.read()))).toEqual(["D", "F0", "F1", "DC"]);
     // D parks again, so a recheck row on DC (dependency-blocked) is never ready and buys nothing.
+    // OBS-1178: every pending decision below binds the park it answers.
     journal.append("task-human", "D", { kind: "gate-fail", reason: "parked again" });
-    journal.append("task-approved", "DC", { by: "op", release: RECHECK_RELEASE });
+    journal.append("task-human", "DC", { kind: "infra", reason: "parked" });
+    journal.append("task-approved", "DC", { by: "op", release: RECHECK_RELEASE, park: journal.newestBinding("DC") });
     // F0 and F1 park and are released with PLAIN (worker-funding) approvals: pending, no battery rank.
     for (const id of ["F0", "F1"]) {
       journal.append("task-human", id, { kind: "gate-fail", reason: "parked again" });
-      journal.append("task-approved", id, { by: "op" });
+      journal.append("task-approved", id, { by: "op", park: journal.newestBinding(id) });
     }
     // T1's recheck approval was CONSUMED by a legacy worker-launch (no recheck-battery row) and the
     // run was interrupted before the task closed: T1 is eligible again with no superseding approval.

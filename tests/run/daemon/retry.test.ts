@@ -1137,6 +1137,84 @@ describe("per-task timeout override (OBS-37b)", () => {
 // ── v1.85 T3 (speed dive): retries repair with the findings in hand ────────────────────────────
 // Measured losses this suite pins: 62 of 68 re-dispatches were FRESH (~20m of onboarding re-bought
 // each time) and ~663m across 5 runs went to loops of normalized-identical failures.
+// OBS-1107: a carry is verified by content. An originally empty commit and a patch the integration tip
+// already holds both refuse a cherry-pick and land under no hash of their own — neither is lost work.
+describe("OBS-1107 carry verification reads content, not hashes (fake adapter, zero tokens)", () => {
+  test("test: the production daemon carries an empty commit and an already-present patch versus parking on a missing nonempty patch while retaining authorship, so counting a rewritten hash alone as lost work fails", async () => {
+    const author = "export GIT_AUTHOR_NAME=Ada GIT_AUTHOR_EMAIL=ada@example.test GIT_AUTHOR_DATE='2026-01-02T03:04:05Z'";
+    const emptyCommit = "git commit -q --allow-empty --no-gpg-sign -m empty";
+    for (const variant of ["represented", "missing"] as const) {
+      const runId = `run-obs1107-${variant}`;
+      const { repo, fake } = setupRepo(
+        [T("T1", { gates: ["build", "test", "lint", "evidence", "scope"] })],
+        {
+          consult: { action: "human", notes: "operator decides" },
+          tasks: { T1: [
+            {
+              shell: `${author} && ${emptyCommit} && echo shared > shared.txt && ${COMMIT} shared && echo own > own.txt && ${COMMIT} own`,
+              result: { ok: true, summary: "three commits" },
+            },
+            // the funded repair changes nothing but another empty commit, so the same red parks it
+            { shell: `${author} && ${emptyCommit}`, result: { ok: true, summary: "repair" } },
+          ] },
+        },
+        // green at the base, red on the worker's tree until the integration tip lands green.txt
+        stringifyYaml({ gates: { build: "true", test: "[ ! -f own.txt ] || [ -f green.txt ]", lint: "true" } }),
+      );
+      expect((await runDaemon(repo, { adapters: [fake], runId })).human, variant).toEqual(["T1"]);
+      let evs = Journal.open(repo, runId).read();
+      // Dispatch site: the repair's recreation leads with the empty commit, accounts for it and keeps
+      // carrying — no work-loss row and the repair is not cancelled over a commit that held nothing.
+      const [first] = evs.filter((e) => e.event === "worktree-recreation" && e.taskId === "T1");
+      const [empty0, shared0, own0] = first!.data.attempted as string[];
+      expect(first!.data, variant).toMatchObject({ carried: [shared0, own0], accounted: [empty0] });
+      expect(evs.filter((e) => e.event === "work-loss" || e.event === "repair-cancelled"), variant).toEqual([]);
+      expect(evs.filter((e) => e.event === "repair-dispatch"), variant).toHaveLength(1);
+
+      const taskWt = worktreePath(repo, `tickmarkr/${runId}--T1`);
+      const [shared, own, empty] = (await shOk("git log --reverse --format=%H HEAD~3..HEAD", taskWt)).trim().split("\n");
+      expect(await shOk(`git diff --quiet ${empty}^ ${empty} && echo empty`, repo), variant).toBe("empty\n");
+      // A sibling lands shared.txt's exact bytes on the integration tip; in the missing variant it also
+      // lands other own.txt bytes, so own's nonempty change can neither apply nor be represented.
+      const intWt = worktreePath(repo, `tickmarkr/${runId}`);
+      writeFileSync(join(intWt, "shared.txt"), "shared\n");
+      writeFileSync(join(intWt, "green.txt"), "green\n");
+      if (variant === "missing") writeFileSync(join(intWt, "own.txt"), "other\n");
+      await shOk(`${COMMIT} sibling`, intWt);
+
+      await approve([runId, "T1", "--recheck", "--by", "op"], repo);
+      const resumed = await runDaemon(repo, { adapters: [fake], runId, resume: true });
+      evs = Journal.open(repo, runId).read();
+      const post = evs.slice(evs.map((e) => e.event).lastIndexOf("run-resume") + 1);
+      // Recheck site: every source hash is rewritten or absent — ancestry alone would call all three lost.
+      const recreation = post.find((e) => e.event === "worktree-recreation" && e.taskId === "T1")!;
+      expect(recreation.data.attempted, variant).toEqual([shared, own, empty]);
+
+      if (variant === "represented") {
+        expect(resumed.done).toEqual(["T1"]);
+        expect(recreation.data).toMatchObject({ carried: [own], accounted: [shared, empty] });
+        expect(post.filter((e) => e.event === "task-human")).toEqual([]);
+        const merged = `tickmarkr/${runId}`;
+        expect(await shOk(`git show ${merged}:own.txt`, repo)).toBe("own\n");
+        expect(await shOk(`git show ${merged}:shared.txt`, repo)).toBe("shared\n");
+        // authorship survives the carry: the rewritten commit's git author and the seat that wrote it
+        expect(await shOk(`git log -1 --format='%an <%ae> %aI' ${merged} -- own.txt`, repo))
+          .toBe("Ada <ada@example.test> 2026-01-02T03:04:05Z\n");
+        expect(post.find((e) => e.event === "task-done" && e.taskId === "T1")!.data.authors).toEqual(["fake:fake-1"]);
+      } else {
+        // shared is accounted for; own is a nonempty change the destination lacks, so the carry stops there
+        // and the task parks naming own first — never the already-present shared patch.
+        expect(resumed.human).toEqual(["T1"]);
+        expect(recreation.data).toMatchObject({ carried: [], accounted: [shared] });
+        const park = post.find((e) => e.event === "task-human" && e.taskId === "T1")!;
+        expect(park.data.reason).toContain("carry lost 2 of 3 verified commit(s)");
+        expect(park.data.reason).toContain(`first missing: ${own!.slice(0, 10)}`);
+        expect(post.filter((e) => e.event === "task-done")).toEqual([]);
+      }
+    }
+  }, 240_000);
+});
+
 describe("T3 retry economics (fake adapter, zero tokens)", () => {
   const evsOf = (repo: string, runId: string) => Journal.open(repo, runId).read();
   const promptOf = (repo: string, runId: string, attempt: number) =>
@@ -1350,7 +1428,11 @@ describe("T3 retry economics (fake adapter, zero tokens)", () => {
     ]);
     expect(journaledFailureBrief(gated, "T2")).toEqual([]);                       // task-scoped
     expect(journaledFailureBrief([...gated, ev("worker-launch")], "T1")).toEqual([]); // spent at launch
-    expect(journaledFailureBrief([...gated, ev("task-approved", { release: "gate-satisfied" })], "T1")).toEqual([]); // and by a WAIVE (OBS-1074: only a waive settles)
+    // A park binding alone cannot waive a gate: no failed gate belongs to this post-dispatch park.
+    const park = { line: gated.length + 1, ts: "2026-08-01T00:00:00.000Z" };
+    expect(journaledFailureBrief([...gated, ev("task-human", { kind: "gate-fail" }), ev("task-approved", { release: "gate-satisfied", park })], "T1")).toHaveLength(2);
+    expect(journaledFailureBrief([...gated, ev("task-human", { kind: "gate-fail" }), ev("task-approved", { release: "gate-satisfied" })], "T1"))
+      .toHaveLength(2); // an unbound waive is refused and retires nothing
 
     // The ONE pre-launch invariant covers the terminal exception path too: task-dispatch does not
     // spend information, task-failed contributes its exact dispatch error, and only an actual launch
@@ -1892,7 +1974,6 @@ test("test: a revival holding both an upheld review and consult guidance carries
     details: reviewDetails,
     findings: structuredFindings("review", reviewDetails),
   });
-  j.append("task-approved", "T1", { by: "op", release: REVIEW_UPHELD_RELEASE, gate: "review" });
   j.append("consult-verdict", "T1", {
     action: "human",
     reason: consultReason,
@@ -1900,6 +1981,8 @@ test("test: a revival holding both an upheld review and consult guidance carries
     notes: consultNotes,
   });
   j.append("task-human", "T1", { kind: "gate-fail", reason: "parked after consult" });
+  // OBS-1178: the uphold answers the park it is bound to; an unbound one is refused and funds no brief.
+  j.append("task-approved", "T1", { by: "op", release: REVIEW_UPHELD_RELEASE, gate: "review", park: j.newestBinding("T1") });
 
   const summary = await runDaemon(repo, { adapters: [fake], runId, resume: true });
   expect(summary.done).toEqual(["T1"]);
@@ -2184,7 +2267,11 @@ describe("T6 a settled review finding stops travelling (fake adapter, zero token
     expect(still(ev("task-approved", { by: "op", release: "recheck" }))).toEqual([FINDING]);
     expect(still(ev("task-approved", { by: "op" }))).toEqual([FINDING]); // a pre-dispatch human gate
     expect(still(ev("task-approved", { by: "op", release: GATE_SATISFIED_RELEASE, gate: "test" }))).toEqual([FINDING]);
-    expect(still(ev("task-approved", { by: "op", release: GATE_SATISFIED_RELEASE, gate: "review" }))).toEqual([]);
+    // OBS-1178: the settling waive is the one bound to the review park it answers; unbound, it is refused and settles nothing.
+    expect(still(ev("task-approved", { by: "op", release: GATE_SATISFIED_RELEASE, gate: "review" }))).toEqual([FINDING]);
+    const parked = [...drawn, ev("task-human", { kind: "gate-fail" })];
+    const park = { line: parked.length, ts: "2026-08-01T00:00:00.000Z" };
+    expect(outstandingReviewFindings([...parked, ev("task-approved", { by: "op", release: GATE_SATISFIED_RELEASE, gate: "review", park })], "T1")).toEqual([]);
   });
 });
 
@@ -2426,7 +2513,11 @@ describe("T2 a passing review does not drop what it deferred (fake adapter, zero
     expect(still(ev("task-approved", { by: "op", release: "recheck" }))).toEqual([DEFERRED_FINGERPRINT]);
     expect(still(ev("task-approved", { by: "op" }))).toEqual([DEFERRED_FINGERPRINT]); // a pre-dispatch human gate
     expect(still(ev("task-approved", { by: "op", release: GATE_SATISFIED_RELEASE, gate: "test" }))).toEqual([DEFERRED_FINGERPRINT]);
-    expect(still(ev("task-approved", { by: "op", release: GATE_SATISFIED_RELEASE, gate: "review" }))).toEqual([]);
+    // OBS-1178: the settling waive is the one bound to the review park it answers; unbound, it is refused and settles nothing.
+    expect(still(ev("task-approved", { by: "op", release: GATE_SATISFIED_RELEASE, gate: "review" }))).toEqual([DEFERRED_FINGERPRINT]);
+    const parked = [...drawn, ev("gate-result", { gate: "review", pass: false }), ev("task-human", { kind: "gate-fail" })];
+    const park = { line: parked.length, ts: "2026-08-01T00:00:00.000Z" };
+    expect(outstandingReviewFindings([...parked, ev("task-approved", { by: "op", release: GATE_SATISFIED_RELEASE, gate: "review", park })], "T1")).toEqual([]);
   });
 });
 
@@ -2668,16 +2759,18 @@ describe("ES-2 daemon tier climb", () => {
 // gate row the fresh attempt was funded to fix, and the operator's reason never reached the worker).
 test("test: a plain approval, a scope grant or a recheck after a park keeps the parked attempt's failed gate rows in the brief and appends the operator's reason, a waive still clears them, and a worker-launch spends them, so a fresh attempt that starts without the finding it was funded to fix fails", () => {
   const ev = (event: string, data: Record<string, unknown> = {}, taskId = "T1") => ({ ts: "t", event, taskId, data }) as never;
-  const parked = [ev("gate-result", { gate: "test", pass: false, details: "FAIL tests/repo/oracle.test.ts > reads an excluded path" })];
+  const parked = [ev("gate-result", { gate: "test", pass: false, details: "FAIL tests/repo/oracle.test.ts > reads an excluded path" }), ev("task-human", { kind: "gate-fail" })];
+  const park = { line: 2, ts: "t" }; // OBS-1178: each decision is bound to the park it answers
   for (const approval of [{ reason: "guard the read with a named skip" }, { release: "scope-request", reason: "files[] += docs/x.md" }, { release: "recheck", reason: "same tree, re-gate" }]) {
-    expect(journaledFailureBrief([...parked, ev("task-approved", approval)], "T1")).toEqual([
+    expect(journaledFailureBrief([...parked, ev("task-approved", { ...approval, park })], "T1")).toEqual([
       "test: FAIL tests/repo/oracle.test.ts > reads an excluded path",
       `approval: ${approval.reason}`,
     ]);
   }
-  expect(journaledFailureBrief([...parked, ev("task-approved", {})], "T1")).toEqual(["test: FAIL tests/repo/oracle.test.ts > reads an excluded path"]);
-  expect(journaledFailureBrief([...parked, ev("task-approved", { release: "gate-satisfied", reason: "waived" })], "T1")).toEqual([]);
-  expect(journaledFailureBrief([...parked, ev("task-approved", { reason: "r" }), ev("worker-launch")], "T1")).toEqual([]);
+  expect(journaledFailureBrief([...parked, ev("task-approved", { park })], "T1")).toEqual(["test: FAIL tests/repo/oracle.test.ts > reads an excluded path"]);
+  expect(journaledFailureBrief([...parked, ev("task-approved", { release: "gate-satisfied", gate: "test", reason: "waived", park })], "T1")).toEqual([]);
+  // OBS-1150: the launch spends the gate rows; the operator's reason is a standing ruling and stays.
+  expect(journaledFailureBrief([...parked, ev("task-approved", { reason: "r", park }), ev("worker-launch")], "T1")).toEqual(["approval: r"]);
 });
 
 // Wiring proofs share the existing fake-adapter repository and real gate battery. Only the

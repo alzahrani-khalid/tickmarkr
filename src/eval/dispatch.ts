@@ -193,6 +193,7 @@ async function dispatchChannel(
     model: channel.model,
     channel: channel.channel,
     tier: channel.tier,
+    ...(channel.effort ? { effort: channel.effort } : {}), // OBS-1182: measured at the effort it would run at
   };
 
   const invocation = adapter.invoke(task, seeded.repo, assignment, { promptFile });

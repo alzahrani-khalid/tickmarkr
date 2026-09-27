@@ -37,7 +37,7 @@ describe("BD-1 — the approved task board", () => {
     const rendered = renderBoard(input, 150);
     expect(rendered.map(stripBoardAnsi)).toEqual(golden);
     const plain = rendered.map(stripBoardAnsi).join("\n");
-    for (const must of ["◍ parked ×3", "↻ 3 review rounds", "✖ test", "waiting on T3", "in flight", "UNMAPPED tests/cockpit/board.test.ts  assets/board.png", "T9  — not in this graph (retired at compile)", "WHERE THE EFFORT WENT", "gates left→right in declaration order"]) expect(plain).toContain(must);
+    for (const must of ["◍ parked ×3", "↻ 3 review rounds", "✖ test", "waiting on T3", "in flight", "UNMAPPED assets/board.png", "T9  — not in this graph (retired at compile)", "WHERE THE EFFORT WENT", "gates left→right in declaration order"]) expect(plain).toContain(must);
     expect(plain).toMatch(/T6 .*✔ {2}✔ {2}✔ {2}· {2}· {2}· {2}─ /u);
 
     // Green needs the FOUR buckets empty; a passed tip alone is not green.
@@ -142,13 +142,13 @@ describe("BD-1 — the approved task board", () => {
       m.input.write("a\r");
       expect(await m.until(() => preview().includes("y approve"))).toBe(true);
       const first = overlay();
-      expect(preview()).toContain(`tickmarkr approve ${f.runId} T1 --by operator`);
+      expect(preview()).toMatch(new RegExp(`tickmarkr approve ${f.runId} T1 --park \\d+@\\S+ --by operator`, "u")); // OBS-1178: the park token
       expect(stripAnsi(m.frame())).toContain("y approve");
       // "na\r" as ONE chunk while the confirm is open: n cancels it, a reopens Actions, Enter previews afresh.
       m.input.write("na\r");
       expect(await m.until(() => overlay() !== first && preview().includes("y approve"))).toBe(true);
       expect(overlay()).not.toBe(first);
-      expect(preview()).toContain(`tickmarkr approve ${f.runId} T1 --by operator`);
+      expect(preview()).toMatch(new RegExp(`tickmarkr approve ${f.runId} T1 --park \\d+@\\S+ --by operator`, "u")); // OBS-1178: the park token
       expect(m.input.kernel()).toBe("");
       // Nothing was appended: two previews, no confirmation — the journal keeps the fixture's two approvals only.
       expect(readFileSync(join(f.cwd, ".tickmarkr", "runs", f.runId, "journal.jsonl"), "utf8").split('"event":"task-approved"').length - 1).toBe(2);
@@ -169,7 +169,7 @@ describe("BD-1 — the approved task board", () => {
       m.input.write("\x1b[?1;2c");
       m.input.write("[a\r");
       expect(await m.until(() => preview().includes("y approve"))).toBe(true);
-      expect(preview()).toContain(`tickmarkr approve ${f.runId} T1 --by operator`);
+      expect(preview()).toMatch(new RegExp(`tickmarkr approve ${f.runId} T1 --park \\d+@\\S+ --by operator`, "u")); // OBS-1178: the park token
       expect(m.delivery.snapshot().state.help).toBe(false);
       expect(m.input.kernel()).toBe("");
     } finally { await m.close(); f.close(); }
@@ -298,13 +298,51 @@ describe("BD-1 — the approved task board", () => {
       expect(lines.some((l) => l.includes("VERDICT /"))).toBe(false);
     } finally { await m.close(); f.close(); }
   });
+
+  test("the production board maps cockpit tests fixture paths and Claude skills to UI REPO and DOCS versus retaining unknown paths as unmapped, so one known path falling through fails", () => {
+    // Closed enumeration: the three mapped prefixes, then one unknown-prefix control.
+    const cases = [
+      { id: "T1", path: "tests/cockpit/board.test.ts", area: "UI" },
+      { id: "T2", path: "tests/fixtures/cockpit/board/frame.150.txt", area: "REPO" },
+      { id: "T3", path: ".claude/skills/tickmarkr-loop/SKILL.md", area: "DOCS" },
+      { id: "T4", path: "vendor/closed-control.txt", area: undefined },
+    ] as const;
+    expect(cases.map((c) => c.area ?? "unmapped")).toEqual(["UI", "REPO", "DOCS", "unmapped"]);
+    const graph = validateGraph({
+      version: 1,
+      spec: { paths: ["specs/areas.spec.md"], hash: "area-map", source: "native" },
+      tasks: cases.map((c) => ({
+        id: c.id, title: c.id, goal: "g", shape: "implement" as const, complexity: 1, deps: [] as string[], files: [c.path], acceptance: ["a"],
+      })),
+    });
+    const snapshot = readOperatorState({
+      events: [{ ts: "2026-09-12T10:00:00.000Z", event: "run-start", data: { graphDefinitionHash: graphDefinitionHash(graph), branch: "fixture" } }],
+      graph,
+    });
+    expect(snapshot.comparable).toBe(true);
+    const plain = renderBoard({ runId: "run-areas", snapshot, graph, now: BOARD_NOW, colour: false, keys: false }, 160).map(stripBoardAnsi);
+    const unmappedLine = plain.find((l) => /^\s+UNMAPPED /u.test(l)) ?? "";
+    expect(plain.some((l) => l.includes("1 unmapped"))).toBe(true);
+    for (const c of cases) {
+      const row = plain.find((l) => l.startsWith(`    ${c.id} `));
+      expect(row, c.path).toBeDefined();
+      if (c.area !== undefined) {
+        expect(row, c.path).toContain(c.area);
+        expect(row, c.path).not.toContain("UNMAPPED");
+        expect(unmappedLine, c.path).not.toContain(c.path);
+      } else {
+        expect(row, c.path).toContain("UNMAPPED");
+        expect(unmappedLine).toContain(c.path);
+      }
+    }
+  });
 });
 
 describe("BD-1 — the fixture copy of the prototype", () => {
   // The design prototype lives under .overseer, which the exporter drops; the byte-diff is skipped
   // on the exported tree because .overseer is absent there (the fixture copy still ships).
   const designPrototype = join(import.meta.dirname, "../../.overseer/design-prototypes/tasks-redesign.mjs");
-  test.skipIf(!existsSync(designPrototype))("the fixture copy of the prototype differs from the design prototype only in reading its root, run and clock from the environment and in the two contract corrections — the declaration-order subtitle and the four-bucket green header — cited to the added fixture file in the diff", () => {
+  test.skipIf(!existsSync(designPrototype))("the fixture copy of the prototype differs from the design prototype only in reading its root, run and clock from the environment, in the two contract corrections — the declaration-order subtitle and the four-bucket green header — and in mapping tests/cockpit, tests/fixtures and .claude/skills, cited to the added fixture file in the diff", () => {
     const design = readFileSync(designPrototype, "utf8");
     const copy = readFileSync(join(fixtures, "tasks-redesign.mjs"), "utf8");
     // Undo exactly the permitted edits; anything else left over fails the byte comparison below.
@@ -321,6 +359,10 @@ describe("BD-1 — the fixture copy of the prototype", () => {
       // contract correction: declaration-order subtitle
       [/ {2}\/\/ contract correction \(RULING-231-19 §2\): declaration order[^\n]*\n/u, ""],
       ["gates left→right in declaration order", "gates left→right in pipeline order"],
+      // OBS-1103: the fixture map classifies prefixes the signed-off prototype left unmapped
+      [", /^tests\\/cockpit\\//", ""],
+      [", /^\\.claude\\/skills\\//", ""],
+      ["helpers|fixtures", "helpers"],
     ];
     const reverted = permitted.reduce<string>((s, [from, to]) => {
       expect(s, `permitted edit missing from the copy: ${String(from)}`).toMatch(from instanceof RegExp ? from : new RegExp(from.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&"), "u"));

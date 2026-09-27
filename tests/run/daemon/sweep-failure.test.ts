@@ -58,7 +58,7 @@ async function failedResume(refuseAppend = false, setupFailure = false) {
     narrate: (event) => {
       if (event.event === "approval-window-start") {
         // A successful sweep would release this task: teardown must not dispatch its funded work.
-        journal.append("task-approved", "parked", { by: "operator" });
+        journal.append("task-approved", "parked", { by: "operator", park: journal.newestBinding("parked") }); // OBS-1178: bound
         armed = true;
       }
     },

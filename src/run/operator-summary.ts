@@ -17,6 +17,9 @@ export interface OperatorDecisionSnapshot {
     readonly kind: string | undefined;
     readonly tombstone: boolean;
     readonly reason?: string;
+    /** OBS-1178: the park row's physical line and timestamp — the token a decision binds to. */
+    readonly line?: number;
+    readonly ts?: string;
   };
   readonly verbs: readonly string[];
   readonly diagnostic?: string;
@@ -96,7 +99,9 @@ export function projectOperatorSummary(
         decisionRequired: verbs.length > 0,
         ...(diagnostic !== undefined || park.reason !== undefined
           ? { diagnostic: diagnostic ?? park.reason } : {}),
-        nextAction: verbs.length > 0 ? `Choose a decision: ${verbs.join(", ")}` : null,
+        nextAction: verbs.length > 0
+          ? `Choose a decision: ${verbs.join(", ")}${park.line !== undefined && park.ts !== undefined ? ` (--park ${park.line}@${park.ts})` : ""}`
+          : null,
       };
       if (!park.tombstone && park.kind === "infra" && task.missingCapability) {
         const { capability, diagnostic: capabilityDiagnostic } = task.missingCapability;

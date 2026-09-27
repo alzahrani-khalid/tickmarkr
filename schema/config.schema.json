@@ -1,0 +1,818 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "executionPolicy": {
+      "type": "object",
+      "properties": {
+        "boundedInfrastructure": {
+          "default": false,
+          "type": "boolean"
+        },
+        "repairSelection": {
+          "default": false,
+          "type": "boolean"
+        },
+        "taskExecutionLimitMs": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        }
+      },
+      "required": [
+        "taskExecutionLimitMs"
+      ],
+      "additionalProperties": false
+    },
+    "concurrency": {
+      "type": "integer",
+      "exclusiveMinimum": 0,
+      "maximum": 9007199254740991
+    },
+    "driver": {
+      "type": "string",
+      "enum": [
+        "auto",
+        "herdr",
+        "subprocess",
+        "orca"
+      ]
+    },
+    "integrationBranchPrefix": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._/-]*$"
+    },
+    "taskTimeoutMinutes": {
+      "type": "number",
+      "exclusiveMinimum": 0
+    },
+    "contextWarnTokens": {
+      "type": "integer",
+      "exclusiveMinimum": 0,
+      "maximum": 9007199254740991
+    },
+    "setup": {
+      "type": "string"
+    },
+    "routing": {
+      "type": "object",
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": [
+            "partner-led",
+            "risk-based",
+            "staff-led"
+          ]
+        },
+        "map": {
+          "type": "object",
+          "propertyNames": {
+            "type": "string"
+          },
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "pin": {
+                "type": "object",
+                "properties": {
+                  "via": {
+                    "type": "string"
+                  },
+                  "model": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "via",
+                  "model"
+                ]
+              },
+              "pool": {
+                "type": "object",
+                "properties": {
+                  "mode": {
+                    "type": "string",
+                    "enum": [
+                      "any",
+                      "ordered"
+                    ]
+                  },
+                  "channels": {
+                    "minItems": 1,
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "pattern": "^[^:\\s]+:\\S.*$"
+                    }
+                  }
+                },
+                "required": [
+                  "mode",
+                  "channels"
+                ]
+              },
+              "tier": {
+                "type": "null"
+              },
+              "prefer": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "escalate": {
+                "type": "boolean"
+              }
+            }
+          }
+        },
+        "floors": {
+          "type": "object",
+          "propertyNames": {
+            "type": "string"
+          },
+          "additionalProperties": {
+            "type": "string",
+            "enum": [
+              "cheap",
+              "mid",
+              "frontier"
+            ]
+          }
+        },
+        "learned": {
+          "type": "string",
+          "enum": [
+            "on",
+            "off"
+          ]
+        },
+        "escalateTier": {
+          "default": "on",
+          "type": "string",
+          "enum": [
+            "on",
+            "off"
+          ]
+        },
+        "learnedTuning": {
+          "type": "object",
+          "properties": {
+            "halfLifeRuns": {
+              "type": "number",
+              "exclusiveMinimum": 0
+            },
+            "availWeight": {
+              "type": "number",
+              "minimum": 0
+            }
+          }
+        },
+        "explore": {
+          "type": "object",
+          "properties": {
+            "mode": {
+              "type": "string",
+              "enum": [
+                "on",
+                "off"
+              ]
+            },
+            "excludeShapes": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "excludeComplexityAtOrAbove": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 10
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "cap": {
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 9007199254740991
+            }
+          }
+        },
+        "sla": {
+          "type": "object",
+          "propertyNames": {
+            "type": "string"
+          },
+          "additionalProperties": {
+            "type": "number",
+            "exclusiveMinimum": 0
+          }
+        },
+        "allowUnverifiedModels": {
+          "type": "boolean"
+        },
+        "allow": {
+          "type": "object",
+          "properties": {
+            "adapters": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "models": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        "deny": {
+          "type": "object",
+          "properties": {
+            "adapters": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "models": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "workers": {
+              "type": "object",
+              "properties": {
+                "adapters": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "models": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "required": [
+        "map",
+        "floors",
+        "learned",
+        "allowUnverifiedModels"
+      ]
+    },
+    "tiers": {
+      "type": "object",
+      "properties": {
+        "claude-code": {
+          "type": "object",
+          "properties": {
+            "vendor": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "minLength": 1
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "channel": {
+              "type": "string",
+              "enum": [
+                "sub",
+                "api"
+              ]
+            },
+            "models": {
+              "type": "object",
+              "propertyNames": {
+                "type": "string"
+              },
+              "additionalProperties": {
+                "type": "string",
+                "enum": [
+                  "cheap",
+                  "mid",
+                  "frontier"
+                ]
+              }
+            },
+            "modelOverrides": {
+              "type": "object",
+              "propertyNames": {
+                "type": "string"
+              },
+              "additionalProperties": {
+                "type": "object",
+                "properties": {
+                  "vendor": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "channel": {
+                    "type": "string",
+                    "enum": [
+                      "sub",
+                      "api"
+                    ]
+                  },
+                  "effort": {
+                    "type": "string",
+                    "enum": [
+                      "low",
+                      "medium",
+                      "high"
+                    ]
+                  }
+                }
+              }
+            },
+            "windows": {
+              "type": "object",
+              "propertyNames": {
+                "type": "string"
+              },
+              "additionalProperties": {
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "maximum": 9007199254740991
+              }
+            }
+          },
+          "required": [
+            "vendor",
+            "channel",
+            "models"
+          ]
+        },
+        "codex": {
+          "type": "object",
+          "properties": {
+            "vendor": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "minLength": 1
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "channel": {
+              "type": "string",
+              "enum": [
+                "sub",
+                "api"
+              ]
+            },
+            "models": {
+              "type": "object",
+              "propertyNames": {
+                "type": "string"
+              },
+              "additionalProperties": {
+                "type": "string",
+                "enum": [
+                  "cheap",
+                  "mid",
+                  "frontier"
+                ]
+              }
+            },
+            "modelOverrides": {
+              "type": "object",
+              "propertyNames": {
+                "type": "string"
+              },
+              "additionalProperties": {
+                "type": "object",
+                "properties": {
+                  "vendor": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "channel": {
+                    "type": "string",
+                    "enum": [
+                      "sub",
+                      "api"
+                    ]
+                  },
+                  "effort": {
+                    "type": "string",
+                    "enum": [
+                      "low",
+                      "medium",
+                      "high"
+                    ]
+                  }
+                }
+              }
+            },
+            "windows": {
+              "type": "object",
+              "propertyNames": {
+                "type": "string"
+              },
+              "additionalProperties": {
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "maximum": 9007199254740991
+              }
+            }
+          },
+          "required": [
+            "vendor",
+            "channel",
+            "models"
+          ]
+        }
+      },
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "vendor": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "channel": {
+            "type": "string",
+            "enum": [
+              "sub",
+              "api"
+            ]
+          },
+          "models": {
+            "type": "object",
+            "propertyNames": {
+              "type": "string"
+            },
+            "additionalProperties": {
+              "type": "string",
+              "enum": [
+                "cheap",
+                "mid",
+                "frontier"
+              ]
+            }
+          },
+          "modelOverrides": {
+            "type": "object",
+            "propertyNames": {
+              "type": "string"
+            },
+            "additionalProperties": {
+              "type": "object",
+              "properties": {
+                "vendor": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "channel": {
+                  "type": "string",
+                  "enum": [
+                    "sub",
+                    "api"
+                  ]
+                },
+                "effort": {
+                  "not": {}
+                }
+              }
+            }
+          },
+          "windows": {
+            "type": "object",
+            "propertyNames": {
+              "type": "string"
+            },
+            "additionalProperties": {
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 9007199254740991
+            }
+          }
+        },
+        "required": [
+          "vendor",
+          "channel",
+          "models"
+        ]
+      }
+    },
+    "pricing": {
+      "type": "object",
+      "propertyNames": {
+        "type": "string"
+      },
+      "additionalProperties": {
+        "type": "number"
+      }
+    },
+    "cost": {
+      "type": "object",
+      "properties": {
+        "models": {
+          "type": "object",
+          "propertyNames": {
+            "type": "string"
+          },
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "inPerMtok": {
+                "type": "number",
+                "minimum": 0
+              },
+              "outPerMtok": {
+                "type": "number",
+                "minimum": 0
+              },
+              "cacheReadPerMtok": {
+                "type": "number",
+                "minimum": 0
+              },
+              "rateDate": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "inPerMtok",
+              "outPerMtok"
+            ]
+          }
+        },
+        "subs": {
+          "type": "object",
+          "propertyNames": {
+            "type": "string"
+          },
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "planMonthly": {
+                "type": "number",
+                "exclusiveMinimum": 0
+              },
+              "windowsPerMonthLow": {
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "maximum": 9007199254740991
+              },
+              "windowsPerMonthHigh": {
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "maximum": 9007199254740991
+              }
+            },
+            "required": [
+              "planMonthly",
+              "windowsPerMonthLow",
+              "windowsPerMonthHigh"
+            ]
+          }
+        }
+      }
+    },
+    "gates": {
+      "type": "object",
+      "properties": {
+        "build": {
+          "type": "string"
+        },
+        "test": {
+          "type": "string"
+        },
+        "tipTest": {
+          "type": "string"
+        },
+        "lint": {
+          "type": "string"
+        },
+        "diffCap": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
+        "byShape": {
+          "type": "object",
+          "propertyNames": {
+            "type": "string",
+            "enum": [
+              "plan",
+              "spec",
+              "implement",
+              "tests",
+              "docs",
+              "migration",
+              "ui",
+              "refactor",
+              "chore"
+            ]
+          },
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "acceptance": {
+                "type": "boolean"
+              },
+              "review": {
+                "type": "boolean"
+              }
+            },
+            "additionalProperties": {}
+          }
+        }
+      }
+    },
+    "scope": {
+      "type": "object",
+      "properties": {
+        "allowDeviations": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "judge": {
+      "type": "object",
+      "properties": {
+        "adapter": {
+          "type": "string"
+        },
+        "model": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "adapter",
+        "model"
+      ]
+    },
+    "review": {
+      "type": "object",
+      "properties": {
+        "complexityThreshold": {
+          "type": "number"
+        },
+        "timeoutMs": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
+        "required": {
+          "type": "boolean"
+        },
+        "prefer": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "policy": {
+          "type": "string",
+          "enum": [
+            "full",
+            "judge-only"
+          ]
+        },
+        "criticalPaths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "floor": {
+          "default": "worker",
+          "anyOf": [
+            {
+              "type": "string",
+              "const": "worker"
+            },
+            {
+              "type": "string",
+              "enum": [
+                "cheap",
+                "mid",
+                "frontier"
+              ]
+            }
+          ]
+        }
+      },
+      "required": [
+        "complexityThreshold",
+        "timeoutMs",
+        "required"
+      ]
+    },
+    "consult": {
+      "type": "object",
+      "properties": {
+        "adapter": {
+          "type": "string"
+        },
+        "model": {
+          "type": "string"
+        },
+        "stallMinutes": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "prefer": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[^:]+:.+$"
+          }
+        }
+      },
+      "required": [
+        "adapter",
+        "model",
+        "stallMinutes"
+      ]
+    },
+    "visibility": {
+      "type": "object",
+      "properties": {
+        "llm": {
+          "type": "string",
+          "enum": [
+            "pane",
+            "headless"
+          ]
+        },
+        "keepPanes": {
+          "type": "string",
+          "enum": [
+            "run",
+            "attempt",
+            "forever"
+          ]
+        },
+        "worker": {
+          "type": "string",
+          "enum": [
+            "interactive",
+            "print"
+          ]
+        },
+        "workersPerTab": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        }
+      },
+      "required": [
+        "llm",
+        "keepPanes",
+        "worker",
+        "workersPerTab"
+      ]
+    }
+  },
+  "required": [
+    "concurrency",
+    "driver",
+    "integrationBranchPrefix",
+    "taskTimeoutMinutes",
+    "contextWarnTokens",
+    "routing",
+    "tiers",
+    "pricing",
+    "gates",
+    "judge",
+    "review",
+    "consult",
+    "visibility"
+  ],
+  "$comment": "Structural schema of the merged (defaults + overlays) config; cross-field refinements live in loadConfig()."
+}

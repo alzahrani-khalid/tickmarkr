@@ -3,7 +3,7 @@ import { join } from "node:path";
 import type { WorkerAdapter } from "../adapters/types.js";
 import { compileSource } from "../compile/index.js";
 import { acceptanceGate } from "../gates/acceptance.js";
-import type { Task } from "../graph/schema.js";
+import type { Effort, Task } from "../graph/schema.js";
 import { shGitOk } from "../run/git.js";
 import { seedFixture, type Fixture } from "./fixtures.js";
 
@@ -86,6 +86,7 @@ export async function runCanaryJudge(
   fixture: Fixture,
   judgeAdapter: WorkerAdapter,
   model: string,
+  effort?: Effort, // OBS-1182: the judge seat's own effort; absent = the CLI's default
 ): Promise<CanaryJudgeResult> {
   if (!isCanaryFixture(fixture)) {
     throw new Error(`fixture ${fixture.id} is not the canary fixture`);
@@ -97,7 +98,7 @@ export async function runCanaryJudge(
 
   try {
     await applyKnownBadChange(seeded.repo);
-    const gateResult = await acceptanceGate(task, seeded.repo, initialCommit, { adapter: judgeAdapter, model });
+    const gateResult = await acceptanceGate(task, seeded.repo, initialCommit, { adapter: judgeAdapter, model, effort });
     const expectedPass = false;
     const judgePass = gateResult.pass;
     const breach = judgePass === true && expectedPass === false;

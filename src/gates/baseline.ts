@@ -202,9 +202,20 @@ export interface BaselineFileDuration {
   durationMs: number;
 }
 
+/**
+ * OBS-1123: WHICH capture a forgiveness rests on — the commit it measured and when it was published.
+ * Stamped by the daemon beside the measurement; absent on every baseline.json written before it, which
+ * readers must render as unknown provenance and never date from any other clock.
+ */
+export interface BaselineProvenance {
+  baseRef: string;
+  capturedAt: string;
+}
+
 export interface Baseline {
   /** No command ran because the dependency inventory could not establish isolation. */
   refusal?: string;
+  provenance?: BaselineProvenance;
   /** Observational capture receipts stay outside the forgiveness-bearing command entries. */
   evidenceReceipts?: Record<string, GateEvidenceReceipt>;
   commands: Record<string, BaselineCommand>;
@@ -509,7 +520,7 @@ const renormalize = (fp: string) => normalizeLine(fp.replace(ANSI_RE, ""));
  * Returns the failure fingerprints of `raw` that are NOT in the baseline entry (fresh), and
  * whether the output carried no recognizable failure shape at all.
  */
-export function freshFailures(entry: BaselineCommand | undefined, raw: string): { failing: string[]; unreadable: boolean } {
+export function freshFailures(entry: BaselineCommand | undefined, raw: string): { failing: string[]; unreadable: boolean; forgiven: string[] } {
   // OBS-534 (T2): an infra-recorded entry is a KILL, not a verdict — whatever fingerprints it carries
   // came from output flushed before the kill, over a suite that never finished. Nothing there is
   // "pre-existing", so it forgives nothing. The rule lives here rather than in either caller, so the
@@ -520,7 +531,9 @@ export function freshFailures(entry: BaselineCommand | undefined, raw: string): 
   const fresh = current.filter(
     (f) => !known.has(f) && (!FAIL_ANCHOR_RE.test(f) || f.startsWith("FAIL ")),
   );
-  return { failing: fresh.filter((f) => f !== UNRECOGNIZED_FAILURE), unreadable: current.includes(UNRECOGNIZED_FAILURE) };
+  // OBS-1123: the baseline-recorded half, named so a reader never has to infer it from the fresh half.
+  return { failing: fresh.filter((f) => f !== UNRECOGNIZED_FAILURE), unreadable: current.includes(UNRECOGNIZED_FAILURE),
+    forgiven: current.filter((f) => known.has(f)) };
 }
 export type PackageManager = "npm" | "pnpm" | "yarn" | "bun";
 
@@ -1008,7 +1021,10 @@ export async function compareToBaseline(
     // below rather than reading as a verified green. Raise the ceiling by teaching isFailureShaped
     // that runner's position rule (leading verdict + identifier, or identifier + separator + trailing
     // verdict); loosening back to vocabulary re-opens OBS-278.
-    const { failing, unreadable } = freshFailures(entry, raw);
+    const { failing, unreadable, forgiven } = freshFailures(entry, raw);
+    // OBS-1123: which baseline-recorded fingerprints this verdict carried, and the capture that
+    // recorded them. Observational only — nothing below reads it to decide a verdict.
+    const provenance = baseline.provenance ? { baselineProvenance: baseline.provenance } : {};
     // T9: classify the FRESH diff before charging it. The complete runner output can legitimately
     // contain a baseline-recorded assertion beside a newly introduced infrastructure death; letting
     // that known assertion outvote the fresh birpc line turns machine failure into a worker defect.
@@ -1081,7 +1097,9 @@ export async function compareToBaseline(
     }
     if (failing.length) {
       const headlined = headlineDetails(raw, failing);
-      const meta = { ...headlined.meta, ...(classification ? { classification } : {}) };
+      // A fresh red beside baseline-recorded ones names both halves, so no reader shows the new one as forgiven.
+      const meta = { ...headlined.meta, ...(classification ? { classification } : {}),
+        ...(forgiven.length ? { freshFingerprints: failing, forgivenFingerprints: forgiven, ...provenance } : {}) };
       record({ gate: name, pass: false, details: headlined.details, ...(Object.keys(meta).length ? { meta } : {}) });
       continue;
     }
@@ -1107,7 +1125,7 @@ export async function compareToBaseline(
       details: `exit ${r.code} but only pre-existing failures (forgiven)${
         unreadable ? " — no failure shape recognized in this output, so a new failure from this runner is invisible to the baseline gate" : ""
       }`,
-      ...(classification ? { meta: { classification } } : {}),
+      meta: { ...(classification ? { classification } : {}), forgivenFingerprints: forgiven, ...provenance },
     });
   }
   return results;

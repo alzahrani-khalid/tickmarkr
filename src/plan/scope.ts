@@ -201,7 +201,7 @@ function bindCandidate(candidate: ScopeCandidate, channels: BillingChannel[]): A
       "re-run scope --preview and confirm again",
     );
   }
-  return { adapter: c.adapter, model: c.model, channel: c.channel, tier: c.tier };
+  return { adapter: c.adapter, model: c.model, channel: c.channel, tier: c.tier, ...(c.effort ? { effort: c.effort } : {}) };
 }
 
 // Adapter-level probes establish the current installation/auth state, but shipped adapters do not
@@ -237,7 +237,7 @@ export async function scopeIntent(intentFile: string, repoRoot: string, options:
       driver, name: `scope-${name}-${attempts}-${adapter.id}`, label: "SCOPE",
       keep: options.cfg.visibility.keepPanes === "forever",
     } : undefined;
-    const draft = extractDraft(await runLlm(adapter, assignment.model, prompt, repoRoot, via));
+    const draft = extractDraft(await runLlm(adapter, assignment.model, prompt, repoRoot, via, undefined, assignment.effort));
     let tasks: number;
     try {
       tasks = validateDraft(draft);

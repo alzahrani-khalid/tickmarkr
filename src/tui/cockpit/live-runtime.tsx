@@ -1,4 +1,4 @@
-import { existsSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { renderMarkdownRecord } from "../../cli/commands/report.js";
 import { loadConfig } from "../../config/config.js";
@@ -19,10 +19,10 @@ import { createPointerReportReader, POINTER_TRACKING_ON, POINTER_TRACKING_OFF, t
 import { deriveRunDecisions, previewDecision, executeDecision, withDecisionPreview, withDecisionReceipt, decisionConfirmLines } from "./decision-actions.js";
 import { approvalRunOwner } from "../../cli/commands/approve.js";
 import { GLYPHS } from "../../brand.js";
-import { Journal } from "../../run/journal.js";
+import { effectiveEvents, Journal, parseJournalText, physicalLine } from "../../run/journal.js";
 import { observeNamedRun, WATCH_OWNER_ENV } from "../../run/supervision.js";
 import { formatOwnedName, type FocusTarget, type FocusResult } from "../../drivers/types.js";
-import type { EvidenceIdentity } from "../../run/operator-state.js";
+import { readOperatorState, type EvidenceIdentity } from "../../run/operator-state.js";
 import { cellWidth, wrapCells } from "./width.js";
 import { resolveShellColourMode } from "./theme.js";
 
@@ -83,6 +83,47 @@ export interface ConsolidatedOptions {
   diagnostics?: readonly HomeNeedsYouTarget[];
 }
 
+/**
+ * OBS-1178: the store's incremental fold reads every task-approved row as a release. A refused or unsound
+ * decision released nothing, so whenever the rows the store has read hold one — whatever state the raw
+ * fold shows now, since a later run-end restores a park but not the gate evidence a rejected recheck
+ * cleared — the operator snapshot is refolded over the decided rows, each keeping its physical line and
+ * the store's evidence identity.
+ * ponytail: a whole-journal read per observed journal change (parsed only when it holds an approval);
+ * move the decision fold into OperatorStateFold if that ever measures slow.
+ */
+export function decidedLiveStore(store: LiveStore): LiveStore {
+  let key: string | undefined;
+  let operator: LiveStoreSnapshot["operator"] | undefined;
+  const decided = (snap: LiveStoreSnapshot): LiveStoreSnapshot => {
+    const { journal, graph } = snap;
+    const observed = `${journal.source}:${journal.generation}:${journal.offset}:${graph.identity}:${graph.status}`;
+    if (observed !== key) {
+      key = observed;
+      operator = undefined;
+      let bytes: Buffer;
+      try { bytes = readFileSync(journal.source).subarray(0, journal.offset); } catch { return snap; }
+      if (bytes.includes("task-approved")) {
+        const rows = parseJournalText(bytes.subarray(0, bytes.lastIndexOf(10) + 1).toString("utf8"))
+          .filter(e => e !== null && typeof e === "object" && typeof e.event === "string" && typeof e.data === "object" && e.data !== null);
+        const kept = effectiveEvents(rows);
+        if (kept.length !== rows.length) {
+          const events = kept.map((event, i) => {
+            const line = physicalLine(kept, i);
+            return { source: journal.source, line, id: `${journal.source}#L${line}`, generation: journal.generation, event };
+          });
+          operator = readOperatorState({ events, graph: graph.status === "readable" ? graph.value : undefined,
+            readable: journal.status === "readable" && journal.backlogBytes === 0 });
+        }
+      }
+    }
+    if (!operator) return snap;
+    const { sequence, observedAt, graphAvailability } = snap.operator;
+    return { ...snap, operator: { ...operator, sequence, observedAt, graphAvailability } };
+  };
+  return { ...store, snapshot: () => decided(store.snapshot()), refresh: () => decided(store.refresh()) };
+}
+
 /** Preserve a policy-disabled gate from C2 even when C5's generic event
  * mapper calls an unpassed result unknown. Lead with the gate name so a long
  * task identity cannot clip the label that explains the disabled glyph. */
@@ -119,7 +160,7 @@ export async function runConsolidatedCockpit(options: ConsolidatedOptions): Prom
     input.on("error", ioError); output.on("error", ioError);
     if (output.isTTY) { entered = true; output.write(SHELL_TERMINAL_ENTER); }
     store = createLiveStore({ cwd, runId, now: options.now });
-    const source = store;
+    const source = decidedLiveStore(store);
     if (options.observeRun !== false) observation = observeNamedRun(cwd, runId, options.environment);
     // BD-1 (RULING-231-19 §2): the daemon-placed board carries the watch owner token and mounts
     // rail-less — a zero shortcut budget the plan honours at every width. The manual cockpit keeps its rail.

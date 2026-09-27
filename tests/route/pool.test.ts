@@ -87,13 +87,41 @@ describe("pool vs floors — lint, never block", () => {
   });
 });
 
-describe("pool vs allow/deny — preflight when prefActive", () => {
-  test("a disallowed pool entry throws with the drop-it remedy", () => {
+describe("pool vs allow/deny — the admitted remainder routes (OBS-1144)", () => {
+  const SKIPPED = "skipped codex:gpt-5.5 (disallowed by routing.deny (codex))";
+
+  test("any mode skips a disallowed entry, routes the rest and names the skip", () => {
     const cfg = poolCfg("any", ["codex:gpt-5.5", "opencode:zai/glm-5.2"]);
     cfg.routing.deny = { adapters: ["codex"] };
-    expect(() => route(mkTask(), cfg, CH)).toThrow(
-      "T1: pool entry codex:gpt-5.5 is disallowed by routing.deny (codex) — remove the deny entry or drop it from the pool",
-    );
+    const r = route(mkTask(), cfg, CH);
+    expect(r.assignment).toMatchObject({ adapter: "opencode", model: "zai/glm-5.2" });
+    expect(r.provenance).toBe(`pool any opencode:zai/glm-5.2 (config routing.map; ${SKIPPED})`);
+  });
+
+  test("ordered mode skips a disallowed head and keeps declaration order for the rest", () => {
+    // any would rank the cheap sub first; ordered must keep fable, the first ADMITTED declaration
+    const cfg = poolCfg("ordered", ["codex:gpt-5.5", "claude-code:fable", "opencode:zai/glm-5.2"]);
+    cfg.routing.deny = { adapters: ["codex"] };
+    const r = route(mkTask(), cfg, CH);
+    expect(r.assignment).toMatchObject({ adapter: "claude-code", model: "fable" });
+    expect(r.provenance).toBe(`pool ordered claude-code:fable (config routing.map; ${SKIPPED})`);
+  });
+
+  test("a pool with no admitted entry refuses as exhausted in either mode, naming every denied entry", () => {
+    for (const mode of ["any", "ordered"] as const) {
+      const cfg = poolCfg(mode, ["codex:gpt-5.5", "codex:gpt-5.6-terra"]);
+      cfg.routing.deny = { adapters: ["codex"] };
+      expect(() => route(mkTask(), cfg, CH)).toThrow(
+        "T1: routing.map.implement.pool is exhausted — no admitted entry remains: codex:gpt-5.5 (disallowed by routing.deny (codex)), codex:gpt-5.6-terra (disallowed by routing.deny (codex))",
+      );
+    }
+  });
+
+  test("a map pin on a disallowed channel stays fail-loud", () => {
+    const cfg = structuredClone(DEFAULT_CONFIG);
+    cfg.routing.map.implement = { pin: { via: "codex", model: "gpt-5.5" } };
+    cfg.routing.deny = { adapters: ["codex"] };
+    expect(() => route(mkTask(), cfg, CH)).toThrow("map pin (config routing.map) codex:gpt-5.5 is disallowed by routing.deny (codex)");
   });
 });
 

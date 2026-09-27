@@ -4,6 +4,7 @@ import { shq } from "../adapters/types.js";
 import type { TickmarkrConfig } from "../config/config.js";
 import {
   type Baseline,
+  type BaselineProvenance,
   beginGateEvidence,
   type GateEvidenceOptions,
   ceilingKillResult,
@@ -56,6 +57,8 @@ export interface TipVerifyResult {
   spawnedCommand?: string;
   /** Q121s: nonzero exit whose failures are ALL baseline-recorded — forgiven exactly as the battery forgives. */
   forgiven?: boolean;
+  /** OBS-1123: the capture that recorded the forgiven fingerprints; absent for a legacy baseline that never said. */
+  baselineProvenance?: BaselineProvenance;
   /** D-131: carried from a persisted per-gate verdict — this cycle did NOT execute the command. */
   reused?: true;
   /**
@@ -287,6 +290,7 @@ export async function verifyIntegrationTip(
         exitCode: hit.exitCode ?? 0,
         fingerprints: (hit.meta?.fingerprints as string[] | undefined) ?? [],
         ...(hit.meta?.forgiven ? { forgiven: true } : {}),
+        ...(hit.meta?.forgiven && hit.meta.baselineProvenance ? { baselineProvenance: hit.meta.baselineProvenance as BaselineProvenance } : {}),
         details: formatReusedDetails(hit.details, id),
         ...(hit.meta?.reportPath ? { reportPath: hit.meta.reportPath as string } : {}),
         ...(hit.meta?.spawnedCommand ? { spawnedCommand: hit.meta.spawnedCommand as string } : {}),
@@ -439,7 +443,7 @@ export async function verifyIntegrationTip(
             + `${describeCapacity(entry?.capacity)} and this verification ran under ${describeCapacity(r.capacity)} `
             + `— forgiveness across a changed capacity is not evidence`
           : `exit ${r.code}`)),
-      ...(forgiven && !deficit ? { forgiven: true } : {}),
+      ...(forgiven && !deficit ? { forgiven: true, ...(baseline?.provenance ? { baselineProvenance: baseline.provenance } : {}) } : {}),
       ...(cause ? { cause } : {}),
       ...(pass ? {} : { artifact }),
     };
@@ -457,7 +461,7 @@ export async function verifyIntegrationTip(
     const id = pending.get(result.gate);
     if (id && id.tree === completedTree && !isInfraResult(result)) {
       store.set(id, { ...result, meta: {
-        fingerprints: result.fingerprints, forgiven: result.forgiven,
+        fingerprints: result.fingerprints, forgiven: result.forgiven, baselineProvenance: result.baselineProvenance,
         reportPath: result.reportPath, spawnedCommand: result.spawnedCommand,
         artifact: result.artifact,
         evidenceReceipt: result.evidenceReceipt, evidenceReceipts: result.evidenceReceipts,

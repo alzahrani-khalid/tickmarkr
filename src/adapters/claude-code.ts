@@ -3,7 +3,7 @@ import { readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { TickmarkrConfig } from "../config/config.js";
-import type { Task } from "../graph/schema.js";
+import type { Effort, Task } from "../graph/schema.js";
 import { parseWorkerResult } from "./prompt.js";
 import { type Assignment, type AuthHealth, type BillingChannel, channelsFromConfig, type ContextUsage, declareInputBox, type Invocation, MODEL_ID_RE, promptFitsArgv, type SessionRef, shq, type TokenUsage, TokenUsageSchema, type TrustDialog, type WorkerAdapter } from "./types.js";
 
@@ -218,6 +218,10 @@ export function probeVersion(bin: string): AuthHealth {
   };
 }
 
+// OBS-1182: an absent effort renders nothing, so the CLI keeps its own default. Every builder places
+// it right after --model's value and before another flag, never before the prompt positional.
+const claudeEffortFlag = (effort?: Effort): string => (effort ? ` --effort ${shq(effort)}` : "");
+
 export const claudeCode: WorkerAdapter = {
   id: "claude-code",
   vendor: "anthropic",
@@ -226,7 +230,7 @@ export const claudeCode: WorkerAdapter = {
   channels: (cfg: TickmarkrConfig): BillingChannel[] => channelsFromConfig("claude-code", cfg),
   // v1.65 T3: every flag the command builders below hardcode — doctor checks `claude --help` still
   // lists each (all present on claude 2.x, verified 2026-07-22). Advisory only, never routing.
-  hardcodedFlags: { binary: "claude", flags: ["-p", "--model", "--permission-mode", "--strict-mcp-config", "--mcp-config", "--output-format", "-r", "--prompt-suggestions", "--settings"] },
+  hardcodedFlags: { binary: "claude", flags: ["-p", "--model", "--permission-mode", "--strict-mcp-config", "--mcp-config", "--output-format", "-r", "--prompt-suggestions", "--settings", "--effort"] },
   // --strict-mcp-config --mcp-config '{"mcpServers":{}}': pin the MCP surface to empty so fresh-worktree
   // workers/gates don't load project .mcp.json servers (herdr scrapes dialogs as idle — v1.4 incident,
   // memory tickmarkr-worker-mcp-dialog-stall). Live-verified 2026-07-10 on claude 2.1.205 (operator check):
@@ -238,8 +242,8 @@ export const claudeCode: WorkerAdapter = {
   // flag must always follow the value, never the prompt.
   // The empty -p argument selects print mode while stdin carries the prompt, keeping its nonce out
   // of process argv. The redirect path is shell-quoted independently from the model.
-  headlessCommand: (promptFile: string, model: string) =>
-    `claude -p '' --model ${shq(model)} --permission-mode bypassPermissions --strict-mcp-config --mcp-config '{"mcpServers":{}}' --output-format text < ${shq(promptFile)}`,
+  headlessCommand: (promptFile: string, model: string, effort?: Effort) =>
+    `claude -p '' --model ${shq(model)}${claudeEffortFlag(effort)} --permission-mode bypassPermissions --strict-mcp-config --mcp-config '{"mcpServers":{}}' --output-format text < ${shq(promptFile)}`,
   // HYG-03 / OBS-137: the residual first-entry dialog is workspace trust, not MCP config loading.
   // Claude's only store is global last-writer-wins ~/.claude.json, so tickmarkr still does not seed it;
   // the daemon safely answers only the exact adapter-declared dialog once per slot.
@@ -259,18 +263,18 @@ export const claudeCode: WorkerAdapter = {
   // OBS-931: the same ONE-argv-string hazard as codex (OBS-930) — over promptArgvCeiling() the TUI
   // launch would E2BIG on Linux, so it returns null → worker-mode-fallback → the headless form.
   // resumeCommand keeps the shape: its contract returns a string (composer delivery is 2.4.3 work).
-  interactiveCommand: (promptFile: string, model: string) =>
+  interactiveCommand: (promptFile: string, model: string, effort?: Effort) =>
     promptFitsArgv(promptFile)
-      ? `claude --model ${shq(model)} --strict-mcp-config --mcp-config '{"mcpServers":{}}' --settings '{"promptSuggestionEnabled":false}' --prompt-suggestions false --permission-mode bypassPermissions "$(cat ${shq(promptFile)})"`
+      ? `claude --model ${shq(model)}${claudeEffortFlag(effort)} --strict-mcp-config --mcp-config '{"mcpServers":{}}' --settings '{"promptSuggestionEnabled":false}' --prompt-suggestions false --permission-mode bypassPermissions "$(cat ${shq(promptFile)})"`
       : null,
   trustDialog: CLAUDE_TRUST_DIALOG,
   inputBox: CLAUDE_INPUT_BOX,
   // A resumed attempt lands in the same painted editor, so it carries the same ghost-text suppression
   // and the same value-then-flag placement.
-  resumeCommand: (sessionId: string, promptFile: string, model: string) =>
-    `claude -r ${shq(sessionId)} --model ${shq(model)} --strict-mcp-config --mcp-config '{"mcpServers":{}}' --settings '{"promptSuggestionEnabled":false}' --prompt-suggestions false --permission-mode bypassPermissions "$(cat ${shq(promptFile)})"`,
+  resumeCommand: (sessionId: string, promptFile: string, model: string, effort?: Effort) =>
+    `claude -r ${shq(sessionId)} --model ${shq(model)}${claudeEffortFlag(effort)} --strict-mcp-config --mcp-config '{"mcpServers":{}}' --settings '{"promptSuggestionEnabled":false}' --prompt-suggestions false --permission-mode bypassPermissions "$(cat ${shq(promptFile)})"`,
   invoke(task: Task, _cwd: string, a: Assignment, ctx: { promptFile: string }): Invocation {
-    return { command: this.headlessCommand(ctx.promptFile, a.model) };
+    return { command: this.headlessCommand(ctx.promptFile, a.model, a.effort) };
   },
   parse: parseWorkerResult,
   collectUsage(cwd: string, sinceMs: number): TokenUsage | undefined {

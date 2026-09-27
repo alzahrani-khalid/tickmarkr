@@ -188,7 +188,7 @@ describe("VIS-07 status --watch purity (D-02)", () => {
     expect(replay).toBe(first);
     expect(JSON.parse(first)).toMatchObject({
       type: "human-decision-required",
-      approvalCommand: "tickmarkr approve run-purity T1",
+      approvalCommand: expect.stringMatching(/^tickmarkr approve run-purity T1 --park \d+@2026-07-11T08:00:01\.000Z$/u),
     });
     expect(readFileSync(journal, "utf8")).toBe(bytesBefore);
     expect(snapshot(repo)).toEqual(before);

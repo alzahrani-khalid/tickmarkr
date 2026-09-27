@@ -5,7 +5,7 @@ import { shq } from "../adapters/types.js";
 import { createWorktree, FORK_CAP_ENV, resolvedForkCap, sh, type ShResult } from "../run/git.js";
 import { Journal, type JournalEvent, parseRunId } from "../run/journal.js";
 import { stateDirName } from "../graph/graph.js";
-import { readWatchBoard, requestWatchBoardStop, stopWatchBoard, WATCH_OWNER_ENV, type WatchBoardOwner } from "../run/supervision.js";
+import { readWatchBoard, requestWatchBoardStop, stopWatchBoard, supervisionPresencePath, WATCH_OWNER_ENV, type WatchBoardOwner } from "../run/supervision.js";
 import { MAX_BUF } from "./subprocess.js";
 import { formatOwnedName, panesToClose, parseOwnedName, type ExecutorDriver, type FocusTarget, type FocusResult, type NotifyOpts, type Slot, type SlotOpts } from "./types.js";
 
@@ -318,11 +318,13 @@ export function mapAgentState(term: Record<string, unknown>, tuiIdle: boolean): 
  * A retired record is replaced by a new reservation (CAS on the tombstone bytes) only once its pane
  * is proven gone. Everything else — a reservation or claim with no bound pane, a failed cleanup, a
  * record another driver holds with a live observer — refuses and keeps the record exactly as it is.
+ * One reservation or claim is HELD rather than in flight: its placer is this process after an
+ * indeterminate split receipt (OBS-1172). It is reconciled again on every call, never split over.
  */
 /** `placer` is the pid of the narrator that wrote the reservation: a reserved or claimed record is a
  *  normal intermediate state while that pid lives (another driver awaiting listing or bind) and a
  *  crash to recover only once it is dead. */
-type BoardRecord = WatchBoardOwner & { retired?: true; runtimeId?: string; placer?: number };
+type BoardRecord = WatchBoardOwner & { runtimeId?: string; placer?: number };
 type BoardState = "reserved" | "claimed" | "bound" | "retired";
 
 function boardState(r: BoardRecord): BoardState {
@@ -474,6 +476,30 @@ function lockEntryGeneration(entry: string): number | undefined {
   const owner = /^owner\.(\d+)$/.exec(entry);
   const legacy = /^pid(?:\.(\d+))?$/.exec(entry);
   return owner ? Number(owner[1]) : legacy ? Number(legacy[1] ?? 0) : undefined;
+}
+
+/** The placing claim window: how long a narrator waits for its observer to claim the reservation. */
+const CLAIM_WINDOW_MS = 5000;
+
+/** Reservation tokens THIS process held after an indeterminate split receipt (OBS-1172). Any other
+ *  reserved or claimed record under a live placer is a placement in flight (or a crash still being
+ *  judged) and is refused untouched; a held one is reconciled again on every call, never split over. */
+const held = new Set<string>();
+
+/** A claimed board's observer is live when its pid answers AND the arm it claimed with is present. */
+function observerLive(r: BoardRecord): boolean {
+  return typeof r.pid === "number" && pidLive(r.pid) && typeof r.armId === "string"
+    && existsSync(supervisionPresencePath(r.repo, "watch", r.armId));
+}
+
+/** Tombstone THIS reservation while it is still the untouched reservation; a record anyone else moved
+ *  is left to them. Answers the tombstone, or undefined when the record was not this reservation. */
+async function tombstoneReservation(path: string, cwd: string, runId: string, token: string, time: OrcaTimeSource,
+  extra: Partial<BoardRecord> = {}): Promise<{ raw: string; record: BoardRecord } | undefined> {
+  const now = readBoard(path, cwd, runId);
+  if (now?.record.token !== token || boardState(now.record) !== "reserved") return undefined;
+  const record: BoardRecord = { ...now.record, ...extra, retired: true };
+  return { raw: await casBoard("split", path, now.raw, record, time), record };
 }
 
 function pidLive(pid: number): boolean {
@@ -784,6 +810,26 @@ export class OrcaDriver implements ExecutorDriver {
     return { id, name: title, cwd: worktree, group: opts?.group };
   }
 
+  /**
+   * OBS-1109: bind THIS instance to a terminal an earlier daemon created for an OWNED slot, so a
+   * resumed daemon can read the interrupted attempt's pane. Binding needs ownership evidence, never
+   * a title or handle alone: exactly one tab on the tracked worktree carries the FULL journaled owned
+   * title, it resolves to exactly one terminal, and that terminal's scrollback proves the exact task
+   * checkout `slot.cwd` (the frame only tickmarkr's own create command prints). Zero, ambiguous or
+   * foreign candidates leave the slot unbound: the throw is the caller's decline. The journaled
+   * nonce is then checked by the caller against the trailer this binding reads.
+   */
+  async adopt(slot: Slot): Promise<Slot> {
+    if (!parseOwnedName(slot.name)) throw new OrcaError("list", `slot ${slot.name} carries no owned title — nothing to adopt`, "");
+    const cwd = canonicalWorktreePath(slot.cwd);
+    const st: OrcaSlotState = { title: slot.name, cwd, buf: "", recoveries: 0, recovering: false };
+    st.tracked = await this.trackedWorktree(cwd);
+    await this.recover("adopt", st, undefined, "", { proveCheckout: true });
+    const id = `orca-${++this.n}`;
+    this.slots.set(id, st);
+    return { id, name: slot.name, cwd, ...(slot.group === undefined ? {} : { group: slot.group }) };
+  }
+
   /** Where to invoke the CLI for this slot's calls (see OrcaSlotState.dir). */
   private cliCwd(st: OrcaSlotState): string {
     return st.dir ?? st.cwd;
@@ -1067,7 +1113,7 @@ export class OrcaDriver implements ExecutorDriver {
     }
   }
 
-  private async recover(family: string, st: OrcaSlotState, newRuntimeId: string | undefined, raw: string): Promise<void> {
+  private async recover(family: string, st: OrcaSlotState, newRuntimeId: string | undefined, raw: string, opts?: { proveCheckout?: boolean }): Promise<void> {
     if (st.recovering) throw this.latched(family, st, "handle recovery re-entered", raw);
     st.recovering = true;
     try {
@@ -1117,17 +1163,19 @@ export class OrcaDriver implements ExecutorDriver {
         throw this.latched(family, st, `the owned tab resolves to ${panes.length} terminals in ${home}`, env.raw);
       }
       const handle = panes[0];
-      if (handle === old) {
-        // Handles are runtime-scoped: the same VALUE under a different runtime proves nothing about
-        // which terminal it addresses, so it is never adopted.
-        throw this.latched(family, st, `replacement handle ${handle} is the old handle value reused by runtime ${newRuntimeId ?? env.runtimeId ?? "unknown"}`, env.raw);
-      }
-      if (st.tracked !== undefined && st.tracked !== st.cwd) {
+      // Handles are runtime-scoped: the same VALUE under a different runtime proves nothing about
+      // which terminal it addresses. OBS-1108: it is therefore reconciled exactly like any other
+      // replacement plus the checkout proof — never on the handle text (a 2.5.8 latch refused a live,
+      // finished worker for hours) and never adopted without that ownership evidence.
+      const reused = handle === old;
+      if (reused || opts?.proveCheckout || (st.tracked !== undefined && st.tracked !== st.cwd)) {
         // FX-N01: a nested checkout shares its worktreePath with every sibling task's terminal, so
         // the candidate must prove the checkout itself (read-only) before it is addressed as ours.
         const proof = await this.checkoutProven(handle, st.cwd, this.cliCwd(st), env.runtimeId);
         if (!proof.proven) {
-          throw this.latched(family, st, `candidate ${handle} does not prove checkout ${st.cwd} (${proof.reason}); the sole same-titled tab on ${home} is not adopted`, env.raw);
+          throw this.latched(family, st, reused
+            ? `replacement handle ${handle} is the old handle value reused by runtime ${newRuntimeId ?? env.runtimeId ?? "unknown"} and does not prove checkout ${st.cwd} (${proof.reason}); a reused handle value is not adopted on its text`
+            : `candidate ${handle} does not prove checkout ${st.cwd} (${proof.reason}); the sole same-titled tab on ${home} is not adopted`, env.raw);
         }
       }
       st.handle = handle;
@@ -1549,13 +1597,27 @@ export class OrcaDriver implements ExecutorDriver {
           throw new OrcaError("split", `Orca narrator placement refused for ${name}: the record is held by driver ${driver} with a live or unclaimed observer; ${kept}`, "");
         }
       } else if (current) {
-        const state = boardState(current.record);
+        let state = boardState(current.record);
+        const { placer, token: heldToken } = current.record;
+        if ((state === "reserved" || state === "claimed") && placer === process.pid && held.has(heldToken)) {
+          // OBS-1172: THIS process held the placement after an indeterminate split receipt. Reconciled
+          // again, never split over: adopted once proven, still held while unknown, and tombstoned
+          // only once proven to have started nothing.
+          const settled = await this.settleIndeterminate(cwd, path, runId, heldToken, launchingHandle, 0);
+          if (settled.kind === "held") {
+            throw new OrcaError("split", `Orca narrator placement remains unresolved for ${name} (${state}, held after an indeterminate split receipt): ${settled.why}; no second board is split over it; ${kept}`, "");
+          }
+          held.delete(heldToken);
+          if (settled.kind === "adopted") return settled.slot;
+          current = await tombstoneReservation(path, cwd, runId, heldToken, this.time);
+          if (!current) throw new OrcaError("split", `Orca narrator placement remains unresolved for ${name}: the held reservation changed underneath; ${kept}`, "");
+          state = boardState(current.record);
+        }
         if (state === "reserved" || state === "claimed") {
           // A reservation or claim with no bound pane is the placing narrator's normal intermediate
           // state while that narrator lives (awaiting its receipt, listing, claim or bind): refused
           // untouched, its observer never asked to stop. Only a DEAD placer (or one unrecorded) makes
           // it a crash to recover.
-          const { placer } = current.record;
           if (typeof placer !== "number" || pidLive(placer)) {
             throw new OrcaError("split", `Orca narrator placement remains unresolved for ${name} (${state}, no bound pane) while placing narrator ${placer ?? "unrecorded"} lives; ${kept}`, "");
           }
@@ -1564,13 +1626,10 @@ export class OrcaDriver implements ExecutorDriver {
           // The placing driver crashed between the observer's claim and its bind. The record is
           // replaced only once that observer is proven gone: dead outright, or live and stopped with
           // its acknowledgement awaited on injected time — unacknowledged, it is refused untouched.
-          const pid = current.record.pid as number;
-          if (pidLive(pid)) {
-            try {
-              await stopWatchBoard(current.record, this.time);
-            } catch (error) {
-              throw new OrcaError("split", `Orca narrator placement refused for ${name}: claimed board's live observer unacknowledged; ${kept}; ${errorText(error)}`, "");
-            }
+          try {
+            await this.stopObserver(current.record);
+          } catch (error) {
+            throw new OrcaError("split", `Orca narrator placement refused for ${name}: claimed board's live observer unacknowledged; ${kept}; ${errorText(error)}`, "");
           }
           const retired: BoardRecord = { ...current.record, retired: true };
           current = { raw: await casBoard("split", path, current.raw, retired, this.time), record: retired };
@@ -1584,10 +1643,13 @@ export class OrcaDriver implements ExecutorDriver {
         if (state === "bound") {
           // The bound record is the durable truth of placement: the child handle PLUS the split
           // envelope's runtime identity. A handle listed by a later runtime is a different pane.
-          if (listedOnRuntime(await this.listAll(cwd), current.record.pane, current.record.runtimeId)) {
+          // OBS-1131: it is adopted only while its observer lives — a resumed daemon retires the
+          // board of a dead observer here (tombstone, stop request, handle-bound close) instead of
+          // answering it and later spending a reopen to discover the death.
+          if (observerLive(current.record) && listedOnRuntime(await this.listAll(cwd), current.record.pane, current.record.runtimeId)) {
             return watchSlot(cwd, name, current.record.pane);
           }
-          // Lost: this runtime no longer has that pane. Tombstone before anything else.
+          // Lost or dead: tombstone before anything else.
           const retired: BoardRecord = { ...current.record, retired: true };
           current = { raw: await casBoard("split", path, current.raw, retired, this.time), record: retired };
         }
@@ -1595,11 +1657,7 @@ export class OrcaDriver implements ExecutorDriver {
         // observer must stop and ack on injected time before the handle-bound close; timeout keeps
         // the tombstone and does not replace it.
         try {
-          if (typeof current.record.pid === "number" && pidLive(current.record.pid)) {
-            await stopWatchBoard(current.record, this.time);
-          } else {
-            requestWatchBoardStop(current.record);
-          }
+          await this.stopObserver(current.record);
         } catch (error) {
           throw new OrcaError("split", `Orca narrator placement refused for ${name}: retired board observer unacknowledged; ${kept}; ${errorText(error)}`, "");
         }
@@ -1614,36 +1672,41 @@ export class OrcaDriver implements ExecutorDriver {
       // judged replaceable above.
       const token = randomUUID();
       await casBoard("split", path, current?.raw, { repo: realpathSync(cwd), runId, driver: this.id, workspace: ORCA_SPACE, pane: "", name, token, placer: process.pid }, this.time);
-      // A reservation that can never be bound — no usable receipt, or no claim — is tombstoned so the
-      // next narrator call splits afresh instead of refusing forever. Only THIS reservation, and only
-      // while it is still the untouched reservation; a record anyone else moved is left to them.
-      const tombstone = async (extra: Partial<BoardRecord> = {}): Promise<void> => {
-        try {
-          const now = readBoard(path, cwd, runId);
-          if (now?.record.token === token && boardState(now.record) === "reserved") {
-            await casBoard("split", path, now.raw, { ...now.record, ...extra, retired: true }, this.time);
-          }
-        } catch { /* the record is kept as it stands; the next narrator judges it */ }
+      // OBS-1172: a split whose receipt never arrived intact — a transport failure or timeout, an
+      // unparseable or handle-less body, a child the listing does not place in the launching tab —
+      // may still have started the board. It is reconciled before any failure: a uniquely proven
+      // live pane is adopted and bound; a split proven to have started nothing is tombstoned so the
+      // next call splits afresh; anything else is HELD — the reservation stays, and no later call
+      // splits a second board over it.
+      const indeterminate = async (reason: string, raw: string): Promise<Slot> => {
+        const settled = await this.settleIndeterminate(cwd, path, runId, token, launchingHandle, CLAIM_WINDOW_MS);
+        if (settled.kind === "adopted") return settled.slot;
+        if (settled.kind === "absent") {
+          await tombstoneReservation(path, cwd, runId, token, this.time).catch(() => undefined);
+          throw new OrcaError("split", `Orca narrator placement failed for ${name}: ${reason}; ${kept}`, raw);
+        }
+        held.add(token);
+        throw new OrcaError("split", `Orca narrator placement unresolved for ${name}: ${reason}; ${settled.why} — the placement is held and no second board is split over it; ${kept}`, raw);
       };
 
       // Exactly one terminal split of the launching handle, horizontal, carrying token and command.
-      // An unknown receipt (transport failure, refusal, unparseable output) after the verb was issued
-      // is as indeterminate as a handle-less one: the pane may exist, so the reservation stays.
-      const env = await this.call("split", [
-        "terminal", "split",
-        "--terminal", launchingHandle,
-        "--direction", "horizontal",
-        "--command", `${WATCH_OWNER_ENV}=${shq(token)} ${command}`,
-      ], cwd).catch(async (error: unknown) => {
-        await tombstone();
-        throw new OrcaError("split", `Orca narrator placement failed for ${name}: split receipt is unknown (${error instanceof OrcaError ? error.reason : errorText(error)}); ${kept}`, error instanceof OrcaError ? error.raw : "");
-      });
+      let env: OrcaEnvelope;
+      try {
+        env = await this.call("split", [
+          "terminal", "split",
+          "--terminal", launchingHandle,
+          "--direction", "horizontal",
+          "--command", `${WATCH_OWNER_ENV}=${shq(token)} ${command}`,
+        ], cwd);
+      } catch (error) {
+        return await indeterminate(`split receipt is unknown (${error instanceof OrcaError ? error.reason : errorText(error)})`, error instanceof OrcaError ? error.raw : "");
+      }
+      const malformed = "split receipt is unknown, malformed or handle-less";
       let child: { handle: string; tabId: string };
       try {
         child = splitReceipt(env);
       } catch {
-        await tombstone();
-        throw new OrcaError("split", `Orca narrator placement failed for ${name}: split receipt is unknown, malformed or handle-less; ${kept}`, env.raw);
+        return await indeterminate(malformed, env.raw);
       }
       // Parent tabId must name the launching terminal's tab, and the child must actually appear
       // there. A handle-only object, a tabId for some other tab, or a handle the list does not
@@ -1652,8 +1715,7 @@ export class OrcaDriver implements ExecutorDriver {
       try {
         listing = await this.listAll(cwd);
       } catch (error) {
-        await tombstone();
-        throw new OrcaError("split", `Orca narrator placement failed for ${name}: split receipt is unknown, malformed or handle-less; ${kept}`, error instanceof OrcaError ? error.raw : env.raw);
+        return await indeterminate(malformed, error instanceof OrcaError ? error.raw : env.raw);
       }
       const launchingTabId = terminalTabId(listing, launchingHandle);
       if (
@@ -1662,14 +1724,13 @@ export class OrcaDriver implements ExecutorDriver {
         || child.handle === launchingHandle
         || terminalTabId(listing, child.handle) !== launchingTabId
       ) {
-        await tombstone();
-        throw new OrcaError("split", `Orca narrator placement failed for ${name}: split receipt is unknown, malformed or handle-less; ${kept}`, env.raw);
+        return await indeterminate(malformed, env.raw);
       }
       const childHandle = child.handle;
 
       // The narrator writes nothing until the observer's single claim is visible, so neither write
       // can erase the other; after it the observer never writes the record again.
-      const claimDeadline = this.time.now() + 5000;
+      const claimDeadline = this.time.now() + CLAIM_WINDOW_MS;
       let claim: { raw: string; record: BoardRecord } | undefined;
       for (;;) {
         const check = readBoard(path, cwd, runId);
@@ -1684,7 +1745,7 @@ export class OrcaDriver implements ExecutorDriver {
       if (!claim) {
         // The receipt's handle may be closed; the reservation is tombstoned naming that pane so the
         // next narrator can prove it gone (or close it) and split afresh.
-        await tombstone({ pane: childHandle, runtimeId: env.runtimeId });
+        await tombstoneReservation(path, cwd, runId, token, this.time, { pane: childHandle, runtimeId: env.runtimeId }).catch(() => undefined);
         let pane: string;
         try {
           await this.closeRecordedPane(cwd, name, childHandle, env.runtimeId);
@@ -1698,6 +1759,53 @@ export class OrcaDriver implements ExecutorDriver {
       await casBoard("split", path, claim.raw, { ...claim.record, pane: childHandle, runtimeId: env.runtimeId }, this.time);
       return watchSlot(cwd, name, childHandle);
     });
+  }
+
+  /** OBS-1172: what an indeterminate split left behind, reconciled from the owner record and Orca's
+   *  terminal table — never from the receipt that did not arrive. The reservation's token reaches no
+   *  process but the split's own command, so a claim proves that split started a board; the owned
+   *  record (this driver, the watch title) is ours by that same token. The claimant must be live (pid
+   *  and arm presence), and it must name the terminal it runs in — a listed pane in the launching tab.
+   *  A claim that names none proves a board started, not WHICH pane hosts it: a sole neighbouring pane
+   *  (row titles are shell-controlled, never ownership keys) is not adopted, so the claim stays held.
+   *  No claim and no such pane: the split started nothing the table shows. Anything else is held. */
+  private async settleIndeterminate(cwd: string, path: string, runId: string, token: string, launchingHandle: string, waitMs: number):
+    Promise<{ kind: "adopted"; slot: Slot } | { kind: "absent" } | { kind: "held"; why: string }> {
+    const deadline = this.time.now() + waitMs;
+    let claim: { raw: string; record: BoardRecord } | undefined;
+    for (;;) {
+      let check: { raw: string; record: BoardRecord } | undefined;
+      try { check = readBoard(path, cwd, runId); }
+      catch (error) { return { kind: "held", why: `the owner record is unreadable (${errorText(error)})` }; }
+      if (check?.record.token !== token || check.record.retired) return { kind: "held", why: "the owner record changed underneath" };
+      if (boardState(check.record) === "claimed") { claim = check; break; }
+      if (this.time.now() >= deadline) break;
+      await this.time.sleep(20);
+    }
+    let listing: OrcaEnvelope;
+    try { listing = await this.listAll(cwd); }
+    catch (error) { return { kind: "held", why: `the terminal table is unreadable (${errorText(error)})` }; }
+    const tab = terminalTabId(listing, launchingHandle);
+    if (!tab) return { kind: "held", why: `the launching terminal ${launchingHandle} is not listed` };
+    const named = claim?.record.handle;
+    const panes = terminalRows(listing).map((row) => str(row.handle)).filter((h): h is string =>
+      h !== undefined && h !== launchingHandle && terminalTabId(listing, h) === tab && (named === undefined || h === named));
+    if (!claim) {
+      return panes.length === 0 ? { kind: "absent" }
+        : { kind: "held", why: `no observer claimed the reservation and ${panes.length} pane(s) of unknown ownership share the launching tab` };
+    }
+    if (!observerLive(claim.record)) return { kind: "held", why: `the observer that claimed it (pid ${claim.record.pid}) is not live` };
+    if (named === undefined) {
+      return { kind: "held", why: `the observer that claimed it (pid ${claim.record.pid}) reports no terminal handle, so no listed pane is proven to host it` };
+    }
+    if (panes.length !== 1) return { kind: "held", why: `its observer reports ${named}, which the launching tab does not list` };
+    const pane = panes[0]!;
+    try {
+      await casBoard("split", path, claim.raw, { ...claim.record, pane, runtimeId: listing.runtimeId }, this.time);
+    } catch (error) {
+      return { kind: "held", why: `the bind was refused (${errorText(error)})` };
+    }
+    return { kind: "adopted", slot: watchSlot(cwd, claim.record.name, pane) };
   }
 
   private boardPath(cwd: string, runId: string): string {
@@ -1738,10 +1846,26 @@ export class OrcaDriver implements ExecutorDriver {
   private async retireAndClose(slot: Slot): Promise<void> {
     await this.serial(async () => {
       const retired = await this.retireBoard("close", slot);
-      if (typeof retired.pid === "number" && pidLive(retired.pid)) await stopWatchBoard(retired, this.time);
-      else requestWatchBoardStop(retired);
+      await this.stopObserver(retired);
       await this.closeRecordedPane(slot.cwd, slot.name, slot.id, retired.runtimeId);
     });
+  }
+
+  /** Stop a retired board's observer before its pane is closed. A live observer acknowledges on
+   *  injected time; a dead one never can, so it is only asked. OBS-1131: an acknowledgement timeout
+   *  is not proof of death — while the pid lives the owned pane stays protected — but a pid that died
+   *  during the wait is, and its pane is closed instead of leaked. */
+  private async stopObserver(record: BoardRecord): Promise<void> {
+    const pid = record.pid;
+    if (typeof pid !== "number" || !pidLive(pid)) {
+      requestWatchBoardStop(record);
+      return;
+    }
+    try {
+      await stopWatchBoard(record, this.time);
+    } catch (error) {
+      if (pidLive(pid) || readWatchBoard(record.repo, record.runId)?.token !== record.token) throw error;
+    }
   }
 
   /** WB-1 seam: the daemon reports this board lost. "Lost" can be a stale beat or missing presence

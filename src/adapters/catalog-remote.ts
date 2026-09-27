@@ -171,49 +171,81 @@ export function readCachedCatalog(repoRoot: string, opts: { now?: () => Date } =
   }
 }
 
-type ModelsDevProvider = { providerKey: string; models: Record<string, unknown> };
-type ModelsDevMatch = ModelsDevProvider & { recordId: string; model: Record<string, unknown> };
+type ModelsDevMatch = { providerKey: string; recordId: string; model: Record<string, unknown>; matchedId: string };
 
-function providerModels(modelsDev: unknown, preferred?: string): ModelsDevProvider[] {
-  const providers = record(modelsDev);
-  if (!providers) return [];
-  const entries = Object.entries(providers);
-  const preferredEntries = preferred
-    ? entries.filter(([key, value]) => key === preferred || record(value)?.id === preferred)
-    : [];
-  // Price is provider-specific. A provider-qualified query must never borrow an identically named
-  // model from another provider, where subscription and metered costs can differ materially.
-  // D-OBS-11 follow-up: that rule presumes the hinted provider EXISTS in the catalog. A hint that
-  // matches nothing (kimi's "moonshot" vs the catalog's "moonshotai"/"kimi-for-coding"; cursor has
-  // no provider at all) used to ZERO the search space and blanket-uncover the whole adapter.
-  // Fail open to the full scan instead — advisory evidence with a visible models.dev id beats none.
-  const selected = preferred && preferredEntries.length > 0 ? preferredEntries : entries;
-  return selected.flatMap(([providerKey, provider]) => {
-    const models = record(record(provider)?.models);
-    return models ? [{ providerKey, models }] : [];
-  });
+// OBS-1148: a model maker's own models.dev provider keys, in tie-break order. Reseller rows (bothub,
+// agentrouter, greenpt …) carry another price or none, and JSON key order moved the pick on a plain
+// cache refresh. ponytail: hand-kept list; a maker missing here only loses its tie to key order.
+const FIRST_PARTY_PROVIDERS = ["anthropic", "openai", "google", "xai", "zai", "zhipuai", "alibaba", "moonshotai", "deepseek", "mistral"];
+
+// OBS-1147: effort/mode tokens CLIs append to a model id (`-high`, `-thinking`, `-max-effort`) — the
+// union of Fleet's own variant set (model-lints.ts) and LiveBench's. NEVER `preview`: a preview is
+// its own client-side identity; only a LiveBench row may carry it as residue (OBS-1149).
+const EFFORT_MODE_TOKENS = new Set(["max", "xhigh", "high", "medium", "low", "minimal", "none", "thinking", "auto", "effort", "fast"]);
+
+/** Exact canonical id: case and the `.`/`:`/`_` separators only — version digits are never touched. */
+const canonicalModelId = (id: string): string => id.trim().toLowerCase().replace(/[.:_]+/g, "-");
+
+/** `c-thinking-high` → [`c-thinking`, `c`]: longest base first, so a real `-thinking` model outranks `c`. */
+function effortBases(id: string): string[] {
+  const tokens = id.split("-");
+  const bases: string[] = [];
+  while (tokens.length > 1 && EFFORT_MODE_TOKENS.has(tokens[tokens.length - 1])) {
+    tokens.pop();
+    bases.push(tokens.join("-"));
+  }
+  return bases;
 }
 
+const codeUnitOrder = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
+
 function findModelsDevModel(catalog: CatalogCache, provider: string | undefined, modelId: string): ModelsDevMatch | undefined {
-  // CLI namespaces prefix their catalog ids (kimi-code/k3 vs catalog key k3; omp's openai/gpt-4):
-  // after exact key/id misses, retry with the bare segment after the last "/". Deterministic
-  // provider order; first hit wins — acceptable for advisory evidence, never routing.
-  const bare = modelId.includes("/") ? modelId.slice(modelId.lastIndexOf("/") + 1) : undefined;
-  for (const { providerKey, models } of providerModels(catalog.modelsDev, provider)) {
-    const direct = record(models[modelId]);
-    if (direct) return { providerKey, models, recordId: modelId, model: direct };
-    for (const [recordId, value] of Object.entries(models)) {
-      const candidate = record(value);
-      if (candidate?.id === modelId) return { providerKey, models, recordId, model: candidate };
+  const providers = Object.entries(record(catalog.modelsDev) ?? {});
+  const named = (name: string | undefined): string[] => name
+    ? providers.filter(([key, value]) => key === name || record(value)?.id === name).map(([key]) => key)
+    : [];
+  // Price is provider-specific: a provider-qualified query never borrows an identically named model
+  // from another provider, where subscription and metered costs differ materially. The CLI's own
+  // namespace (`zai-coding-plan/glm-5.2`, `google/…`) is the most explicit qualification and outranks
+  // the tier vendor hint. D-OBS-11 follow-up: a qualifier naming NO catalog provider (kimi's "moonshot"
+  // vs "moonshotai"; cursor has none) fails open to the full scan rather than blanket-uncovering the
+  // adapter — advisory evidence with a visible models.dev id beats none.
+  const slash = modelId.indexOf("/");
+  const namespace = slash > 0 ? named(modelId.slice(0, slash)) : [];
+  const scope = namespace.length > 0 ? namespace : named(provider);
+  // Full id, then (inside its own namespace) the rest, then the bare segment after the last "/"
+  // (kimi-code/k3 vs catalog key k3); only after every exact canonical miss, the effort-stripped bases.
+  const exact = [...new Set([
+    modelId,
+    ...(namespace.length > 0 ? [modelId.slice(slash + 1)] : []),
+    ...(slash >= 0 ? [modelId.slice(modelId.lastIndexOf("/") + 1)] : []),
+  ].map(canonicalModelId))];
+  const candidates = [...new Set([...exact, ...exact.flatMap(effortBases)])];
+  // One pass, then a total order: candidate, first-party rank, provider key, record key — never JSON key order.
+  const firstParty = (key: string): number => {
+    const rank = FIRST_PARTY_PROVIDERS.indexOf(key);
+    return rank < 0 ? FIRST_PARTY_PROVIDERS.length : rank;
+  };
+  let best: ModelsDevMatch | undefined;
+  let bestCandidate = candidates.length;
+  for (const [providerKey, value] of providers) {
+    if (scope.length > 0 && !scope.includes(providerKey)) continue;
+    for (const [recordId, raw] of Object.entries(record(record(value)?.models) ?? {})) {
+      const model = record(raw);
+      if (!model) continue;
+      const candidate = Math.min(...[recordId, model.id]
+        .flatMap((id) => (typeof id === "string" ? [candidates.indexOf(canonicalModelId(id))] : []))
+        .filter((i) => i >= 0));
+      if (!Number.isFinite(candidate)) continue;
+      if (best && (candidate - bestCandidate
+        || firstParty(providerKey) - firstParty(best.providerKey)
+        || codeUnitOrder(providerKey, best.providerKey)
+        || codeUnitOrder(recordId, best.recordId)) >= 0) continue;
+      best = { providerKey, recordId, model, matchedId: candidates[candidate] };
+      bestCandidate = candidate;
     }
   }
-  if (bare) {
-    for (const { providerKey, models } of providerModels(catalog.modelsDev, provider)) {
-      const direct = record(models[bare]);
-      if (direct) return { providerKey, models, recordId: bare, model: direct };
-    }
-  }
-  return undefined;
+  return best;
 }
 
 function artificialAnalysisRows(value: unknown): unknown[] {
@@ -315,10 +347,17 @@ function assertUsableLiveBench(rows: Record<string, unknown>[], categories: Reco
 // `-thinking-auto-medium-effort`); the highest effort is the model at its best. Rank by
 // hyphen-delimited token so `xhigh` never reads as `high`.
 const LIVEBENCH_EFFORT_RANK: Record<string, number> = { max: 5, xhigh: 4, high: 3, medium: 2, low: 1 };
-const LIVEBENCH_VARIANT_RE = /^-(?:max|xhigh|high|medium|low|thinking|auto|effort|fast)(?:-(?:max|xhigh|high|medium|low|thinking|auto|effort|fast))*$/;
 
-const liveBenchEffortRank = (residue: string): number =>
-  residue.split("-").reduce((rank, token) => Math.max(rank, LIVEBENCH_EFFORT_RANK[token] ?? 0), 0);
+// OBS-1149: LiveBench benchmarks some models only as their preview (`gemini-3.1-pro-preview-high`),
+// so on THIS side `preview` is residue too. Every residue token must be a word: `.2` never is.
+const isLiveBenchVariant = (residue: string): boolean =>
+  residue.startsWith("-") && residue.slice(1).split("-").every((token) => token === "preview" || EFFORT_MODE_TOKENS.has(token));
+
+/** A GA row always outranks a preview row of the same model; effort ranks within each. */
+const liveBenchEffortRank = (residue: string): number => {
+  const tokens = residue.split("-");
+  return (tokens.includes("preview") ? 0 : 10) + tokens.reduce((rank, token) => Math.max(rank, LIVEBENCH_EFFORT_RANK[token] ?? 0), 0);
+};
 
 const liveBenchCategoryMean = (row: Record<string, unknown>, tasks: unknown): number | undefined => {
   const scores = (Array.isArray(tasks) ? tasks : [])
@@ -338,18 +377,22 @@ function liveBenchIndex(
   const root = record(value);
   if (!root || !Array.isArray(root.rows)) return undefined;
   const wanted = identities.map(liveBenchIdentity).filter(Boolean);
-  let best: { row: Record<string, unknown>; rank: number } | undefined;
+  let best: { row: Record<string, unknown>; identity: number; rank: number } | undefined;
   for (const raw of root.rows) {
     const row = record(raw);
     const model = typeof row?.model === "string" ? liveBenchIdentity(row.model) : undefined;
     if (!row || !model) continue;
     // Bare startsWith is a false-positive machine: `glm-5` would claim `glm-5.2`. The residue after
     // the fleet id must be empty or an effort suffix.
-    const residue = wanted.map((identity) => model.startsWith(identity) ? model.slice(identity.length) : undefined)
-      .find((rest) => rest === "" || LIVEBENCH_VARIANT_RE.test(rest ?? ""));
-    if (residue === undefined) continue;
-    const rank = liveBenchEffortRank(residue);
-    if (!best || rank > best.rank) best = { row, rank };
+    const residues = wanted.map((identity) => model.startsWith(identity) ? model.slice(identity.length) : undefined);
+    const identity = residues.findIndex((rest) => rest === "" || isLiveBenchVariant(rest ?? ""));
+    if (identity < 0) continue;
+    // Identities are listed most-specific first (the client's `gpt-5.6-high` before its stripped base
+    // `gpt-5.6`): a row reached through an earlier identity always beats one reached only through a
+    // later one, so a client's exact `-high` row is never outranked by a sibling `-low` row whose
+    // residue happens to carry an effort token. Effort rank only orders rows of the SAME identity.
+    const rank = liveBenchEffortRank(residues[identity] ?? "");
+    if (!best || identity < best.identity || (identity === best.identity && rank > best.rank)) best = { row, identity, rank };
   }
   if (!best) return undefined;
   const categories = record(root.categories);
@@ -383,10 +426,13 @@ export function resolveCatalogModel(
     modelId,
     query.model,
     ...[modelId, query.model].flatMap((identity) => identity.includes("/") ? [identity.slice(identity.lastIndexOf("/") + 1)] : []),
+    // OBS-1147/1082: the exact base an effort variant resolved to (`gemini-3-pro-high` → `gemini-3-pro`).
+    match.matchedId,
     ...(typeof model.name === "string" ? [model.name] : []),
   ];
   const intelligence = artificialAnalysisIndex(catalog.artificialAnalysis, [
     modelId,
+    match.matchedId,
     ...(typeof model.name === "string" ? [model.name] : []),
   ], query.provider);
   const liveBench = liveBenchIndex(catalog.liveBench, identities);

@@ -19,6 +19,7 @@ import {
 } from "../../cli/commands/approve.js";
 import {
   ATTEMPT_CAP_RELEASE,
+  bindingToken,
   GATE_SATISFIED_RELEASE,
   Journal,
   RECHECK_RELEASE,
@@ -1260,6 +1261,8 @@ export type ParkedDecision = {
    * so it is drawn read-only and neither verb is offered on it.
    */
   readonly tombstone: boolean;
+  /** OBS-1178: the park's `<line>@<ts>` token — the confirmed write binds to it via `--park`. */
+  readonly park?: string;
 };
 
 /**
@@ -1303,7 +1306,7 @@ export function deriveParkedDecisions(
   journal: Journal,
 ): readonly ParkedDecision[] {
   const statuses = journal.replayStatuses();
-  const events = journal.read();
+  const { events, lines } = journal.readSourced();
   const decisions: ParkedDecision[] = [];
   for (const [taskId, status] of statuses) {
     if (status !== "human") continue;
@@ -1329,6 +1332,7 @@ export function deriveParkedDecisions(
       attempts,
       failedGate,
       tombstone: isTombstonePark(kind, reason),
+      ...(typeof parked?.ts === "string" ? { park: bindingToken({ line: lines[parkedIndex]!, ts: parked.ts }) } : {}),
     });
   }
   return decisions;
@@ -1340,6 +1344,8 @@ export type SetupDecisionVerb = "approve" | "waive" | "uphold" | "recheck";
 export type SetupDecisionCommand = {
   readonly verb: SetupDecisionVerb;
   readonly taskId: string;
+  /** OBS-1178: the park token the confirm inset displayed — approve refuses it once a newer park opens. */
+  readonly park?: string;
 };
 
 /** What the journal file gained this session — one entry per confirmed write. */
@@ -1440,7 +1446,7 @@ export function applySetupDecisionsKey(
       session: {
         ...session,
         selection,
-        confirming: { verb, taskId: decision.taskId },
+        confirming: { verb, taskId: decision.taskId, ...(decision.park === undefined ? {} : { park: decision.park }) },
       },
     };
   }
@@ -1485,6 +1491,7 @@ export async function executeSetupDecision(
         runId,
         command.taskId,
         ...decisionFlag(command.verb),
+        ...(command.park === undefined ? [] : ["--park", command.park]),
         "--by",
         by,
       ],
@@ -1599,6 +1606,7 @@ export function setupDecisionConfirmLines(
 ): readonly string[] {
   return [
     `task   ${command.taskId}${decision === undefined ? "" : ` · ${decision.kind} · attempt ${decision.attempts}`}`,
+    ...(command.park === undefined ? [] : [`park   ${command.park} · bound; refused if a newer park opens`]),
     `actor  ${actor}`,
     ...decisionEffectLines(command, decision, run),
     `file   ${journalFile} · append only`,

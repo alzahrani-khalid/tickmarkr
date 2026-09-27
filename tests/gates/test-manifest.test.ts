@@ -8,10 +8,12 @@ import { DEFAULT_CONFIG } from "../../src/config/config.js";
 import { captureBaseline, compareToBaseline, type Baseline, type BaselineCommand } from "../../src/gates/baseline.js";
 import { runGates, testCommandForFiles } from "../../src/gates/run-gates.js";
 import { discoverTestManifest, fileHangBudgetMs, isVitestTestCommand, readTestReport, singleForkRetryCommand, verifyManifestReport } from "../../src/gates/test-manifest.js";
+import { TEST_REPORTER_SOURCE } from "../../src/gates/test-reporter.js";
 import { preserveWorktree, shGitOk, VERIFICATION_PROTOCOL } from "../../src/run/git.js";
 import { SubprocessDriver } from "../../src/drivers/subprocess.js";
 import { validateGraph } from "../../src/graph/schema.js";
 import { verifyIntegrationTip } from "../../src/run/merge.js";
+import { alive, ownedFailures, runOwned } from "../helpers/owned-process.js";
 import { makeRepo, makeTestTempDir } from "../helpers/tmprepo.js";
 
 const install = join(process.cwd(), "node_modules");
@@ -765,7 +767,7 @@ test("test: OBS-1166 under a real vitest projects config a stranded single-fork 
   const runs = f.runs();
   expect(runs.slice(0, 2).map(r => r.files)).toEqual([["tests/a.test.ts", "tests/single.test.ts"], ["tests/single.test.ts"]]);
   const retryFilters = runs[1]!.args.filter(a => !a.startsWith("-") && a !== "run");
-  expect(retryFilters).toEqual([join(f.repo, "tests/single.test.ts")]);
+  expect(retryFilters).toEqual([join(realpathSync(f.repo), "tests/single.test.ts")]);
   expect(runs[1]!.args).toContain("--exclude=tests/a.test.ts");
 }, 90_000);
 
@@ -844,6 +846,99 @@ test("test: tip verify of an integration tip whose first run stranded its single
   expect(rows[0]!.data.details).toContain(runs[1]!.nonce);
 }, 60_000);
 
+test("test: production task and tip recovery rediscover and run exactly the stranded serial file through a symlinked fixture root versus the direct root, so an empty positional-filter discovery or completed-file rerun fails", async () => {
+  // OBS-1180: real Vitest in both phases under a projects config; the wrapper injects only the stranded
+  // serial-project certificate after the first real run. Vitest resolves its root through every symlink,
+  // so a retry filter rooted at the symlink path would discover nothing.
+  const body = "import { test, expect } from 'vitest'; test('owned', () => expect(1).toBe(1));\n";
+  // A fresh repository per case: verdict reuse is keyed by the realpath worktree, so a shared one would
+  // let the symlinked case replay the direct case's verdict instead of running.
+  const rooted = (symlinked: boolean) => {
+    const evidence = realpathSync(makeTestTempDir("obs1180-"));
+    const log = join(evidence, "invocations.json");
+    const direct = realpathSync(makeRepo({
+      ".gitignore": "node_modules\n.vitest-cache/\n",
+      "package.json": JSON.stringify({ type: "module" }),
+      ...Object.fromEntries(["tests/p1.test.ts", "tests/p2.test.ts", "tests/s.test.ts"].map(f => [f, body])),
+      "vitest.config.mjs": `export default { test: { pool: 'forks', projects: [
+  { extends: true, test: { name: 'parallel', include: ['tests/p1.test.ts', 'tests/p2.test.ts'], exclude: ['**/node_modules/**'], pool: 'forks' } },
+  { extends: true, test: { name: 'serial', include: ['tests/s.test.ts'], exclude: ['**/node_modules/**'], pool: 'forks', poolOptions: { forks: { singleFork: true } } } }
+] } };\n`,
+      "vitest.mjs": `
+import { spawnSync } from 'node:child_process';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+const argv = process.argv.slice(2), listing = argv[0] === 'list', log = ${JSON.stringify(log)};
+const rows = existsSync(log) ? JSON.parse(readFileSync(log, 'utf8')) : [];
+const child = spawnSync(process.execPath, [${JSON.stringify(join(realpathSync(install), "vitest/vitest.mjs"))}, ...argv], { stdio: listing ? ['ignore', 'pipe', 'inherit'] : 'inherit', encoding: 'utf8' });
+if (listing) process.stdout.write(child.stdout);
+const file = process.env.TICKMARKR_TEST_REPORT, report = !listing && file && existsSync(file) ? JSON.parse(readFileSync(file, 'utf8')) : undefined;
+rows.push({ argv, listing, listed: listing ? JSON.parse(child.stdout.slice(child.stdout.indexOf('['))).map(r => r.file) : undefined,
+  started: report ? Object.keys(report.started).sort() : undefined });
+writeFileSync(log, JSON.stringify(rows));
+if (child.status !== 0 || listing) process.exit(child.status ?? 1);
+if (rows.filter(r => !r.listing).length === 1) {
+  for (const [name, scheduled] of Object.entries(report.scheduling)) if (scheduled.singleFork) { delete report.started[name]; delete report.completed[name]; }
+  report.certificate.exitCode = 1; report.certificate.errors = 1;
+  report.certificate.diagnostics = ['Error: [vitest-worker]: Timeout calling "onTaskUpdate"'];
+  writeFileSync(file, JSON.stringify(report)); process.exit(1);
+}
+`,
+    }));
+    symlinkSync(install, join(direct, "node_modules"), "dir");
+    const base = git(direct, "rev-parse", "HEAD");
+    writeFileSync(join(direct, "tests/s.test.ts"), body.replace("owned", "owned serial")); commit(direct);
+    const link = join(evidence, "link");
+    symlinkSync(direct, link, "dir");
+    expect(realpathSync(link)).toBe(direct);
+    expect(link).not.toBe(direct);
+    return { root: symlinked ? link : direct, direct, base, log };
+  };
+  const cmd = "node vitest.mjs run --configLoader native";
+  const { Journal } = await import("../../src/run/journal.js");
+  const { verifyIntegrationTipCached } = await import("../../src/run/daemon.js");
+  const phases: Record<string, (root: string, base: string) => Promise<{ pass: boolean; details: string }>> = {
+    task: async (root, base) => {
+      const out = await runGates(task, {
+        worktree: root, baseRef: base, author: { adapter: "fake", model: "fake", tier: "mid", channel: "sub" },
+        result: { ok: true, summary: "done", deviations: [], raw: "" }, commands: { test: cmd }, baseline: baseline(cmd),
+        channels: [], adapters: [], cfg: structuredClone(DEFAULT_CONFIG), artifactDir: makeTestTempDir("obs1180-artifacts-"),
+      });
+      const row = out.results.find(r => r.gate === "test")!;
+      expect(row, JSON.stringify(out)).toBeDefined();
+      return { pass: row.pass, details: row.details };
+    },
+    tip: async (root) => {
+      const journal = Journal.create(root, `run-obs1180-${randomBytes(4).toString("hex")}`);
+      journal.append("run-start", undefined, { commands: { test: cmd } });
+      await verifyIntegrationTipCached(root, { test: cmd }, journal);
+      const rows = journal.read().filter(r => r.event === "tip-verify");
+      expect(rows).toHaveLength(1);
+      return { pass: rows[0]!.data.pass as boolean, details: rows[0]!.data.details as string };
+    },
+  };
+  for (const [phase, verify] of Object.entries(phases)) {
+    for (const symlinked of [false, true]) {
+      const { root, direct, base, log } = rooted(symlinked);
+      const outcome = await verify(root, base);
+      const label = `${phase} ${symlinked ? "symlinked" : "direct"}: ${outcome.details}`;
+      const rows = JSON.parse(readFileSync(log, "utf8")) as Array<{ argv: string[]; listing: boolean; listed?: string[]; started?: string[] }>;
+      expect(outcome.pass, label).toBe(true);
+      const runs = rows.filter(r => !r.listing), listings = rows.filter(r => r.listing);
+      // Recorded before the injected strand: the first real run executed every file; the retry only the serial one.
+      expect(runs.map(r => r.started), label).toEqual([["tests/p1.test.ts", "tests/p2.test.ts", "tests/s.test.ts"], ["tests/s.test.ts"]]);
+      expect(listings.map(r => r.listed!.map(f => f.slice(direct.length + 1)).sort()), label)
+        .toEqual([["tests/p1.test.ts", "tests/p2.test.ts", "tests/s.test.ts"], ["tests/s.test.ts"]]);
+      // The retry: the un-narrowed configured command, the stranded file rooted at the canonical realpath
+      // as its only positional filter, and every completed file excluded by its relative manifest identity.
+      const retry = runs[1]!.argv;
+      expect(retry.slice(0, 3)).toEqual(["run", "--configLoader", "native"]);
+      expect(retry.filter(a => !a.startsWith("-") && a !== "run" && a !== "native")).toEqual([join(direct, "tests/s.test.ts")]);
+      expect(retry.filter(a => a.startsWith("--exclude="))).toEqual(["--exclude=tests/p1.test.ts", "--exclude=tests/p2.test.ts"]);
+      expect(outcome.details, label).toContain("single fork retry");
+    }
+  }
+}, 120_000);
+
 test("test: baseline capture preserves successful versus failed discovery results while reclaiming exactly the owned listing directory in both cases, so one leaked directory or deletion of an unrelated sibling fails", async () => {
   // OBS-1155: TMPDIR is this file's recorded directory (tests/setup.ts), so every listing directory
   // the capture makes is visible here, and an unrelated sibling planted beside them must survive.
@@ -870,3 +965,70 @@ test("test: baseline capture preserves successful versus failed discovery result
   expect(listings()).toEqual(["tickmarkr-test-manifest-unrelated"]); // no leaked listing directory, sibling untouched
   expect(readFileSync(join(sibling, "keep.txt"), "utf8")).toBe("keep\n");
 }, 90_000);
+
+test("test: a nested manifested Vitest fixture cancelled while its child is held records failure and reaps its recorded runner versus normal completion, so a runner outliving its owning fixture fails", async () => {
+  // OBS-1167 / D-478 add.1: a nested runner is an owned subprocess (tests/helpers/owned-process.ts). Its one
+  // test holds a child on a barrier file under the gate's reporter; cancelling the owner mid-hold must tear
+  // the runner, its fork and the held child down before the fixture's failure is recorded, while the
+  // released twin completes through the same reporter and leaves nothing behind either.
+  const FILE = "tests/held.test.ts";
+  const repo = makeRepo({
+    ".gitignore": "node_modules/\n",
+    "package.json": JSON.stringify({ type: "module" }),
+    [FILE]: `import { spawn } from "node:child_process";
+import { expect, test } from "vitest";
+test("held", async () => {
+  const child = spawn("sh", ["-c", 'echo $$ > "$0/held.pid"; until test -e "$0/release"; do sleep 0.05; done', process.env.TKR_HELD_DIR], { stdio: "ignore" });
+  expect(await new Promise((resolve) => child.once("exit", resolve))).toBe(0);
+}, 60_000);
+`,
+  });
+  symlinkSync(install, join(repo, "node_modules"), "dir");
+  const reporter = join(makeTestTempDir("owned-vitest-reporter-"), "reporter.mjs");
+  writeFileSync(reporter, TEST_REPORTER_SOURCE);
+  const env: NodeJS.ProcessEnv = { ...process.env, FORCE_COLOR: "0", NO_COLOR: "1", VITEST_MAX_FORKS: "1" };
+  for (const key of ["VITEST", "TEST", "VITEST_WORKER_ID", "VITEST_POOL_ID"]) delete env[key];
+  const nested = async (cancel: boolean) => {
+    const dir = makeTestTempDir("owned-vitest-");
+    const reportPath = join(dir, "report.json");
+    const controller = new AbortController();
+    const running = runOwned(process.execPath, [join(install, "vitest/vitest.mjs"), "run", `--reporter=${reporter}`], {
+      cwd: repo, ms: 60_000, signal: controller.signal,
+      env: { ...env, TKR_HELD_DIR: dir, TICKMARKR_TEST_REPORT: reportPath, TICKMARKR_TEST_NONCE: "owned" },
+    });
+    const heldPid = () => { try { return Number(readFileSync(join(dir, "held.pid"), "utf8").trim()) || undefined; } catch { return undefined; } };
+    for (const until = Date.now() + 45_000; heldPid() === undefined && Date.now() < until;) await new Promise((r) => setTimeout(r, 50));
+    const held = heldPid();
+    if (cancel || held === undefined) controller.abort(); else writeFileSync(join(dir, "release"), "");
+    const run = await running;
+    const failures = [...ownedFailures(run, "nested vitest"), ...(run.exitCode === 0 ? [] : [`nested vitest: exit ${run.exitCode ?? run.signal}`])];
+    return { run, held, failures, report: readTestReport(reportPath) };
+  };
+
+  const cancelled = await nested(true);
+  const label = `${cancelled.run.out}\n${cancelled.run.err}`;
+  expect(cancelled.held, label).toBeGreaterThan(0);
+  expect(cancelled.run.why).toBe("cancelled");
+  expect(cancelled.failures).toEqual(["nested vitest: cancelled", "nested vitest: exit SIGKILL"]);
+  expect(cancelled.report?.started[FILE], "the runner had started the held module when it was cancelled").toBeGreaterThan(0);
+  expect(cancelled.report?.completed[FILE]).toBeUndefined();
+  expect(cancelled.report?.certificate).toBeUndefined();
+  // the recorded runner, its fork and the held child were all in the owned tree, and none outlived it
+  const recorded = cancelled.run.tree.map((p) => p.pid);
+  expect(recorded).toContain(cancelled.run.pid);
+  expect(recorded).toContain(cancelled.held);
+  expect(recorded.length).toBeGreaterThanOrEqual(3);
+  expect(cancelled.run.unresolved).toBeUndefined();
+  expect(cancelled.run.survivors).toEqual([]);
+  expect(recorded.filter(alive)).toEqual([]);
+  expect(alive(-cancelled.run.pid!)).toBe(false);
+
+  const completed = await nested(false);
+  expect(completed.failures, `${completed.run.out}\n${completed.run.err}`).toEqual([]);
+  expect(completed.run.why).toBe("settled");
+  expect(completed.report?.completed[FILE]?.status).toBe("passed");
+  expect(completed.report?.certificate).toBeDefined();
+  expect(completed.run.survivors).toEqual([]);
+  expect(alive(completed.held!)).toBe(false);
+  expect(alive(-completed.run.pid!)).toBe(false);
+}, 150_000);

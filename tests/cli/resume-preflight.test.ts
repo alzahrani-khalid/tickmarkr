@@ -97,7 +97,7 @@ describe("v1.87 T3 resume preflight is scoped to the resumed graph", () => {
   test("the preflight consumes the loaded graph's shape set rather than the whole routing map and runs after the graph is read, cited from the reordered lines in resume.ts", () => {
     const src = readFileSync(join(import.meta.dirname, "../../src/cli/commands/resume.ts"), "utf8");
     const graphRead = src.indexOf("const graph = loadGraph(cwd)");
-    const preflight = src.indexOf("denyPreferCollisions(cfg, graph.tasks.map((t) => t.shape))");
+    const preflight = src.indexOf("denyPreferCollisions(cfg, graph.tasks.map((t) => t.shape), readDoctor(cwd))");
 
     expect(graphRead).toBeGreaterThan(-1);
     expect(preflight).toBeGreaterThan(graphRead); // reordered: graph first, preflight second

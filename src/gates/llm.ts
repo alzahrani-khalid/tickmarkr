@@ -5,6 +5,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { matchesTrustDialog, type WorkerAdapter } from "../adapters/types.js";
+import type { Effort } from "../graph/schema.js";
 import { formatOwnedName, parseOwnedName, type ExecutorDriver, type Slot } from "../drivers/types.js";
 import { bannerShell, paneDispatchCommand, PLAIN_BANNER } from "../brand.js";
 import { sh } from "../run/git.js";
@@ -351,12 +352,13 @@ async function runHeadlessDetailed(
   prompt: string,
   cwd: string,
   timeoutMs = 300000,
+  effort?: Effort,
 ): Promise<LlmRunResult> {
   const dir = mkdtempSync(join(tmpdir(), "tickmarkr-llm-"));
   try {
     const pf = join(dir, "prompt.md");
     writeFileSync(pf, prompt);
-    const r = await sh(adapter.headlessCommand(pf, model), cwd, timeoutMs);
+    const r = await sh(adapter.headlessCommand(pf, model, effort), cwd, timeoutMs);
     const output = r.stdout + "\n" + r.stderr;
     const nonce = extractPromptNonce(prompt) ?? "";
     return { output, exitCode: r.code, timedOut: r.timedOut === true,
@@ -372,8 +374,9 @@ export async function runHeadless(
   prompt: string,
   cwd: string,
   timeoutMs = 300000,
+  effort?: Effort,
 ): Promise<string> {
-  return (await runHeadlessDetailed(adapter, model, prompt, cwd, timeoutMs)).output;
+  return (await runHeadlessDetailed(adapter, model, prompt, cwd, timeoutMs, effort)).output;
 }
 
 // v1.1 default path: the same headless CLI call, but dispatched through the driver
@@ -385,6 +388,7 @@ async function runViaDriverDetailed(
   cwd: string,
   via: LlmVia,
   timeoutMs = 300000,
+  effort?: Effort,
 ): Promise<LlmRunResult> {
   const dir = mkdtempSync(join(tmpdir(), "tickmarkr-llm-"));
   let slot: Slot | undefined;
@@ -399,7 +403,7 @@ async function runViaDriverDetailed(
     writeFileSync(scriptPath, [
       "export BASH_SILENCE_DEPRECATION_WARNING=1",
       bannerShell(),
-      adapter.headlessCommand(pf, model),
+      adapter.headlessCommand(pf, model, effort),
       gateExitTrailer(nonce),
     ].join("\n"));
     slot = await via.driver.slot(cwd, rolePaneNameFromPrompt(prompt, via.name), via.label ? { label: via.label } : undefined);
@@ -549,8 +553,9 @@ export async function runViaDriver(
   cwd: string,
   via: LlmVia,
   timeoutMs = 300000,
+  effort?: Effort,
 ): Promise<string> {
-  return (await runViaDriverDetailed(adapter, model, prompt, cwd, via, timeoutMs)).output;
+  return (await runViaDriverDetailed(adapter, model, prompt, cwd, via, timeoutMs, effort)).output;
 }
 
 // OBS-155: a TUI renders the verdict as a bullet and HARD-wraps it at pane width with a 2-space
@@ -614,10 +619,11 @@ export async function runLlmDetailed(
   cwd: string,
   via?: LlmVia,
   timeoutMs = 300000,
+  effort?: Effort,
 ): Promise<LlmRunResult> {
   const result = await (via
-    ? runViaDriverDetailed(adapter, model, prompt, cwd, via, timeoutMs)
-    : runHeadlessDetailed(adapter, model, prompt, cwd, timeoutMs));
+    ? runViaDriverDetailed(adapter, model, prompt, cwd, via, timeoutMs, effort)
+    : runHeadlessDetailed(adapter, model, prompt, cwd, timeoutMs, effort));
   llmOutputCapture.getStore()?.push(result.output);
   return result;
 }
@@ -629,8 +635,9 @@ export async function runLlm(
   cwd: string,
   via?: LlmVia,
   timeoutMs = 300000,
+  effort?: Effort,
 ): Promise<string> {
-  return (await runLlmDetailed(adapter, model, prompt, cwd, via, timeoutMs)).output;
+  return (await runLlmDetailed(adapter, model, prompt, cwd, via, timeoutMs, effort)).output;
 }
 
 export function extractJson<T>(raw: string): T | null {

@@ -15,7 +15,7 @@ import { redactSecrets } from "../run/redact.js";
 import { rankPreferredChannels, reviewPreferenceTieBreak } from "../route/role-pick.js";
 import { modelProvider } from "../route/preference.js";
 import { resolveStateDir } from "./cache.js";
-import { appendAnchoredReview, COMPLETION_FAKING_CHECKLIST, extractVerdictJson, generateVerdictNonce, type GateVia, parseAnchoredComments, runLlmDetailed, verdictNonceLine } from "./llm.js";
+import { appendAnchoredReview, COMPLETION_FAKING_CHECKLIST, dewrapPaneVerdict, extractVerdictJson, generateVerdictNonce, type GateVia, parseAnchoredComments, runLlmDetailed, verdictNonceLine } from "./llm.js";
 import type { GateResult } from "./types.js";
 import { classifyVerdictCause, type VerdictUnparseableCause } from "./verdict-cause.js";
 import {
@@ -485,6 +485,36 @@ ${fingerprints}
 ${priorMaterials.map((finding, i) => `${i + 1}. ${finding.note}`).join("\n\n")}`;
 }
 
+/**
+ * OBS-1052(2): a seat that lost the top of a long brief, or believed it had already filed its review,
+ * answered in prose — and prose is no verdict. So the requirement, naming THIS call's nonce with a
+ * valid example, is both the first and the last instruction of the brief. It is best-effort wording:
+ * the parser stays the authority, and nothing here reads approval out of prose.
+ */
+export function reviewResponseExample(nonce: string): string {
+  return JSON.stringify({
+    nonce, approve: false, resolved: [], reraised: [],
+    findings: [{ note: "path/to/file.ts:42 — the defect, in one line", severity: "material", defer: false, rationale: "" }],
+    comments: [],
+  });
+}
+
+export function reviewResponseRequirement(nonce: string): string {
+  return `## Response requirement
+Your reply must end with exactly ONE JSON object whose "nonce" is "${nonce}" — this brief's nonce, never one from an earlier brief. A valid example (a rejection; replace every value with your own verdict):
+${reviewResponseExample(nonce)}
+This holds even if you already filed or posted a review of this task elsewhere (an earlier session or brief, a PR comment): that review is not on record here, so restate it now as this JSON with nonce "${nonce}". Prose saying a review was filed or approved is recorded as no verdict; approval is never inferred from it.`;
+}
+
+// The example parses by design, so an echo of the brief (a CLI printing its prompt, a pane showing it)
+// would otherwise read as the seat's own verdict — or as its participation when it wrote only prose.
+// Removed verbatim or hard-wrapped (renderer whitespace and chrome between any two characters) before
+// the verdict is extracted or its absence classified; the saved raw bytes keep it as evidence.
+function withoutExampleEcho(raw: string, nonce: string): string {
+  const chars = [...reviewResponseExample(nonce).replace(/\s+/g, "")];
+  return raw.replace(new RegExp(chars.map((c) => c.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("[\\s│|]*"), "g"), "");
+}
+
 export async function reviewGate(
   task: Task,
   worktree: string,
@@ -618,7 +648,10 @@ export async function reviewGate(
   const suiteBudget = ownTestFiles.length
     ? `You may run at most the task's own test files explicitly named in files[]; these are the only suites you may run: ${ownTestFiles.map((file) => `\`${file}\``).join(", ")}.`
     : "No suite may be run: files[] names no explicit test file owned by this task.";
+  const responseRequirement = reviewResponseRequirement(nonce);
   const prompt = `TICKMARKR-REVIEW
+${responseRequirement}
+
 You are a skeptical cross-vendor code reviewer. Another agent (vendor: ${author.adapter}) authored this diff.
 Look for correctness bugs, security issues, and acceptance-criteria gaps. Approve only if you would merge it.
 
@@ -663,6 +696,8 @@ For every prior material, put its fingerprint in exactly one of resolved (verifi
 (still a blocking defect). Use only the listed fingerprints; never omit one or put it in both lists.
 Approve iff no material finding remains and every prior material is resolved.
 The top-level comments array is optional. Use it only for actionable line-anchored feedback.
+
+${responseRequirement}
 `;
   // Filenames are journaled (daemon.ts lifts meta.rawPath/briefPath onto the gate-result row), so they
   // must be reproducible from the same inputs — the verdict nonce is cryptographically random and would
@@ -709,6 +744,7 @@ The top-level comments array is optional. Use it only for actionable line-anchor
     // stdout that read as "unparseable" and escalated to re-implementation of green code
     // (run-20260709-104447 P87-09). The configured ceiling defaults to that measured 15 minutes.
     cfg.review.timeoutMs,
+    reviewer.effort, // OBS-1182: the picked seat's own effort, never the author's
   );
   const raw = llm.output;
   let saved: string | undefined;
@@ -721,7 +757,11 @@ The top-level comments array is optional. Use it only for actionable line-anchor
     }
   }
   const provider = modelProvider(reviewer.model, reviewer.vendor);
-  const v = extractVerdictJson<ReviewVerdict>(raw, nonce);
+  // A pane's own dewrap stops at the first parseable nonce-bound object; once the example's echo is gone
+  // a genuinely wrapped verdict behind it is reconstructed here, exactly as llm.ts would have.
+  const echoFree = withoutExampleEcho(raw, nonce);
+  const seat = via ? dewrapPaneVerdict(echoFree, nonce) : echoFree;
+  const v = extractVerdictJson<ReviewVerdict>(seat, nonce);
   const findings = v && Array.isArray(v.findings) ? (v.findings as unknown[]) : null;
   const priorIds = priorMaterials;
   const closureInvalid = isReviewClosureInvalid(v, priorIds);
@@ -735,7 +775,7 @@ The top-level comments array is optional. Use it only for actionable line-anchor
       : llm.launchNeverStarted ? "launch-never-started"
       : llm.silentAtBeat ? "silent"
       : llm.timedOut ? (bytes > 0 ? "truncated" : "silent")
-      : classifyVerdictCause(raw, nonce, "approve", llm);
+      : classifyVerdictCause(seat, nonce, "approve", llm);
     const failure = cause === "malformed-verdict"
       ? "review output unparseable"
       : cause === "closure-mismatch"

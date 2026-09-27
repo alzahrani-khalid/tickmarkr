@@ -3,10 +3,10 @@ import type { CommandReceiptAttribution, ShellReceipt } from "../run/protocol.js
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { loadavg, tmpdir } from "node:os";
 import { join, posix } from "node:path";
-import { type Assignment, type BillingChannel, channelKey, shq, type WorkerAdapter, type WorkerResult } from "../adapters/types.js";
+import { type Assignment, type BillingChannel, channelKey, configuredEffort, shq, type WorkerAdapter, type WorkerResult } from "../adapters/types.js";
 import { type TickmarkrConfig, TIER_RANK } from "../config/config.js";
 import { getAdapter } from "../adapters/registry.js";
-import { GATE_NAMES, type GateName, type Task } from "../graph/schema.js";
+import { type Effort, GATE_NAMES, type GateName, type Task } from "../graph/schema.js";
 import { acceptanceGate } from "./acceptance.js";
 import { type Baseline, type RetryOptions, type GateEvidenceOptions, compareToBaseline, effectiveCeilingMs, waitForCalmWindow, calmWindowReady } from "./baseline.js";
 import { evidenceGate } from "./evidence.js";
@@ -52,6 +52,7 @@ export function resetLoadProviderForTests(): void {
 
 interface LlmDispatchClock {
   channel: string;
+  effort?: Effort;
   preparedAt: number;
   startedAtPath: string;
   completedAtPath: string;
@@ -60,6 +61,8 @@ interface LlmDispatchClock {
 
 interface LlmDispatchSpan {
   channel: string;
+  // OBS-1182: the effort the adapter command was actually built with; absent = the CLI's default.
+  effort?: Effort;
   durationMs: number;
 }
 
@@ -77,13 +80,14 @@ function instrumentLlmAdapter(adapter: WorkerAdapter, clocks: LlmDispatchClock[]
   return new Proxy(adapter, {
     get(target, property) {
       if (property === "headlessCommand") {
-        return (promptFile: string, model: string): string => {
-          const command = target.headlessCommand(promptFile, model);
+        return (promptFile: string, model: string, effort?: Effort): string => {
+          const command = target.headlessCommand(promptFile, model, effort);
           const dir = mkdtempSync(join(tmpdir(), "tickmarkr-gate-invocation-"));
           const startedAtPath = join(dir, "started-at");
           const completedAtPath = join(dir, "completed-at");
           clocks.push({
             channel: channelKey({ adapter: target.id, model }),
+            ...(effort ? { effort } : {}),
             preparedAt: Date.now(),
             startedAtPath,
             completedAtPath,
@@ -116,7 +120,7 @@ function finishLlmDispatches(clocks: LlmDispatchClock[]): LlmDispatchSpan[] {
     } finally {
       rmSync(clock.dir, { recursive: true, force: true });
     }
-    return { channel: clock.channel, durationMs: completedAt - startedAt };
+    return { channel: clock.channel, ...(clock.effort ? { effort: clock.effort } : {}), durationMs: completedAt - startedAt };
   });
 }
 
@@ -137,7 +141,8 @@ async function captureLlmDispatches<T>(
 /**
  * One gate's own measurement, taken WHERE THE GATE RUNS. `durationMs` sums that gate's execution
  * intervals and nothing between them, so the composite `test` gate (a selected screen, then other
- * gates, then the full suite) reports the two suites' cost rather than the span containing them —
+ * gates, then the full suite) reports the two suites' cost rather than the span containing them
+ * (split across the two rows when the screen is published before semantic gates, OBS-1176) —
  * and no consumer has to re-derive a duration by subtracting journal timestamps, which measures the
  * queue as well as the work. Load is sampled at each interval's endpoints and every second within it;
  * start preserves the scheduling input while max and mean retain sustained interior saturation.
@@ -468,10 +473,14 @@ export async function runGates(
     task.gates.includes(g) && (g !== "acceptance" && g !== "review" || shapeGates?.[g] !== false);
   const failed = () => results.some((r) => !r.pass);
   // T4 (OBS-265): a GREEN selected-test run is a screen, not the round's verdict — the merge-candidate
-  // round re-runs the full suite on the same commit and THAT is what the round reports. Held here so
-  // exactly one `test` gate-result ever leaves a round, always carrying which suite spoke for it.
+  // round re-runs the full suite on the same commit and THAT is what the round reports. With no
+  // semantic gate to act on it, the screen is held so its full suite speaks for it in one row.
   // (A RED screen IS the verdict: the round ends there, so it is recorded immediately.)
   let heldTest: GateResult | undefined;
+  // OBS-1176: when acceptance/review WILL act on a green screen, the screen is published before they
+  // start, as its own selected row. The full suite afterwards is a second invocation on its own row —
+  // it carries only its own receipts and interval, so it neither erases nor re-counts the screen.
+  const publishScreen = enabled("acceptance") || enabled("review");
   // v2.0 T2 (OBS-554): this round's per-gate measurement. Every interval a gate actually spends
   // executing is added HERE, at the call site that runs it, so a gate that runs twice (the test
   // gate's screen and its full suite) sums to its own cost and never to the span between them.
@@ -841,7 +850,13 @@ export async function runGates(
       if (g === "test" && selected) {
         const screened = { ...r!, meta: { ...r!.meta, selectedTests: selected } };
         if (!screened.pass) await record(screened);
-        else {
+        else if (publishScreen) {
+          await record(screened);
+          // The screen's interval now lives on its own row; the full suite measures from zero.
+          spans.delete("test");
+          loadSamples.delete("test");
+          selectedDurationMs = undefined;
+        } else {
           heldTest = withTelemetry(screened);
           results.push(heldTest);
         }
@@ -947,18 +962,19 @@ export async function runGates(
     // asks ("how long does ONE healthy judge invocation take?"), so the invocations are kept apart.
     // Separate from `invocations` above deliberately: that array is transcript evidence and records
     // one entry per CAPTURED OUTPUT, so a dispatch that produced none contributes nothing to it.
-    const invocationSpans: Array<{ channel: string; durationMs: number }> = [];
+    const invocationSpans: LlmDispatchSpan[] = [];
     const invokeJudge = async (
       adapter: WorkerAdapter,
       model: string,
       via: typeof jvia,
+      effort: Effort | undefined,
     ): Promise<GateResult> => {
       const captured = await captureLlmDispatches([adapter], ([instrumented]) =>
         acceptanceGate(
           task,
           ctx.worktree,
           ctx.baseRef,
-          { adapter: instrumented!, model },
+          { adapter: instrumented!, model, effort },
           via,
           { testCmd: ctx.commands.test, diffCap: ctx.cfg.gates.diffCap },
         ));
@@ -982,7 +998,8 @@ export async function runGates(
       }
       return captured.value;
     };
-    let a = await invokeJudge(judgeAdapter, ctx.cfg.judge.model, jvia);
+    // OBS-1182: every judge seat launches at its OWN configured effort, never the worker's.
+    let a = await invokeJudge(judgeAdapter, ctx.cfg.judge.model, jvia, configuredEffort(ctx.cfg, ctx.cfg.judge));
     // GATE-09: an unparseable judge verdict retries the JUDGE exactly once on a failover channel — never
     // the worker (run-20260711-185020 P43-03 L70-72 billed a judge flake as a worker attempt). The flaked
     // first verdict NEVER enters results (no false gate-result journal event, no operator notify, no stale
@@ -1018,7 +1035,7 @@ export async function runGates(
         ? { driver: ctx.via.driver, keep: ctx.via.keep, onSlot: ctx.via.onSlot, name: ctx.via.nameFor("judge", retryAdapter.id) + "-r1", label: ctx.via.labelFor("judge") }
         : undefined;
       // the retry IS a second acceptanceGate call: one code path, one parser, zero new parse leniency.
-      a = await invokeJudge(retryAdapter, retry.model, retryJvia);
+      a = await invokeJudge(retryAdapter, retry.model, retryJvia, configuredEffort(ctx.cfg, retry));
       a = { ...a, meta: { ...a.meta, judgeRetry: { flaked: flakedKey, retried: channelKey({ adapter: retry.adapter, model: retry.model }) } } };
     }
     // No dispatch, no key: a deterministic-oracle round writes no `invocations` field rather than an
@@ -1031,7 +1048,7 @@ export async function runGates(
     // v2.0 T2: per-dispatch spans, exactly as the judge keeps them. A round that re-asks a second
     // seat spends two invocations, and one blended span cannot tell a slow reviewer from two.
     // A pick that found NO eligible seat dispatched nothing, so it contributes no invocation.
-    const invocations: Array<{ channel: string; durationMs: number }> = [];
+    const invocations: LlmDispatchSpan[] = [];
     // Dispatch is PROVEN, never inferred: captureLlmOutput records one output per runLlm return, so an
     // empty capture means reviewGate returned before asking anyone — a policy skip, a pre-dispatch diff
     // cap, or no eligible seat. Reading `noEligibleReviewer` alone missed the first two and invented
@@ -1231,9 +1248,10 @@ export async function runGates(
 
   // The merge-candidate round: every other gate is green, so THIS round is the one that can merge —
   // the full suite runs on the exact gated commit before the pipeline reports green. Nothing merges
-  // on a subset (spec: "nothing merges without a complete green suite"). Its verdict SUPERSEDES the
-  // held screen rather than joining it: one `test` entry in the record, one `test` end event in the
-  // stream, and `fullSuite` says which suite spoke while `selectedTests` keeps what the screen ran.
+  // on a subset (spec: "nothing merges without a complete green suite"). Its verdict replaces the
+  // screen's entry in the returned record (one `test` entry), and `fullSuite` says which suite spoke
+  // while `selectedTests` keeps what the screen ran. In the stream, a held screen is superseded (one
+  // `test` end event); a published screen keeps its own earlier event and this is the second.
   if (selected) {
     await emitStart("test");
     // This is the last shell command a round can run — the judge's named-test oracle (acceptance.ts)

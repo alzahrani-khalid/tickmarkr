@@ -19,7 +19,11 @@ import { trackJournalRows } from "../../run/protocol.js";
 import { newestPark, permittedDecisionVerbs } from "./approve.js";
 import {
   Journal,
+  bindingToken,
+  effectiveEvents,
   formatJournalNarration,
+  parseJournalText,
+  physicalLine,
   type JournalEvent,
   engagementComparable,
   isQualityFailureParkKind,
@@ -228,7 +232,7 @@ export const decisionEventsFromJournal = (
       ...base,
       type: "human-decision-required" as const,
       tier: "decision" as const,
-      approvalCommand: `tickmarkr approve ${runId} ${event.taskId}`,
+      approvalCommand: `tickmarkr approve ${runId} ${event.taskId} --park ${bindingToken({ line: physicalLine(events, index), ts: event.ts })}`,
       ...(typeof event.data.kind === "string" ? { kind: event.data.kind } : {}),
       ...(typeof event.data.reason === "string" ? { reason: event.data.reason } : {}),
     }];
@@ -1003,18 +1007,6 @@ const statusEngagement = (events: JournalEvent[], loadedHash: string): StatusEng
   return { comparable: true };
 };
 
-// The journal's own reader rule (src/run/journal.ts readJsonl), applied to bytes already in hand:
-// skip blanks, drop a line that will not parse (a torn trailing write after a crash), keep the rest.
-const parseJournalSnapshot = (raw: string): JournalEvent[] =>
-  raw.split("\n").flatMap((line) => {
-    if (!line.trim()) return [];
-    try {
-      return [JSON.parse(line) as JournalEvent];
-    } catch {
-      return [];
-    }
-  });
-
 type RunRecord = {
   runId: string;
   raw: string;
@@ -1062,7 +1054,7 @@ const readRunRecord = (cwd: string, graph: RunGraph, namedRunId?: string): RunRe
   const runId = explicitRunId ?? lockedRunId ?? Journal.latestRunId(cwd, { withJournal: true });
   if (!runId) return undefined;
   const raw = readRunJournalRaw(cwd, runId, lockedRunId === runId);
-  const events = parseJournalSnapshot(raw);
+  const events = parseJournalText(raw);
   // The resume comparator is the fail-closed baseline; a matching graph-rehash is the daemon's
   // append-only audit that authorizes this status replay after stop-amend-resume.
   const engagement = statusEngagement(events, graphDefinitionHash(graph));
@@ -1095,8 +1087,9 @@ const recordTaskRows = (record: RunRecord, graph: RunGraph, isDaemonAlive?: (pid
 const recordProjection = (record: RunRecord | undefined, graph: RunGraph, isDaemonAlive?: (pid: number) => boolean) => {
   const rows = record ? recordTaskRows(record, graph, isDaemonAlive) : new Map<string, TaskRow>();
   const events = record?.comparable ? record.events : [];
+  // OBS-1178: a refused or unsound decision released nothing, so the activity fold never reads it.
   const activity = projectActivity(record?.runId ?? "", trackJournalRows(record?.runId ?? "",
-    events.map((raw, sourceIndex) => ({ raw, sourceIndex }))), graph.tasks);
+    effectiveEvents(events).map((raw, sourceIndex) => ({ raw, sourceIndex }))), graph.tasks);
   const tasks = graph.tasks.map(task => {
     const row = rows.get(task.id);
     const evidence = events.filter(event => event.taskId === task.id);
@@ -1260,13 +1253,26 @@ const renderFrame = (
   // OBS-738: recovery facts stay on the journal's two established reducers. The prefix fold keeps an
   // older journal equally readable by asking upheldFeedbackByTask what was active at that exact
   // restore boundary; current resume-restore rows additionally carry the same task for narration.
+  // OBS-1178: both folds read decisions through the one decision fold over the whole journal.
+  const decided = effectiveEvents(events);
   const preservedRefs = preservedRefsByTask(events);
-  const restoredUpheldFeedback = new Set(events.flatMap((event, index) =>
+  const restoredUpheldFeedback = new Set(decided.flatMap((event, index) =>
     event.event === "resume-restore" && event.taskId
-      && upheldFeedbackByTask(events.slice(0, index)).has(event.taskId)
+      && upheldFeedbackByTask(decided.slice(0, index)).has(event.taskId)
       ? [event.taskId]
       : []));
+  // OBS-1178: a failed task's newest task-failed row is the token its recheck binds to. Only an
+  // effective decision consumes it — a refused or unsound recheck leaves the task failed and the token shown.
+  const failureTokens = new Map<string, string>();
+  decided.forEach((event, index) => {
+    if (!event.taskId || !["task-dispatch", "task-done", "task-failed", "task-human", "task-approved"].includes(event.event)) return;
+    if (event.event === "task-failed") failureTokens.set(event.taskId, bindingToken({ line: physicalLine(decided, index), ts: event.ts }));
+    else failureTokens.delete(event.taskId);
+  });
   const recoveryLinesForTask = (taskId: string): string[] => [
+    ...(failureTokens.has(taskId) && runId
+      ? [`failed — ${taskId} — failure ${failureTokens.get(taskId)!} — re-gate landed work with \`tickmarkr approve ${runId} ${taskId} --recheck --park ${failureTokens.get(taskId)!}\``]
+      : []),
     ...(preservedRefs.get(taskId) ?? []).flatMap(({ ref, diffCommand }) => [
       `preserved worktree — ${taskId} — ${ref}`,
       `  ${diffCommand}`,
@@ -1708,7 +1714,7 @@ export async function status(argv: string[], cwd = process.cwd(), opts: StatusOp
       decisionRunId = runId;
       journalCursor = 0;
     }
-    const journalEvents = parseJournalSnapshot(readRunJournalRaw(cwd, runId, lockedRunId === runId));
+    const journalEvents = parseJournalText(readRunJournalRaw(cwd, runId, lockedRunId === runId));
     if (journalEvents.length < journalCursor) journalCursor = 0;
     const fresh = decisionEventsFromJournal(journalEvents, runId, stateDirName(cwd))
       .filter((event) => event.sequence > journalCursor);

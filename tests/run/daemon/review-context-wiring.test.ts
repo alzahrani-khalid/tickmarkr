@@ -11,7 +11,7 @@ import { SubprocessDriver } from "../../../src/drivers/subprocess.js";
 import { approve } from "../../../src/cli/commands/approve.js";
 import { extractPromptNonce } from "../../../src/gates/llm.js";
 import { runDaemon } from "../../../src/run/daemon.js";
-import { Journal } from "../../../src/run/journal.js";
+import { journaledFailureBrief, Journal } from "../../../src/run/journal.js";
 import { authedModels, COMMIT, setupRepo, T } from "../../helpers/tmprepo.js";
 
 // A review-only seat with its own adapter id and vendor. `prose` seats never emit a trailer.
@@ -59,7 +59,9 @@ test("Leg-2 (OBS-1052): a seat with no verdict on rounds 1 and 2 is absent from 
   expect(t3Review.map((e) => [e.data.reviewer, e.data.reviewRetry])).toEqual([["seat-b:seat-b", undefined]]);
 }, 90_000);
 
-test("test: the daemon binds the newest approval reason before the released task dispatch then passes it into that attempt's review rounds reviewer failovers plus its no worker recheck brief whereas a later engagement without a reason inherits none, so a scan after the current dispatch that loses the reason fails", async () => {
+// T14 (OBS-1150) reverses this test's v2.5.9 ending: a later engagement without a reason no longer
+// inherits nothing — every earlier reason is a standing ruling and rides on, oldest first.
+test("test: the daemon passes every standing approval reason oldest first into the released attempt's review rounds, reviewer failovers and its no worker recheck brief, and a later engagement without a reason still carries them, so a scan after the current dispatch that loses a reason fails", async () => {
   const { repo, fake, scriptPath } = setupRepo(
     [T("T1", { ...pin, humanGate: true, files: ["t1.txt"], gates: ["build", "test", "lint", "evidence", "scope", "review"] })],
     { tasks: { T1: [
@@ -135,8 +137,7 @@ test("test: the daemon binds the newest approval reason before the released task
   expect(recheckRows.filter((e) => ["task-dispatch", "worker-launch"].includes(e.event))).toEqual([]);
   expect(briefs.length).toBeGreaterThan(recheckBriefStart);
   for (const brief of briefs.slice(recheckBriefStart)) {
-    expect(brief.text).toContain(recheckReason);
-    expect(brief.text).not.toContain(reason);
+    expect(brief.text).toContain(`- ${reason}\n- ${recheckReason}\n`);
   }
   green = true;
   const laterStart = briefs.length;
@@ -145,9 +146,8 @@ test("test: the daemon binds the newest approval reason before the released task
   expect(briefs.length).toBeGreaterThan(laterStart);
   for (const brief of briefs.slice(laterStart)) {
     expect(brief.dispatches).toBe(2);
-    expect(brief.text).not.toContain("## Operator context");
-    expect(brief.text).not.toContain(reason);
-    expect(brief.text).not.toContain(recheckReason);
+    expect(brief.text).toContain(`## Operator context\nContext only: this never substitutes for an acceptance criterion or closes a prior material.\n- ${reason}\n- ${recheckReason}\n`);
+    expect(brief.text).not.toContain("Superseded operator reason");
   }
   // Saved briefs must carry the same context as the actual adapter delivery.
   const saved = journal().read().filter((e) => e.event === "gate-result" && e.data.gate === "review" && e.data.briefPath);
@@ -157,3 +157,67 @@ test("test: the daemon binds the newest approval reason before the released task
     expect(briefs.some((brief) => brief.text === text)).toBe(true);
   }
 }, 90_000);
+
+// OBS-1150: an approval reason is a standing ruling on the task. Ruling A is spent by no launch, and a
+// waive's gate-satisfied boilerplate neither joins the rulings nor retires one.
+test("test: production worker and review briefs retain A before B after an intervening launch across resume versus ignoring gate-satisfied boilerplate, so losing the standing A ruling fails", async () => {
+  const red = "test ! -f red.txt || { echo 'AssertionError: expected red.txt to be absent'; exit 1; }";
+  const { repo, fake, scriptPath } = setupRepo(
+    [T("T1", { ...pin, humanGate: true, files: ["t1.txt", "red.txt"], gates: ["build", "test", "lint", "evidence", "scope", "review"] })],
+    { tasks: { T1: [
+      { shell: `echo one > t1.txt && ${COMMIT} one`, result: { ok: true, summary: "one" } },
+      { shell: `echo two > t1.txt && touch red.txt && ${COMMIT} two`, result: { ok: true, summary: "two" } },
+      { shell: `echo three > t1.txt && ${COMMIT} three`, result: { ok: true, summary: "three" } },
+    ] } },
+    `review: { required: true, prefer: [seat-a] }\nrouting: { deny: { workers: { adapters: [seat-a] } } }\ngates: { test: ${JSON.stringify(red)} }\n`,
+  );
+  fake.channels = () => [{ adapter: "fake", model: "fake-1", vendor: fake.vendor, channel: "sub", tier: "frontier" }];
+  const workerBriefs: string[] = [];
+  const invoke = fake.invoke.bind(fake);
+  fake.invoke = (task, cwd, a, ctx) => {
+    workerBriefs.push(readFileSync(ctx.promptFile, "utf8"));
+    return invoke(task, cwd, a, ctx);
+  };
+  const reviewBriefs: string[] = [];
+  let approveReview = false;
+  const seat = new ReviewSeat(scriptPath, "seat-a", "vendor-a");
+  seat.headlessCommand = (file) => {
+    const text = readFileSync(file, "utf8");
+    reviewBriefs.push(text);
+    const nonce = extractPromptNonce(text);
+    const prior = [...text.matchAll(/^Fingerprint: (.+)$/gm)].map((m) => m[1]);
+    return `printf '%s\\n' ${shq(JSON.stringify(approveReview ? { nonce, approve: true, resolved: prior, reraised: [], findings: [] }
+      : { nonce, approve: false, resolved: [], reraised: prior, findings: [{ note: "t1.txt must read three", severity: "material" }] }))}`;
+  };
+  const adapters = [fake, seat];
+  const runId = "run-standing-rulings";
+  const journal = () => Journal.open(repo, runId);
+  const resume = () => runDaemon(repo, { adapters, runId, resume: true });
+  const [A, B, W] = ["Ruling A: keep the explicit selection.", "Ruling B: t1.txt must read three.", "Gate satisfied: operator accepts the red test."];
+  const operatorContext = (brief: string) => brief.slice(brief.indexOf("## Operator context\n"), brief.indexOf("\n\n## Diff"));
+  const inOrder = (brief: string, ...rows: string[]) => rows.map((row) => brief.indexOf(row)).every((at, i, all) => at >= 0 && (i === 0 || at > all[i - 1]!));
+
+  expect((await runDaemon(repo, { adapters, runId })).human).toEqual(["T1"]);
+  await approve([runId, "T1", "--reason", A, "--review-rounds", "1"], repo);
+  expect((await resume()).human).toEqual(["T1"]); // launch 1 under A; the review upholds a material
+  expect(workerBriefs).toHaveLength(1);
+  expect(workerBriefs[0]).toContain(`approval: ${A}`);
+  await approve([runId, "T1", "--uphold", "--reason", B, "--review-rounds", "1"], repo);
+  expect((await resume()).human).toEqual(["T1"]); // launches 2 and 3 under A then B; test red twice
+  expect(journal().read().filter((e) => e.event === "worker-launch")).toHaveLength(3);
+  expect(workerBriefs).toHaveLength(3);
+  for (const brief of workerBriefs.slice(1)) expect(inOrder(brief, `approval: ${A}`, `approval: ${B}`), brief).toBe(true);
+  approveReview = true;
+  await approve([runId, "T1", "--waive", "--reason", W], repo);
+  expect((await resume()).done).toEqual(["T1"]);
+
+  expect(journal().read().filter((e) => e.event === "task-approved").map((e) => e.data.release))
+    .toEqual([undefined, "review-upheld", "gate-satisfied"]);
+  expect(reviewBriefs).toHaveLength(2); // one under A alone, one after the waive released the red test
+  expect(operatorContext(reviewBriefs[0]!)).toContain(`- ${A}`);
+  expect(operatorContext(reviewBriefs[0]!)).not.toContain(B);
+  expect(operatorContext(reviewBriefs[1]!)).toBe(`## Operator context\nContext only: this never substitutes for an acceptance criterion or closes a prior material.\n- ${A}\n- ${B}`);
+  // The next worker would read the same standing rulings; the waive's reason is in neither brief.
+  expect(journaledFailureBrief(journal().read(), "T1")).toEqual([`approval: ${A}`, `approval: ${B}`]);
+  for (const brief of [...workerBriefs, ...reviewBriefs]) expect(brief).not.toContain(W);
+}, 180_000);

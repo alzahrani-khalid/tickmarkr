@@ -1,12 +1,22 @@
-import { existsSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { userInfo } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import { type ApprovalDisposition, approve } from "../../src/cli/commands/approve.js";
-import { tickmarkrDir } from "../../src/graph/graph.js";
-import { runDaemon } from "../../src/run/daemon.js";
+import { status } from "../../src/cli/commands/status.js";
+import { graphDefinitionHash, loadGraph, taskDefinitionFingerprint, tickmarkrDir } from "../../src/graph/graph.js";
+import { outstandingApprovals, pendingDaemonApprovalActions, runDaemon } from "../../src/run/daemon.js";
 import { gitHead } from "../../src/run/git.js";
-import { Journal, PARK_KINDS } from "../../src/run/journal.js";
+import {
+  activeRetryBan, APPROVAL_REFUSED, applyScopeAmendments, bindingToken, effectiveDecisions, foldDecisions, identicalGateFailures, journaledFailureBrief, Journal, normalizeGateFailure, PARK_KINDS,
+  pendingApprovalActions, pendingRechecks, recordedGraphDefinitionHash, repairReachSinceApproval, repairsSinceApproval, reviewRoundsSinceApproval,
+  staleApprovals, type DecisionBinding,
+} from "../../src/run/journal.js";
+import { previewDecision } from "../../src/tui/cockpit/decision-actions.js";
+import { deriveRunCockpitData } from "../../src/tui/cockpit/derive.js";
+import { createLiveStore } from "../../src/tui/cockpit/live-store.js";
+import { decidedLiveStore } from "../../src/tui/cockpit/live-runtime.js";
+import { acquireApprovalSerialization } from "../../src/run/lock.js";
 import { COMMIT, setupRepo, T } from "../helpers/tmprepo.js";
 
 const countApproved = (dir: string, runId: string): number =>
@@ -327,5 +337,346 @@ describe("tickmarkr approve — fail-closed human gate approval (GATE-08, zero-t
       expect(record.disposition).toBe(disposition);
       expect(["dispatch", "waive-gate", "re-dispatch", "fund-fixed-attempt", "fresh-budget"]).toContain(record.disposition);
     }
+  });
+});
+
+// OBS-1178 (D-470): a decision binds to the park open when it was COMMANDED, not when it lands.
+describe("tickmarkr approve — park-bound decisions (OBS-1178, zero-token)", () => {
+  test("test: two queued approvals bind the first review park and refuse its stale second waive after a new test park opens, versus applying a matching review waive, so waiving the newer test fails", async () => {
+    const { repo } = setupRepo([T("T1")], { tasks: {} });
+    const runId = "run-queued-waives";
+    const j = Journal.create(repo, runId);
+    j.append("gate-result", "T1", { gate: "review", pass: false, details: "reviewer requested changes" });
+    j.append("task-human", "T1", { kind: "gate-fail", reason: "review park" });
+    const lineOf = (event: string): string => {
+      const { events, lines } = j.readSourced();
+      const i = events.map((e) => e.event).lastIndexOf(event);
+      return bindingToken({ line: lines[i]!, ts: events[i]!.ts });
+    };
+    const reviewPark = lineOf("task-human");
+
+    // Both decisions are commanded while the review park is open, each queued behind the serializer.
+    // The first lands and applies: a matching review waive bound to the review park.
+    const held = await acquireApprovalSerialization(repo, runId);
+    const first = approve([runId, "T1", "--waive", "--by", "operator"], repo);
+    held.release();
+    await expect(first).resolves.toContain("waived failed gate review");
+    // The second (a standing order) is commanded against that same review park and queues…
+    const heldAgain = await acquireApprovalSerialization(repo, runId);
+    const second = approve([runId, "T1", "--waive", "--by", "standing-order"], repo);
+    const settled = second.then(() => "appended", (e: Error) => e.message);
+    // …while the daemon enacts the first and a new TEST park opens.
+    j.append("worktree-recreation", "T1", {});
+    j.append("gate-result", "T1", { gate: "test", pass: false, details: "1 failed" });
+    j.append("task-human", "T1", { kind: "gate-fail", reason: "test park" });
+    const testPark = lineOf("task-human");
+    heldAgain.release();
+    // Revalidated under serialization, the queued waive is stale: it never lands on the test park.
+    expect(await settled).toBe(`refusing stale decision for T1: bound to park ${reviewPark} but the open park is ${testPark} — read \`tickmarkr status ${runId}\` and decide the open park; nothing appended`);
+    // The explicit re-issue of that same stale token names both parks and appends nothing.
+    await expect(approve([runId, "T1", "--waive", "--park", reviewPark, "--by", "standing-order"], repo))
+      .rejects.toThrow(`bound to park ${reviewPark} but the open park is ${testPark}`);
+
+    const approvals = j.read().filter((e) => e.event === "task-approved");
+    expect(approvals).toHaveLength(1);
+    expect(approvals[0]!.data).toMatchObject({ by: "operator", release: "gate-satisfied", gate: "review", park: { line: Number(reviewPark.split("@")[0]) } });
+    expect(j.replaySatisfiedGates().get("T1")).toBeUndefined(); // the newer test gate is NOT waived
+    expect(j.replayStatuses().get("T1")).toBe("human");
+
+    // A stale waive written past the CLI (e.g. a racing writer) is refused again before enactment: the
+    // daemon's revalidation names it, its refusal row consumes it, and the test gate stays red.
+    j.append("task-approved", "T1", { by: "standing-order", via: "cli", release: "gate-satisfied", gate: "review", park: approvals[0]!.data.park });
+    const refused = staleApprovals(j.read());
+    expect(refused.get("T1")?.reason).toContain(`bound to park ${reviewPark} but the newest park is ${testPark}`);
+    // an unrelated task row landing between the decision and its refusal must not let the decision stand
+    j.append("worktree-preserved", "T1", { ref: `refs/tickmarkr/preserved/${runId}--T1` });
+    j.append(APPROVAL_REFUSED, "T1", { reason: refused.get("T1")!.reason, lines: refused.get("T1")!.lines });
+    expect(j.replaySatisfiedGates().get("T1")).toBeUndefined();
+    expect(j.replayStatuses().get("T1")).toBe("human");
+
+    // Versus: the matching decision on the open test park applies, bound to that park.
+    await expect(approve([runId, "T1", "--waive", "--park", testPark, "--gate", "test", "--by", "operator"], repo))
+      .resolves.toContain("waived failed gate test");
+    const bound = j.read().filter((e) => e.event === "task-approved").at(-1)!;
+    expect(bound.data).toMatchObject({ release: "gate-satisfied", gate: "test", park: { line: Number(testPark.split("@")[0]) } });
+    expect(staleApprovals(j.read()).size).toBe(0);
+    expect(j.replaySatisfiedGates().get("T1")).toBe("test");
+  });
+
+  test("a bound waiver requires an explicit recognized gate failed by its own park", () => {
+    const { repo } = setupRepo([T("T1")], { tasks: {} });
+    for (const gate of [undefined, "unknown", "test"]) {
+      const j = Journal.create(repo, `run-invalid-waive-${gate ?? "missing"}`);
+      j.append("gate-result", "T1", { gate: "test", pass: false, details: "1 failed" });
+      j.append("task-human", "T1", { kind: "gate-fail" });
+      j.append("task-human", "T1", { kind: "infra" });
+      j.append("task-approved", "T1", { release: "gate-satisfied", ...(gate === undefined ? {} : { gate }), park: j.newestBinding("T1") });
+      const line = j.readSourced().lines.at(-1)!;
+      expect(effectiveDecisions(j.read()).has(line)).toBe(false);
+      expect(staleApprovals(j.read()).get("T1")?.lines).toEqual([line]);
+      expect(j.replayStatuses().get("T1")).toBe("human");
+      expect(j.replaySatisfiedGates().get("T1")).toBeUndefined();
+      expect(journaledFailureBrief(j.read(), "T1")).toEqual(["test: 1 failed"]);
+      j.append("worktree-recreation", "T1", {});
+      expect(effectiveDecisions(j.read()).has(line)).toBe(false);
+      expect(journaledFailureBrief(j.read(), "T1")).toEqual(["test: 1 failed"]);
+    }
+  });
+
+  test("every open decision is judged: an unbound review waive followed by a bound recheck of the same park refuses, so review is never satisfied; a lone bound recheck stands", async () => {
+    const { repo } = setupRepo([T("T1")], { tasks: {} });
+    const runId = "run-open-decisions";
+    const j = Journal.create(repo, runId);
+    j.append("task-dispatch", "T1", { attempt: 0 });
+    j.append("gate-result", "T1", { gate: "review", pass: false, details: "reviewer requested changes" });
+    j.append("task-human", "T1", { kind: "gate-fail", reason: "review park" });
+    const park = j.newestBinding("T1")!;
+    // An unbound review waive lands, then a recheck correctly bound to P (the newest row).
+    j.append("task-approved", "T1", { by: "racer", via: "cli", release: "gate-satisfied", gate: "review" });
+    j.append("task-approved", "T1", { by: "operator", via: "cli", release: "recheck", park });
+    const refused = staleApprovals(j.read());
+    expect(refused.get("T1")?.reason).toMatch(/^#L\d+ an unbound decision names no park token/u);
+    j.append(APPROVAL_REFUSED, "T1", { reason: refused.get("T1")!.reason, lines: refused.get("T1")!.lines });
+    expect(j.replaySatisfiedGates().get("T1")).toBeUndefined(); // the refusal voids the unbound waive
+    expect(refused.get("T1")!.lines).toHaveLength(1); // only the unbound waive is named…
+    expect(staleApprovals(j.read()).size).toBe(0); // …the bound recheck survives its refusal
+    expect(j.replayStatuses().get("T1")).toBe("pending"); // released by that sound recheck alone, with review unsatisfied
+    // Versus: one bound recheck alone on the same park is judged sound.
+    j.append("task-approved", "T1", { by: "operator", via: "cli", release: "recheck", park });
+    expect(staleApprovals(j.read()).size).toBe(0);
+  });
+
+  test("an unenacted waive stays open across a newer park, so it is refused rather than carried into a recheck bound to the new park", () => {
+    const { repo } = setupRepo([T("T1")], { tasks: {} });
+    const runId = "run-unenacted-across-park";
+    const j = Journal.create(repo, runId);
+    j.append("task-dispatch", "T1", { attempt: 0 });
+    j.append("gate-result", "T1", { gate: "review", pass: false, details: "reviewer requested changes" });
+    j.append("task-human", "T1", { kind: "gate-fail", reason: "review park P" });
+    j.append("task-approved", "T1", { by: "racer", via: "cli", release: "gate-satisfied", gate: "review" }); // unbound, never enacted
+    j.append("task-human", "T1", { kind: "gate-fail", reason: "park Q" });
+    j.append("task-approved", "T1", { by: "operator", via: "cli", release: "recheck", park: j.newestBinding("T1") });
+    const refused = staleApprovals(j.read());
+    expect(refused.get("T1")?.reason).toMatch(/an unbound decision names no park token/u);
+    j.append(APPROVAL_REFUSED, "T1", { reason: refused.get("T1")!.reason, lines: refused.get("T1")!.lines });
+    expect(j.replaySatisfiedGates().get("T1")).toBeUndefined(); // review is never carried into Q's recheck
+    expect(refused.get("T1")!.lines).toHaveLength(1);
+    expect(j.replayStatuses().get("T1")).toBe("pending"); // Q's sound recheck alone releases the park
+  });
+
+  test("a park-bound decision is stale once the task fails after its park; a refused failed-task recheck keeps the failure token", async () => {
+    const { repo } = setupRepo([T("T1")], { tasks: {} });
+    const runId = "run-failed-after-park";
+    const j = Journal.create(repo, runId);
+    j.append("task-dispatch", "T1", { attempt: 0 });
+    j.append("task-human", "T1", { kind: "gate-fail", reason: "park" });
+    j.append("task-approved", "T1", { by: "operator", via: "cli", park: j.newestBinding("T1") });
+    j.append("task-failed", "T1", { error: "worker died" });
+    const staleApprove = staleApprovals(j.read()).get("T1")!;
+    expect(staleApprove.reason).toMatch(/but the task failed since/u);
+    j.append(APPROVAL_REFUSED, "T1", { reason: staleApprove.reason, lines: staleApprove.lines });
+    j.append("task-approved", "T1", { by: "racer", via: "cli", release: "recheck" }); // unbound recheck
+    const why = staleApprovals(j.read()).get("T1")!;
+    expect(why.reason).toMatch(/unbound decision/u);
+    j.append(APPROVAL_REFUSED, "T1", { reason: why.reason, lines: why.lines });
+    const failure = j.newestBinding("T1", "task-failed")!;
+    const { status } = await import("../../src/cli/commands/status.js");
+    expect(await status([runId], repo)).toContain(`failed — T1 — failure ${bindingToken(failure)}`);
+  });
+
+  // D-514: ONE fold decides whether a decision happened, keyed by physical journal line. Every consumer
+  // of task-approved rows must agree with it for every binding, park shape, refusal and blank line.
+  test("every decision consumer agrees with the one physical-line fold across {bound, unbound, stale} x {same park, new park, failed task, scope-request} x {refused, not} x {blank line before, not}", async () => {
+    const { repo } = setupRepo([T("T1", { files: ["src/a.ts"] })], { tasks: {} });
+    const graph = loadGraph(repo);
+    const task = graph.tasks[0]!;
+    const amended = { ...graph, tasks: [{ ...task, files: [...task.files, "src/b.ts"] }] };
+    const amendment = { from: graphDefinitionHash(graph), to: graphDefinitionHash(amended), beforeFiles: task.files, files: amended.tasks[0]!.files, definition: taskDefinitionFingerprint(task) };
+    const seat = { adapter: "fake", model: "fake-1", channel: "sub", tier: "frontier" };
+    let run = 0;
+    for (const binding of ["bound", "unbound", "stale"] as const) {
+      for (const shape of ["same park", "new park", "failed task", "scope-request"] as const) {
+        for (const refused of [false, true]) {
+          for (const blank of [false, true]) {
+            const label = `${binding} / ${shape} / ${refused ? "refused" : "not refused"} / ${blank ? "blank line before" : "no blank line"}`;
+            const runId = `run-agree-${run++}`;
+            const j = Journal.create(repo, runId);
+            const newest = (event: string): DecisionBinding => {
+              const { events, lines } = j.readSourced();
+              const i = events.map((e) => e.event).lastIndexOf(event);
+              return { line: lines[i]!, ts: events[i]!.ts };
+            };
+            j.append("run-start", undefined, { graphDefinitionHash: amendment.from });
+            j.append("task-dispatch", "T1", { assignment: seat, attempt: 0 });
+            const dispatch = newest("task-dispatch");
+            if (blank) appendFileSync(j.journalPath, "\n\n"); // physical lines now run ahead of row indexes
+            if (shape === "failed task") j.append("task-failed", "T1", { error: "worker died" });
+            else {
+              if (shape !== "scope-request") j.append("gate-result", "T1", { gate: "review", pass: false, details: "changes requested", commit: "c1" });
+              j.append("task-human", "T1", { kind: shape === "scope-request" ? "scope-request" : "gate-fail", reason: "parked" });
+            }
+            const open = newest(shape === "failed task" ? "task-failed" : "task-human");
+            const named = binding === "bound" ? open : binding === "stale" ? dispatch : undefined;
+            const release = shape === "failed task" ? { release: "recheck" } : shape === "scope-request"
+              ? { release: "scope-request", amendment: { ...amendment, parkLine: open.line } }
+              : { release: "gate-satisfied", gate: "review" };
+            j.append("task-approved", "T1", { by: "op", via: "cli", ...release, ...(named ? { [shape === "failed task" ? "failure" : "park"]: named } : {}) });
+            const decision = newest("task-approved").line;
+            if (shape === "new park") {
+              j.append("gate-result", "T1", { gate: "test", pass: false, details: "1 failed", commit: "c1" });
+              j.append("task-human", "T1", { kind: "gate-fail", reason: "newer park" });
+            }
+            if (refused) j.append(APPROVAL_REFUSED, "T1", { reason: "refused before enactment", lines: [decision] });
+
+            const took = binding === "bound" && shape !== "new park" && !refused;
+            const events = j.read();
+            expect(effectiveDecisions(events).has(decision), label).toBe(took);
+            expect(j.replayStatuses().get("T1"), label).toBe(took ? "pending" : shape === "failed task" ? "failed" : "human");
+            expect(j.replaySatisfiedGates().get("T1"), label).toBe(took && shape === "same park" ? "review" : undefined);
+            expect(j.replayResumeState().get("T1")?.lastAssignment === undefined, label).toBe(took && shape === "failed task");
+            expect(pendingApprovalActions(events).has("T1"), label).toBe(took);
+            expect(pendingDaemonApprovalActions(events).has("T1"), label).toBe(took);
+            expect(pendingRechecks(events).has("T1"), label).toBe(took && shape === "failed task");
+            // run-end reports answers, not effects: every decision not refused is still unanswered here
+            expect(outstandingApprovals(events).includes("T1"), label).toBe(!refused);
+            expect(staleApprovals(events).has("T1"), label).toBe(!took && !refused);
+            const scoped = took && shape === "scope-request";
+            expect(applyScopeAmendments(graph, j).tasks[0]!.files, label).toEqual(scoped ? amendment.files : task.files);
+            expect(recordedGraphDefinitionHash(j.read()), label).toBe(scoped ? amendment.to : amendment.from);
+            if (shape === "failed task") {
+              expect((await status([runId], repo)).includes(`failure ${bindingToken(open)}`), label).toBe(!took);
+            } else if (shape !== "scope-request") {
+              const preview = previewDecision({ verb: "waive", taskId: "T1" }, { cwd: repo, runId, by: "op" });
+              expect(preview.ok ? "open" : preview.refusal, label).toMatch(took ? /was already released at #L/u : /^open$/u);
+            }
+          }
+        }
+      }
+    }
+  });
+
+  test("an unbound review waive superseded by a newer park never takes effect, even once a recheck bound to that park is enacted, so review is never carried into the recheck", () => {
+    const { repo } = setupRepo([T("T1")], { tasks: {} });
+    const j = Journal.create(repo, "run-superseded-waive");
+    j.append("task-dispatch", "T1", { attempt: 0 });
+    j.append("gate-result", "T1", { gate: "review", pass: false, details: "changes requested", commit: "X" });
+    j.append("task-human", "T1", { kind: "gate-fail", reason: "review park P" });
+    j.append("task-approved", "T1", { by: "racer", via: "cli", release: "gate-satisfied", gate: "review" });
+    const waive = j.readSourced().lines.at(-1)!;
+    j.append("task-human", "T1", { kind: "infra", reason: "park Q" });
+    j.append("task-approved", "T1", { by: "operator", via: "cli", release: "recheck", park: j.newestBinding("T1") });
+    const recheck = j.readSourced().lines.at(-1)!;
+    j.append("recheck-battery", "T1", { pass: true });
+    const effective = effectiveDecisions(j.read());
+    expect(effective.has(waive)).toBe(false);
+    expect(effective.has(recheck)).toBe(true);
+    expect(j.replaySatisfiedGates(new Map([["T1", "X"]])).get("T1")).toBeUndefined();
+  });
+
+  test("a refused approval resets no execution budget: review rounds, identical-failure counts, repair history and the retry ban stand, versus a bound recheck that opens a new engagement", () => {
+    const { repo } = setupRepo([T("T1")], { tasks: {} });
+    const j = Journal.create(repo, "run-refused-budgets");
+    j.append("task-dispatch", "T1", { attempt: 0 });
+    j.append("gate-result", "T1", { gate: "review", pass: false, details: "changes requested" });
+    j.append("repair-attempt", "T1", { repair: 1, gates: ["test"] });
+    j.append("worker-launch", "T1", {});
+    j.append("gate-result", "T1", { gate: "test", pass: false, details: "FAIL a.test.ts" });
+    j.append("gate-result", "T1", { gate: "test", pass: false, details: "FAIL a.test.ts" });
+    j.append("gate-fingerprint-cap", "T1", { gate: "test", channel: "fake:fake-1" });
+    j.append("task-human", "T1", { kind: "gate-fail", reason: "fingerprint cap" });
+    const budgets = () => {
+      const events = j.read();
+      return {
+        reviewRounds: reviewRoundsSinceApproval(events, "T1"),
+        identical: identicalGateFailures(events, "T1", "test", normalizeGateFailure("FAIL a.test.ts")),
+        repairs: repairsSinceApproval(events, "T1"),
+        reach: repairReachSinceApproval(events, "T1").length,
+        ban: activeRetryBan(events, "T1", "fake:fake-1"),
+      };
+    };
+    const spent = { reviewRounds: 1, identical: 2, repairs: 1, reach: 1, ban: "test" };
+    expect(budgets()).toEqual(spent);
+    // An unbound recheck, then one bound to a park that is no longer open: both refused, neither resets a budget.
+    const park = j.newestBinding("T1")!;
+    j.append("task-approved", "T1", { by: "racer", via: "cli", release: "recheck" });
+    j.append("task-approved", "T1", { by: "racer", via: "cli", release: "recheck", park: { line: park.line - 1, ts: park.ts } });
+    expect(budgets()).toEqual(spent); // not yet refused: unsound decisions are no engagement either
+    const refused = staleApprovals(j.read()).get("T1")!;
+    expect(refused.lines).toHaveLength(2);
+    j.append(APPROVAL_REFUSED, "T1", { reason: refused.reason, lines: refused.lines });
+    expect(budgets()).toEqual(spent);
+    // Versus: the recheck bound to the open park is an effective decision — a new engagement.
+    j.append("task-approved", "T1", { by: "operator", via: "cli", release: "recheck", park });
+    expect(budgets()).toEqual({ reviewRounds: 0, identical: 0, repairs: 0, reach: 0, ban: undefined });
+  });
+
+  test("a refused recheck leaves status, the cockpit fold and the live board reading the park with its failed gate evidence at its physical line", async () => {
+    const { repo } = setupRepo([T("T1")], { tasks: {} });
+    const runId = "run-refused-surfaces";
+    const j = Journal.create(repo, runId);
+    j.append("run-start", undefined, { graphDefinitionHash: graphDefinitionHash(loadGraph(repo)), pid: 999_999_999 });
+    j.append("task-dispatch", "T1", { attempt: 0, assignment: { adapter: "fake", model: "fake-1" } });
+    j.append("gate-result", "T1", { gate: "test", pass: false, details: "1 failed" });
+    const gateLine = j.readSourced().lines.at(-1)!;
+    j.append("task-human", "T1", { kind: "gate-fail", reason: "test red" });
+    j.append("run-end", undefined, { done: [], failed: [], human: ["T1"], blocked: [], pending: [], tipVerify: "not required" });
+    appendFileSync(j.journalPath, "\n"); // physical lines now run ahead of row indexes
+    j.append("task-approved", "T1", { by: "racer", via: "cli", release: "recheck" }); // unbound
+    const refused = staleApprovals(j.read()).get("T1")!;
+    j.append(APPROVAL_REFUSED, "T1", { reason: refused.reason, lines: refused.lines });
+    expect(j.replayStatuses().get("T1")).toBe("human");
+
+    // status and every capture reader fold the cockpit rows over the decided journal
+    const raw = readFileSync(j.journalPath, "utf8");
+    expect(deriveRunCockpitData({ fileName: `${runId}.journal.jsonl`, raw }, "test").taskRows.find((r) => r.taskId === "T1"))
+      .toMatchObject({ state: "human", parkKind: "gate-fail" });
+    const shown = (await status([runId], repo)).split("\n").find((line) => /\bT1\b/u.test(line) && /\[.\]/u.test(line))!;
+    expect(shown).toMatch(/\bparked \(gate-fail\)/u);
+    expect(shown).not.toMatch(/\bpending\b/u);
+
+    // the live board: the store's incremental fold reads the refused row as a release; the decided store does not
+    const store = createLiveStore({ cwd: repo, runId });
+    try {
+      expect(store.snapshot().operator.tasks.find((t) => t.id === "T1")!.state).toBe("pending");
+      const board = decidedLiveStore(store).snapshot().operator;
+      const task = board.tasks.find((t) => t.id === "T1")!;
+      expect(task.state).toBe("human");
+      expect(task.parkKind).toBe("gate-fail");
+      expect(task.gates.test).toMatchObject({ state: "failed", evidence: { line: gateLine, id: `${j.journalPath}#L${gateLine}` } });
+      expect(board.approvedResumeRequired).toBe(false);
+      expect(board.label).not.toBe("approved; resume required");
+    } finally { store.dispose(); }
+
+    // A later run-end restores the park on the raw fold, but not the gate evidence the refused recheck
+    // erased there: the decided board keeps it whatever state the raw fold shows.
+    j.append("run-end", undefined, { done: [], failed: [], human: ["T1"], blocked: [], pending: [], tipVerify: "not required" });
+    const ended = createLiveStore({ cwd: repo, runId });
+    try {
+      const rawTask = ended.snapshot().operator.tasks.find((t) => t.id === "T1")!;
+      expect(rawTask.state).toBe("human");
+      expect(rawTask.gates.test?.state).not.toBe("failed");
+      expect(decidedLiveStore(ended).snapshot().operator.tasks.find((t) => t.id === "T1")!.gates.test)
+        .toMatchObject({ state: "failed", evidence: { line: gateLine } });
+    } finally { ended.dispose(); }
+  });
+
+  test("an enacted decision consumes its park: a second approval bound to that park after the task completed is stale and never resurrects the task", () => {
+    const { repo } = setupRepo([T("T1")], { tasks: {} });
+    const j = Journal.create(repo, "run-consumed-park");
+    j.append("gate-result", "T1", { gate: "review", pass: false, details: "changes requested" });
+    j.append("task-human", "T1", { kind: "gate-fail", reason: "review park" });
+    const park = j.newestBinding("T1")!;
+    j.append("task-approved", "T1", { by: "operator", via: "cli", park });
+    j.append("task-dispatch", "T1", { attempt: 1 });
+    j.append("task-done", "T1", {});
+    const enacted = j.readSourced().lines[2]!;
+    j.append("task-approved", "T1", { by: "late", via: "cli", park });
+    const late = j.readSourced().lines.at(-1)!;
+    const { effective, open } = foldDecisions(j.read());
+    expect(effective.has(enacted)).toBe(true); // the enacted decision stays effective
+    expect(effective.has(late)).toBe(false);
+    expect(open).toEqual([expect.objectContaining({ taskId: "T1", line: late, stale: expect.stringContaining("newest park is none") })]);
+    expect(staleApprovals(j.read()).get("T1")?.lines).toEqual([late]);
+    expect(j.replayStatuses().get("T1")).toBe("done");
   });
 });

@@ -13,10 +13,14 @@ import { LIVEBENCH_TABLE_URL, MODELS_DEV_CATALOG_URL } from "../../src/adapters/
 import { retiredModelReason } from "../../src/adapters/model-lints.js";
 import { GLYPHS } from "../../src/brand.js";
 import { assembleFleetEditor, fleet, type FleetIO } from "../../src/cli/commands/fleet.js";
+import { doctor } from "../../src/cli/commands/doctor.js";
+import { Journal } from "../../src/run/journal.js";
 import { formatFleetPrint, loadConfig, overlayBytesLoadError } from "../../src/config/config.js";
 import { pickRole } from "../../src/route/role-pick.js";
+import { route } from "../../src/route/router.js";
+import { TaskSchema } from "../../src/graph/schema.js";
 import { tickmarkrDir } from "../../src/graph/graph.js";
-import { channelsFromConfig, type WorkerAdapter } from "../../src/adapters/types.js";
+import { channelKey, channelsFromConfig, type WorkerAdapter } from "../../src/adapters/types.js";
 import { makeRepo } from "../helpers/tmprepo.js";
 
 const FAKE_TIERS = `tiers:
@@ -49,6 +53,7 @@ const KEYS = {
   s: "s",
   y: "y",
   n: "n",
+  tab: "\t",
   backspace: "\x7f",
 } as const;
 
@@ -2693,5 +2698,482 @@ describe("Fleet role selection", () => {
     const stale = new Date(0);
     utimesSync(join(repo, ".tickmarkr", "doctor.json"), stale, stale);
     expect(await pick("consult")).toEqual({ code: 1, out: expect.stringContaining("consult.prefer: probe data missing or stale") });
+  });
+});
+
+// OBS-1144: the review diff is the last screen before y — every dead pool entry the written config
+// carries is named there with its reason and with what still routes, never saved silently.
+describe("OBS-1144 the write review names each dead carried pool entry", () => {
+  // the review panel wraps a long note at its own width: read that column back as one text
+  const reviewText = (frame: string) => {
+    const rows = strip(frame).split("\n");
+    const col = rows.find((row) => row.includes("│ review ·"))?.indexOf("│ review ·") ?? 0;
+    return rows.map((row) => row.slice(col + 1).replace(/[│╭╮╰╯─]/g, "").trim()).filter(Boolean).join(" ");
+  };
+
+  test("the Fleet write review names denied B while keeping admitted A routable versus naming an exhausted pool, so saving a dead entry without its reason fails", async () => {
+    const writeDeny = async (channels: string) => {
+      const { repo, adapter } = setup();
+      withOverlay(repo, `${FAKE_TIERS}routing:\n  map:\n    implement: { pool: { mode: ordered, channels: [${channels}] } }\n`);
+      const globalDir = isolatedGlobal();
+      const io = makeIO();
+      queueAnswers("y");
+      // the cursor row is fake:fake-1 (B): out(workers) stages the deny the review must explain
+      const out = await drive(repo, adapter, io.io, REACH_WORKERS + KEYS.w, ["--global-dir", globalDir]);
+      expect(out).toMatch(/^fleet: wrote /);
+      expect(parse(readFileSync(join(repo, ".tickmarkr", "config.yaml"), "utf8")).routing.deny.workers.models).toEqual(["fake:fake-1"]);
+      const review = reviewText(io.writes.find((f) => strip(f).includes("review ·")) ?? "");
+      const why = await fleet(["--why", "--global-dir", globalDir], repo, [adapter]);
+      return { review, implement: why.split("\n").find((line) => /\bimplement\b/.test(line)) ?? "" };
+    };
+    const reason = "routing.map.implement.pool entry fake:fake-1 is disallowed by routing.deny (fake:fake-1)";
+
+    const partial = await writeDeny("fake:fake-1, fake:fake-2");
+    expect(partial.review).toContain(`! ${reason} — skipped — routes the admitted remainder fake:fake-2`);
+    expect(partial.implement).toContain("pool(ordered·2) → fake:fake-2");
+
+    const exhausted = await writeDeny("fake:fake-1");
+    expect(exhausted.review).toContain(`! ${reason} — the pool is exhausted — no admitted entry remains, so the shape is unroutable`);
+    expect(exhausted.review).not.toContain("routes the admitted remainder");
+    expect(exhausted.implement).toContain("routing.map.implement.pool is exhausted");
+  });
+
+  test("at 80x24 the wrapped notes of several dead entries scroll with the diff, so none is unreachable before y", async () => {
+    const { repo, adapter } = setup();
+    const shapes = ["implement", "docs", "tests", "refactor", "chore"];
+    const pools = shapes.map((shape) => `    ${shape}: { pool: { mode: any, channels: [fake:fake-1, fake:fake-2] } }\n`).join("");
+    withOverlay(repo, `${FAKE_TIERS}routing:\n  map:\n${pools}`);
+    const io = makeIO();
+    io.output.columns = 80;
+    io.output.rows = 24; // viewRows 12 → a 13-row review window; five notes wrap to far more rows
+    const done = fleet(["--global-dir", isolatedGlobal()], repo, [adapter], io.io);
+    io.input.write(REACH_WORKERS + KEYS.w);
+    await settle(() => strip(io.writes.join("")).includes("review · "));
+    expect(strip(io.writes.at(-1)!)).toMatch(/… \d+ below — ↓ scrolls/);
+    // the whole frame fits the terminal: nothing sits below its last row, unreachable
+    const fits = () => expect(strip(io.writes.at(-1)!).split("\n").length).toBeLessThanOrEqual(24);
+    fits();
+    const seen: string[] = [reviewText(io.writes.at(-1)!)];
+    // one line at a time, so every note (≤ the window tall) is wholly on screen in some frame
+    for (let i = 0; i < 80 && /… \d+ below/.test(strip(io.writes.at(-1)!)); i++) {
+      const mark = io.writes.length;
+      io.input.write(KEYS.down);
+      await settle(() => io.writes.length > mark);
+      seen.push(reviewText(io.writes.at(-1)!));
+      fits();
+    }
+    expect(strip(io.writes.at(-1)!)).not.toMatch(/… \d+ below/);
+    for (const shape of shapes) {
+      expect(seen.some((text) => text.includes(
+        `! routing.map.${shape}.pool entry fake:fake-1 is disallowed by routing.deny (fake:fake-1) — skipped — routes the admitted remainder fake:fake-2`,
+      ))).toBe(true);
+    }
+    io.input.write("\x03");
+    expect(await done).toBe("fleet: quit without writing");
+  });
+});
+
+// OBS-1145 add.1: a carried pool member the picker cannot offer stays IN the chain at its own
+// ordinal with its ✗ reason, and Space drops it without lifting the deny that excludes it.
+describe("OBS-1145 Fleet removes an inadmissible carried pool entry", () => {
+  const RAIL = KEYS.left;
+  const TO_DOCS = RAIL + KEYS.down + KEYS.enter + KEYS.escape + KEYS.down.repeat(4);
+  // reads cfg.tiers, so three frontier channels exist without widening the shared FakeAdapter
+  const threeAdapter: WorkerAdapter = {
+    id: "fake",
+    vendor: "fake",
+    probe: async () => ({ installed: true, authed: true, models: [] }),
+    channels: (cfg) => channelsFromConfig("fake", cfg),
+    headlessCommand: () => "fake",
+    interactiveCommand: () => null,
+    invoke: () => ({ command: "fake" }),
+    parse: () => ({ ok: false, summary: "unused", deviations: [], raw: "" }),
+    listModels: async () => [],
+  };
+  const models = ["fake-1", "fake-2", "fake-3"];
+  const setupAXB = (deny = "[fake:fake-2]", pool = "[fake:fake-1, fake:fake-2, fake:fake-3]") => {
+    const repo = makeRepo({ "keep.txt": "x" });
+    withOverlay(repo, `tiers:
+  fake:
+    vendor: fake
+    channel: sub
+    models:
+${models.map((m) => `      ${m}: frontier\n`).join("")}routing:
+  deny:
+    models: ${deny}
+  map:
+    docs: { pool: { mode: ordered, channels: ${pool} } }
+`);
+    const probedAt = "2026-09-25T00:00:00.000Z";
+    registry.writeDoctor(repo, {
+      fake: {
+        installed: true, authed: true, version: "fake", models,
+        modelAuth: Object.fromEntries(models.map((m) => [m, { authed: true, probedAt }])),
+      },
+    });
+    const when = new Date(Date.now() - 5 * 60_000);
+    utimesSync(join(tickmarkrDir(repo), "doctor.json"), when, when);
+    return repo;
+  };
+  const written = (repo: string) => parse(readFileSync(join(repo, ".tickmarkr", "config.yaml"), "utf8")) as Record<string, any>;
+  // opens docs' picker, returns its first frame and the row index of each candidate/ledger line
+  const openPicker = async (io: ReturnType<typeof makeIO>, keys: string) => {
+    const mark = io.writes.length;
+    io.input.write(keys);
+    await settle(() => io.writes.slice(mark).map(strip).some((f) => f.includes("pool · docs")));
+    const frame = io.writes.slice(mark).map(strip).find((f) => f.includes("pool · docs"))!;
+    const items = frame.split("\n").filter((l) => /fake[:/]fake-\d/.test(l) && !l.includes("not offered:") && !l.includes("pool:"));
+    return { frame, rowOf: (id: string) => items.findIndex((l) => l.includes(id)) };
+  };
+  const commit = async (io: ReturnType<typeof makeIO>, keys: string, apply: string = KEYS.enter) => {
+    const mark = io.writes.length;
+    io.input.write(keys + apply);
+    await settle(() => io.writes.slice(mark).map(strip).some((f) => f.includes("pool mode · docs")));
+    const summary = io.writes.slice(mark).map(strip).find((f) => f.includes("pool mode · docs"))!;
+    io.input.write(KEYS.enter + KEYS.w + KEYS.y);
+    return summary;
+  };
+
+  test("Fleet renders excluded X at ordinal 2 in chain A X B and commits A B after Space versus retaining untouched X, so a hidden or irremovable chain member fails", async () => {
+    // Space on X: the ✗ row carries ordinal 2 and its deny reason; Space drops it, B renumbers
+    const repo = setupAXB();
+    const io = makeIO();
+    const done = fleet(["--global-dir", isolatedGlobal()], repo, [threeAdapter], io.io);
+    const { frame, rowOf } = await openPicker(io, TO_DOCS + KEYS.p);
+    expect(frame).toMatch(/1 fake:fake-1/);
+    expect(frame).toMatch(/2 ✗ fake\/fake-2 — reach: out all — routing\.deny\.models \(fake:fake-2\)/);
+    expect(frame).toMatch(/3 fake:fake-3/);
+    const x = rowOf("fake/fake-2");
+    expect(x).toBeGreaterThan(-1);
+    const mark = io.writes.length;
+    io.input.write(KEYS.down.repeat(x) + KEYS.space);
+    await settle(() => io.writes.slice(mark).map(strip).some((f) => /2 fake:fake-3/.test(f)));
+    const dropped = strip(io.writes.at(-1)!);
+    expect(dropped).toMatch(/2 fake:fake-3/);
+    expect(dropped).not.toMatch(/\d ✗ fake\/fake-2/);
+    expect(await commit(io, KEYS.up.repeat(x))).toContain("pool: fake:fake-1 → fake:fake-3");
+    expect(await done).toMatch(/^fleet: wrote /);
+    expect(written(repo).routing.map.docs.pool).toEqual({ mode: "ordered", channels: ["fake:fake-1", "fake:fake-3"] });
+    expect(written(repo).routing.deny.models).toEqual(["fake:fake-2"]); // the drop lifted no deny
+
+    // reopen: the remaining pool and order round-trip; Space on the now-unchained ✗ X adds nothing
+    const again = makeIO();
+    const reopened = fleet(["--global-dir", isolatedGlobal()], repo, [threeAdapter], again.io);
+    const second = await openPicker(again, TO_DOCS + KEYS.p);
+    expect(second.frame).toMatch(/1 fake:fake-1/);
+    expect(second.frame).toMatch(/2 fake:fake-3/);
+    expect(second.frame).not.toMatch(/\d ✗ fake\/fake-2/);
+    const refuse = again.writes.length;
+    again.input.write(KEYS.down.repeat(second.rowOf("fake/fake-2")) + KEYS.space);
+    await settle(() => again.writes.slice(refuse).map(strip).some((f) => f.includes("Enter lifts it first")));
+    expect(strip(again.writes.at(-1)!)).toContain("fake:fake-2 is not offered — Enter lifts it first");
+    expect(strip(again.writes.at(-1)!)).not.toMatch(/\d ✗ fake\/fake-2/);
+    again.input.write("\x03");
+    expect(await reopened).toBe("fleet: quit without writing");
+
+    // versus: Space on B instead leaves X untouched — it is retained at its ordinal and written
+    const control = setupAXB();
+    const cio = makeIO();
+    const cdone = fleet(["--global-dir", isolatedGlobal()], control, [threeAdapter], cio.io);
+    const picker = await openPicker(cio, TO_DOCS + KEYS.p);
+    const b = picker.rowOf("fake:fake-3");
+    expect(await commit(cio, KEYS.down.repeat(b) + KEYS.space + KEYS.up.repeat(b))).toContain("pool: fake:fake-1 → fake:fake-2");
+    expect(await cdone).toMatch(/^fleet: wrote /);
+    expect(written(control).routing.map.docs.pool).toEqual({ mode: "ordered", channels: ["fake:fake-1", "fake:fake-2"] });
+  });
+
+  test("an entirely denied pool commits a Space drop through Tab and keeps every deny", async () => {
+    // pool [X, Y], every installed channel denied: no row is offered, Enter on any row lifts it,
+    // so Tab is the commit path — it writes [Y] and reopening shows Y alone at ordinal 1
+    const repo = setupAXB("[fake:fake-1, fake:fake-2, fake:fake-3]", "[fake:fake-1, fake:fake-2]");
+    const io = makeIO();
+    const done = fleet(["--global-dir", isolatedGlobal()], repo, [threeAdapter], io.io);
+    const { frame } = await openPicker(io, TO_DOCS + KEYS.p);
+    expect(frame).toMatch(/2 ✗ fake\/fake-2/);
+    expect(frame).toMatch(/❯ 1 ✗ fake\/fake-1/); // the cursor opens on X
+    expect(await commit(io, KEYS.space, KEYS.tab)).toContain("pool: fake:fake-2");
+    expect(await done).toMatch(/^fleet: wrote /);
+    expect(written(repo).routing.map.docs.pool).toEqual({ mode: "ordered", channels: ["fake:fake-2"] });
+    expect(written(repo).routing.deny.models).toEqual(["fake:fake-1", "fake:fake-2", "fake:fake-3"]);
+
+    const again = makeIO();
+    const reopened = fleet(["--global-dir", isolatedGlobal()], repo, [threeAdapter], again.io);
+    const second = await openPicker(again, TO_DOCS + KEYS.p);
+    expect(second.frame).toMatch(/1 ✗ fake\/fake-2/);
+    expect(second.frame).not.toMatch(/\d ✗ fake\/fake-1/);
+    again.input.write("\x03");
+    expect(await reopened).toBe("fleet: quit without writing");
+  });
+
+  test("carried entries lead the picker ledger in chain order and an undiscovered one still gets its own row", async () => {
+    const repo = setupAXB();
+    withOverlay(repo, readFileSync(join(repo, ".tickmarkr", "config.yaml"), "utf8")
+      .replace("fake-3: frontier", "fake-3: frontier\n      fake-4: frontier")
+      .replace("models: [fake:fake-2]", "models: [fake:fake-2, fake:fake-4]")
+      .replace("[fake:fake-1, fake:fake-2, fake:fake-3]", "[fake:fake-1, fake:fake-9, fake:fake-4, fake:fake-3]"));
+    const assembled = await assembleFleetEditor(repo, [threeAdapter], makeIO().io, { globalDir: isolatedGlobal() });
+    if ("unavailable" in assembled) throw new Error(assembled.unavailable);
+    const { candidatesForShape, initialMap, initialDenyAdapters, initialDenyModels } = assembled.props;
+    const picked = candidatesForShape("docs", "risk-based", initialMap, {
+      adapters: initialDenyAdapters, models: initialDenyModels, workersAdapters: [], workersModels: [],
+    });
+    // natural order is fake-2 then fake-4; the carried fake-9 and fake-4 lead, in pool order
+    expect(picked.ledger?.map((line) => line.split(" — ")[0])).toEqual(["fake/fake-9", "fake/fake-4", "fake/fake-2"]);
+    expect(picked.ledger?.[0]).toBe("fake/fake-9 — not served by an installed adapter — carried in routing.map.docs.pool");
+  });
+});
+
+describe("OBS-1052(3) review no-verdict history", () => {
+  const OPEN_STEER = KEYS.left + KEYS.down.repeat(2) + KEYS.enter;
+  const SEAT = "fake:fake-1";
+  const doctorStub = { id: "fixture", vendor: "x", probe: async () => ({ installed: true, authed: true, models: [] }) } as unknown as WorkerAdapter;
+  let seq = 0;
+  // one completed run: each no-verdict journals its note AND the terminal review gate-result repeating it
+  const completedRun = (repo: string, noVerdicts: number) => {
+    seq += 1;
+    const journal = Journal.create(repo, `run-20260920-000000-${String(seq).padStart(16, "0")}`);
+    journal.append("run-start", undefined, { branch: "test" });
+    for (let i = 0; i < noVerdicts; i++) {
+      journal.append("review-no-verdict", "T1", { reviewer: SEAT, noVerdict: true, cause: "no-verdict" });
+      journal.append("gate-result", "T1", { gate: "review", reviewer: SEAT, noVerdict: true, cause: "no-verdict", skipped: true, infra: true, details: "no verdict" });
+    }
+    if (!noVerdicts) journal.append("gate-result", "T1", { gate: "review", pass: true, reviewer: SEAT, details: "ok" });
+    journal.append("run-end", undefined, {});
+  };
+  const surfaces = async (runs: number[]) => {
+    const { repo, adapter } = setup();
+    for (const noVerdicts of runs) completedRun(repo, noVerdicts);
+    const assembled = await assembleFleetEditor(repo, [adapter], makeIO().io, { globalDir: isolatedGlobal() });
+    if ("unavailable" in assembled) throw new Error(assembled.unavailable);
+    const reviewPool = registry.discoverChannels(loadConfig(repo), [adapter], registry.readDoctor(repo)!, "review")
+      .map((c) => `${c.adapter}:${c.model}`);
+    const { io, writes } = makeIO();
+    expect(await drive(repo, adapter, io, OPEN_STEER + KEYS.q, ["--global-dir", isolatedGlobal()])).toBe("fleet: quit without writing");
+    const frame = strip(writes.join(""));
+    const report = strip(await doctor(["--"], repo, [doctorStub], { banner: false }));
+    return { assembled, reviewPool, frame, report };
+  };
+
+  test("Fleet and doctor flag a review channel with two no-verdicts in the last ten completed runs versus one or an eleventh-run event, so a duplicate count or eligibility change fails", async () => {
+    // two no-verdicts at both edges of a ten-run window
+    const flagged = await surfaces([1, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    expect(flagged.assembled.props.reviewAdvisories).toEqual([
+      `review history: ${SEAT} — 2 review no-verdicts in the last 10 completed runs — advisory; review eligibility unchanged`,
+    ]);
+    expect(flagged.frame).toContain(`! review history: ${SEAT} — 2 review no-verdicts in the last 10`);
+    expect(flagged.report).toMatch(/fake:fake-1\s+2 review no-verdicts in the last 10 completed runs — advisory; review eligibility unchanged/);
+    // advisory only: the flagged seat stays in the review pool and every steering/judge picker
+    expect(flagged.reviewPool).toContain(SEAT);
+    expect(flagged.assembled.props.steeringOptionsFor("review", [])).toContain(SEAT);
+    expect(flagged.assembled.props.judgeSeats).toContain(SEAT);
+
+    // one observed no-verdict (its gate-result row repeats it) is one, not two
+    const once = await surfaces([1]);
+    expect(once.assembled.props.reviewAdvisories).toEqual([]);
+    expect(once.frame).not.toContain("review history:");
+    expect(once.report).toMatch(/fake:fake-1\s+1 review no-verdict in the last 1 completed run$/m);
+
+    // the first of eleven completed runs is outside the window
+    const eleventh = await surfaces([1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+    expect(eleventh.assembled.props.reviewAdvisories).toEqual([]);
+    expect(eleventh.frame).not.toContain("review history:");
+    expect(eleventh.report).toMatch(/fake:fake-1\s+1 review no-verdict in the last 10 completed runs$/m);
+    for (const quiet of [once, eleventh]) {
+      expect(quiet.reviewPool).toContain(SEAT);
+      expect(quiet.report).not.toContain("advisory; review eligibility unchanged");
+    }
+  });
+});
+
+describe("OBS-1182 Fleet persists launch effort as channel metadata", () => {
+  test("Fleet round-trips configured Claude high or Codex medium effort into routed Assignment versus omitted effort preserving defaults, so a metadata bridge changing channel identity fails", async () => {
+    const repo = makeRepo({ "keep.txt": "x" });
+    const gdir = isolatedGlobal();
+    // a pre-existing codex override: the effort write must land BESIDE its channel, never replace it
+    withOverlay(repo, "tiers:\n  codex:\n    modelOverrides:\n      gpt-5.6-sol: { channel: api }\n");
+    const authed = (models: string[]) => ({
+      installed: true, authed: true, version: "x", models, modelsDetectedAt: "2026-09-25T00:00:00.000Z",
+      modelAuth: Object.fromEntries(models.map((m) => [m, { authed: true, probedAt: "2026-09-25T00:00:00.000Z" }])),
+    });
+    registry.writeDoctor(repo, { "claude-code": authed(["fable", "opus"]), codex: authed(["gpt-5.6-sol"]) });
+    const when = new Date(Date.now() - 5 * 60_000);
+    utimesSync(join(tickmarkrDir(repo), "doctor.json"), when, when);
+    const base = fakeAdapter(repo);
+    const seat = (id: string): WorkerAdapter => Object.assign(Object.create(base) as WorkerAdapter, {
+      id, channels: (cfg: Parameters<WorkerAdapter["channels"]>[0]) => channelsFromConfig(id, cfg),
+    });
+    const seats = [seat("claude-code"), seat("codex")];
+    const session = async (keys: string) => {
+      const { io } = makeIO();
+      const out = fleet(["--global-dir", gdir], repo, seats, io);
+      io.input!.write(keys);
+      return out;
+    };
+    const channelsOf = () => {
+      const cfg = loadConfig(repo, { globalDir: gdir });
+      return { cfg, channels: [...channelsFromConfig("claude-code", cfg), ...channelsFromConfig("codex", cfg)] };
+    };
+    const routed = (via: string, model: string) => {
+      const { cfg, channels } = channelsOf();
+      const task = TaskSchema.parse({
+        id: "T1", title: "t", goal: "g", shape: "implement", complexity: 3, acceptance: ["a"],
+        routingHints: { pin: { via, model } },
+      });
+      return route(task, cfg, channels).assignment;
+    };
+    const keysBefore = channelsOf().channels.map(channelKey);
+    const search = (q: string) => `/${q}${KEYS.enter}`;
+
+    // default → low → medium → high on fable; default → low → medium on sol
+    expect(await session(`${search("claude-code/fable")}eee${KEYS.escape}${search("codex/gpt-5.6-sol")}ee${KEYS.escape}${KEYS.w}y`))
+      .toMatch(/^fleet: wrote /);
+    const parsedOverlay = () => parse(readFileSync(join(repo, ".tickmarkr", "config.yaml"), "utf8")) as Record<string, any>;
+    const written = parsedOverlay();
+    expect(written.tiers["claude-code"]).toEqual({ modelOverrides: { fable: { effort: "high" } } });
+    expect(written.tiers.codex).toEqual({ modelOverrides: { "gpt-5.6-sol": { channel: "api", effort: "medium" } } });
+
+    // identity is untouched: the same channel keys, no effort folded into any model id
+    expect(channelsOf().channels.map(channelKey)).toEqual(keysBefore);
+    expect(routed("claude-code", "fable")).toEqual({ adapter: "claude-code", model: "fable", channel: "sub", tier: "frontier", effort: "high" });
+    expect(routed("codex", "gpt-5.6-sol")).toEqual({ adapter: "codex", model: "gpt-5.6-sol", channel: "api", tier: "frontier", effort: "medium" });
+    const omitted = routed("claude-code", "opus");
+    expect(omitted).toEqual({ adapter: "claude-code", model: "opus", channel: "sub", tier: "frontier" });
+    expect("effort" in omitted).toBe(false);
+    expect(await fleet(["--print", "--global-dir", gdir], repo, seats)).toMatch(/fable:\s+effort: high # repo — fleet e edits/);
+
+    // high → default clears fable's key alone; sol keeps its channel and medium effort
+    expect(await session(`${search("claude-code/fable")}e${KEYS.escape}${KEYS.w}y`)).toMatch(/^fleet: wrote /);
+    const cleared = parsedOverlay();
+    expect(cleared.tiers["claude-code"]).toBeUndefined();
+    expect(cleared.tiers.codex).toEqual({ modelOverrides: { "gpt-5.6-sol": { channel: "api", effort: "medium" } } });
+    expect("effort" in routed("claude-code", "fable")).toBe(false);
+    expect(routed("codex", "gpt-5.6-sol").effort).toBe("medium");
+    expect(channelsOf().channels.map(channelKey)).toEqual(keysBefore);
+  });
+
+  test("clearing an effort a lower layer declares masks it in the merged config, keeping vendor/channel siblings and never an empty override", async () => {
+    const repo = makeRepo({ "keep.txt": "x" });
+    const gdir = isolatedGlobal();
+    // global high under repo medium (fable); global effort-only (opus); global effort beside a channel (sol)
+    writeFileSync(join(gdir, "config.yaml"), `tiers:
+  claude-code:
+    modelOverrides:
+      fable: { effort: high }
+      opus: { effort: low }
+  codex:
+    modelOverrides:
+      gpt-5.6-sol: { channel: api, effort: high }
+`);
+    withOverlay(repo, "tiers:\n  claude-code:\n    modelOverrides:\n      fable: { effort: medium }\n");
+    const authed = (models: string[]) => ({
+      installed: true, authed: true, version: "x", models, modelsDetectedAt: "2026-09-25T00:00:00.000Z",
+      modelAuth: Object.fromEntries(models.map((m) => [m, { authed: true, probedAt: "2026-09-25T00:00:00.000Z" }])),
+    });
+    registry.writeDoctor(repo, { "claude-code": authed(["fable", "opus"]), codex: authed(["gpt-5.6-sol"]) });
+    const when = new Date(Date.now() - 5 * 60_000);
+    utimesSync(join(tickmarkrDir(repo), "doctor.json"), when, when);
+    const base = fakeAdapter(repo);
+    const seat = (id: string): WorkerAdapter => Object.assign(Object.create(base) as WorkerAdapter, {
+      id, channels: (cfg: Parameters<WorkerAdapter["channels"]>[0]) => channelsFromConfig(id, cfg),
+    });
+    const { io } = makeIO();
+    const out = fleet(["--global-dir", gdir], repo, [seat("claude-code"), seat("codex")], io);
+    const search = (q: string) => `/${q}${KEYS.enter}`;
+    // medium → high → default; low → medium → high → default; high → default
+    io.input!.write(`${search("claude-code/fable")}ee${KEYS.escape}${search("claude-code/opus")}eee${KEYS.escape}${search("codex/gpt-5.6-sol")}e${KEYS.escape}${KEYS.w}y`);
+    expect(await out).toMatch(/^fleet: wrote /);
+
+    const written = parse(readFileSync(join(repo, ".tickmarkr", "config.yaml"), "utf8")) as Record<string, any>;
+    expect(written.tiers["claude-code"].modelOverrides).toEqual({ fable: null, opus: null });
+    expect(written.tiers.codex.modelOverrides).toEqual({ "gpt-5.6-sol": { effort: null } });
+    const cfg = loadConfig(repo, { globalDir: gdir });
+    const all = [...channelsFromConfig("claude-code", cfg), ...channelsFromConfig("codex", cfg)];
+    for (const model of ["fable", "opus", "gpt-5.6-sol"]) expect(all.find((c) => c.model === model)).not.toHaveProperty("effort");
+    expect(cfg.tiers.codex.modelOverrides?.["gpt-5.6-sol"]).toEqual({ channel: "api" });
+    expect(all.find((c) => c.model === "gpt-5.6-sol")?.channel).toBe("api");
+  });
+
+  test("clearing a repo effort masks a global one even when the global layer only validates beside repo fields", async () => {
+    const repo = makeRepo({ "keep.txt": "x" });
+    const gdir = isolatedGlobal();
+    // D-503 repro: global vendor:null cannot load without the repo's vendor, yet its fable effort is inherited
+    writeFileSync(join(gdir, "config.yaml"), "tiers:\n  claude-code:\n    vendor: null\n    modelOverrides:\n      fable: { effort: high }\n");
+    withOverlay(repo, "tiers:\n  claude-code:\n    vendor: anthropic\n    modelOverrides:\n      fable: { effort: medium }\n");
+    registry.writeDoctor(repo, { "claude-code": {
+      installed: true, authed: true, version: "x", models: ["fable"], modelsDetectedAt: "2026-09-25T00:00:00.000Z",
+      modelAuth: { fable: { authed: true, probedAt: "2026-09-25T00:00:00.000Z" } },
+    } });
+    const when = new Date(Date.now() - 5 * 60_000);
+    utimesSync(join(tickmarkrDir(repo), "doctor.json"), when, when);
+    const base = fakeAdapter(repo);
+    const seat = Object.assign(Object.create(base) as WorkerAdapter, {
+      id: "claude-code", channels: (cfg: Parameters<WorkerAdapter["channels"]>[0]) => channelsFromConfig("claude-code", cfg),
+    });
+    expect(channelsFromConfig("claude-code", loadConfig(repo, { globalDir: gdir })).find((c) => c.model === "fable")?.effort).toBe("medium");
+    const { io } = makeIO();
+    const out = fleet(["--global-dir", gdir], repo, [seat], io);
+    // medium → high → default
+    io.input!.write(`/claude-code/fable${KEYS.enter}ee${KEYS.escape}${KEYS.w}y`);
+    expect(await out).toMatch(/^fleet: wrote /);
+
+    const written = parse(readFileSync(join(repo, ".tickmarkr", "config.yaml"), "utf8")) as Record<string, any>;
+    expect(written.tiers["claude-code"]).toEqual({ vendor: "anthropic", modelOverrides: { fable: null } });
+    const fable = channelsFromConfig("claude-code", loadConfig(repo, { globalDir: gdir })).find((c) => c.model === "fable");
+    expect(fable).toMatchObject({ vendor: "anthropic", channel: "sub" });
+    expect(fable).not.toHaveProperty("effort");
+  });
+});
+
+describe("OBS-1182 setting effort beneath a tombstone", () => {
+  test("setting an effort beneath a tombstoned override or modelOverrides re-masks the inherited vendor/channel and sibling overrides it suppressed", async () => {
+    const repo = makeRepo({ "keep.txt": "x" });
+    const gdir = isolatedGlobal();
+    writeFileSync(join(gdir, "config.yaml"), `tiers:
+  claude-code:
+    modelOverrides:
+      fable: { channel: api }
+  codex:
+    modelOverrides:
+      gpt-5.6-sol: { vendor: azure, channel: api }
+      gpt-5.6-terra: { channel: api }
+`);
+    // the repo suppresses fable's override and codex's whole modelOverrides block
+    withOverlay(repo, "tiers:\n  claude-code:\n    modelOverrides:\n      fable: null\n  codex:\n    modelOverrides: null\n");
+    const authed = (models: string[]) => ({
+      installed: true, authed: true, version: "x", models, modelsDetectedAt: "2026-09-25T00:00:00.000Z",
+      modelAuth: Object.fromEntries(models.map((m) => [m, { authed: true, probedAt: "2026-09-25T00:00:00.000Z" }])),
+    });
+    registry.writeDoctor(repo, { "claude-code": authed(["fable"]), codex: authed(["gpt-5.6-sol", "gpt-5.6-terra"]) });
+    const when = new Date(Date.now() - 5 * 60_000);
+    utimesSync(join(tickmarkrDir(repo), "doctor.json"), when, when);
+    const base = fakeAdapter(repo);
+    const seat = (id: string): WorkerAdapter => Object.assign(Object.create(base) as WorkerAdapter, {
+      id, channels: (cfg: Parameters<WorkerAdapter["channels"]>[0]) => channelsFromConfig(id, cfg),
+    });
+    const channels = () => {
+      const cfg = loadConfig(repo, { globalDir: gdir });
+      return [...channelsFromConfig("claude-code", cfg), ...channelsFromConfig("codex", cfg)];
+    };
+    const seatOf = (model: string) => channels().find((c) => c.model === model);
+    const before = { fable: seatOf("fable"), sol: seatOf("gpt-5.6-sol"), terra: seatOf("gpt-5.6-terra") };
+    expect(before.fable?.channel).toBe("sub");
+    expect(before.terra?.channel).toBe("sub");
+
+    const { io } = makeIO();
+    const out = fleet(["--global-dir", gdir], repo, [seat("claude-code"), seat("codex")], io);
+    const search = (q: string) => `/${q}${KEYS.enter}`;
+    io.input!.write(`${search("claude-code/fable")}e${KEYS.escape}${search("codex/gpt-5.6-sol")}ee${KEYS.escape}${KEYS.w}y`);
+    expect(await out).toMatch(/^fleet: wrote /);
+
+    const written = parse(readFileSync(join(repo, ".tickmarkr", "config.yaml"), "utf8")) as Record<string, any>;
+    expect(written.tiers["claude-code"].modelOverrides).toEqual({ fable: { effort: "low", channel: null } });
+    expect(written.tiers.codex.modelOverrides).toEqual({
+      "gpt-5.6-sol": { effort: "medium", vendor: null, channel: null },
+      "gpt-5.6-terra": null,
+    });
+    // only effort changed: vendor, channel and the sibling seat resolve exactly as before
+    expect(seatOf("fable")).toEqual({ ...before.fable, effort: "low" });
+    expect(seatOf("gpt-5.6-sol")).toEqual({ ...before.sol, effort: "medium" });
+    expect(seatOf("gpt-5.6-terra")).toEqual(before.terra);
   });
 });

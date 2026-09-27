@@ -134,7 +134,7 @@ tickmarkr status <runId> --oneline # compact snapshot, then exit
 tickmarkr status <runId> --watch # TTY: Run cockpit; non-TTY: line output
 tickmarkr status <runId> --watch --plain # preserved line/ANSI fallback, including on a TTY
 tickmarkr resume <runId>       # continue an engagement from the local execution log
-tickmarkr approve <runId> <taskId>   # append permission for a non-gate park; see below
+tickmarkr approve <runId> <taskId> --park <line>@<ts>   # decide the park status printed; see below
 tickmarkr report <runId>       # cost/quality report
 tickmarkr report <runId> --md > feature.record.md # explicit file write beside your spec
 tickmarkr profile              # show the learned routing profile
@@ -189,8 +189,19 @@ graph says “not comparable” and supplies no borrowed denominator. Historical
 does not establish current completion.
 
 The CLI twin for the same decision is
-`tickmarkr approve <runId> T2 --by operator --reason 'ready to proceed'`, followed by the
-receipt check and explicit resume above. Other parks have different permitted decisions:
+`tickmarkr approve <runId> T2 --park <line>@<ts> --by operator --reason 'ready to proceed'`,
+followed by the receipt check and explicit resume above. Every decision is bound to one park:
+status, the park notice and the Run confirmation print its `<line>@<ts>` token (the park row's
+physical journal line and timestamp), and `--park` names it — without `--park` the park open
+when the command starts is bound. A waive is also bound to that park's failed gate, named
+explicitly with `--gate` (`tickmarkr approve <runId> T2 --waive --park <line>@<ts> --gate review`).
+A decision queued behind another approval is revalidated under serialization, and the daemon
+revalidates it again before enactment: once a newer park opens, a stale token, an unbound row or a
+mismatched gate is refused (the daemon journals `approval-refused`) and never waives the newer gate.
+A failed task's recheck keeps working with its own bound token: status prints
+`failed — T3 — failure <line>@<ts>`, and
+`tickmarkr approve <runId> T3 --recheck --park <line>@<ts>` re-gates its landed commits with no
+worker. Other parks have different permitted decisions:
 
 | Park | Decision and effect |
 |---|---|

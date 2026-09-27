@@ -1,15 +1,18 @@
-// WB-1 (OBS-988): the daemon watches its own cockpit. A stale watch beat, a missing presence for the
-// recorded arm, or a dead owner pid is a lost board; the daemon journals it, reopens through the same
-// narrator path (bounded), and run-end retires the reopened pane — never the ghost.
+// WB-1 (OBS-988): the daemon watches its own cockpit. A dead owner pid or a missing presence for the
+// recorded arm is a lost board — a stale beat under a live owner is only slow (OBS-1110). The daemon
+// journals a loss, reopens through the same narrator path (bounded), and run-end retires the
+// reopened pane — never the ghost.
 import { spawnSync } from "node:child_process";
 import { mkdirSync, utimesSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { expect, test } from "vitest";
+import { OrcaDriver, type OrcaExec } from "../../src/drivers/orca.js";
 import { SubprocessDriver } from "../../src/drivers/subprocess.js";
 import { formatOwnedName, type Slot } from "../../src/drivers/types.js";
 import { runDaemon } from "../../src/run/daemon.js";
 import { Journal } from "../../src/run/journal.js";
 import { readWatchBoard, reserveWatchBoard, supervisionBeatPath, SUPERVISION_STALE_MS } from "../../src/run/supervision.js";
+import { FakeOrca, fakeBoardObserver, killBoardObservers, orcaBoardDriver, pollBoardObservers, steppedTime, type FakeBoardObserver } from "../helpers/fake-orca.js";
 import { COMMIT, setupRepo, T } from "../helpers/tmprepo.js";
 
 /** A pid that once existed and is now certainly dead. */
@@ -81,10 +84,11 @@ const boardRepo = (shell = `echo ok > ok.txt && ${COMMIT} ok`) => setupRepo(
   { tasks: { T1: [{ shell, result: { ok: true, summary: "ok" } }], T2: [{ shell: `echo two > two.txt && ${COMMIT} two`, result: { ok: true, summary: "two" } }] } },
 );
 
-test("test: a run whose opened board's beat is aged past the stale bound or whose owner pid is dead journals watch-board-lost naming the pane and pid then reopens through the narrator and journals watch-board-reopened naming a new pane that the owner record now names before the next task boundary, while a run whose board beats fresh journals neither row, so a dead board the daemon never notices fails", async () => {
+test("test: a run whose opened board's owner pid is dead, with its beat aged past the stale bound or not, journals watch-board-lost naming the pane and pid then reopens through the narrator and journals watch-board-reopened naming a new pane that the owner record now names before the next task boundary, while a run whose board beats fresh journals neither row, so a dead board the daemon never notices fails", async () => {
   const alive = { pid: process.pid, armId: "arm-live", beat: "fresh" as const };
   const cases: Record<string, BoardState[]> = {
-    stale: [{ pid: process.pid, armId: "arm-dead", beat: "stale" }, alive],
+    // OBS-1110: a stale beat is a loss only under a dead owner — a live one is a slow board (below)
+    stale: [{ pid: deadPid(), armId: "arm-dead", beat: "stale" }, alive],
     "dead-pid": [{ pid: deadPid() }, alive],
     fresh: [alive],
   };
@@ -148,7 +152,7 @@ test("test: a board lost a fourth time in one run journals watch-board-lost with
 // still match — exactly the state a dead cockpit whose pane survived leaves behind. A reopen that answers
 // with the lost pane has reopened nothing.
 test("test: a lost board whose driver's narrator answers from its cache is retired through retireLostWatch before the narrator is called again so the reopened row names a pane different from the lost one, while a driver without that seam that answers with the lost pane journals watch-board-reopen-failed and never watch-board-reopened for the lost pane, so a cached ghost reported as a reopened board fails", async () => {
-  const stale: BoardState[] = [{ pid: process.pid, armId: "arm-dead", beat: "stale" }, { pid: process.pid, armId: "arm-live", beat: "fresh" }];
+  const stale: BoardState[] = [{ pid: deadPid(), armId: "arm-dead", beat: "stale" }, { pid: process.pid, armId: "arm-live", beat: "fresh" }];
   for (const seam of [true, false]) {
     const { repo, fake } = boardRepo(`sleep 3; echo ok > ok.txt && ${COMMIT} ok`);
     const runId = `run-board-cached-${seam ? "seam" : "noseam"}`;
@@ -206,4 +210,119 @@ test("test: a board whose owner pid is dead and whose narrator throws on every r
   // the polls kept coming after the bound (T1 sleeps well past three ticks) and journaled nothing more
   expect(events.filter((e) => e.event.startsWith("watch-board")).length).toBe(4);
   expect(closed).not.toContain(opened[0]!.id); // the ghost is never closed
+}, 120_000);
+
+// OBS-1110: beat age alone is not a loss. A board whose beat aged past the stale bound while the owner
+// the record names is provably alive — its pid answers and its claimed arm is present — is SLOW: one
+// `watch-board-slow` row for the episode, no lost row, no reopen, the whole budget intact. Only a
+// proven dead owner is a loss that spends a reopen.
+test("test: the production daemon records a slow live board without spending its three reopen budget versus reopening a proven dead owner, so stale beat age alone spending one reopen fails", async () => {
+  const alive = { pid: process.pid, armId: "arm-next", beat: "fresh" as const };
+  for (const mode of ["slow", "dead"] as const) {
+    // T1 outlasts many poll ticks: a stale-alone reopen would spend the whole budget and go boardless.
+    const { repo, fake } = boardRepo(`sleep 3; echo ok > ok.txt && ${COMMIT} ok`);
+    const runId = `run-board-${mode}-owner`;
+    const first: BoardState = { pid: mode === "slow" ? process.pid : deadPid(), armId: `arm-${mode}`, beat: "stale" };
+    const { driver, opened, closed } = boardDriver(runId, [first, alive]);
+    const summary = await runDaemon(repo, { adapters: [fake], runId, driver, concurrency: 1 });
+    expect(summary.done.sort(), mode).toEqual(["T1", "T2"]);
+    const events = Journal.open(repo, runId).read();
+    const rows = (event: string) => events.filter((e) => e.event === event);
+    if (mode === "slow") {
+      expect(rows("watch-board-slow"), mode).toHaveLength(1);
+      expect(rows("watch-board-slow")[0]!.data, mode).toMatchObject({ pane: opened[0]!.id, pid: process.pid });
+      expect(rows("watch-board-slow")[0]!.data.beatAgeMs as number, mode).toBeGreaterThan(SUPERVISION_STALE_MS);
+      for (const event of ["watch-board-lost", "watch-board-reopened", "watch-board-reopen-failed"]) expect(rows(event), `${mode} ${event}`).toEqual([]);
+      expect(opened, mode).toHaveLength(1); // the narrator was never called again: nothing was spent
+      expect(readWatchBoard(repo, runId)?.pane, mode).toBe(opened[0]!.id);
+      expect(closed, mode).toContain(opened[0]!.id); // run-end retires the slow board like any live one
+      continue;
+    }
+    expect(rows("watch-board-slow"), mode).toEqual([]);
+    expect(rows("watch-board-lost").map((e) => e.data), mode).toEqual([expect.objectContaining({ pane: opened[0]!.id, pid: first.pid })]);
+    expect(rows("watch-board-reopened").map((e) => e.data), mode).toEqual([{ pane: opened[1]!.id, attempt: 1 }]);
+    expect(opened, mode).toHaveLength(2);
+  }
+}, 120_000);
+
+// OBS-1131: a partial run ends, then the operator resumes it. The prior engagement's board is decided
+// through the production OrcaDriver on real process liveness: an observer that left without
+// acknowledging is dead and its pane is closed (at run-end, or by the resume that finds it dead); an
+// acknowledgement timeout under a still-live observer is NOT death — that owned pane is preserved and
+// no second board is split beside it. A foreign pane sharing the launching tab is never closed.
+test("test: production daemon partial resume reconciles its prior board through the real driver versus preserving a live owner on acknowledgement timeout, so a leaked owned board or a foreign close fails", async () => {
+  try {
+    for (const mode of ["exits", "died", "live"] as const) {
+      const { repo, fake } = setupRepo([T("T1", { humanGate: true })], {});
+      const runId = `run-board-resume-${mode}`;
+      const launching = "term_launching";
+      const operator = "term_operator"; // the operator's own pane in the launching tab
+      const orca = new FakeOrca({
+        terminals: [
+          { handle: launching, title: "launching-tab", worktree: repo, tabId: "launch_tab" },
+          { handle: operator, title: "launching-tab", worktree: repo, tabId: "launch_tab", paneTitle: "psql", parentHandle: launching },
+        ],
+        trackedWorktrees: [repo],
+      });
+      const boards: string[] = [];
+      const observers: FakeBoardObserver[] = [];
+      // the prior board acknowledges nothing: it leaves on the stop ("exits") or stays silent
+      let onStop: FakeBoardObserver["onStop"] = mode === "exits" ? "exit" : "silent";
+      const exec: OrcaExec = async (args, cwd, timeoutMs) => {
+        const res = await orca.exec(args, cwd, timeoutMs);
+        if (args[1] === "split") {
+          boards.push(orca.last()!.handle);
+          observers.push(fakeBoardObserver(repo, runId, { handle: orca.last()!.handle, onStop }));
+        }
+        return res;
+      };
+      const clock = steppedTime();
+      const sleep = clock.sleep;
+      clock.sleep = async (ms) => { await pollBoardObservers(); return sleep(ms); };
+      const engage = (resume: boolean) => runDaemon(repo, {
+        adapters: [fake], runId, approvalWindowMs: 1, ...(resume ? { resume: true } : {}),
+        driver: orcaBoardDriver(new OrcaDriver({ exec, time: clock, launchingHandle: launching })),
+      });
+      const closes = () => orca.calls.filter((c) => c[1] === "close").map((c) => c[3]);
+
+      expect((await engage(false)).human, mode).toEqual(["T1"]); // a partial run: T1 parked for a human
+      const partial = Journal.open(repo, runId).read();
+      const prior = boards[0]!;
+      if (mode === "exits") {
+        // dead without acknowledging: its pane is closed at run-end, never left for a resume to find
+        expect(partial.filter((e) => e.event === "watch-cleanup-failed"), mode).toEqual([]);
+        expect(closes(), mode).toEqual([prior]);
+      } else {
+        // an acknowledgement timeout under a live observer: the owned pane is protected, not closed
+        expect(partial.find((e) => e.event === "watch-cleanup-failed")?.data.error, mode).toMatch(/unacknowledged/);
+        expect(closes(), mode).toEqual([]);
+        expect(orca.of(prior), mode).toBeDefined();
+      }
+      if (mode === "died") await observers[0]!.die(); // the silent board's process is gone before the resume
+      onStop = "ack";
+
+      expect((await engage(true)).human, mode).toEqual(["T1"]);
+      const rows = Journal.open(repo, runId).read();
+      const resumed = rows.slice(rows.findIndex((e) => e.event === "run-resume"));
+      const placementFailed = resumed.filter((e) => e.event === "watch-placement-failed");
+      if (mode === "live") {
+        // still live, still unacknowledged: preserved as it stands, and no second board beside it
+        expect(placementFailed.map((e) => String(e.data.error)), mode).toEqual([expect.stringMatching(/retired board observer unacknowledged/)]);
+        expect(boards, mode).toEqual([prior]);
+        expect(closes(), mode).toEqual([]);
+        expect(readWatchBoard(repo, runId), mode).toMatchObject({ pane: prior, pid: observers[0]!.pid, retired: true });
+        expect(orca.terminals.map((t) => t.handle).sort(), mode).toEqual([launching, operator, prior].sort());
+        continue;
+      }
+      // reconciled: the dead prior board is closed by its recorded handle, one fresh board is placed
+      // and the resumed run-end retires it — no owned board survives, no foreign pane is touched
+      expect(placementFailed, mode).toEqual([]);
+      expect(resumed.filter((e) => e.event === "watch-cleanup-failed"), mode).toEqual([]);
+      expect(boards, mode).toHaveLength(2);
+      expect(closes(), mode).toEqual([prior, boards[1]!]);
+      expect(orca.terminals.map((t) => t.handle).sort(), mode).toEqual([launching, operator].sort());
+    }
+  } finally {
+    await killBoardObservers();
+  }
 }, 120_000);

@@ -1,5 +1,5 @@
 tickmarkr fixture | RUN | run-20260912-100000
-1 Home  4 Run  5 Evidence | content | 1–33/75 | 42 hidden
+1 Home  4 Run  5 Evidence | content | 1–33/77 | 44 hidden
 ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 │RUN / RUNNING · 1/8 merged | human T1,T3 | current-cycle tip PENDING | RUNNING | matching graph | snapshot #1  │
 │ tickmarkr  run-20260912-100000  │  1/8 done  │  2 esc  │  0h38m                                               │
@@ -20,8 +20,8 @@ tickmarkr fixture | RUN | run-20260912-100000
 │    T7   FLEET           —             Router asset outs  ✔  ·  ·  ·  ·  ·  ·    claude-cod  1    1/7 gates run│
 │    T8   —               —             Queued task with   ·  ·  ·  ·  ·  ·  ·    —           0    queued       │
 │                                                                                                               │
-│    area    SPEC · FLEET · RUN · GATE · UI · DOCS · REPO   2 unmapped                                          │
-│            UNMAPPED tests/cockpit/board.test.ts  assets/board.png                                             │
+│    area    SPEC · FLEET · RUN · GATE · UI · DOCS · REPO   1 unmapped                                          │
+│            UNMAPPED assets/board.png                                                                          │
 │    gates   bu build  te test  li lint  ev evidence  sc scope  ac acceptance  re review                        │
 │            ✔ passed   ✖ failed   · pending   ─ not declared (acceptance and review are the optional two)      │
 │                                                                                                               │

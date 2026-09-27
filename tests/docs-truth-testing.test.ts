@@ -13,8 +13,9 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { describe, expect, test } from "vitest";
+import { ownedFailures, runOwned } from "./helpers/owned-process.js";
 
 const repoRoot = join(import.meta.dirname, "..");
 const codebaseDocs = join(repoRoot, "docs", "codebase");
@@ -118,7 +119,7 @@ function makeScratchRepo(prefix: string): string {
   return scratch;
 }
 
-function runScratchTests(scratch: string, files: string[], title?: string) {
+async function runScratchTests(scratch: string, files: string[], title?: string) {
   const args = [vitestBin, "run", "--configLoader", "runner", ...files];
   if (title) {
     const isolatedConfig = join(scratch, "vitest.docs-truth-mutation.config.mts");
@@ -130,32 +131,26 @@ function runScratchTests(scratch: string, files: string[], title?: string) {
   // Q72s: async spawn, not spawnSync — a synchronous child run blocks this worker's event
   // loop for the child's whole lifetime, starving vitest's birpc on 2-core CI runners
   // (4/4 deterministic end-of-suite kills). The loop must breathe DURING children.
-  return new Promise<{ status: number | null; stdout: string; stderr: string }>((resolve) => {
-    const child = spawn(process.execPath, args, {
-      cwd: scratch,
-      env: {
-        ...process.env,
-        FORCE_COLOR: "0",
-        NO_COLOR: "1",
-        TICKMARKR_DOCS_TRUTH_MUTATION_CHILD: "1",
-        // OBS-854: every nested run is a whole vitest process whose fork pool pre-spawns min(cpus-1, maxForks)
-        // workers at startup — 17 per child on an 18-core host, ~45 children per sweep: the storm that starves a
-        // concurrent suite's birpc window. vitest 3.2.7 reads VITEST_MAX_FORKS natively, so this caps the child
-        // under the scratch's vitest.config.ts AND the isolated mutation config; the children are already
-        // awaited one at a time, so the sweep is serial by construction.
-        VITEST_MAX_FORKS: "1",
-      },
-    });
-    let stdout = "";
-    let stderr = "";
-    child.stdout.on("data", (d) => { stdout += d; });
-    child.stderr.on("data", (d) => { stderr += d; });
-    const timer = setTimeout(() => child.kill("SIGTERM"), 120_000);
-    child.on("close", (status) => {
-      clearTimeout(timer);
-      resolve({ status, stdout, stderr });
-    });
+  // OBS-1167 / D-478 add.1: the child is an owned subprocess — at its bound (or on any exit) its whole tree,
+  // fork workers included, is torn down and awaited, and a runner that outlives it is red.
+  const run = await runOwned(process.execPath, args, {
+    cwd: scratch,
+    ms: 120_000,
+    env: {
+      ...process.env,
+      FORCE_COLOR: "0",
+      NO_COLOR: "1",
+      TICKMARKR_DOCS_TRUTH_MUTATION_CHILD: "1",
+      // OBS-854: every nested run is a whole vitest process whose fork pool pre-spawns min(cpus-1, maxForks)
+      // workers at startup — 17 per child on an 18-core host, ~45 children per sweep: the storm that starves a
+      // concurrent suite's birpc window. vitest 3.2.7 reads VITEST_MAX_FORKS natively, so this caps the child
+      // under the scratch's vitest.config.ts AND the isolated mutation config; the children are already
+      // awaited one at a time, so the sweep is serial by construction.
+      VITEST_MAX_FORKS: "1",
+    },
   });
+  if (run.unresolved || run.survivors.length > 0) throw new Error(ownedFailures(run, "docs-truth child").join("; "));
+  return { status: run.exitCode, stdout: run.out, stderr: run.why === "expired" ? `${run.err}\nchild exceeded 120 s` : run.err };
 }
 
 function childOutput(result: Awaited<ReturnType<typeof runScratchTests>>): string {

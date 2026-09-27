@@ -18,7 +18,10 @@ import {
 } from "../../report/operator-record.js";
 import { cellsOf, cellSummary } from "../../route/profile.js";
 import { Journal, loadRoutingProfile, type JournalEvent, type TelemetryRow } from "../../run/journal.js";
-import { formatTipProof, runEndTipProof } from "../../run/daemon.js";
+import {
+  baselineProvenanceOf, fingerprintsOf, forgivenFingerprints, forgivenGateRow, formatBaselineProvenance, formatFingerprints,
+  formatForgiven, formatTipProof, runEndTipProof,
+} from "../../run/daemon.js";
 import { deriveRunCockpitData } from "../../tui/cockpit/derive.js";
 
 const n = (x: number) => x.toLocaleString("en-US"); // explicit locale — CI/darwin flake guard
@@ -191,6 +194,11 @@ const VERIFICATION_READING: Record<Verification, string> = {
   absent: "absent — no tip verification recorded: neither passed nor failed",
 };
 
+function forgivenLines(events: JournalEvent[]): string[] {
+  const forgiven = forgivenFingerprints(closedCycle(events));
+  return forgiven.length ? ["- **forgiven vs baseline:**", ...forgiven.map((f) => `  - ${formatForgiven(f)}`)] : [];
+}
+
 function verificationReading(runId: string, events: JournalEvent[]): string {
   const state = verificationOf(runId, events);
   const proof = runEndTipProof(closedCycle(events));
@@ -200,6 +208,16 @@ function verificationReading(runId: string, events: JournalEvent[]): string {
   }
   return VERIFICATION_READING[state];
 }
+
+// OBS-1123: a battery row that carried baseline reds names them apart from any red it introduced, so a
+// new regression can never read as forgiven. Rows without the structured fields render as before.
+const fingerprintClauses = (data: Record<string, unknown>): string => {
+  const fresh = fingerprintsOf(data.freshFingerprints) ?? [];
+  const forgiven = fingerprintsOf(data.forgivenFingerprints);
+  if (!forgiven && !forgivenGateRow(data)) return "";
+  return `${fresh.length ? `; new red (not in baseline): ${formatFingerprints(fresh)}` : ""}`
+    + `; forgiven vs baseline: ${formatFingerprints(forgiven)} — ${formatBaselineProvenance(baselineProvenanceOf(data.baselineProvenance))}`;
+};
 
 // VIS-07 / REC-01: derived only from the run journal, telemetry, and local configuration.
 export function renderMarkdownRecord(runId: string, events: JournalEvent[], prices: ChannelCost[] = [], rows: TelemetryRow[] = []): string {
@@ -237,6 +255,8 @@ export function renderMarkdownRecord(runId: string, events: JournalEvent[], pric
     `- **failed:** ${count("failed")}`,
     `- **human:** ${count("human")}`,
     `- **verification:** ${verificationReading(runId, events)}`,
+    // OBS-1123: the same fold the run-end record states, over the same closed cycle as verification.
+    ...forgivenLines(events),
     "",
     "## Usage & efficiency",
     "",
@@ -301,7 +321,7 @@ export function renderMarkdownRecord(runId: string, events: JournalEvent[], pric
         }
         const resolved = gate === "review" && g.data.pass === true && Array.isArray(g.data.resolved)
           ? g.data.resolved.filter((id): id is string => typeof id === "string") : [];
-        lines.push(`  - ${gate}: ${pass} — ${firstLine(g.data.details)}${resolved.length ? `; resolved: ${resolved.join(", ")}` : ""}`);
+        lines.push(`  - ${gate}: ${pass} — ${firstLine(g.data.details)}${resolved.length ? `; resolved: ${resolved.join(", ")}` : ""}${fingerprintClauses(g.data)}`);
       }
       for (const row of leg2) {
         const pass = row.data.pass === true ? "pass" : row.data.pass === false ? "fail" : EM;

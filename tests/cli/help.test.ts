@@ -117,6 +117,24 @@ const documentedFlags = (text: string) => [...new Set([...text.matchAll(/--[a-z]
 const optionFlags = (help: { options: Record<string, string> }) => documentedFlags(Object.keys(help.options).join(" "));
 
 // Leaf title is the complete acceptance criterion, verbatim.
+test("Changed approve help lines accurately state the engagement-only review-round ceiling and restoration of the default by a later unflagged approval.", async () => {
+  const help = commandHelp("approve");
+  const option = COMMAND_HELP.approve.options["--review-rounds <N>"];
+  expect(help).toContain(`--review-rounds <N>  ${option}`);
+  expect(option).toContain("positive integer review-round ceiling");
+  expect(option).toContain("binds only this approval engagement");
+  expect(option).toContain("a later approval without --review-rounds restores the built-in default");
+  // The park-token examples introduced by park-bound approval survive the wording change.
+  const parkExamples = COMMAND_HELP.approve.examples.filter((example) => example.includes("--park "));
+  expect(parkExamples.length).toBeGreaterThan(0);
+  for (const example of parkExamples) {
+    expect(example).toMatch(/--park \d+@\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z/);
+    expect(help).toContain(`tickmarkr ${example}`);
+  }
+  expect((await dispatch("approve", ["--help"])).out).toBe(help);
+});
+
+// Leaf title is the complete acceptance criterion, verbatim.
 test("The production dispatcher answers --help and -h for every registered command and nested profile operation before invoking its handler. Seeded config, lock, scope destination and eval fixture bytes and available fake-adapter call counters remain unchanged for help, while normal confirmed actions reach their handlers. Literal --help after -- is data, and eval’s prior strict unknown-option refusal becomes usable help without claiming historical seeding. A zero counter achieved by hiding CLIs or a help route that actuates unlock/profile reset fails.", async () => {
   const repo = mkdtempSync(join(tmpdir(), "tickmarkr-help-"));
   const xdg = process.env.XDG_CONFIG_HOME;

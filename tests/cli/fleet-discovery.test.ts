@@ -12,7 +12,7 @@ import { rolePools } from "../../src/adapters/registry.js";
 import { MODEL_ID_RE, type AuthHealth, type WorkerAdapter } from "../../src/adapters/types.js";
 import { assembleFleetEditor, fleet, type FleetIO } from "../../src/cli/commands/fleet.js";
 import { plan } from "../../src/cli/commands/plan.js";
-import { readCachedCatalog } from "../../src/adapters/catalog-remote.js";
+import { readCachedCatalog, type CatalogReadResult } from "../../src/adapters/catalog-remote.js";
 import {
   DEFAULT_CONFIG,
   TierEntrySchema,
@@ -570,4 +570,131 @@ test("OBS-1099 review: a workers-model entry naming a gateway id folded into ano
   const own = await driveInk(folded, " \r" + KEYS.w, { initialDenyWorkersModels: ["omp:gw"] });
   expect(stripAnsi(own.writes.join("\n"))).toContain("space: cleared omp:gw from routing.deny.workers.models");
   expect(own.reviewed?.denyWorkersModels).toEqual([]);
+});
+
+// T16 (OBS-1147/1148/1149/1082): the catalog enrichment Fleet renders — price on configured rows,
+// LiveBench score on detected rows — resolved through one deterministic, version-safe matcher.
+type ModelsDevFixture = Record<string, { id: string; models: Record<string, Record<string, unknown>> }>;
+const cachedCatalog = (modelsDev: ModelsDevFixture, liveBench?: unknown): CatalogReadResult => ({
+  catalog: { schemaVersion: 1, fetchedAt: "2026-09-25T00:00:00.000Z", modelsDev, ...(liveBench ? { liveBench } : {}) },
+  source: "cache",
+  stale: false,
+});
+const priced = (id: string, input?: number, output?: number) => ({
+  id,
+  ...(input !== undefined && output !== undefined ? { cost: { input, output } } : {}),
+  limit: { context: 200_000 },
+});
+/** Same rows, another JSON key order — providers and the models inside each. */
+const reordered = (modelsDev: ModelsDevFixture, order: (keys: string[]) => string[]): ModelsDevFixture =>
+  Object.fromEntries(order(Object.keys(modelsDev)).map((key) => [key, {
+    ...modelsDev[key],
+    models: Object.fromEntries(order(Object.keys(modelsDev[key].models)).map((id) => [id, modelsDev[key].models[id]])),
+  }]));
+
+async function fleetRows(repo: string, adapter: WorkerAdapter, catalog: CatalogReadResult) {
+  const assembled = await assembleFleetEditor(repo, [adapter], {}, {
+    globalDir: mkdtempSync(join(tmpdir(), "tickmarkr-catalog-global-")),
+    catalog,
+  });
+  if ("unavailable" in assembled) throw new Error(assembled.unavailable);
+  return new Map(assembled.props.modelGroups.find((group) => group.adapter === adapter.id)?.rows.map((row) => [row.model, row]));
+}
+
+test("test: Fleet catalog enrichment resolves effort variants to exact base models and provider-first prices under shuffled reseller rows versus keeping glm-5 distinct from glm-5.2, so one cross-version or order-dependent price match fails", async () => {
+  const repo = makeRepo({ "keep.txt": "x" });
+  mkdirSync(join(repo, ".tickmarkr"), { recursive: true });
+  // `mixed` names no models.dev provider, so the tier hint cannot pick the row (the OBS-1148 condition).
+  writeFileSync(join(repo, ".tickmarkr", "config.yaml"), `tiers:
+  nova:
+    vendor: mixed
+    channel: api
+    models:
+      gpt-5.6-high: mid
+      claude-fable-5-1-max: frontier
+      zai-coding-plan/glm-5.2: mid
+      glm-5: mid
+`);
+  registry.writeDoctor(repo, { nova: installed([], "2026-09-25T00:00:00.000Z") });
+  // Resellers sort BEFORE the makers in key order and carry other prices or none (verbatim OBS-1148 shapes).
+  const modelsDev: ModelsDevFixture = {
+    agentrouter: { id: "agentrouter", models: { "gpt-5.6": priced("gpt-5.6") } },
+    bothub: { id: "bothub", models: {
+      "claude-fable-5-1": priced("claude-fable-5-1", 1, 1),
+      "gpt-5.6": priced("gpt-5.6", 0.06, 0.37),
+      "glm-5.2": priced("glm-5.2", 0.5, 2),
+    } },
+    greenpt: { id: "greenpt", models: { "glm-5.2": priced("glm-5.2", 0.9, 3.1) } },
+    anthropic: { id: "anthropic", models: { "claude-fable-5-1": priced("claude-fable-5-1", 10, 50) } },
+    openai: { id: "openai", models: { "gpt-5.6": priced("gpt-5.6", 4, 20) } },
+    zai: { id: "zai", models: { "glm-5.2": priced("glm-5.2", 1, 4) } },
+    "zai-coding-plan": { id: "zai-coding-plan", models: { "glm-5.2": priced("glm-5.2", 0, 0) } },
+  };
+  const orders: Array<(keys: string[]) => string[]> = [
+    (keys) => keys,
+    (keys) => [...keys].reverse(),
+    (keys) => [...keys.slice(3), ...keys.slice(0, 3)],
+  ];
+  for (const [i, order] of orders.entries()) {
+    const rows = await fleetRows(repo, declaredAdapter("nova"), cachedCatalog(reordered(modelsDev, order)));
+    const price = (model: string) => {
+      const evidence = rows.get(model)?.evidence;
+      return [evidence?.inputCostPerMtok, evidence?.outputCostPerMtok];
+    };
+    // effort variants land on their exact base, and on the maker's row, not a reseller's
+    expect(price("gpt-5.6-high"), `order ${i}`).toEqual([4, 20]);
+    expect(price("claude-fable-5-1-max"), `order ${i}`).toEqual([10, 50]);
+    // the CLI's own namespace is the provider: the plan's $0 row, never greenpt's or zai's metered one
+    expect(price("zai-coding-plan/glm-5.2"), `order ${i}`).toEqual([0, 0]);
+    // glm-5 is another version: no row, so no price — never glm-5.2's
+    expect(rows.has("glm-5"), `order ${i}`).toBe(true);
+    expect(price("glm-5"), `order ${i}`).toEqual([undefined, undefined]);
+  }
+});
+
+test("test: Fleet benchmark enrichment reaches a preview-high LiveBench row for its exact canonical base versus refusing another model version, so stripping version digits or client-side preview identity fails", async () => {
+  const repo = makeRepo({ "keep.txt": "x" });
+  mkdirSync(join(repo, ".tickmarkr"), { recursive: true });
+  registry.writeDoctor(repo, {
+    nova: installed([
+      "google/gemini-3.1-pro",
+      "google/gemini-3.2-pro",
+      "google/gemini-3.1-flash-preview",
+      "glm-5",
+    ], "2026-09-25T00:00:00.000Z"),
+  });
+  const modelsDev: ModelsDevFixture = {
+    google: { id: "google", models: {
+      "gemini-3.1-pro": priced("gemini-3.1-pro", 2, 12),
+      "gemini-3.2-pro": priced("gemini-3.2-pro", 2, 12),
+      // GA only: the client's `-preview` id names a DIFFERENT identity and must stay unknown
+      "gemini-3.1-flash": priced("gemini-3.1-flash", 0.5, 3),
+    } },
+    zai: { id: "zai", models: { "glm-5": priced("glm-5", 1, 4) } },
+  };
+  const categories = { "Agentic Coding": ["javascript", "typescript", "python"], Coding: ["code_generation"] };
+  const scores = (n: number) => ({ javascript: n, typescript: n, python: n, code_generation: n });
+  const liveBench = {
+    tableDate: "2026_06_25",
+    categories,
+    rows: [
+      { model: "gemini-3.1-pro-preview-low", ...scores(40) },
+      { model: "gemini-3.1-pro-preview-high", ...scores(71) },
+      { model: "gemini-3.1-flash-high", ...scores(55) },
+      { model: "glm-5.2-preview-high", ...scores(66) },
+    ],
+  };
+  const rows = await fleetRows(repo, declaredAdapter("nova"), cachedCatalog(modelsDev, liveBench));
+
+  // the exact canonical base reaches its preview-high row (not the preview-low one)
+  expect(rows.get("google/gemini-3.1-pro")?.score).toBe(71);
+  // another version is refused: 3.2 never borrows 3.1's row, glm-5 never borrows glm-5.2's
+  expect(rows.get("google/gemini-3.2-pro")?.evidence?.inputCostPerMtok).toBe(2);
+  expect(rows.get("google/gemini-3.2-pro")?.score).toBeUndefined();
+  expect(rows.get("glm-5")?.evidence?.inputCostPerMtok).toBe(1);
+  expect(rows.get("glm-5")?.score).toBeUndefined();
+  // preview is residue on the LiveBench side ONLY: the client's preview id is not its GA base
+  expect(rows.has("google/gemini-3.1-flash-preview")).toBe(true);
+  expect(rows.get("google/gemini-3.1-flash-preview")?.score).toBeUndefined();
+  expect(rows.get("google/gemini-3.1-flash-preview")?.evidence?.inputCostPerMtok).toBeUndefined();
 });

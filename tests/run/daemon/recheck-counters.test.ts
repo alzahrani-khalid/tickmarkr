@@ -8,7 +8,9 @@ import { describe, expect, test } from "vitest";
 import { channelKey, shq, type BillingChannel } from "../../../src/adapters/types.js";
 import { extractPromptNonce } from "../../../src/gates/llm.js";
 import { FakeAdapter } from "../../../src/adapters/fake.js";
-import { approve } from "../../../src/cli/commands/approve.js";
+import { approve, parkToken } from "../../../src/cli/commands/approve.js";
+import { status } from "../../../src/cli/commands/status.js";
+import { deriveRunDecisions, executeDecision, previewDecision } from "../../../src/tui/cockpit/decision-actions.js";
 import { SubprocessDriver } from "../../../src/drivers/subprocess.js";
 import type { ExecutorDriver } from "../../../src/drivers/types.js";
 import { graphDefinitionHash, loadGraph, saveGraph, tickmarkrDir } from "../../../src/graph/graph.js";
@@ -16,7 +18,7 @@ import { validateGraph } from "../../../src/graph/schema.js";
 import { runDaemon } from "../../../src/run/daemon.js";
 import { gitHead, worktreePath } from "../../../src/run/git.js";
 import { COMMAND_LEASE_TOKEN_ENV } from "../../../src/run/lease.js";
-import { Journal, type JournalEvent } from "../../../src/run/journal.js";
+import { APPROVAL_REFUSED, Journal, type JournalEvent } from "../../../src/run/journal.js";
 import { authedModels, COMMIT, makeRepo, setupRepo, T } from "../../helpers/tmprepo.js";
 
 const fake1 = { adapter: "fake", model: "fake-1", channel: "sub" as const, tier: "frontier" as const };
@@ -289,6 +291,92 @@ describe("v2.5.6 T5 — zero-spend verbs and honest counters", () => {
       } finally {
         if (before === undefined) delete process.env[COMMAND_LEASE_TOKEN_ENV]; else process.env[COMMAND_LEASE_TOKEN_ENV] = before;
       }
+    }
+  }, 300_000);
+});
+
+// OBS-1178: every surface displays the token a decision binds to; approve and the cockpit carry it
+// through to the daemon, which enacts only a decision still bound to the row it names.
+describe("park-bound approvals round-trip through resume (OBS-1178)", () => {
+  const JUDGE_RED = {
+    judge: { pass: false, criteria: [{ criterion: "c1", met: false, reason: "operator override required" }] },
+    review: { approve: true, issues: [] },
+    consult: { action: "human" as const, notes: "operator must decide" },
+    tasks: { T1: [{ shell: `echo approved > approved.txt && ${COMMIT} approved`, result: { ok: true, summary: "implemented" } }] },
+  };
+
+  test("test: CLI and cockpit approval round-trips a displayed park or failed-task token through resume versus refusing stale tokens or mismatched gates, so an unbound release fails", async () => {
+    // ---- CLI: the failed-task token status displays binds the recheck; resume runs the battery ----
+    {
+      const { repo, fake } = setupRepo([T("T1")], { tasks: { T1: [{ shell: `echo one > t1.txt && ${COMMIT} t1`, result: { ok: true, summary: "t1" } }] } });
+      const runId = "run-bound-failure";
+      expect((await runDaemon(repo, { adapters: [fake], runId, driver: wedgedAfterWork() })).failed).toEqual(["T1"]);
+      const shown = await status([runId], repo);
+      const token = /failure (\d+@\S+) — re-gate landed work with `tickmarkr approve run-bound-failure T1 --recheck --park \1`/u.exec(shown)?.[1];
+      expect(token, shown).toBeDefined();
+      const start = rows(repo, runId)[0]!;
+      await expect(approve([runId, "T1", "--recheck", "--park", `1@${start.ts}`], repo)).rejects.toThrow(/refusing stale decision for T1: bound to failure 1@/u);
+      await expect(approve([runId, "T1", "--recheck", "--park", token!, "--gate", "test"], repo)).rejects.toThrow(/--gate names a parked failed gate/u);
+      expect(of(rows(repo, runId), "task-approved")).toEqual([]);
+      await approve([runId, "T1", "--recheck", "--park", token!, "--by", "op"], repo);
+      expect(of(rows(repo, runId), "task-approved").at(-1)?.data.failure).toEqual({ line: Number(token!.split("@")[0]), ts: token!.slice(token!.indexOf("@") + 1) });
+      const resumed = await runDaemon(repo, { adapters: [fake], runId, resume: true });
+      expect(resumed.done).toEqual(["T1"]);
+      expect(of(after(rows(repo, runId), "run-resume"), "recheck-battery")[0]?.data.pass).toBe(true);
+      expect(of(rows(repo, runId), APPROVAL_REFUSED)).toEqual([]);
+    }
+    // ---- cockpit: the displayed park token rides the argv; a stale token or a wrong gate is refused ----
+    {
+      const { repo, fake } = setupRepo([T("T1", { complexity: 8 })], JUDGE_RED);
+      const runId = "run-bound-park";
+      expect((await runDaemon(repo, { adapters: [fake], runId })).human).toEqual(["T1"]);
+      const [decision] = deriveRunDecisions(Journal.open(repo, runId));
+      const token = parkToken(decision!.park)!;
+      expect(decision!.park.failedGate).toBe("acceptance");
+      await expect(approve([runId, "T1", "--waive", "--park", token, "--gate", "review"], repo))
+        .rejects.toThrow(`refusing mismatched gate for T1: --gate review but park ${token} failed acceptance`);
+      const stale = previewDecision({ verb: "waive", taskId: "T1", park: `1@${rows(repo, runId)[0]!.ts}` }, { cwd: repo, runId, by: "op" });
+      expect(stale).toMatchObject({ ok: false });
+      const preview = previewDecision({ verb: "waive", taskId: "T1" }, { cwd: repo, runId, by: "op" });
+      if (!preview.ok) throw new Error(preview.refusal);
+      expect(preview.preview.argv).toEqual([runId, "T1", "--waive", "--park", token, "--gate", "acceptance", "--by", "op"]);
+      expect(of(rows(repo, runId), "task-approved")).toEqual([]);
+      const receipt = await executeDecision(preview.preview, { cwd: repo });
+      expect(receipt.ok, receipt.ok ? "" : receipt.refusal).toBe(true);
+      expect(of(rows(repo, runId), "task-approved").at(-1)?.data).toMatchObject({ release: "gate-satisfied", gate: "acceptance", park: { line: decision!.park.line, ts: decision!.park.ts } });
+      const resumed = await runDaemon(repo, { adapters: [fake], runId, resume: true });
+      expect(resumed.done).toEqual(["T1"]);
+      expect(of(rows(repo, runId), APPROVAL_REFUSED)).toEqual([]);
+    }
+    // ---- a release bypassing both surfaces: mis-bound, or unbound though appended after its park — never enacted ----
+    for (const variant of ["mis-bound", "unbound"] as const) {
+      const { repo, fake } = setupRepo([T("T1", { complexity: 8 })], JUDGE_RED);
+      const runId = `run-${variant}-release`;
+      expect((await runDaemon(repo, { adapters: [fake], runId })).human).toEqual(["T1"]);
+      const journal = Journal.open(repo, runId);
+      const budget = journal.replayResumeState().get("T1");
+      expect(budget?.attempts, variant).toBeGreaterThan(0);
+      if (variant === "mis-bound") {
+        journal.append("task-approved", "T1", { by: "racer", via: "cli", release: "gate-satisfied", gate: "acceptance", park: { line: 1, ts: rows(repo, runId)[0]!.ts } });
+      } else {
+        // the ordinary append order: park, then an unbound fresh-budget release, then an unrelated task row
+        journal.append("task-approved", "T1", { by: "racer", via: "cli", release: "attempt-cap" });
+        journal.append("worktree-preserved", "T1", { ref: `refs/tickmarkr/preserved/${runId}--T1` });
+      }
+      const resumed = await runDaemon(repo, { adapters: [fake], runId, resume: true });
+      expect(resumed.human, variant).toEqual(["T1"]);
+      const post = after(rows(repo, runId), "run-resume");
+      const refusal = of(rows(repo, runId), APPROVAL_REFUSED);
+      expect(refusal, variant).toHaveLength(1);
+      expect(String(refusal[0]!.data.reason)).toMatch(variant === "mis-bound" ? /bound to park 1@/u : /unbound decision names no park token/u);
+      expect(of(post, "task-dispatch"), variant).toEqual([]);
+      expect(of(post, "worktree-recreation"), variant).toEqual([]);
+      expect(of(post, "merge"), variant).toEqual([]);
+      // every fold reads the refused decision as never made: still parked, budget and gates untouched
+      const replayed = Journal.open(repo, runId);
+      expect(replayed.replayStatuses().get("T1"), variant).toBe("human");
+      expect(replayed.replayResumeState().get("T1"), variant).toEqual(budget);
+      expect(replayed.replaySatisfiedGates().get("T1"), variant).toBeUndefined();
     }
   }, 300_000);
 });

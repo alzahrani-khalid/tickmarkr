@@ -34,7 +34,7 @@ import {
 } from "./components.js";
 import { authorsNote } from "../../run/operator-state.js";
 import { fieldReading, type RunCockpitData, type TaskRow } from "./derive.js";
-import { STALL_MARKER } from "./run-view.js";
+import { MISSING_EVIDENCE, STALL_MARKER } from "./run-view.js";
 import {
   initialRunInteractionState,
   projectRunKeyEntries,
@@ -600,8 +600,12 @@ function promotedViewRows(
  * task row — identity, phase, build evidence, blocker, next action — each unrecorded field saying so,
  * each recorded one citing the journal line it was read from, and the OBS-1048 stall marker when the
  * newest attempt's harvest is suspect. No attempt label is printed here: the ruler is the row's own.
+ * A task with no recorded dispatch folds identity, phase, and build into one missing-evidence clause
+ * (OBS-1104). A recorded blocker or next action — a pre-dispatch park, a dependency wait — stays,
+ * cited to the journal row that produced it.
  */
 export function taskProjectionText(row: TaskRow, journal: readonly JournalRow[] = []): string {
+  if ((row.attempts ?? 0) === 0) return undispatchedProjectionText(row, journal);
   const identity = row.identities?.at(-1);
   const blocker = row.summary?.blocker;
   const harvest = row.harvests?.at(-1);
@@ -620,6 +624,25 @@ export function taskProjectionText(row: TaskRow, journal: readonly JournalRow[] 
     `blocker ${blocker ? `${blocker.kind} ${at(evidence.blocker)}` : "none"}`,
     `next ${blocker?.nextAction == null ? fieldReading(undefined) : `${blocker.nextAction} ${at(evidence.nextAction)}`}`,
     ...(harvest?.suspectedStalledHarvest ? [`${STALL_MARKER} · launch ${at(evidence.launch)} · ${harvest.nudgeFailures} nudge failed ${at(evidence.nudge)} · ${harvest.pageCount} paged ${at(evidence.page)} · no worker-result`] : []),
+  ].reduce((text, part) => `${text} · ${part}`);
+}
+
+/**
+ * Identity, phase, and build are unrecorded until a dispatch. Append the blocker and next action
+ * only when the summary recorded one — an unknown placeholder with no journal row is the missing clause.
+ */
+function undispatchedProjectionText(row: TaskRow, journal: readonly JournalRow[]): string {
+  const blocker = row.summary?.blocker;
+  if (blocker == null) return MISSING_EVIDENCE;
+  const evidence = projectionEvidence(row, journal);
+  const at = (line: number | undefined) => line === undefined ? "(no journal row)" : `#L${line}`;
+  const showBlocker = blocker.kind !== "unknown" || evidence.blocker !== undefined;
+  const showNext = blocker.nextAction != null;
+  if (!showBlocker && !showNext) return MISSING_EVIDENCE;
+  return [
+    MISSING_EVIDENCE,
+    ...(showBlocker ? [`blocker ${blocker.kind} ${at(evidence.blocker)}`] : []),
+    ...(showNext ? [`next ${blocker.nextAction} ${at(evidence.nextAction)}`] : []),
   ].reduce((text, part) => `${text} · ${part}`);
 }
 

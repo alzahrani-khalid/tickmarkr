@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { GATE_NAMES, type GateName } from "../graph/schema.js";
+import { EFFORTS, GATE_NAMES, type GateName } from "../graph/schema.js";
 import { normalizeGateOutcome, type GateOutcome } from "./outcome.js";
 
 // T32 (F2): the decision protocol is deliberately smaller than the journal. Existing journals contain
@@ -160,6 +160,8 @@ const RoleInvocationIdentityDataSchema = z.object({
   adapter: NonEmptyStringSchema.optional(),
   model: NonEmptyStringSchema.optional(),
   vendor: NonEmptyStringSchema.optional(),
+  // OBS-1182: the effort the seat actually launched at; absent = the CLI's own default, never a level.
+  effort: z.enum(EFFORTS).optional(),
   evidence: EvidenceSchema.optional(),
 });
 

@@ -1,11 +1,12 @@
+import { execFileSync } from "node:child_process";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { describe, expect, test } from "vitest";
+import { describe, expect, test, vi } from "vitest";
 import { channelKey } from "../../src/adapters/types.js";
 import { FakeAdapter } from "../../src/adapters/fake.js";
 import { SubprocessDriver } from "../../src/drivers/subprocess.js";
-import { formatOwnedName, parseOwnedName, type ExecutorDriver, type Slot, type SlotOpts } from "../../src/drivers/types.js";
+import { canonicalizeLegacyName, formatOwnedName, parseOwnedName, type ExecutorDriver, type Slot, type SlotOpts } from "../../src/drivers/types.js";
 import { graphDefinitionHash, loadGraph, tickmarkrDir, saveGraph } from "../../src/graph/graph.js";
 import { validateGraph } from "../../src/graph/schema.js";
 import { runDaemon } from "../../src/run/daemon.js";
@@ -26,14 +27,14 @@ const AUTH_FAIL = "echo 'Not logged in. Please run /login to authenticate.'; exi
 // and merges, proving the seeded state flows through gates unharmed. A fresh FakeAdapter instance resets
 // its invoke counter to 0, so the first real (resumed) dispatch maps to script step 0 regardless of the
 // replayed attempt number.
-const setupResumeRepo = () => {
+const setupResumeRepo = (judge: unknown = { pass: true, criteria: [{ criterion: "c1", met: true, reason: "ok" }] }) => {
   const repo = makeRepo({ "base.txt": "base\n" });
   saveGraph(repo, validateGraph({ version: 1, spec: { source: "prd", paths: ["p"], hash: "h" }, tasks: [T("T1")] }));
   writeFileSync(join(tickmarkrDir(repo), "config.yaml"), "judge: { adapter: fake, model: fake-1 }\nconsult: { adapter: fake, model: fake-1 }\n");
   const sdir = mkdtempSync(join(tmpdir(), "tickmarkr-rr-"));
   const scriptPath = join(sdir, "s.json");
   writeFileSync(scriptPath, JSON.stringify({
-    judge: { pass: true, criteria: [{ criterion: "c1", met: true, reason: "ok" }] },
+    judge,
     review: { approve: true, issues: [] },
     consult: { action: "retry", notes: "retry" },
     tasks: { T1: [{ shell: `echo done > t1.txt && ${COMMIT} t1`, result: { ok: true, summary: "t1 done" } }] },
@@ -73,11 +74,12 @@ describe("OBS-1089 lifetime worker dispatch identity", () => {
       ...Array.from({ length: 5 }, (_, attempt) => ({
         event: "task-dispatch", taskId: "T1", data: { assignment: fake1, attempt },
       })),
-      { event: "task-approved", taskId: "T1", data: { release: "attempt-cap" } },
+      { event: "task-human", taskId: "T1", data: { kind: "attempt-cap" } },
     ]);
+    const journal = Journal.open(repo, runId);
+    journal.append("task-approved", "T1", { release: "attempt-cap", park: journal.newestBinding("T1") }); // OBS-1178: bound
     const result = await runDaemon(repo, { adapters: [fake], runId, resume: true });
     expect(result.done).toEqual(["T1"]);
-    const journal = Journal.open(repo, runId);
     const rows = postResume(journal.read());
     expect(rows.some((e) => e.event === "dead-channel-failover")).toBe(true);
     expect(rows.filter((e) => e.event === "task-dispatch").map((e) => ({
@@ -111,9 +113,11 @@ describe("OBS-1089 lifetime worker dispatch identity", () => {
           } },
           ...(priorRelease === "recheck" ? [{ event: "recheck-battery", taskId: "T1" }] : []),
         ]),
-        { event: "task-approved", taskId: "T1", data: { release } },
+        { event: "task-human", taskId: "T1", data: { kind: release === "attempt-cap" ? "attempt-cap" : "gate-fail" } },
       ]);
-      const before = Journal.open(repo, runId).read().length;
+      const seeded = Journal.open(repo, runId);
+      seeded.append("task-approved", "T1", { release, park: seeded.newestBinding("T1") }); // OBS-1178: bound
+      const before = seeded.read().length;
       const result = await runDaemon(repo, { adapters: [fake], runId, resume: true });
       expect(result.done).toContain("T1");
       const journal = Journal.open(repo, runId);
@@ -159,9 +163,10 @@ describe("OBS-1089 lifetime worker dispatch identity", () => {
     await seedJournal(repo, runId, [
       { event: "task-dispatch", taskId: "T1", data: { assignment: fake1, attempt: 0, workerDispatchOrdinal: 0 } },
       { event: "task-dispatch", taskId: "T1", data: { assignment: fake1, attempt: 1, workerDispatchOrdinal: 1 } },
-      { event: "task-approved", taskId: "T1", data: { release: "attempt-cap" } },
+      { event: "task-human", taskId: "T1", data: { kind: "attempt-cap", reason: "attempt cap" } },
     ]);
     const journal = Journal.open(repo, runId);
+    journal.append("task-approved", "T1", { release: "attempt-cap", park: journal.newestBinding("T1") }); // OBS-1178: bound to its park
     expect(journal.replayResumeState().get("T1")!.attempts).toBe(0);
     journal.append("task-dispatch", "T1", { assignment: fake1, attempt: 0, workerDispatchOrdinal: 2 });
     journal.append("task-approved", "T1", { release: "recheck" });
@@ -481,4 +486,210 @@ test("a tier climb committed before interruption reaches the next restored dispa
   expect(dispatch.data.provenance).toContain("tier-escalated fake:fake-1 → fake:fake-2 (repair-exhausted)");
   expect(dispatch.data.excludedChannels).toEqual(["fake:fake-1"]);
   expect(rows.filter((e) => e.event === "tier-escalated")).toHaveLength(1);
+});
+
+// OBS-1109: an attempt a dead daemon left between worker-launch and worker-result. It is written as a
+// live daemon writes it (the launch carries the attempt's nonce, dispatch script and slot); the pane
+// text and the task branch decide whether it finished. The fake script would commit t1.txt if the
+// task were dispatched again.
+describe("OBS-1109 resume harvest across repeated resumes (fake adapter, zero tokens)", () => {
+  const git = (cwd: string, ...args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+  const nonce = "0badc0de";
+  // A terminal host that outlives daemon instances. Every driver instance starts EMPTY, as production
+  // drivers do after a restart: the journaled slot is unknown to it until the daemon restores the
+  // owned pane by name through its read-only adopt, and its reconcile closes every owned pane the
+  // journal fold no longer desires. A name the host does not hold cannot be adopted; a pane holding
+  // an Error is one the driver cannot read.
+  class PaneHost { panes = new Map<string, string | Error>(); closed: string[] = []; }
+  const hostDriver = (host: PaneHost): ExecutorDriver => {
+    const inner = new SubprocessDriver();
+    const adopted = new Map<string, string>(); // slot id → pane name
+    let n = 0;
+    return {
+      id: "pane-host", interactive: false,
+      slot: inner.slot.bind(inner),
+      // a read-only binding to the pane the host still holds under the owned name — never an allocation
+      adopt: async (s: Slot) => {
+        if (!host.panes.has(s.name)) throw new Error(`no pane ${s.name} to adopt`);
+        const id = `host-${++n}`;
+        adopted.set(id, s.name);
+        return { id, name: s.name, cwd: s.cwd };
+      },
+      run: inner.run.bind(inner), waitOutput: inner.waitOutput.bind(inner),
+      waitAgentStatus: inner.waitAgentStatus.bind(inner), status: inner.status.bind(inner),
+      read: async (s: Slot, lines: number) => {
+        const name = adopted.get(s.id);
+        if (!name) return inner.read(s, lines);
+        const p = host.panes.get(name);
+        if (p === undefined) throw new Error(`pane ${name} is closed`);
+        if (p instanceof Error) throw p;
+        return p;
+      },
+      notify: inner.notify.bind(inner),
+      close: async (s: Slot) => { if (adopted.has(s.id)) host.panes.delete(adopted.get(s.id)!); else await inner.close(s); },
+      worktree: inner.worktree.bind(inner),
+      reconcile: async (desired, runId) => {
+        for (const name of Array.from(host.panes.keys())) {
+          if (desired.has(formatOwnedName(canonicalizeLegacyName(name, runId)))) continue;
+          host.panes.delete(name);
+          host.closed.push(name);
+        }
+      },
+    } as ExecutorDriver;
+  };
+  const seedInterrupted = async (runId: string, pane: string | Error | undefined, committed: boolean, benchAuthor = false, judge?: unknown) => {
+    const { repo, fake } = setupResumeRepo(judge);
+    const base = await gitHead(repo);
+    const wt = await new SubprocessDriver().worktree(repo, `tickmarkr/${runId}--T1`, base);
+    if (committed) {
+      writeFileSync(join(wt, "harvest.txt"), "finished\n");
+      git(wt, "add", "-A");
+      git(wt, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "--no-gpg-sign", "-qm", "finished work");
+    }
+    const slot = { id: `pane-${runId}`, name: formatOwnedName({ role: "worker", taskId: "T1", attempt: 0, runId }), cwd: wt };
+    await seedJournal(repo, runId, [
+      { event: "task-dispatch", taskId: "T1", data: { assignment: fake2, attempt: 0, workerDispatchOrdinal: 0 } },
+      { event: "worker-launch", taskId: "T1", data: { attempt: 0, nonce, dispatchScript: join(repo, ".tickmarkr", "T1-a0.sh"), slot } },
+      // a sibling's failover benched the producing seat: the resumed route no longer lands on the author
+      ...(benchAuthor ? [{ event: "channel-exclusion", data: { channel: "fake:fake-2", reason: "auth-required", kind: "dead-channel" } }] : []),
+    ]);
+    const host = new PaneHost();
+    if (pane !== undefined) host.panes.set(slot.name, pane);
+    let interruptAt: string | undefined;
+    // a FRESH driver per daemon instance, as production restarts get: nothing of the last one survives
+    const driver = (): ExecutorDriver => ({
+      ...hostDriver(host),
+      // the daemon is killed at the named projection: the process stops here
+      project: async (_id: string, state: string) => {
+        if (state !== interruptAt) return;
+        process.emit("SIGTERM", "SIGTERM");
+        await new Promise(() => {});
+      },
+    });
+    return { repo, fake, driver, host, interruptAt: (state: string) => { interruptAt = state; }, resumeNormally: () => { interruptAt = undefined; } };
+  };
+  const rowsAfterLastResume = (rows: JournalEvent[]) => rows.slice(rows.map((e) => e.event).lastIndexOf("run-resume") + 1);
+  const finishedPane = `TICKMARKR_RESULT_${nonce} {"ok":true,"summary":"t1 finished","deviations":[]}\n`;
+  const killed = async (repo: string, fake: FakeAdapter, runId: string, driver: () => ExecutorDriver) => {
+    let exited!: (code: number) => void;
+    const exitCode = new Promise<number>((resolve) => { exited = resolve; });
+    await expect(runDaemon(repo, { adapters: [fake], runId, resume: true, driver: driver(), exit: exited })).rejects.toThrow("terminated by SIGTERM");
+    expect(await exitCode).toBe(143);
+  };
+  // the second resume gates the one recorded harvest under its producer: nothing is redone or recorded twice
+  const gatesHarvestUnderProducer = async (repo: string, fake: FakeAdapter, runId: string, driver: () => ExecutorDriver) => {
+    const s = await runDaemon(repo, { adapters: [fake], runId, resume: true, driver: driver() });
+    expect(s.done).toEqual(["T1"]);
+    const all = Journal.open(repo, runId).read();
+    expect(all.filter((e) => e.event === "worker-result-harvested")).toHaveLength(1);
+    expect(all.filter((e) => e.event === "worker-result")).toHaveLength(1);
+    const second = rowsAfterLastResume(all);
+    expect(second.filter((e) => ["task-dispatch", "worker-launch", "worker-result"].includes(e.event))).toEqual([]);
+    expect(second.some((e) => e.event === "gate-result")).toBe(true);
+    const done = second.find((e) => e.event === "task-done")!;
+    expect(done.data.assignment).toEqual(fake2);
+    expect(done.data.authors).toEqual(["fake:fake-2"]);
+    expect(git(repo, "show", `tickmarkr/${runId}:harvest.txt`)).toBe("finished");
+    expect(() => git(repo, "show", `tickmarkr/${runId}:t1.txt`)).toThrow();
+    return all;
+  };
+
+  test("test: repeated production resumes preserve one harvest and its original author versus recovering an unfinished or foreign-nonce attempt, so double harvesting or trusting the foreign trailer fails", async () => {
+    // (a) finished: the first resume harvests and dies before gating; the second gates that same harvest
+    {
+      const runId = "run-harvest-repeated";
+      const { repo, fake, driver, interruptAt, resumeNormally } = await seedInterrupted(runId, finishedPane, true, true);
+      interruptAt("in-review"); // after recording the harvest, before its first gate
+      await killed(repo, fake, runId, driver);
+      const first = rowsAfterLastResume(Journal.open(repo, runId).read());
+      expect(first.filter((e) => e.event === "worker-result-harvested")).toHaveLength(1);
+      expect(first.filter((e) => ["task-dispatch", "gate-result", "task-done"].includes(e.event))).toEqual([]);
+      resumeNormally();
+      await gatesHarvestUnderProducer(repo, fake, runId, driver);
+    }
+    // (a2) killed BETWEEN the harvest's worker-result and its harvest row: the next resume finishes that
+    // one record from the result it wrote, and never falls back to redispatching the finished attempt
+    {
+      const runId = "run-harvest-torn";
+      const { repo, fake, driver } = await seedInterrupted(runId, finishedPane, true, true);
+      // the process dies AT the harvest row: that write and every later one never reach the journal
+      const write = Journal.prototype.append as (...args: unknown[]) => void;
+      let dead = false;
+      const crash = vi.spyOn(Journal.prototype, "append").mockImplementation(function (this: Journal, ...args: unknown[]) {
+        if (dead) return;
+        if (args[0] === "worker-result-harvested") {
+          dead = true;
+          throw new Error("killed between the harvest's rows");
+        }
+        write.apply(this, args);
+      } as typeof Journal.prototype.append);
+      try {
+        await runDaemon(repo, { adapters: [fake], runId, resume: true, driver: driver() });
+      } finally {
+        crash.mockRestore();
+      }
+      expect(dead).toBe(true);
+      const first = rowsAfterLastResume(Journal.open(repo, runId).read());
+      expect(first.filter((e) => e.event === "worker-result")).toHaveLength(1);
+      expect(first.filter((e) => e.event === "worker-result-harvested")).toEqual([]);
+      const all = await gatesHarvestUnderProducer(repo, fake, runId, driver);
+      expect(all.find((e) => e.event === "worker-result-harvested")!.data).toMatchObject({
+        attempt: 0, source: "resume", trailer: true, summary: "t1 finished",
+      });
+    }
+    // (a3) killed AFTER the harvest's gates recorded a result (a red judge, so the resume moved on to a
+    // new dispatch and died before it), with the producing seat benched and rerouted off: the next resume replays those
+    // recorded gates and still gates — and credits — the harvest under its producer, not the new route
+    {
+      const runId = "run-harvest-gated";
+      const { repo, fake, driver, interruptAt, resumeNormally } = await seedInterrupted(runId, finishedPane, true, true, [
+        { pass: false, criteria: [{ criterion: "c1", met: false, reason: "not yet" }] },
+        { pass: true, criteria: [{ criterion: "c1", met: true, reason: "ok" }] },
+      ]);
+      interruptAt("in-progress"); // after the gate results, before any new dispatch
+      await killed(repo, fake, runId, driver);
+      const first = rowsAfterLastResume(Journal.open(repo, runId).read());
+      expect(first.filter((e) => e.event === "worker-result-harvested")).toHaveLength(1);
+      expect(first.some((e) => e.event === "gate-result" && e.data.gate === "acceptance" && e.data.pass === false)).toBe(true);
+      expect(first.filter((e) => ["task-dispatch", "task-done"].includes(e.event))).toEqual([]);
+      // ...and its consult had rerouted off the producing seat: the replayed seat memory is cleared, so
+      // only the harvest's own record can still name its author
+      Journal.open(repo, runId).append("consult-verdict", "T1", { action: "reroute", notes: "reroute", adapter: "fake", model: "fake-1", vendor: "fake-a" });
+      resumeNormally();
+      await gatesHarvestUnderProducer(repo, fake, runId, driver);
+    }
+    // (a4) a LIVE daemon recorded the worker's own result and died before gating it (no harvest row,
+    // no gate result): the next resume finishes that record and gates it — it never redispatches
+    {
+      const runId = "run-harvest-live-result";
+      const { repo, fake, driver } = await seedInterrupted(runId, undefined, true, true);
+      Journal.open(repo, runId).append("worker-result", "T1", { ok: true, summary: "t1 finished", deviations: [], finished: true, exitCode: 0, mode: "print" });
+      const all = await gatesHarvestUnderProducer(repo, fake, runId, driver);
+      expect(all.find((e) => e.event === "worker-result-harvested")!.data).toMatchObject({ attempt: 0, source: "resume", trailer: true, summary: "t1 finished" });
+    }
+    // (b) unfinished — no trailer, nothing committed — (c) a pane holding ANOTHER attempt's trailer over
+    // committed work, and (d) a pane the fresh driver cannot read at all, committed or not: an unread pane
+    // proves neither a matching trailer nor the absence of a foreign one. None is harvested or gated as
+    // trailerless; each is declined, its spared pane swept, and the ordinary recovery dispatch takes over
+    for (const [label, pane, committed, reason] of [
+      ["unfinished", "still working…\n", false, "unfinished"],
+      ["foreign", `TICKMARKR_RESULT_deadbeef {"ok":true,"summary":"another attempt's claim","deviations":[]}\n`, true, "foreign-nonce"],
+      ["unreadable", new Error("terminal handle lost"), true, "pane unreadable: terminal handle lost"],
+      ["unreadable-unfinished", new Error("terminal handle lost"), false, "pane unreadable: terminal handle lost"],
+    ] as const) {
+      const runId = `run-harvest-${label}`;
+      const { repo, fake, driver, host } = await seedInterrupted(runId, pane, committed);
+      const s = await runDaemon(repo, { adapters: [fake], runId, resume: true, driver: driver() });
+      expect(s.done).toEqual(["T1"]);
+      const post = rowsAfterLastResume(Journal.open(repo, runId).read());
+      expect(post.filter((e) => e.event === "worker-result-harvested")).toEqual([]);
+      expect(post.filter((e) => e.event === "worker-result" && e.data.source === "resume")).toEqual([]);
+      expect(post.find((e) => e.event === "resume-harvest-declined")!.data).toEqual({ attempt: 0, reason });
+      expect(host.closed).toEqual([formatOwnedName({ role: "worker", taskId: "T1", attempt: 0, runId })]);
+      const dispatches = post.filter((e) => e.event === "task-dispatch");
+      expect(dispatches).toHaveLength(1);
+      expect(dispatches[0]!.data.attempt).toBe(1);
+      expect(git(repo, "show", `tickmarkr/${runId}:t1.txt`)).toBe("done");
+    }
+  }, 120_000);
 });

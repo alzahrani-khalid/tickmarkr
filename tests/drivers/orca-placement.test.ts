@@ -1026,26 +1026,29 @@ describe("OrcaDriver placement, laziness and owned-title reconcile", () => {
     expect(fake.calls.filter((c) => c[1] === "split").length).toBe(splitCountBeforeMalformed + 1);
     expect(fake.calls.filter((c) => c[1] === "close").length).toBe(closeCountBeforeMalformed);
     expect(fake.calls.filter((c) => c[1] === "close").map((c) => c[3])).not.toContain("term_forged_no_parent_tab");
-    // The reservation can never be bound, so it is tombstoned (still present, still readable): a
-    // later call splits afresh instead of refusing forever — and never closes the forged handle.
-    expect(JSON.parse(readFileSync(join(repo, stateDirName(repo), "supervision", `watch-board.${malformedRunId}.json`), "utf8"))).toMatchObject({ pane: "", retired: true });
+    // OBS-1172: no observer claimed it, and the launching tab still holds earlier boards' panes of
+    // unknown ownership, so the split may have started a board nobody can name. The reservation is
+    // HELD (still present, never tombstoned) and a later call reconciles it again instead of splitting
+    // a second board over it — and never closes the forged handle.
+    expect(JSON.parse(readFileSync(join(repo, stateDirName(repo), "supervision", `watch-board.${malformedRunId}.json`), "utf8"))).toMatchObject({ pane: "", placer: process.pid });
+    expect(JSON.parse(readFileSync(join(repo, stateDirName(repo), "supervision", `watch-board.${malformedRunId}.json`), "utf8")).retired).toBeUndefined();
     await expect(
       driver.narrator(repo, `tickmarkr run --view run-board --run-id ${malformedRunId}`, malformedRunId)
-    ).rejects.toThrow(/placement.*malformed or handle-less.*indeterminate cleanup/i);
-    expect(fake.calls.filter((c) => c[1] === "split").length).toBe(splitCountBeforeMalformed + 2);
+    ).rejects.toThrow(/placement remains unresolved .*held after an indeterminate split receipt.*unknown ownership.*indeterminate cleanup/i);
+    expect(fake.calls.filter((c) => c[1] === "split").length).toBe(splitCountBeforeMalformed + 1);
     expect(fake.calls.filter((c) => c[1] === "close").length).toBe(closeCountBeforeMalformed);
 
-    // Unknown receipt: the verb was issued but its output is unparseable — same refusal, same tombstone.
+    // Unknown receipt: the verb was issued but its output is unparseable — same hold, no second split.
     malformedSplitReceipt = { code: 0, stdout: "split: connection reset" };
     const unknownRunId = "run-unknown-998";
     await expect(
       driver.narrator(repo, `tickmarkr run --view run-board --run-id ${unknownRunId}`, unknownRunId)
-    ).rejects.toThrow(/placement failed .*receipt is unknown.*indeterminate cleanup/is);
+    ).rejects.toThrow(/placement unresolved .*receipt is unknown.*held.*indeterminate cleanup/is);
     expect(readWatchBoard(repo, unknownRunId)?.pane).toBe("");
     await expect(
       driver.narrator(repo, `tickmarkr run --view run-board --run-id ${unknownRunId}`, unknownRunId)
-    ).rejects.toThrow(/placement failed .*receipt is unknown.*indeterminate cleanup/is);
-    expect(fake.calls.filter((c) => c[1] === "split").length).toBe(splitCountBeforeMalformed + 4);
+    ).rejects.toThrow(/placement remains unresolved .*held after an indeterminate split receipt/is);
+    expect(fake.calls.filter((c) => c[1] === "split").length).toBe(splitCountBeforeMalformed + 2);
     expect(fake.calls.filter((c) => c[1] === "close").length).toBe(closeCountBeforeMalformed);
 
     // Handle present but parent tabId is not the launching terminal's — still malformed, no close.
@@ -1303,7 +1306,7 @@ describe("Orca board owner record lifecycle, judged by a second OrcaDriver", () 
     expect(rig.fake.of(slot.id)).toBeUndefined();
   });
 
-  test("retire: a run whose Orca board beat goes stale while its owner pid stays live journals watch-board-lost, and the daemon's reopen retires the board through the real OrcaDriver seam without a close on the wire — the tombstone and the pane stay while the stop is unacknowledged and no reopened row appears", async () => {
+  test("retire: a run whose Orca board beat goes stale while its owner pid stays live journals watch-board-slow once and never watch-board-lost or a reopen (OBS-1110), and run-end retires the board through the real OrcaDriver without a close on the wire — the tombstone and the pane stay while the stop is unacknowledged", async () => {
     const runId = "run-board-stale-live";
     const { repo, fake: adapter } = setupRepo(
       [T("T1", { files: ["ok.txt"] })],
@@ -1350,16 +1353,14 @@ describe("Orca board owner record lifecycle, judged by a second OrcaDriver", () 
     const summary = await runDaemon(repo, { adapters: [adapter], runId, driver, concurrency: 1 });
     expect(summary.done).toEqual(["T1"]);
     const rows = Journal.open(repo, runId).read();
-    const lost = rows.filter((e) => e.event === "watch-board-lost");
-    const failed = rows.filter((e) => e.event === "watch-board-reopen-failed");
+    const slow = rows.filter((e) => e.event === "watch-board-slow");
     const tomb = JSON.parse(readFileSync(join(repo, stateDirName(repo), "supervision", `watch-board.${runId}.json`), "utf8")) as WatchBoardOwner & { retired?: boolean };
     const pane = tomb.pane;
-    expect(lost.length).toBeGreaterThan(0);
-    expect(lost[0]!.data).toMatchObject({ pane, pid: process.pid });
-    expect(lost[0]!.data.beatAgeMs as number).toBeGreaterThan(SUPERVISION_STALE_MS);
-    expect(rows.filter((e) => e.event === "watch-board-reopened")).toEqual([]);
-    expect(failed.length).toBeGreaterThan(0);
-    expect(failed[0]!.data.error).toMatch(/unacknowledged/);
+    expect(slow).toHaveLength(1);
+    expect(slow[0]!.data).toMatchObject({ pane, pid: process.pid });
+    expect(slow[0]!.data.beatAgeMs as number).toBeGreaterThan(SUPERVISION_STALE_MS);
+    expect(rows.filter((e) => ["watch-board-lost", "watch-board-reopened", "watch-board-reopen-failed"].includes(e.event))).toEqual([]);
+    expect(rows.find((e) => e.event === "watch-cleanup-failed")?.data.error).toMatch(/unacknowledged/);
     expect(tomb).toMatchObject({ retired: true, pid: process.pid, armId });
     expect(watchBoardAcknowledged(tomb)).toBe(false);
     expect(orca.calls.filter((c) => c[1] === "close")).toEqual([]);

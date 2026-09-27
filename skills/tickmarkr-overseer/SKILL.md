@@ -18,6 +18,14 @@ Fleet/Bootstrap and Plan/Health remain follow-ons with existing CLI entries. A r
 1/3 merged, human T2, blocked T3 run is PARTIAL despite tip pass. The orchestrator owns
 the Run confirmation and read-back of the appended `task-approved` receipt after a ruling;
 permission is not dispatch, and a closed run needs explicit `tickmarkr resume <runId>`.
+A ruling is bound to the park it decides (OBS-1178): relay it with that park's token, e.g.
+`tickmarkr approve <runId> T2 --waive --park <line>@<ts> --gate review`, copied from `tickmarkr
+status <runId>` or the park notice. A standing order or queued ruling written
+against one park is refused once a newer park opens (the daemon journals `approval-refused`) — rule
+again on the new token; never re-issue the old one (D-470: an unbound approve waived a RED test
+gate). A failed task keeps its recheck with its bound failure token: status prints
+`failed — T3 — failure <line>@<ts>`, and `tickmarkr approve <runId> T3 --recheck --park <line>@<ts>`
+re-gates its landed commits with no worker.
 Manual UI retains the receipt; the daemon-owned board gracefully stands down only its own
 presence before closing its owned pane. Non-TTY supervision keeps `status`, `report` and
 default-watch line output (`--watch --plain` is also available on a TTY). Keep the canonical
@@ -743,6 +751,40 @@ number — an unmeasured budget is not a small budget.
 #### On Orca (`TERM_PROGRAM=Orca` and non-empty `ORCA_TERMINAL_HANDLE`) — mutual clear
 
 Write the handoff and announce it with `orca terminal send --terminal <handle> --text "Read <handoff> and <brief>" --enter --wait-submit 15 --json`. Require observed submission (`result.send.prompt.stages.includes("turn_started")`) and inspect `orca terminal read --terminal <handle> --screen --json` before and after clearing. Arm file/journal and context evidence watchers for both seats.
+
+#### Opt-in Claude context sidecar — a Claude seat's `%` from disk (OBS-1122)
+
+A Claude seat's fill can also be read from a file instead of off its screen. It is opt-in, per seat,
+Claude only, and fully reversible. Claude has ONE `statusLine` slot and it belongs to the operator, so
+`scripts/context-statusline.sh` never takes it over: it **chains the operator's existing status
+command** — runs it with the same stdin and returns its stdout and exit status unchanged — and only as a
+side effect writes the payload's `context_window.used_percentage` (nothing else) to
+`.tickmarkr/overseer/context/<seat>.json` under the launch-supplied root, atomically (temp file +
+rename).
+
+1. **Record the operator's current `statusLine.command` verbatim in the brief** — it is the reversal.
+2. **The operator wraps it; this skill never edits their home configuration.** The wrapped command is
+   `<repo>/.claude/skills/tickmarkr-overseer/scripts/context-statusline.sh '<existing statusLine command>'`,
+   set in the same settings file, or in that one seat's launch `--settings` JSON so it ends with the seat.
+   With no existing command, omit the argument; the collector then prints nothing.
+3. **The launch recipe names the seat and its root:** start the Claude seat with
+   `TKR_CONTEXT_SEAT=<seat>` and `TKR_CONTEXT_ROOT=<absolute repo path>` in its environment. Only a safe
+   basename (`[A-Za-z0-9][A-Za-z0-9._-]{0,63}`) and an absolute root are accepted; anything else writes
+   nothing — never a sanitized name that could land in another seat's file — and a seat launched without
+   either collects nothing while its statusline still chains. The root never comes from the payload or
+   the seat's cwd: both can differ from the last valid payload's directory, which would let a malformed
+   payload's invalidation land in another tree while the stale number stayed readable.
+4. **Read:** `context-statusline.sh --read <seat> [<root>]` prints the percentage, or `unknown` when the
+   file is absent, malformed, attributed to another seat, older than 120 seconds, or the payload carried
+   no percentage. A malformed payload overwrites the seat's last number with no percentage, so a stale
+   good reading never outlives it. **`unknown` is never 0 %** — it sends you back to the screen read,
+   never to headroom.
+5. **Reverse:** restore the recorded command in the settings it came from, then remove
+   `.tickmarkr/overseer/context/`.
+
+**Codex seats stay screen-read.** The collector reads Claude's statusLine payload only, so it measures
+nothing about a Codex seat — its `--read` stays `unknown` — and a Codex seat's fill is read off its screen
+exactly as above.
 
 ### A GO has a deadline — arm the launch observer in the same act as the GO
 

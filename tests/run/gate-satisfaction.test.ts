@@ -36,15 +36,23 @@ const COMPLETED_RUNNER = "printf '%s\\n' ' Tests  0 failed | 3 passed (3)'; exit
 test("test: replaySatisfiedGates keeps a gate-satisfied entry only while it is the task's newest approval so a later uphold or recheck approval clears it while the shipped fold that lets a stale waiver persist across a later uphold fails", () => {
   const repo = makeTestTempDir("tickmarkr-waiver-approval-");
   const journal = Journal.create(repo, "run-waiver-newest-approval");
+  // OBS-1178: each decision binds to the park it answers.
+  const park = (taskId: string, gate: string) => {
+    journal.append("gate-result", taskId, { gate, pass: false });
+    journal.append("task-human", taskId, { kind: "gate-fail" });
+    return journal.newestBinding(taskId);
+  };
+  const p1 = park("T1", "build");
+  const p2 = park("T2", "lint");
 
-  journal.append("task-approved", "T1", { by: "operator", release: "gate-satisfied", gate: "build" });
-  journal.append("task-approved", "T2", { by: "operator", release: "gate-satisfied", gate: "lint" });
+  journal.append("task-approved", "T1", { by: "operator", release: "gate-satisfied", gate: "build", park: p1 });
+  journal.append("task-approved", "T2", { by: "operator", release: "gate-satisfied", gate: "lint", park: p2 });
   expect(journal.replaySatisfiedGates()).toEqual(new Map([["T1", "build"], ["T2", "lint"]]));
 
-  journal.append("task-approved", "T1", { by: "operator", release: "review-upheld" });
+  journal.append("task-approved", "T1", { by: "operator", release: "review-upheld", park: p1 });
   expect(journal.replaySatisfiedGates()).toEqual(new Map([["T2", "lint"]]));
 
-  journal.append("task-approved", "T2", { by: "operator", release: "recheck" });
+  journal.append("task-approved", "T2", { by: "operator", release: "recheck", park: p2 });
   expect(journal.replaySatisfiedGates()).toEqual(new Map());
 });
 
@@ -260,14 +268,17 @@ test("review waiver carry fails closed without a subject and ends on superseding
     // Unrelated tasks and daemon annotations confer no authority on this task.
     journal.append("task-approved", "T2", { release: "review-upheld" });
     journal.append("gate-waiver-carried", "T3", { gate: "review", commit: "subject", carried: true });
-    journal.append("task-approved", "T1", { release: "recheck" });
+    // OBS-1178: every later decision binds to the park it answers.
+    const repark = () => { journal.append("task-human", "T1", { kind: "infra" }); return journal.newestBinding("T1"); };
+    journal.append("task-approved", "T1", { release: "recheck", park: repark() });
     expect(journal.replaySatisfiedGates().get("T1")).toBe(ending === "missing" ? undefined : "review");
     expect(journal.replaySatisfiedGates().has("T3")).toBe(false);
     journal.append("worktree-recreation", "T1", {});
+    const park = repark();
     if (ending === "dispatch") journal.append("task-dispatch", "T1", {});
     else if (ending === "changed") journal.append("gate-result", "T1", { gate: "test", pass: true, commit: "new-subject" });
-    else if (ending !== "missing") journal.append("task-approved", "T1", ending === "untyped" ? {} : { release: ending });
-    journal.append("task-approved", "T1", { release: "recheck" });
+    else if (ending !== "missing") journal.append("task-approved", "T1", ending === "untyped" ? { park } : { release: ending, park });
+    journal.append("task-approved", "T1", { release: "recheck", park });
     expect(journal.replaySatisfiedGates(new Map([["T1", "subject"]])).has("T1")).toBe(false);
   }
 });

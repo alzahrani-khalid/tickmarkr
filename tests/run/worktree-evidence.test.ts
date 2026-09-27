@@ -250,7 +250,11 @@ test("a worktree change runDaemon detects rearms the stall window and not only t
 
   const run = async (changed: boolean) => {
     const runId = `run-worktree-rearm-${changed ? "changed" : "unchanged"}`;
-    const { repo, fake } = setupRepo([T("T1", { timeoutMinutes: 0.01 })], STALLED);
+    // OBS-1198: a 1200 ms window, not 600. The conclusion lags the deadline by a FIXED ~300 ms (the poll
+    // slice plus harvest), measured at 913-945 ms against a 600 ms window on 2.6.1 and 2.6.2 alike. So the
+    // old 1000 ms ceiling kept a 7 % margin and went red under full-suite gate load (1001-1080 ms). Doubling
+    // the window doubles every slack below while the lag stays fixed; each claim keeps its meaning.
+    const { repo, fake } = setupRepo([T("T1", { timeoutMinutes: 0.02 })], STALLED);
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       await runDaemon(repo, {
@@ -259,7 +263,7 @@ test("a worktree change runDaemon detects rearms the stall window and not only t
         driver: evidenceDriver({
           actAfterLaunch: (worktree) => {
             if (changed && timer === undefined) {
-              timer = setTimeout(() => writeFileSync(join(worktree, "late.txt"), "late change\n"), 450);
+              timer = setTimeout(() => writeFileSync(join(worktree, "late.txt"), "late change\n"), 900);
             }
           },
         }),
@@ -284,11 +288,11 @@ test("a worktree change runDaemon detects rearms the stall window and not only t
   const changedContact = taskEventTime(changed, "worker-contact");
   const changedEnd = taskEventTime(changed, "worker-result");
 
-  expect(unchangedDuration).toBeGreaterThanOrEqual(500);
-  expect(unchangedDuration).toBeLessThan(1_000);
-  expect(changedContact - taskEventTime(changed, "worker-launch")).toBeGreaterThanOrEqual(450);
-  expect(changedEnd - changedContact).toBeGreaterThanOrEqual(500);
-  expect(changedEnd - taskEventTime(changed, "worker-launch")).toBeGreaterThan(unchangedDuration + 400);
+  expect(unchangedDuration).toBeGreaterThanOrEqual(1_000);
+  expect(unchangedDuration).toBeLessThan(2_000);
+  expect(changedContact - taskEventTime(changed, "worker-launch")).toBeGreaterThanOrEqual(900);
+  expect(changedEnd - changedContact).toBeGreaterThanOrEqual(1_000);
+  expect(changedEnd - taskEventTime(changed, "worker-launch")).toBeGreaterThan(unchangedDuration + 600);
 }, 30_000);
 
 test("with every worker-side input held constant, the same worktree delta, the same pane frames and a status held at working, runDaemon reaches the identical survive-or-die decision whether the nudge was delivered and unanswered or failed both delivery attempts, while the failed-delivery row is journaled only in the second, so a delivery outcome standing in for worktree evidence fails", async () => {

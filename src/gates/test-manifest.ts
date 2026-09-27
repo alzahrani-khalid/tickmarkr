@@ -563,10 +563,14 @@ function strandedSingleForkFiles(files: string[], nonce: string, run: ManifestRu
  * selection (OBS-1166: a selected screen's retry rediscovered the whole selection and refused). So the
  * retry is built from the UN-narrowed base command, its own `--` rule, the stranded files as the only
  * positional filters, and an `--exclude` of every completed file; the caller then requires discovery
- * to prove the exact retry set before launch. */
+ * to prove the exact retry set before launch. OBS-1180: Vitest matches an absolute filter against the
+ * module path it resolved through every symlink, so the filters are rooted at the canonical realpath of
+ * `cwd` — a symlinked worktree root otherwise filters to an empty discovery. */
 export function singleForkRetryCommand(base: string, cwd: string, stranded: readonly string[], completed: readonly string[]): string {
+  let root = cwd;
+  try { root = realpathSync(cwd); } catch { /* unreadable cwd — the exact rediscovery below fails closed */ }
   const excluded = completed.map(f => `--exclude=${shq(f.replace(/[\\*?[\]{}()!+@]/g, "\\$&"))}`).join(" ");
-  return `${base}${runnerInvocation(base, cwd).separator} ${stranded.map(f => shq(join(cwd, f))).join(" ")} ${excluded}`;
+  return `${base}${runnerInvocation(base, cwd).separator} ${stranded.map(f => shq(join(root, f))).join(" ")} ${excluded}`;
 }
 
 /** One configured runner execution, and its own collection under the same arguments and environment.

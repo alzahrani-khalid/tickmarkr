@@ -1,7 +1,10 @@
 import { execFileSync, spawn } from "node:child_process";
-import { realpathSync, statSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
-import { canonicalWorktreePath, ORCA_FIXTURE_VERSION, type OrcaExec, type OrcaFamily } from "../../src/drivers/orca.js";
+import { canonicalWorktreePath, ORCA_FIXTURE_VERSION, type OrcaDriver, type OrcaExec, type OrcaFamily } from "../../src/drivers/orca.js";
+import { SubprocessDriver } from "../../src/drivers/subprocess.js";
+import { parseOwnedName, type ExecutorDriver, type Slot } from "../../src/drivers/types.js";
+import { supervisionBeatPath, supervisionPresencePath } from "../../src/run/supervision.js";
 
 /**
  * Orca 1.4.200 split receipt capture, taken 2026-09-14T01:00:09Z with:
@@ -819,5 +822,84 @@ export function steppedTime(): { now: () => number; sleep: (ms: number) => Promi
     now: () => ms,
     sleep: async (n) => { ms += Math.max(1, n); },
     advance: (n: number) => { ms += Math.max(0, n); },
+  };
+}
+
+/**
+ * The `tickmarkr ui` board an Orca split starts, reduced to what the owner protocol can see: a REAL
+ * child process (so pid liveness is the kernel's answer, never a flag) whose pid claims the reservation
+ * exactly as observeNamedRun does — pid, arm id and, when given, the terminal it reports running in —
+ * with presence and a fresh watch beat. `poll()` answers a pending stop request: `ack` releases
+ * presence, acknowledges and exits; `silent` is a live board that never acknowledges; `exit` leaves
+ * without acknowledging. Every observer dies with `killBoardObservers()`, so none outlives its test.
+ */
+export interface FakeBoardObserver {
+  pid: number; armId: string; token: string;
+  onStop: "ack" | "silent" | "exit";
+  poll(): Promise<void>;
+  die(): Promise<void>;
+}
+const boardObservers = new Set<FakeBoardObserver>();
+export function fakeBoardObserver(repo: string, runId: string, opts: { handle?: string; onStop?: FakeBoardObserver["onStop"] } = {}): FakeBoardObserver {
+  const child = spawn("sleep", ["120"], { stdio: "ignore" });
+  const exited = new Promise<void>((done) => child.once("exit", () => done()));
+  const pid = child.pid!;
+  const beat = supervisionBeatPath(repo, "watch");
+  const boardFile = join(dirname(beat), `watch-board.${runId}.json`);
+  const reservation = JSON.parse(readFileSync(boardFile, "utf8")) as { token: string };
+  const armId = `arm-${pid}`;
+  const presence = supervisionPresencePath(repo, "watch", armId);
+  writeFileSync(boardFile, JSON.stringify({ ...reservation, pid, armId, ...(opts.handle ? { handle: opts.handle } : {}) }) + "\n");
+  writeFileSync(presence, JSON.stringify({ tier: "watch", id: armId }) + "\n");
+  writeFileSync(beat, JSON.stringify({ tier: "watch", armId }) + "\n");
+  // the stop/ack message files are supervision.ts's private naming — `watch-board.<token>.<kind>`
+  const message = (kind: "stop" | "ack") => join(dirname(beat), `watch-board.${reservation.token}.${kind}`);
+  let answered = false;
+  const observer: FakeBoardObserver = {
+    pid, armId, token: reservation.token, onStop: opts.onStop ?? "ack",
+    async poll() {
+      if (answered || observer.onStop === "silent" || !existsSync(message("stop"))) return;
+      answered = true;
+      if (observer.onStop === "ack") {
+        rmSync(presence, { force: true });
+        writeFileSync(message("ack"), JSON.stringify({ token: reservation.token, armId, pid }) + "\n");
+      }
+      await observer.die();
+    },
+    async die() {
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      await exited;
+    },
+  };
+  boardObservers.add(observer);
+  return observer;
+}
+export async function killBoardObservers(): Promise<void> {
+  for (const observer of boardObservers) await observer.die();
+  boardObservers.clear();
+}
+/** Answer every live observer's pending stop — wire it into the driver's injected sleep. */
+export async function pollBoardObservers(): Promise<void> {
+  for (const observer of boardObservers) await observer.poll();
+}
+
+/** The production daemon's driver with its board on a real OrcaDriver and its workers on subprocess. */
+export function orcaBoardDriver(board: OrcaDriver): ExecutorDriver {
+  const inner = new SubprocessDriver();
+  const isWatch = (s: Slot) => parseOwnedName(s.name)?.role === "watch";
+  return {
+    id: "orca",
+    interactive: true,
+    status: inner.status.bind(inner),
+    slot: inner.slot.bind(inner),
+    run: inner.run.bind(inner),
+    waitOutput: inner.waitOutput.bind(inner),
+    waitAgentStatus: inner.waitAgentStatus.bind(inner),
+    read: inner.read.bind(inner),
+    notify: inner.notify.bind(inner),
+    worktree: inner.worktree.bind(inner),
+    close: (s: Slot) => (isWatch(s) ? board.close(s) : inner.close(s)),
+    narrator: board.narrator.bind(board),
+    retireLostWatch: board.retireLostWatch.bind(board),
   };
 }

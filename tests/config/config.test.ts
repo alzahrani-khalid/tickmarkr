@@ -3,6 +3,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import { parse } from "yaml";
+import { z } from "zod";
+import { channelsFromConfig } from "../../src/adapters/types.js";
+import { EFFORTS } from "../../src/graph/schema.js";
 import { ConfigError, DEFAULT_CONFIG, TickmarkrConfigSchema, configTemplate, fleetRepoOverlayFromDelta, globalConfigDir, loadConfig, ModelPricingSchema, repoOverlayYaml, serializeFleetOverlay, SubPricingSchema, TIER_RANK, unifiedYamlDiff, type FleetEditable } from "../../src/config/config.js";
 
 function repoWithOverlay(yaml: string, globalDir?: string) {
@@ -836,5 +839,54 @@ describe("OBS-986: routing.escalateTier config knob", () => {
       const bad = repoWithOverlay(`routing:\n  escalateTier: ${badValue}\n`);
       expect(() => loadConfig(bad.repo, { globalDir: bad.globalDir })).toThrow(/escalateTier/);
     }
+  });
+});
+
+describe("OBS-1182 effort metadata", () => {
+  test("the config loader and emitted schemas accept supported effort metadata versus rejecting an unsupported adapter or level, so accepting an effort that cannot be launched fails", () => {
+    const overlay = (claude: string, codex: string, other = "") => `tiers:
+  claude-code:
+    modelOverrides:
+      fable: { effort: ${claude} }
+  codex:
+    modelOverrides:
+      gpt-5.6-sol: { vendor: openai, channel: api, effort: ${codex} }
+${other}`;
+    const ok = repoWithOverlay(overlay("high", "medium"));
+    const cfg = loadConfig(ok.repo, { globalDir: ok.globalDir });
+    expect(cfg.tiers["claude-code"].models.fable).toBe("frontier");
+    expect(channelsFromConfig("claude-code", cfg).find((c) => c.model === "fable")?.effort).toBe("high");
+    expect(channelsFromConfig("codex", cfg).find((c) => c.model === "gpt-5.6-sol"))
+      .toEqual({ adapter: "codex", vendor: "openai", model: "gpt-5.6-sol", channel: "api", tier: "frontier", effort: "medium" });
+
+    const kimi = "  kimi:\n    modelOverrides:\n      kimi-code/k3: { effort: high }\n";
+    const rejected: Array<[string, string]> = [
+      ["unsupported adapter", overlay("high", "medium", kimi)],
+      ["unsupported claude level", overlay("xhigh", "medium")],
+      ["unsupported codex level", overlay("high", "max")],
+    ];
+    for (const [name, yaml] of rejected) {
+      const bad = repoWithOverlay(yaml);
+      expect(() => loadConfig(bad.repo, { globalDir: bad.globalDir }), name).toThrow(ConfigError);
+    }
+
+    // the shipped config schema is the zod schema's emit, and it draws the same line as the loader
+    const shipped = JSON.parse(readFileSync("schema/config.schema.json", "utf8")) as Record<string, unknown>;
+    const { $comment: _comment, ...body } = shipped;
+    expect(body).toEqual(z.toJSONSchema(TickmarkrConfigSchema, { io: "input", unrepresentable: "any" }));
+    const tiers = (shipped as { properties: { tiers: Record<string, any> } }).properties.tiers;
+    expect(tiers.properties["claude-code"].properties.modelOverrides.additionalProperties.properties.effort.enum).toEqual([...EFFORTS]);
+    const validator = z.fromJSONSchema(shipped as Parameters<typeof z.fromJSONSchema>[0]);
+    const merged = (edit: (tiers: Record<string, any>) => void) => {
+      const next = structuredClone(DEFAULT_CONFIG) as unknown as { tiers: Record<string, any> };
+      edit(next.tiers);
+      return next;
+    };
+    expect(validator.safeParse(merged((t) => {
+      t["claude-code"].modelOverrides = { fable: { effort: "high" } };
+      t.codex.modelOverrides = { "gpt-5.6-sol": { effort: "medium" } };
+    })).success).toBe(true);
+    expect(validator.safeParse(merged((t) => { t.kimi.modelOverrides = { "kimi-code/k3": { effort: "high" } }; })).success, "unsupported adapter").toBe(false);
+    expect(validator.safeParse(merged((t) => { t["claude-code"].modelOverrides = { fable: { effort: "xhigh" } }; })).success, "unsupported level").toBe(false);
   });
 });

@@ -39,11 +39,12 @@ jobs:
       # tree. OBS-156: serialize on the 2-core hosted runner. OBS-148 fixed release.yml only, so
       # this job starved a different load-sensitive test on every release (v1.78 herdr READINESS,
       # v1.79 daemon tip-verify artifact) while Release passed on the identical commit.
+      # OBS-1184: each Vitest step runs through run-ci-vitest.sh, which tees the log and keeps the
+      # command's own status unless the overseer skill's shared log classifier (the one the release
+      # grader uses) proves the complete RPC-timeout-only exception; the count oracle stays separate.
       - name: Run coverage proof (parallel suite project)
         shell: bash
-        run: |
-          set -o pipefail
-          npm run test:coverage -- --project suite 2>&1 | tee "$RUNNER_TEMP/tickmarkr-test-output.log"
+        run: bash scripts/run-ci-vitest.sh "$RUNNER_TEMP/tickmarkr-test-output.log" npm run test:coverage -- --project suite
         env:
           TICKMARKR_CI_LEAN_REPORTERS: "1"
           VITEST_MAX_FORKS: "1"
@@ -51,9 +52,7 @@ jobs:
       - name: Run single-fork projects (independent of the step above)
         if: always()
         shell: bash
-        run: |
-          set -o pipefail
-          npx vitest run --project sync-heavy --project keys-ledger --project built-cli --project signal-reaper 2>&1 | tee "$RUNNER_TEMP/tickmarkr-test-output-singlefork.log"
+        run: bash scripts/run-ci-vitest.sh "$RUNNER_TEMP/tickmarkr-test-output-singlefork.log" npx vitest run --project sync-heavy --project keys-ledger --project built-cli --project signal-reaper
         env:
           TICKMARKR_CI_LEAN_REPORTERS: "1"
           VITEST_MAX_FORKS: "1"
@@ -77,9 +76,7 @@ jobs:
       # Same two-invocation proof and serialization as ubuntu (the lane-equality test pins it).
       - name: Run coverage proof (parallel suite project)
         shell: bash
-        run: |
-          set -o pipefail
-          npm run test:coverage -- --project suite 2>&1 | tee "$RUNNER_TEMP/tickmarkr-test-output.log"
+        run: bash scripts/run-ci-vitest.sh "$RUNNER_TEMP/tickmarkr-test-output.log" npm run test:coverage -- --project suite
         env:
           TICKMARKR_CI_LEAN_REPORTERS: "1"
           VITEST_MAX_FORKS: "1"
@@ -87,9 +84,7 @@ jobs:
       - name: Run single-fork projects (independent of the step above)
         if: always()
         shell: bash
-        run: |
-          set -o pipefail
-          npx vitest run --project sync-heavy --project keys-ledger --project built-cli --project signal-reaper 2>&1 | tee "$RUNNER_TEMP/tickmarkr-test-output-singlefork.log"
+        run: bash scripts/run-ci-vitest.sh "$RUNNER_TEMP/tickmarkr-test-output-singlefork.log" npx vitest run --project sync-heavy --project keys-ledger --project built-cli --project signal-reaper
         env:
           TICKMARKR_CI_LEAN_REPORTERS: "1"
           VITEST_MAX_FORKS: "1"

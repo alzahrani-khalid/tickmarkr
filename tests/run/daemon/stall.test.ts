@@ -7,7 +7,7 @@ import { DEFAULT_CONFIG } from "../../../src/config/config.js";
 import { SubprocessDriver } from "../../../src/drivers/subprocess.js";
 import { type ExecutorDriver, type Slot } from "../../../src/drivers/types.js";
 import { tickmarkrDir } from "../../../src/graph/graph.js";
-import { EARLY_LAUNCH_LIVENESS_MS, NUDGEABLE_ADAPTERS, resetDeadChannelFastKillMsForTests, resetEarlyLaunchLivenessMsForTests, resetNudgeTimingForTests, resetPageRepeatMsForTests, resetQuotaBannerSilentMsForTests, runDaemon, setDeadChannelFastKillMsForTests, setEarlyLaunchLivenessMsForTests, setNudgeTimingForTests, setPageRepeatMsForTests, setQuotaBannerSilentMsForTests, WORKER_NUDGE_MESSAGE } from "../../../src/run/daemon.js";
+import { EARLY_LAUNCH_LIVENESS_MS, NUDGEABLE_ADAPTERS, resetContactUnreadableDeadlineMsForTests, resetDeadChannelFastKillMsForTests, resetEarlyLaunchLivenessMsForTests, resetNudgeTimingForTests, resetPageRepeatMsForTests, resetQuotaBannerSilentMsForTests, runDaemon, setContactUnreadableDeadlineMsForTests, setDeadChannelFastKillMsForTests, setEarlyLaunchLivenessMsForTests, setNudgeTimingForTests, setPageRepeatMsForTests, setQuotaBannerSilentMsForTests, WORKER_NUDGE_MESSAGE } from "../../../src/run/daemon.js";
 import { Journal } from "../../../src/run/journal.js";
 import { shGit } from "../../../src/run/git.js";
 import { PANE_READ_ROWS, resetRowRearmTokenFlatMsForTests, setRowRearmTokenFlatMsForTests } from "../../../src/run/stall.js";
@@ -905,11 +905,19 @@ describe("T1 stall detection (OBS-262/263, fake adapter, zero tokens)", () => {
       notify: async () => {},
     });
 
-    const summary = await runDaemon(repo, { adapters: [fake], runId: "run-t2-dead-pane-unreadable", driver });
+    // OBS-1108 bounds the hold with a contact deadline (contact-unreadable.test.ts owns that park);
+    // this case is the hold itself, so its deadline sits past the attempt's hard backstop.
+    setContactUnreadableDeadlineMsForTests(60_000);
+    const summary = await runDaemon(repo, { adapters: [fake], runId: "run-t2-dead-pane-unreadable", driver })
+      .finally(resetContactUnreadableDeadlineMsForTests);
 
     expect(summary.human).toEqual(["T1"]);
     const events = Journal.open(repo, "run-t2-dead-pane-unreadable").read();
-    expect(events.find((e) => e.event === "worker-result")?.data.cause).toBe("stall-timeout");
+    // The hold ends at the hard backstop with the pane still unreadable: that is contact loss, so the
+    // attempt parks infra as contact-unreadable (work preserved, no repair debit) rather than being
+    // classified a stall timeout on bytes it never read (OBS-1108 review).
+    expect(events.find((e) => e.event === "worker-result")).toBeUndefined();
+    expect(events.find((e) => e.event === "task-human")?.data).toMatchObject({ kind: "infra", disposition: "contact-unreadable" });
     expect(events.filter((e) => e.event === "worker-dead-held" && e.data.reason === "pane-read-unreadable")).toHaveLength(1);
     expect(events.some((e) => e.event === "worker-dead-held" && e.data.reason === "unambiguous-worker-death")).toBe(false);
   }, 30_000);

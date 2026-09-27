@@ -691,7 +691,7 @@ describe("setup tab decisions surface", () => {
       decisions,
     );
     expect(opened.command).toBeUndefined();
-    expect(opened.session.confirming).toEqual({ verb: "waive", taskId: "T4" });
+    expect(opened.session.confirming).toEqual({ verb: "waive", taskId: "T4", park: decisions.find((d) => d.taskId === "T4")!.park }); // OBS-1178
 
     const frame = await drawDecisions(decisions, opened.session, 140, journalFile);
     expect(frame).toContain("CONFIRM WAIVE");
@@ -703,7 +703,7 @@ describe("setup tab decisions surface", () => {
 
     // Even the confirm key itself only names the write; nothing touches the file.
     const confirmed = applySetupDecisionsKey(opened.session, { input: "y", key: {} }, decisions);
-    expect(confirmed.command).toEqual({ verb: "waive", taskId: "T4" });
+    expect(confirmed.command).toEqual({ verb: "waive", taskId: "T4", park: decisions.find((d) => d.taskId === "T4")!.park });
     expect(confirmed.session.confirming).toBeNull();
     expect(readFileSync(journalPath, "utf8")).toBe(before);
 
@@ -795,7 +795,7 @@ describe("setup tab decisions surface", () => {
       { input: "u", key: {} },
       decisions,
     );
-    expect(opened.session.confirming).toEqual({ verb: "uphold", taskId: "T7" });
+    expect(opened.session.confirming).toEqual({ verb: "uphold", taskId: "T7", park: decisions.find((d) => d.taskId === "T7")!.park }); // OBS-1178
     const confirmFrame = await drawDecisions(decisions, opened.session, 140, journalFile);
     expect(confirmFrame).toContain("CONFIRM UPHOLD");
     expect(confirmFrame).toContain("release review-upheld");
@@ -975,9 +975,10 @@ describe("setup tab decisions surface", () => {
       const taskId = `park-${kind}`;
       const selection = decisions.filter((decision) => !decision.tombstone).findIndex((decision) => decision.taskId === taskId);
       const opened = applySetupDecisionsKey({ ...initialSetupDecisionsSession(), selection }, { input: "a", key: {} }, decisions);
-      expect(opened.session.confirming).toEqual({ verb: "approve", taskId });
+      const park = decisions.find((decision) => decision.taskId === taskId)!.park; // OBS-1178: the displayed token
+      expect(opened.session.confirming).toEqual({ verb: "approve", taskId, park });
       const confirmed = applySetupDecisionsKey(opened.session, { input: "y", key: {} }, decisions);
-      expect(confirmed.command).toEqual({ verb: "approve", taskId });
+      expect(confirmed.command).toEqual({ verb: "approve", taskId, park });
       const outcome = await executeSetupDecision(confirmed.command!, { cwd: root, runId: "run-cockpit-verbs", by: "operator" });
       expect(outcome.ok).toBe(true);
       const approvals = journal.read().filter((event) => event.event === "task-approved" && event.taskId === taskId);

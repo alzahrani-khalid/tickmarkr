@@ -18,6 +18,9 @@ import { releaseAll, releaseIndex, releaseOn, releaseOnAll, workerBarrier, type 
 const assignment = { adapter: "fake", model: "fake-1", channel: "sub", tier: "frontier" };
 const dispatches = (events: JournalEvent[], taskId: string) =>
   events.filter((e) => e.event === "task-dispatch" && e.taskId === taskId);
+// OBS-1178: a pending decision binds the park it answers, as `approve` does.
+const approveBound = (journal: Journal, taskId: string, data: Record<string, unknown> = {}) =>
+  journal.append("task-approved", taskId, { by: "test", via: "test", ...data, park: journal.newestBinding(taskId) });
 const afterApproval = (events: JournalEvent[], taskId: string) =>
   events.slice(events.findIndex((e) => e.event === "task-approved" && e.taskId === taskId) + 1);
 
@@ -43,7 +46,7 @@ function liveApprovalRun(runId: string) {
     concurrency: 2,
     narrate: releaseOn(b, "task-dispatch", "A", (e) => {
       if (e.event === "task-dispatch" && e.taskId === "B") {
-        Journal.open(repo, runId).append("task-approved", "A", { by: "test", via: "test" });
+        approveBound(Journal.open(repo, runId), "A");
       }
     }),
   }).finally(() => releaseAll(b));
@@ -194,11 +197,11 @@ test("each live release encoding reaches its production path, including a worker
     narrate: releaseOnAll(sHeld, SEEDED_ENACTMENTS, (e) => {
       if (e.event !== "task-dispatch" || e.taskId !== "S") return;
       const journal = Journal.open(repo, runId);
-      journal.append("task-approved", "H", { by: "test", via: "test" });
-      journal.append("task-approved", "G", { by: "test", via: "test", release: GATE_SATISFIED_RELEASE, gate: "acceptance" });
-      journal.append("task-approved", "R", { by: "test", via: "test", release: RECHECK_RELEASE });
-      journal.append("task-approved", "U", { by: "test", via: "test", release: REVIEW_UPHELD_RELEASE, gate: "review" });
-      journal.append("task-approved", "C", { by: "test", via: "test", release: ATTEMPT_CAP_RELEASE });
+      approveBound(journal, "H");
+      approveBound(journal, "G", { release: GATE_SATISFIED_RELEASE, gate: "acceptance" });
+      approveBound(journal, "R", { release: RECHECK_RELEASE });
+      approveBound(journal, "U", { release: REVIEW_UPHELD_RELEASE, gate: "review" });
+      approveBound(journal, "C", { release: ATTEMPT_CAP_RELEASE });
     }),
   }).finally(() => releaseAll(sHeld));
 
@@ -427,7 +430,7 @@ test("test: a concurrency-one chain whose tasks all merge journals no end-condit
     const summary = await runDaemon(repo, {
       adapters: [fake], runId, concurrency: 1, approvalWindowMs: 1,
       narrate: (e) => {
-        if (e.event === "approval-window-expired") Journal.open(repo, runId).append("task-approved", "A", { by: "test", via: "test" });
+        if (e.event === "approval-window-expired") approveBound(Journal.open(repo, runId), "A");
       },
     });
     const events = Journal.open(repo, runId).read();
@@ -461,7 +464,7 @@ test("test: an approval landing after a tip verify has completed keeps that veri
     narrate: (e) => {
       if (e.event === "tip-verify" && !released) {
         released = true;
-        Journal.open(repo, runId).append("task-approved", "A", { by: "test", via: "test" });
+        approveBound(Journal.open(repo, runId), "A");
       }
     },
   });

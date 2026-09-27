@@ -294,12 +294,17 @@ test("test: with task A held in review by a stalled reviewer and task B entering
       expect(held).toBe(true);
       const rows = Journal.open(fixture.repo, runId).read();
       const bTest = rows.findIndex(row => row.taskId === "B" && row.event === "gate-result" && row.data.gate === "test");
-      const aResult = rows.findIndex(row => row.taskId === "A" && row.event === "gate-result" && row.data.gate === (phase === "review" ? "review" : phase === "oracle" ? "acceptance" : "test"));
+      // OBS-1176: A's selected screen is its own earlier test row; the lease contention is the full suite's.
+      const aResult = rows.findIndex(row => row.taskId === "A" && row.event === "gate-result" && row.data.gate === (phase === "review" ? "review" : phase === "oracle" ? "acceptance" : "test")
+        && (phase !== "full" || row.data.fullSuite === true));
       expect(bTest).toBeGreaterThan(-1); expect(aResult).toBeGreaterThan(-1);
       const waits = rows.filter(row => row.taskId === "B" && row.event === "suite-wait");
       if (phase === "review") { expect(bTest).toBeLessThan(aResult); expect(waits).toEqual([]); }
       else { expect(bTest).toBeGreaterThan(aResult); expect(waits[0]?.data.count).toBeGreaterThan(0); }
-      if (phase === "full") expect(rows[aResult]!.data.fullSuite).toBe(true);
+      if (phase === "full") {
+        const aScreen = rows.findIndex(row => row.taskId === "A" && row.event === "gate-result" && row.data.gate === "test" && row.data.fullSuite !== true);
+        expect(aScreen).toBeGreaterThan(-1); expect(aScreen).toBeLessThan(aResult);
+      }
     } finally { writeFileSync(release, "go"); startB(); resetSpawnForTests(); resetLiveSuiteCountForTests(); }
   }
 }, 60_000);

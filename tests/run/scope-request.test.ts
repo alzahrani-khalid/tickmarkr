@@ -190,7 +190,7 @@ test("an interrupted approval append recovers its missing rehash from the durabl
   const journal = Journal.create(repo, "run-scope-partial");
   journal.append("run-start", undefined, { graphDefinitionHash: graphDefinitionHash(graph) });
   journal.append("task-human", "T1", { kind: "scope-request" });
-  journal.append("task-approved", "T1", { by: "operator", release: "scope-request", amendment: {
+  journal.append("task-approved", "T1", { by: "operator", release: "scope-request", park: journal.newestBinding("T1"), amendment: {
     from: graphDefinitionHash(graph), to: graphDefinitionHash(amended), beforeFiles: ["owned.txt"], files: ["owned.txt", "needed.txt"], parkLine: 2,
   } });
   const path = join(journal.dir, "journal.jsonl");
@@ -218,7 +218,7 @@ test("test: an in-run scope amendment replays onto a graph where another task wa
   const journal = Journal.create(repo, "run-scope-release");
   journal.append("run-start", undefined, { graphDefinitionHash: graphDefinitionHash(graph) });
   journal.append("task-human", "T1", { kind: "scope-request" });
-  journal.append("task-approved", "T1", { by: "operator", release: "scope-request", amendment: {
+  journal.append("task-approved", "T1", { by: "operator", release: "scope-request", park: journal.newestBinding("T1"), amendment: {
     from: graphDefinitionHash(graph), to: graphDefinitionHash(amended), beforeFiles: ["owned.txt"], files: ["owned.txt", "needed.txt"], parkLine: 2,
     definition: taskDefinitionFingerprint(graph.tasks.find((t) => t.id === "T1")!),
   } });

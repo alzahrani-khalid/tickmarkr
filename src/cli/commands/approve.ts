@@ -5,7 +5,7 @@ import { loadConfig } from "../../config/config.js";
 import { integrationBranch } from "../../run/merge.js";
 import { separabilityErrors, surfaceErrors, taskBudgetErrors } from "../../compile/collateral.js";
 import { GATE_NAMES } from "../../graph/schema.js";
-import { applyScopeAmendments, engagementComparable, engagementReleased, ATTEMPT_CAP_RELEASE, GATE_SATISFIED_RELEASE, Journal, RECHECK_RELEASE, REVIEW_UPHELD_RELEASE, type JournalEvent } from "../../run/journal.js";
+import { applyScopeAmendments, bindingToken, engagementComparable, engagementReleased, failedGateBeforePark, parseBindingToken, physicalLine, ATTEMPT_CAP_RELEASE, GATE_SATISFIED_RELEASE, Journal, RECHECK_RELEASE, REVIEW_UPHELD_RELEASE, type DecisionBinding, type JournalEvent } from "../../run/journal.js";
 
 export const APPROVAL_DISPOSITIONS = ["dispatch", "waive-gate", "re-dispatch", "fund-fixed-attempt", "fresh-budget"] as const;
 export type ApprovalDisposition = (typeof APPROVAL_DISPOSITIONS)[number];
@@ -78,9 +78,9 @@ export function newestPark(
     const kind = typeof e.data.kind === "string" ? e.data.kind : undefined;
     const reason = typeof e.data.reason === "string" ? e.data.reason : undefined;
     return {
-      index: i, line: (sourceIndexes?.[i] ?? i) + 1, ts: typeof e.ts === "string" ? e.ts : undefined, kind, reason,
+      index: i, line: sourceIndexes?.[i] === undefined ? physicalLine(events, i) : sourceIndexes[i]! + 1, ts: typeof e.ts === "string" ? e.ts : undefined, kind, reason,
       approveCommand: typeof e.data.approveCommand === "string" ? e.data.approveCommand : undefined,
-      failedGate: failedGateForNewestPark(events, taskId, i), tombstone: isTombstonePark(kind, reason),
+      failedGate: failedGateBeforePark(events, taskId, i), tombstone: isTombstonePark(kind, reason),
     };
   }
   return undefined;
@@ -93,6 +93,19 @@ export function readJournalEvents(journal: Journal): { events: JournalEvent[]; s
     events: tracked.map((row) => row.raw as JournalEvent),
     sourceIndexes: tracked.map((row) => row.sourceIndex),
   };
+}
+
+/** OBS-1178: the token a park is decided by — what status, park notices and the cockpit print. */
+export const parkToken = (park: Pick<NewestPark, "line" | "ts">): string | undefined =>
+  park.ts === undefined ? undefined : bindingToken({ line: park.line, ts: park.ts });
+
+/** OBS-1178: the newest task-failed row for a task — the failure a failed-task recheck binds to. */
+export function newestFailure(events: readonly JournalEvent[], taskId: string, sourceIndexes?: readonly number[]): DecisionBinding | undefined {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const e = events[i]!;
+    if (e.event === "task-failed" && e.taskId === taskId && typeof e.ts === "string") return { line: sourceIndexes?.[i] === undefined ? physicalLine(events, i) : sourceIndexes[i]! + 1, ts: e.ts };
+  }
+  return undefined;
 }
 
 /**
@@ -207,13 +220,17 @@ export function approvalEnactment(token: ApprovalDisposition, run: ApprovalRunOw
 
 /** The production command registered in COMMANDS; its returned bytes are what the CLI prints. */
 export async function approve(argv: string[], cwd = process.cwd()): Promise<string> {
-  const { runId, taskId, by, reason, waive, uphold, recheck, reviewRoundCeiling, files } = parseArgs(argv);
+  const { runId, taskId, by, reason, waive, uphold, recheck, reviewRoundCeiling, files, park: namedPark, gate: namedGate } = parseArgs(argv);
   const decisions = [waive, uphold, recheck].filter(Boolean).length;
   if (decisions > 1) throw new Error("--waive, --uphold and --recheck are different decisions — pass one");
+  // OBS-1178: the decision binds at COMMAND time — to the named --park, else to the park (or, for a
+  // failed task's recheck, the failure) open now — and is revalidated under serialization below. A
+  // decision queued behind another approval can therefore never land on a park that opened meanwhile.
+  // Journal.open throws `no journal for <runId> at <dir>` on an unknown run — that IS the refusal.
+  const bound = namedPark ?? openDecision(Journal.open(cwd, runId), taskId);
   const serialization = await acquireApprovalSerialization(cwd, runId);
 
   try {
-  // Journal.open throws `no journal for <runId> at <dir>` on an unknown run — that IS the refusal.
   const journal = Journal.open(cwd, runId);
 
   const status = journal.replayStatuses().get(taskId);
@@ -224,13 +241,16 @@ export async function approve(argv: string[], cwd = process.cwd()): Promise<stri
   // integration base owns verified-able work; --recheck re-gates that tree with no worker. Any other
   // verb on a failed task, or a recheck over nothing landed, is refused naming why.
   if (status === "failed" && recheck) {
+    if (namedGate !== undefined) throw new Error(`--gate names a parked failed gate; task ${taskId} is failed — bind its recheck with --park <failure token>`);
+    const { events: failedEvents, sourceIndexes: failedIndexes } = readJournalEvents(journal);
+    const failure = requireBound(runId, taskId, bound, newestFailure(failedEvents, taskId, failedIndexes), "failure");
     const ahead = failedTaskCommitsAhead(cwd, journal, runId, taskId);
     if (ahead.count === 0) {
       throw new Error(`task ${taskId} is failed and ${ahead.ref} carries no commits ahead of ${ahead.base} — nothing to re-gate; use resume --retry-failed to fund a worker`);
     }
     journal.append("task-approved", taskId, {
       by, ...(reason ? { reason } : {}), via: "cli", release: RECHECK_RELEASE,
-      recheckedRef: ahead.ref, commitsAhead: ahead.count,
+      recheckedRef: ahead.ref, commitsAhead: ahead.count, failure,
       ...(reviewRoundCeiling === undefined ? {} : { reviewRoundCeiling }),
     });
     return disposition(cwd, runId, "re-dispatch", `re-checking failed ${taskId} in ${runId} — by ${by}; ${ahead.count} commit(s) on ${ahead.ref} ahead of ${ahead.base}; no worker funded`, serialization.contended);
@@ -250,6 +270,10 @@ export async function approve(argv: string[], cwd = process.cwd()): Promise<stri
   const infraPark = park?.kind === "infra" || park?.kind === "diff-cap";
   const authoringRunnerPark = park?.kind === "authoring" && isToolGate(park.failedGate);
   const failedGate = gateFailPark || authoringRunnerPark ? park?.failedGate : undefined;
+  const parkBinding = requireBound(runId, taskId, bound, park?.ts === undefined ? undefined : { line: park.line, ts: park.ts }, "park");
+  if (namedGate !== undefined && namedGate !== park?.failedGate) {
+    throw new Error(`refusing mismatched gate for ${taskId}: --gate ${namedGate} but park ${bindingToken(parkBinding)} failed ${park?.failedGate ?? "no gate"} — nothing appended`);
+  }
   if ((park?.kind === "scope-request" && !decisions) || files !== undefined) {
     if (park?.kind !== "scope-request") throw new Error("--files requires a scope-request park");
     if (!files?.length) throw new Error(`scope-request for ${taskId} requires --files <glob,…>`);
@@ -275,7 +299,7 @@ export async function approve(argv: string[], cwd = process.cwd()): Promise<stri
         + `remedy: close the run, split the task in its spec, recompile, then \`tickmarkr resume ${runId} --graph-changed\``);
     }
     journal.append("task-approved", taskId, {
-      by, ...(reason ? { reason } : {}), via: "cli", release: "scope-request",
+      by, ...(reason ? { reason } : {}), via: "cli", release: "scope-request", park: parkBinding,
       ...(reviewRoundCeiling === undefined ? {} : { reviewRoundCeiling }), // OBS-1083
       amendment: { from, to: graphDefinitionHash(amended), beforeFiles: task.files, files: amendedFiles, parkLine: park.line, definition: taskDefinitionFingerprint(task) },
     });
@@ -301,6 +325,7 @@ export async function approve(argv: string[], cwd = process.cwd()): Promise<stri
       via: "cli",
       release: REVIEW_UPHELD_RELEASE,
       gate: "review",
+      park: parkBinding,
       ...(reviewRoundCeiling === undefined ? {} : { reviewRoundCeiling }),
     });
     return disposition(cwd, runId, "fund-fixed-attempt", `upheld the reviewer for ${taskId} in ${runId} — by ${by}`, serialization.contended);
@@ -314,6 +339,7 @@ export async function approve(argv: string[], cwd = process.cwd()): Promise<stri
       ...(reason ? { reason } : {}),
       via: "cli",
       release: RECHECK_RELEASE,
+      park: parkBinding,
       // OBS-1084: failedGate names the runner report for every recheck. Authoring rechecks additionally
       // carry gate so their durable release row identifies the red tool gate that made recheck admissible.
       ...(failedGate ? { failedGate } : {}),
@@ -332,6 +358,7 @@ export async function approve(argv: string[], cwd = process.cwd()): Promise<stri
       via: "cli",
       release: GATE_SATISFIED_RELEASE,
       gate: failedGate,
+      park: parkBinding,
       ...(reviewRoundCeiling === undefined ? {} : { reviewRoundCeiling }),
     });
     return disposition(cwd, runId, "waive-gate", `waived failed gate ${failedGate} for ${taskId} in ${runId} — by ${by}`, serialization.contended);
@@ -360,12 +387,30 @@ export async function approve(argv: string[], cwd = process.cwd()): Promise<stri
     via: "cli",
     ...(reviewRoundCeiling === undefined ? {} : { reviewRoundCeiling }),
     ...(capPark ? { release: ATTEMPT_CAP_RELEASE } : {}),
+    park: parkBinding,
   });
   const token = capPark ? "fresh-budget" : "dispatch";
   return disposition(cwd, runId, token, `approved ${taskId} in ${runId} — by ${by}`, serialization.contended);
   } finally {
     serialization.release();
   }
+}
+
+/** The row a decision on this task answers right now: its newest failure when failed, else its newest park. */
+function openDecision(journal: Journal, taskId: string): DecisionBinding | undefined {
+  const { events, sourceIndexes } = readJournalEvents(journal);
+  if (journal.replayStatuses().get(taskId) === "failed") return newestFailure(events, taskId, sourceIndexes);
+  const park = newestPark(events, taskId, sourceIndexes);
+  return park?.ts === undefined ? undefined : { line: park.line, ts: park.ts };
+}
+
+/** OBS-1178: under serialization, the decision's command-time binding must still name the open row. */
+function requireBound(runId: string, taskId: string, bound: DecisionBinding | undefined, open: DecisionBinding | undefined, what: "park" | "failure"): DecisionBinding {
+  if (open === undefined) throw new Error(`task ${taskId} has no ${what} row with a timestamp to bind this decision to — refusing an unbound release`);
+  if (bound === undefined || bound.line !== open.line || bound.ts !== open.ts) {
+    throw new Error(`refusing stale decision for ${taskId}: bound to ${bound === undefined ? "no open row" : `${what} ${bindingToken(bound)}`} but the open ${what} is ${bindingToken(open)} — read \`tickmarkr status ${runId}\` and decide the open ${what}; nothing appended`);
+  }
+  return open;
 }
 
 /**
@@ -433,6 +478,10 @@ function disposition(cwd: string, runId: string, token: ApprovalDisposition, mes
 
 interface ParsedArgs {
   files?: string[];
+  /** OBS-1178: `--park <line>@<ts>` — the park (or failed task's failure) this decision answers. */
+  park?: DecisionBinding;
+  /** OBS-1178: `--gate <gate>` — the failed gate the bound park must carry. */
+  gate?: string;
   runId: string;
   taskId: string;
   by: string;
@@ -443,13 +492,15 @@ interface ParsedArgs {
   reviewRoundCeiling?: number;
 }
 
-const USAGE = "usage: tickmarkr approve <run-id> <task-id> [--files <glob,…>] [--waive|--uphold|--recheck] [--review-rounds <positive-integer>] [--by <name>] [--reason <text>]";
+const USAGE = "usage: tickmarkr approve <run-id> <task-id> [--park <line>@<ts>] [--gate <gate>] [--files <glob,…>] [--waive|--uphold|--recheck] [--review-rounds <positive-integer>] [--by <name>] [--reason <text>]";
 
 // hand-parsed argv — no CLI framework (house style). Positionals are runId then taskId; decision,
 // ceiling, actor and reason are flags. Throws usage on missing positionals (mirrors resume.ts/unlock.ts).
 function parseArgs(argv: string[]): ParsedArgs {
   const positionals: string[] = [];
   let files: string[] | undefined;
+  let park: DecisionBinding | undefined;
+  let gate: string | undefined;
   let by: string | undefined;
   let reason: string | undefined;
   let waive = false;
@@ -465,6 +516,13 @@ function parseArgs(argv: string[]): ParsedArgs {
       if (files.some((file) => !file || file.startsWith("/") || file.startsWith("!") || file.split("/").includes(".."))) {
         throw new Error("--files requires non-empty repository-relative globs");
       }
+    } else if (a === "--park") {
+      const value = argv[++i];
+      park = value === undefined ? undefined : parseBindingToken(value);
+      if (!park) throw new Error("--park requires the <line>@<ts> token `tickmarkr status` prints for the park");
+    } else if (a === "--gate") {
+      gate = argv[++i];
+      if (!gate || !(GATE_NAMES as readonly string[]).includes(gate)) throw new Error(`--gate requires one of ${GATE_NAMES.join(", ")}`);
     } else if (a === "--by") {
       by = argv[++i];
       if (!by) throw new Error(USAGE);
@@ -492,18 +550,5 @@ function parseArgs(argv: string[]): ParsedArgs {
   if (!runId || !taskId) {
     throw new Error(USAGE);
   }
-  return { runId, taskId, by: by ?? userInfo().username, reason, waive, uphold, recheck, reviewRoundCeiling, files };
-}
-
-function failedGateForNewestPark(events: readonly JournalEvent[], taskId: string, lastHumanIndex: number): string | undefined {
-  for (let i = lastHumanIndex - 1; i >= 0; i -= 1) {
-    const event = events[i]!;
-    if (event.taskId !== taskId) continue;
-    if (event.event === "task-approved" || event.event === "task-human" || event.event === "task-dispatch") return undefined;
-    if (event.event === "gate-result" && event.data.pass === false
-        && typeof event.data.gate === "string" && (GATE_NAMES as readonly string[]).includes(event.data.gate)) {
-      return event.data.gate;
-    }
-  }
-  return undefined;
+  return { runId, taskId, by: by ?? userInfo().username, reason, waive, uphold, recheck, reviewRoundCeiling, files, park, gate };
 }

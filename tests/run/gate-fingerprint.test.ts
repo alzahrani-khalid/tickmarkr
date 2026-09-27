@@ -250,9 +250,13 @@ describe("gate fingerprint — mkdtemp suffix (T3)", () => {
     const current = normalizeGateFailure(String(events.at(-1)!.data.details));
     expect(identicalGateFailures(events, "T5", "test", current)).toBe(GATE_FINGERPRINT_CAP);
 
-    // An operator approval is still a new engagement, and a different prefix still buys its own budget.
-    const approved: JournalEvent[] = [events[0]!, { ts: "2026-08-06T11:30:00.000Z", event: "task-approved", taskId: "T5", data: {} }, events.at(-1)!];
+    // An enacted operator approval is still a new engagement, and a different prefix still buys its own budget.
+    const approval: JournalEvent = { ts: "2026-08-06T11:30:00.000Z", event: "task-approved", taskId: "T5", data: {} };
+    const approved: JournalEvent[] = [events[0]!, approval, { ts: "2026-08-06T11:31:00.000Z", event: "task-dispatch", taskId: "T5", data: {} }, events.at(-1)!];
     expect(identicalGateFailures(approved, "T5", "test", current)).toBe(1);
+    // OBS-1178: an approval the daemon refused is no new engagement — the count stands.
+    const refused: JournalEvent[] = [events[0]!, approval, { ts: "2026-08-06T11:31:00.000Z", event: "approval-refused", taskId: "T5", data: { lines: [2] } }, events.at(-1)!];
+    expect(identicalGateFailures(refused, "T5", "test", current)).toBe(GATE_FINGERPRINT_CAP);
     expect(identicalGateFailures(events, "T5", "test", normalizeGateFailure(tmpDetail(DARWIN_TMP, "tickmarkr-eval-IwtrdE")))).toBe(0);
   });
 });

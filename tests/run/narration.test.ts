@@ -91,6 +91,8 @@ describe("narration side-channel (fake adapter, zero tokens)", () => {
         })
         .replace(/"ts":"[^"]*"/g, '"ts":"X"')
         .replace(/"processGroup":\d+/g, '"processGroup":"PGID"')
+        // OBS-1109: each worker attempt draws a fresh random nonce, recorded on its launch row
+        .replace(/^(.*"event":"worker-launch".*"nonce":)"[0-9a-f]{8}"/gm, '$1"NONCE"')
         .replace(/"(durationMs|selectedDurationMs|fullDurationMs|load1Start|load1End|load1Max|load1Mean)":-?[\d.e+-]+/g, '"$1":"X"');
       };
       const onFile = maskTs(readFileSync(join(tickmarkrDir(on.repo), "runs", "run-byte", "journal.jsonl"), "utf8").split(on.repo).join("<repo>"));

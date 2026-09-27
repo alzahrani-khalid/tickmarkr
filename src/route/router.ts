@@ -55,6 +55,7 @@ export function marginalCostRank(c: BillingChannel): number {
 
 const toAssignment = (c: BillingChannel): Assignment => ({
   adapter: c.adapter, model: c.model, channel: c.channel, tier: c.tier,
+  ...(c.effort ? { effort: c.effort } : {}),
 });
 
 function resolvePin(pin: { via: string; model: string }, channels: BillingChannel[]): BillingChannel {
@@ -185,6 +186,13 @@ const maybeSlaLint = (
 };
 
 export function route(task: Task, cfg: TickmarkrConfig, channels: BillingChannel[], profile?: RoutingProfile, preferCtx?: RoutingPreferContext, exclude?: ReadonlySet<string>, exploreCtx?: ExploreContext): Route {
+  // OBS-1143: deny checks below read the probed identity the offered channels carry — the identity
+  // discovery admitted them under. A seat no channel vouches for stays unknown (conservative).
+  const observed = new Map(channels.flatMap((c) => (c.identity ? [[channelKey(c), c.identity] as const] : [])));
+  const seat = (adapter: string, model: string) => {
+    const identity = observed.get(channelKey({ adapter, model }));
+    return identity ? { adapter, model, identity } : { adapter, model };
+  };
   channels = withoutExcluded(channels, exclude);
   const lints: string[] = [];
   const advisoryFloor = cfg.routing.floors[task.shape];
@@ -196,7 +204,7 @@ export function route(task: Task, cfg: TickmarkrConfig, channels: BillingChannel
   const prefer = effectivePrefer(entry);
   const prefActive = !!(cfg.routing.allow || cfg.routing.deny);
   const disallowedPin = (via: string, model: string, kind: string) => {
-    const d = disallowedBy({ adapter: via, model }, cfg.routing);
+    const d = disallowedBy(seat(via, model), cfg.routing);
     if (d) {
       throw new RoutingError(
         `${task.id}: ${kind} ${via}:${model} is disallowed by routing.${d.by} (${d.entry}) — remove the ${d.by} entry or re-pin to an allowed channel`,
@@ -211,8 +219,8 @@ export function route(task: Task, cfg: TickmarkrConfig, channels: BillingChannel
     }
     if (cfg.tiers[p]) {
       const expanded = channelsFromConfig(p, cfg);
-      if (expanded.length && expanded.every((c) => disallowedBy(c, cfg.routing) !== null)) {
-        const d = disallowedBy(expanded[0], cfg.routing)!;
+      if (expanded.length && expanded.every((c) => disallowedBy(seat(c.adapter, c.model), cfg.routing) !== null)) {
+        const d = disallowedBy(seat(expanded[0].adapter, expanded[0].model), cfg.routing)!;
         throw new RoutingError(
           `${task.id}: prefer entry ${p} is disallowed by routing.${d.by} (${d.entry}) — remove the ${d.by} entry or re-pin to an allowed channel`,
         );
@@ -273,24 +281,29 @@ export function route(task: Task, cfg: TickmarkrConfig, channels: BillingChannel
   // single-channel pool) and the open floor/auto path. Exhaustion stays fail-loud (pin precedent).
   if (entry?.pool) {
     const pool = entry.pool;
-    if (prefActive) {
-      for (const p of pool.channels) {
-        const i = p.indexOf(":");
-        const d = disallowedBy({ adapter: p.slice(0, i), model: p.slice(i + 1) }, cfg.routing);
-        if (d) {
-          throw new RoutingError(
-            `${task.id}: pool entry ${p} is disallowed by routing.${d.by} (${d.entry}) — remove the ${d.by} entry or drop it from the pool`,
-          );
-        }
-      }
+    // OBS-1144: a disallowed entry is skipped, named in provenance, never fatal for the pool; only an
+    // empty admitted remainder refuses. Filtering keeps declaration order, so ordered stays ordered.
+    const skipped: string[] = [];
+    const admitted = pool.channels.filter((p) => {
+      if (!prefActive) return true;
+      const i = p.indexOf(":");
+      const d = disallowedBy(seat(p.slice(0, i), p.slice(i + 1)), cfg.routing);
+      if (d) skipped.push(`${p} (disallowed by routing.${d.by} (${d.entry}))`);
+      return d === null;
+    });
+    const skippedNote = skipped.length ? `; skipped ${skipped.join(", ")}` : "";
+    if (!admitted.length) {
+      throw new RoutingError(
+        `${task.id}: routing.map.${task.shape}.pool is exhausted — no admitted entry remains: ${skipped.join(", ")} — remove the deny/allow entry or add an admitted channel to the pool`,
+      );
     }
     // live preserves pool declaration order — ordered mode and any-mode stable-sort ties depend on it
-    const live = pool.channels
+    const live = admitted
       .map((id) => channels.find((c) => channelKey(c) === id))
       .filter((c): c is BillingChannel => c !== undefined && (!taskFloor || TIER_RANK[c.tier] >= TIER_RANK[taskFloor]));
     if (!live.length) {
       throw new RoutingError(
-        `${task.id}: routing.map.${task.shape}.pool has no live channel${taskFloor ? ` at task floor ${taskFloor}` : ""} — declared: ${pool.channels.join(", ")}; doctor found: ${channels.map(channelKey).join(", ") || "(nothing)"}`,
+        `${task.id}: routing.map.${task.shape}.pool has no live channel${taskFloor ? ` at task floor ${taskFloor}` : ""} — declared: ${pool.channels.join(", ")}${skippedNote}; doctor found: ${channels.map(channelKey).join(", ") || "(nothing)"}`,
       );
     }
     // No learned/explore inside pools: any spreads deterministically; ordered keeps declaration order.
@@ -299,7 +312,7 @@ export function route(task: Task, cfg: TickmarkrConfig, channels: BillingChannel
       : rankAnyPool(live, task)[0];
     lintMapPinFloor(chosen.tier, "pool");
     maybeSlaLint(lints, task, profile, slaMinutes, chosen);
-    return { assignment: toAssignment(chosen), ladder: ladderFor(task, entry), lints, provenance: `${degraded}pool ${pool.mode} ${channelKey(chosen)} (config routing.map)` };
+    return { assignment: toAssignment(chosen), ladder: ladderFor(task, entry), lints, provenance: `${degraded}pool ${pool.mode} ${channelKey(chosen)} (config routing.map${skippedNote})` };
   }
 
   const baseTier: Tier = floor ?? "cheap";
@@ -317,7 +330,7 @@ export function route(task: Task, cfg: TickmarkrConfig, channels: BillingChannel
     let msg = `${task.id}: no channel at tier>=${minTier}; available: ${channels.map(channelKey).join(", ") || "(none)"}`;
     if (prefActive) {
       const excluded = Object.keys(cfg.tiers).flatMap((id) => channelsFromConfig(id, cfg))
-        .filter((c) => disallowedBy(c, cfg.routing) !== null && TIER_RANK[c.tier] >= TIER_RANK[minTier])
+        .filter((c) => disallowedBy(seat(c.adapter, c.model), cfg.routing) !== null && TIER_RANK[c.tier] >= TIER_RANK[minTier])
         .map(channelKey);
       if (excluded.length) msg += `; ${excluded.length} channel(s) excluded by routing.allow/deny: ${excluded.join(", ")}`;
     }

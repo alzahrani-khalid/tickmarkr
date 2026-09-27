@@ -2,7 +2,7 @@ import { mkdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFile
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import type { TickmarkrConfig } from "../config/config.js";
-import type { Task } from "../graph/schema.js";
+import type { Effort, Task } from "../graph/schema.js";
 import { probeVersion } from "./claude-code.js";
 import { parseWorkerResult } from "./prompt.js";
 import { type Assignment, type BillingChannel, channelsFromConfig, declareInputBox, type Invocation, MODEL_ID_RE, promptFitsArgv, shq, type TokenUsage, TokenUsageSchema, type TrustDialog, type TrustVerdict, type WorkerAdapter } from "./types.js";
@@ -80,6 +80,9 @@ const GITDIR_WRITABLE = `-c "sandbox_workspace_write.writable_roots=[\\"$(git re
 // -s/--sandbox workspace-write sandbox (deliberately NOT --dangerously-bypass-approvals-and-sandbox,
 // which would drop the sandbox). Listed by `codex --help` and `codex exec --help` (verified 2026-07-23).
 const CODEX_HOOK_TRUST = "--dangerously-bypass-hook-trust";
+// OBS-1182: config override, not a flag — codex has no --effort. Absent renders nothing (CLI default);
+// placed before --model so --model's value stays the last flag before the prompt, as it always was.
+const codexEffortFlag = (effort?: Effort): string => (effort ? ` -c ${shq(`model_reasoning_effort=${effort}`)}` : "");
 
 // v1.75 T2 / OBS-137: current Codex workspace-trust prompt (0.144.6). The exact heading
 // is distinct from normal agent output; Enter accepts the selected "Yes, continue" option.
@@ -235,8 +238,8 @@ export const codex: WorkerAdapter = {
   // --sandbox workspace-write is the autonomous sandbox mode (codex v0.144.1+)
   // MCP suppression built per dispatch (config can change between runs) — see codexMcpSuppressionFlags.
   // CODEX_HOOK_TRUST (OBS-125) clears the per-worktree "Hooks need review" gate while keeping the sandbox.
-  headlessCommand: (promptFile: string, model: string) =>
-    `codex exec --sandbox workspace-write ${CODEX_HOOK_TRUST} ${codexMcpSuppressionFlags()} ${GITDIR_WRITABLE} --model ${shq(model)} - < ${shq(promptFile)}`,
+  headlessCommand: (promptFile: string, model: string, effort?: Effort) =>
+    `codex exec --sandbox workspace-write ${CODEX_HOOK_TRUST} ${codexMcpSuppressionFlags()} ${GITDIR_WRITABLE}${codexEffortFlag(effort)} --model ${shq(model)} - < ${shq(promptFile)}`,
   // OBS-930: the visible pane runs the REAL TUI. Codex's TUI takes its prompt only as the [PROMPT]
   // positional (`codex --help`, 0.153.4 — no file/stdin form), so the launch inlines the file exactly
   // as the claude adapter does: the prompt is the LAST positional and every flag value is followed by
@@ -247,12 +250,12 @@ export const codex: WorkerAdapter = {
   // autonomous approval policy (exec has no approvals to configure).
   // OBS-930 (Linux): the inlined prompt is ONE argv string and Linux caps one at 131072 bytes, so a
   // prompt over promptArgvCeiling() returns null → worker-mode-fallback → the headless form (types.ts).
-  interactiveCommand: (promptFile: string, model: string) =>
+  interactiveCommand: (promptFile: string, model: string, effort?: Effort) =>
     promptFitsArgv(promptFile)
-      ? `codex -a never -s workspace-write ${CODEX_HOOK_TRUST} ${codexMcpSuppressionFlags()} ${GITDIR_WRITABLE} --model ${shq(model)} "$(cat ${shq(promptFile)})"`
+      ? `codex -a never -s workspace-write ${CODEX_HOOK_TRUST} ${codexMcpSuppressionFlags()} ${GITDIR_WRITABLE}${codexEffortFlag(effort)} --model ${shq(model)} "$(cat ${shq(promptFile)})"`
       : null,
   invoke(task: Task, _cwd: string, a: Assignment, ctx: { promptFile: string }): Invocation {
-    return { command: this.headlessCommand(ctx.promptFile, a.model) };
+    return { command: this.headlessCommand(ctx.promptFile, a.model, a.effort) };
   },
   parse: parseWorkerResult,
   // v1.22 T5: seed [projects."<repoRoot>"] trust_level="trusted" so fresh worktrees never stall on

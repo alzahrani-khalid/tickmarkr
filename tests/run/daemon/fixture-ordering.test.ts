@@ -2,18 +2,17 @@
 // ordered here by journal events through tests/helpers/worker-barrier.ts. Every scenario runs the
 // PRODUCTION daemon (runDaemon) in both worker arrival orders and proves the held worker finished
 // after the row that released it, so a barrier released before its recorded event is red.
-import { type ChildProcess, execFile, spawn } from "node:child_process";
-import { once } from "node:events";
+import { type ChildProcess, spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
-import { promisify } from "node:util";
 import { describe, expect, test } from "vitest";
 import { QUOTA_RE, shq } from "../../../src/adapters/types.js";
 import { SubprocessDriver } from "../../../src/drivers/subprocess.js";
 import { runDaemon } from "../../../src/run/daemon.js";
 import { shOk } from "../../../src/run/git.js";
 import { Journal, type JournalEvent } from "../../../src/run/journal.js";
+import { alive, exited, ownedFailures, type Proc, type PsTable, psTable, runOwned, teardownTree } from "../../helpers/owned-process.js";
 import { COMMIT, setupRepo, T, TEST_BASE_TMPDIR_ENV } from "../../helpers/tmprepo.js";
 import { conflictPair, heldAfterRelease, releaseAll, releaseIndex, releaseOn, type WorkerBarrier, workerBarrier } from "../../helpers/worker-barrier.js";
 
@@ -84,7 +83,10 @@ describe("fixture ordering by events (fake adapter, zero tokens)", () => {
     } });
     const s = await runDaemon(repo, { adapters: [fake], runId, approvalWindowMs: 1, concurrency: 2,
       narrate: releaseOn(b, "task-dispatch", "A", (e) => {
-        if (e.event === "task-dispatch" && e.taskId === "B") Journal.open(repo, runId).append("task-approved", "A", { by: "test", via: "test" });
+        if (e.event === "task-dispatch" && e.taskId === "B") {
+          const journal = Journal.open(repo, runId); // OBS-1178: the approval binds A's park
+          journal.append("task-approved", "A", { by: "test", via: "test", park: journal.newestBinding("A") });
+        }
       }),
     }).finally(() => releaseAll(b));
     expect(s.done.sort()).toEqual(["A", "B"]);
@@ -119,8 +121,10 @@ describe("fixture ordering by events (fake adapter, zero tokens)", () => {
         },
       });
       const s = await runDaemon(repo, { adapters: [fake], runId, narrate: releaseOn(b, "merge", first) }).finally(() => releaseAll(b));
-      expect(s.done.sort(), runId).toEqual(["T1", "T2"]);
       const rows = events(repo, runId);
+      // a loaded-host red names each task's last rows, so the undelivered task's cause is on the record
+      const tail = (id: Id) => rows.filter((e) => e.taskId === id).slice(-5).map((e) => `${e.event} ${JSON.stringify(e.data).slice(0, 160)}`);
+      expect(s.done.sort(), `${runId} — T1: ${tail("T1").join(" | ")} — T2: ${tail("T2").join(" | ")}`).toEqual(["T1", "T2"]);
       expectHeldAfterRelease(rows, b, held, "merge", first);
       expect(rows.some((e) => e.event === "quota-failover"), runId).toBe(false);
       expect(rows.filter((e) => e.event === "merge").map((e) => e.taskId), runId).toEqual([first, held]);
@@ -134,117 +138,59 @@ describe("fixture ordering by events (fake adapter, zero tokens)", () => {
 
 // ── wall-time-bounded stress harness ──────────────────────────────────────────────────────────
 // Each repetition runs `concurrent` conflict-pair daemon fixtures at once (alternating arrival
-// orders) and records ONE outcome per fixture — a rejection is an outcome, never a lost row. Each
-// fixture runs in its OWN node process, so the bound cuts every execution path it has: the daemon,
-// its detached worker groups, headless judge/review/consult commands and git. That process tree is
-// torn down (frozen, killed, awaited) before the outcome is recorded, and the ledger names any pid
-// that survived, so a leaked child is red.
+// orders) and records ONE outcome per fixture — a rejection, a cut or a failed process discovery is
+// an outcome, never a lost row. Each fixture runs in its OWN owned node process
+// (tests/helpers/owned-process.ts), so the bound cuts every execution path it has: the daemon, its
+// detached worker groups, headless judge/review/consult commands and git. That process tree is torn
+// down (frozen, killed, awaited) before the outcome is recorded, and the ledger names any pid that
+// survived and any ownership a failed discovery left unproven, so a leaked child is red.
 type Mode = "pair" | "hang";
-type Proc = { pid: number; ppid: number; pgid: number };
-type FixtureLedger = { runId: string; ok: boolean; error?: string; tree: number; detached: number; survivors: number[] };
+type FixtureSpec = { mode: Mode; runId: string; first: Id; ms: number; armOn?: RegExp; ps?: PsTable };
+type FixtureLedger = { runId: string; ok: boolean; error?: string; tree: Proc[]; detached: number; survivors: number[] };
 type Outcome = { rep: number; slot: number } & FixtureLedger;
 const STRESS = process.env.TICKMARKR_TEST_STRESS;
 const ROOT = fileURLToPath(new URL("../../../", import.meta.url));
 const TSX = createRequire(import.meta.url).resolve("tsx");
 const HELPER = new URL("../../helpers/worker-barrier.ts", import.meta.url).href;
-const execFileP = promisify(execFile);
 const ARM_CEILING_MS = 60_000;
-const exited = (c: ChildProcess) => c.exitCode !== null || c.signalCode !== null;
-const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
-const signal = (pid: number, sig: NodeJS.Signals) => { try { process.kill(pid, sig); } catch { /* already gone */ } };
-async function killOwned(c: ChildProcess) {
-  if (exited(c)) return;
-  try { process.kill(-c.pid!, "SIGKILL"); } catch { c.kill("SIGKILL"); }
-  await once(c, "exit");
-}
-
-async function psTable(): Promise<Proc[]> {
-  const { stdout } = await execFileP("ps", ["-A", "-o", "pid=,ppid=,pgid="]);
-  return stdout.trim().split("\n").map((line) => {
-    const [pid, ppid, pgid] = line.trim().split(/\s+/).map(Number);
-    return { pid: pid!, ppid: ppid!, pgid: pgid! };
-  });
-}
-
-/**
- * Tear down `root` and every descendant, whatever group it forked into — the SubprocessDriver's
- * workers are detached into their own process groups, so a group kill alone would miss them.
- * Freeze-then-kill: SIGSTOP each newly seen descendant until a ps pass finds none new (a stopped
- * process cannot fork out of the snapshot), then SIGKILL the whole set and await every pid's exit
- * within a bound; whatever outlives that bound is a survivor.
- */
-async function teardownTree(root: ChildProcess, boundMs = 10_000): Promise<{ tree: Proc[]; survivors: number[] }> {
-  const tree = new Map<number, Proc>();
-  for (let grew = true; grew;) {
-    grew = false;
-    const rows = await psTable();
-    const children = new Map<number, Proc[]>();
-    for (const p of rows) children.set(p.ppid, [...(children.get(p.ppid) ?? []), p]);
-    const queue = rows.filter((p) => p.pid === root.pid);
-    for (let p = queue.shift(); p; p = queue.shift()) {
-      queue.push(...(children.get(p.pid) ?? []));
-      if (tree.has(p.pid)) continue;
-      tree.set(p.pid, p);
-      signal(p.pid, "SIGSTOP");
-      grew = true;
-    }
-  }
-  for (const pid of tree.keys()) signal(pid, "SIGKILL");
-  if (!exited(root)) await once(root, "exit");
-  const deadline = Date.now() + boundMs;
-  let survivors = [...tree.keys()].filter(alive);
-  while (survivors.length > 0 && Date.now() < deadline) {
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    survivors = survivors.filter(alive);
-  }
-  return { tree: [...tree.values()], survivors };
-}
+/** A node root script that spawns `spawnArgs` detached and unreferenced, prints its pid, then runs `then`. */
+const SPAWN_DETACHED = (spawnArgs: string, then: string) =>
+  `const c = require("node:child_process").spawn(${spawnArgs}, { detached: true, stdio: "ignore" }); c.unref(); console.log(c.pid); ${then}`;
 
 /**
  * One fixture in its own owned node process. The wall-time bound runs from spawn, or from the first
  * stdout match of `armOn` (a fixture that never arms is still cut at ARM_CEILING_MS, so it cannot
  * outlive its test); the fixture reports `OUTCOME <violations>` and parks, so its tree is still
  * intact when it is torn down. Whichever comes first — outcome, exit or bound — the tree is torn
- * down and awaited before the ledger row exists.
+ * down and awaited before the ledger row exists. Never rejects.
  */
-async function ownedFixture(o: { mode: Mode; runId: string; first: Id; ms: number; armOn?: RegExp }): Promise<FixtureLedger> {
+async function ownedFixture(o: FixtureSpec): Promise<FixtureLedger> {
   const script = [
     `const { fixtureViolations } = await import(${JSON.stringify(HELPER)});`,
     `const violations = await fixtureViolations(${JSON.stringify(o.mode)}, ${JSON.stringify(o.runId)}, ${JSON.stringify(o.first)}).catch((e) => [String(e?.stack ?? e)]);`,
     `process.stdout.write("\\nOUTCOME " + JSON.stringify(violations) + "\\n");`,
     "setInterval(() => {}, 1 << 30); // parked until the harness tears this tree down",
   ].join("\n");
-  const child = spawn(process.execPath, ["--import", TSX, "--input-type=module", "-e", script], {
-    cwd: ROOT, detached: true, stdio: ["ignore", "pipe", "pipe"],
+  const run = await runOwned(process.execPath, ["--import", TSX, "--input-type=module", "-e", script], {
+    cwd: ROOT, ms: o.ms, armOn: o.armOn, armCeilingMs: ARM_CEILING_MS, settleOn: /^OUTCOME /m, ps: o.ps,
     // the child's fixture temporaries land under this file's recorded TMPDIR, reaped with it
     env: { ...process.env, [TEST_BASE_TMPDIR_ENV]: process.env.TMPDIR },
   });
-  let out = "";
-  let err = "";
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  let ceiling: ReturnType<typeof setTimeout> | undefined;
-  const why = await new Promise<"expired" | "settled">((resolve) => {
-    const arm = () => { timer ??= setTimeout(() => resolve("expired"), o.ms); };
-    if (!o.armOn) arm(); else ceiling = setTimeout(() => resolve("expired"), ARM_CEILING_MS);
-    child.stdout!.on("data", (d) => {
-      out += d;
-      if (o.armOn?.test(out)) arm();
-      if (/^OUTCOME /m.test(out)) resolve("settled");
-    });
-    child.stderr!.on("data", (d) => { err = (err + d).slice(-4_000); });
-    child.once("exit", () => resolve("settled"));
-  });
-  clearTimeout(timer);
-  clearTimeout(ceiling);
-  const { tree, survivors } = await teardownTree(child);
-  const reported = /^OUTCOME (.*)$/m.exec(out)?.[1];
-  const violations: string[] = why === "expired" ? [`${o.runId}: wall-time bound ${o.ms} ms exhausted`]
-    : reported ? JSON.parse(reported) : [`${o.runId}: fixture process exited without an outcome: ${err}`];
+  const reported = /^OUTCOME (.*)$/m.exec(run.out)?.[1];
+  const parsed = (text: string): string[] => { try { return JSON.parse(text); } catch { return [`${o.runId}: unparseable outcome ${text}`]; } };
+  const violations: string[] = [
+    ...(run.why === "expired" ? [`${o.runId}: wall-time bound ${o.ms} ms exhausted`]
+      : reported ? parsed(reported) : [`${o.runId}: fixture process exited without an outcome: ${run.err.slice(-4_000)}`]),
+    ...(run.unresolved ? [`${o.runId}: ownership unresolved — ${run.unresolved}`] : []),
+  ];
   return {
     runId: o.runId, ok: violations.length === 0, ...(violations.length ? { error: violations.join("; ") } : {}),
-    tree: tree.length, detached: tree.filter((p) => p.pgid !== child.pid).length, survivors,
+    tree: run.tree, detached: run.tree.filter((p) => p.pgid !== run.pid).length, survivors: run.survivors,
   };
 }
+
+/** One ledger row per spec, whatever each fixture does: ownedFixture never rejects, so no row is lost to an aborted Promise.all. */
+const ownedFixtures = (specs: FixtureSpec[]) => Promise.all(specs.map(ownedFixture));
 
 async function stressMatrix(o: { reps: number; concurrent: number; burners: number; wallMs: number }) {
   const burners: ChildProcess[] = [];
@@ -254,15 +200,13 @@ async function stressMatrix(o: { reps: number; concurrent: number; burners: numb
     for (let i = 0; i < o.burners; i++) burners.push(spawn("nice", ["-n", "19", "sh", "-c", "while :; do :; done"], { stdio: "ignore", detached: true }));
     for (let rep = 0; rep < o.reps; rep++) {
       const remaining = deadline - Date.now();
-      const round = await Promise.all(Array.from({ length: o.concurrent }, async (_, slot): Promise<Outcome> => {
-        const runId = `run-stress-${rep}-${slot}`;
-        if (remaining <= 0) return { rep, slot, runId, ok: false, error: `${runId}: wall-time bound exhausted before start`, tree: 0, detached: 0, survivors: [] };
-        return { rep, slot, ...await ownedFixture({ mode: "pair", runId, first: ORDERS[slot % 2]!, ms: remaining }) };
-      }));
-      outcomes.push(...round);
+      const specs = Array.from({ length: o.concurrent }, (_, slot): FixtureSpec => ({ mode: "pair", runId: `run-stress-${rep}-${slot}`, first: ORDERS[slot % 2]!, ms: remaining }));
+      const round = remaining > 0 ? await ownedFixtures(specs)
+        : specs.map((s): FixtureLedger => ({ runId: s.runId, ok: false, error: `${s.runId}: wall-time bound exhausted before start`, tree: [], detached: 0, survivors: [] }));
+      outcomes.push(...round.map((r, slot) => ({ rep, slot, ...r })));
     }
   } finally {
-    await Promise.all(burners.map(killOwned));
+    await Promise.all(burners.map((c) => teardownTree(c)));
   }
   return { outcomes, burners: burners.map((c) => ({ pid: c.pid, exited: exited(c) })) };
 }
@@ -274,9 +218,71 @@ describe("fixture stress harness", () => {
     expect(ledger.ok).toBe(false);
     expect(ledger.error).toBe("run-bound-hang: wall-time bound 0 ms exhausted");
     expect(ledger.detached, "the held worker's own process group was inside the teardown").toBeGreaterThanOrEqual(1);
-    expect(ledger.tree).toBeGreaterThan(ledger.detached);
+    expect(ledger.tree.length).toBeGreaterThan(ledger.detached);
     expect(ledger.survivors).toEqual([]);
   }, 120_000);
+
+  test("test: the fixture harness returns one outcome for every owned fixture when one exceeds its deadline versus normal completion and reaps known children even when discovery fails, so an aborted Promise.all or surviving recorded child fails", async () => {
+    // Discovery answers its first pass — the held worker's detached group is recorded and frozen — then
+    // fails. The teardown must still kill and await everything recorded, and the row must name the
+    // fixture's ownership unresolved, while its concurrent sibling completes normally beside it.
+    let passes = 0;
+    const failing: PsTable = async (o) => { if (o.phase === "teardown" && passes++ > 0) throw new Error("injected ps failure"); return psTable(o); };
+    const [cut, normal, ...extra] = await ownedFixtures([
+      { mode: "hang", runId: "run-deadline-hang", first: "T1", ms: 0, armOn: /^LAUNCHED T1$/m, ps: failing },
+      { mode: "pair", runId: "run-deadline-pair", first: "T1", ms: 150_000 },
+    ]);
+    expect(extra).toEqual([]);
+    expect(passes).toBe(2);
+    expect(cut!.ok).toBe(false);
+    expect(cut!.error).toBe("run-deadline-hang: wall-time bound 0 ms exhausted; run-deadline-hang: ownership unresolved — process discovery failed: injected ps failure");
+    expect(cut!.detached, "the held worker's own group was recorded before discovery failed").toBeGreaterThanOrEqual(1);
+    expect(cut!.survivors).toEqual([]);
+    expect(cut!.tree.filter((p) => alive(p.pid))).toEqual([]);
+    expect(normal, normal?.error).toMatchObject({ runId: "run-deadline-pair", ok: true, survivors: [] });
+    expect(normal!.tree.length).toBeGreaterThanOrEqual(1);
+    expect(normal!.tree.filter((p) => alive(p.pid))).toEqual([]);
+
+    // Discovery failing on its very first pass still reaps the root, its group and the detached child the
+    // tracker recorded while the root ran — all known before teardown began.
+    const tracked = await runOwned(process.execPath, ["-e", SPAWN_DETACHED("'sleep', ['60']", "setInterval(() => {}, 1 << 30)")], {
+      ms: 1_500, ps: (o) => o.phase === "teardown" ? Promise.reject(new Error("injected ps failure")) : psTable(o),
+    });
+    const orphan = Number(tracked.out.trim());
+    expect(tracked.why).toBe("expired");
+    expect(tracked.unresolved).toBe("process discovery failed: injected ps failure");
+    expect(tracked.tree.map((p) => p.pid)).toContain(orphan);
+    expect(tracked.survivors).toEqual([]);
+    expect(alive(orphan)).toBe(false);
+    expect(alive(-tracked.pid!)).toBe(false);
+
+    // Discovery that never answers is cut at half of one teardown deadline, and the reaping still happens.
+    const started = Date.now();
+    const stalled = await runOwned("sh", ["-c", "sleep 60 & sleep 60"], {
+      ms: 200, boundMs: 2_000, ps: (o) => o.phase === "teardown" ? new Promise<never>(() => {}) : psTable(o),
+    });
+    expect(Date.now() - started).toBeLessThan(10_000);
+    expect(stalled.why).toBe("expired");
+    expect(stalled.unresolved).toBe("process discovery failed: discovery past its 1000 ms share of the teardown bound timed out");
+    expect(stalled.survivors).toEqual([]);
+    expect(stalled.tree.filter((p) => alive(p.pid))).toEqual([]);
+    expect(alive(-stalled.pid!)).toBe(false);
+  }, 240_000);
+
+  test("an owned root that exits normally before its detached child still owns and reaps that child, so a descendant leaked past its root's exit fails", async () => {
+    // tracked: the root outlives a tracking pass after spawning a detached platform binary, then exits 0
+    const lingered = await runOwned(process.execPath, ["-e", SPAWN_DETACHED("'sleep', ['60']", "setTimeout(() => {}, 1_500)")], { ms: 30_000 });
+    // tagged: the root exits the moment its detached child is spawned, before any tracking pass can see it
+    const quick = await runOwned(process.execPath, ["-e", SPAWN_DETACHED("process.execPath, ['-e', 'setInterval(() => {}, 1 << 30)']", "")], { ms: 30_000 });
+    for (const run of [lingered, quick]) {
+      const orphan = Number(run.out.trim());
+      expect(orphan, run.err).toBeGreaterThan(0);
+      expect(run).toMatchObject({ why: "settled", exitCode: 0, survivors: [] });
+      expect(ownedFailures(run, "orphan")).toEqual([]);
+      expect(run.tree.map((p) => p.pid)).toContain(orphan);
+      expect(alive(orphan)).toBe(false);
+    }
+  }, 60_000);
 
   test.skipIf(STRESS !== "smoke" && STRESS !== "1")("the fixture smoke harness records individual success for all 4 repetitions at 2 concurrent daemon fixtures plus 0 burners with complete owned-child cleanup, so one missing outcome or leaked child fails", async () => {
     const { outcomes, burners } = await stressMatrix({ reps: 4, concurrent: 2, burners: 0, wallMs: 150_000 });
@@ -284,7 +290,7 @@ describe("fixture stress harness", () => {
     expect(outcomes.filter((r) => !r.ok)).toEqual([]);
     expect(burners).toHaveLength(0);
     // every fixture process was owned (in its torn-down tree) and nothing it spawned outlived teardown
-    expect(outcomes.filter((r) => r.tree < 1 || r.survivors.length > 0)).toEqual([]);
+    expect(outcomes.filter((r) => r.tree.length < 1 || r.survivors.length > 0)).toEqual([]);
   }, 180_000);
 
   // The overseer's release proof after run-end, never a task criterion: 32 × 16 daemon fixtures
@@ -295,6 +301,6 @@ describe("fixture stress harness", () => {
     expect(outcomes.filter((r) => !r.ok)).toEqual([]);
     expect(burners).toHaveLength(16);
     expect(burners.every((c) => c.exited)).toBe(true);
-    expect(outcomes.filter((r) => r.tree < 1 || r.survivors.length > 0)).toEqual([]);
+    expect(outcomes.filter((r) => r.tree.length < 1 || r.survivors.length > 0)).toEqual([]);
   }, 1_600_000);
 });

@@ -1,7 +1,8 @@
 import { statSync } from "node:fs";
 import { z } from "zod";
 import type { TickmarkrConfig, Tier } from "../config/config.js";
-import type { Task } from "../graph/schema.js";
+import type { Effort, Task } from "../graph/schema.js";
+import type { VerdictUnparseableCause } from "../gates/verdict-cause.js";
 
 // SPEND-01/06: normalized token counts — the measurable fact. NO cost field, ever: CLIs report
 // cost:0 on sub plans and notional list prices on others (LIVE-CHECK finding 3); money is Phase 18's
@@ -29,8 +30,9 @@ export function addUsage(a: TokenUsage | undefined, b: TokenUsage): TokenUsage {
   };
 }
 
-export interface Assignment { adapter: string; model: string; channel: "sub" | "api"; tier: Tier }
-export interface BillingChannel { adapter: string; vendor: string; model: string; channel: "sub" | "api"; tier: Tier; identity?: string }
+// OBS-1182: effort rides beside the seat (absent = the CLI's own default); channelKey and the model id never carry it.
+export interface Assignment { adapter: string; model: string; channel: "sub" | "api"; tier: Tier; effort?: Effort }
+export interface BillingChannel { adapter: string; vendor: string; model: string; channel: "sub" | "api"; tier: Tier; identity?: string; effort?: Effort }
 export const MODEL_PROBE_ERRORS = ["EMFILE", "EAGAIN", "ENFILE", "ENOMEM", "ENOSPC"] as const;
 export type ModelProbeError = typeof MODEL_PROBE_ERRORS[number];
 export interface ModelAuth { authed: boolean; reason?: string; probeError?: ModelProbeError; probedAt: string; identity?: string }
@@ -54,7 +56,9 @@ export function modelAuthed(health: AuthHealth | undefined, model: string, allow
   return authed === true || (authed === undefined && allowUnverifiedModels);
 }
 export interface Invocation { command: string }
-export interface WorkerResult { ok: boolean; summary: string; deviations: string[]; raw: string }
+// OBS-1175: `cause` is the parse boundary's own answer to "was a trailer parsed?" — present on every
+// unparsed result, absent on every parsed one. A summary is worker-written text, never that answer.
+export interface WorkerResult { ok: boolean; summary: string; deviations: string[]; raw: string; cause?: VerdictUnparseableCause }
 
 // v1.69 T6: adapters whose real TUI has no argv-seeding surface can still be launched interactively by
 // opening the TUI first, waiting for a deterministic readiness marker, and then injecting the task as a
@@ -374,18 +378,19 @@ export interface WorkerAdapter {
   probeConcurrency?: number;
   probe(): Promise<AuthHealth>;
   channels(cfg: TickmarkrConfig): BillingChannel[];
-  headlessCommand(promptFile: string, model: string): string;
+  // OBS-1182: `effort` absent = the CLI's own default; only claude-code and codex render it.
+  headlessCommand(promptFile: string, model: string, effort?: Effort): string;
   // Adapter-owned launch notices are emitted by the CLI, not by the review seat. Each entry is one
   // complete recorded terminal row, in render order. The seat-byte grammar treats only this closed
   // list (and partial paints of its next row) as harness at the banner boundary.
   harnessBannerRows?: readonly string[];
   // v1.2: launch the CLI's real interactive TUI with the prompt injected; null = adapter can't → print fallback
-  interactiveCommand(promptFile: string, model: string): string | null;
+  interactiveCommand(promptFile: string, model: string, effort?: Effort): string | null;
   // v1.69 T6: launch the real TUI without a prompt, wait for readiness, then inject one seed turn.
   // When present, the daemon uses this instead of the single-command interactiveCommand path.
   interactiveSeed?: InteractiveSeed;
   // v1.29 T1: same-session retry capability; absent means the CLI has no solid resume semantics.
-  resumeCommand?(sessionId: string, promptFile: string, model: string): string;
+  resumeCommand?(sessionId: string, promptFile: string, model: string, effort?: Effort): string;
   // v1.53 T3: capture the CLI's own session id from a completed attempt's output (kimi ends every
   // -p run with `To resume this session: kimi -r session_<uuid>`, live probe 2026-07-18). Pure
   // string scan, last valid line wins; undefined = no capture → the daemon keeps its slot-name id.
@@ -459,8 +464,15 @@ export function channelsFromConfig(adapterId: string, cfg: TickmarkrConfig): Bil
       model,
       channel: override?.channel ?? e.channel,
       tier,
+      ...(override?.effort ? { effort: override.effort } : {}),
     }];
   });
+}
+
+// OBS-1182: a config-declared seat's launch effort (judge, consult pin) — the same modelOverrides
+// read channelsFromConfig makes for routed channels. Absent = the CLI's own default.
+export function configuredEffort(cfg: TickmarkrConfig, seat: { adapter: string; model: string }): Effort | undefined {
+  return cfg.tiers[seat.adapter]?.modelOverrides?.[seat.model]?.effort;
 }
 
 export function channelKey(c: { adapter: string; model: string }): string {

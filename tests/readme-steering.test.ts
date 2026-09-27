@@ -2,6 +2,7 @@ import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSy
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test, vi } from "vitest";
+import { parkToken } from "../src/cli/commands/approve.js";
 import { dispatch } from "../src/cli/index.js";
 import { status } from "../src/cli/commands/status.js";
 import { report } from "../src/cli/commands/report.js";
@@ -88,6 +89,10 @@ test("Changed README and canonical skill prose walk the recorded partial-human-p
       expect(prose.replace(/\s+/g, " "), `${file}: ${phrase}`).toContain(phrase);
     }
     expect(prose).toMatch(/approval records permission/i);
+    // OBS-1178: the CLI twin is park-bound, and a failed task's recheck keeps its bound failure token.
+    expect(prose.replace(/\s+/g, " ")).toContain("tickmarkr approve <runId> T2 --park <line>@<ts> --by operator --reason 'ready to proceed'");
+    expect(prose.replace(/\s+/g, " ")).toContain("tickmarkr approve <runId> T3 --recheck --park <line>@<ts>");
+    expect(prose.replace(/\s+/g, " ")).toContain("failed — T3 — failure <line>@<ts>");
     expect(prose).toMatch(/CURRENT TIP (?:is )?PENDING/);
     expect(prose).not.toMatch(/Approving records.*proceeds to merge/);
   }
@@ -117,7 +122,7 @@ test("Changed README and canonical skill prose walk the recorded partial-human-p
     expect(result.ok).toBe(true);
     if (!result.ok) throw new Error(result.refusal);
     const confirm = decisionConfirmLines(result.preview).join("\n");
-    expect(confirm).toContain(`tickmarkr approve ${runId} T2 --by operator --reason "ready to proceed"`);
+    expect(confirm).toContain(`tickmarkr approve ${runId} T2 --park ${parkToken(selected.park)} --by operator --reason "ready to proceed"`);
     expect(confirm).toContain("#L5 human-gate");
     expect(confirm).toContain("recorded, not dispatched; resume required");
     const session = withDecisionPreview(picked.session, result);

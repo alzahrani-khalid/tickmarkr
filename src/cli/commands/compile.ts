@@ -4,8 +4,9 @@ import {
   collateralLints, sourceScopeFindings, sourceScopeLints, type SourceScopeFinding,
 } from "../../compile/collateral.js";
 import { CompileError } from "../../compile/common.js";
+import { readDoctor } from "../../adapters/registry.js";
 import { loadConfig } from "../../config/config.js";
-import { denyPreferCollisionLine, denyPreferCollisions } from "../../route/preference.js";
+import { deadPoolEntries, deadPoolEntryLine, denyPreferCollisionLine, denyPreferCollisions } from "../../route/preference.js";
 import { compileSource } from "../../compile/index.js";
 import { retiredLiteralErrors } from "../../compile/retired-literals.js";
 import { clearCompileRefusal, saveCompileRefusal, saveGraph, stateDirName } from "../../graph/graph.js";
@@ -100,11 +101,20 @@ export async function compile(argv: string[], cwd = process.cwd(), harnessFrom: 
     // that uses it; plan already said so, compile now refuses the seal before any state write so a dry
     // run reaches the same refusal. Pool only: a partial deny leaves live members, and pin/prefer
     // collisions on the default map stay doctor's and resume's business. Scoped to the graph's shapes.
-    const deadPools = denyPreferCollisions(loadConfig(cwd), g.tasks.map((task) => task.shape))
+    // OBS-1143: aliases are judged by doctor's CACHED identity — compile never spends a probe.
+    const routingCfg = loadConfig(cwd);
+    const shapes = g.tasks.map((task) => task.shape);
+    const health = readDoctor(cwd);
+    const deadPools = denyPreferCollisions(routingCfg, shapes, health)
       .filter((collision) => collision.kind === "pool");
     if (deadPools.length > 0) {
       throw new CompileError(`${src} routes a task shape to a fully denied pool:\n${deadPools.map((collision) => `  - ${denyPreferCollisionLine(collision)}`).join("\n")}${diagnostics}`);
     }
+    // OBS-1144: a partial deny compiles, as the router routes it — but each skipped entry is named.
+    const skippedPoolEntries = deadPoolEntries(routingCfg, shapes, health).map(deadPoolEntryLine);
+    const poolNotes = skippedPoolEntries.length
+      ? `\npool notes:\n${skippedPoolEntries.map((line) => `  ! ${line}`).join("\n")}`
+      : "";
     // One bounded read supplies both cross-run surfaces: unresolved findings below and merge facts for
     // the ancestry check. Neither fact mutates the compiled graph; status and every readiness predicate
     // remain the source compiler's answer.
@@ -136,7 +146,7 @@ export async function compile(argv: string[], cwd = process.cwd(), harnessFrom: 
     const mergeHistory = mergedPending.length
       ? `\nmerge history:\n${mergedPending.map((line) => `  ${line}`).join("\n")}`
       : "";
-    return `${harnessLine(resolveHarness(harnessFrom))}\n${summary}${diagnostics}${priorFindings}${mergeHistory}`;
+    return `${harnessLine(resolveHarness(harnessFrom))}\n${summary}${diagnostics}${poolNotes}${priorFindings}${mergeHistory}`;
   } catch (error) {
     // A dry run is a pure validation query. A real authoring refusal records the negative result
     // without replacing the last good graph; run treats this sibling as newer truth than that graph.

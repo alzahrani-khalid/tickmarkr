@@ -6,6 +6,7 @@ import { describe, expect, test } from "vitest";
 import { trailerPattern } from "../../src/adapters/prompt.js";
 import {
   CHECKOUT_MARK,
+  canonicalWorktreePath,
   checkoutPrefix,
   checkoutProofLine,
   joinWrapped,
@@ -22,11 +23,19 @@ import {
   STALE_HANDLE_CODES,
   STATUS_GOVERNED_METHODS,
   TERMINAL_GONE_CODE,
+  type OrcaExec,
   type OrcaFamily,
 } from "../../src/drivers/orca.js";
 import { formatOwnedName, type Slot } from "../../src/drivers/types.js";
 import { herdrSealShellPrefix } from "../../src/drivers/subprocess.js";
-import { FakeOrca, ORCA_FIXTURE_NONCE, ORCA_LITERAL_MARKER, pagedMarkerLines, steppedTime, type FakeOrcaOpts } from "../helpers/fake-orca.js";
+import { resetContactUnreadableDeadlineMsForTests, runDaemon, setContactUnreadableDeadlineMsForTests } from "../../src/run/daemon.js";
+import { Journal } from "../../src/run/journal.js";
+import { readWatchBoard } from "../../src/run/supervision.js";
+import { COMMIT, setupRepo, T } from "../helpers/tmprepo.js";
+import {
+  FakeOrca, fakeBoardObserver, killBoardObservers, ORCA_FIXTURE_NONCE, ORCA_LITERAL_MARKER, orcaBoardDriver, pagedMarkerLines,
+  pollBoardObservers, steppedTime, type FakeBoardObserver, type FakeOrcaOpts,
+} from "../helpers/fake-orca.js";
 
 const WT = "/tmp/orca-wt/T1";
 const OTHER_WT = "/tmp/orca-wt/T2";
@@ -778,8 +787,11 @@ describe("OrcaDriver", () => {
       const err = await r.driver.read(s, 5).then((v) => v, (e: unknown) => e);
       expect(err, label).toBeInstanceOf(OrcaUnavailableError);
       for (const l of lookalikes()) expect(addressed(r.fake, l.handle), `${label} addressed a lookalike`).toBe(false);
-      // including "reuse": whatever now answers to term_A under rt-2 is never addressed either.
-      expect(r.fake.calls.slice(mark).some((a) => a.some(x => x.includes("term_A"))), `${label} addressed the reused old handle`).toBe(false);
+      // including "reuse": whatever now answers to term_A under rt-2 is never addressed either, beyond
+      // the read-only checkout proof OBS-1108 requires before a reused value could ever be reconciled.
+      const touched = r.fake.calls.slice(mark).filter((a) => a.some(x => x.includes("term_A")));
+      if (label === "reuse") expect(touched.every((a) => a[1] === "read"), `${label} addressed the reused old handle`).toBe(true);
+      else expect(touched, `${label} addressed the reused old handle`).toEqual([]);
       // and the slot STAYS unavailable — no later call quietly resolves onto anything
       await expect(r.driver.status(s)).rejects.toBeInstanceOf(OrcaUnavailableError);
       await expect(r.driver.run(s, "anything")).rejects.toBeInstanceOf(OrcaUnavailableError);
@@ -1155,3 +1167,221 @@ describe("checkoutPrefix keeps the proof marker out of the typed command (OBS-11
     expect(provesCheckout(`${oldEcho}\n${checkoutProofLine(checkout)}\n`, checkout)).toBe(false);
   });
 });
+
+// OBS-1108: an Orca restart that reissues the SAME handle value is reconciled on ownership evidence —
+// the one owned tab in the slot's worktree resolving to that handle, whose scrollback proves the exact
+// task checkout — and refused when the value now answers for somebody else's terminal. Refused means
+// never adopted (no bytes of it reach the caller) and never closed; the handle text decides nothing.
+test("test: the production Orca driver and daemon reconcile a reused handle for the same dispatch versus refusing a foreign owner, so adopting or closing the foreign pane fails", async () => {
+  const cwd = canonicalWorktreePath(WT);
+  const foreignLines = ["operator@host:~$ vim notes.md", "FOREIGN PANE BYTES"];
+  // Driver: same dispatch — the reissued term_A still proves this slot's checkout.
+  {
+    const { fake, driver } = rig({ runtimeId: "rt-1", nextHandle: "term_A" });
+    const slot = await bound(driver, fake, [checkoutProofLine(cwd), "working"]);
+    fake.restart("rt-2", [{ handle: "term_A", title: TITLE, worktree: WT, lines: [checkoutProofLine(cwd), "working", "SAME DISPATCH"] }]);
+    expect(await driver.read(slot, 5)).toContain("SAME DISPATCH");
+    await driver.run(slot, "continue");
+    expect(fake.sent.get("term_A")).toEqual(["continue"]);
+  }
+  // Driver: foreign owner — term_A under rt-2 sits under the owned tab but proves no checkout of ours.
+  {
+    const { fake, driver } = rig({ runtimeId: "rt-1", nextHandle: "term_A" });
+    const slot = await bound(driver, fake, [checkoutProofLine(cwd), "working"]);
+    fake.restart("rt-2", [{ handle: "term_A", title: TITLE, worktree: WT, lines: foreignLines }]);
+    const mark = fake.calls.length;
+    const err = await driver.read(slot, 5).then((v) => v, (e: unknown) => e);
+    expect(err).toBeInstanceOf(OrcaUnavailableError);
+    expect(String((err as Error).message)).toMatch(/reused by runtime rt-2 and does not prove checkout/);
+    await expect(driver.run(slot, "must-not-arrive")).rejects.toBeInstanceOf(OrcaUnavailableError);
+    await expect(driver.close(slot)).rejects.toBeInstanceOf(OrcaUnavailableError);
+    const after = fake.calls.slice(mark).filter((a) => a.includes("term_A"));
+    expect(after.every((a) => a[1] === "read")).toBe(true); // the read-only checkout proof, nothing else
+    expect(fake.sent.get("term_A")).toBeUndefined();
+    expect(fake.countOf("close")).toBe(0);
+    expect(fake.of("term_A")?.lines).toEqual(foreignLines);
+  }
+  // Daemon: the same restart lands mid-attempt, through runDaemon and a real OrcaDriver.
+  setContactUnreadableDeadlineMsForTests(1_500);
+  try {
+    for (const mode of ["same", "foreign"] as const) {
+      const { repo, fake: adapter } = setupRepo([T("T1")], {
+        tasks: { T1: [{ shell: `echo ok > ok.txt && ${COMMIT} ok`, result: { ok: true, summary: "ok" } }] },
+      });
+      const orca = new FakeOrca({ executeCommands: true });
+      let launched = false;
+      let postLaunchCalls = 0;
+      let reused: string | undefined;
+      class RestartingDriver extends OrcaDriver {
+        override async run(slot: Slot, command: string): Promise<void> {
+          await super.run(slot, command);
+          launched = true;
+        }
+      }
+      const driver = new RestartingDriver({
+        pollMs: 50,
+        exec: async (args, cwd, timeout) => {
+          // The restart lands before the attempt's wait loop reads the pane (the launch read is first).
+          if (launched && reused === undefined && ["read", "wait"].includes(args[1]!) && ++postLaunchCalls === 2) {
+            const t = orca.terminals.find((x) => x.handle === args[args.indexOf("--terminal") + 1])!;
+            reused = t.handle;
+            orca.restart("rt-2", [{ handle: t.handle, title: t.title, worktree: t.worktree, tabId: t.tabId,
+              lines: mode === "same" ? t.lines : foreignLines }]);
+          }
+          return orca.exec(args, cwd, timeout);
+        },
+      });
+      const runId = `run-reused-handle-${mode}`;
+      const summary = await runDaemon(repo, { adapters: [adapter], runId, driver, approvalWindowMs: 0 });
+      const events = Journal.open(repo, runId).read().filter((e) => e.taskId === "T1");
+      expect(reused, mode).toBeDefined();
+      if (mode === "same") {
+        expect(summary.done).toEqual(["T1"]);
+        expect(events.filter((e) => e.event === "contact-unreadable" && e.data.source === "driver")).toEqual([]);
+        expect(events.some((e) => e.event === "task-human")).toBe(false);
+        continue;
+      }
+      expect(summary.done).toEqual([]);
+      expect(summary.human).toEqual(["T1"]);
+      const lost = events.filter((e) => e.event === "contact-unreadable" && e.data.source === "driver");
+      expect(lost).toHaveLength(1);
+      expect(String(lost[0]!.data.error)).toMatch(/reused by runtime rt-2/);
+      expect(events.find((e) => e.event === "task-human")?.data).toMatchObject({ kind: "infra", disposition: "contact-unreadable" });
+      expect(events.some((e) => e.event === "worker-result" && e.data.ok === true)).toBe(false);
+      // Never adopted, never closed: every post-restart call naming the reused value is the read-only
+      // proof, the foreign pane survives the park and the run-end sweep with its own bytes intact.
+      const named = orca.calls.filter((a) => a.includes(reused!) && a[1] !== "create");
+      expect(named.filter((a) => a[1] === "close" || a[1] === "send")).toEqual([]);
+      expect(orca.of(reused!)?.lines).toEqual(foreignLines);
+    }
+  } finally {
+    resetContactUnreadableDeadlineMsForTests();
+  }
+}, 90_000);
+
+// OBS-1172: an Orca split whose request times out may still have started the board. Through runDaemon
+// and a real OrcaDriver: a board whose observer claimed the reservation and reports its own terminal is
+// adopted under that handle — the daemon then tracks it like any board, so its death is a loss naming
+// the adopted pane and the reopen closes exactly that handle; a claim that lands only after the claim
+// window is adopted by the daemon's next poll — and one landing only after worker dispatch with every
+// slot busy is still seen and adopted mid-task; one whose first reconciliations find the terminal table
+// unreadable is retried until a later listing proves it, with no bound on the offers (a listing that
+// stays unreadable well past ten seconds is adopted once it recovers). A timeout that started nothing leaves
+// only the operator's foreign pane beside the launching terminal: ownership is unknown — as it is for a
+// live claimant that reports no terminal of its own — so the reservation is held unresolved, the
+// foreign pane is never adopted or closed, and no second board is ever split.
+test("test: a production Orca split timing out after starting the matching board is adopted with its handle and tracked through death versus an unknown foreign pane held unresolved, so starting a second board fails", async () => {
+  const launching = "term_launching";
+  const operator = "term_operator";
+  const TIMED_OUT = { code: 124, stdout: "", stderr: "orca: terminal split request timed out", timedOut: true };
+  try {
+    for (const mode of ["matching", "late", "async", "relisted", "recovered", "foreign", "handle-less"] as const) {
+      // the async claim and the long-unreadable listing both need T1 to outlast them
+      const t1 = mode === "async" ? 6 : mode === "recovered" ? 16 : 3;
+      const { repo, fake } = setupRepo([T("T1")], {
+        tasks: { T1: [{ shell: `sleep ${t1}; echo ok > ok.txt && ${COMMIT} ok`, result: { ok: true, summary: "ok" } }] },
+      });
+      const runId = `run-split-timeout-${mode}`;
+      const orca = new FakeOrca({
+        terminals: [
+          { handle: launching, title: "launching-tab", worktree: repo, tabId: "launch_tab" },
+          { handle: operator, title: "launching-tab", worktree: repo, tabId: "launch_tab", paneTitle: "psql", parentHandle: launching },
+        ],
+        trackedWorktrees: [repo],
+      });
+      const boards: string[] = [];
+      const observers: FakeBoardObserver[] = [];
+      let unreadableLists = 0;
+      let unreadableUntil = 0; // wall clock: the listing stays down past the old 40-offer (~10 s) window
+      let unreadableCount = 0;
+      const exec: OrcaExec = async (args, cwd, timeoutMs) => {
+        if (args[1] === "list" && (unreadableLists > 0 || Date.now() < unreadableUntil)) {
+          unreadableLists--;
+          unreadableCount++;
+          return { code: 1, stdout: "", stderr: "orca: runtime unavailable" };
+        }
+        if (args[1] !== "split") return orca.exec(args, cwd, timeoutMs);
+        const first = orca.countOf("split") === 0;
+        if (first && (mode === "foreign" || mode === "handle-less")) {
+          orca.calls.push([...args]); // the request timed out before Orca listed anything
+          // a live claimant that names no terminal: the sole pane beside it is the operator's
+          if (mode === "handle-less") observers.push(fakeBoardObserver(repo, runId));
+          return TIMED_OUT;
+        }
+        const res = await orca.exec(args, cwd, timeoutMs);
+        const handle = orca.last()!.handle;
+        boards.push(handle);
+        // the board's observer claims at command start, reporting the terminal it runs in
+        if (!(first && (mode === "late" || mode === "async"))) observers.push(fakeBoardObserver(repo, runId, { handle }));
+        // the placing reconcile and the daemon's first adoption offer both find the table unreadable
+        if (first && mode === "relisted") unreadableLists = 2;
+        if (first && mode === "recovered") unreadableUntil = Date.now() + 11_000;
+        return first ? TIMED_OUT : res;
+      };
+      const clock = steppedTime();
+      const sleep = clock.sleep;
+      clock.sleep = async (ms) => { await pollBoardObservers(); return sleep(ms); };
+      const board = new OrcaDriver({ exec, time: clock, launchingHandle: launching });
+      const driver = orcaBoardDriver(board);
+      const narrator = driver.narrator!;
+      driver.narrator = async (cwd, command, id) => {
+        try {
+          const slot = await narrator(cwd, command, id);
+          // the adopted board dies while T1 still runs: the daemon must notice it under its handle
+          if (mode === "matching" && observers.length === 1) setTimeout(() => void observers[0]!.die(), 300);
+          return slot;
+        } catch (error) {
+          // the late board's claim lands only after the placing call gave up on its claim window
+          if (mode === "late" && observers.length === 0) observers.push(fakeBoardObserver(repo, runId, { handle: boards[0] }));
+          // the async board claims only after T1 is dispatched (every slot busy), then dies mid-task:
+          // only a daemon still polling the unresolved reservation adopts it in time to see the death
+          if (mode === "async" && observers.length === 0) setTimeout(() => {
+            observers.push(fakeBoardObserver(repo, runId, { handle: boards[0] }));
+            setTimeout(() => void observers[0]!.die(), 2000);
+          }, 1000);
+          throw error;
+        }
+      };
+
+      const summary = await runDaemon(repo, { adapters: [fake], runId, driver, concurrency: 1 });
+      expect(summary.done, mode).toEqual(["T1"]);
+      const rows = Journal.open(repo, runId).read();
+      const data = (event: string) => rows.filter((e) => e.event === event).map((e) => e.data);
+      const closes = orca.calls.filter((c) => c[1] === "close").map((c) => c[3]);
+      expect(closes, mode).not.toContain(operator);
+      expect(closes, mode).not.toContain(launching);
+      if (mode === "matching" || mode === "async") {
+        expect(data("watch-placement-failed").map((d) => String(d.error)), mode).toEqual(mode === "matching" ? [] : [expect.stringMatching(/placement unresolved .*held/)]);
+        expect(data("watch-board-adopted"), mode).toEqual(mode === "matching" ? [] : [{ pane: boards[0] }]);
+        expect(data("watch-board-lost"), mode).toEqual([expect.objectContaining({ pane: boards[0], pid: observers[0]!.pid })]);
+        expect(data("watch-board-reopened"), mode).toEqual([{ pane: boards[1], attempt: 1 }]);
+        expect(closes, mode).toEqual([boards[0], boards[1]]); // the adopted handle on its death, the reopened one at run-end
+        expect(orca.countOf("split"), mode).toBe(2);
+        continue;
+      }
+      if (mode === "late" || mode === "relisted" || mode === "recovered") {
+        expect(data("watch-placement-failed").map((d) => String(d.error)), mode).toEqual([expect.stringMatching(
+          mode === "late" ? /placement unresolved .*held/ : /placement unresolved .*terminal table is unreadable.*held/s)]);
+        if (mode === "recovered") expect(unreadableCount, mode).toBeGreaterThan(3); // offered repeatedly, backed off, never exhausted
+        expect(data("watch-board-adopted"), mode).toEqual([{ pane: boards[0] }]);
+        expect(data("watch-board-lost"), mode).toEqual([]);
+        expect(closes, mode).toEqual([boards[0]]); // the adopted board retired at run-end
+        expect(orca.countOf("split"), mode).toBe(1);
+        continue;
+      }
+      expect(data("watch-placement-failed").map((d) => String(d.error)), mode).toEqual([expect.stringMatching(
+        mode === "foreign" ? /placement unresolved .*unknown ownership.*held/ : /placement unresolved .*reports no terminal handle.*held/)]);
+      expect(data("watch-board-adopted"), mode).toEqual([]);
+      expect(closes, mode).toEqual([]);
+      expect(readWatchBoard(repo, runId), mode).toMatchObject({ pane: "" });
+      expect(readWatchBoard(repo, runId)?.retired, mode).toBeUndefined();
+      // starting a second board is refused while ownership stays unknown — no split, no close
+      await expect(new OrcaDriver({ exec, time: clock, launchingHandle: launching }).narrator(repo, "tickmarkr ui", runId), mode)
+        .rejects.toThrow(/remains unresolved .*held after an indeterminate split receipt/);
+      expect(orca.countOf("split"), mode).toBe(1);
+      expect(orca.of(operator), mode).toBeDefined();
+    }
+  } finally {
+    await killBoardObservers();
+  }
+}, 90_000);

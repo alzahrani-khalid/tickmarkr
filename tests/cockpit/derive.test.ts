@@ -11,7 +11,7 @@ import { DECISION_VERBS } from "../../src/cli/commands/approve.js";
 import { status } from "../../src/cli/commands/status.js";
 import { graphDefinitionHash, saveGraph, tickmarkrDir } from "../../src/graph/graph.js";
 import { validateGraph, type RunGraph } from "../../src/graph/schema.js";
-import { Journal, PARK_KINDS, type JournalEvent } from "../../src/run/journal.js";
+import { effectiveDecisions, Journal, PARK_KINDS, withPhysicalLine, type JournalEvent } from "../../src/run/journal.js";
 import { applyDecisionKey, deriveRunDecisions, initialDecisionSession } from "../../src/tui/cockpit/decision-actions.js";
 import type { CaptureEvent, DemoJournalCapture } from "../../src/tui/cockpit/demo.js";
 import {
@@ -1048,6 +1048,7 @@ describe("cockpit view rows", () => {
     // sequence the operator releases a parked task after the run has ended, so
     // the newest thing recorded about it is `task-approved` — pending, awaiting
     // a dispatch. A daemon that is gone must not repaint that as interrupted.
+    // OBS-1178: the release is bound to the park it answers (line 3 of this journal).
     const approvedAfterEnd = deriveRunCockpitData(
       syntheticSource("run-approved.journal.jsonl", [
         { ts: AT(0), event: "run-start", data: { branch: "tickmarkr/run-approved", pid: 1 } },
@@ -1065,7 +1066,7 @@ describe("cockpit view rows", () => {
           data: { assignment: { adapter: "codex", model: "gpt-9" }, attempt: 0 },
         },
         { ts: AT(4), event: "run-end", data: { tipVerify: "passed" } },
-        { ts: AT(5), event: "task-approved", taskId: "T1", data: { by: "khalid" } },
+        { ts: AT(5), event: "task-approved", taskId: "T1", data: { by: "khalid", park: { line: 3, ts: AT(2) } } },
       ]),
       "9.8.7",
       // The run has ended and its daemon is gone — the interruption every other
@@ -2061,11 +2062,13 @@ const ENDS_PARKED = [
 const PARK_WINDOW_JOURNALS: readonly RunCockpitSource[] = [
   journalOf("dispatch-then-park", [OPENED, DISPATCHED, ENDS_PARKED]),
   journalOf("done-then-park", [OPENED, DISPATCHED, ["task-done", "T1", {}], ENDS_PARKED]),
+  // OBS-1178: a release binds to a park row (line 3, :02), so this one records the park it answers.
   journalOf("approve-after-park", [
     OPENED,
     DISPATCHED,
+    ["task-human", "T1", { kind: "gate-fail" }],
     ENDS_PARKED,
-    ["task-approved", "T1", {}],
+    ["task-approved", "T1", { park: { line: 3, ts: "2026-08-01T00:00:02.000Z" } }],
   ]),
   journalOf("merge-after-park", [
     OPENED,
@@ -2158,7 +2161,11 @@ function assertBoardMatchesFold(source: RunCockpitSource, label: string): void {
   const { events: lines, defects } = sourceLines(source.raw);
   const events = lines.map((line) => line.event);
   const data = derived(source);
-  const fold = foldJournal(events);
+  // OBS-1178: task state reads decisions through the one decision fold — a refused, unsound or still-open
+  // unbound approval released nothing. Every other count below reads every row.
+  const effective = effectiveDecisions(lines.map((line) => withPhysicalLine({ ...line.event }, line.line)));
+  const decided = lines.filter((line) => line.event.event !== "task-approved" || effective.has(line.line)).map((line) => line.event);
+  const fold = foldJournal(decided);
   const tasks = [...fold.values()];
   const parked = tasks.filter((task) => task.state === "human");
   const failed = tasks.filter((task) => task.state === "failed");
@@ -2169,7 +2176,7 @@ function assertBoardMatchesFold(source: RunCockpitSource, label: string): void {
 
   // The run's word — owed to the parks the fold holds and to the parks the
   // latest run-end names and nothing since resolved.
-  const summary = summaryParks(events);
+  const summary = summaryParks(decided);
   if (failed.length > 0) expect(data.status, label).toBe("failed");
   else if (parked.length > 0 || summary.length > 0) {
     expect(data.status, label).toBe("parked");
@@ -2930,7 +2937,7 @@ describe("cockpit rows read the shared projection", () => {
     expect(rendered("T4").phase).not.toBe("awaiting merge phase");
     expect(rows.find((r) => r.taskId === "T4")!.summary!.phase).not.toBe("awaiting merge phase");
     // A disagreement fails: perturb one field and the comparison above would have caught it.
-    expect(rendered("T3")["next action"]).toBe("Choose a decision: approve");
+    expect(rendered("T3")["next action"]).toMatch(/^Choose a decision: approve \(--park \d+@\S+\)$/u); // OBS-1178 token
     expect(rows.find((r) => r.taskId === "T3")!.summary!.blocker!.permittedActions).toEqual(["approve"]);
     rmSync(repo, { recursive: true, force: true });
   });

@@ -1,7 +1,12 @@
+import { mkdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import { writeDoctor } from "../../src/adapters/registry.js";
-import type { WorkerAdapter } from "../../src/adapters/types.js";
+import { channelsFromConfig, type WorkerAdapter } from "../../src/adapters/types.js";
+import { compile } from "../../src/cli/commands/compile.js";
+import { doctor } from "../../src/cli/commands/doctor.js";
 import { plan } from "../../src/cli/commands/plan.js";
+import { resume } from "../../src/cli/commands/resume.js";
 import { saveGraph } from "../../src/graph/graph.js";
 import { validateGraph } from "../../src/graph/schema.js";
 import { authedModels, makeRepo } from "../helpers/tmprepo.js";
@@ -132,4 +137,126 @@ describe("plan review fleet lints", () => {
     const diverseOut = await plan([], diverseRepo, [codexAdapter, ompDiverseAdapter]);
     expect(diverseOut).not.toContain(CROSS_VENDOR_PAIR_LINT);
   });
+});
+
+// OBS-1143 add.1: deny claude-code:claude-opus-5 must not refuse the floating alias opus once doctor
+// observed it serving claude-opus-5-5 — and must still refuse it when it serves claude-opus-5.
+const OPUS_DENY_CFG = `tiers:
+  claude-code:
+    vendor: anthropic
+    channel: sub
+    models:
+      fable: null
+      opus: frontier
+      sonnet: null
+      haiku: null
+routing:
+  deny:
+    models: [claude-code:claude-opus-5]
+  map:
+    implement: { pool: { mode: any, channels: [claude-code:opus] } }
+`;
+const OPUS_SPEC = "<!-- tickmarkr:spec -->\n## T1: Keep the widget observable\n- goal: Keep widgetValue observable through widgetValue.\n- shape: implement\n- complexity: 2\n- files: src/widget.ts, tests/widget.test.ts\n- acceptance:\n  - test: widgetValue returns one | suite: tests/widget.test.ts\n";
+const OPUS_POOL_REFUSAL = "routing.map.implement.pool claude-code:opus fully disallowed by routing.deny (claude-code:claude-opus-5)";
+const claudeOpusAdapter = () => ({
+  id: "claude-code",
+  vendor: "anthropic",
+  probe: async () => ({ installed: true, authed: true, models: [] }),
+  channels: (cfg: Parameters<typeof channelsFromConfig>[1]) => channelsFromConfig("claude-code", cfg),
+  headlessCommand: () => "printf OK",
+}) as unknown as WorkerAdapter;
+
+function opusDenyRepo(): string {
+  const repo = makeRepo({ "feature.spec.md": OPUS_SPEC, "src/widget.ts": "export const widgetValue = () => 1;\n" });
+  mkdirSync(join(repo, ".tickmarkr"), { recursive: true });
+  writeFileSync(join(repo, ".tickmarkr", "config.yaml"), OPUS_DENY_CFG);
+  return repo;
+}
+
+describe("OBS-1143 deny decisions read the observed alias identity", () => {
+  test("test: strict compile resume preflight and doctor admit opus with observed identity claude-opus-5-5 versus refusing claude-opus-5 under the same deny, so one identity-blind alias refusal fails", async () => {
+    const runId = "run-20260926-000000-0000000000001143";
+    for (const [identity, admitted] of [["claude-opus-5-5", true], ["claude-opus-5", false]] as const) {
+      const repo = opusDenyRepo();
+      // doctor records the identity it observed; compile and resume read only that cache, never a probe
+      const doctorOut = await doctor(["--"], repo, [claudeOpusAdapter()], { banner: false, resolveClaudeAliasIdentity: () => identity });
+      saveGraph(repo, validateGraph({
+        version: 1,
+        spec: { source: "prd", paths: ["p"], hash: "h" },
+        tasks: [{ id: "T1", title: "t", goal: "g", shape: "implement", complexity: 2, acceptance: ["a"] }],
+      }));
+      const compiled = () => compile(["feature.spec.md", "--strict", "--dry-run"], repo);
+      const resumed = () => resume([runId, "--driver", "subprocess"], repo);
+      if (admitted) {
+        expect(doctorOut).not.toContain("deny∩prefer:");
+        expect(doctorOut).toMatch(/opus\s+frontier\s.*denied=—/);
+        await expect(compiled()).resolves.toMatch(/validated feature\.spec\.md/);
+        // past the preflight the daemon itself runs — and stops only at the absent journal
+        await expect(resumed()).rejects.toThrow(`no journal for ${runId}`);
+      } else {
+        expect(doctorOut).toContain(`deny∩prefer: ${OPUS_POOL_REFUSAL}`);
+        expect(doctorOut).toMatch(/opus\s+frontier\s.*denied=claude-code:claude-opus-5/);
+        await expect(compiled()).rejects.toThrow(OPUS_POOL_REFUSAL);
+        await expect(resumed()).rejects.toThrow(`deny∩prefer: ${OPUS_POOL_REFUSAL}`);
+      }
+    }
+  }, 60_000);
+});
+
+// OBS-1144: a pool carrying one denied entry routes its admitted remainder in either mode; only a pool
+// with no admitted entry left refuses. B (claude-code:opus) is declared FIRST, so ordered must skip it.
+const poolSkipCfg = (mode: "any" | "ordered", channels: string) => `tiers:
+  claude-code:
+    vendor: anthropic
+    channel: sub
+    models:
+      fable: null
+      opus: frontier
+      sonnet: frontier
+      haiku: null
+routing:
+  deny:
+    models: [claude-code:opus]
+  map:
+    implement: { pool: { mode: ${mode}, channels: [${channels}] } }
+`;
+
+function poolSkipRepo(cfg: string): string {
+  const repo = makeRepo({ "feature.spec.md": OPUS_SPEC, "src/widget.ts": "export const widgetValue = () => 1;\n" });
+  mkdirSync(join(repo, ".tickmarkr"), { recursive: true });
+  writeFileSync(join(repo, ".tickmarkr", "config.yaml"), cfg);
+  writeDoctor(repo, {
+    ...NO_CHANNELS_DOCTOR,
+    "claude-code": { installed: true, authed: true, models: [], modelAuth: authedModels(["opus", "sonnet"]) },
+  });
+  saveGraph(repo, validateGraph({
+    version: 1,
+    spec: { source: "prd", paths: ["p"], hash: "h" },
+    tasks: [{ id: "T1", title: "t", goal: "g", shape: "implement", complexity: 2, acceptance: ["a"] }],
+  }));
+  return repo;
+}
+
+describe("OBS-1144 pools route the admitted remainder", () => {
+  test("test: strict compile and plan route surviving A from pool A plus denied B in either pool mode naming skipped B versus refusing an exhausted pool, so discarding the admitted remainder fails", async () => {
+    const skippedB = "routing.map.implement.pool entry claude-code:opus is disallowed by routing.deny (claude-code:opus) — skipped — routes the admitted remainder claude-code:sonnet";
+    for (const mode of ["any", "ordered"] as const) {
+      const repo = poolSkipRepo(poolSkipCfg(mode, "claude-code:opus, claude-code:sonnet"));
+      const compiled = await compile(["feature.spec.md", "--strict", "--dry-run"], repo);
+      expect(compiled).toMatch(/validated feature\.spec\.md/);
+      expect(compiled).toContain(`pool notes:\n  ! ${skippedB}`);
+      const planned = await plan([], repo);
+      expect(planned).toMatch(/T1\s+implement\s+c2\s*→ claude-code:sonnet \[sub\/frontier\]/);
+      expect(planned).toContain(`pool ${mode} claude-code:sonnet (config routing.map; skipped claude-code:opus (disallowed by routing.deny (claude-code:opus)))`);
+      expect(planned).not.toContain("T1: unroutable");
+    }
+    for (const mode of ["any", "ordered"] as const) {
+      const exhausted = poolSkipRepo(poolSkipCfg(mode, "claude-code:opus"));
+      await expect(compile(["feature.spec.md", "--strict", "--dry-run"], exhausted))
+        .rejects.toThrow("routing.map.implement.pool claude-code:opus fully disallowed by routing.deny (claude-code:opus)");
+      const planned = await plan([], exhausted);
+      expect(planned).toContain("T1: unroutable — T1: routing.map.implement.pool is exhausted — no admitted entry remains: claude-code:opus (disallowed by routing.deny (claude-code:opus))");
+      expect(planned).not.toMatch(/→ claude-code:/);
+    }
+  }, 60_000);
 });

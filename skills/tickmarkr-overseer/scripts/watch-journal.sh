@@ -72,7 +72,8 @@ field() { printf '%s' "$2" | sed -n "s/.*\"$1\":\"\([^\"]*\)\".*/\1/p" | head -1
 bucket() { printf '%s' "$2" | sed -n "s/.*\"$1\":\[\([^]]*\)\].*/\1/p" | head -1; }
 
 report() {
-  local line="$1" run="$2" ev
+  # $3 is the row's physical journal line: with its ts it is the token a decision binds to (OBS-1178)
+  local line="$1" run="$2" at="${3:-}" ev
   ev=$(field event "$line")
   case "$ev" in
     run-end)
@@ -98,12 +99,13 @@ report() {
     task-human)
       echo "TASK_HUMAN $(field taskId "$line") — $run"
       echo "  $(printf '%s' "$line" | sed -n 's/.*"reason":"\([^"]\{0,160\}\).*/\1/p')"
-      echo "  a park waits for a DECISION; read the gate evidence, then \`tickmarkr approve $run $(field taskId "$line")\` or re-scope"
+      echo "  a park waits for a DECISION; read the gate evidence, then \`tickmarkr approve $run $(field taskId "$line") --park $at@$(field ts "$line")\` (bound to THIS park; refused once a newer one opens) or re-scope"
       ;;
     task-failed)
       echo "TASK_FAILED $(field taskId "$line") — $run"
       echo "  $(printf '%s' "$line" | sed -n 's/.*"error":"\([^"]\{0,160\}\).*/\1/p')"
       echo "  the run may continue on independent tasks; this task did not deliver"
+      echo "  landed commits re-gate with \`tickmarkr approve $run $(field taskId "$line") --recheck --park $at@$(field ts "$line")\` (its bound failure token)"
       ;;
     consult-verdict)
       echo "CONSULT_VERDICT $(field taskId "$line") action=$(field action "$line") — $run"
@@ -127,9 +129,9 @@ while [ "$elapsed" -lt "$CAP" ]; do
   # A new run resets the baseline — its whole journal is unseen by definition.
   if [ "$J" != "$seen_run" ]; then seen_run="$J"; base=0; fi
 
-  hit=$(since_arm "$J" | grep -E "$PAT" | head -1)
+  hit=$(since_arm "$J" | grep -n -E "$PAT" | head -1)
   if [ -n "$hit" ]; then
-    report "$hit" "$(basename "$(dirname "$J")")"
+    report "${hit#*:}" "$(basename "$(dirname "$J")")" "$((base + ${hit%%:*}))"
     exit 0
   fi
 done

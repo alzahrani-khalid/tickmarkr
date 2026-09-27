@@ -2,6 +2,40 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v2.6.2 — the run keeps honest books
+
+**v2.6.2** makes the run's accounts match what happened: failed infrastructure is not billed as worker repair, an approval acts only on the park it was written for, forgiven failures name their baseline, and effort, routing and review context are carried to the invocation that uses them. Run `run-20260925-234935-0000000000000149`: 23/23 merged over five laps, green at run-end (done 23; failed, human, blocked and pending empty; tip build, test and lint fresh on 2e38361d, 380 test files). Every review ran against another vendor than the task's authors. For T6, T8 and T9, whose commits carried both Anthropic and OpenAI authors, no such reviewer existed, so each got an out-of-band third-vendor review before its review gate was waived.
+
+- **T1 — public CI follows the grader (OBS-1184).** The public CI Vitest steps and `grade-ci.sh` share one strict log classifier. Only a proven RPC-timeout-only exit is forgiven; coverage errors, truncated logs, signals and unknown exits stay red.
+- **T2–T5 — Fleet and routing (OBS-1143, OBS-1144, OBS-1145, OBS-1052(3)).**
+  - Deny checks use the same probed identity as the router.
+  - Routing takes the admitted remainder of a pool and refuses an empty one.
+  - The Fleet editor shows and removes an inadmissible carried entry.
+  - Review no-verdict history is shown as an advisory without changing routing.
+- **T6/T7 — effort as channel metadata (OBS-1182).** `modelOverrides.<model>.effort` (low, medium or high) for claude-code and codex is edited in Fleet, carried in the assignment, passed to every worker, judge, review and consult invocation (`--effort`; `-c model_reasoning_effort=`), and journaled with each dispatch.
+- **T8 — an approval binds to its park (OBS-1178).** Each decision binds to the park it answers, and each waive to its failed gate, at command time (`--park`, `--gate`). It is revalidated before enactment.
+- **T9–T13 — infrastructure is not billed as repair.**
+  - Bootstrap failures and parsed capacity verdicts are kept in their own accounts (OBS-1169, OBS-1175).
+  - An empty carry is distinguished from lost changes (OBS-1107).
+  - A resume harvests an interrupted attempt that already finished (OBS-1109).
+  - Unreadable contacts and reused Orca handles are bounded (OBS-1108).
+  - Board ownership is reconciled before a reopen (OBS-1110, OBS-1131, OBS-1172).
+- **T14/T15 — the record carries its reasons.**
+  - Standing operator rulings reach later workers and review briefs as context only, never as criteria (OBS-1150, OBS-1052(2)).
+  - Forgiven fingerprints name the baseline capture that justified them, in run-end and both report renderings (OBS-1123).
+- **T16 — deterministic catalog fallbacks (OBS-1147, OBS-1148, OBS-1149, OBS-1082).**
+- **T17 — a chained Claude context sidecar for overseer seats (OBS-1122).**
+- **T18 — a selected test result is journaled before acceptance and review start (OBS-1176, OBS-1070).** The full suite then speaks on its own row, and the merge still requires it.
+- **T19–T21 — test recovery and proofs.**
+  - A stranded test recovery works through a symlinked worktree root (OBS-1180).
+  - Fixture subprocess teardown is bounded, including when discovery fails (OBS-1167).
+  - The reused-red single-charge proof is restored (OBS-1174).
+- **T22/T23 — the board and help.**
+  - Board areas and undispatched projections are informative (OBS-1103, OBS-1104).
+  - `approve --help` states that `--review-rounds` binds only this approval (OBS-1112).
+- **Fixed in the run, beside the tasks (verified with the release).** `tests/run/worktree-evidence.test.ts`'s rearm case runs a 1200 ms window, so its ceiling has real slack (OBS-1198).
+- **Known gap (queued for 2.6.3, not shipped).** On the Orca driver, a kimi worker's "Trust this folder?" dialog is never auto-answered: the launch wait reads the terminal stream, where the cursor-drawn dialog has no text, so the launch waits out the task timeout (OBS-1205). OBS-414's hands-free launch is therefore still unproven.
+
 ## v2.6.1 — the suite stays honest under load
 
 **v2.6.1** removes false work signals from a loaded host: fixtures order by events rather than sleeps, a degraded host waits instead of spending a gate, and capacity errors fail over instead of paging. Run `run-20260925-022253-0000000000000127`: 15/15 merged. Every review was cross-vendor or ruled. Tip verify ran fresh (376 test files present; 374 executed).

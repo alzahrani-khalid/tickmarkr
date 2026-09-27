@@ -4,7 +4,7 @@ import { z } from "zod";
 import { channelKey, shq, type WorkerAdapter } from "../adapters/types.js";
 import { compileNative } from "../compile/native.js";
 import { DEFAULT_DIFF_CAP } from "../config/config.js";
-import { renderAcceptanceItem, type AcceptanceItem, type Task } from "../graph/schema.js";
+import { type Effort, renderAcceptanceItem, type AcceptanceItem, type Task } from "../graph/schema.js";
 import { sh } from "../run/git.js";
 import { checkTaskDiffCaps, fetchTaskDiff, isProtectedEvidence, setAsideReceiptPath } from "./review.js";
 import { appendAnchoredReview, COMPLETION_FAKING_CHECKLIST, extractVerdictJson, generateVerdictNonce, type LlmVia, runLlm, verdictNonceLine } from "./llm.js";
@@ -407,7 +407,8 @@ export async function acceptanceGate(
   task: Task,
   worktree: string,
   baseRef: string,
-  judge: { adapter: WorkerAdapter; model: string },
+  // OBS-1182: the judge seat's OWN effort (absent = CLI default) — never the worker's.
+  judge: { adapter: WorkerAdapter; model: string; effort?: Effort },
   via?: LlmVia,
   opts: AcceptanceGateOpts = {},
 ): Promise<GateResult> {
@@ -505,7 +506,10 @@ Each criteria[].criterion MUST be the stable id from the rubric (c1, c2, ...) ex
 Each criteria[].evidence MUST be a structured citation {"path", "line"} whose "path" and "line" appear in the "Citable evidence lines" list above (a new-file line number inside a changed hunk); a citation outside every changed hunk or to an untouched file voids the whole verdict.
 The top-level comments array is optional. Use it only for actionable line-anchored feedback.
 `;
-  const raw = await runLlm(judge.adapter, judge.model, prompt, worktree, via, JUDGE_TIMEOUT_MS);
+  // OBS-1182: an unset seat passes no effort argument at all — the CLI default, and the call shape callers pin.
+  const raw = await (judge.effort
+    ? runLlm(judge.adapter, judge.model, prompt, worktree, via, JUDGE_TIMEOUT_MS, judge.effort)
+    : runLlm(judge.adapter, judge.model, prompt, worktree, via, JUDGE_TIMEOUT_MS));
   const extracted = extractVerdictJson<JudgeVerdict>(raw, nonce);
   if (!extracted) {
     const cause = classifyVerdictCause(raw, nonce, "pass");

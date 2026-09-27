@@ -722,6 +722,58 @@ gates:
     const attempt1Escalations = escalations.filter((e) => e.data.attempt === 2);
     expect(attempt1Escalations).toHaveLength(1);
   });
+
+  test("test: the production daemon executes a deterministic lint red once then reuses it while charging each eligible retry once versus fresh build on a new attempt, so deleting the reuse row assertion or double charging fails", async () => {
+    const calls = join(makeTestTempDir("daemon-reused-red-calls-"), "calls.log");
+    const { repo, fake } = setupRepo(
+      [T("T1", { files: ["code.txt", "ok.flag", "build.sh", "lint.sh"] })],
+      {
+        tasks: {
+          T1: [
+            { shell: "rm -f ok.flag && echo c1 > code.txt && git add -A && git commit --no-gpg-sign -m c1", result: { ok: true, summary: "c1" } },
+            { shell: "git commit --allow-empty --no-gpg-sign -m retry", result: { ok: true, summary: "same tree" } },
+          ],
+        },
+        consult: { action: "human", notes: "halt" },
+      },
+      'gates: { build: "sh build.sh", lint: "sh lint.sh" }',
+    );
+    writeFileSync(join(repo, "build.sh"), `echo "build:$PWD" >> ${JSON.stringify(calls)}\nexit 0\n`);
+    writeFileSync(join(repo, "lint.sh"), `echo "lint:$PWD" >> ${JSON.stringify(calls)}\n[ -f ok.flag ] && exit 0\necho 'lint: deterministic failure'\nexit 1\n`);
+    writeFileSync(join(repo, "ok.flag"), "ok\n");
+    commitAll(repo, "lint-baseline");
+
+    const runId = "run-reused-lint-red";
+    setApprovalWindowForTests(1);
+    try {
+      await runDaemon(repo, { adapters: [fake], runId });
+    } finally {
+      resetApprovalWindowForTests();
+    }
+
+    const events = Journal.open(repo, runId).read();
+    const taskRows = events.filter(e => e.taskId === "T1");
+    const lintRows = taskRows.filter(e => e.event === "gate-result" && e.data.gate === "lint");
+    const buildRows = taskRows.filter(e => e.event === "gate-result" && e.data.gate === "build");
+    expect(lintRows.map(e => e.data.attempt)).toEqual([0, 1]);
+    expect(lintRows.map(e => e.data.pass)).toEqual([false, false]);
+    expect(lintRows[1]!.data.details).toBe(lintRows[0]!.data.details);
+    expect(lintRows[0]!.data.reused).not.toBe(true);
+    expect(lintRows[1]!.data).toMatchObject({ reused: true, evidenceReceipt: lintRows[0]!.data.evidenceReceipt });
+    const reuseRows = taskRows.filter(e => e.event === "gate-reused-verdict");
+    expect(reuseRows).toHaveLength(1);
+    expect(reuseRows[0]!.data).toMatchObject({ gate: "lint", pass: false });
+    expect(String(reuseRows[0]!.data.details)).toContain("reused verdict (identity: gate=lint");
+    expect(buildRows.map(e => e.data.attempt)).toEqual([0, 1]);
+    expect(buildRows.every(e => e.data.pass === true && e.data.reused !== true)).toBe(true);
+    expect(buildRows[1]!.data.evidenceReceipt).not.toEqual(buildRows[0]!.data.evidenceReceipt);
+    const invocations = readFileSync(calls, "utf8").trim().split("\n")
+      .filter(line => line.includes(`tickmarkr-${runId}--T1`));
+    expect(invocations.filter(line => line.startsWith("build:"))).toHaveLength(2);
+    expect(invocations.filter(line => line.startsWith("lint:"))).toHaveLength(1);
+    expect(taskRows.filter(e => e.event === "gate-fingerprint-cap" && e.data.gate === "lint")).toHaveLength(1);
+    expect(taskRows.filter(e => e.event === "escalation").map(e => e.data.attempt)).toEqual([1, 2]);
+  });
 });
 
 

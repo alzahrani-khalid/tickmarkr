@@ -64,7 +64,9 @@ test("test: a resume that restores upheld feedback names the task it was restore
   const root = mkdtempSync(join(tmpdir(), "tickmarkr-upheld-restore-"));
   const upheld = Journal.create(root, "run-upheld-restore");
   upheld.append("gate-result", "T1", { gate: "review", pass: false, details: "retain the passing work" });
-  upheld.append("task-approved", "T1", { release: REVIEW_UPHELD_RELEASE });
+  upheld.append("task-human", "T1", { kind: "gate-fail" });
+  // OBS-1178: only an uphold bound to the park it answers restores the brief
+  upheld.append("task-approved", "T1", { release: REVIEW_UPHELD_RELEASE, park: upheld.newestBinding("T1") });
   upheld.append("resume-restore", "T1", { attempts: 0 });
   const restored = upheld.read().at(-1)!;
   expect(restored.data.upheldFeedbackRestoredFor).toBe("T1");
@@ -357,7 +359,7 @@ describe("journal", () => {
     const dir = mkdtempSync(join(tmpdir(), "tickmarkr-j-"));
     const j = Journal.create(dir, "run-1");
     j.append("task-human", "T1");
-    j.append("task-approved", "T1", { by: "test" });
+    j.append("task-approved", "T1", { by: "test", park: j.newestBinding("T1") }); // OBS-1178: bound to its park
     expect(j.replayStatuses().get("T1")).toBe("pending");
   });
 
@@ -758,7 +760,7 @@ describe("replayResumeState (Phase 46 derivation)", () => {
     expect(before.tried).toEqual([channelKey(A), channelKey(B)]);
     expect(channelKey(before.lastAssignment!)).toBe(channelKey(B));
 
-    j.append("task-approved", "T1", { by: "op", release: ATTEMPT_CAP_RELEASE });
+    j.append("task-approved", "T1", { by: "op", release: ATTEMPT_CAP_RELEASE, park: j.newestBinding("T1") });
     const st = j.replayResumeState().get("T1")!;
     expect(st.attempts).toBe(0); // fresh budget — daemon will not re-park at the cap
     expect(st.tried).toEqual([]); // v2.5.6 T5 (OBS-1028): a fresh-budget release resets BOTH halves of the ladder
@@ -772,7 +774,7 @@ describe("replayResumeState (Phase 46 derivation)", () => {
     const A = midA("fake", "fake-1");
     for (let i = 0; i < 10; i++) j.append("task-dispatch", "T1", { assignment: A, attempt: i });
     j.append("task-human", "T1", { reason: "attempt cap (10) reached" });
-    j.append("task-approved", "T1", { by: "op", via: "cli" }); // GATE-08 shape, no release
+    j.append("task-approved", "T1", { by: "op", via: "cli", park: j.newestBinding("T1") }); // GATE-08 shape, no release
     const st = j.replayResumeState().get("T1")!;
     expect(st.attempts).toBe(10); // NOT zeroed — pre-v1.24 corpus outcome-identical
     expect(st.tried).toEqual([channelKey(A)]);

@@ -235,7 +235,8 @@ describe("GATE-08: human gate approval (fake adapter, zero tokens)", () => {
     expect(j1.some((e) => e.event === "task-dispatch")).toBe(false); // parked, never dispatched
 
     // approval is a JOURNAL EVENT carrying who/when — never a graph.json mutation (D-02: recompile erases it)
-    Journal.open(repo, "run-g08-oracle").append("task-approved", "T1", { by: "test" });
+    const oracle = Journal.open(repo, "run-g08-oracle"); // OBS-1178: bound to the park it answers
+    oracle.append("task-approved", "T1", { by: "test", park: oracle.newestBinding("T1") });
 
     const s2 = await runDaemon(repo, { adapters: [fake], runId: "run-g08-oracle", resume: true });
     expect(s2.done).toEqual(["T1"]); // RED on HEAD: [] — the approval takes effect
@@ -255,7 +256,8 @@ describe("GATE-08: human gate approval (fake adapter, zero tokens)", () => {
     expect(s1.human.sort()).toEqual(["T1", "T2"]);
 
     // approve ONLY T1
-    Journal.open(repo, "run-g08-bucket").append("task-approved", "T1", { by: "test" });
+    const bucket = Journal.open(repo, "run-g08-bucket"); // OBS-1178: bound to the park it answers
+    bucket.append("task-approved", "T1", { by: "test", park: bucket.newestBinding("T1") });
 
     const s2 = await runDaemon(repo, { adapters: [fake], runId: "run-g08-bucket", resume: true });
     expect(s2.done).toEqual(["T1"]);

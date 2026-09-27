@@ -5,7 +5,7 @@ import type { ApprovalRunOwner } from "../../cli/commands/approve.js";
 import { formatOwnedName, parseOwnedName } from "../../drivers/types.js";
 import { GATE_NAMES, type GateName, type RunGraph } from "../../graph/schema.js";
 import { projectActivity } from "../../run/activity.js";
-import type { JournalEvent } from "../../run/journal.js";
+import { effectiveDecisions, withPhysicalLine, type JournalEvent } from "../../run/journal.js";
 import { projectOperatorSummary } from "../../run/operator-summary.js";
 import { trackJournalRows } from "../../run/protocol.js";
 import { normalizeGateOutcome, type GateOutcome } from "../../run/outcome.js";
@@ -154,7 +154,7 @@ export function runGateCells(task: OperatorTask, evidence: EvidenceLookup, rows:
       if (line === undefined || later.line <= line || later.event?.taskId !== task.id) continue;
       const e = later.event;
       if (e.event === "gate-reused" && e.data.gate === gate) labels.push(`inherited from ${str(e.data.commit) ?? "unknown commit"} · #L${later.line}`);
-      if (e.event === "task-approved" && e.data.release === "gate-satisfied" && e.data.gate === gate) labels.push(`satisfied by approval #L${later.line}`);
+      if (e.event === "task-approved" && e.data.release === "gate-satisfied" && e.data.gate === gate && !undecidedLines(evidence.later(0)).has(later.line)) labels.push(`satisfied by approval #L${later.line}`);
     }
     const verdict = row?.event?.event === "gate-result" && typeof data?.details === "string" ? data.details.split("\n") : [];
     return { gate, state: cell.state, letter: GATE_CELL_LETTERS[cell.state], ...(line === undefined ? {} : { line }), ...(outcome ? { outcome } : {}), outcomeClass: outcomeClassOf(outcome, cell.state), labels, verdict };
@@ -246,8 +246,8 @@ export interface TaskProjection {
   readonly build: ProjectionField;
   readonly blocker: ProjectionField;
   readonly nextAction: ProjectionField;
-  /** OBS-1048: present only when the newest launched attempt has failed nudges, pages and no worker-result. */
-  readonly stalled?: ProjectionField;
+  /** OBS-1048: present only when the newest launched attempt has failed nudges, pages and no worker-result. OBS-1104: neverDispatched collapses that task's line. */
+  readonly stalled?: ProjectionField; readonly neverDispatched?: true;
 }
 
 export const STALL_MARKER = "⚠ stalled harvest suspected";
@@ -265,7 +265,7 @@ const readLabel = (f: ProjectionField): string => `${f.label} ${f.line === undef
  * Nothing is inferred from a title, a provider or a task id: an unrecorded field says so.
  */
 export function projectRunTasks(snapshot: OperatorSnapshot, rows: readonly RunEvidenceRow[], graph: RunGraph | undefined, decisions: readonly RunDecision[], runId: string): readonly TaskProjection[] {
-  const ordered = [...rows].filter((r) => r.event !== undefined).sort((a, b) => a.line - b.line);
+  const ordered = decidedRows(rows);
   const graphTask = (id: string) => graph?.tasks.find((t) => t.id === id);
   const activityTasks = snapshot.tasks.map((t) => ({ id: t.id, gates: graphTask(t.id)?.gates ?? [...GATE_NAMES], deps: graphTask(t.id)?.deps ?? [], status: t.state }));
   const tracked = trackJournalRows(runId, ordered.map((r) => ({ raw: r.event, sourceIndex: r.line })));
@@ -282,7 +282,16 @@ export function projectRunTasks(snapshot: OperatorSnapshot, rows: readonly RunEv
       ...(own.length === 0 ? {} : { phase: activity.get(t.id)?.state, lastEvidenceAt: own.at(-1)!.event!.ts }),
       ...(responsibility ? { responsible: { role: str(responsibility.event!.data.role), agent: str(responsibility.event!.data.agent) } } : {}),
     };
-  }), decisions.map((d) => ({ taskId: d.taskId, park: { kind: d.park.kind, tombstone: d.park.tombstone, ...(d.park.reason === undefined ? {} : { reason: d.park.reason }) }, verbs: d.verbs, ...(d.diagnostic === undefined ? {} : { diagnostic: d.diagnostic }) }))).map((s) => [s.taskId, s]));
+  }), decisions.map((d) => ({
+    taskId: d.taskId,
+    park: {
+      kind: d.park.kind, tombstone: d.park.tombstone, line: d.park.line,
+      ...(d.park.ts === undefined ? {} : { ts: d.park.ts }),
+      ...(d.park.reason === undefined ? {} : { reason: d.park.reason }),
+    },
+    verbs: d.verbs,
+    ...(d.diagnostic === undefined ? {} : { diagnostic: d.diagnostic }),
+  }))).map((s) => [s.taskId, s]));
   return snapshot.tasks.map((t): TaskProjection => {
     const own = byTask(t.id);
     const act = activity.get(t.id);
@@ -330,7 +339,7 @@ export function projectRunTasks(snapshot: OperatorSnapshot, rows: readonly RunEv
     const stalled = launched !== undefined && !returned && nudges.length > 0 && pages.length > 0
       ? { label: `${STALL_MARKER} · launch #L${launched} · nudge failed ${nudges.map((l) => `#L${l}`).join(",")} · paged ${pages.map((l) => `#L${l}`).join(",")} · no worker-result`, line: launched }
       : undefined;
-    return { taskId: t.id, identity, phase, build, blocker, nextAction, ...(stalled ? { stalled } : {}) };
+    return { taskId: t.id, identity, phase, build, blocker, nextAction, ...(stalled ? { stalled } : {}), ...(t.dispatches === 0 ? { neverDispatched: true } : {}) };
   });
 }
 
@@ -352,8 +361,18 @@ function acceptedChanges(runId: string, tracked: ReturnType<typeof trackJournalR
   return out;
 }
 
-/** One wrapped line per task: every field with its line, and the stall marker when the harvest is suspect. */
-export const projectionLine = (p: TaskProjection): string => [p.taskId, readLabel(p.identity), readLabel(p.phase), readLabel(p.build), readLabel(p.blocker), readLabel(p.nextAction), ...(p.stalled ? [p.stalled.label] : [])].join(" · ");
+/**
+ * OBS-1104: a never-dispatched task has no identity, phase, or build row. Those fold into one
+ * missing-evidence clause. A substantive or journal-cited blocker and next action stay — a
+ * pre-dispatch park and a dependency wait are recorded facts, and dropping them hides the park token.
+ */
+export const MISSING_EVIDENCE = "missing evidence";
+const UNRECORDED_BLOCKER = new Set(["blocker none", "blocker unknown"]);
+const UNRECORDED_NEXT = new Set(["next none"]);
+const keptWhenUndispatched = (field: ProjectionField, unrecorded: ReadonlySet<string>): boolean =>
+  field.line !== undefined || !unrecorded.has(field.label);
+export const projectionLine = (p: TaskProjection): string =>
+  p.neverDispatched === true ? undispatchedProjectionLine(p) : recordedProjectionLine(p);
 
 export interface PaneLocator {
   readonly status: "recorded" | "unavailable";
@@ -422,6 +441,32 @@ export interface RunViewProps {
   readonly now?: () => number;
 }
 
+function recordedProjectionLine(p: TaskProjection): string {
+  return [p.taskId, readLabel(p.identity), readLabel(p.phase), readLabel(p.build), readLabel(p.blocker), readLabel(p.nextAction), ...(p.stalled ? [p.stalled.label] : [])].join(" · ");
+}
+
+function undispatchedProjectionLine(p: TaskProjection): string {
+  return [
+    p.taskId,
+    MISSING_EVIDENCE,
+    ...(keptWhenUndispatched(p.blocker, UNRECORDED_BLOCKER) ? [readLabel(p.blocker)] : []),
+    ...(keptWhenUndispatched(p.nextAction, UNRECORDED_NEXT) ? [readLabel(p.nextAction)] : []),
+    ...(p.stalled ? [p.stalled.label] : []),
+  ].join(" · ");
+}
+
+/**
+ * Rows the projection panel paints. A never-dispatched clause is shorter than the field line it
+ * replaces; the shell's content counter is the panel's wrapped height, and the pinned run frames
+ * record that counter. Blank rows keep the block as tall as the field lines were.
+ */
+function projectionBlockRows(projections: readonly TaskProjection[], wrap: (text: string) => string[]): readonly { readonly key: string; readonly line: string; readonly strong: boolean }[] {
+  const shown = projections.flatMap((p) => wrap(projectionLine(p)).map((line, i) => ({ key: `${p.taskId}:${i}`, line, strong: p.stalled !== undefined && i === 0 })));
+  const prior = projections.flatMap((p) => wrap(recordedProjectionLine(p)));
+  const pad = Math.max(0, prior.length - shown.length);
+  return [...shown, ...Array.from({ length: pad }, (_, i) => ({ key: `projection-pad:${i}`, line: " ", strong: false }))];
+}
+
 /** The Run body: the approved board (BD-1) over the fold, then the selected task's detail panels. */
 export function RunView({ snapshot, rows, page, graph, decisions, session, columns, run, now = Date.now }: RunViewProps): ReactElement {
   const inner = Math.max(1, Math.floor(columns) - 4);
@@ -464,7 +509,7 @@ export function RunView({ snapshot, rows, page, graph, decisions, session, colum
       )}
       {projections.length > 0 && (
         <Panel title="PROJECTION / every task · identity · phase · build · blocker · next action, each with its journal line">
-          {projections.flatMap((p) => wrap(projectionLine(p)).map((line, i) => <BodyText key={`${p.taskId}:${i}`} emphasis={p.stalled && i === 0 ? "strong" : "normal"}>{line}</BodyText>))}
+          {projectionBlockRows(projections, wrap).map((row) => <BodyText key={row.key} emphasis={row.strong ? "strong" : "normal"}>{row.line}</BodyText>)}
         </Panel>
       )}
       {verdictCell !== undefined && (
@@ -508,4 +553,18 @@ export function RunView({ snapshot, rows, page, graph, decisions, session, colum
       <BodyText emphasis="dim">{clipBoard(boardFooter([...RUN_VIEW_KEYS, decisionKeybar(session.decisions, decision)].filter(Boolean), colour), width)}</BodyText>
     </Box>
   );
+}
+
+// OBS-1178: a refused or unsound decision released and satisfied nothing, so neither the projections nor
+// a gate cell's satisfied label read it; the one decision fold judges every row by its physical line.
+function undecidedLines(rows: readonly RunEvidenceRow[]): Set<number> {
+  const ordered = rows.filter((r) => r.event !== undefined).sort((a, b) => a.line - b.line);
+  const effective = effectiveDecisions(ordered.map((r) => withPhysicalLine(r.event!, r.line)));
+  return new Set(ordered.filter((r) => r.event!.event === "task-approved" && !effective.has(r.line)).map((r) => r.line));
+}
+
+/** Readable rows in physical-line order, minus the decisions that are not effective. */
+function decidedRows(rows: readonly RunEvidenceRow[]): RunEvidenceRow[] {
+  const undecided = undecidedLines(rows);
+  return rows.filter((r) => r.event !== undefined && !undecided.has(r.line)).sort((a, b) => a.line - b.line);
 }

@@ -6,7 +6,7 @@ import { type TickmarkrConfig } from "../config/config.js";
 import { modelLints, suggestOverlay } from "./model-lints.js";
 import { HerdrDriver } from "../drivers/herdr.js";
 import { tickmarkrDir, stateDirName } from "../graph/graph.js";
-import { disallowedBy, excludedChannels, exclusionLine, type PreferenceRole, preferRanks } from "../route/preference.js";
+import { disallowedBy, excludedChannels, exclusionLine, observedIdentity, observedSeat, type PreferenceRole, preferRanks } from "../route/preference.js";
 import { sh } from "../run/git.js";
 import { FakeAdapter } from "./fake.js";
 import { parseWorkerResult } from "./prompt.js";
@@ -658,7 +658,7 @@ export function discoverChannels(
       return a.channels(cfg)
         .filter((c) => !invalid.has(c.model) && modelAuthed(h, c.model, cfg.routing.allowUnverifiedModels) && (!s || s.includes(c.model)))
         .map((c) => {
-          const identity = h?.modelAuth?.[c.model]?.identity ?? h?.modelIdentities?.[c.model];
+          const identity = observedIdentity(health, a.id, c.model);
           return identity ? { ...c, identity } : c;
         });
     });
@@ -820,7 +820,7 @@ export function formatDoctorReport(cwd: string, cfg: TickmarkrConfig, health: Re
     for (const m of models) {
       const v = h.modelAuth?.[m];
       const auth = !v ? "unknown" : v.authed ? "authed" : `unauthed: ${trunc(v.reason ?? "probe failed", 40)} (${dateOf(v.probedAt)})`;
-      const d = disallowedBy({ adapter: a.id, model: m }, cfg.routing);
+      const d = disallowedBy(observedSeat(health, a.id, m), cfg.routing);
       const denied = d?.by === "deny" ? d.entry : "—";
       const pref = preferRanks({ adapter: a.id, model: m }, cfg).map((p) => `${p.shape}#${p.rank}`).join(",") || "—";
       statusRows.push(`    ${m.padEnd(w)} ${classified[m].padEnd(8)} ${auth}  denied=${denied}  prefer=${pref}`);

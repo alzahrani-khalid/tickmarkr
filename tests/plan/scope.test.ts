@@ -285,7 +285,8 @@ describe("confirmed scope cached model health", () => {
       cfg, adapters: [fake], candidate: preview.candidate!,
     });
 
-    expect(author).toHaveBeenCalledWith(expect.any(String), "fake-1");
+    // OBS-1182: the bound seat configures no effort, so the draft launches at the CLI's default
+    expect(author).toHaveBeenCalledWith(expect.any(String), "fake-1", undefined);
     expect(readFileSync(result.specFile, "utf8")).toBe(VALID_DRAFT);
   });
 });

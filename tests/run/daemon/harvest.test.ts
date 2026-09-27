@@ -1,20 +1,24 @@
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import { extractPromptNonce } from "../../../src/gates/llm.js";
 import { writeBashEnvFixture } from "../../helpers/bash-env.js";
-import { readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { chmodSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomBytes } from "node:crypto";
-import { spawn } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { describe, expect, test, vi } from "vitest";
 import * as stall from "../../../src/run/stall.js";
 import { FakeAdapter } from "../../../src/adapters/fake.js";
 import { shq } from "../../../src/adapters/types.js";
 import { SubprocessDriver } from "../../../src/drivers/subprocess.js";
-import { type ExecutorDriver, type Slot } from "../../../src/drivers/types.js";
-import { tickmarkrDir } from "../../../src/graph/graph.js";
+import { checkoutProofLine, OrcaDriver } from "../../../src/drivers/orca.js";
+import { HerdrDriver } from "../../../src/drivers/herdr.js";
+import { FakeOrca } from "../../helpers/fake-orca.js";
+import { canonicalizeLegacyName, formatOwnedName, type ExecutorDriver, type Slot } from "../../../src/drivers/types.js";
+import { graphDefinitionHash, loadGraph, tickmarkrDir } from "../../../src/graph/graph.js";
 import { NO_TRAILER_SUMMARY } from "../../../src/adapters/prompt.js";
 import { setAttemptHardTimeoutMsForTests, resetAttemptHardTimeoutMsForTests, HARVESTED_RESULT_SUMMARY, harvestCpuFlatWindowMs, NUDGEABLE_ADAPTERS, resetDeadChannelFastKillMsForTests, resetHarvestCpuFlatMsForTests, resetHarvestSilentMsForTests, resetNudgeTimingForTests, runDaemon, setDeadChannelFastKillMsForTests, setHarvestCpuFlatMsForTests, setHarvestSilentMsForTests, setNudgeTimingForTests, workerTreeCpuMs } from "../../../src/run/daemon.js";
+import { gitHead } from "../../../src/run/git.js";
 import { Journal, type JournalEvent } from "../../../src/run/journal.js";
 import { COMMIT, makeTestTempDir, setupRepo, T } from "../../helpers/tmprepo.js";
 
@@ -1330,4 +1334,355 @@ describe("reap: a same-session non-descendant survives, an observed detached des
     expect(unobserved.killed).not.toContain(710_003);
     expect(unobserved.alive).toEqual(expect.arrayContaining([710_002, 710_003]));
   });
+});
+
+// ── OBS-1109: a daemon that died while its worker ran must harvest that attempt on resume ──────────
+// The interrupted attempt is written exactly as a live daemon writes it (task-dispatch, then a
+// worker-launch carrying the attempt's nonce, dispatch script and slot) and then left unanswered: no
+// worker-result, the task branch holding the finished work, and a still-running process in the
+// attempt's owned group. The fake script would commit redo.txt if the task were dispatched again.
+describe("resume harvest: an interrupted finished attempt is gated, never redispatched (OBS-1109)", () => {
+  const fake2 = { adapter: "fake", model: "fake-2", channel: "api" as const, tier: "frontier" as const };
+  const git = (cwd: string, ...args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
+  const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
+  // A terminal host that outlives daemon instances. Every driver instance starts EMPTY, as production
+  // drivers do after a restart: the journaled slot is unknown to it until the daemon restores the
+  // owned pane by name through its read-only adopt, and its reconcile closes every owned pane the
+  // journal fold no longer desires. A name the host does not hold cannot be adopted.
+  class PaneHost { panes = new Map<string, string | Error>(); closed: string[] = []; }
+  const hostDriver = (host: PaneHost): ExecutorDriver => {
+    const inner = new SubprocessDriver();
+    const adopted = new Map<string, string>(); // slot id → pane name
+    let n = 0;
+    return {
+      id: "pane-host", interactive: false,
+      slot: inner.slot.bind(inner),
+      // a read-only binding to the pane the host still holds under the owned name — never an allocation
+      adopt: async (s: Slot) => {
+        if (!host.panes.has(s.name)) throw new Error(`no pane ${s.name} to adopt`);
+        const id = `host-${++n}`;
+        adopted.set(id, s.name);
+        return { id, name: s.name, cwd: s.cwd };
+      },
+      run: inner.run.bind(inner), waitOutput: inner.waitOutput.bind(inner),
+      waitAgentStatus: inner.waitAgentStatus.bind(inner), status: inner.status.bind(inner),
+      read: async (s: Slot, lines: number) => {
+        const name = adopted.get(s.id);
+        if (!name) return inner.read(s, lines);
+        const pane = host.panes.get(name);
+        if (pane === undefined) throw new Error(`pane ${name} is closed`);
+        if (pane instanceof Error) throw pane;
+        return pane;
+      },
+      notify: inner.notify.bind(inner),
+      close: async (s: Slot) => { if (adopted.has(s.id)) host.panes.delete(adopted.get(s.id)!); else await inner.close(s); },
+      worktree: inner.worktree.bind(inner),
+      reconcile: async (desired, runId) => {
+        for (const name of Array.from(host.panes.keys())) {
+          if (desired.has(formatOwnedName(canonicalizeLegacyName(name, runId)))) continue;
+          host.panes.delete(name);
+          host.closed.push(name);
+        }
+      },
+    } as ExecutorDriver;
+  };
+
+  test("test: the resumed production daemon harvests a finished interrupted branch with a matching trailer versus gating committed trailerless work before any worker dispatch, so redoing either finished attempt fails", async () => {
+    // "live-result": a LIVE daemon recorded the worker's own result and died before handling its reap —
+    // that row never proves cleanup, so the resume reaps the still-running orphan before harvesting it
+    for (const mode of ["trailer", "trailerless", "live-result"] as const) {
+      const trailer = mode !== "trailerless";
+      const { repo, fake } = setupRepo([T("T1")], { tasks: { T1: [
+        { shell: `echo redo > redo.txt && ${COMMIT} redo`, result: { ok: true, summary: "redone" } },
+      ] } });
+      const runId = `run-resume-harvest-${mode}`;
+      const base = await gitHead(repo);
+      const wt = await new SubprocessDriver().worktree(repo, `tickmarkr/${runId}--T1`, base);
+      writeFileSync(join(wt, "harvest.txt"), "finished before the daemon died\n");
+      git(wt, "add", "-A");
+      git(wt, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "--no-gpg-sign", "-qm", "finished work");
+      const journal = Journal.create(repo, runId);
+      journal.append("run-start", undefined, { baseRef: base, commands: {}, graphDefinitionHash: graphDefinitionHash(loadGraph(repo)) });
+      writeFileSync(join(journal.dir, "baseline.json"), JSON.stringify({ commands: {} }));
+      const nonce = "a1b2c3d4";
+      const dispatchScript = join(journal.dir, "T1-a0.sh");
+      writeFileSync(dispatchScript, "sleep 30\n");
+      // the worker the dead daemon launched is still running in its own group — it must be reaped first
+      const orphan = spawn("bash", [dispatchScript], { cwd: wt, detached: true, stdio: "ignore" });
+      orphan.unref();
+      writeFileSync(`${dispatchScript}.${nonce}.pgid`, `${orphan.pid}\n`);
+      const slot = { id: `pane-${runId}`, name: `T1-worker-fake-a0-${runId.replace(/^run-/, "")}`, cwd: wt };
+      journal.append("task-dispatch", "T1", { assignment: fake2, attempt: 0, workerDispatchOrdinal: 0, retryMode: "fresh" });
+      journal.append("worker-launch", "T1", { attempt: 0, retryMode: "fresh", nonce, dispatchScript, driver: "pane-world", slot });
+      if (mode === "live-result") {
+        journal.append("worker-result", "T1", { ok: true, summary: "t1 finished before the daemon died", deviations: [], finished: true, exitCode: 0, mode: "print" });
+      }
+      const host = new PaneHost();
+      // trailerless: the pane holds no trailer, only the committed branch speaks for the attempt
+      if (mode === "trailer") host.panes.set(slot.name, `working…\nTICKMARKR_RESULT_${nonce} {"ok":true,"summary":"t1 finished before the daemon died","deviations":[]}\n`);
+      if (mode === "trailerless") host.panes.set(slot.name, "working…\n");
+      try {
+        const s = await runDaemon(repo, { adapters: [fake], runId, resume: true, driver: hostDriver(host) });
+        expect(s.done).toEqual(["T1"]);
+        const all = journal.read();
+        const post = all.slice(all.findIndex((e) => e.event === "run-resume") + 1);
+        expect(post.filter((e) => e.event === "task-dispatch" || e.event === "worker-launch")).toEqual([]);
+        const harvests = post.filter((e) => e.event === "worker-result-harvested");
+        expect(harvests).toHaveLength(1);
+        expect(harvests[0]!.data).toMatchObject({
+          attempt: 0, source: "resume", trailer,
+          summary: trailer ? "t1 finished before the daemon died" : HARVESTED_RESULT_SUMMARY,
+        });
+        if (mode === "live-result") expect(post.filter((e) => e.event === "worker-result")).toEqual([]); // finished, never rewritten
+        else expect(post.find((e) => e.event === "worker-result")!.data).toMatchObject({ finished: trailer, ok: trailer, attempt: 0 });
+        // owned-process cleanup precedes the harvest, and the orphan is gone
+        const reaped = post.findIndex((e) => e.event === "worker-process-reaped");
+        expect(reaped).toBeGreaterThanOrEqual(0);
+        expect(reaped).toBeLessThan(post.indexOf(harvests[0]!));
+        expect(post[reaped]!.data).toMatchObject({ attempt: 0, processGroup: orphan.pid, survivors: [] });
+        expect(alive(orphan.pid!)).toBe(false);
+        // the startup reconcile spared the evidence pane; once harvested it is swept like any other
+        if (mode === "trailer") expect(host.closed).toEqual([slot.name]);
+        expect(post.some((e) => e.event === "gate-result")).toBe(true);
+        expect(post.find((e) => e.event === "task-done")!.data.assignment).toEqual(fake2);
+        expect(git(repo, "show", `tickmarkr/${runId}:harvest.txt`)).toBe("finished before the daemon died");
+        expect(() => git(repo, "show", `tickmarkr/${runId}:redo.txt`)).toThrow();
+      } finally {
+        if (alive(orphan.pid!)) process.kill(-orphan.pid!, "SIGKILL");
+      }
+    }
+  }, 60_000);
+
+  // The production Orca driver keeps an instance-local slot registry and Orca has no adopt verb, so
+  // a FRESH OrcaDriver binds the interrupted attempt's terminal only on ownership evidence: the one tab
+  // carrying the journaled owned title on the tracked worktree, resolving to one terminal whose
+  // scrollback proves the task checkout. Through that binding the real driver reads the pane: a
+  // matching trailer is harvested, a foreign one is declined, and no candidate at all stays unreadable
+  // — declined, never classified. The exec seam emulates the orca CLI; the live CLI is never reached.
+  test("a fresh production OrcaDriver adopts the interrupted owned terminal on ownership evidence: a matching trailer is harvested, a foreign trailer and an absent terminal are declined onto recovery", async () => {
+    for (const mode of ["matching", "foreign", "absent"] as const) {
+      const { repo, fake } = setupRepo([T("T1")], { tasks: { T1: [
+        { shell: `echo redo > redo.txt && ${COMMIT} redo`, result: { ok: true, summary: "redone" } },
+      ] } });
+      const runId = `run-resume-harvest-orca-${mode}`;
+      const base = await gitHead(repo);
+      const wt = await new SubprocessDriver().worktree(repo, `tickmarkr/${runId}--T1`, base);
+      writeFileSync(join(wt, "harvest.txt"), "finished before the daemon died\n");
+      git(wt, "add", "-A");
+      git(wt, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "--no-gpg-sign", "-qm", "finished work");
+      const journal = Journal.create(repo, runId);
+      journal.append("run-start", undefined, { baseRef: base, commands: {}, graphDefinitionHash: graphDefinitionHash(loadGraph(repo)) });
+      writeFileSync(join(journal.dir, "baseline.json"), JSON.stringify({ commands: {} }));
+      const nonce = "0rca0rca";
+      const dispatchScript = join(journal.dir, "T1-a0.sh");
+      writeFileSync(dispatchScript, "sleep 30\n");
+      const slot = { id: "orca-1", name: formatOwnedName({ role: "worker", taskId: "T1", attempt: 0, runId }), cwd: wt };
+      journal.append("task-dispatch", "T1", { assignment: fake2, attempt: 0, workerDispatchOrdinal: 0, retryMode: "fresh" });
+      journal.append("worker-launch", "T1", { attempt: 0, retryMode: "fresh", nonce, dispatchScript, driver: "orca", slot });
+      const trailerNonce = mode === "foreign" ? "deadbeef" : nonce;
+      const trailer = `TICKMARKR_RESULT_${trailerNonce} {"ok":true,"summary":"t1 finished before the daemon died","deviations":[]}`;
+      // the terminal table the dead daemon left behind: Orca tracks the clone, the owned title lives at
+      // TAB identity only, and the create command's proof frame names the task checkout
+      const orcaHost = new FakeOrca({ trackedWorktrees: [repo], pageSize: 8, terminals: mode === "absent" ? [] : [
+        { handle: "term_owned", title: slot.name, worktree: repo, lines: [checkoutProofLine(wt), "working…", trailer, "$ "] }, // the pane's shell is still up
+      ] });
+      const orca = new OrcaDriver({ exec: orcaHost.exec, launchingHandle: "term_launch" });
+      const inner = new SubprocessDriver();
+      // the interrupted attempt's owned slot goes through the real OrcaDriver; the recovery dispatch runs headless
+      const orcaSlots = new Set([slot.id]);
+      const driver: ExecutorDriver = {
+        ...inner, id: "orca", interactive: false,
+        slot: inner.slot.bind(inner),
+        adopt: async (s: Slot) => { const a = await orca.adopt(s); orcaSlots.add(a.id); return a; },
+        read: (s, lines) => orcaSlots.has(s.id) ? orca.read(s, lines) : inner.read(s, lines),
+        close: (s) => orcaSlots.has(s.id) ? Promise.resolve() : inner.close(s),
+        run: inner.run.bind(inner), waitOutput: inner.waitOutput.bind(inner), waitAgentStatus: inner.waitAgentStatus.bind(inner),
+        status: inner.status.bind(inner), notify: inner.notify.bind(inner), worktree: inner.worktree.bind(inner),
+      } as ExecutorDriver;
+      const s = await runDaemon(repo, { adapters: [fake], runId, resume: true, driver });
+      expect(s.done).toEqual(["T1"]);
+      const all = journal.read();
+      const post = all.slice(all.findIndex((e) => e.event === "run-resume") + 1);
+      // the real driver bound (or refused) through Orca's own verbs: no terminal was created or invented
+      expect(orcaHost.families()).toContain("list");
+      expect(orcaHost.families().filter((f) => f === "create" || f === "close")).toEqual([]);
+      if (mode === "matching") {
+        expect(orcaHost.families()).toContain("read");
+        const harvests = post.filter((e) => e.event === "worker-result-harvested");
+        expect(harvests).toHaveLength(1);
+        expect(harvests[0]!.data).toMatchObject({ attempt: 0, source: "resume", trailer: true, summary: "t1 finished before the daemon died" });
+        expect(post.find((e) => e.event === "worker-result")!.data).toMatchObject({ finished: true, ok: true, attempt: 0, source: "resume" });
+        expect(post.filter((e) => e.event === "task-dispatch" || e.event === "worker-launch")).toEqual([]);
+        expect(post.find((e) => e.event === "task-done")!.data.assignment).toEqual(fake2);
+        expect(git(repo, "show", `tickmarkr/${runId}:harvest.txt`)).toBe("finished before the daemon died");
+        expect(() => git(repo, "show", `tickmarkr/${runId}:redo.txt`)).toThrow();
+        continue;
+      }
+      const declined = post.findIndex((e) => e.event === "resume-harvest-declined");
+      expect(post[declined]!.data).toEqual({ attempt: 0, reason: mode === "foreign"
+        ? "foreign-nonce"
+        : expect.stringMatching(/^pane unreadable: .*no tab in .* carries the owned title/) });
+      expect(post.filter((e) => ["worker-result-harvested", "worker-process-reaped"].includes(e.event) && e.data.attempt === 0)).toEqual([]);
+      expect(post.some((e) => e.event === "worker-result" && e.data.source === "resume")).toBe(false);
+      const dispatches = post.filter((e) => e.event === "task-dispatch");
+      expect(dispatches.map((e) => e.data.attempt)).toEqual([1]);
+      expect(post.indexOf(dispatches[0]!)).toBeGreaterThan(declined);
+      expect(git(repo, "show", `tickmarkr/${runId}:redo.txt`)).toBe("redo");
+    }
+  }, 90_000);
+  // A fresh OrcaDriver numbers its slots from orca-1 again, so a journaled slot.id names whatever
+  // terminal THIS instance bound under it: here T2's dead-daemon id is the id T1's adoption takes first.
+  // Each attempt must still be read through its OWN terminal — bound on title and checkout, never on id.
+  test("two interrupted tasks whose journaled Orca slot ids collide after a resume re-numbers them are each harvested through their own terminal", async () => {
+    const { repo, fake } = setupRepo([T("T1"), T("T2")], { tasks: {
+      T1: [{ shell: `echo redo > redo.txt && ${COMMIT} redo`, result: { ok: true, summary: "redone" } }],
+      T2: [{ shell: `echo redo > redo.txt && ${COMMIT} redo`, result: { ok: true, summary: "redone" } }],
+    } });
+    const runId = "run-resume-harvest-orca-collide";
+    const base = await gitHead(repo);
+    const journal = Journal.create(repo, runId);
+    journal.append("run-start", undefined, { baseRef: base, commands: {}, graphDefinitionHash: graphDefinitionHash(loadGraph(repo)) });
+    writeFileSync(join(journal.dir, "baseline.json"), JSON.stringify({ commands: {} }));
+    const terminals = [];
+    const nonces = { T1: "aaaa1111", T2: "bbbb2222" } as const;
+    // T2 was slot orca-1 in the dead daemon; this instance hands orca-1 to a different terminal first
+    const ids = { T1: "orca-2", T2: "orca-1" } as const;
+    for (const id of ["T1", "T2"] as const) {
+      const wt = await new SubprocessDriver().worktree(repo, `tickmarkr/${runId}--${id}`, base);
+      writeFileSync(join(wt, `${id}.txt`), `${id} finished\n`);
+      git(wt, "add", "-A");
+      git(wt, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "--no-gpg-sign", "-qm", `${id} work`);
+      const dispatchScript = join(journal.dir, `${id}-a0.sh`);
+      writeFileSync(dispatchScript, "sleep 30\n");
+      const slot = { id: ids[id], name: formatOwnedName({ role: "worker", taskId: id, attempt: 0, runId }), cwd: wt };
+      journal.append("task-dispatch", id, { assignment: fake2, attempt: 0, workerDispatchOrdinal: 0, retryMode: "fresh" });
+      journal.append("worker-launch", id, { attempt: 0, retryMode: "fresh", nonce: nonces[id], dispatchScript, driver: "orca", slot });
+      terminals.push({ handle: `term_${id}`, title: slot.name, worktree: repo,
+        lines: [checkoutProofLine(wt), `TICKMARKR_RESULT_${nonces[id]} {"ok":true,"summary":"${id} finished","deviations":[]}`, "$ "] });
+    }
+    // a terminal the fresh driver binds BEFORE either harvest (as a resumed daemon adopts its prior
+    // watch pane): it takes orca-1, the id T2's dead daemon journaled, and holds a foreign trailer
+    const strayWt = await new SubprocessDriver().worktree(repo, `tickmarkr/${runId}--T9`, base);
+    const strayName = formatOwnedName({ role: "worker", taskId: "T9", attempt: 0, runId });
+    terminals.push({ handle: "term_stray", title: strayName, worktree: repo,
+      lines: [checkoutProofLine(strayWt), 'TICKMARKR_RESULT_deadbeef {"ok":true,"summary":"a stranger","deviations":[]}', "$ "] });
+    const orcaHost = new FakeOrca({ trackedWorktrees: [repo], pageSize: 8, terminals });
+    const orca = new OrcaDriver({ exec: orcaHost.exec, launchingHandle: "term_launch" });
+    const inner = new SubprocessDriver();
+    const orcaSlots = new Set(Object.values(ids));
+    const stray = await orca.adopt({ id: "orca-9", name: strayName, cwd: strayWt });
+    expect(stray.id).toBe(ids.T2);
+    orcaSlots.add(stray.id);
+    const driver: ExecutorDriver = {
+      ...inner, id: "orca", interactive: false,
+      slot: inner.slot.bind(inner),
+      adopt: async (s: Slot) => { const a = await orca.adopt(s); orcaSlots.add(a.id); return a; },
+      read: (s, lines) => orcaSlots.has(s.id) ? orca.read(s, lines) : inner.read(s, lines),
+      close: (s) => orcaSlots.has(s.id) ? Promise.resolve() : inner.close(s),
+      run: inner.run.bind(inner), waitOutput: inner.waitOutput.bind(inner), waitAgentStatus: inner.waitAgentStatus.bind(inner),
+      status: inner.status.bind(inner), notify: inner.notify.bind(inner), worktree: inner.worktree.bind(inner),
+    } as ExecutorDriver;
+    const s = await runDaemon(repo, { adapters: [fake], runId, resume: true, driver });
+    expect(s.done.sort()).toEqual(["T1", "T2"]);
+    const all = journal.read();
+    const post = all.slice(all.findIndex((e) => e.event === "run-resume") + 1);
+    expect(post.filter((e) => e.event === "task-dispatch" || e.event === "worker-launch" || e.event === "resume-harvest-declined")).toEqual([]);
+    for (const id of ["T1", "T2"] as const) {
+      expect(post.find((e) => e.event === "worker-result-harvested" && e.taskId === id)!.data).toMatchObject({ attempt: 0, trailer: true, summary: `${id} finished` });
+      expect(git(repo, "show", `tickmarkr/${runId}:${id}.txt`)).toBe(`${id} finished`);
+    }
+    expect(() => git(repo, "show", `tickmarkr/${runId}:redo.txt`)).toThrow();
+  }, 90_000);
+
+  // D-546: HerdrDriver has no read-only adoption. Its slot() is an ALLOCATION — a fresh tab whose
+  // reclaimStaleLabel closes the original same-named pane before its trailer is read, holding a dispatch
+  // lease only run() releases — so it is never an adoption fallback. The resume declines the harvest
+  // and Herdr keeps ordinary recovery, whatever trailer the pane holds. The `herdr` binary is a stub
+  // that records every invocation and emulates the pane registry; the live CLI is never reached.
+  test("a resume through the production HerdrDriver declines a matching or foreign trailer without allocating, closing or leasing a pane", async () => {
+    for (const mode of ["matching", "foreign"] as const) {
+      const { repo, fake } = setupRepo([T("T1")], { tasks: { T1: [
+        { shell: `echo redo > redo.txt && ${COMMIT} redo`, result: { ok: true, summary: "redone" } },
+      ] } });
+      const runId = `run-resume-harvest-herdr-${mode}`;
+      const base = await gitHead(repo);
+      const wt = await new SubprocessDriver().worktree(repo, `tickmarkr/${runId}--T1`, base);
+      writeFileSync(join(wt, "harvest.txt"), "finished before the daemon died\n");
+      git(wt, "add", "-A");
+      git(wt, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "--no-gpg-sign", "-qm", "finished work");
+      const journal = Journal.create(repo, runId);
+      journal.append("run-start", undefined, { baseRef: base, commands: {}, graphDefinitionHash: graphDefinitionHash(loadGraph(repo)) });
+      writeFileSync(join(journal.dir, "baseline.json"), JSON.stringify({ commands: {} }));
+      const nonce = "4e4d4e4d";
+      const dispatchScript = join(journal.dir, "T1-a0.sh");
+      writeFileSync(dispatchScript, "sleep 30\n");
+      const slot = { id: "w1:pOWNED", name: formatOwnedName({ role: "worker", taskId: "T1", attempt: 0, runId }), cwd: wt };
+      journal.append("task-dispatch", "T1", { assignment: fake2, attempt: 0, workerDispatchOrdinal: 0, retryMode: "fresh" });
+      journal.append("worker-launch", "T1", { attempt: 0, retryMode: "fresh", nonce, dispatchScript, driver: "herdr", slot });
+      const dir = makeTestTempDir("tickmarkr-herdr-stub-");
+      const log = join(dir, "calls.log");
+      const panes = join(dir, "panes.txt");
+      const pane = join(dir, "owned-pane.txt");
+      writeFileSync(log, "");
+      writeFileSync(panes, `w1:pOWNED ${slot.name}\n`);
+      writeFileSync(pane, `working…\nTICKMARKR_RESULT_${mode === "matching" ? nonce : "deadbeef"} {"ok":true,"summary":"t1 finished before the daemon died","deviations":[]}\n`);
+      const bin = join(dir, "herdr");
+      writeFileSync(bin, [
+        "#!/bin/bash",
+        `printf '%s\\n' "$*" >> ${shq(log)}`,
+        'case "$1 $2" in',
+        `  "pane list") printf '{"result":{"panes":['; sep=; while read -r id label; do printf '%s{"pane_id":"%s","label":"%s"}' "$sep" "$id" "$label"; sep=,; done < ${shq(panes)}; echo ']}}' ;;`,
+        `  "pane read") [ "$3" = w1:pOWNED ] && cat ${shq(pane)} ;;`,
+        `  "tab create") echo '{"result":{"tab":{"tab_id":"w1:t1"},"root_pane":{"pane_id":"w1:pNEW"}}}' ;;`,
+        `  "pane rename") printf '%s %s\\n' "$3" "$4" >> ${shq(panes)}; echo '{}' ;;`,
+        `  "pane close") grep -v "^$3 " ${shq(panes)} > ${shq(`${panes}.tmp`)}; mv ${shq(`${panes}.tmp`)} ${shq(panes)}; echo '{}' ;;`,
+        "  *) echo '{}' ;;",
+        "esac",
+      ].join("\n"));
+      chmodSync(bin, 0o755);
+      // the driver captures its workspace at construction: with one, a slot() here WOULD place a pane
+      const prior = process.env.HERDR_WORKSPACE_ID;
+      process.env.HERDR_WORKSPACE_ID = "wTEST";
+      const herdr = new HerdrDriver(bin);
+      if (prior === undefined) delete process.env.HERDR_WORKSPACE_ID;
+      else process.env.HERDR_WORKSPACE_ID = prior;
+      const inner = new SubprocessDriver();
+      // the interrupted attempt's owned name goes through the real HerdrDriver; the recovery dispatch runs headless
+      const herdrSlots = new Set<Slot>();
+      const driver: ExecutorDriver = {
+        id: "herdr", interactive: false,
+        slot: async (cwd: string, name: string, o?: Parameters<ExecutorDriver["slot"]>[2]) => {
+          if (name !== slot.name) return inner.slot(cwd, name);
+          const s = await herdr.slot(cwd, name, o);
+          herdrSlots.add(s);
+          return s;
+        },
+        read: (s: Slot, lines: number) => herdrSlots.has(s) ? herdr.read(s, lines) : inner.read(s, lines),
+        close: (s: Slot) => herdrSlots.has(s) ? herdr.close(s) : inner.close(s),
+        run: inner.run.bind(inner), waitOutput: inner.waitOutput.bind(inner), waitAgentStatus: inner.waitAgentStatus.bind(inner),
+        status: inner.status.bind(inner), notify: inner.notify.bind(inner), worktree: inner.worktree.bind(inner),
+      } as ExecutorDriver;
+      const s = await runDaemon(repo, { adapters: [fake], runId, resume: true, driver });
+      expect(s.done).toEqual(["T1"]);
+      const all = journal.read();
+      const post = all.slice(all.findIndex((e) => e.event === "run-resume") + 1);
+      // declined before anything is bound: no pane allocated, renamed, run into or closed
+      const calls = readFileSync(log, "utf8").split("\n").filter(Boolean);
+      expect(calls.filter((c) => /^(tab (create|close|rename)|pane (split|rename|run|close|send))/.test(c))).toEqual([]);
+      expect(readFileSync(panes, "utf8")).toBe(`w1:pOWNED ${slot.name}\n`);
+      // ...and no dispatch lease is left holding the driver's delivery chain
+      let free = false;
+      void (herdr as unknown as { deliverySerial: Promise<unknown> }).deliverySerial.then(() => { free = true; });
+      await new Promise((r) => setImmediate(r));
+      expect(free).toBe(true);
+      const declined = post.findIndex((e) => e.event === "resume-harvest-declined");
+      expect(post[declined]!.data).toEqual({ attempt: 0, reason: "no read-only adoption on this driver" });
+      expect(post.filter((e) => ["worker-result-harvested", "worker-process-reaped"].includes(e.event) && e.data.attempt === 0)).toEqual([]);
+      expect(post.some((e) => e.event === "worker-result" && e.data.source === "resume")).toBe(false);
+      const dispatches = post.filter((e) => e.event === "task-dispatch");
+      expect(dispatches.map((e) => e.data.attempt)).toEqual([1]);
+      expect(post.indexOf(dispatches[0]!)).toBeGreaterThan(declined);
+      expect(git(repo, "show", `tickmarkr/${runId}:redo.txt`)).toBe("redo");
+    }
+  }, 90_000);
 });

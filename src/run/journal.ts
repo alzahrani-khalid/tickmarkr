@@ -85,6 +85,13 @@ export interface ResumeState {
   // OBS-189: set by a task-approved{release:review-upheld} replay — the upheld reviewer's findings,
   // carried into the next dispatch as the retry brief so the fix attempt knows what to fix.
   upheldFeedback?: string;
+  // OBS-1169: channels a bootstrap failover escalated away from WITHOUT launching them, keyed to the
+  // recorded reason — kept apart from `tried` (the channels actually dispatched) and cleared only by
+  // the release that clears `tried`, or by a later dispatch that really does try one.
+  escalated?: Record<string, string>;
+  // OBS-1169: the adapters those failovers escalated away from — held apart from channels so a
+  // single-channel adapter's exclusion survives having no sibling to carry it.
+  escalatedAdapters?: string[];
 }
 
 // T15: a gate result is reusable evidence, not operator authority. The daemon may reuse only the
@@ -118,6 +125,173 @@ export const REVIEW_UPHELD_RELEASE = "review-upheld" as const;
 // marks no gate satisfied: green merges directly, red returns to the existing ladder with attempts
 // and tried seats intact.
 export const RECHECK_RELEASE = "recheck" as const;
+// OBS-1178: the daemon's answer to a pending approval that no longer binds to the park it names. It
+// enacts nothing and consumes the decision, so every fold reads the task as still parked.
+export const APPROVAL_REFUSED = "approval-refused" as const;
+
+/** OBS-1178: the journal row a decision answers — its physical 1-based line plus its timestamp. */
+export interface DecisionBinding { line: number; ts: string }
+
+/** The token every surface prints and `approve --park` accepts: `<line>@<ts>`. */
+export const bindingToken = (binding: DecisionBinding): string => `${binding.line}@${binding.ts}`;
+
+export function parseBindingToken(token: string): DecisionBinding | undefined {
+  const match = /^([1-9]\d*)@(\S+)$/u.exec(token);
+  return match && Number.isSafeInteger(Number(match[1])) ? { line: Number(match[1]), ts: match[2]! } : undefined;
+}
+
+/** The binding a task-approved row recorded under `park` or `failure`, when well formed. */
+export function recordedBinding(value: unknown): DecisionBinding | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const { line, ts } = value as Record<string, unknown>;
+  return typeof line === "number" && Number.isSafeInteger(line) && line > 0 && typeof ts === "string" ? { line, ts } : undefined;
+}
+
+/** The newest failed gate before a park row — the gate a waive of that park would satisfy. */
+export function failedGateBeforePark(events: readonly JournalEvent[], taskId: string, parkIndex: number): GateName | undefined {
+  for (let i = parkIndex - 1; i >= 0; i -= 1) {
+    const event = events[i]!;
+    if (event.taskId !== taskId) continue;
+    if (event.event === "task-approved" || event.event === "task-human" || event.event === "task-dispatch") return undefined;
+    if (event.event === "gate-result" && event.data.pass === false
+        && typeof event.data.gate === "string" && (GATE_NAMES as readonly string[]).includes(event.data.gate)) {
+      return event.data.gate as GateName;
+    }
+  }
+  return undefined;
+}
+
+// OBS-1178: every row read from a journal file remembers its PHYSICAL 1-based line, so a decision
+// fold keys bindings and refusals by the line an operator's token names — never by a compacted index
+// a blank or torn line would shift. Rows built in memory (tests, fixtures) fall back to index + 1.
+const SOURCE_LINE = new WeakMap<object, number>();
+
+/** The physical journal line of `events[i]` (see SOURCE_LINE). */
+export const physicalLine = (events: readonly JournalEvent[], i: number): number => SOURCE_LINE.get(events[i]!) ?? i + 1;
+
+/** A row parsed outside this module (a cockpit capture) names its own physical line to the decision fold. */
+export const withPhysicalLine = <T extends JournalEvent>(row: T, line: number): T => { SOURCE_LINE.set(row, line); return row; };
+
+/** OBS-1178: an approval neither enacted nor refused yet, and — when it may not be enacted — why. */
+export interface OpenDecision { taskId: string; line: number; stale?: string }
+
+// Rows that enact (consume) the decisions open for their task: a dispatch, a battery, a recreation,
+// or the task closing done. A new task-human or task-failed row is NOT one — it proves nothing was
+// enacted, so an earlier decision stays open and is judged against the newer park or failure.
+const ENACTS_DECISIONS = new Set([
+  "task-dispatch", "repair-dispatch", "resume-restore", "worker-launch", "recheck-battery", "worktree-recreation",
+  "task-done",
+]);
+
+/**
+ * OBS-1178: THE decision fold. Every reader of task-approved rows — the replay folds, the daemon's
+ * startup, sweep and pending-action folds, scope-amendment replay and its audits, status and both
+ * cockpits — reads decisions through it, so no two surfaces can disagree on whether one happened.
+ *
+ * `effective` holds the PHYSICAL lines of the task-approved rows whose effects may apply: a row that
+ * was sound when an enactment row consumed it (bound by line and timestamp to the task's newest park,
+ * a waive also to that park's failed gate, or a recheck to the newest failure with no park after it;
+ * a legacy row carrying no binding only when no park or failure landed between it and that
+ * enactment), plus a row still open that is sound NOW. A refused row is never effective, and neither is an open row that no
+ * longer binds — a newer park or failure landed, or it names none — whatever unrelated rows landed
+ * around it. An enactment row also consumes the task's park and failure: a decision naming either
+ * after the task moved on is stale, while the decisions that enactment already consumed stay effective.
+ * `open` lists every unenacted, unrefused row with why it may not be enacted, and `refused` the lines
+ * an approval-refused row answered.
+ */
+export function foldDecisions(events: readonly JournalEvent[]): { effective: Set<number>; open: OpenDecision[]; refused: Set<number> } {
+  const lineOf = (i: number): number => physicalLine(events, i);
+  const token = (i: number | undefined): string => i === undefined ? "none" : bindingToken({ line: lineOf(i), ts: String(events[i]!.ts) });
+  const names = (binding: DecisionBinding, i: number | undefined): boolean => i !== undefined && lineOf(i) === binding.line && events[i]!.ts === binding.ts;
+  const parks = new Map<string, number>();
+  const failures = new Map<string, number>();
+  const pending = new Map<string, number[]>();
+  const effective = new Set<number>();
+  const refused = new Set<number>();
+  // Why the decision at `index` may not be enacted against the rows read so far; `open` refuses an unbound row outright.
+  const judge = (taskId: string, index: number, open: boolean): string | undefined => {
+    const row = events[index]!;
+    const park = parks.get(taskId);
+    const failure = failures.get(taskId);
+    const parkBinding = recordedBinding(row.data.park);
+    const failureBinding = row.data.release === RECHECK_RELEASE ? recordedBinding(row.data.failure) : undefined;
+    if (parkBinding) {
+      if (!names(parkBinding, park)) return `bound to park ${bindingToken(parkBinding)} but the newest park is ${token(park)}`;
+      if ((failure ?? -1) > park!) return `bound to park ${bindingToken(parkBinding)} but the task failed since, at ${token(failure)}`;
+      if (row.data.release !== GATE_SATISFIED_RELEASE) return undefined;
+      const gate = failedGateBeforePark(events, taskId, park!);
+      return gate !== undefined && gate === row.data.gate ? undefined : `waive names gate ${String(row.data.gate ?? "none")} but park ${token(park)} failed ${gate ?? "no gate"}`;
+    }
+    if (failureBinding) {
+      return names(failureBinding, failure) && (park ?? -1) < failure!
+        ? undefined
+        : `bound to failure ${bindingToken(failureBinding)} but the newest failure is ${token(failure)} and the newest park ${token(park)}`;
+    }
+    // Enacted history written before decisions carried bindings stays readable unless a park or failure
+    // superseded it before its enactment. An open unbound row is refused whatever order it landed in.
+    if (!open && Math.max(park ?? -1, failure ?? -1) < index) return undefined;
+    return `an unbound decision names no park token (the newest park is ${token(park)}) — refusing an unbound release`;
+  };
+  events.forEach((e, i) => {
+    const taskId = e.taskId;
+    if (!taskId) return;
+    if (e.event === "task-approved") {
+      pending.set(taskId, [...(pending.get(taskId) ?? []), i]);
+    } else if (e.event === APPROVAL_REFUSED) {
+      // A refusal voids the rows its `lines` name (every open row of its task when it names none).
+      const named = Array.isArray(e.data.lines) ? new Set<unknown>(e.data.lines) : undefined;
+      const kept = (pending.get(taskId) ?? []).filter((at) => {
+        if (named !== undefined && !named.has(lineOf(at))) return true;
+        refused.add(lineOf(at));
+        return false;
+      });
+      if (kept.length) pending.set(taskId, kept); else pending.delete(taskId);
+    } else if (ENACTS_DECISIONS.has(e.event)) {
+      for (const at of pending.get(taskId) ?? []) if (judge(taskId, at, false) === undefined) effective.add(lineOf(at));
+      pending.delete(taskId);
+      // The task moved on: its park and failure are consumed, so a later decision naming either is stale.
+      parks.delete(taskId);
+      failures.delete(taskId);
+    } else if (e.event === "task-human" || e.event === "task-failed") {
+      (e.event === "task-human" ? parks : failures).set(taskId, i);
+    }
+  });
+  const open: OpenDecision[] = [];
+  for (const [taskId, rows] of pending) {
+    for (const at of rows) {
+      const stale = judge(taskId, at, true);
+      if (stale === undefined) effective.add(lineOf(at));
+      open.push({ taskId, line: lineOf(at), ...(stale === undefined ? {} : { stale }) });
+    }
+  }
+  return { effective, open, refused };
+}
+
+/** The physical lines of the task-approved rows whose effects may apply (see foldDecisions). */
+export const effectiveDecisions = (events: readonly JournalEvent[]): Set<number> => foldDecisions(events).effective;
+
+/**
+ * The journal as every decision reader must see it: task-approved rows that are not effective removed,
+ * every other row (and its physical line) kept. Order-only folds iterate this instead of skipping rows
+ * on their own.
+ */
+export function effectiveEvents(events: readonly JournalEvent[]): JournalEvent[] {
+  const effective = effectiveDecisions(events);
+  return events.filter((e, i) => e.event !== "task-approved" || effective.has(physicalLine(events, i)));
+}
+
+/** Per task, the open decisions that may not be enacted now — what the daemon refuses before enactment. */
+export interface StaleApprovals { reason: string; lines: number[] }
+
+export function staleApprovals(events: readonly JournalEvent[]): Map<string, StaleApprovals> {
+  const refused = new Map<string, StaleApprovals>();
+  for (const { taskId, line, stale } of foldDecisions(events).open) {
+    if (stale === undefined) continue;
+    const prior = refused.get(taskId);
+    refused.set(taskId, { reason: prior ? `${prior.reason}; #L${line} ${stale}` : `#L${line} ${stale}`, lines: [...(prior?.lines ?? []), line] });
+  }
+  return refused;
+}
 
 export interface PreservedRef {
   ref: string;
@@ -146,15 +320,18 @@ export function preservedRefsByTask(events: JournalEvent[]): Map<string, Preserv
 // approval for the task. A whole-journal count re-parks an upheld task before its funded attempt can
 // dispatch (measured live on run-20260726-213539), making a fresh journal the only escape. A T15
 // replayMeasurement re-observes an interrupted round and is audit evidence, not a newly funded round.
-export function reviewRoundsSinceApproval(events: JournalEvent[], taskId: string): number {
-  let rounds = 0;
-  for (const e of events) {
+// OBS-1178: only an effective decision opens an engagement — a refused or unsound approval resets nothing.
+// `rounds` narrows the decided rows AFTER the decision fold has read the whole journal (the daemon's
+// decisive-round filter drops gate rows a park's failed gate is read from).
+export function reviewRoundsSinceApproval(events: JournalEvent[], taskId: string, rounds: (decided: JournalEvent[]) => JournalEvent[] = (decided) => decided): number {
+  let drawn = 0;
+  for (const e of rounds(effectiveEvents(events))) {
     if (e.taskId !== taskId) continue;
-    if (e.event === "task-approved") rounds = 0;
+    if (e.event === "task-approved") drawn = 0;
     else if (e.event === "gate-result" && e.data.gate === "review" && e.data.pass === false
-             && e.data.replayMeasurement !== true) rounds++;
+             && e.data.replayMeasurement !== true) drawn++;
   }
-  return rounds;
+  return drawn;
 }
 
 // OBS-189/OBS-254: the uphold brief is the operator's funded decision, not attempt state. ONE fold,
@@ -661,7 +838,7 @@ export const GATE_FINGERPRINT_CAP = 2;
 
 export function identicalGateFailures(events: JournalEvent[], taskId: string, gate: string, normalized: string): number {
   let n = 0;
-  for (const e of events) {
+  for (const e of effectiveEvents(events)) { // OBS-1178: a refused or unsound approval is no new engagement
     if (e.taskId !== taskId) continue;
     if (e.event === "task-approved") n = 0;
     else if (e.event === "gate-result" && e.data.gate === gate && e.data.pass === false
@@ -685,7 +862,7 @@ export interface RepairReach {
 
 export function repairReachSinceApproval(events: JournalEvent[], taskId: string): RepairReach[] {
   const repairs: Array<RepairReach & { launched: boolean; closed: boolean }> = [];
-  for (const e of events) {
+  for (const e of effectiveEvents(events)) { // OBS-1178: a refused or unsound approval resets no repair history
     if (e.taskId !== taskId) continue;
     if (e.event === "task-approved") {
       repairs.length = 0;
@@ -707,6 +884,8 @@ export function repairReachSinceApproval(events: JournalEvent[], taskId: string)
       if (e.event === "worker-launch") {
         if (repair.launched) repair.closed = true;
         else repair.launched = true;
+      } else if (BOOTSTRAP_DEATH.has(e.event)) {
+        repair.launched = false; // that launch died in its CLI's bootstrap: the repair's turn is still owed
       } else if (repair.launched && e.event === "gate-result" && typeof e.data.gate === "string") {
         if (!repair.reached.includes(e.data.gate)) repair.reached.push(e.data.gate);
         if (e.data.pass === false && repair.diedAt === undefined) repair.diedAt = e.data.gate;
@@ -725,7 +904,7 @@ export function repairsSinceApproval(events: JournalEvent[], taskId: string): nu
 /** Recheck releases not yet enacted by a battery (or by a legacy worker launch). */
 export function pendingRechecks(events: JournalEvent[]): Set<string> {
   const pending = new Set<string>();
-  for (const e of events) {
+  for (const e of effectiveEvents(events)) { // OBS-1178: a refused or unsound recheck was never pending
     if (!e.taskId) continue;
     if (e.event === "task-approved" && e.data.release === RECHECK_RELEASE) pending.add(e.taskId);
     else if (e.event === "recheck-battery" || e.event === "worker-launch") pending.delete(e.taskId);
@@ -744,6 +923,7 @@ export type PendingApprovalAction =
   | { taskId: string; ts: string; authority: "waiver"; release: typeof GATE_SATISFIED_RELEASE; gate: GateName }
   | { taskId: string; ts: string; authority: "inert"; release: unknown };
 
+// OBS-1178: only effective decisions (effectiveEvents) are pending actions; a refused or unsound row never is.
 const ENACTED_BY: Record<Exclude<PendingApprovalAction["authority"], "inert">, readonly string[]> = {
   worker: ["task-dispatch", "worker-launch"],
   battery: ["recheck-battery"],
@@ -760,7 +940,7 @@ const ENACTED_BY: Record<Exclude<PendingApprovalAction["authority"], "inert">, r
  */
 export function pendingApprovalActions(events: JournalEvent[]): Map<string, PendingApprovalAction> {
   const pending = new Map<string, PendingApprovalAction>();
-  for (const e of events) {
+  for (const e of effectiveEvents(events)) {
     if (!e.taskId) continue;
     if (e.event === "task-approved") {
       pending.set(e.taskId, approvalAction(e.taskId, e));
@@ -772,7 +952,7 @@ export function pendingApprovalActions(events: JournalEvent[]): Map<string, Pend
   return pending;
 }
 
-function approvalAction(taskId: string, e: JournalEvent): PendingApprovalAction {
+export function approvalAction(taskId: string, e: JournalEvent): PendingApprovalAction {
   const { release, gate } = e.data;
   const base = { taskId, ts: e.ts };
   if (release === undefined) return { ...base, authority: "worker", release: "plain" };
@@ -798,13 +978,19 @@ function approvalAction(taskId: string, e: JournalEvent): PendingApprovalAction 
 // prompt with the repair findings gone, or re-run the banned channel. worker-launch is appended only
 // once the prompt has actually been delivered to a worker, which is the dispatch the decision governs.
 const DECISION_SPENT = "worker-launch";
+// OBS-1169: the daemon's rows closing a launch whose CLI died in its own bootstrap. That worker never
+// read the brief, so the launch spent nothing: its decision, failure brief and repair turn survive it,
+// and the dispatch it closes charges no attempt.
+const BOOTSTRAP_DEATH = new Set(["bootstrap-retry", "bootstrap-failover"]);
 
 function decisionForNextDispatch(events: JournalEvent[], taskId: string, event: string): JournalEvent | undefined {
   let pending: JournalEvent | undefined;
+  let spent: JournalEvent | undefined;
   for (const e of events) {
     if (e.taskId !== taskId) continue;
     if (e.event === event) pending = e;
-    else if (e.event === DECISION_SPENT) pending = undefined;
+    else if (e.event === DECISION_SPENT) [spent, pending] = [pending, undefined];
+    else if (BOOTSTRAP_DEATH.has(e.event)) pending = spent;
   }
   return pending;
 }
@@ -824,18 +1010,18 @@ function decisionForNextDispatch(events: JournalEvent[], taskId: string, event: 
  * failures OR the delivery failure that preceded it. Of the approvals, only a WAIVE clears (the operator
  * retired the findings by fiat — the uphold case re-derives its own brief separately). OBS-1074: a
  * plain approve, a scope grant or a recheck re-funds an attempt that must still see why the last one
- * parked, plus the operator's stated reason — v2.5.7's T11 looped four times on one hygiene oracle
- * because every approval erased exactly the finding the fresh attempt was funded to fix.
+ * parked — v2.5.7's T11 looped four times on one hygiene oracle because every approval erased exactly
+ * the finding the fresh attempt was funded to fix. The operator's stated reasons ride after those rows
+ * as `standingRulings` (OBS-1150): no launch and no waive resets them.
  */
 export function journaledFailureBrief(events: JournalEvent[], taskId: string): string[] {
   let rows: string[] = [];
-  for (const e of events) {
+  let spent: string[] = [];
+  for (const e of effectiveEvents(events)) { // OBS-1178: a refused or unsound waive retires nothing
     if (e.taskId !== taskId) continue;
-    if (e.event === "worker-launch") rows = [];
-    else if (e.event === "task-approved") {
-      if (e.data.release === GATE_SATISFIED_RELEASE) rows = [];
-      else if (typeof e.data.reason === "string" && e.data.reason.trim()) rows.push(`approval: ${e.data.reason.trim()}`);
-    }
+    if (e.event === "worker-launch") [spent, rows] = [rows, []];
+    else if (BOOTSTRAP_DEATH.has(e.event)) rows = [...spent, ...rows];
+    else if (e.event === "task-approved" && e.data.release === GATE_SATISFIED_RELEASE) rows = [];
     else if (e.event === "gate-result" && e.data.pass === false && e.data.skipped !== true
              && typeof e.data.details === "string") rows.push(`${e.data.gate}: ${e.data.details}`);
     else if (e.event === "delivery-readiness-failed" && typeof e.data.transcript === "string") {
@@ -844,7 +1030,25 @@ export function journaledFailureBrief(events: JournalEvent[], taskId: string): s
       rows.push(`dispatch: ${e.data.error}`);
     }
   }
-  return rows;
+  return [...rows, ...standingRulings(events, taskId).map((ruling) => `approval: ${ruling}`)];
+}
+
+/**
+ * OBS-1150: an operator's approval reason is a ruling on the TASK, not on the attempt it released.
+ * The failure rows above are spent at the next worker-launch and the review context once bound only
+ * the newest reason, so ruling A vanished at the first launch after it and a later ruling B replaced
+ * it. Every effective reason therefore stands, oldest first, for the whole run; a repeat is carried
+ * once. A gate-satisfied release accepts a gate's verdict rather than ruling on the work, so its
+ * reason adds no standing ruling — and, being no ruling, it retires none either.
+ */
+export function standingRulings(events: JournalEvent[], taskId: string): string[] {
+  const rulings: string[] = [];
+  for (const e of effectiveEvents(events)) { // OBS-1178: a refused or unsound approval rules nothing
+    if (e.taskId !== taskId || e.event !== "task-approved" || e.data.release === GATE_SATISFIED_RELEASE) continue;
+    const reason = typeof e.data.reason === "string" ? e.data.reason.trim() : "";
+    if (reason && !rulings.includes(reason)) rulings.push(reason);
+  }
+  return rulings;
 }
 
 /** Never infer a cross-path alias from a symbol, sentence, or hash. */
@@ -963,7 +1167,7 @@ export function carryReviewFindings(priors: readonly StructuredFinding[], rows: 
  */
 export function outstandingReviewFindings(events: JournalEvent[], taskId: string): StructuredFinding[] {
   let open: StructuredFinding[] = [];
-  for (const e of events) {
+  for (const e of effectiveEvents(events)) { // OBS-1178: only an effective review waive retires findings
     if (e.taskId !== taskId) continue;
     if (e.event === "task-approved") {
       if (e.data.release === GATE_SATISFIED_RELEASE && e.data.gate === "review") open = [];
@@ -1009,7 +1213,7 @@ export function pendingRepairFindings(events: JournalEvent[], taskId: string): s
  */
 export function activeRetryBan(events: JournalEvent[], taskId: string, channel: string): string | undefined {
   let pending: JournalEvent | undefined;
-  for (const e of events) {
+  for (const e of effectiveEvents(events)) { // OBS-1178: a refused or unsound recheck lifts no ban
     if (e.taskId !== taskId) continue;
     if (e.event === "gate-fingerprint-cap") pending = e;
     else if (e.event === DECISION_SPENT
@@ -1095,6 +1299,68 @@ export function recordedTaskFailureKind(events: JournalEvent[], taskId: string):
       : undefined;
   }
   return undefined;
+}
+
+// OBS-1109: the `source` a resume harvest stamps on its worker-result and worker-result-harvested rows.
+export const RESUME_HARVEST_SOURCE = "resume" as const;
+export interface InterruptedAttempt {
+  attempt: number;
+  /** The producing dispatch's own assignment — the author the harvested work is gated under. */
+  assignment: Assignment;
+  /** Owned evidence still to read: nothing of this attempt's harvest is recorded yet. */
+  launch?: { nonce: string; dispatchScript: string; slot: { id: string; name: string; cwd: string } };
+  /** A worker-result with no harvest row after it: finish that record. `reaped` only when a resume wrote
+   *  it — a resume records the result after its owned-process cleanup; a live daemon records it BEFORE
+   *  handling a failed reap, so its result alone never proves cleanup and `launch` must be reaped again. */
+  result?: { finished: boolean; summary: string; reaped: boolean };
+  // Neither: an earlier resume recorded the whole harvest — gate it, never record it twice.
+}
+// Any harvest row — a live daemon's no-trailer synthesis or a resume's — means the attempt's result is
+// on record: whichever daemon died after it, the next resume gates that record and never redispatches.
+const isHarvested = (e: JournalEvent): boolean => e.event === "worker-result-harvested";
+const newestDispatch = (events: JournalEvent[], taskId: string) => {
+  const rows = effectiveEvents(events).filter((e) => e.taskId === taskId);
+  const at = rows.map((e) => e.event).lastIndexOf("task-dispatch");
+  if (at < 0) return undefined;
+  const assignment = DispatchAssignmentSchema.safeParse(rows[at]!.data.assignment);
+  return { dispatch: rows[at]!, since: rows.slice(at + 1), assignment: assignment.success ? assignment.data : undefined };
+};
+// OBS-1109: the author of a harvested attempt. It holds through every gate result, park or release
+// recorded on that harvest — only a newer dispatch (new work, new author) ends it.
+export function resumeHarvestAuthor(events: JournalEvent[], taskId: string): Assignment | undefined {
+  const newest = newestDispatch(events, taskId);
+  return newest?.since.some(isHarvested) ? newest.assignment : undefined;
+}
+// OBS-1109: the newest dispatch of a task that no result, verdict or decision has closed yet — the
+// attempt a dead daemon left between worker-launch and worker-result. Only a launch row that recorded
+// its nonce and dispatch script is owned evidence; a legacy launch (or none) stays on the ordinary path.
+export function interruptedAttempt(events: JournalEvent[], taskId: string): InterruptedAttempt | undefined {
+  const newest = newestDispatch(events, taskId);
+  if (!newest) return undefined;
+  const { dispatch, since, assignment } = newest;
+  // A declined harvest is on the ordinary recovery path: its pane is no longer evidence to spare.
+  if (since.some((e) => ["gate-result", "task-done", "task-failed", "task-human", "task-approved", "resume-harvest-declined"].includes(e.event))) return undefined;
+  const attempt = dispatch.data.attempt;
+  if (!assignment || !Number.isInteger(attempt)) return undefined; // no recorded author, no harvest
+  const base = { attempt: attempt as number, assignment };
+  if (since.some(isHarvested)) return base;
+  const launched = [...since].reverse().find((e) => e.event === "worker-launch" && e.data.attempt === attempt);
+  const slot = launched?.data.slot as Record<string, unknown> | undefined;
+  const launch = typeof launched?.data.nonce === "string" && typeof launched.data.dispatchScript === "string"
+    && typeof slot?.id === "string" && typeof slot.name === "string" && typeof slot.cwd === "string"
+    ? { nonce: launched.data.nonce, dispatchScript: launched.data.dispatchScript, slot: { id: slot.id, name: slot.name, cwd: slot.cwd } }
+    : undefined;
+  // A worker-result with no verdict after it — a live daemon's, or a resume harvest's torn off before
+  // its harvest row — is a finished attempt whose gating never happened: finish its record, never redispatch.
+  const resulted = since.find((e) => e.event === "worker-result");
+  if (resulted) {
+    return { ...base, ...(launch ? { launch } : {}), result: {
+      finished: resulted.data.finished === true,
+      summary: typeof resulted.data.summary === "string" ? resulted.data.summary : "",
+      reaped: resulted.data.source === RESUME_HARVEST_SOURCE,
+    } };
+  }
+  return launch ? { ...base, launch } : undefined;
 }
 
 // Runs can end and later resume in the same journal. The newest lifecycle marker decides whether
@@ -1257,8 +1523,12 @@ export function recordedGraphDefinitionHash(events: JournalEvent[]): string | un
   if (!start) return undefined;
   const origin = typeof start.data.graphDefinitionHash === "string" ? start.data.graphDefinitionHash : null;
   let recorded = origin;
+  // OBS-1178: an approval's own rehash moves the identity only while that approval is effective.
+  const granted = new Set(effectiveEvents(events).filter((e) => e.event === "task-approved" && e.data.release === "scope-request")
+    .map((e) => `${e.taskId}\0${e.ts}`));
   for (const e of events) {
     if (e.event !== "graph-rehash") continue;
+    if (e.data.source === "approval" && e.data.replay !== true && !granted.has(`${e.taskId}\0${String(e.data.approval)}`)) continue;
     const audited = e.data.from === recorded || e.data.from === origin;
     recorded = audited && typeof e.data.to === "string" ? e.data.to : null;
   }
@@ -1298,7 +1568,7 @@ export const ScopeAmendmentSchema = z.object({
  * older than v2.5.7): the caller reads it from the run's materialized graph snapshot.
  */
 export function replayScopeAmendments(graph: RunGraph, events: JournalEvent[], release = false, approvedDefinitions: ReadonlyMap<string, string> = new Map()): RunGraph {
-  const amendments = events.filter((e) => e.event === "task-approved" && e.data.release === "scope-request")
+  const amendments = effectiveEvents(events).filter((e) => e.event === "task-approved" && e.data.release === "scope-request")
     .map((event) => ({ event, amendment: ScopeAmendmentSchema.parse(event.data.amendment) }));
   if (!amendments.length) return graph;
   let result = graph;
@@ -1346,7 +1616,7 @@ export function replayScopeAmendments(graph: RunGraph, events: JournalEvent[], r
 export function applyScopeAmendments(graph: RunGraph, journal: Journal, auditReplay = false, release = false): RunGraph {
   const events = journal.read();
   const result = replayScopeAmendments(graph, events, release, release ? snapshotDefinitions(journal) : new Map()); // validate all before moving any identity
-  const approvals = events.filter((e) => e.event === "task-approved" && e.data.release === "scope-request");
+  const approvals = effectiveEvents(events).filter((e) => e.event === "task-approved" && e.data.release === "scope-request");
   for (const approval of approvals) {
     const amendment = ScopeAmendmentSchema.parse(approval.data.amendment);
     if (!events.some((e) => e.event === "graph-rehash" && e.data.approval === approval.ts && e.taskId === approval.taskId
@@ -1430,12 +1700,18 @@ const runsDir = (repoRoot: string) => join(repoRoot, stateDirName(repoRoot), "ru
 // One JSONL reader for every append-only log: skip blanks, drop any line that
 // won't parse, keeping everything before it intact.
 function readJsonl(path: string): unknown[] {
-  if (!existsSync(path)) return [];
-  const out: unknown[] = [];
-  for (const line of readFileSync(path, "utf8").split("\n")) {
+  return existsSync(path) ? parseJournalText(readFileSync(path, "utf8")) : [];
+}
+
+/** The journal reader rule over bytes in hand: skip blanks, drop a torn line, keep each row's physical line. */
+export function parseJournalText(raw: string): JournalEvent[] {
+  const out: JournalEvent[] = [];
+  for (const [sourceIndex, line] of raw.split("\n").entries()) {
     if (!line.trim()) continue;
     try {
-      out.push(JSON.parse(line));
+      const row = JSON.parse(line);
+      if (row && typeof row === "object") SOURCE_LINE.set(row, sourceIndex + 1);
+      out.push(row);
     } catch {
       // torn trailing write after a crash — ignore; everything before it is intact
     }
@@ -1451,7 +1727,9 @@ function readJsonlSource(path: string): JournalSourceRow[] {
   for (const [sourceIndex, line] of readFileSync(path, "utf8").split("\n").entries()) {
     if (!line.trim()) continue;
     try {
-      out.push({ sourceIndex, raw: JSON.parse(line) });
+      const raw = JSON.parse(line);
+      if (raw && typeof raw === "object") SOURCE_LINE.set(raw, sourceIndex + 1);
+      out.push({ sourceIndex, raw });
     } catch {
       // torn trailing write after a crash — ignore; everything before it is intact
     }
@@ -1515,6 +1793,83 @@ export function readPriorRunEvidence(
       evidence.runId !== opts.suppressRunId
       && current.get(evidence.taskId) === evidence.taskContentDigest),
   };
+}
+
+// OBS-1052(3): measured review no-verdict history, per reviewer channel, over the last ten COMPLETED
+// run journals. Advisory display only — nothing here feeds discovery, routing or the review rotation
+// (the run-scoped tally in run-gates is the only thing that retires a seat).
+export const REVIEW_NO_VERDICT_RUN_WINDOW = 10;
+export const REVIEW_NO_VERDICT_ADVISORY_AT = 2;
+
+export interface ReviewNoVerdictHistory {
+  /** completed runs measured, oldest first */
+  runs: string[];
+  /** window journals with a row that did not parse — their events are unknown, never zero */
+  unreadable: string[];
+  /** reviewer channel → review-no-verdict events; every channel seen reviewing is present, 0 included */
+  counts: Map<string, number>;
+}
+
+// Unlike readJsonl, one unparseable row voids the whole journal: it may have been the missing event.
+function readJournalStrict(path: string): JournalEvent[] | undefined {
+  try {
+    return readFileSync(path, "utf8").split("\n").filter((line) => line.trim()).map((line) => {
+      const row = JSON.parse(line) as JournalEvent | null;
+      if (!row || typeof row !== "object" || typeof row.event !== "string") throw new Error("not a journal row");
+      return row;
+    });
+  } catch {
+    return undefined;
+  }
+}
+
+export function readReviewNoVerdictHistory(repoRoot: string, window = REVIEW_NO_VERDICT_RUN_WINDOW): ReviewNoVerdictHistory {
+  const history: ReviewNoVerdictHistory = { runs: [], unreadable: [], counts: new Map() };
+  const dir = runsDir(repoRoot);
+  if (!existsSync(dir)) return history;
+  const runIds = readdirSync(dir)
+    .filter((runId) => runId.startsWith("run-") && existsSync(join(dir, runId, "journal.jsonl")))
+    .sort()
+    .reverse();
+  for (const runId of runIds) {
+    // an unreadable journal holds its slot: skipping it would reach an eleventh run in its place
+    if (history.runs.length + history.unreadable.length >= window) break;
+    const events = readJournalStrict(join(dir, runId, "journal.jsonl"));
+    if (!events) {
+      history.unreadable.unshift(runId);
+      continue;
+    }
+    if (!runHasEnded(events)) continue;
+    history.runs.unshift(runId);
+    for (const event of events) {
+      const reviewer = event.data?.reviewer;
+      if (typeof reviewer !== "string") continue;
+      // Count each observation once: the terminal review gate-result repeats the last seat's
+      // no-verdict note, so only the note counts and the gate row merely marks the seat as measured.
+      if (event.event === "review-no-verdict") history.counts.set(reviewer, (history.counts.get(reviewer) ?? 0) + 1);
+      else if (event.event === "gate-result" && event.data.gate === "review") history.counts.set(reviewer, history.counts.get(reviewer) ?? 0);
+    }
+  }
+  return history;
+}
+
+/** One row per measured channel (plus one naming unreadable journals); doctor prints all, Fleet the warn rows. */
+export function reviewNoVerdictRows(history: ReviewNoVerdictHistory): { channel: string; verdict: "pass" | "warn"; value: string }[] {
+  const span = `the last ${history.runs.length} completed run${history.runs.length === 1 ? "" : "s"}`;
+  const unreadable = history.unreadable.length;
+  const rows = [...history.counts].sort(([a], [b]) => a.localeCompare(b)).map(([channel, n]) => {
+    const counted = `${n} review no-verdict${n === 1 ? "" : "s"} in ${span}`;
+    if (n >= REVIEW_NO_VERDICT_ADVISORY_AT) {
+      return { channel, verdict: "warn" as const, value: `${counted} — advisory; review eligibility unchanged` };
+    }
+    return unreadable
+      ? { channel, verdict: "warn" as const, value: `unknown — at least ${n} in ${span}; ${unreadable} run journal${unreadable === 1 ? "" : "s"} unreadable` }
+      : { channel, verdict: "pass" as const, value: counted };
+  });
+  if (unreadable) {
+    rows.push({ channel: "unreadable", verdict: "warn", value: `unknown — ${history.unreadable.join(", ")} did not parse; review no-verdicts there are unmeasured` });
+  }
+  return rows;
 }
 
 // VIS-03 reset cursor — one trimmed runId line at .tickmarkr/profile-since; absent/empty ⇒ undefined.
@@ -1635,7 +1990,7 @@ export class Journal {
             refs.map(({ ref, diffCommand }) => ({ taskId: preservedTaskId, ref, diffCommand })));
           return preservedRefs.length > 0 ? { ...inputData, preservedRefs } : inputData;
         })()
-      : event === "resume-restore" && rowTaskId && upheldFeedbackByTask(priorEvents).has(rowTaskId)
+      : event === "resume-restore" && rowTaskId && upheldFeedbackByTask(effectiveEvents(priorEvents)).has(rowTaskId)
         ? {
             ...inputData,
             upheldFeedbackRestoredFor: rowTaskId,
@@ -1704,13 +2059,29 @@ export class Journal {
     return readJsonl(this.journalPath) as JournalEvent[];
   }
 
+  /** Parsed rows paired with their physical 1-based journal lines (OBS-1178 bindings name lines). */
+  readSourced(): { events: JournalEvent[]; lines: number[] } {
+    const rows = readJsonlSource(this.journalPath);
+    return { events: rows.map((row) => row.raw as JournalEvent), lines: rows.map((row) => row.sourceIndex + 1) };
+  }
+
+  /** OBS-1178: the binding of a task's newest park (or `task-failed`) row — what a decision on it names. */
+  newestBinding(taskId: string, event: "task-human" | "task-failed" = "task-human"): DecisionBinding | undefined {
+    const { events, lines } = this.readSourced();
+    for (let i = events.length - 1; i >= 0; i -= 1) {
+      const e = events[i]!;
+      if (e.event === event && e.taskId === taskId) return typeof e.ts === "string" ? { line: lines[i]!, ts: e.ts } : undefined;
+    }
+    return undefined;
+  }
+
   readTracked(): TrackedJournalRow[] {
     return trackJournalRows(this.runId, readJsonlSource(this.journalPath));
   }
 
   replayStatuses(): Map<string, TaskStatus> {
     const s = new Map<string, TaskStatus>();
-    for (const e of this.read()) {
+    for (const e of effectiveEvents(this.read())) { // OBS-1178: a refused or unsound decision released nothing
       if (!e.taskId) continue;
       if (e.event === "task-dispatch") s.set(e.taskId, "running");
       else if (e.event === "task-done") s.set(e.taskId, "done");
@@ -1765,7 +2136,7 @@ export class Journal {
 
   replayResumeState(): Map<string, ResumeState> {
     const m = new Map<string, ResumeState>();
-    const events = this.read();
+    const events = effectiveEvents(this.read()); // OBS-1178: a refused or unsound decision funds no budget
     // Keep the legacy resume-state field aligned with the journal-authoritative prompt-time fold.
     // In particular, a review pass after an uphold must erase the fallback daemon.ts may consult.
     const activeUpheldFeedback = upheldFeedbackByTask(events);
@@ -1795,6 +2166,7 @@ export class Journal {
           const key = channelKey(parsed.data);
           const added = !st.tried.includes(key);
           if (added) st.tried.push(key);
+          if (st.escalated) delete st.escalated[key];
           lastDispatch.set(e.taskId, {
             ...(added ? { addedKey: key } : {}),
             prevAssignment: st.lastAssignment,
@@ -1824,13 +2196,28 @@ export class Journal {
           if (undo.consumedReroute) pendingReroute.add(e.taskId);
           lastDispatch.delete(e.taskId);
         }
-      } else if (e.event === "capacity-requeue") {
+      } else if (e.event === "capacity-requeue" || BOOTSTRAP_DEATH.has(e.event)) {
         // OBS-1161: a capacity requeue is free — the daemon re-dispatches the SAME attempt on the SAME
         // seat — so the dispatch it closes must not count, or a resume bills every busy-seat wait
         // against MAX_ATTEMPTS. Only the attempt rewinds: the seat stays tried and in force (busy, not
         // burned). Idempotent by the same rule as the scope rewind: only the OUTSTANDING dispatch.
+        // OBS-1169: a bootstrap death bought no worker turn either, retried in place or failed over.
         const st = m.get(e.taskId);
         if (st && lastDispatch.delete(e.taskId)) st.attempts = Math.max(0, st.attempts - 1);
+        if (st && e.event === "bootstrap-failover") {
+          // OBS-1169: the failover's routing disposition outlives the process too — its escalated
+          // siblings stay excluded with their reason, and a crash before the destination's dispatch
+          // resumes ON that destination instead of relaunching the exhausted source channel.
+          const reason = typeof e.data.reason === "string" ? e.data.reason : "vendor escalated";
+          for (const k of Array.isArray(e.data.escalated) ? e.data.escalated : []) {
+            if (typeof k === "string" && !st.tried.includes(k)) st.escalated = { ...st.escalated, [k]: reason };
+          }
+          // The whole ADAPTER of `from` (a channel key, `adapter:model`) is excluded, sibling or none.
+          const adapter = typeof e.data.from === "string" ? e.data.from.split(":")[0] : undefined;
+          if (adapter && !st.escalatedAdapters?.includes(adapter)) st.escalatedAdapters = [...(st.escalatedAdapters ?? []), adapter];
+          const to = DispatchAssignmentSchema.safeParse(e.data.toAssignment);
+          st.lastAssignment = to.success ? to.data : undefined;
+        }
       } else if (e.event === "consult-verdict" && e.data.action === "reroute") {
         // A reroute bans the in-force channel; retry/decompose/human verdicts ban nothing (D-03).
         pendingReroute.add(e.taskId);
@@ -1847,6 +2234,8 @@ export class Journal {
           st.attempts = 0;
           st.tried = [];
           st.lastAssignment = undefined;
+          delete st.escalated;
+          delete st.escalatedAdapters;
         }
       } else if (e.event === "task-approved" && e.data.release === RECHECK_RELEASE) {
         // OBS-1028: the ladder survives a recheck (attempts AND tried); only the seat memory is cleared
@@ -1894,7 +2283,7 @@ export class Journal {
     const reviewSubjects = new Map<string, string>();
     const subjects = new Map<string, string>();
     const reviewWaivers = new Map<string, string>();
-    for (const e of this.read()) {
+    for (const e of effectiveEvents(this.read())) { // OBS-1178: a refused or unsound waive satisfies nothing
       if (!e.taskId) continue;
       if (e.event === "task-dispatch") {
         reviewSubjects.delete(e.taskId);
@@ -1949,7 +2338,7 @@ export class Journal {
   // exclusively to replaySatisfiedGates(), whose typed release-marker contract above is unchanged.
   replayCurrentAttemptGateResults(): Map<string, CurrentAttemptGateReplay> {
     const replay = new Map<string, CurrentAttemptGateReplay>();
-    for (const e of this.read()) {
+    for (const e of effectiveEvents(this.read())) {
       if (!e.taskId) continue;
       if (e.event === "task-dispatch") {
         replay.delete(e.taskId);

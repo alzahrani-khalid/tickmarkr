@@ -8,6 +8,8 @@ export const STATUSES = ["pending", "running", "gated", "failed", "done", "human
 export const GATE_NAMES = ["build", "test", "lint", "evidence", "scope", "acceptance", "review"] as const;
 const MANDATORY_GATES = ["build", "test", "lint", "evidence", "scope"] as const;
 export const TIERS = ["cheap", "mid", "frontier"] as const;
+// OBS-1182: launch effort — channel metadata beside tier, never part of model identity or channelKey.
+export const EFFORTS = ["low", "medium", "high"] as const;
 export const SPEC_SOURCES = ["speckit", "gsd", "prd", "native"] as const;
 // v1.19 acceptance oracles: command (exit code), test (named test), judge (LLM, free-text rubric).
 // A plain string is the read-old/write-new compat form — semantically a judge oracle (spec §2).
@@ -17,6 +19,7 @@ export type Shape = (typeof SHAPES)[number];
 export type TaskStatus = (typeof STATUSES)[number];
 export type GateName = (typeof GATE_NAMES)[number];
 export type Oracle = (typeof ORACLES)[number];
+export type Effort = (typeof EFFORTS)[number];
 export type SpecSource = (typeof SPEC_SOURCES)[number];
 
 // Typed acceptance oracle: command carries the thing to run, test the test name, judge free text.

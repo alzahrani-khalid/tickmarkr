@@ -88,8 +88,10 @@ const fiveDispositionRun = (runId: string): string => {
   return repo;
 };
 
+// OBS-1178: each row binds its own park's line and timestamp; the park's ts is per-repository wall time.
 const approvalBytes = (repo: string, runId: string): string[] =>
-  Journal.open(repo, runId).read().filter((e) => e.event === "task-approved").map((e) => JSON.stringify(e.data));
+  Journal.open(repo, runId).read().filter((e) => e.event === "task-approved")
+    .map((e) => JSON.stringify({ ...e.data, park: { ...(e.data.park as object), ts: "<park ts>" } }));
 
 const runEnd = (repo: string, runId: string): JournalEvent =>
   Journal.open(repo, runId).read().filter((e) => e.event === "run-end").at(-1)!;

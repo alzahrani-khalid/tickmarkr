@@ -14,6 +14,7 @@ import {
   DENY_SCOPES,
   initialDenyPropOf,
   loadConfigWithMode,
+  lowerLayerModelOverrides,
   overlayBytesLoadError,
   readOverlayFile,
   stagedDenyKeyOf,
@@ -35,9 +36,9 @@ import { doctor } from "./doctor.js";
 import { candidateRow, costSignal, shapeCandidates } from "./fleet-picker.js";
 import { route } from "../../route/router.js";
 import { pickRole } from "../../route/role-pick.js";
-import { denyPreferCollisionLine, denyPreferCollisions, disallowedBy, entryMatchesChannel, exclusionCollector } from "../../route/preference.js";
+import { deadPoolEntries, deadPoolEntryLine, denyPreferCollisionLine, denyPreferCollisions, disallowedBy, entryMatchesChannel, exclusionCollector } from "../../route/preference.js";
 import { resolveRunMode, type ResolvedRunMode } from "../../run/daemon.js";
-import { loadRoutingProfile } from "../../run/journal.js";
+import { loadRoutingProfile, readReviewNoVerdictHistory, reviewNoVerdictRows } from "../../run/journal.js";
 // type-only: the Ink module must never load on the print path (nor before the TTY/FORCE_COLOR fixture)
 import type {
   FleetEditorResult,
@@ -692,7 +693,7 @@ export async function assembleFleetEditor(
     }
 
     // 8. deny∩prefer collision — a standing lint on this shape's declaration, never a fleet toggle.
-    for (const collision of denyPreferCollisions(cfgPreview, [shape])) {
+    for (const collision of denyPreferCollisions(cfgPreview, [shape], health)) {
       captions.push(denyPreferCollisionLine(collision));
     }
 
@@ -711,7 +712,7 @@ export async function assembleFleetEditor(
   ): string[] => {
     const entry = map[shape];
     const floor = cfgPreview.routing.floors[shape];
-    const collisions = denyPreferCollisions(cfgPreview, [shape]);
+    const collisions = denyPreferCollisions(cfgPreview, [shape], health);
     const discovered = new Set(previewChannels.map((c) => `${c.adapter}:${c.model}`));
     // T2 review (D-225): discovery already dropped a channel whose model probe failed — it is
     // rebuilt as a structured channel from its adapter's own declaration and walks the SAME
@@ -733,7 +734,7 @@ export async function assembleFleetEditor(
     // never greys beside itself; its pin/pool/floor/prefer captions stay in excludedNote
     const ledgerChannels = [...previewChannels.map((c) => ({ ...c, authReason: undefined as string | undefined })), ...failedProbes, ...unauthedCliChannels]
       .filter((c) => !offered.has(`${c.adapter}:${c.model}`));
-    return ledgerChannels.flatMap((c) => {
+    const lines = ledgerChannels.flatMap((c) => {
       const key = `${c.adapter}:${c.model}`;
       const reasons = exclusionCollector(c, cfgPreview.routing, "worker").map(exclusionReason);
       // OBS-1065: a greyed picker row carries its reach beside its reasons, like the models view
@@ -759,8 +760,19 @@ export async function assembleFleetEditor(
       }
       if (c.authReason) reasons.push(c.authReason);
       // labelled like the models view's row (adapter/model), so a ledger row never reads as a candidate
-      return reasons.length ? [`${c.adapter}/${c.model} — reach: ${reach} — ${reasons.join("; ")}`] : [];
+      return reasons.length ? [{ key, line: `${c.adapter}/${c.model} — reach: ${reach} — ${reasons.join("; ")}` }] : [];
     });
+    // OBS-1145 add.1: every carried pool member the picker does not offer leads the ledger in chain
+    // order — one no reason above names still gets its own row — so the picker renders its ordinal
+    // and Space can drop it; a chain member with no row is hidden AND irremovable
+    const carried = entry?.pool?.channels.filter((key) => !offered.has(key)) ?? [];
+    const named = new Set(lines.map((row) => row.key));
+    const unnamed = carried.filter((key) => !named.has(key)).map((key) => ({
+      key,
+      line: `${key.replace(":", "/")} — ${discovered.has(key) ? `not offered for ${shape}` : "not served by an installed adapter"} — carried in routing.map.${shape}.pool`,
+    }));
+    const order = (key: string) => (carried.includes(key) ? carried.indexOf(key) : carried.length);
+    return [...lines, ...unnamed].sort((a, b) => order(a.key) - order(b.key)).map((row) => row.line);
   };
   const candidatesForShape = (shape: Shape, mode: RoutingMode, map: Record<string, MapEntry>, deny: StagedDeny) => {
     const preview = previewCfg(mode, map, deny);
@@ -792,6 +804,10 @@ export async function assembleFleetEditor(
     review: cfg.review.prefer?.slice(),
     consult: cfg.consult.prefer?.slice(),
   };
+  // OBS-1052(3): shown on the Steering view beside review.prefer; the pickers above stay untouched.
+  const reviewAdvisories = reviewNoVerdictRows(readReviewNoVerdictHistory(cwd))
+    .filter((row) => row.verdict === "warn")
+    .map((row) => `review history: ${row.channel} — ${row.value}`);
   const steeringOptionsFor = (which: FleetSteeringKey, current: string[]) => {
     const discovered = which === "review" ? [...reviewAdapters, ...seats] : seats;
     return [...discovered, ...current.filter((entry) => !discovered.includes(entry))];
@@ -800,12 +816,19 @@ export async function assembleFleetEditor(
   // discovered seats universe plus a keep-default row, and a write is staged only on a real change.
   const initialJudge = `${cfg.judge.adapter}:${cfg.judge.model}`;
   let pendingWrite: FleetOverlayWrite | null = null;
+  // OBS-1182: the layers under the repo overlay, read raw, so clearing an effort masks an inherited
+  // one even when those layers only validate beside repo fields.
+  const lowerOverrides = lowerLayerModelOverrides({ globalDir });
   const reviewOverlay = (state: FleetEditorState): FleetOverlayReview => {
     const staged = structuredClone(initial) as FleetEditable;
     // OBS-994/FL-1, OBS-1099 add.1: every schema-enumerated deny scope rides the same review/write funnel
     for (const scope of DENY_SCOPES) staged[scope.key] = state[scope.key];
     staged.allowOut = state.allowOut ?? initial.allowOut;
     staged.map = state.map;
+    // OBS-1182: staged efforts replace the loaded ones; none staged anywhere ⇒ no key, as loaded
+    const efforts = Object.fromEntries(Object.entries(state.efforts ?? {}).filter(([, models]) => Object.keys(models).length));
+    if (Object.keys(efforts).length) staged.efforts = efforts;
+    else delete staged.efforts;
     const today = new Date().toISOString().slice(0, 10);
     for (const classification of state.classifications) {
       staged.tiers[classification.adapter] ??= {};
@@ -834,6 +857,7 @@ export async function assembleFleetEditor(
       initial,
       edited: staged,
       universe,
+      lowerOverrides,
       ...(modeChanged ? { mode: state.selectedMode } : {}),
       ...(judgeChanged && judgeSeat ? { judge: judgeSeat } : {}),
       steering: { initial: initialSteering, edited: state.steering },
@@ -844,12 +868,22 @@ export async function assembleFleetEditor(
       return { kind: "empty" };
     }
     pendingWrite = write;
+    // OBS-1144: the review names every dead pool entry the written config carries, with its reason and
+    // what still routes — before y. Unloadable bytes carry no notes: the reload guard refuses them anyway.
+    let poolNotes: string[] = [];
+    try {
+      const written = loadConfigWithMode(cwd, { globalDir, repoOverlayText: after }).cfg;
+      poolNotes = deadPoolEntries(written, undefined, health).map(deadPoolEntryLine);
+    } catch {
+      poolNotes = [];
+    }
     return {
       kind: "diff",
       before,
       after,
       diff: unifiedYamlDiff(before, after, path),
       path,
+      ...(poolNotes.length ? { notes: poolNotes } : {}),
     };
   };
   const reloadGuard = io.reloadGuard
@@ -861,6 +895,7 @@ export async function assembleFleetEditor(
     health,
     ...Object.fromEntries(DENY_SCOPES.map((scope) => [initialDenyPropOf(scope), editable[scope.key] ?? []])),
     initialAllowOut: editable.allowOut,
+    initialEfforts: editable.efforts,
     modelGroups,
     initialMode: rm.mode.mode,
     modeOptions: ROUTING_MODES.map((mode) => ({ id: mode, gloss: MODE_GLOSS[mode] })),
@@ -874,6 +909,7 @@ export async function assembleFleetEditor(
     ],
     initialSteering,
     steeringOptionsFor,
+    reviewAdvisories,
     reviewOverlay,
     reloadGuard,
     stagedRouting,

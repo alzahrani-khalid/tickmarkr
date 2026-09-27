@@ -51,6 +51,14 @@ describe("journal corpus compat (Phase 46, criterion 3)", () => {
     ];
     writeFileSync(join(legacy.dir, "journal.jsonl"), rows.map((row) => JSON.stringify(row)).join("\n") + "\n");
 
+    // OBS-1178 (D-514): that release was never enacted and names no park, so it is a pending unbound
+    // decision — it takes no effect (the daemon refuses it before enactment) and the task stays parked…
+    expect(JSON.stringify(Object.fromEntries(legacy.replayStatuses()))).toBe('{"T-legacy":"human"}');
+    expect(legacy.replaySatisfiedGates()).toEqual(new Map());
+    // …while the same release bound to its park by line and timestamp, over the gate that park failed, replays as before.
+    const bound = [rows[0]!, { ts: "2026-01-01T00:00:00.500Z", event: "gate-result", taskId: "T-legacy", data: { gate: "build", pass: false } }, rows[1]!,
+      { ...rows[2]!, data: { ...rows[2]!.data, park: { line: 3, ts: rows[1]!.ts } } }, rows[3]!];
+    writeFileSync(join(legacy.dir, "journal.jsonl"), bound.map((row) => JSON.stringify(row)).join("\n") + "\n");
     expect(JSON.stringify(Object.fromEntries(legacy.replayStatuses()))).toBe('{"T-legacy":"pending"}');
     expect(legacy.replaySatisfiedGates()).toEqual(new Map([["T-legacy", "build"]]));
   });

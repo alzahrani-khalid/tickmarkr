@@ -52,7 +52,9 @@ test("The production dispatcher’s ui [id] --view run, ui --setup [id] and TTY 
     parks.send({ key: "a" });
     await expect.poll(frame, { timeout: 5000 }).toContain("Actions — Enter reviews");
     parks.send({ key: "\r" });
-    await expect.poll(frame, { timeout: 5000 }).toContain("tickmarkr approve run-observed T2 --by operator");
+    // OBS-1178: the argv binds the displayed park token (the frame wraps it at this width)
+    await expect.poll(frame, { timeout: 5000 }).toContain("tickmarkr approve run-observed T2 --park");
+    expect(frame()).toContain("5@2026-09-05T00:00:00.000Z --by operator");
     const before = readFileSync(path, "utf8");
     parks.send({ key: "n" });
     await expect.poll(frame, { timeout: 5000 }).not.toContain("y approve");

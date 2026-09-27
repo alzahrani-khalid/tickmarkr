@@ -1249,6 +1249,7 @@ describe("status checklist rendering", () => {
           `    phase terminal · last evidence ${lastRowTime} · responsible unrecorded · blocker none · next action unrecorded · human-decision no\n` +
           "  [!] T2 mixed  B[x] T[!] L[ ] E[ ] S[ ] A. R.  failed  fake:fake-2\n" +
           `    phase terminal · last evidence ${lastRowTime} · responsible unrecorded · blocker none · next action unrecorded · human-decision no\n` +
+          `    failed — T2 — failure 9@${lastRowTime} — re-gate landed work with \`tickmarkr approve run-watch T2 --recheck --park 9@${lastRowTime}\`\n` +
           "  [ ] T3 waiting  B[ ] T[ ] L[ ] E[ ] S[ ] A. R.  pending starved  -\n" +
           "    phase unrecorded · last evidence unrecorded · responsible unrecorded · blocker dependency-wait · next action Wait for prerequisites: T2 · human-decision no";
         expect(out).toBe(golden);
@@ -1447,7 +1448,7 @@ describe("status checklist rendering", () => {
       tier: "decision",
       runId: "run-watch",
       taskId: "T1",
-      approvalCommand: "tickmarkr approve run-watch T1",
+      approvalCommand: `tickmarkr approve run-watch T1 --park 2@${ts}`, // OBS-1178: the park token
       evidence: ".tickmarkr/runs/run-watch/journal.jsonl#L2",
     });
   });

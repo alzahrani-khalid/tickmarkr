@@ -4,7 +4,7 @@ import { dirname, join } from "node:path";
 import { execSync } from "node:child_process";
 import { describe, expect, test } from "vitest";
 import { FakeAdapter } from "../../src/adapters/fake.js";
-import { type Assignment, type BillingChannel, channelKey } from "../../src/adapters/types.js";
+import { type Assignment, type BillingChannel, channelKey, shq } from "../../src/adapters/types.js";
 import {
   goalDensityErrors, reviewParticipationErrors, surfaceErrors, symbolOwnershipErrors, taskUnitContractErrors,
 } from "../../src/compile/collateral.js";
@@ -14,7 +14,7 @@ import { compileNative } from "../../src/compile/native.js";
 import { criticalPathHits, declaredReviewPolicy, DEFAULT_CONFIG, effectiveReviewPolicy, isReviewLeafPath, repoOverlayPath } from "../../src/config/config.js";
 import { captureBaseline } from "../../src/gates/baseline.js";
 import { fetchTaskDiff, isReviewClosureMismatch, matchClosureId, modelProvider, pickReviewer, renderPriorMaterials, type ReviewVerdict, reviewGate } from "../../src/gates/review.js";
-import { extractJson } from "../../src/gates/llm.js";
+import { extractJson, extractPromptNonce } from "../../src/gates/llm.js";
 import { runGates } from "../../src/gates/run-gates.js";
 import { gitHead } from "../../src/run/git.js";
 import { structuredFindings, carryReviewFindings, observedReviewFingerprints, outstandingReviewFindings, type JournalEvent, type StructuredFinding, deriveSignalBasis } from "../../src/run/journal.js";
@@ -84,6 +84,11 @@ test("test: a task declaring no out of scope items renders delivered and saved r
   const baseline = normalize(first.delivered);
   expect(baseline).toMatchInlineSnapshot(`
     "TICKMARKR-REVIEW
+    ## Response requirement
+    Your reply must end with exactly ONE JSON object whose "nonce" is "<nonce>" — this brief's nonce, never one from an earlier brief. A valid example (a rejection; replace every value with your own verdict):
+    {"nonce":"<nonce>","approve":false,"resolved":[],"reraised":[],"findings":[{"note":"path/to/file.ts:42 — the defect, in one line","severity":"material","defer":false,"rationale":""}],"comments":[]}
+    This holds even if you already filed or posted a review of this task elsewhere (an earlier session or brief, a PR comment): that review is not on record here, so restate it now as this JSON with nonce "<nonce>". Prose saying a review was filed or approved is recorded as no verdict; approval is never inferred from it.
+
     You are a skeptical cross-vendor code reviewer. Another agent (vendor: fake) authored this diff.
     Look for correctness bugs, security issues, and acceptance-criteria gaps. Approve only if you would merge it.
 
@@ -141,6 +146,11 @@ test("test: a task declaring no out of scope items renders delivered and saved r
     (still a blocking defect). Use only the listed fingerprints; never omit one or put it in both lists.
     Approve iff no material finding remains and every prior material is resolved.
     The top-level comments array is optional. Use it only for actionable line-anchored feedback.
+
+    ## Response requirement
+    Your reply must end with exactly ONE JSON object whose "nonce" is "<nonce>" — this brief's nonce, never one from an earlier brief. A valid example (a rejection; replace every value with your own verdict):
+    {"nonce":"<nonce>","approve":false,"resolved":[],"reraised":[],"findings":[{"note":"path/to/file.ts:42 — the defect, in one line","severity":"material","defer":false,"rationale":""}],"comments":[]}
+    This holds even if you already filed or posted a review of this task elsewhere (an earlier session or brief, a PR comment): that review is not on record here, so restate it now as this JSON with nonce "<nonce>". Prose saying a review was filed or approved is recorded as no verdict; approval is never inferred from it.
     "
   `);
   expect(normalize(first.saved)).toBe(baseline);
@@ -164,6 +174,47 @@ test("test: a review round for a task declaring out of scope items renders them 
   expect(boundsAt).toBeLessThan(delivered.indexOf("## Diff"));
 });
 
+// OBS-1052(2): every responder below also prints the brief it was handed to stderr, verbatim and
+// hard-wrapped behind pane chrome, the way a CLI that echoes its prompt does.
+test("test: the production review brief frames its response requirement using the current nonce at both ends versus already-filed prose remaining unparseable, so stale-nonce or inferred approval fails", async () => {
+  const { repo, base } = repoWithCommit();
+  const briefs: string[] = [];
+  const review = (respond: (nonce: string) => string) => {
+    const fake = fakeWith({});
+    fake.headlessCommand = (file) => {
+      briefs.push(readFileSync(file, "utf8"));
+      return `${respond(extractPromptNonce(briefs.at(-1)!)!)}; cat ${shq(file)} >&2; fold -w 37 ${shq(file)} | sed 's/^/│ /' >&2`;
+    };
+    return reviewGate(mkTask(), repo, base, author, CH, [fake], DEFAULT_CONFIG);
+  };
+  const verdict = (nonce: string) => `printf '%s\\n' ${shq(JSON.stringify({ nonce, approve: true, findings: [] }))}`;
+
+  // A real verdict still wins over the echoed example that follows it.
+  expect((await review(verdict)).pass).toBe(true);
+  const nonce = extractPromptNonce(briefs[0]!)!;
+  const sections = briefs[0]!.trim().split("\n\n");
+  const requirement = sections.at(-1)!;
+  expect(sections[0]).toBe(`TICKMARKR-REVIEW\n${requirement}`); // the first instruction and the last, byte for byte
+  expect(requirement).toMatch(/^## Response requirement\n/);
+  expect(requirement).toContain(`whose "nonce" is "${nonce}"`);
+  expect(requirement).toContain("already filed");
+  const example = JSON.parse(requirement.split("\n").find((line) => line.startsWith("{"))!);
+  expect(example).toMatchObject({ nonce, approve: false, findings: [{ severity: "material" }] });
+
+  const filed = await review(() => "printf 'I already filed my review of this task in the earlier session: approved, nothing further.\\n'");
+  expect(filed.pass).toBe(false);
+  expect(filed.meta).toMatchObject({ noVerdict: true, cause: "no-verdict" });
+  expect(filed.meta?.unparseable).toBeUndefined(); // the echoed example is no participation either
+
+  const stale = await review(() => verdict(nonce));
+  expect(stale.pass).toBe(false);
+  expect(stale.meta).toMatchObject({ noVerdict: true, cause: "no-verdict" });
+  const current = extractPromptNonce(briefs.at(-1)!)!;
+  expect(current).not.toBe(nonce);
+  expect(briefs.at(-1)!.trim().split("\n\n").at(-1)).toContain(`whose "nonce" is "${current}"`);
+  expect(briefs.at(-1)).not.toContain(nonce);
+});
+
 function promptSection(prompt: string, heading: string): string {
   const marker = `## ${heading}\n`;
   const start = prompt.indexOf(marker);
@@ -183,6 +234,11 @@ test("test: a task whose files[] names no test file receives a brief that says n
   // Captured from the production gate before adding the suite budget; normalize only its random nonce.
   expect(prompt.replace(budget, "").replaceAll(nonce, "<nonce>")).toMatchInlineSnapshot(`
     "TICKMARKR-REVIEW
+    ## Response requirement
+    Your reply must end with exactly ONE JSON object whose "nonce" is "<nonce>" — this brief's nonce, never one from an earlier brief. A valid example (a rejection; replace every value with your own verdict):
+    {"nonce":"<nonce>","approve":false,"resolved":[],"reraised":[],"findings":[{"note":"path/to/file.ts:42 — the defect, in one line","severity":"material","defer":false,"rationale":""}],"comments":[]}
+    This holds even if you already filed or posted a review of this task elsewhere (an earlier session or brief, a PR comment): that review is not on record here, so restate it now as this JSON with nonce "<nonce>". Prose saying a review was filed or approved is recorded as no verdict; approval is never inferred from it.
+
     You are a skeptical cross-vendor code reviewer. Another agent (vendor: fake) authored this diff.
     Look for correctness bugs, security issues, and acceptance-criteria gaps. Approve only if you would merge it.
 
@@ -241,6 +297,11 @@ test("test: a task whose files[] names no test file receives a brief that says n
     (still a blocking defect). Use only the listed fingerprints; never omit one or put it in both lists.
     Approve iff no material finding remains and every prior material is resolved.
     The top-level comments array is optional. Use it only for actionable line-anchored feedback.
+
+    ## Response requirement
+    Your reply must end with exactly ONE JSON object whose "nonce" is "<nonce>" — this brief's nonce, never one from an earlier brief. A valid example (a rejection; replace every value with your own verdict):
+    {"nonce":"<nonce>","approve":false,"resolved":[],"reraised":[],"findings":[{"note":"path/to/file.ts:42 — the defect, in one line","severity":"material","defer":false,"rationale":""}],"comments":[]}
+    This holds even if you already filed or posted a review of this task elsewhere (an earlier session or brief, a PR comment): that review is not on record here, so restate it now as this JSON with nonce "<nonce>". Prose saying a review was filed or approved is recorded as no verdict; approval is never inferred from it.
     "
   `);
 });
@@ -1825,6 +1886,11 @@ test("test: a round given no operator context over identical task diff plus carr
   // Captured after T15, before OBS-1091 changes, from identical task/diff/carried inputs.
   expect(normalizeBriefNonce(delivered)).toMatchInlineSnapshot(`
     "TICKMARKR-REVIEW
+    ## Response requirement
+    Your reply must end with exactly ONE JSON object whose "nonce" is "<nonce>" — this brief's nonce, never one from an earlier brief. A valid example (a rejection; replace every value with your own verdict):
+    {"nonce":"<nonce>","approve":false,"resolved":[],"reraised":[],"findings":[{"note":"path/to/file.ts:42 — the defect, in one line","severity":"material","defer":false,"rationale":""}],"comments":[]}
+    This holds even if you already filed or posted a review of this task elsewhere (an earlier session or brief, a PR comment): that review is not on record here, so restate it now as this JSON with nonce "<nonce>". Prose saying a review was filed or approved is recorded as no verdict; approval is never inferred from it.
+
     You are a skeptical cross-vendor code reviewer. Another agent (vendor: fake) authored this diff.
     Look for correctness bugs, security issues, and acceptance-criteria gaps. Approve only if you would merge it.
 
@@ -1892,10 +1958,20 @@ test("test: a round given no operator context over identical task diff plus carr
     (still a blocking defect). Use only the listed fingerprints; never omit one or put it in both lists.
     Approve iff no material finding remains and every prior material is resolved.
     The top-level comments array is optional. Use it only for actionable line-anchored feedback.
+
+    ## Response requirement
+    Your reply must end with exactly ONE JSON object whose "nonce" is "<nonce>" — this brief's nonce, never one from an earlier brief. A valid example (a rejection; replace every value with your own verdict):
+    {"nonce":"<nonce>","approve":false,"resolved":[],"reraised":[],"findings":[{"note":"path/to/file.ts:42 — the defect, in one line","severity":"material","defer":false,"rationale":""}],"comments":[]}
+    This holds even if you already filed or posted a review of this task elsewhere (an earlier session or brief, a PR comment): that review is not on record here, so restate it now as this JSON with nonce "<nonce>". Prose saying a review was filed or approved is recorded as no verdict; approval is never inferred from it.
     "
   `);
   expect(normalizeBriefNonce(saved)).toMatchInlineSnapshot(`
     "TICKMARKR-REVIEW
+    ## Response requirement
+    Your reply must end with exactly ONE JSON object whose "nonce" is "<nonce>" — this brief's nonce, never one from an earlier brief. A valid example (a rejection; replace every value with your own verdict):
+    {"nonce":"<nonce>","approve":false,"resolved":[],"reraised":[],"findings":[{"note":"path/to/file.ts:42 — the defect, in one line","severity":"material","defer":false,"rationale":""}],"comments":[]}
+    This holds even if you already filed or posted a review of this task elsewhere (an earlier session or brief, a PR comment): that review is not on record here, so restate it now as this JSON with nonce "<nonce>". Prose saying a review was filed or approved is recorded as no verdict; approval is never inferred from it.
+
     You are a skeptical cross-vendor code reviewer. Another agent (vendor: fake) authored this diff.
     Look for correctness bugs, security issues, and acceptance-criteria gaps. Approve only if you would merge it.
 
@@ -1963,6 +2039,11 @@ test("test: a round given no operator context over identical task diff plus carr
     (still a blocking defect). Use only the listed fingerprints; never omit one or put it in both lists.
     Approve iff no material finding remains and every prior material is resolved.
     The top-level comments array is optional. Use it only for actionable line-anchored feedback.
+
+    ## Response requirement
+    Your reply must end with exactly ONE JSON object whose "nonce" is "<nonce>" — this brief's nonce, never one from an earlier brief. A valid example (a rejection; replace every value with your own verdict):
+    {"nonce":"<nonce>","approve":false,"resolved":[],"reraised":[],"findings":[{"note":"path/to/file.ts:42 — the defect, in one line","severity":"material","defer":false,"rationale":""}],"comments":[]}
+    This holds even if you already filed or posted a review of this task elsewhere (an earlier session or brief, a PR comment): that review is not on record here, so restate it now as this JSON with nonce "<nonce>". Prose saying a review was filed or approved is recorded as no verdict; approval is never inferred from it.
     "
   `);
 });

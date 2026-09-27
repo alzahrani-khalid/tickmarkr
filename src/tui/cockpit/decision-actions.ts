@@ -7,6 +7,7 @@ import {
   approve,
   DECISION_VERBS,
   newestPark,
+  parkToken,
   permittedDecisionVerbs,
   readJournalEvents,
   releaseForDecision,
@@ -17,7 +18,7 @@ import {
 } from "../../cli/commands/approve.js";
 import { stateDirName } from "../../graph/graph.js";
 import type { RunGraph } from "../../graph/schema.js";
-import { Journal, type JournalEvent } from "../../run/journal.js";
+import { bindingToken, effectiveDecisions, Journal, physicalLine, recordedBinding, type JournalEvent } from "../../run/journal.js";
 
 /* ------------------------------------------------------------------------ */
 /* C4 — the Run view's one mutation boundary (FINAL §2, §3.3, R22/R23).      */
@@ -82,6 +83,10 @@ export interface DecisionCommand {
   readonly reason?: string;
   /** `--review-rounds`: the review-round ceiling the release carries. */
   readonly reviewRounds?: number;
+  /** OBS-1178: `--park <line>@<ts>` — the displayed park this decision binds to. */
+  readonly park?: string;
+  /** OBS-1178: `--gate <gate>` — the failed gate a waive binds to. */
+  readonly gate?: string;
 }
 
 /** The exact argv the production command receives — built only from the closed verb set. */
@@ -96,6 +101,8 @@ export function decisionArgv(command: DecisionCommand, { runId, by }: { runId: s
   const flag = { approve: [], waive: ["--waive"], uphold: ["--uphold"], recheck: ["--recheck"] }[command.verb];
   return [
     runId, command.taskId, ...flag,
+    ...(command.park === undefined ? [] : ["--park", command.park]),
+    ...(command.gate === undefined ? [] : ["--gate", command.gate]),
     ...(command.reviewRounds === undefined ? [] : ["--review-rounds", String(command.reviewRounds)]),
     "--by", by,
     ...(command.reason === undefined ? [] : ["--reason", command.reason]),
@@ -129,20 +136,26 @@ export const journalFileFor = (cwd: string, runId: string): string =>
  * the named verb is outside the park's table, so a confirm inset can never promise a decision the
  * command would refuse. The enactor is read from the run lock now, and read again at the receipt.
  */
-export function previewDecision(command: DecisionCommand, { cwd, runId, by }: { cwd: string; runId: string; by: string }): DecisionPreviewResult {
-  let argv: string[];
-  try { argv = decisionArgv(command, { runId, by }); } catch (e) { return { ok: false, refusal: (e as Error).message }; }
+export function previewDecision(named: DecisionCommand, { cwd, runId, by }: { cwd: string; runId: string; by: string }): DecisionPreviewResult {
+  try { decisionArgv(named, { runId, by }); } catch (e) { return { ok: false, refusal: (e as Error).message }; }
   let events: JournalEvent[];
   let sourceIndexes: number[];
   try { ({ events, sourceIndexes } = readJournalEvents(Journal.open(cwd, runId))); } catch (e) { return { ok: false, refusal: (e as Error).message }; }
-  const park = newestPark(events, command.taskId, sourceIndexes);
-  if (!park) return { ok: false, refusal: `task ${command.taskId} has no park in run ${runId} — nothing to decide` };
+  const park = newestPark(events, named.taskId, sourceIndexes);
+  if (!park) return { ok: false, refusal: `task ${named.taskId} has no park in run ${runId} — nothing to decide` };
+  // OBS-1178: the argv binds the park this preview displays; approve refuses it once another opens.
+  const token = parkToken(park);
+  if (named.park !== undefined && named.park !== token) return { ok: false, refusal: `task ${named.taskId}'s open park is ${token ?? "untimestamped"}, not ${named.park} — refresh and decide the open park` };
+  if (named.gate !== undefined && named.gate !== park.failedGate) return { ok: false, refusal: `refusing mismatched gate for ${named.taskId}: --gate ${named.gate} but park ${token} failed ${park.failedGate ?? "no gate"} — nothing appended` };
+  const command: DecisionCommand = { ...named, ...(token === undefined ? {} : { park: token }), ...(named.verb === "waive" && named.gate === undefined && park.failedGate !== undefined ? { gate: park.failedGate } : {}) };
+  let argv: string[];
+  try { argv = decisionArgv(command, { runId, by }); } catch (e) { return { ok: false, refusal: (e as Error).message }; }
   const verbs = permittedDecisionVerbs(park);
   if (!verbs.includes(command.verb)) {
     const why = parkDiagnostic(park) ?? `permitted: ${verbs.join(", ")}`;
     return { ok: false, refusal: `${command.verb} is not a decision for ${command.taskId}'s ${park.kind ?? "unknown"} park (${why})` };
   }
-  const released = events.slice(park.index + 1).find((e) => e.event === "task-approved" && e.taskId === command.taskId);
+  const released = releaseSince(events, park.index, command.taskId);
   if (released) {
     return { ok: false, refusal: `task ${command.taskId} was already released at #L${sourceIndexes[events.indexOf(released)]! + 1} by ${String(released.data.by ?? "unknown")} — nothing to confirm` };
   }
@@ -159,27 +172,13 @@ export function previewDecision(command: DecisionCommand, { cwd, runId, by }: { 
 const parkLine = (park: NewestPark): string =>
   `#L${park.line} ${park.kind ?? "unknown kind"}${park.failedGate ? ` · failed gate ${park.failedGate}` : ""}${park.reason ? ` · ${park.reason}` : ""}`;
 
+/** The decision already open on this park, if any. OBS-1178: a refused or unsound row released nothing. */
+function releaseSince(events: readonly JournalEvent[], parkIndex: number, taskId: string): JournalEvent | undefined {
+  const effective = effectiveDecisions(events);
+  return events.find((e, i) => i > parkIndex && e.event === "task-approved" && e.taskId === taskId && effective.has(physicalLine(events, i)));
+}
+
 const quoteArg = (arg: string): string => (/^[\w.:/@=-]+$/u.test(arg) ? arg : JSON.stringify(arg));
-
-/** What a confirmed write buys, from the command's own table — never a phrase of this file's own. */
-function consequenceLines(verb: DecisionVerb, park: NewestPark, release: string | undefined, disposition: ApprovalDisposition): string[] {
-  const lines = [`consequence  disposition ${disposition}; appends one task-approved${release ? ` with release ${release}` : " with no release"}`];
-  if (verb === "waive") lines.push(`             marks gate ${park.failedGate} satisfied; it does NOT mark the task done`);
-  if (verb === "recheck") lines.push("             marks no gate satisfied; the whole declared battery re-runs");
-  if (verb === "uphold") lines.push("             sides with the reviewer; funds one fixed attempt carrying the findings");
-  lines.push(`             it will ${APPROVAL_ENACTS[disposition]}`);
-  return lines;
-}
-
-/** Who enacts it — the three lock states, each stated by the command's own sentence. */
-export function enactmentLines(run: ApprovalRunOwner, disposition: ApprovalDisposition): string[] {
-  const owner = run.live
-    ? "enactment    matching live daemon — pending daemon enactment at its next task boundary"
-    : run.blockingRunId
-      ? `enactment    other live run \`${run.blockingRunId}\` holds the repository lock — recorded, not dispatched`
-      : `enactment    no live owner — recorded, not dispatched; resume required: tickmarkr resume ${run.runId}`;
-  return [owner, `             ${approvalEnactment(disposition, run)}`];
-}
 
 /** The confirm inset: run/task, the newest park line, actor/reason, exact argv, consequence, enactor. */
 export function decisionConfirmLines(preview: DecisionPreview): readonly string[] {
@@ -239,7 +238,7 @@ export async function executeDecision(
   if (!park || park.index !== preview.park.index || park.line !== preview.park.line || park.kind !== preview.park.kind) {
     return { ok: false, preview, stale: true, refusal: `task ${named.taskId}'s park changed since preview (${park ? `now #L${park.line} ${park.kind ?? "unknown"}` : "no park now"}) — refresh and preview again` };
   }
-  const released = before.slice(park.index + 1).find((e) => e.event === "task-approved" && e.taskId === named.taskId);
+  const released = releaseSince(before, park.index, named.taskId);
   if (released) {
     return { ok: false, preview, stale: true, refusal: `task ${named.taskId} was released at #L${beforeSourceIndexes[before.indexOf(released)]! + 1} by ${String(released.data.by ?? "unknown")} after this preview — no second decision appended; refresh` };
   }
@@ -281,6 +280,7 @@ export async function executeDecision(
     via: "cli",
     gate: named.verb === "waive" ? park.failedGate : named.verb === "uphold" ? "review" : undefined,
     reviewRoundCeiling: named.reviewRounds,
+    park: parkToken(park),
   };
   const actual = {
     release,
@@ -289,6 +289,7 @@ export async function executeDecision(
     via: appended.event.data.via,
     gate: appended.event.data.gate,
     reviewRoundCeiling: appended.event.data.reviewRoundCeiling,
+    park: recordedBinding(appended.event.data.park) === undefined ? undefined : bindingToken(recordedBinding(appended.event.data.park)!),
   };
   const mismatch = (Object.keys(expected) as (keyof typeof expected)[])
     .find((field) => actual[field] !== expected[field]);
@@ -366,8 +367,7 @@ export interface DecisionKeyResult {
 /**
  * The reducer never writes and never reads a file; it names commands. `a` opens the menu for the
  * selected park (a diagnostic park opens a menu with no verbs, stating why); ↑↓ move; Enter picks a
- * verb — which OPENS the confirm inset, never confirms; `y` on a confirm names the write; `n`/Esc
- * cancel the deepest layer. Enter on a confirm is inert by construction.
+ * verb opens the confirm inset; `y` names the write; `n`/Esc cancel the deepest layer. Enter on a confirm is inert.
  */
 export function applyDecisionKey(session: DecisionSession, event: DecisionKeyEvent, selected: RunDecision | undefined): DecisionKeyResult {
   if (session.confirming !== null) {
@@ -412,4 +412,27 @@ export function decisionKeybar(session: DecisionSession, selected: RunDecision |
   if (session.confirming !== null) return `y Confirm ${session.confirming.command.verb} · n Cancel`;
   if (session.menu !== null) return session.menu.verbs.length === 0 ? "Esc Close" : "↑↓ Choose · Enter Preview · Esc Close";
   return selected === undefined ? "" : "a Actions";
+}
+
+// Consequence and enactor lines, shared by the confirm inset and the receipt above. Kept below the key
+// grammar so the operator walkthrough's line citations stay put.
+
+/** What a confirmed write buys, from the command's own table — never a phrase of this file's own. */
+function consequenceLines(verb: DecisionVerb, park: NewestPark, release: string | undefined, disposition: ApprovalDisposition): string[] {
+  const lines = [`consequence  disposition ${disposition}; appends one task-approved${release ? ` with release ${release}` : " with no release"}`];
+  if (verb === "waive") lines.push(`             marks gate ${park.failedGate} satisfied; it does NOT mark the task done`);
+  if (verb === "recheck") lines.push("             marks no gate satisfied; the whole declared battery re-runs");
+  if (verb === "uphold") lines.push("             sides with the reviewer; funds one fixed attempt carrying the findings");
+  lines.push(`             it will ${APPROVAL_ENACTS[disposition]}`);
+  return lines;
+}
+
+/** Who enacts it — the three lock states, each stated by the command's own sentence. */
+export function enactmentLines(run: ApprovalRunOwner, disposition: ApprovalDisposition): string[] {
+  const owner = run.live
+    ? "enactment    matching live daemon — pending daemon enactment at its next task boundary"
+    : run.blockingRunId
+      ? `enactment    other live run \`${run.blockingRunId}\` holds the repository lock — recorded, not dispatched`
+      : `enactment    no live owner — recorded, not dispatched; resume required: tickmarkr resume ${run.runId}`;
+  return [owner, `             ${approvalEnactment(disposition, run)}`];
 }

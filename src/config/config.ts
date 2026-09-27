@@ -2,11 +2,11 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { filesGlob } from "../graph/files-glob.js";
-import { Document, parse } from "yaml";
+import { Document, isScalar, parse } from "yaml";
 import { z } from "zod";
 import { CITED_MODEL_WINDOWS } from "../adapters/model-windows.js";
 import { stateDirName } from "../graph/graph.js";
-import { SHAPES, TIERS } from "../graph/schema.js";
+import { EFFORTS, type Effort, SHAPES, TIERS } from "../graph/schema.js";
 
 const TierEnum = z.enum(TIERS, {
   error: (iss) => `Invalid option: expected one of "cheap"|"mid"|"frontier" (got ${JSON.stringify(iss.input)})`,
@@ -61,22 +61,33 @@ export const MapEntrySchema = z.object({
 export type MapEntry = z.infer<typeof MapEntrySchema>;
 
 const DeclaredVendorSchema = z.string().trim().min(1, "vendor must be nonempty");
-const ModelOverrideSchema = z
+// OBS-1182: effort is launch metadata only these CLIs accept (claude --effort, codex -c
+// model_reasoning_effort=). Every other adapter's override refuses the key outright, so config
+// load and the emitted JSON schema both reject an effort that could never be launched.
+export const EFFORT_ADAPTERS = ["claude-code", "codex"] as const;
+const EffortEnum = z.enum(EFFORTS, {
+  error: (iss) => `Invalid effort: expected one of "low"|"medium"|"high" (got ${JSON.stringify(iss.input)})`,
+});
+const NoEffort = z.never({
+  error: () => `effort is launch metadata only ${EFFORT_ADAPTERS.join(" and ")} accept — this adapter's CLI takes no effort level`,
+});
+const modelOverrideSchema = <E extends z.ZodType>(effort: E) => z
   .object({
     vendor: DeclaredVendorSchema.optional(),
     channel: z.enum(["sub", "api"]).optional(),
+    effort: effort.optional(),
   })
-  .refine((override) => override.vendor !== undefined || override.channel !== undefined, {
-    message: "a model override must declare vendor, channel, or both",
+  .refine((override) => override.vendor !== undefined || override.channel !== undefined || override.effort !== undefined, {
+    message: "a model override must declare vendor, channel, effort, or a combination",
   });
 
-export const TierEntrySchema = z.object({
+const tierEntrySchema = <E extends z.ZodType>(effort: E) => z.object({
   vendor: DeclaredVendorSchema.nullable(),
   channel: z.enum(["sub", "api"]),
   models: z.record(z.string(), TierEnum),
   // T19: keep model values scalar for existing consumers. Optional sibling metadata resolves before
   // parent metadata in channelsFromConfig; neither provider prefixes nor adapter ids manufacture it.
-  modelOverrides: z.record(z.string(), ModelOverrideSchema).optional(),
+  modelOverrides: z.record(z.string(), modelOverrideSchema(effort)).optional(),
   // v1.47 T3: optional per-model context-window sizes (tokens). Absent block ⇒ no doctor column, no plan lint.
   windows: z.record(z.string(), z.number().int().positive()).optional(),
 }).superRefine((entry, ctx) => {
@@ -90,6 +101,13 @@ export const TierEntrySchema = z.object({
     });
   }
 });
+export const TierEntrySchema = tierEntrySchema(EffortEnum);
+// Per-adapter object + catchall rather than a record, so the emitted JSON schema carries the same
+// adapter restriction as the loader; typed as the record every consumer already reads.
+// ponytail: catchall parses the EFFORT_ADAPTERS keys first — the seed table already lists them first.
+const TiersSchema = z
+  .object(Object.fromEntries(EFFORT_ADAPTERS.map((id) => [id, TierEntrySchema.optional()])))
+  .catchall(tierEntrySchema(NoEffort)) as unknown as z.ZodRecord<z.ZodString, typeof TierEntrySchema>;
 export type TierEntry = z.infer<typeof TierEntrySchema>;
 
 // v1.10 FLEET-06: optional routing.allow/deny fleet preference; absent blocks ⇒ byte-identical routing/discovery.
@@ -431,7 +449,7 @@ export const TickmarkrConfigSchema = z.object({
     allow: PrefBlockSchema.optional(),
     deny: DenyBlockSchema.optional(),
   }),
-  tiers: z.record(z.string(), TierEntrySchema),
+  tiers: TiersSchema,
   pricing: z.record(z.string(), z.number()),
   // v1.20 REC-02: optional detailed price table for cost estimation. Distinct from `pricing` above
   // (the coarse per-task tier estimate `tickmarkr plan` shows) — this one drives the usage/cost report.
@@ -869,6 +887,18 @@ export function loadConfigWithMode(
   return { cfg: r.data, mode: resolveRoutingMode(r.data, [globalCfg, repoCfg]) };
 }
 
+/** OBS-1182: tiers.<adapter>.modelOverrides as the layers under the repo overlay (defaults + global)
+ *  merge them. Read raw, never schema-validated: a lower layer may only validate beside repo fields
+ *  (global `vendor: null` completed by a repo vendor) and its override metadata is still inherited. */
+export function lowerLayerModelOverrides(opts: { globalDir?: string } = {}): Record<string, Record<string, Record<string, unknown>>> {
+  const isMap = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
+  const merged: unknown = deepMerge(structuredClone(DEFAULT_CONFIG), readYaml(join(opts.globalDir ?? globalConfigDir(), "config.yaml")));
+  const tiers = isMap(merged) && isMap(merged.tiers) ? merged.tiers : {};
+  return Object.fromEntries(Object.entries(tiers).map(([adapter, entry]) => [adapter, Object.fromEntries(
+    Object.entries(isMap(entry) && isMap(entry.modelOverrides) ? entry.modelOverrides : {}).filter(([, o]) => isMap(o)),
+  ) as Record<string, Record<string, unknown>>]));
+}
+
 export function loadConfig(repoRoot: string, opts: { globalDir?: string } = {}): TickmarkrConfig {
   return loadConfigWithMode(repoRoot, opts).cfg;
 }
@@ -1025,6 +1055,8 @@ export type FleetEditable = Partial<Record<DenyScopeKey, string[]>> & {
   // authored deny is cleared. Present only when the reader was handed a universe.
   allowOut?: string[];
   tiers: Record<string, Record<string, FleetTierAssignment | null>>;
+  /** OBS-1182: tiers.<adapter>.modelOverrides.<model>.effort — absent = CLI default; present only when one is set */
+  efforts?: Record<string, Record<string, Effort>>;
   map: Record<string, MapEntry>;
   floors: Record<string, Tier>;
 };
@@ -1076,10 +1108,13 @@ export function fleetEditableFromConfig(
   universe?: FleetUniverseRow[],
 ): FleetEditable {
   const tiers: FleetEditable["tiers"] = {};
+  const efforts: NonNullable<FleetEditable["efforts"]> = {};
   for (const [adapter, entry] of Object.entries(cfg.tiers)) {
     tiers[adapter] = {};
     for (const [model, tier] of Object.entries(entry.models)) {
       tiers[adapter][model] = { tier };
+      const effort = entry.modelOverrides?.[model]?.effort;
+      if (effort) (efforts[adapter] ??= {})[model] = effort;
     }
   }
   // every enumerated deny scope rides verbatim (sorted) under its own key
@@ -1109,6 +1144,7 @@ export function fleetEditableFromConfig(
     ...denyLists,
     ...(allowOut !== undefined ? { allowOut } : {}),
     tiers,
+    ...(Object.keys(efforts).length ? { efforts } : {}),
     map: structuredClone(cfg.routing.map),
     floors: { ...cfg.routing.floors },
   };
@@ -1154,6 +1190,12 @@ export function formatFleetPrint(repoRoot: string, opts: { globalDir?: string } 
   annotate(["routing", "floors"]);
   for (const [adapter, entry] of Object.entries(effective.tiers)) {
     for (const model of Object.keys(entry.models)) annotate(["tiers", adapter, "models", model]);
+    // OBS-1182: the effort value prints in place; its note names the layer that set it and the edit
+    for (const [model, override] of Object.entries(entry.modelOverrides ?? {})) {
+      const path = ["tiers", adapter, "modelOverrides", model, "effort"];
+      const node = doc.getIn(path, true);
+      if (override.effort && isScalar(node)) node.comment = ` ${fleetKeyLayer(repoRoot, path.join("."), opts)} — fleet e edits`;
+    }
   }
   return String(doc);
 }

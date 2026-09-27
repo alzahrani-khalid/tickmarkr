@@ -158,19 +158,23 @@ describe("gate-result telemetry (v2.0 T2, fake adapter, zero tokens)", () => {
     const intervening = rows.find((r) => r.gate === "acceptance")!;
     const events = Journal.open(repo, "run-telemetry-composite").read();
 
-    // one logical `test` row per round, and it really is the composite one: the screen ran a subset
-    // and the merge-candidate round ran the whole suite on the same commit
-    expect(testRows).toHaveLength(1);
-    const row = testRows[0]!;
+    // OBS-1176: the screen the semantic gates acted on is its own row, published before them; the
+    // merge-candidate round ran the whole suite on the same commit and journaled the second row
+    expect(testRows).toHaveLength(2);
+    const [screen, row] = testRows as [GateRow, GateRow];
+    expect(screen.selectedTests).toEqual(["covered.test.js"]);
+    expect(screen.fullSuite).toBeUndefined();
     expect(row.selectedTests).toEqual(["covered.test.js"]);
     expect(row.fullSuite).toBe(true);
     expect(intervening.durationMs).toBeGreaterThanOrEqual(INTERVENING_MS); // the intervening gate really was delayed
 
-    const duration = row.durationMs;
-    const selected = row.selectedDurationMs as number;
-    const full = row.fullDurationMs as number;
-    // the two halves are kept apart AND they are exactly what the whole is made of
-    expect(selected + full).toBe(duration);
+    const selected = screen.durationMs;
+    const full = row.durationMs;
+    // each row carries only its own interval, named by its phase, so neither re-counts the other
+    expect(screen.selectedDurationMs).toBe(selected);
+    expect(row.fullDurationMs).toBe(full);
+    expect(Object.hasOwn(row, "selectedDurationMs")).toBe(false);
+    const duration = selected + full;
     expect(selected).toBeGreaterThanOrEqual(SELECTED_MS);
     expect(selected).toBeLessThan(FULL_MS); // the screen is the subset, not a second full suite
     expect(full).toBeGreaterThanOrEqual(FULL_MS);
@@ -184,9 +188,72 @@ describe("gate-result telemetry (v2.0 T2, fake adapter, zero tokens)", () => {
     // and it is measured where the gate runs, not re-derived: the journal span from the round's first
     // `test` phase-start to its verdict is strictly larger, because it contains everything in between
     const firstTestStart = events.find((e) => e.event === "phase-start" && e.data.gate === "test")!;
-    const verdict = events.find((e) => e.event === "gate-result" && e.data.gate === "test")!;
+    const verdict = events.filter((e) => e.event === "gate-result" && e.data.gate === "test").at(-1)!;
     const journalSpan = Date.parse(verdict.ts) - Date.parse(firstTestStart.ts);
     expect(journalSpan).toBeGreaterThan(duration + INTERVENING_MS);
+  }, 180000);
+
+  // OBS-1176/1070: acceptance and review are launched on the strength of a green selected screen, so
+  // that screen is a verdict someone acted on and must be on the ledger before they start. The full
+  // merge-candidate suite afterwards is a SECOND invocation: its row must neither replace the screen's
+  // (hidden) nor carry the screen's receipts again (duplicated).
+  test("the production daemon journals a selected test result before both semantic phase starts and later journals its full test result under a distinct invocation versus a selected red stopping semantics, so a hidden or duplicated selected verdict fails", async () => {
+    // `$#` > 0 only for the selected screen (run-gates appends the covered file); the full suite has none.
+    const firstRound = async (runId: string, selectedExit: 0 | 1) => {
+      const testCmd = `sh -c 'if [ $# -gt 0 ]; then echo FAIL covered.test.js; exit ${selectedExit}; fi' tkr`;
+      const fixture = setupRepo([T("T1")], { tasks: { T1: [
+        { shell: `echo "// worker" > covered.test.js && ${COMMIT} covered`, result: { ok: true, summary: "done" } },
+        { shell: `echo "// repair" >> covered.test.js && ${COMMIT} repair`, result: { ok: true, summary: "done" } },
+      ] } }, `gates: { test: "${testCmd}" }\n`);
+      await runDaemon(fixture, runId);
+      const events = Journal.open(fixture.repo, runId).read().filter((e) => e.taskId === "T1");
+      const isRound = (e: (typeof events)[number]) => e.event === "phase-start" && e.data.phase === "gates";
+      const start = events.findIndex(isRound);
+      const next = events.findIndex((e, i) => i > start && isRound(e));
+      return events.slice(start + 1, next < 0 ? undefined : next);
+    };
+    const at = (round: Awaited<ReturnType<typeof firstRound>>, match: (e: (typeof round)[number]) => boolean) =>
+      round.findIndex(match);
+    const semanticStart = (phase: string) => (e: { event: string; data: Record<string, unknown> }) =>
+      e.event === "phase-start" && e.data.phase === phase;
+    const ids = (row: Record<string, unknown>) =>
+      ((row.evidenceReceipts ?? []) as Array<{ invocationId: string }>).map((r) => r.invocationId);
+
+    const green = await firstRound("run-selected-published", 0);
+    const testRows = green.filter((e) => e.event === "gate-result" && e.data.gate === "test");
+    expect(testRows).toHaveLength(2);
+    const [screen, full] = testRows as [(typeof green)[number], (typeof green)[number]];
+    expect(screen.data).toMatchObject({ pass: true, selectedTests: ["covered.test.js"] });
+    expect(screen.data.fullSuite).toBeUndefined();
+    expect(full.data).toMatchObject({ pass: true, fullSuite: true });
+    // the screen precedes BOTH semantic starts; the full suite follows them
+    const judgeStart = at(green, semanticStart("judge"));
+    const reviewStart = at(green, semanticStart("review"));
+    expect(judgeStart).toBeGreaterThan(-1);
+    expect(reviewStart).toBeGreaterThan(-1);
+    const screenAt = green.indexOf(screen);
+    const fullAt = green.indexOf(full);
+    expect(screenAt).toBeLessThan(Math.min(judgeStart, reviewStart));
+    expect(fullAt).toBeGreaterThan(Math.max(judgeStart, reviewStart));
+    // distinct invocations, each on exactly one row: the full row does not re-carry the screen's receipt
+    const screenId = (screen.data.evidenceReceipt as { invocationId: string }).invocationId;
+    const fullId = (full.data.evidenceReceipt as { invocationId: string }).invocationId;
+    expect(screenId).toBeTruthy();
+    expect(fullId).toBeTruthy();
+    expect(fullId).not.toBe(screenId);
+    expect(ids(screen.data)).toContain(screenId);
+    expect(ids(full.data)).not.toContain(screenId);
+    expect(green.filter((e) => e.event === "gate-result" && ids(e.data).includes(screenId))).toHaveLength(1);
+
+    // a red screen IS the round's verdict: journaled once, and neither semantic gate starts after it
+    const red = await firstRound("run-selected-red", 1);
+    const redTests = red.filter((e) => e.event === "gate-result" && e.data.gate === "test");
+    expect(redTests).toHaveLength(1);
+    expect(redTests[0]!.data).toMatchObject({ pass: false, selectedTests: ["covered.test.js"] });
+    expect(redTests[0]!.data.fullSuite).toBeUndefined();
+    expect(at(red, semanticStart("judge"))).toBe(-1);
+    expect(at(red, semanticStart("review"))).toBe(-1);
+    expect(red.filter((e) => e.event === "gate-result" && (e.data.gate === "acceptance" || e.data.gate === "review"))).toHaveLength(0);
   }, 180000);
 
   test("test: review & acceptance rows carry per-invocation durations & channels covering primary & retry so a single blended span fails", async () => {

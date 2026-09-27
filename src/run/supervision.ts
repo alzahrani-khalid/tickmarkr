@@ -200,7 +200,7 @@ const supervisionObligationPath = (repoRoot: string, tier: SupervisionTier): str
 // its own file, and an unremoved file ages past the same ceiling a beat does and stops counting.
 const presencePrefix = (tier: SupervisionTier): string => `${tier}.live.`;
 
-const supervisionPresencePath = (repoRoot: string, tier: SupervisionTier, id: string): string =>
+export const supervisionPresencePath = (repoRoot: string, tier: SupervisionTier, id: string): string =>
   join(supervisionDir(repoRoot), `${presencePrefix(tier)}${id}`);
 
 /** Every presence file on this tier, by name. Missing directory ⇒ nobody is present. */
@@ -645,12 +645,17 @@ export const supervisionText = (tiers: readonly TierLiveness[], divider = " · "
   ).join(divider)}`;
 
 
-/** A board's durable identity is independent of its short title and of other observers. */
+/** A board's durable identity is independent of its short title and of other observers.
+ *  `handle` is the terminal the claiming observer reports running in, when its host exports one: the
+ *  one fact that names the board's pane when the placing split's receipt never arrived (OBS-1172).
+ *  `retired` marks a tombstone a driver keeps in the record's place; it is never answered again. */
 export interface WatchBoardOwner {
   repo: string; runId: string; driver: string; workspace: string; pane: string; name: string;
-  token: string; pid?: number; armId?: string;
+  token: string; pid?: number; armId?: string; handle?: string; retired?: true;
 }
 export const WATCH_OWNER_ENV = "TICKMARKR_WATCH_OWNER";
+/** Orca exports each terminal's own handle into the processes it runs. */
+const TERMINAL_HANDLE_ENV = "ORCA_TERMINAL_HANDLE";
 const boardPath = (repo: string, runId: string) => join(supervisionDir(repo), `watch-board.${parseRunId(runId)}.json`);
 const boardMessagePath = (owner: WatchBoardOwner, kind: "stop" | "ack") => {
   if (!/^[a-f0-9-]{36}$/.test(owner.token)) throw new Error("invalid watch owner token");
@@ -712,7 +717,8 @@ export function observeNamedRun(repo: string, runId: string, env: NodeJS.Process
     if (token) {
       const candidate = readWatchBoard(repo, runId);
       if (!candidate || candidate.token !== token || candidate.pid !== undefined) throw new Error("watch ownership unknown; refusing narrator acknowledgement");
-      owner = { ...candidate, pid: process.pid, armId: armed.id };
+      const handle = env[TERMINAL_HANDLE_ENV]?.trim();
+      owner = { ...candidate, pid: process.pid, armId: armed.id, ...(handle ? { handle } : {}) };
       atomicRecord(boardPath(repo, runId), owner);
     }
   } catch (error) { armed.disarm(); throw error; }

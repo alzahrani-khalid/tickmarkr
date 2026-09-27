@@ -1,4 +1,3 @@
-import { spawn } from "node:child_process";
 import {
   copyFileSync,
   cpSync,
@@ -74,6 +73,7 @@ import {
   RunCockpitFrame,
   type RunCockpitData,
 } from "../../src/tui/cockpit/run-cockpit.js";
+import { ownedFailures, runOwned } from "../helpers/owned-process.js";
 
 const SURFACE_DECLARED_BRANCH_MODULES = [
   "src/tui/cockpit/keys.ts",
@@ -564,57 +564,39 @@ function makeBranchSandbox(): string {
   return sandbox;
 }
 
-function runNamedLedgerTest(
+async function runNamedLedgerTest(
   sandbox: string,
   entry: BranchLedgerEntry,
 ): Promise<NamedTestResult> {
-  return new Promise((resolve, reject) => {
-    const child = spawn(process.execPath, [
-      VITEST_BIN,
-      "run",
-      entry.testFile,
-      "--configLoader",
-      "runner",
-      "--reporter=verbose",
-      "-t",
-      entry.testTitle,
-    ], {
-      cwd: sandbox,
-      env: {
-        ...process.env,
-        // OBS-886 (the OBS-854 precedent): every nested run is a whole vitest process whose fork pool pre-spawns
-        // min(cpus-1, maxForks) workers; one ledger entry at a time inside a PARALLEL fork ran ≈60 s and starved
-        // the worker↔host birpc window (post-summary "Timeout calling onTaskUpdate" with every test green).
-        // The entries are awaited serially, so one fork per child costs nothing and ends the storm.
-        VITEST_MAX_FORKS: "1",
-        FORCE_COLOR: "0",
-        NO_COLOR: "1",
-      },
-      stdio: ["ignore", "pipe", "pipe"],
-    });
-    let output = "";
-    const append = (chunk: Buffer): void => {
-      output += chunk.toString("utf8");
-      if (output.length > 16 * 1024 * 1024) {
-        child.kill("SIGKILL");
-        reject(new Error(`${entry.branch}: named test output exceeded 16 MiB`));
-      }
-    };
-    child.stdout.on("data", append);
-    child.stderr.on("data", append);
-    const timeout = setTimeout(() => {
-      child.kill("SIGKILL");
-      reject(new Error(`${entry.branch}: named test exceeded 45 seconds`));
-    }, 45_000);
-    child.once("error", (error) => {
-      clearTimeout(timeout);
-      reject(error);
-    });
-    child.once("close", (status) => {
-      clearTimeout(timeout);
-      resolve({ status, output });
-    });
+  // OBS-1167 / D-478 add.1: the nested runner is an owned subprocess — at its bound (or on any exit) its
+  // whole tree, fork workers included, is torn down and awaited, and a runner that outlives it is red.
+  const run = await runOwned(process.execPath, [
+    VITEST_BIN,
+    "run",
+    entry.testFile,
+    "--configLoader",
+    "runner",
+    "--reporter=verbose",
+    "-t",
+    entry.testTitle,
+  ], {
+    cwd: sandbox,
+    ms: 45_000,
+    env: {
+      ...process.env,
+      // OBS-886 (the OBS-854 precedent): every nested run is a whole vitest process whose fork pool pre-spawns
+      // min(cpus-1, maxForks) workers; one ledger entry at a time inside a PARALLEL fork ran ≈60 s and starved
+      // the worker↔host birpc window (post-summary "Timeout calling onTaskUpdate" with every test green).
+      // The entries are awaited serially, so one fork per child costs nothing and ends the storm.
+      VITEST_MAX_FORKS: "1",
+      FORCE_COLOR: "0",
+      NO_COLOR: "1",
+    },
   });
+  if (run.why === "expired") throw new Error(`${entry.branch}: named test exceeded 45 seconds`);
+  const owned = ownedFailures(run, entry.branch);
+  if (owned.length > 0) throw new Error(owned.join("; "));
+  return { status: run.exitCode, output: run.out + run.err };
 }
 
 function assertNamedTestPassed(entry: BranchLedgerEntry, result: NamedTestResult): void {

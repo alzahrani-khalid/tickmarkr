@@ -61,9 +61,9 @@ const AREAS = [
   ["FLEET", [/^src\/(route|config|adapters)\//]],
   ["RUN",   [/^src\/(run|drivers|eval)\//]],
   ["GATE",  [/^src\/gates\//]],
-  ["UI",    [/^src\/(cli|tui|report)\//, /^src\/brand\.ts/]],
-  ["DOCS",  [/^(docs|skills)\//]],
-  ["REPO",  [/^(scripts|schema)\//, /^\.github\//, /^tests\/(lint|repo|helpers)\//, /^(vitest\.config|package\.json|tsconfig)/]],
+  ["UI",    [/^src\/(cli|tui|report)\//, /^src\/brand\.ts/, /^tests\/cockpit\//]],
+  ["DOCS",  [/^(docs|skills)\//, /^\.claude\/skills\//]],
+  ["REPO",  [/^(scripts|schema)\//, /^\.github\//, /^tests\/(lint|repo|helpers|fixtures)\//, /^(vitest\.config|package\.json|tsconfig)/]],
 ];
 const AREA_ORDER = AREAS.map(([n]) => n);
 // A brace group expands before matching, or `src/{run,gates}/x.ts` matches nothing and vanishes silently.

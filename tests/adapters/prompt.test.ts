@@ -2,7 +2,7 @@ import { mkdtempSync, readFileSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
-import { buildTaskPrompt, classifyDeadChannel, classifyTransientCapacity, parseWorkerResult, trailerPattern, writePrompt } from "../../src/adapters/prompt.js";
+import { buildTaskPrompt, classifyDeadChannel, classifyTransientCapacity, NO_TRAILER_SUMMARY, parseWorkerResult, trailerPattern, UNPARSEABLE_TRAILER_SUMMARY, writePrompt } from "../../src/adapters/prompt.js";
 import { validateGraph } from "../../src/graph/schema.js";
 
 const N = "testnonce"; // fixed nonce for direct-call tests; the daemon uses a random per-run one
@@ -291,6 +291,33 @@ describe("classifyTransientCapacity (OBS-1161)", () => {
   test("a parsed trailer quoting the phrase is the worker speaking, never capacity", () => {
     expect(classifyTransientCapacity(parseWorkerResult(`Selected model is at capacity\nTICKMARKR_RESULT_${N} {"ok":false,"summary":"tests failing"}`, N))).toBeNull();
   });
+});
+
+describe("parser cause owns channel classification (OBS-1175)", () => {
+  test.each([NO_TRAILER_SUMMARY, UNPARSEABLE_TRAILER_SUMMARY])(
+    "a parsed false trailer with summary %s preserves work failure over every channel diagnostic",
+    (summary) => {
+      for (const [raw, reason] of [
+        ["Not logged in. Please run /login", "auth-required"],
+        ["zsh: command not found: codex", "setup-required"],
+        ["Unable to reach the model provider", "provider-outage"],
+        ["Error: request timed out", "timeout"],
+        ["Selected model is at capacity", undefined],
+      ] as const) {
+        const parsed = parseWorkerResult(`${raw}\nTICKMARKR_RESULT_${N} ${JSON.stringify({ ok: false, summary })}`, N);
+        expect(parsed).toMatchObject({ ok: false, summary });
+        expect(parsed.cause).toBeUndefined();
+        expect(classifyDeadChannel(parsed), raw).toBeUndefined();
+        expect(classifyTransientCapacity(parsed), raw).toBeNull();
+
+        // Identical diagnostics without the trailer still classify, even when display text changes.
+        const unparsed = { ...parseWorkerResult(raw, N), summary: "localized parser diagnostic" };
+        expect(unparsed.cause).toBe("no-verdict");
+        expect(classifyDeadChannel(unparsed), raw).toBe(reason);
+        expect(classifyTransientCapacity(unparsed)?.[0], raw).toBe(reason ? undefined : raw);
+      }
+    },
+  );
 });
 
 // v1.4 self-reference-premature-harvest regression: a worker editing tickmarkr's own source DISPLAYS

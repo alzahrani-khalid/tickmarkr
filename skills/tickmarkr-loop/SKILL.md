@@ -112,8 +112,14 @@ enacts at its next task boundary; if a different live run owns the repository lo
 for that run to end before resuming this one.
 
 For a non-TTY decision, the same command is
-`tickmarkr approve <runId> T2 --by operator --reason 'ready to proceed'`; check its receipt
-and explicitly resume. Preserve resume refusals and repair the named source/config issue
+`tickmarkr approve <runId> T2 --park <line>@<ts> --by operator --reason 'ready to proceed'`,
+naming the park token `tickmarkr status <runId>` prints; check its receipt and explicitly
+resume. Every decision binds to one park (a waive also to its failed gate:
+`tickmarkr approve <runId> T2 --waive --park <line>@<ts> --gate review`); once a newer park
+opens, a stale token, unbound release or mismatched gate refuses — the daemon journals
+`approval-refused` and never waives the newer gate. A failed task keeps its recheck with its
+own bound failure token: status prints `failed — T3 — failure <line>@<ts>`, then
+`tickmarkr approve <runId> T3 --recheck --park <line>@<ts>` re-gates its landed commits. Preserve resume refusals and repair the named source/config issue
 (including deny/prefer conflicts); never edit the compiled graph to force a result. Resume
 makes CURRENT TIP PENDING; historical GATES RAN does not prove completion. The completed
 case has 3/3 recorded merges, a latest run-end, a nonfailed known tip result and empty

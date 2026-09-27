@@ -2,18 +2,20 @@
 // neither quota (permanent demotion for the run) nor a stall (a full window of waiting): the daemon
 // waits briefly on the same seat, bounded, then fails over within the floor, and the budget lives
 // in the journal so a resume continues it. A parsed verdict quoting the phrase is work, never capacity.
-import { writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, test } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { FakeAdapter } from "../../../src/adapters/fake.js";
-import { CAPACITY_RE, channelKey, QUOTA_RE, type AuthHealth, type BillingChannel } from "../../../src/adapters/types.js";
+import { NO_TRAILER_SUMMARY, UNPARSEABLE_TRAILER_SUMMARY } from "../../../src/adapters/prompt.js";
+import { CAPACITY_RE, channelKey, QUOTA_RE, type Assignment, type AuthHealth, type BillingChannel } from "../../../src/adapters/types.js";
 import { SubprocessDriver } from "../../../src/drivers/subprocess.js";
 import { type Slot } from "../../../src/drivers/types.js";
 import { graphDefinitionHash, loadGraph, saveGraph, tickmarkrDir } from "../../../src/graph/graph.js";
-import { validateGraph } from "../../../src/graph/schema.js";
-import { resetCapacityBackoffMsForTests, resetQuotaBannerSilentMsForTests, runDaemon, setCapacityBackoffMsForTests, setQuotaBannerSilentMsForTests } from "../../../src/run/daemon.js";
+import { validateGraph, type Task } from "../../../src/graph/schema.js";
+import { resetCapacityBackoffMsForTests, resetHarvestCpuFlatMsForTests, resetQuotaBannerSilentMsForTests, runDaemon, setCapacityBackoffMsForTests, setHarvestCpuFlatMsForTests, setQuotaBannerSilentMsForTests } from "../../../src/run/daemon.js";
 import { gitHead } from "../../../src/run/git.js";
 import { Journal, type JournalEvent } from "../../../src/run/journal.js";
+import { WorkerTreeCpuAccountant } from "../../../src/run/stall.js";
 import { COMMIT, makeRepo, makeTestTempDir, setupRepo, T } from "../../helpers/tmprepo.js";
 
 const BANNER = "Selected model is at capacity";
@@ -24,11 +26,25 @@ const evs = (repo: string, runId: string) => Journal.open(repo, runId).read();
 const of = (all: JournalEvent[], event: string, taskId = "T1") => all.filter((e) => e.event === event && e.taskId === taskId);
 const seatOf = (e: JournalEvent) => channelKey((e.data as { assignment: BillingChannel }).assignment);
 
+// These fixtures vary banners and parser outcomes over an idle worker. Supply only the CPU
+// observation that establishes that premise: overriding ps also corrupts process ownership and
+// reap censuses, while relying on the host makes these tests hang wherever ps is unavailable.
+beforeEach(() => {
+  vi.spyOn(WorkerTreeCpuAccountant.prototype, "read").mockReturnValue({
+    cpu: { ms: 0, resolutionMs: 10 }, gaps: 0,
+  });
+  setHarvestCpuFlatMsForTests(200);
+});
+afterEach(() => {
+  vi.restoreAllMocks();
+  resetHarvestCpuFlatMsForTests();
+});
+
 // An interactive driver whose FIRST worker pane paints `text` after two benign frames and then sits
 // idle — the live banner shape (tests/run/daemon/stall.test.ts quota mirror). That first worker never
 // runs its step (a requeue re-dispatches the SAME attempt, and the interactive fake keys its step on
 // the attempt), so the seat's recovery is the same step served to the second, real, worker.
-const bannerDriver = (text: string) => {
+const bannerDriver = (text: string | (() => string)) => {
   const inner = new SubprocessDriver();
   let workerRuns = 0;
   let reads = 0;
@@ -46,7 +62,7 @@ const bannerDriver = (text: string) => {
     read: (slot: Slot, lines?: number) => {
       if (slot.name.includes("-worker-") && workerRuns === 1) {
         reads++;
-        return Promise.resolve(reads <= 2 ? "composing a plan for the task" : `${text}\nplease try again later`);
+        return Promise.resolve(reads <= 2 ? "composing a plan for the task" : typeof text === "function" ? text() : `${text}\nplease try again later`);
       }
       return inner.read(slot, lines);
     },
@@ -218,4 +234,56 @@ describe("OBS-1161: transient capacity waits briefly then fails over within the 
     expect(of(lEvs, "capacity-requeue")).toHaveLength(1);
     expect(of(lEvs, "quota-failover")).toHaveLength(0);
   }, 120_000);
+});
+
+// OBS-1175: "no trailer was parsed" is the parser's cause, never summary equality — a worker may write
+// either parser sentinel as its own summary. Its first print attempt exits one after the trailer, so
+// the exit path's nonzero-exit capacity guard is open.
+class ExitOneFake extends FakeAdapter {
+  private invokes = 0;
+  override invoke(task: Task, cwd: string, a: Assignment, ctx: { promptFile: string }) {
+    const inv = super.invoke(task, cwd, a, ctx);
+    return this.invokes++ === 0 ? { ...inv, command: `${inv.command}; false` } : inv;
+  }
+}
+
+describe("OBS-1175: a parsed verdict carrying a parser sentinel is still the worker speaking", () => {
+  beforeEach(() => { setQuotaBannerSilentMsForTests(1_500); setCapacityBackoffMsForTests(100); });
+  afterEach(() => { resetQuotaBannerSilentMsForTests(); resetCapacityBackoffMsForTests(); });
+
+  test("test: the production daemon preserves parsed false trailers whose summaries equal either parser sentinel on live and exit paths versus backing off a true trailerless capacity banner, so the sentinel collision requeue fails", async () => {
+    const preserved = (all: JournalEvent[], summary: string, exitCode: number | null) => {
+      expect(of(all, "worker-result")[0]!.data).toMatchObject({ ok: false, summary, finished: true, exitCode });
+      for (const ev of ["capacity-banner", "capacity-requeue", "capacity-failover", "quota-failover", "channel-exclusion"]) expect(of(all, ev)).toHaveLength(0);
+      // the parsed false verdict takes the ordinary ladder: the attempt is charged, never requeued
+      expect(of(all, "task-dispatch").map((e) => (e.data as { attempt: number }).attempt)).toEqual([0, 1]);
+    };
+    for (const [i, summary] of [NO_TRAILER_SUMMARY, UNPARSEABLE_TRAILER_SUMMARY].entries()) {
+      // exit path: the capacity banner row, then a parsed ok:false trailer, then exit one
+      const exit = setupRepo([T("T1")], { tasks: { T1: [{ shell: `echo ${JSON.stringify(BANNER)}`, result: { ok: false, summary } }, okStep("T1")] }, consult: RETRY });
+      const s = await runDaemon(exit.repo, { adapters: [new ExitOneFake(exit.scriptPath)], runId: `run-sentinel-exit-${i}` });
+      expect(s.done).toEqual(["T1"]);
+      preserved(evs(exit.repo, `run-sentinel-exit-${i}`), summary, 1);
+
+      // live path: an idle pane painting the capacity banner above the same parsed trailer
+      const live = setupRepo([T("T1", { timeoutMinutes: 5 })], { tasks: { T1: [okStep("T1")] }, consult: RETRY });
+      const runId = `run-sentinel-live-${i}`;
+      const pane = () => {
+        const prompt = readFileSync(join(tickmarkrDir(live.repo), "runs", runId, "prompts", "T1-a0.md"), "utf8");
+        const nonce = /TICKMARKR_RESULT_([0-9a-z]+) /.exec(prompt)![1];
+        return `${BANNER}\nTICKMARKR_RESULT_${nonce} ${JSON.stringify({ ok: false, summary, deviations: [] })}`;
+      };
+      const s2 = await runDaemon(live.repo, { adapters: [live.fake], runId, driver: bannerDriver(pane) });
+      expect(s2.done).toEqual(["T1"]);
+      preserved(evs(live.repo, runId), summary, null);
+    }
+
+    // a true trailerless capacity banner still backs off on its seat, on both paths
+    const exit = setupRepo([T("T1")], { tasks: { T1: [CAPACITY_EXIT, okStep("T1")] }, consult: RETRY });
+    await runDaemon(exit.repo, { adapters: [exit.fake], runId: "run-sentinel-true-exit" });
+    expect(of(evs(exit.repo, "run-sentinel-true-exit"), "capacity-requeue").map((e) => e.data)).toMatchObject([{ requeue: 1, source: "exit" }]);
+    const live = setupRepo([T("T1", { timeoutMinutes: 5 })], { tasks: { T1: [okStep("T1")] }, consult: RETRY });
+    await runDaemon(live.repo, { adapters: [live.fake], runId: "run-sentinel-true-live", driver: bannerDriver(BANNER) });
+    expect(of(evs(live.repo, "run-sentinel-true-live"), "capacity-requeue").map((e) => e.data)).toMatchObject([{ requeue: 1, source: "banner" }]);
+  }, 180_000);
 });

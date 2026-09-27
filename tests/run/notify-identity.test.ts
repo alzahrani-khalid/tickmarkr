@@ -89,7 +89,11 @@ function normJournal(events: JournalEvent[], repo: string, runId: string, baseRe
       const slot = row.data.slot as { name: string; cwd: string };
       expect(slot.cwd).toBe(worktreePath(repo, `tickmarkr/${runId}--${taskId}`));
       expect(slot.name).toBe(`${taskId}-worker-fake-a${row.data.attempt}-${runId.replace(/^run-/, "")}`);
-      row = { ...row, data: { ...row.data, slot: { ...slot, cwd: "<WORKTREE>", name: `<RUNID>-${taskId}-${row.data.attempt}` } } };
+      // OBS-1109: the attempt's ownership evidence — a fresh random nonce and its run's dispatch script.
+      expect(row.data.nonce).toMatch(/^[0-9a-f]{8}$/);
+      expect(row.data.dispatchScript).toBe(`${Journal.open(repo, runId).dir}/prompts/${taskId}-a${row.data.attempt}.sh`);
+      row = { ...row, data: { ...row.data, nonce: "<NONCE>", dispatchScript: `<PROMPTS>/${taskId}-a${row.data.attempt}.sh`,
+        slot: { ...slot, cwd: "<WORKTREE>", name: `<RUNID>-${taskId}-${row.data.attempt}` } } };
     }
     if (row.event === "worker-process-reaped") {
       // PGIDs and slot run IDs are host identities, not effects of the notification sink.

@@ -954,6 +954,20 @@ export async function declaredBaseContainment(
   return missing.length > 0 ? { result: "drifted", missing } : { result: "contained", via: "patch-id" };
 }
 
+/**
+ * OBS-1107: does `dest` already hold everything `commit` changed? Replays the commit's OWN
+ * parent-to-commit change onto `dest` as a three-way merge; a clean merge whose tree IS `dest`'s tree
+ * brings nothing the destination lacks — a content-empty commit, or a patch already represented there
+ * under another hash. Content, never hash identity. Any git failure (a root commit, a git without
+ * `merge-tree --merge-base`) answers false: unproven work stays unaccounted.
+ */
+export async function changeRepresented(cwd: string, commit: string, dest = "HEAD"): Promise<boolean> {
+  const merged = await shGit(`git merge-tree --write-tree --merge-base=${shq(`${commit}^`)} ${shq(dest)} ${shq(commit)}`, cwd);
+  if (merged.code !== 0) return false;
+  const tree = await shGit(`git rev-parse ${shq(`${dest}^{tree}`)}`, cwd);
+  return tree.code === 0 && merged.stdout.split("\n")[0]!.trim() === tree.stdout.trim();
+}
+
 export async function removeWorktree(repo: string, dir: string): Promise<void> {
   await shGit(`git worktree remove --force ${shq(dir)}`, repo); // best-effort; stale dirs are re-added with -B
   await shGit(`rm -rf ${shq(dir)}`, repo);

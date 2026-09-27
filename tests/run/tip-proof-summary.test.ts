@@ -1,9 +1,12 @@
 import { renderMarkdownRecord } from "../../src/cli/commands/report.js";
-import { writeFileSync } from "node:fs";
+import { approve } from "../../src/cli/commands/approve.js";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { expect, test } from "vitest";
 import { SubprocessDriver } from "../../src/drivers/subprocess.js";
-import { formatTipProof, recordFatalRunEnd, runDaemon, runEndTipProof } from "../../src/run/daemon.js";
+import {
+  forgivenFingerprints, formatForgiven, formatSummary, formatTipProof, recordFatalRunEnd, runDaemon, runEndTipProof,
+} from "../../src/run/daemon.js";
 import { Journal, type JournalEvent } from "../../src/run/journal.js";
 import { COMMIT, makeTestTempDir, setupRepo, T } from "../helpers/tmprepo.js";
 
@@ -192,3 +195,136 @@ test("test: a whole cycle carried from a verified tip still reads cached for eve
   expect(formatTipProof(runEndTipProof(failed))).toContain("tip proof: failed");
   expect(recordOf(failed)).toContain("FAILED");
 });
+
+// OBS-1123: a red baseline the build keeps printing, plus a second red only where the work created new.txt.
+const KNOWN_RED = "FAIL tests/known.test.ts > pre-existing red";
+const NEW_RED = "FAIL tests/new.test.ts > introduced by this run";
+const RED_BUILD = `printf '%s\\n' '${KNOWN_RED}'; if [ -f new.txt ]; then printf '%s\\n' '${NEW_RED}'; fi; exit 1`;
+const RED_BUILD_CFG = `gates: { build: ${JSON.stringify(RED_BUILD)} }\n`;
+const ISO_TIME = /\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/;
+const UNKNOWN = "baseline provenance unknown (legacy: no capture identity or time recorded)";
+
+const runEnd = (repo: string, runId: string) => Journal.open(repo, runId).read().findLast((e) => e.event === "run-end")!;
+const capturedProvenance = (repo: string, runId: string) => {
+  const baseline = JSON.parse(readFileSync(join(Journal.open(repo, runId).dir, "baseline.json"), "utf8"));
+  const p = baseline.provenance as { baseRef: string; capturedAt: string };
+  return { baseline, provenance: p, dated: `baseline ${p.baseRef.slice(0, 12)} captured ${p.capturedAt}` };
+};
+
+test("test: production run-end and markdown records attribute each forgiven task or tip fingerprint to its baseline time versus legacy unknown provenance, so a bare label or invented date fails", async () => {
+  const runId = "run-forgiven-provenance";
+  const { repo, fake } = setupRepo([T("T1"), T("T2", { humanGate: true })], { tasks: {
+    T1: [{ shell: `echo one > t1.txt && ${COMMIT} t1`, result: { ok: true, summary: "t1" } }],
+    T2: [{ shell: `echo two > t2.txt && ${COMMIT} t2`, result: { ok: true, summary: "t2" } }],
+  } }, RED_BUILD_CFG);
+  const run = (resume: boolean) => runDaemon(repo, { adapters: [fake], runId, resume, approvalWindowMs: 0 });
+
+  const first = await run(false);
+  const { baseline, provenance, dated } = capturedProvenance(repo, runId);
+  const events = Journal.open(repo, runId).read();
+  // The capture's own identity and publication time, stamped beside the measurement.
+  expect(provenance.baseRef).toBe(events.find((e) => e.event === "run-start")!.data.baseRef);
+  expect(provenance.capturedAt).toMatch(ISO_TIME);
+  expect(Date.parse(provenance.capturedAt)).toBeGreaterThanOrEqual(Date.parse(events.find((e) => e.event === "baseline-start")!.ts));
+  expect(first.done).toEqual(["T1"]);
+  expect(runEnd(repo, runId).data.forgiven).toEqual([
+    { taskId: "T1", gate: "build", fingerprints: [KNOWN_RED], baseline: provenance },
+    { gate: "build", fingerprints: [KNOWN_RED], baseline: provenance },
+  ]);
+  expect(first.forgiven).toEqual(runEnd(repo, runId).data.forgiven);
+  const text = formatSummary(first);
+  expect(text).toContain(`forgiven vs baseline — T1 build: ${KNOWN_RED} — ${dated}`);
+  expect(text).toContain(`forgiven vs baseline — tip build: ${KNOWN_RED} — ${dated}`);
+  const md = renderMarkdownRecord(runId, events);
+  expect(md).toContain(`- **forgiven vs baseline:**\n  - T1 build: ${KNOWN_RED} — ${dated}\n  - tip build: ${KNOWN_RED} — ${dated}\n`);
+  expect(md).toContain(`(forgiven); forgiven vs baseline: ${KNOWN_RED} — ${dated}`);
+
+  // A baseline.json written before provenance existed: T2's gates and the tip forgive against it on resume.
+  const { provenance: _dropped, ...legacy } = baseline;
+  writeFileSync(join(Journal.open(repo, runId).dir, "baseline.json"), JSON.stringify(legacy));
+  await approve([runId, "T2", "--by", "test"], repo);
+  const second = await run(true);
+  expect(second.done.sort()).toEqual(["T1", "T2"]);
+  expect(runEnd(repo, runId).data.forgiven).toEqual([
+    { taskId: "T1", gate: "build", fingerprints: [KNOWN_RED], baseline: provenance }, // its row keeps its capture
+    { taskId: "T2", gate: "build", fingerprints: [KNOWN_RED] },
+    { gate: "build", fingerprints: [KNOWN_RED] },
+  ]);
+  const later = Journal.open(repo, runId).read();
+  const records = [
+    formatSummary(second).split("\n").filter((l) => l.startsWith("forgiven vs baseline — ")),
+    renderMarkdownRecord(runId, later).split("\n").filter((l) => /^ {2}- (T\d|tip) build: /.test(l)),
+  ];
+  for (const lines of records) {
+    expect(lines).toHaveLength(3);
+    expect(lines[0]).toContain(`T1 build: ${KNOWN_RED} — ${dated}`);
+    for (const line of lines.slice(1)) {
+      expect(line).toMatch(/(T2|tip) build: /);
+      expect(line).toContain(`${KNOWN_RED} — ${UNKNOWN}`);
+      expect(line).not.toMatch(ISO_TIME); // never a date borrowed from the row, the run or the resume
+    }
+  }
+
+  // A row from before structured forgiveness is still named forgiven, with nothing it never recorded.
+  const legacyRow = { ts: "2026-09-22T00:00:00.000Z", event: "gate-result", taskId: "T0",
+    data: { gate: "lint", pass: true, details: "exit 1 but only pre-existing failures (forgiven)" } };
+  expect(forgivenFingerprints([legacyRow])).toEqual([{ taskId: "T0", gate: "lint" }]);
+  expect(formatForgiven(forgivenFingerprints([legacyRow])[0]!)).toBe(`T0 lint: fingerprints not recorded — ${UNKNOWN}`);
+  expect(renderMarkdownRecord("run-legacy", [legacyRow])).toContain(`(forgiven); forgiven vs baseline: fingerprints not recorded — ${UNKNOWN}`);
+
+  // A fatal close keeps what the greens before it carried: the verifier dies at the tip after T1's forgiven build.
+  const fatalId = "run-forgiven-fatal";
+  const killTip = "test ! -e t1.txt || { ps -o command= -p $PPID | grep -q input-type=module && kill -9 $PPID; exit 1; }";
+  const crash = setupRepo([T("T1"), T("T2", { humanGate: true })],
+    { tasks: { T1: [{ shell: `echo one > t1.txt && ${COMMIT} t1`, result: { ok: true, summary: "t1" } }] } },
+    `gates: { build: ${JSON.stringify(RED_BUILD)}, test: 'node -e ""', tipTest: ${JSON.stringify(killTip)} }\n`);
+  await expect(runDaemon(crash.repo, { adapters: [crash.fake], runId: fatalId, approvalWindowMs: 0 })).rejects.toThrow();
+  const crashed = Journal.open(crash.repo, fatalId).read();
+  const fatalEnd = crashed.findLast((e) => e.event === "run-end")!;
+  const fatalCapture = capturedProvenance(crash.repo, fatalId);
+  expect(fatalEnd.data.fatal).toBe(true);
+  const fatalForgiven = fatalEnd.data.forgiven as ReturnType<typeof forgivenFingerprints>;
+  expect(fatalForgiven).toEqual(forgivenFingerprints(crashed.slice(0, crashed.lastIndexOf(fatalEnd))));
+  expect(fatalForgiven[0]).toEqual({ taskId: "T1", gate: "build", fingerprints: [KNOWN_RED], baseline: fatalCapture.provenance });
+  const fatalMd = renderMarkdownRecord(fatalId, crashed);
+  for (const f of fatalForgiven) expect(fatalMd).toContain(`  - ${formatForgiven(f)}\n`);
+  expect(fatalMd).toContain(`  - T1 build: ${KNOWN_RED} — ${fatalCapture.dated}\n`);
+}, 240_000);
+
+test("test: production reports distinguish a baseline-forgiven fingerprint from a newly introduced red on the same task, so displaying the new regression as forgiven fails", async () => {
+  const runId = "run-forgiven-vs-new";
+  const { repo, fake } = setupRepo([T("T1")], { tasks: { T1: [
+    { shell: `echo new > new.txt && ${COMMIT} regress`, result: { ok: true, summary: "introduces a red" } },
+    { shell: `rm -f new.txt && echo fixed > fixed.txt && ${COMMIT} fix`, result: { ok: true, summary: "removes it" } },
+  ] } }, RED_BUILD_CFG);
+  const summary = await runDaemon(repo, { adapters: [fake], runId, approvalWindowMs: 0 });
+  const { provenance, dated } = capturedProvenance(repo, runId);
+  const events = Journal.open(repo, runId).read();
+  const builds = events.filter((e) => e.event === "gate-result" && e.taskId === "T1" && e.data.gate === "build");
+  const red = builds.find((e) => e.data.pass === false)!;
+  expect(red.data).toMatchObject({ freshFingerprints: [NEW_RED], forgivenFingerprints: [KNOWN_RED], baselineProvenance: provenance });
+  expect(builds.at(-1)!.data).toMatchObject({ pass: true, forgivenFingerprints: [KNOWN_RED], baselineProvenance: provenance });
+  expect(builds.at(-1)!.data.freshFingerprints).toBeUndefined();
+
+  const md = renderMarkdownRecord(runId, events);
+  const redLine = md.split("\n").find((l) => l.startsWith("  - build: fail"))!;
+  expect(redLine).toContain(`; new red (not in baseline): ${NEW_RED}; forgiven vs baseline: ${KNOWN_RED} — ${dated}`);
+  expect(redLine.slice(redLine.indexOf("forgiven vs baseline:"))).not.toContain(NEW_RED);
+  const greenLine = md.split("\n").findLast((l) => l.startsWith("  - build: pass"))!;
+  expect(greenLine).toContain(`forgiven vs baseline: ${KNOWN_RED} — ${dated}`);
+  expect(greenLine).not.toContain(NEW_RED);
+
+  // The standing record names what the green carried — the baseline's red, never the one the work introduced.
+  expect(summary.done).toEqual(["T1"]);
+  const forgiven = [
+    { taskId: "T1", gate: "build", fingerprints: [KNOWN_RED], baseline: provenance },
+    { gate: "build", fingerprints: [KNOWN_RED], baseline: provenance },
+  ];
+  expect(runEnd(repo, runId).data.forgiven).toEqual(forgiven);
+  expect(summary.forgiven).toEqual(forgiven);
+  expect(formatSummary(summary)).toContain(`forgiven vs baseline — T1 build: ${KNOWN_RED} — ${dated}`);
+  expect(formatSummary(summary)).not.toContain(NEW_RED);
+  const header = md.slice(md.indexOf("- **forgiven vs baseline:**"), md.indexOf("## Usage & efficiency"));
+  expect(header).toContain(`  - T1 build: ${KNOWN_RED} — ${dated}`);
+  expect(header).not.toContain(NEW_RED);
+}, 180_000);

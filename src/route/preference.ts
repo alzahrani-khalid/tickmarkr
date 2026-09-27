@@ -50,6 +50,17 @@ export function routingEntrySeatLines(cfg: TickmarkrConfig): string[] {
   return lines;
 }
 
+// OBS-1143: the probed identity doctor cached for adapter:model — the one discoverChannels routes
+// with. Absent ⇒ unknown, and the deny matcher stays conservative (alias-family match).
+export const observedIdentity = (
+  health: Record<string, AuthHealth> | null | undefined, adapter: string, model: string,
+): string | undefined => health?.[adapter]?.modelAuth?.[model]?.identity ?? health?.[adapter]?.modelIdentities?.[model];
+
+export const observedSeat = (health: Record<string, AuthHealth> | null | undefined, adapter: string, model: string) => {
+  const identity = observedIdentity(health, adapter, model);
+  return identity ? { adapter, model, identity } : { adapter, model };
+};
+
 const adapterIds = (adapters: { id: string }[] | string[]): string[] =>
   typeof adapters[0] === "string" ? (adapters as string[]) : (adapters as { id: string }[]).map((a) => a.id);
 
@@ -64,9 +75,7 @@ export function excludedChannels(
   for (const id of adapterIds(adapters)) {
     if (!health[id]?.installed || !health[id]?.authed) continue;
     for (const c of channelsFromConfig(id, cfg)) {
-      const identity = health[id]?.modelAuth?.[c.model]?.identity ?? health[id]?.modelIdentities?.[c.model];
-      const chan = identity ? { ...c, identity } : c;
-      const d = disallowedBy(chan, cfg.routing);
+      const d = disallowedBy(observedSeat(health, c.adapter, c.model), cfg.routing);
       if (d) out.push({ key: channelKey(c), d });
     }
   }
@@ -210,12 +219,19 @@ const disallowedFromPreferError = (msg: string): Disallowed | null => {
   return m ? { by: m[1] as "deny" | "allow", entry: m[2] } : null;
 };
 
-export function preferEntryDenied(p: string, cfg: TickmarkrConfig): Disallowed | null {
+// OBS-1143: `health` is doctor's CACHED verdict (never a probe); its identities ride the channels
+// route() reads them from, so the preflight answers exactly as the router would.
+export function preferEntryDenied(p: string, cfg: TickmarkrConfig, health?: Record<string, AuthHealth> | null): Disallowed | null {
   if (!cfg.routing.allow && !cfg.routing.deny) return null;
   const probe = structuredClone(cfg);
   probe.routing.map = { ...probe.routing.map, [PREFLIGHT_SHAPE]: { prefer: [p] } };
+  const observed = Object.keys(cfg.tiers).flatMap((id) => channelsFromConfig(id, cfg))
+    .flatMap((c) => {
+      const identity = observedIdentity(health, c.adapter, c.model);
+      return identity ? [{ ...c, identity }] : [];
+    });
   try {
-    route(preflightTask, probe, []);
+    route(preflightTask, probe, observed);
     return null;
   } catch (e) {
     if (e instanceof RoutingError) return disallowedFromPreferError(e.message);
@@ -227,14 +243,18 @@ export function preferEntryDenied(p: string, cfg: TickmarkrConfig): Disallowed |
 // route — resume hands it the loaded graph's shape set, so a collision on a shape no resumed task
 // uses can no longer refuse the only crash-recovery path. Omitted ⇒ the whole routing map: doctor
 // audits the config itself, which has no graph to be scoped by.
-export function denyPreferCollisions(cfg: TickmarkrConfig, shapes?: Iterable<string>): DenyPreferCollision[] {
+// OBS-1143: `health` (doctor's cached verdict) supplies each alias's observed identity; omitted or
+// unrecorded ⇒ unknown, which stays conservative.
+export function denyPreferCollisions(
+  cfg: TickmarkrConfig, shapes?: Iterable<string>, health?: Record<string, AuthHealth> | null,
+): DenyPreferCollision[] {
   if (!cfg.routing.allow && !cfg.routing.deny) return [];
   const inGraph = shapes === undefined ? undefined : new Set(shapes);
   const out: DenyPreferCollision[] = [];
   for (const [shape, entry] of Object.entries(cfg.routing.map)) {
     if (inGraph && !inGraph.has(shape)) continue;
     if (entry.pin) {
-      const d = disallowedBy({ adapter: entry.pin.via, model: entry.pin.model }, cfg.routing);
+      const d = disallowedBy(observedSeat(health, entry.pin.via, entry.pin.model), cfg.routing);
       if (d) {
         out.push({
           kind: "pin",
@@ -245,20 +265,17 @@ export function denyPreferCollisions(cfg: TickmarkrConfig, shapes?: Iterable<str
       }
     }
     const prefer = entry.prefer ?? [];
-    if (prefer.length && prefer.every((p) => preferEntryDenied(p, cfg) !== null)) {
+    if (prefer.length && prefer.every((p) => preferEntryDenied(p, cfg, health) !== null)) {
       out.push({
         kind: "prefer",
         shape,
         detail: prefer.join(" > "),
-        disallowed: preferEntryDenied(prefer[0], cfg)!,
+        disallowed: preferEntryDenied(prefer[0], cfg, health)!,
       });
     }
     const pool = entry.pool;
     if (pool) {
-      const denied = pool.channels.map((p) => {
-        const i = p.indexOf(":");
-        return disallowedBy({ adapter: p.slice(0, i), model: p.slice(i + 1) }, cfg.routing);
-      });
+      const denied = pool.channels.map((p) => poolEntryDisallowed(p, cfg, health));
       // only a FULLY dead pool collides — a partial deny still leaves live members to route
       if (denied.every((d) => d !== null)) {
         out.push({ kind: "pool", shape, detail: pool.channels.join(" > "), disallowed: denied[0]! });
@@ -266,6 +283,35 @@ export function denyPreferCollisions(cfg: TickmarkrConfig, shapes?: Iterable<str
     }
   }
   return out;
+}
+
+const poolEntryDisallowed = (p: string, cfg: TickmarkrConfig, health?: Record<string, AuthHealth> | null) => {
+  const i = p.indexOf(":");
+  return disallowedBy(observedSeat(health, p.slice(0, i), p.slice(i + 1)), cfg.routing);
+};
+
+export interface DeadPoolEntry { shape: string; entry: string; disallowed: Disallowed; admitted: string[] }
+
+// OBS-1144: every disallowed entry a pool carries, beside the admitted remainder the router routes
+// instead — the router skips the entry; an empty remainder is the exhausted pool it refuses.
+export function deadPoolEntries(
+  cfg: TickmarkrConfig, shapes?: Iterable<string>, health?: Record<string, AuthHealth> | null,
+): DeadPoolEntry[] {
+  if (!cfg.routing.allow && !cfg.routing.deny) return [];
+  const inGraph = shapes === undefined ? undefined : new Set(shapes);
+  return Object.entries(cfg.routing.map).flatMap(([shape, entry]) => {
+    if (!entry.pool || (inGraph && !inGraph.has(shape))) return [];
+    const judged = entry.pool.channels.map((p) => ({ p, d: poolEntryDisallowed(p, cfg, health) }));
+    const admitted = judged.filter(({ d }) => d === null).map(({ p }) => p);
+    return judged.flatMap(({ p, d }) => (d ? [{ shape, entry: p, disallowed: d, admitted }] : []));
+  });
+}
+
+export function deadPoolEntryLine({ shape, entry, disallowed, admitted }: DeadPoolEntry): string {
+  const verdict = admitted.length
+    ? `skipped — routes the admitted remainder ${admitted.join(" > ")}`
+    : "the pool is exhausted — no admitted entry remains, so the shape is unroutable";
+  return `routing.map.${shape}.pool entry ${entry} is disallowed by routing.${disallowed.by} (${disallowed.entry}) — ${verdict}`;
 }
 
 export function denyPreferCollisionLine({ kind, shape, detail, disallowed }: DenyPreferCollision): string {

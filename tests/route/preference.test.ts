@@ -334,7 +334,7 @@ describe("T7 deny∩prefer static preflight", () => {
     expect(routerSrc).toContain("disallowedBy(");
     expect(routerSrc).toContain("channelsFromConfig(p, cfg)");
     expect(prefSrc).toContain("export function preferEntryDenied");
-    expect(prefSrc).toContain("route(preflightTask, probe, [])");
+    expect(prefSrc).toContain("route(preflightTask, probe, observed)");
     expect(prefSrc).not.toMatch(/if \(p\.includes\(":"\)\)/);
   });
 });

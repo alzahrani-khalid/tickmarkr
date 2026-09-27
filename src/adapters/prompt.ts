@@ -71,8 +71,9 @@ function workerVerdictWitness(raw: string, nonce: string, positions: readonly nu
   return `{"nonce":${JSON.stringify(nonce)},"ok":false,`;
 }
 
-// v1.65 T1: the parse boundary's own no-trailer sentinel summaries. classifyDeadChannel keys on
-// these — a result carrying any other summary is a PARSED trailer, i.e. the worker speaking.
+// v1.65 T1: the parse boundary's own no-trailer sentinel summaries — display text only. OBS-1175:
+// classifiers key on the parser's `cause`, never on these: a PARSED trailer may carry either string
+// as its own summary, and it is still the worker speaking.
 export const NO_TRAILER_SUMMARY = "worker produced no TICKMARKR_RESULT trailer";
 export const UNPARSEABLE_TRAILER_SUMMARY = "unparseable TICKMARKR_RESULT trailer";
 
@@ -155,17 +156,27 @@ const TIMEOUT_RE = /\bETIMEDOUT\b|request timed out|connection timed out|deadlin
 // speaking, so a verdict that QUOTES the capacity phrase stays ordinary work evidence. The caller
 // hands in the chrome-filtered banner rows as `raw`, exactly as it does for classifyDeadChannel.
 export function classifyTransientCapacity(result: WorkerResult): RegExpExecArray | null {
-  if (result.ok || (result.summary !== NO_TRAILER_SUMMARY && result.summary !== UNPARSEABLE_TRAILER_SUMMARY)) return null;
-  return CAPACITY_RE.exec(result.raw);
+  return unparsed(result) ? CAPACITY_RE.exec(result.raw) : null;
 }
 
 export function classifyDeadChannel(result: WorkerResult): DeadChannelReason | undefined {
   // A parsed trailer — ok:true OR ok:false — is the worker speaking: genuine work outcomes walk
   // the normal gate/ladder path even when their transcript mentions auth/outage/timeout text.
-  if (result.ok || (result.summary !== NO_TRAILER_SUMMARY && result.summary !== UNPARSEABLE_TRAILER_SUMMARY)) return undefined;
+  if (!unparsed(result)) return undefined;
   if (AUTH_RE.test(result.raw)) return "auth-required";
   if (SETUP_RE.test(result.raw)) return "setup-required";
   if (OUTAGE_RE.test(result.raw)) return "provider-outage";
   if (TIMEOUT_RE.test(result.raw)) return "timeout";
   return undefined;
 }
+
+// OBS-1175: the one "no trailer was parsed" test every classifier here shares.
+function unparsed(result: WorkerResult): boolean {
+  return !result.ok && result.cause !== undefined;
+}
+
+// OBS-1169: a CLI that died in its own bootstrap (codex: "account/read failed during TUI bootstrap …
+// (code -32603)") never read the brief. Known bootstrap phrasing only — evidence solely inside the
+// startup prefix the daemon's StartupFailureDetector owns (before any tool frame or input box, in an
+// unsaturated read, inside the startup window); the same words in a worker's tool output are work.
+export const BOOTSTRAP_FAILURE_RE = /\b[\w/-]+ failed during TUI bootstrap\b/i;

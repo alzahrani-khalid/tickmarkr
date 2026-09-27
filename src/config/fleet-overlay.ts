@@ -41,6 +41,9 @@ export type FleetOverlayWrite = {
   // exclusion sets write the minimal routing.allow membership form and tombstone the deny
   // adapters/models scopes; absent ⇒ the legacy deny-array write, byte-identical to before.
   universe?: FleetUniverseRow[];
+  // OBS-1182: tiers.<adapter>.modelOverrides as the layers BELOW the repo overlay (defaults +
+  // global) resolve them, so clearing an effort masks an inherited one instead of revealing it.
+  lowerOverrides?: Record<string, Record<string, Record<string, unknown>>>;
 };
 
 // The minimal routing.allow form for an exclusion-set membership write: whole adapter ids for
@@ -391,6 +394,54 @@ export function renderFleetOverlayWrite(priorBytes: string, write: FleetOverlayW
       const path = ["tiers", adapter, "models", model];
       if (after === null || after === undefined) setScalarPreservingComment(doc, path, null);
       else setScalarPreservingComment(doc, path, after.tier, unpackFleetProvenance(after.provenance).provenance);
+    }
+  }
+
+  // OBS-1182: effort lands in tiers.<adapter>.modelOverrides.<model>.effort — the scalar tier and
+  // every sibling override key (vendor, channel) keep their bytes.
+  const efforts = (e: FleetEditable) => e.efforts ?? {};
+  for (const adapter of new Set([...Object.keys(efforts(initial)), ...Object.keys(efforts(edited))])) {
+    for (const model of new Set([...Object.keys(efforts(initial)[adapter] ?? {}), ...Object.keys(efforts(edited)[adapter] ?? {})])) {
+      const after = efforts(edited)[adapter]?.[model];
+      if (efforts(initial)[adapter]?.[model] === after) continue;
+      const override = ["tiers", adapter, "modelOverrides", model];
+      if (after !== undefined) {
+        // Setting beneath a tombstone (the override, or modelOverrides above it) lifts it, and
+        // deepMerge would restore what it masked: re-mask each lower-layer key it covered — sibling
+        // models, then this override's vendor/channel (unknown lower ⇒ both, blind).
+        // ponytail: tiers.<adapter> itself tombstoned is unreachable here — its models, and so a tier, are masked too.
+        const tombstoned = (depth: number) => {
+          const node = doc.getIn(override.slice(0, depth), true);
+          return node !== undefined && !isMap(node);
+        };
+        const lowerModels = write.lowerOverrides?.[adapter] ?? {};
+        const remask: string[][] = [];
+        if (tombstoned(3)) for (const other of Object.keys(lowerModels)) if (other !== model) remask.push([...override.slice(0, 3), other]);
+        if (tombstoned(3) || tombstoned(4)) {
+          for (const key of write.lowerOverrides ? Object.keys(lowerModels[model] ?? {}) : ["vendor", "channel"]) {
+            if (key !== "effort") remask.push([...override, key]);
+          }
+        }
+        setScalarPreservingComment(doc, [...override, "effort"], after);
+        for (const path of remask) setScalarPreservingComment(doc, path, null);
+        continue;
+      }
+      // Clearing means no effort in the MERGED config: drop the repo key, then mask an effort the
+      // lower layers still declare (unknown lower ⇒ a repo that never held the key inherited it).
+      const held = doc.getIn([...override, "effort"]) !== undefined;
+      deleteAt(doc, [...override, "effort"]);
+      const lower = write.lowerOverrides?.[adapter]?.[model];
+      const maskEffort = write.lowerOverrides ? lower?.effort !== undefined : !held;
+      const repoNode = doc.getIn(override, true);
+      const { effort: _masked, ...rest } = { ...lower, ...(isMap(repoNode) ? repoNode.toJSON() as object : {}) };
+      if (Object.values(rest).some((v) => v !== null && v !== undefined)) {
+        if (maskEffort) setScalarPreservingComment(doc, [...override, "effort"], null);
+      } else if (maskEffort || (isMap(repoNode) && repoNode.items.length > 0)) {
+        // Tombstone-only siblings must still suppress lower metadata when effort is cleared,
+        // even without inherited effort. Their merged {} would fail the nonempty refinement.
+        setScalarPreservingComment(doc, override, null);
+      }
+      for (const depth of [4, 3, 2, 1]) deleteEmptyMap(doc, override.slice(0, depth));
     }
   }
 

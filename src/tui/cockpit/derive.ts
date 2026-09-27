@@ -5,6 +5,7 @@ import { channelKey } from "../../adapters/types.js";
 import { newestPark, permittedDecisionVerbs } from "../../cli/commands/approve.js";
 import { parseOwnedName } from "../../drivers/types.js";
 import { projectActivity, type TaskActivityProjection } from "../../run/activity.js";
+import { effectiveDecisions, withPhysicalLine } from "../../run/journal.js";
 import { isPidLive } from "../../run/lock.js";
 import { normalizeGateOutcome } from "../../run/outcome.js";
 import { projectOperatorSummary, type OperatorTaskSummary } from "../../run/operator-summary.js";
@@ -310,6 +311,16 @@ function parseSource(raw: string): {
     }
   }
   return { events, defects };
+}
+
+/**
+ * OBS-1178: the rows the task-state folds read. A refused or unsound decision released nothing, so its
+ * task-approved row is dropped here; the one decision fold keys every row by its physical line. The
+ * journal rows the cockpit draws keep every line as evidence.
+ */
+function decidedEvents(events: readonly CaptureEvent[]): CaptureEvent[] {
+  const effective = effectiveDecisions(events.map((event) => withPhysicalLine(event, event.line)));
+  return events.filter((event) => event.event !== "task-approved" || effective.has(event.line));
 }
 
 function assignmentFrom(value: unknown): Assignment | undefined {
@@ -1172,7 +1183,8 @@ export function deriveRunCockpitData(
     // alive in the lock — the cockpit called a live run interrupted.
     : pid !== undefined && (options.isDaemonAlive ?? isPidLive)(pid);
   const interrupted = !alive;
-  const tasks = deriveTasks(events, interrupted);
+  const decided = decidedEvents(events);
+  const tasks = deriveTasks(decided, interrupted);
   const taskFacts = [...tasks.values()];
   const done = taskFacts.filter((task) => task.state === "done").length;
   const failed = taskFacts.filter((task) => task.state === "failed").length;
@@ -1203,7 +1215,7 @@ export function deriveRunCockpitData(
   // run-end — the run's own closing statement is enough.
   const runStatus: RunStatus = failed > 0
     ? "failed"
-    : human > 0 || unresolvedSummaryParks(events).length > 0
+    : human > 0 || unresolvedSummaryParks(decided).length > 0
       ? "parked"
       : lifecycle === "superseded" || hasInterruptedTask
           ? "interrupted"

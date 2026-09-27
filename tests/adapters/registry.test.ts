@@ -918,6 +918,7 @@ describe("hardcoded flag drift (v1.65 T3)", () => {
       a.headlessCommand("/tmp/p.md", "m"),
       a.interactiveCommand("/tmp/p.md", "m") ?? "",
       a.resumeCommand?.("sid", "/tmp/p.md", "m") ?? "",
+      a.headlessCommand("/tmp/p.md", "m", "high"), // OBS-1182: --effort is emitted only with an effort
     ].join("\n");
     // every token these builders emit that a CLI would parse as a flag
     const usedFlags = (cmd: string) =>
@@ -948,7 +949,7 @@ describe("hardcoded flag drift (v1.65 T3)", () => {
     expect(asked).toEqual(["help"]);
     // this direction is the one that catches it: a used-but-undeclared flag
     const undeclared = [...used].filter((f) => !UNCHANGED.includes(f));
-    expect(undeclared).toEqual(["--settings", "--prompt-suggestions"]);
+    expect(undeclared).toEqual(["--settings", "--prompt-suggestions", "--effort"]);
   });
 
   test("every adapter whose command strings hardcode flags declares those flags for the probe", () => {
@@ -957,10 +958,12 @@ describe("hardcoded flag drift (v1.65 T3)", () => {
       expect(a.hardcodedFlags, a.id).toBeDefined();
       expect(a.hardcodedFlags!.flags.length, a.id).toBeGreaterThan(0);
       // the declaration is honest: each declared flag appears verbatim in the adapter's own command strings
+      // (rendered with an effort too, so an effort-only flag such as claude's --effort is seen — OBS-1182)
       const t = tokens([
         a.headlessCommand("/tmp/p.md", "m"),
         a.interactiveCommand("/tmp/p.md", "m") ?? "",
         a.resumeCommand?.("sid", "/tmp/p.md", "m") ?? "",
+        a.headlessCommand("/tmp/p.md", "m", "high"),
       ].join("\n"));
       for (const f of a.hardcodedFlags!.flags) expect(t.has(f), `${a.id} declares ${f}`).toBe(true);
     }

@@ -2,12 +2,13 @@ import { Box, render, Text, useApp, useInput } from "ink";
 import { useRef, useState } from "react";
 import { MODEL_ID_RE, type AuthHealth, type WorkerAdapter } from "../../adapters/types.js";
 import { retiredModelReason } from "../../adapters/model-lints.js";
-import { DENY_SCOPES, denyBlockFrom, denyEntriesAt, initialDenyPropOf, stagedDenyKeyOf, type DenyScope, type DenyScopeKey, type InitialDenyProps, type MapEntry, type RoutingMode, type StagedDenyKey, type Tier, type TickmarkrConfig } from "../../config/config.js";
+import { DENY_SCOPES, EFFORT_ADAPTERS, denyBlockFrom, denyEntriesAt, initialDenyPropOf, stagedDenyKeyOf, type DenyScope, type DenyScopeKey, type InitialDenyProps, type MapEntry, type RoutingMode, type StagedDenyKey, type Tier, type TickmarkrConfig } from "../../config/config.js";
 import { fleetFirstTouchProvenance } from "../../config/fleet-overlay.js";
 import { exclusionReason } from "../../config/fleet-why.js";
 import { entryMatchesChannel, exclusionCollector, type ExclusionScope, type PreferenceRole } from "../../route/preference.js";
-import { TIERS, type Shape } from "../../graph/schema.js";
+import { EFFORTS, TIERS, type Effort, type Shape } from "../../graph/schema.js";
 import { windowRows } from "./components.js";
+import { wrapCells } from "../cockpit/width.js";
 import {
   clip,
   clipPathTail,
@@ -38,6 +39,8 @@ export type FleetEditorState = Record<DenyScopeKey, string[]> & {
   /** OBS-1046: the staged routing.allow complement, distinct from the authored deny lists above */
   allowOut?: string[];
   classifications: FleetClassification[];
+  /** OBS-1182: staged launch effort per adapter → model; absent = the CLI's own default */
+  efforts?: Record<string, Record<string, Effort>>;
   selectedMode: RoutingMode;
   map: Record<string, MapEntry>;
   // v1.61: one seat, not a chain — config.judge is z.object({ adapter, model }) (GATE-09 failover
@@ -54,6 +57,8 @@ export type FleetOverlayReview =
     after: string;
     diff: string;
     path: string;
+    /** OBS-1144: dead pool entries the written config would carry, each with its reason. */
+    notes?: string[];
   };
 
 export type FleetEditorResult =
@@ -159,6 +164,13 @@ export function formatDoctorAge(ageMs: number | null): string {
 function splitSeat(seat: string): { adapter: string; model: string } {
   const at = seat.indexOf(":");
   return { adapter: seat.slice(0, at), model: seat.slice(at + 1) };
+}
+
+// a picker ledger row is labelled "adapter/model — …" (fleet.ts channelLedger); this is its seat id
+function ledgerChannelId(line: string): string | undefined {
+  const head = line.split(" — ")[0];
+  const slash = head.indexOf("/");
+  return slash === -1 ? undefined : `${head.slice(0, slash)}:${head.slice(slash + 1)}`;
 }
 
 type View = "models" | "shapes" | "steering";
@@ -284,6 +296,7 @@ type Ui = {
   /** OBS-1046: channels routing.allow leaves out — a reason of its own, never merged into deny */
   allowOut: Set<string>;
   classifications: FleetClassification[];
+  efforts: Record<string, Record<string, Effort>>;
   selectedMode: RoutingMode;
   map: Record<string, MapEntry>;
   steering: Record<FleetSteeringKey, string[] | undefined>;
@@ -300,6 +313,7 @@ export function FleetApp({
   ageMs,
   agents,
   initialAllowOut = [],
+  initialEfforts = {},
   modelGroups,
   initialMode,
   modeOptions,
@@ -310,6 +324,7 @@ export function FleetApp({
   preferOptionsForShape,
   initialSteering,
   steeringOptionsFor,
+  reviewAdvisories = [],
   reviewOverlay,
   reloadGuard,
   stagedRouting,
@@ -325,6 +340,8 @@ export function FleetApp({
   agents: AgentCli[];
   /** OBS-1046: adapter ids and adapter:model keys routing.allow leaves out of the fleet */
   initialAllowOut?: string[];
+  /** OBS-1182: configured launch effort per adapter → model */
+  initialEfforts?: Record<string, Record<string, Effort>>;
   modelGroups: FleetModelGroup[];
   initialMode: RoutingMode;
   modeOptions: FleetModeOption[];
@@ -340,6 +357,8 @@ export function FleetApp({
   preferOptionsForShape: (shape: Shape, current: string[]) => string[];
   initialSteering: Record<FleetSteeringKey, string[] | undefined>;
   steeringOptionsFor: (which: FleetSteeringKey, current: string[]) => string[];
+  /** OBS-1052(3): advisory review no-verdict history lines — display only, never a routing input */
+  reviewAdvisories?: string[];
   reviewOverlay: (state: FleetEditorState) => FleetOverlayReview;
   reloadGuard: (bytes: string) => string | null;
   /** the routing policy the staged deny sets load as (fleet: the config loader over the candidate
@@ -385,6 +404,7 @@ export function FleetApp({
     allowOut: new Set(initialAllowOut),
     ...(Object.fromEntries(DENY_SCOPES.map((scope) => [scope.key, new Set(initialDeny[scope.key])])) as Record<DenyScopeKey, Set<string>>),
     classifications: [],
+    efforts: structuredClone(initialEfforts),
     selectedMode: initialMode,
     map: structuredClone(initialMap),
     steering: structuredClone(initialSteering),
@@ -417,6 +437,11 @@ export function FleetApp({
     }
     for (const key of STEERING_KEYS) {
       if (JSON.stringify(ui.steering[key]) !== JSON.stringify(initialSteering[key])) n += 1;
+    }
+    for (const adapter of new Set([...Object.keys(initialEfforts), ...Object.keys(ui.efforts)])) {
+      for (const model of new Set([...Object.keys(initialEfforts[adapter] ?? {}), ...Object.keys(ui.efforts[adapter] ?? {})])) {
+        if (initialEfforts[adapter]?.[model] !== ui.efforts[adapter]?.[model]) n += 1;
+      }
     }
     return n;
   };
@@ -699,6 +724,7 @@ export function FleetApp({
           }),
         }
         : classification),
+    efforts: structuredClone(ui.efforts),
     selectedMode: ui.selectedMode,
     map: ui.map,
     ...(ui.judgeSeat ? { judgeSeat: splitSeat(ui.judgeSeat) } : {}),
@@ -1032,10 +1058,9 @@ export function FleetApp({
   // same picker reopens over the recomputed policy — a shared or adapter-wide entry is refused by
   // name and the row stays greyed
   const liftFromPicker = (overlay: CandidatesOverlay, line: string) => {
-    const head = line.split(" — ")[0];
-    const slash = head.indexOf("/");
-    const self = slash === -1 ? undefined
-      : displayedChannels().find((channel) => channel.adapter === head.slice(0, slash) && channel.model === head.slice(slash + 1));
+    const lineId = ledgerChannelId(line);
+    const self = lineId === undefined ? undefined
+      : displayedChannels().find((channel) => `${channel.adapter}:${channel.model}` === lineId);
     if (!self) {
       ui.notice = `nothing to lift on this row — ${line}`;
       bump();
@@ -1076,7 +1101,12 @@ export function FleetApp({
   };
 
   const reviewWindow = (overlay: Extract<Overlay, { kind: "review" }>) => {
-    const lines = overlay.review.diff.split("\n");
+    // OBS-1144: notes are pre-wrapped to the diff's width and lead the SAME scrolled buffer, so a
+    // note never sits past the terminal's last row, unreachable, while y still saves.
+    const notes = (overlay.review.notes ?? [])
+      .flatMap((note) => wrapCells(`! ${note}`, bodyW - 6, { continuationPrefix: "  " }))
+      .map((text) => ({ text, note: true }));
+    const lines = [...notes, ...overlay.review.diff.split("\n").map((text) => ({ text, note: false }))];
     const cap = reviewCapacity();
     const maxScroll = Math.max(lines.length - cap, 0);
     const scroll = Math.min(Math.max(overlay.scroll, 0), maxScroll);
@@ -1393,12 +1423,33 @@ export function FleetApp({
           bump();
           return;
         }
-        if (input === " " && rows[overlay.at]) {
-          const id = rows[overlay.at].id;
+        if (input === " ") {
+          const offered = rows[overlay.at];
+          const greyed = offered ? undefined : ledger[overlay.at - rows.length];
+          const id = offered?.id ?? (greyed === undefined ? undefined : ledgerChannelId(greyed));
+          if (id === undefined) return;
           const at = overlay.chain.indexOf(id);
-          if (at === -1) overlay.chain.push(id);
-          else overlay.chain.splice(at, 1);
+          // OBS-1145 add.1: Space drops ANY carried member, admitted or not, and leaves its deny
+          // alone; only an offered row joins — a greyed one still enters through its reach (Enter)
+          if (at !== -1) overlay.chain.splice(at, 1);
+          else if (offered) overlay.chain.push(id);
+          else ui.notice = `${id} is not offered — Enter lifts it first; Space pools offered rows only`;
           bump();
+          return;
+        }
+        // a selection is a POOL, and its mode is a decision, not a default — the tiny
+        // poolmode overlay asks it; Esc there restores this picker with the chain intact
+        // OBS-525: an existing pool's mode seeds the cursor so a round-trip keeps it
+        const askPoolMode = () =>
+          setOverlay({ kind: "poolmode", picker: overlay, at: ui.map[overlay.shape]?.pool?.mode === "ordered" ? 1 : 0 });
+        // OBS-1145 add.1: Tab applies the chain from ANY row — in an all-greyed picker every row is
+        // ✗ and Enter lifts it, so a Space drop there had no commit path; Tab lifts no deny
+        if (key.tab) {
+          if (overlay.chain.length) askPoolMode();
+          else {
+            ui.notice = `the ${overlay.shape} pool is empty — Esc keeps it; a on the shape reverts it to auto`;
+            bump();
+          }
           return;
         }
         if (key.return) {
@@ -1408,10 +1459,7 @@ export function FleetApp({
             return;
           }
           if (overlay.chain.length) {
-            // a selection is a POOL, and its mode is a decision, not a default — the tiny
-            // poolmode overlay asks it; Esc there restores this picker with the chain intact
-            // OBS-525: an existing pool's mode seeds the cursor so a round-trip keeps it
-            setOverlay({ kind: "poolmode", picker: overlay, at: ui.map[overlay.shape]?.pool?.mode === "ordered" ? 1 : 0 });
+            askPoolMode();
             return;
           }
           if (rows[overlay.at]) {
@@ -1792,6 +1840,25 @@ export function FleetApp({
         setOverlay({ kind: "lift", id: `${row.adapter}:${row.model}`, covering: row.covering });
         return;
       }
+      if (hotkey === "e" && row) {
+        // OBS-1182: e cycles launch effort default → low → medium → high → default; the seat's
+        // identity (adapter:model) never changes, only tiers.<adapter>.modelOverrides.<model>.effort
+        if (!(EFFORT_ADAPTERS as readonly string[]).includes(row.adapter)) {
+          ui.notice = `${row.adapter} takes no effort level — effort is launch metadata only ${EFFORT_ADAPTERS.join(" and ")} accept`;
+        } else if (!row.tier) {
+          ui.notice = `${row.adapter}:${row.model} is unclassified — classify it before setting its effort`;
+        } else {
+          const current = ui.efforts[row.adapter]?.[row.model];
+          const next = EFFORTS[current === undefined ? 0 : EFFORTS.indexOf(current) + 1];
+          const models = { ...ui.efforts[row.adapter] };
+          if (next === undefined) delete models[row.model];
+          else models[row.model] = next;
+          ui.efforts = { ...ui.efforts, [row.adapter]: models };
+          ui.notice = `${row.adapter}:${row.model} effort → ${next ?? "CLI default"} — w writes tiers.${row.adapter}.modelOverrides.${row.model}.effort`;
+        }
+        bump();
+        return;
+      }
       if (hotkey === "t" && row) {
         if (row.tier) {
           ui.notice = "tier reassignment on classified models is not supported in v1 — edit config directly";
@@ -2000,6 +2067,7 @@ export function FleetApp({
     const parts = [
       `${row.adapter}:${row.model}`,
       row.tier ?? "unclassified",
+      ui.efforts[row.adapter]?.[row.model] ? `effort ${ui.efforts[row.adapter][row.model]}` : "",
       ui.lastEdit?.id === `${row.adapter}:${row.model}` ? ui.lastEdit.text : "",
       identityDetail(row),
       row.tier ? reachDetail(row) : "",
@@ -2149,15 +2217,15 @@ export function FleetApp({
       const { visible, scroll, cap, lines } = reviewWindow(overlay);
       const below = lines.length - scroll - visible.length;
       return (
-        <OverlayPanel title={`review · ${overlay.review.path}`} width={bodyW}>
+        <OverlayPanel title={clipPathTail(`review · ${overlay.review.path}`, bodyW - 4)} width={bodyW}>
           <Text dimColor wrap="truncate">{clip("everything staged lands in this one diff — y writes, n discards, ↑↓ scroll, Esc keeps editing", bodyW - 4)}</Text>
           {scroll > 0 && <ElisionMark count={scroll} side="above" />}
-          {visible.map((line, index) => (
+          {visible.map(({ text: line, note }, index) => (
             <Text
               key={`${scroll + index}:${line}`}
               wrap="truncate"
-              color={line.startsWith("+") ? INK.brand : line.startsWith("-") ? INK.fail : undefined}
-              dimColor={line.startsWith("@") || line.startsWith("---") || line.startsWith("+++")}
+              color={note ? INK.warn : line.startsWith("+") ? INK.brand : line.startsWith("-") ? INK.fail : undefined}
+              dimColor={!note && (line.startsWith("@") || line.startsWith("---") || line.startsWith("+++"))}
             >
               {clip(line, bodyW - 6) || " "}
             </Text>
@@ -2264,7 +2332,7 @@ export function FleetApp({
       const chained = overlay.chain.length > 0;
       return (
         <OverlayPanel title={chained ? `pool · ${overlay.shape}` : `pin · ${overlay.shape}`} width={bodyW}>
-          <Text dimColor wrap="truncate">{clip("Enter pins one channel · Space selects a pool in order — Enter then asks its mode (pool replaces pin)", bodyW - 4)}</Text>
+          <Text dimColor wrap="truncate">{clip("Enter pins one channel · Space pools in order · Tab applies the pool from any row — Enter on an offered row too (pool replaces pin)", bodyW - 4)}</Text>
           <SearchRow filter={ui.filter} active />
           {noteLines.map((line, index) =>
             <Text key={`excluded-${index}`} dimColor wrap="truncate">{clip(line, bodyW - 4)}</Text>)}
@@ -2272,11 +2340,15 @@ export function FleetApp({
           {visible.map(({ candidate, line }, index) => {
             const selected = start + index === overlay.at;
             if (candidate === undefined) {
+              // OBS-1145 add.1: a carried chain member the picker cannot offer keeps its ordinal
+              const id = ledgerChannelId(line);
+              const at = id === undefined ? -1 : overlay.chain.indexOf(id);
               return (
                 <Text key={`ledger-${start + index}`} wrap="truncate">
                   <Pointer on={selected} />
+                  {at !== -1 && <Text color={INK.brand}>{`${at + 1} `}</Text>}
                   <Text dimColor>{"✗ "}</Text>
-                  <Text bold={selected} dimColor={!selected}>{clip(line, bodyW - 10)}</Text>
+                  <Text bold={selected} dimColor={!selected}>{clip(line, bodyW - (at === -1 ? 10 : 12))}</Text>
                 </Text>
               );
             }
@@ -2455,6 +2527,9 @@ export function FleetApp({
         </Text>
         <Text> </Text>
         {rows.map((row, index) => renderPlainRow(row.id, row.label, ui.focus === "list" && index === ui.listAt))}
+        {reviewAdvisories.length ? <Text> </Text> : null}
+        {reviewAdvisories.flatMap((line) => wrapCells(`! ${line}`, bodyW - 4, { continuationPrefix: "  " }))
+          .map((text, index) => <Text key={`advisory-${index}`} color={INK.warn}>{text}</Text>)}
       </Box>
     );
   })();
@@ -2528,6 +2603,7 @@ export function FleetApp({
       if (overlay.kind === "candidates") {
         return [
           { key: "Enter", label: overlay.chain.length ? "apply pool" : "pin · lift greyed" },
+          ...(overlay.chain.length ? [{ key: "Tab", label: "apply from any row" }] : []),
           { key: "Space", label: "pool in order" },
           { key: "type", label: "search" },
           { key: "Esc", label: "cancel" },
@@ -2572,6 +2648,7 @@ export function FleetApp({
         { key: "Enter", label: "assign/classify" },
         { key: "Space", label: "reach picker" },
         { key: "l", label: "lift entry" },
+        { key: "e", label: "effort" },
         { key: "m", label: "presets" },
         { key: "w", label: "review + write" },
         { key: "←", label: "rail" },
@@ -2633,6 +2710,7 @@ export async function runFleetInkEditor({
   adapters,
   health,
   initialAllowOut = [],
+  initialEfforts,
   modelGroups,
   initialMode,
   modeOptions,
@@ -2643,6 +2721,7 @@ export async function runFleetInkEditor({
   preferOptionsForShape,
   initialSteering,
   steeringOptionsFor,
+  reviewAdvisories = [],
   reviewOverlay,
   reloadGuard,
   stagedRouting,
@@ -2660,6 +2739,8 @@ export async function runFleetInkEditor({
   health: Record<string, AuthHealth>;
   /** OBS-1046: adapter ids and adapter:model keys routing.allow leaves out of the fleet */
   initialAllowOut?: string[];
+  /** OBS-1182: configured launch effort per adapter → model */
+  initialEfforts?: Record<string, Record<string, Effort>>;
   modelGroups: FleetModelGroup[];
   initialMode: RoutingMode;
   modeOptions: FleetModeOption[];
@@ -2675,6 +2756,8 @@ export async function runFleetInkEditor({
   preferOptionsForShape: (shape: Shape, current: string[]) => string[];
   initialSteering: Record<FleetSteeringKey, string[] | undefined>;
   steeringOptionsFor: (which: FleetSteeringKey, current: string[]) => string[];
+  /** OBS-1052(3): advisory review no-verdict history lines — display only, never a routing input */
+  reviewAdvisories?: string[];
   reviewOverlay: (state: FleetEditorState) => FleetOverlayReview;
   reloadGuard: (bytes: string) => string | null;
   /** the routing policy the staged deny sets load as (fleet: the config loader over the candidate
@@ -2717,6 +2800,7 @@ export async function runFleetInkEditor({
       agents={agents}
       {...initialDenyProps}
       initialAllowOut={initialAllowOut}
+      initialEfforts={initialEfforts}
       modelGroups={declaredModelGroups}
       initialMode={initialMode}
       modeOptions={modeOptions}
@@ -2727,6 +2811,7 @@ export async function runFleetInkEditor({
       preferOptionsForShape={preferOptionsForShape}
       initialSteering={initialSteering}
       steeringOptionsFor={steeringOptionsFor}
+      reviewAdvisories={reviewAdvisories}
       reviewOverlay={reviewOverlay}
       reloadGuard={reloadGuard}
       stagedRouting={stagedRouting}

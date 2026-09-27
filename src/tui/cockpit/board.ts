@@ -57,9 +57,9 @@ const AREAS: readonly (readonly [string, readonly RegExp[]])[] = [
   ["FLEET", [/^src\/(route|config|adapters)\//]],
   ["RUN", [/^src\/(run|drivers|eval)\//]],
   ["GATE", [/^src\/gates\//]],
-  ["UI", [/^src\/(cli|tui|report)\//, /^src\/brand\.ts/]],
-  ["DOCS", [/^(docs|skills)\//]],
-  ["REPO", [/^(scripts|schema)\//, /^\.github\//, /^tests\/(lint|repo|helpers)\//, /^(vitest\.config|package\.json|tsconfig)/]],
+  ["UI", [/^src\/(cli|tui|report)\//, /^src\/brand\.ts/, /^tests\/cockpit\//]],
+  ["DOCS", [/^(docs|skills)\//, /^\.claude\/skills\//]],
+  ["REPO", [/^(scripts|schema)\//, /^\.github\//, /^tests\/(lint|repo|helpers|fixtures)\//, /^(vitest\.config|package\.json|tsconfig)/]],
 ];
 export const BOARD_AREA_ORDER = AREAS.map(([n]) => n);
 const expandBraces = (p: string): string[] => {

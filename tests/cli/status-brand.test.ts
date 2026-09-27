@@ -273,6 +273,8 @@ describe("T3 watch cockpit brand restyle", () => {
         `    phase terminal · last evidence ${lastRowTime} · responsible unrecorded · blocker none · next action unrecorded · human-decision no\n` +
         "  [!] T2 failed  B[x] T[!] L[ ] E[ ] S[ ] A. R.  failed  fake:fake-2 / ctx 1234\n" +
         `    phase terminal · last evidence ${lastRowTime} · responsible unrecorded · blocker none · next action unrecorded · human-decision no\n` +
+        // OBS-1178: a failed task's recovery line names the failure token its recheck binds to
+        `    failed — T2 — failure 9@${lastRowTime} — re-gate landed work with \`tickmarkr approve run-brand T2 --recheck --park 9@${lastRowTime}\`\n` +
         "  [ ] T3 starved  B[ ] T[ ] L[ ] E[ ] S[ ] A. R.  pending starved  -\n" +
         "    phase unrecorded · last evidence unrecorded · responsible unrecorded · blocker dependency-wait · next action Wait for prerequisites: T2 · human-decision no",
       );

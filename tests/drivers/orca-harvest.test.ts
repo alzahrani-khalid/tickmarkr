@@ -134,7 +134,7 @@ describe("OrcaDriver harvest truth", () => {
     expect(screenReads(stuck.fake)).toBeGreaterThan(1);
   });
 
-  test("test: classifyHost with a whitespace-only terminal handle classifies none; two driver instances racing the board owner lock where the first crashes after its reservation write leave the canonical record present and readable at every step, the second binds after it recovers the dead holder's lock within one injected tick when that holder's observer is dead, and while the crashed holder's observer is still alive the second is refused and neither replaces nor acts on the record until that observer's acknowledged stop arrives on injected time, after which it binds; a live holder is refused after the bounded wait with the record untouched; a fixture observer that claims after two injected ticks is bound, one that never claims leaves a tombstone so the next narrator call issues a fresh split, and a split whose receipt is malformed or handle-less rejects naming placement, tombstones the reservation and never closes a guessed handle, so a lock without staleness recovery, a crash that orphans the record, a replacement before the observer's acknowledged stop, a wall-clock claim wait, or an accepted malformed receipt fails", async () => {
+  test("test: classifyHost with a whitespace-only terminal handle classifies none; two driver instances racing the board owner lock where the first crashes after its reservation write leave the canonical record present and readable at every step, the second binds after it recovers the dead holder's lock within one injected tick when that holder's observer is dead, and while the crashed holder's observer is still alive the second is refused and neither replaces nor acts on the record until that observer's acknowledged stop arrives on injected time, after which it binds; a live holder is refused after the bounded wait with the record untouched; a fixture observer that claims after two injected ticks is bound, one that never claims leaves a tombstone so the next narrator call issues a fresh split, and a split whose receipt is malformed or handle-less rejects naming placement, holds the reservation without a second split and never closes a guessed handle, so a lock without staleness recovery, a crash that orphans the record, a replacement before the observer's acknowledged stop, a wall-clock claim wait, or an accepted malformed receipt fails", async () => {
     expect(classifyHost({ TERM_PROGRAM: "Orca", ORCA_TERMINAL_HANDLE: " \t " })).toBe("none");
     expect(classifyHost({ TERM_PROGRAM: "Orca", ORCA_TERMINAL_HANDLE: "term_x" })).toBe("orca");
 
@@ -399,13 +399,17 @@ describe("OrcaDriver harvest truth", () => {
     expect(readWatchBoard(repo, neverRun)).toMatchObject({ pane: fresh.id, pid: process.pid });
     expect(readWatchBoard(repo, neverRun)?.token).not.toBe(tombstone.token);
 
-    // --- a malformed or handle-less split receipt: rejected, tombstoned, no guessed close ---
+    // --- a malformed or handle-less split receipt: rejected, no guessed close. The split DID start a
+    // pane nobody claimed, so the reservation is held (OBS-1172), never tombstoned: a second call
+    // reconciles it again and splits no second board ---
     for (const [label, receipt] of [["handle-less", { tabId: "launching-tab" }], ["malformed", { handle: "term_forged" }]] as const) {
       const malformedRun = `run-malformed-${label}`;
       const bad = rigFor({ splitReceipt: receipt });
       hooks.runId = malformedRun;
-      await expect(bad.driver().narrator(repo, command(malformedRun), malformedRun), label).rejects.toThrow(/placement failed .*malformed or handle-less/);
-      expect(JSON.parse(bytes(malformedRun)), label).toMatchObject({ driver: "orca", pane: "", retired: true });
+      await expect(bad.driver().narrator(repo, command(malformedRun), malformedRun), label).rejects.toThrow(/placement unresolved .*malformed or handle-less.*held/);
+      expect(JSON.parse(bytes(malformedRun)), label).toMatchObject({ driver: "orca", pane: "" });
+      expect(JSON.parse(bytes(malformedRun)).retired, label).toBeUndefined();
+      await expect(bad.driver().narrator(repo, command(malformedRun), malformedRun), label).rejects.toThrow(/remains unresolved .*held after an indeterminate split receipt/);
       expect(bad.fake.calls.filter((c) => c[1] === "close"), label).toEqual([]);
       expect(bad.fake.countOf("split"), label).toBe(1);
     }

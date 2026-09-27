@@ -123,7 +123,10 @@ async function seedResume(
       });
     }
   });
-  if (approval) journal.append("task-approved", "T1", approval);
+  if (approval) { // OBS-1178: a pending decision answers a park and binds it
+    journal.append("task-human", "T1", { kind: "gate-fail", reason: "seeded park" });
+    journal.append("task-approved", "T1", { ...approval, park: journal.newestBinding("T1") });
+  }
   writeFileSync(join(journal.dir, "baseline.json"), JSON.stringify({
     commands: Object.fromEntries(SHELL_GATES.map((gate) => [gate, { exitCode: 0, fingerprints: [] }])),
   }));
@@ -297,7 +300,7 @@ test("test: a waiver is consumed by the worktree-recreation row journaled as its
   });
   journal.append("task-human", "T1", { reason: "build failed", kind: "gate-fail" });
   journal.append("task-approved", "T1", {
-    by: "operator", release: "gate-satisfied", gate: "build",
+    by: "operator", release: "gate-satisfied", gate: "build", park: journal.newestBinding("T1"),
   });
   expect(journal.replaySatisfiedGates()).toEqual(new Map([["T1", "build"]]));
 
@@ -318,9 +321,10 @@ test("test: a task re-parked after its waiver was enacted resumes with no gate m
     "run-waiver-enacted-then-reparked",
   );
   journal.append("task-dispatch", "T1", { assignment: ASSIGNMENT, attempt: 0 });
+  journal.append("gate-result", "T1", { gate: "build", pass: false, details: "exit 1" });
   journal.append("task-human", "T1", { reason: "gate failed", kind: "gate-fail" });
   journal.append("task-approved", "T1", {
-    by: "operator", release: "gate-satisfied", gate: "build",
+    by: "operator", release: "gate-satisfied", gate: "build", park: journal.newestBinding("T1"),
   });
   expect(journal.replayStatuses().get("T1")).toBe("pending");
   expect(journal.replaySatisfiedGates()).toEqual(new Map([["T1", "build"]]));
@@ -330,6 +334,7 @@ test("test: a task re-parked after its waiver was enacted resumes with no gate m
   });
   expect(journal.replaySatisfiedGates()).toEqual(new Map());
 
+  journal.append("gate-result", "T1", { gate: "test", pass: false, details: "1 failed" });
   journal.append("task-human", "T1", {
     reason: "post-approval gate failed", kind: "gate-fail",
   });
@@ -339,7 +344,7 @@ test("test: a task re-parked after its waiver was enacted resumes with no gate m
   expect(journal.replaySatisfiedGates()).toEqual(new Map());
 
   journal.append("task-approved", "T1", {
-    by: "operator", release: "gate-satisfied", gate: "test",
+    by: "operator", release: "gate-satisfied", gate: "test", park: journal.newestBinding("T1"),
   });
   expect(journal.replayStatuses().get("T1")).toBe("pending");
   expect(journal.replaySatisfiedGates()).toEqual(new Map([["T1", "test"]]));
@@ -518,13 +523,13 @@ async function fundedPlainResume(live: boolean, closed: boolean) {
   const graph = loadGraph(seed.repo);
   saveGraph(seed.repo, { ...graph, tasks: graph.tasks.map((t) => ({ ...t, status: "human" })) });
   if (closed) seed.journal.append("run-end", undefined, { branch: `tickmarkr/${seed.runId}` });
-  if (!live) seed.journal.append("task-approved", "T1", { by: "operator" });
+  if (!live) seed.journal.append("task-approved", "T1", { by: "operator", park: seed.journal.newestBinding("T1") });
   let appended = false;
   const summary = await runDaemon(seed.repo, { adapters: [seed.fake], runId: seed.runId, resume: true, approvalWindowMs: 1,
     narrate: (e) => {
       if (live && !appended && e.event === "approval-window-start") {
         appended = true;
-        seed.journal.append("task-approved", "T1", { by: "operator" });
+        seed.journal.append("task-approved", "T1", { by: "operator", park: seed.journal.newestBinding("T1") });
       }
     },
   });
@@ -778,7 +783,8 @@ test("test: the same waiver restore whose provisioning exits nonzero re-enters b
 test("test: a recheck restore runs build as a gate and journals no gate-provisioned row, so provisioning that runs a second build beside the build gate fails", async () => {
   const seed = await seedResume("run-recheck-provision", [waiverResults], undefined, undefined, {},
     { ".gitignore": "dist/\n" }, restoreProvisions);
-  seed.journal.append("task-approved", "T1", { by: "operator", release: "recheck", recheckedRef: seed.commit });
+  seed.journal.append("task-human", "T1", { kind: "gate-fail", reason: "review red" }); // OBS-1178: the park it binds
+  seed.journal.append("task-approved", "T1", { by: "operator", release: "recheck", recheckedRef: seed.commit, park: seed.journal.newestBinding("T1") });
   const events = await resume(seed);
   expect(markerLines(seed.marker)).toEqual(["build", "lint", "test"]);
   expect(events.filter((e) => e.event === "gate-provisioned" || e.event === "gate-reused")).toEqual([]);

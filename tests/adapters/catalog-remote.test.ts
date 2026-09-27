@@ -201,6 +201,25 @@ describe("cache-only model capability catalog", () => {
     expect(resolveCatalogModel(cache, { provider: "anthropic", model: "ns/model-x" })?.contextWindow).toBe(111);
   });
 
+  // T16 review (OBS-1147 fallback): the stripped base is a FALLBACK LiveBench identity, never a peer.
+  // With models.dev holding only `gpt-5.6`, a client `gpt-5.6-high` reaches its own `-high` row through
+  // the exact identity; the base identity must not let a sibling `-low`/`-xhigh` row's effort token
+  // outrank that exact row. Effort rank only orders rows of the SAME identity (the bare base's best).
+  test("a client effort variant keeps its exact LiveBench row over sibling effort rows reached through the stripped base", () => {
+    const row = (model: string, n: number) => ({ model, javascript: n, code_generation: n });
+    const rows = [row("gpt-5.6-high", 70), row("gpt-5.6-low", 40), row("gpt-5.6-xhigh", 80)];
+    for (const ordered of [rows, [...rows].reverse()]) {
+      const cache: CatalogCache = {
+        ...catalogFixture([{ id: "gpt-5.6", input: 4, output: 20, context: 400_000 }]),
+        liveBench: { tableDate: "2026_06_25", categories: { "Agentic Coding": ["javascript"], Coding: ["code_generation"] }, rows: ordered },
+      };
+      const high = resolveCatalogModel(cache, { provider: "anthropic", model: "gpt-5.6-high" });
+      expect(high?.catalogId).toBe("anthropic/gpt-5.6");
+      expect(high?.agenticCodingScore).toBe(70);
+      expect(resolveCatalogModel(cache, { provider: "anthropic", model: "gpt-5.6" })?.agenticCodingScore).toBe(80);
+    }
+  });
+
   test("test: no suggested tier is ever written into live config, and a suggestion carries its evidence into the provenance note the operator must confirm", () => {
     const repo = makeRepo({ "keep.txt": "x" });
     mkdirSync(join(repo, ".tickmarkr"), { recursive: true });

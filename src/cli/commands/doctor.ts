@@ -15,10 +15,11 @@ import { HerdrDriver } from "../../drivers/herdr.js";
 import { ORCA_FIXTURE_VERSION, parseEnvelope, resolveOrcaCliBinary } from "../../drivers/orca.js";
 import type { WorkerAdapter } from "../../adapters/types.js";
 import { kimi, type KimiDoctorTurnResult, probeKimiDoctorTurn } from "../../adapters/kimi.js";
-import { denyPreferCollisionLine, denyPreferCollisions, disallowedBy, excludedChannels, exclusionLine, preferRanks } from "../../route/preference.js";
+import { denyPreferCollisionLine, denyPreferCollisions, disallowedBy, excludedChannels, exclusionLine, observedSeat, preferRanks } from "../../route/preference.js";
 import { CATALOG_REFRESH_TIMEOUT_MS, LIVEBENCH_TABLE_DATE, formatCatalogRefreshLegs, readCachedCatalog, refreshCatalogCommand, type CatalogFetcher, type CatalogReadResult } from "../../adapters/catalog-remote.js";
 import { sh, type ShResult } from "../../run/git.js";
 import { auditNamedTestOracles, listVitestTests, type VitestListResult } from "../../gates/acceptance.js";
+import { readReviewNoVerdictHistory, reviewNoVerdictRows } from "../../run/journal.js";
 
 /** Where a newer `table_<date>.csv` is discovered — the deployed site builds filenames by
  *  concatenation and publishes no index, so the release listing is the only enumerable surface. */
@@ -739,6 +740,12 @@ export async function doctor(
         `${demotion.count} review seat${demotion.count === 1 ? "" : "s"} demoted · cause ${causes}`));
     }
   }
+  // OBS-1052(3): measured, never inferred — an unreadable journal renders unknown, not a clean zero.
+  const noVerdictRows = reviewNoVerdictRows(readReviewNoVerdictHistory(cwd));
+  if (noVerdictRows.length) {
+    rows.push(legend("review no-verdict history:"));
+    for (const row of noVerdictRows) rows.push(alignedStatusRow(row.verdict, row.channel, row.value));
+  }
   if (existsSync(graphPath(cwd))) {
     try {
       const graph = loadGraph(cwd);
@@ -842,7 +849,7 @@ export async function doctor(
   lintRows.push(...modelLints(cfg, health, adapters, { tty: ttyVisual(), stateDir: stateDirName(cwd), overlayPreferShapes: overlayPreferShapes(cwd) }).map(attentionRow));
   const excluded = excludedChannels(cfg, adapters, health);
   if (excluded.length) lintRows.push(attentionRow(exclusionLine(excluded)));
-  lintRows.push(...denyPreferCollisions(cfg).map((c) => attentionRow(denyPreferCollisionLine(c))));
+  lintRows.push(...denyPreferCollisions(cfg, undefined, health).map((c) => attentionRow(denyPreferCollisionLine(c))));
   const aliasExcluded = modelAliasExclusions(cfg, adapters, health);
   if (aliasExcluded.length) lintRows.push(attentionRow(modelAliasLine(aliasExcluded)));
   lintRows.push(...binaryShadowWarnings(adapters, health, cwd).map(attentionRow));
@@ -913,7 +920,7 @@ export async function doctor(
           : v.authed
           ? `${ok("authed")}${probed}`
           : `${fail("unauthed:")} ${trunc(v.reason ?? "probe failed", 40)} (${dateOf(v.probedAt)})`;
-      const d = disallowedBy({ adapter: a.id, model: m }, cfg.routing);
+      const d = disallowedBy(observedSeat(health, a.id, m), cfg.routing);
       const denied = d?.by === "deny" ? d.entry : "—";
       const pref = preferRanks({ adapter: a.id, model: m }, cfg).map((p) => `${p.shape}#${p.rank}`).join(",") || "—";
       const window = declaredModelWindow(cfg, a.id, m);

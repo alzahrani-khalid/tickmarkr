@@ -135,14 +135,21 @@ export const COMMAND_HELP = {
   approve: {
     usage: "approve <run-id> <task-id> [options]", description: "Append a validated park decision. A running owner may enact it; a closed run requires a separate resume. Decisions cannot be undone.",
     options: {
+      "--park <line>@<ts>": "Bind the decision to the park token status prints (a failed task's recheck binds its failure token); refused once a newer park opens.",
+      "--gate <gate>": "Bind a waive to the park's failed gate; refused when the park failed another gate.",
       "--files <glob,…>": "Extend files[] for a scope-request park with comma-separated repository-relative globs; required for scope approval.",
       "--by <name>": "Name the actor (default: current OS user).",
       "--reason <text>": "Record the decision reason.",
       "--waive": "Waive only the identified failed gate.",
       "--uphold": "Uphold a review failure and fund a fixed attempt.",
       "--recheck": "Request rechecking an infra or failed-gate park; satisfies no gate.",
-      "--review-rounds <N>": "Set a positive integer review-round ceiling with the decision.",
-    }, examples: ["approve run-example T1 --by operator --reason 'ready to proceed'", "approve run-example T1 --recheck --reason 'infra recovered'"],
+      "--review-rounds <N>": "Set a positive integer review-round ceiling that binds only this approval engagement; a later approval without --review-rounds restores the built-in default.",
+    }, examples: [
+      "approve run-example T1 --park 42@2026-09-26T08:00:00.000Z --by operator --reason 'ready to proceed'",
+      "approve run-example T1 --waive --park 42@2026-09-26T08:00:00.000Z --gate review",
+      "approve run-example T1 --recheck --park 42@2026-09-26T08:00:00.000Z --reason 'infra recovered'",
+      "approve run-example T3 --recheck --park 57@2026-09-26T08:05:00.000Z --reason 'failed task: re-gate its landed commits'",
+    ],
   },
   beat: {
     usage: "beat <orchestrator|orchestrator-context|overseer|overseer-context|watch> --seat <identity> [options]",

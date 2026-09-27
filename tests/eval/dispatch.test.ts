@@ -2,12 +2,16 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
+import { claudeCode } from "../../src/adapters/claude-code.js";
+import { codex } from "../../src/adapters/codex.js";
+import { FakeAdapter } from "../../src/adapters/fake.js";
 import { parseWorkerResult } from "../../src/adapters/prompt.js";
-import type { Assignment, AuthHealth, BillingChannel, Invocation, WorkerAdapter, WorkerResult } from "../../src/adapters/types.js";
-import { DEFAULT_CONFIG } from "../../src/config/config.js";
+import { type Assignment, type AuthHealth, type BillingChannel, channelsFromConfig, type Invocation, type WorkerAdapter, type WorkerResult } from "../../src/adapters/types.js";
+import { DEFAULT_CONFIG, type TickmarkrConfig } from "../../src/config/config.js";
 import { dispatchFixture, type ChannelResult } from "../../src/eval/dispatch.js";
 import type { Fixture } from "../../src/eval/fixtures.js";
-import type { Task } from "../../src/graph/schema.js";
+import { type Effort, type Task, validateGraph } from "../../src/graph/schema.js";
+import { scopeIntent } from "../../src/plan/scope.js";
 
 const PROBED_AT = "1970-01-01T00:00:00.000Z";
 
@@ -255,4 +259,104 @@ describe("identical cross-channel dispatch", () => {
     expect(results[0]?.worker?.ok).toBe(true);
     cleanup();
   });
+});
+
+// OBS-1182: every caller outside the daemon hands the adapter the routed seat's effort too.
+class ScopeEffortFake extends FakeAdapter {
+  readonly efforts: Array<Effort | undefined> = [];
+  override channels(cfg: TickmarkrConfig): BillingChannel[] {
+    return channelsFromConfig("fake", cfg);
+  }
+  override headlessCommand(promptFile: string, model: string, effort?: Effort): string {
+    this.efforts.push(effort);
+    return super.headlessCommand(promptFile, model);
+  }
+}
+
+const SCOPE_DRAFT = `<!-- tickmarkr:spec -->
+# Export reports
+
+## Requirements
+- REQ-01: Export reports as JSON
+
+## Assumptions
+- Existing authorization rules apply
+
+## Traceability
+| Requirement | Tasks |
+| --- | --- |
+| REQ-01 | T1 |
+
+## T1: Export reports [REQ-01]
+- goal: Export reports as JSON
+- shape: implement
+- files: src/reports.ts
+- acceptance:
+  - command: npm test
+`;
+
+async function scopeEfforts(model: "fake-1" | "fake-2", bound: boolean): Promise<Array<Effort | undefined>> {
+  const repo = mkdtempSync(join(tmpdir(), "tickmarkr-scope-effort-"));
+  const intentFile = join(repo, "reports.intent.md");
+  writeFileSync(intentFile, "# Export reports\n\n## Blocking questions\n1. Which format?\n\n## Answers\n1. JSON\n");
+  const scriptFile = join(repo, "fake.json");
+  writeFileSync(scriptFile, JSON.stringify({ tasks: {}, judge: { spec: SCOPE_DRAFT } }));
+  const cfg = structuredClone(DEFAULT_CONFIG);
+  cfg.tiers.fake = {
+    vendor: "fake-a", channel: "sub",
+    models: { "fake-1": "frontier", "fake-2": "frontier" },
+    modelOverrides: { "fake-1": { effort: "high" } },
+  };
+  cfg.routing.map.spec = { pin: { via: "fake", model } };
+  const fake = new ScopeEffortFake(scriptFile);
+  try {
+    await scopeIntent(intentFile, repo, { cfg, adapters: [fake], ...(bound ? { candidate: { adapter: "fake", model } } : {}) });
+  } finally {
+    rmSync(repo, { recursive: true, force: true });
+  }
+  return fake.efforts;
+}
+
+describe("OBS-1182 non-daemon effort", () => {
+  test("direct adapter invoke eval dispatch and planning preserve configured effort versus omitted defaults, so one non-daemon caller losing high effort fails", async () => {
+    // direct adapter invoke: the real CLIs' argv carries the level, and omission renders nothing
+    const task = validateGraph({
+      version: 1, spec: { source: "prd", paths: ["p"], hash: "h" },
+      tasks: [{ id: "T1", title: "t", goal: "g", shape: "implement", complexity: 3, acceptance: ["a"] }],
+    }).tasks[0]!;
+    const seat = (adapter: string, model: string, effort?: Effort): Assignment =>
+      ({ adapter, model, channel: "sub", tier: "frontier", ...(effort ? { effort } : {}) });
+    const ctx = { promptFile: "/tmp/prompt.md" };
+    expect(claudeCode.invoke(task, "/w", seat("claude-code", "opus", "high"), ctx).command).toContain(" --effort 'high' ");
+    expect(claudeCode.invoke(task, "/w", seat("claude-code", "opus"), ctx).command).not.toContain("--effort");
+    expect(codex.invoke(task, "/w", seat("codex", "gpt-5.6-sol", "high"), ctx).command).toContain(" -c 'model_reasoning_effort=high' ");
+    expect(codex.invoke(task, "/w", seat("codex", "gpt-5.6-sol"), ctx).command).not.toContain("model_reasoning_effort");
+
+    // eval dispatch: each channel is invoked at its own effort, an unset channel with no effort key
+    const { fixture, cleanup } = tempFixture('[ "$(cat a.txt)" = "start" ]');
+    const adapter = new PromptProbeAdapter();
+    try {
+      await dispatchFixture({
+        fixture,
+        channels: [
+          { adapter: "prompt-probe", vendor: "prompt-probe", model: "m1", channel: "sub", tier: "frontier", effort: "high" },
+          { adapter: "prompt-probe", vendor: "prompt-probe", model: "m2", channel: "api", tier: "frontier" },
+        ],
+        adapters: [adapter],
+        health: { "prompt-probe": await adapter.probe() },
+        cfg: DEFAULT_CONFIG,
+      });
+    } finally {
+      cleanup();
+    }
+    expect(adapter.invokes.map((i) => i.assignment.model)).toEqual(["m1", "m2"]);
+    expect(adapter.invokes[0]!.assignment.effort).toBe("high");
+    expect("effort" in adapter.invokes[1]!.assignment).toBe(false);
+
+    // planning: a routed and an operator-bound scope seat both draft at the seat's effort
+    for (const bound of [false, true]) {
+      expect(await scopeEfforts("fake-1", bound), `bound=${bound}`).toEqual(["high"]);
+      expect(await scopeEfforts("fake-2", bound), `bound=${bound}`).toEqual([undefined]);
+    }
+  }, 60_000);
 });

@@ -11,6 +11,7 @@ import {
   approvalRunOwner,
   approve,
   DECISION_VERBS,
+  parkToken,
   permittedDecisionVerbs,
   releaseForDecision,
   type DecisionVerb,
@@ -129,6 +130,44 @@ function park(j: Journal, taskId: string, kind: string, opts: { failedGate?: str
 }
 
 describe("C4 — Run and validated decisions", () => {
+  test("cockpit refuses an explicitly mismatched gate and preserves a matching or inferred gate", () => {
+    const root = repo();
+    const runId = "run-named-gate";
+    const j = Journal.create(root, runId);
+    park(j, "T1", "gate-fail", { failedGate: "test" });
+    const context = { cwd: root, runId, by: "operator" };
+    expect(previewDecision({ verb: "waive", taskId: "T1", gate: "review" }, context)).toMatchObject({
+      ok: false, refusal: expect.stringContaining("refusing mismatched gate for T1: --gate review"),
+    });
+    for (const gate of [undefined, "test"]) {
+      const result = previewDecision({ verb: "waive", taskId: "T1", gate }, context);
+      if (!result.ok) throw new Error(result.refusal);
+      expect(result.preview.command.gate).toBe("test");
+      expect(result.preview.argv).toContain("--gate");
+      expect(result.preview.argv[result.preview.argv.indexOf("--gate") + 1]).toBe("test");
+    }
+    expect(approvals(root, runId, "T1")).toHaveLength(0);
+  });
+
+  test("a park whose earlier decision the daemon refused still takes a fresh bound Run cockpit decision (OBS-1178)", async () => {
+    const root = repo();
+    const runId = "run-refused-then-fresh";
+    const j = Journal.create(root, runId);
+    park(j, "T1", "gate-fail", { failedGate: "review", reason: "review red" });
+    j.append("task-approved", "T1", { by: "racer", via: "cli", release: "gate-satisfied", gate: "review" }); // unbound
+    j.append("approval-refused", "T1", { reason: "unbound" });
+    const [decision] = deriveRunDecisions(Journal.open(root, runId));
+    expect(decision?.taskId).toBe("T1");
+    const preview = previewDecision({ verb: "waive", taskId: "T1" }, { cwd: root, runId, by: "operator" });
+    expect(preview.ok, preview.ok ? "" : preview.refusal).toBe(true);
+    if (!preview.ok) return;
+    const receipt = await executeDecision(preview.preview, { cwd: root });
+    expect(receipt.ok, receipt.ok ? "" : receipt.refusal).toBe(true);
+    expect(approvals(root, runId, "T1")).toHaveLength(2);
+    expect(approvals(root, runId, "T1").at(-1)!.data).toMatchObject({ by: "operator", release: "gate-satisfied", gate: "review", park: { line: preview.preview.park.line } });
+    expect(Journal.open(root, runId).replaySatisfiedGates().get("T1")).toBe("review");
+  });
+
   test("a mounted Run scope request shows its exact files approval diagnostic and cannot open a bare approve confirmation", async () => {
     const root = repo();
     const runId = "run-scope-view";
@@ -180,7 +219,7 @@ describe("C4 — Run and validated decisions", () => {
     j.append("task-dispatch", "T6", { assignment: ASSIGNMENT, attempt: 0 });
     j.append("gate-result", "T6", { gate: "review", pass: false, details: "requested changes" });
     j.append("task-human", "T6", { kind: "gate-fail", reason: "review round cap" });
-    j.append("task-approved", "T6", { by: "op", via: "cli", release: "gate-satisfied", gate: "review" });
+    j.append("task-approved", "T6", { by: "op", via: "cli", release: "gate-satisfied", gate: "review", park: j.newestBinding("T6") });
     // T7: attempt 0 passed build then died; attempt 1 is running build — the earlier pass must not show.
     j.append("task-dispatch", "T7", { assignment: ASSIGNMENT, attempt: 0 });
     j.append("gate-result", "T7", { gate: "build", pass: true, details: "ok" });
@@ -477,7 +516,7 @@ describe("C4 — Run and validated decisions", () => {
       expect(lines).toContain("park         #L3 infra · failed gate test · signal exit");
       expect(lines).toContain("actor        operator");
       expect(lines).toContain("reason       runner died");
-      expect(lines).toContain(`argv         tickmarkr approve ${runId} T1 --recheck --by operator --reason "runner died"`);
+      expect(lines).toContain(`argv         tickmarkr approve ${runId} T1 --recheck --park ${parkToken(preview.preview.park)} --by operator --reason "runner died"`);
       expect(lines).toContain("consequence  disposition re-dispatch; appends one task-approved with release recheck");
       expect(lines).toContain(`             ${approvalEnactment("re-dispatch", run)}`);
       expect(lines.some((l) => l.startsWith("enactment    ") && l.includes(
@@ -505,7 +544,7 @@ describe("C4 — Run and validated decisions", () => {
       const receiptLines = decisionReceiptLines(receipt);
       expect(receiptLines[0]).toBe(`appended     #L${receipt.appended.line} task-approved T1 · release recheck · disposition re-dispatch · read back from ${join(".tickmarkr", "runs", runId, "journal.jsonl")}`);
       expect(receiptLines).toContain("actor        operator · reason runner died");
-      expect(receiptLines).toContain(`argv         tickmarkr approve ${runId} T1 --recheck --by operator --reason "runner died"`);
+      expect(receiptLines).toContain(`argv         tickmarkr approve ${runId} T1 --recheck --park ${parkToken(preview.preview.park)} --by operator --reason "runner died"`);
       expect(receiptLines).toContain(`             ${approvalEnactment("re-dispatch", run)}`);
       const enactment = receiptLines.find((l) => l.startsWith("enactment    "))!;
       const state = receiptLines.find((l) => l.startsWith("state        "))!;
@@ -533,7 +572,7 @@ describe("C4 — Run and validated decisions", () => {
       const uphold = previewDecision({ verb: "uphold", taskId: "T2", reviewRounds: 2 }, { cwd: root, runId, by: "operator" });
       expect(uphold.ok).toBe(true);
       if (!uphold.ok) continue;
-      expect(decisionConfirmLines(uphold.preview)).toContain(`argv         tickmarkr approve ${runId} T2 --uphold --review-rounds 2 --by operator`);
+      expect(decisionConfirmLines(uphold.preview)).toContain(`argv         tickmarkr approve ${runId} T2 --uphold --park ${parkToken(uphold.preview.park)} --review-rounds 2 --by operator`);
       expect(decisionConfirmLines(uphold.preview)).toContain("park         #L6 gate-fail · failed gate review · review round cap");
       const upheld = await executeDecision(uphold.preview, { cwd: root });
       expect(upheld.ok).toBe(true);
@@ -708,10 +747,12 @@ describe("T9 — projection per agent with source references and honest locators
     expect(by.T2!.phase).toMatchObject({ label: "phase terminal", line: t2Park });
     expect(by.T2!.stalled).toBeUndefined();
 
-    // T3: never dispatched — every field says so rather than inventing a row.
-    expect(by.T3).toMatchObject({ identity: { label: "identity unrecorded" }, blocker: { label: "blocker dependency-wait" }, nextAction: { label: "next Wait for prerequisites: T2" } });
+    // T3: never dispatched — identity, phase, and build fold into one clause; the dependency wait stays.
+    expect(by.T3).toMatchObject({ identity: { label: "identity unrecorded" }, blocker: { label: "blocker dependency-wait" }, nextAction: { label: "next Wait for prerequisites: T2" }, neverDispatched: true });
     expect(by.T3!.identity.line).toBeUndefined();
     expect(by.T3!.stalled).toBeUndefined();
+    expect(projectionLine(by.T3!)).toBe("T3 · missing evidence · blocker dependency-wait (no journal row) · next Wait for prerequisites: T2 (no journal row)");
+    expect(projectionLine(by.T3!)).not.toMatch(/identity |phase |build /u);
 
     // Every recorded reading carries the line it came from — a row without source references fails.
     for (const p of [by.T1!, by.T2!]) for (const f of [p.identity, p.phase]) expect(f.line, `${p.taskId} ${f.label}`).toBeGreaterThan(0);
@@ -776,7 +817,7 @@ describe("T9 — projection per agent with source references and honest locators
     const t1Text = taskRows.find((r) => r.text.startsWith("T1 "))!.text;
     expect(t1Text).toContain(`${STALL_MARKER} · launch #L${t1Launch1} · 1 nudge failed (no journal row) · 1 paged (no journal row)`);
     expect(t1Text).not.toContain("source");
-    expect(taskProjectionText(data.taskRows.find((r) => r.taskId === "T3")!, data.journalRows)).toBe("identity - · phase unconfirmed (no journal row) · build start-unrecorded · blocker unknown (no journal row) · next -");
+    expect(taskProjectionText(data.taskRows.find((r) => r.taskId === "T3")!, data.journalRows)).toBe("missing evidence");
 
     // Presentation rows omit attempts, so the cockpit must fail closed in the opposite ordering
     // too: stale attempt-0 evidence before accepted attempt-1 evidence is still ambiguous here.
@@ -795,6 +836,117 @@ describe("T9 — projection per agent with source references and honest locators
     const probeText = deriveRunViewRows(probeData, "tasks")[0]!.text;
     expect(probeText).toContain("phase returned-for-verification (no journal row)");
     expect(probeText).toContain("build completed (no journal row)");
+  });
+
+  test("the production Run view renders one missing-evidence clause for a never-dispatched task versus separate recorded fields after dispatch, so repeated empty labels or lost recorded facts fails", async () => {
+    const root = repo();
+    const graph = graphOf(["T1", "T2"]);
+    const j = Journal.create(root, T9_RUN);
+    j.append("run-start", undefined, { graphDefinitionHash: graphDefinitionHash(graph), branch: "fixture" });
+    const projectionTaskLine = (frame: string, taskId: string): string => {
+      const lines = frame.split("\n").map((line) => line.replaceAll("│", "").trim());
+      const start = lines.findIndex((l) => l.includes("PROJECTION / every task"));
+      const body: string[] = [];
+      for (const line of lines.slice(start + 1)) {
+        if (line === "" || /^[╭╮╰╯─]+$/u.test(line)) break;
+        body.push(line);
+      }
+      let current = "";
+      const chunks: string[] = [];
+      for (const line of body) {
+        if (/^T\d+ · /u.test(line)) {
+          if (current) chunks.push(current);
+          current = line;
+        } else if (current) current += line;
+      }
+      if (current) chunks.push(current);
+      return chunks.find((chunk) => chunk.startsWith(`${taskId} ·`)) ?? "";
+    };
+
+    const before = await drawRun(root, T9_RUN, initialRunViewSession(), 800, graph);
+    for (const id of ["T1", "T2"]) {
+      const line = projectionTaskLine(before, id);
+      expect(line, id).toBe(`${id} · missing evidence`);
+      expect(line.split(" · "), id).toEqual([id, "missing evidence"]);
+      expect(line, id).not.toMatch(/\(no journal row\)|identity |phase |build |blocker |next /u);
+    }
+
+    j.append("task-dispatch", "T1", { assignment: ASSIGNMENT, attempt: 0, worktree: "/wt/T1", pane: "pane-T1", alarmMs: 600000 });
+    launch(j, "T1", 0, { id: "p-11", name: ownedWorker("T1", 0) });
+    j.append("worker-result", "T1", { attempt: 0, ok: true, finished: true, role: "worker", agent: "fake:fake-1" });
+    j.append("phase-start", "T1", { phase: "gates", attempt: 0 });
+    j.append("build-receipt", "T1", { gate: "build", outcome: "completed", confirmedStart: true, exitCode: 0, durationMs: 12, attribution: { runId: T9_RUN, taskId: "T1", attempt: 0, gateRound: 1, invocation: "build#1" } });
+    j.append("gate-result", "T1", { gate: "review", pass: false, attempt: 0, details: "review red" });
+    j.append("task-human", "T1", { kind: "gate-fail", reason: "review red" });
+
+    const after = await drawRun(root, T9_RUN, initialRunViewSession(), 800, graph);
+    const { rows, snapshot } = readRun(root, T9_RUN, graph);
+    const decisions = deriveRunDecisions(Journal.open(root, T9_RUN), graph);
+    const dispatched = projectRunTasks(snapshot, rows, graph, decisions, T9_RUN).find((p) => p.taskId === "T1")!;
+    const rendered = projectionTaskLine(after, "T1");
+    expect(dispatched.neverDispatched).toBeUndefined();
+    expect(rendered).toBe(projectionLine(dispatched));
+    expect(rendered).not.toBe("T1 · missing evidence");
+    for (const field of [dispatched.identity, dispatched.phase, dispatched.build, dispatched.blocker, dispatched.nextAction]) {
+      expect(rendered, field.label).toContain(field.label);
+    }
+    expect(rendered).toContain("fake:fake-1");
+    expect(rendered).toContain("build completed exit 0");
+    expect(rendered.split(" · ").length).toBeGreaterThan(2);
+    expect(projectionTaskLine(after, "T2")).toBe("T2 · missing evidence");
+
+    const data = deriveRunCockpitData({ fileName: `${T9_RUN}.journal.jsonl`, raw: readFileSync(join(tickmarkrDir(root), "runs", T9_RUN, "journal.jsonl"), "utf8") }, "t22", { graph: { tasks: graph.tasks.map((t) => ({ id: t.id, title: t.title })) } });
+    expect(taskProjectionText(data.taskRows.find((r) => r.taskId === "T2")!, data.journalRows)).toBe("missing evidence");
+    const dispatchedText = taskProjectionText(data.taskRows.find((r) => r.taskId === "T1")!, data.journalRows);
+    expect(dispatchedText).not.toBe("missing evidence");
+    for (const label of ["identity ", "phase ", "build ", "blocker ", "next "]) expect(dispatchedText, label).toContain(label);
+    expect(dispatchedText).toContain(ownedWorker("T1", 0));
+
+    // A pre-dispatch park is never dispatched, and its journal still recorded the blocker and the park token.
+    const parkRoot = repo();
+    const parkGraph = graphOf(["T5", "T3", "T2"], { T3: ["T2"] });
+    const parkJournal = Journal.create(parkRoot, T9_RUN);
+    parkJournal.append("run-start", undefined, { graphDefinitionHash: graphDefinitionHash(parkGraph), branch: "fixture" });
+    parkJournal.append("task-human", "T5", { kind: "human-gate", reason: 'humanGate: "Task T5" requires approval before dispatch' });
+    const parkedFrame = await drawRun(parkRoot, T9_RUN, initialRunViewSession(), 800, parkGraph);
+    const { rows: parkRows, snapshot: parkSnapshot } = readRun(parkRoot, T9_RUN, parkGraph);
+    const parkDecisions = deriveRunDecisions(Journal.open(parkRoot, T9_RUN), parkGraph);
+    const parked = projectRunTasks(parkSnapshot, parkRows, parkGraph, parkDecisions, T9_RUN);
+    const parkLine = projectionTaskLine(parkedFrame, "T5");
+    const parkProjection = parked.find((p) => p.taskId === "T5")!;
+    expect(parkSnapshot.tasks.find((t) => t.id === "T5")!.dispatches).toBe(0);
+    expect(parkProjection.neverDispatched).toBe(true);
+    expect(parkProjection.blocker.line).toBeGreaterThan(0);
+    expect(parkProjection.nextAction.line).toBe(parkProjection.blocker.line);
+    expect(parkLine).toBe(projectionLine(parkProjection));
+    expect(parkLine).toContain("missing evidence");
+    expect(parkLine).toContain(parkProjection.blocker.label);
+    expect(parkLine).toContain(parkProjection.nextAction.label);
+    expect(parkLine).toContain(`#L${parkProjection.blocker.line}`);
+    expect(parkLine).toContain("(--park ");
+    expect(parkLine).not.toMatch(/identity |phase |build |\(no journal row\)/u);
+    const waiting = parked.find((p) => p.taskId === "T3")!;
+    const waitLine = projectionTaskLine(parkedFrame, "T3");
+    expect(waitLine).toBe(projectionLine(waiting));
+    expect(waitLine).toContain("missing evidence");
+    expect(waitLine).toContain("blocker dependency-wait");
+    expect(waitLine).toContain("next Wait for prerequisites: T2");
+    expect(waitLine).not.toMatch(/identity |phase |build /u);
+    expect(projectionTaskLine(parkedFrame, "T2")).toBe("T2 · missing evidence");
+
+    const parkData = deriveRunCockpitData({ fileName: `${T9_RUN}.journal.jsonl`, raw: readFileSync(join(tickmarkrDir(parkRoot), "runs", T9_RUN, "journal.jsonl"), "utf8") }, "t22", { graph: { tasks: parkGraph.tasks.map((t) => ({ id: t.id, title: t.title, deps: t.deps, status: t.id === "T3" ? "pending" : undefined })) } });
+    const parkText = taskProjectionText(parkData.taskRows.find((r) => r.taskId === "T5")!, parkData.journalRows);
+    expect(parkText.startsWith("missing evidence · blocker ")).toBe(true);
+    expect(parkText).toContain("blocker human-decision");
+    expect(parkText).toContain("next Choose a decision: approve");
+    expect(parkText).toContain("(--park ");
+    expect(parkText).toMatch(/#L\d+/u);
+    expect(parkText).not.toMatch(/identity |phase |build /u);
+    const waitText = taskProjectionText(parkData.taskRows.find((r) => r.taskId === "T3")!, parkData.journalRows);
+    expect(waitText).toContain("missing evidence");
+    expect(waitText).toContain("blocker dependency-wait");
+    expect(waitText).toContain("next Wait for prerequisites: T2");
+    expect(waitText).not.toMatch(/identity |phase |build /u);
   });
 
   test("a pane locator the driver cannot verify a stale one and an ambiguous one render as unavailable with the recorded evidence reachable and no other terminal is selected by title provider or task id, so a guessed replacement tab fails", async () => {

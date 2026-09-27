@@ -5,14 +5,17 @@ import { execSync } from "node:child_process";
 import { describe, expect, test } from "vitest";
 import { FakeAdapter } from "../../src/adapters/fake.js";
 import { claudeCode } from "../../src/adapters/claude-code.js";
-import type { Assignment, BillingChannel } from "../../src/adapters/types.js";
+import { type Assignment, type BillingChannel, channelsFromConfig } from "../../src/adapters/types.js";
 import { runViaDriver, gatePaneName, gateExitTrailer, generateVerdictNonce, verdictNonceLine } from "../../src/gates/llm.js";
 import { DEFAULT_CONFIG } from "../../src/config/config.js";
 import { SubprocessDriver } from "../../src/drivers/subprocess.js";
 import type { ExecutorDriver, Slot } from "../../src/drivers/types.js";
 import { acceptanceGate } from "../../src/gates/acceptance.js";
 import { reviewGate } from "../../src/gates/review.js";
-import { GATE_NAMES, validateGraph } from "../../src/graph/schema.js";
+import { captureBaseline } from "../../src/gates/baseline.js";
+import { runGates } from "../../src/gates/run-gates.js";
+import { type Effort, GATE_NAMES, validateGraph } from "../../src/graph/schema.js";
+import { consult, type ConsultInvocation } from "../../src/run/consult.js";
 import { makeRepo } from "../helpers/tmprepo.js";
 
 const mkTask = (over: Record<string, unknown> = {}) =>
@@ -197,4 +200,104 @@ describe("v1.1 driver-routed gates", () => {
     expect(names).toHaveLength(0);
     expect(closed).toHaveLength(0);
   });
+});
+
+// OBS-1182: each role launches at its OWN seat's effort. The recording fake keeps id "fake" (so its
+// verdicts stay nonce-bound) and notes what every transport handed its command builder, per role.
+class EffortRecordingFake extends FakeAdapter {
+  readonly calls: Array<{ role: string; model: string; effort?: Effort }> = [];
+  // consult seats on these models answer with prose, never a verdict — the failover falls through them
+  unparseableConsult = new Set<string>();
+  override headlessCommand(promptFile: string, model: string, effort?: Effort): string {
+    const prompt = readFileSync(promptFile, "utf8");
+    const role = /TICKMARKR-JUDGE/.test(prompt) ? "judge" : /TICKMARKR-REVIEW/.test(prompt) ? "review" : /TICKMARKR-CONSULT/.test(prompt) ? "consult" : "other";
+    this.calls.push({ role, model, ...(effort ? { effort } : {}) });
+    if (role === "consult" && this.unparseableConsult.has(model)) return "echo 'no verdict here'";
+    return super.headlessCommand(promptFile, model);
+  }
+}
+
+describe("OBS-1182 role seat effort", () => {
+  test("production judge review and consult invocations each deliver their recorded seat effort through both direct and driver transports versus an unset seat, so inheriting worker effort or dropping medium fails", async () => {
+    const run = async (transport: "direct" | "driver", seatEffort: Effort | undefined) => {
+      const { repo, base } = repoWithCommit();
+      const dir = mkdtempSync(join(tmpdir(), "tickmarkr-effort-"));
+      const script = join(dir, "s.json");
+      writeFileSync(script, JSON.stringify({
+        tasks: {},
+        judge: { pass: true, criteria: [{ criterion: "c1", met: true, reason: "r" }] },
+        review: { approve: true, issues: [] },
+        consult: { action: "retry", notes: "try again" },
+      }));
+      const fake = new EffortRecordingFake(script);
+      const cfg = structuredClone(DEFAULT_CONFIG);
+      cfg.visibility.llm = transport === "driver" ? "pane" : "headless";
+      cfg.judge = { ...cfg.judge, adapter: "fake", model: "fake-1" };
+      cfg.consult = { ...cfg.consult, adapter: "fake", model: "fake-1" };
+      const seat = (vendor: string) => ({ vendor, ...(seatEffort ? { effort: seatEffort } : {}) });
+      // fake-3 is the worker's seat at HIGH: a role that inherits the worker's effort reads high, never medium.
+      cfg.tiers.fake = {
+        vendor: "fake-a", channel: "sub",
+        models: { "fake-1": "frontier", "fake-2": "frontier", "fake-3": "frontier" },
+        modelOverrides: { "fake-1": seat("fake-a"), "fake-2": seat("fake-b"), "fake-3": { vendor: "fake-c", effort: "high" } },
+      };
+      const channels = channelsFromConfig("fake", cfg);
+      const worker: Assignment = { adapter: "fake", model: "fake-3", channel: "sub", tier: "frontier", effort: "high" };
+      const { driver } = spyDriver();
+      const { results } = await runGates(mkTask({ files: [], gates: ["build", "test", "lint", "evidence", "scope", "acceptance", "review"] }), {
+        worktree: repo, baseRef: base, author: worker,
+        result: { ok: true, summary: "", deviations: [], raw: "" },
+        commands: {}, baseline: await captureBaseline(repo, {}),
+        channels, judgeChannels: channels, adapters: [fake], cfg,
+        ...(transport === "driver" ? { via: { driver, nameFor: (role: string, adapter: string) => `T1-${role}-${adapter}`, labelFor: (role: string) => role.toUpperCase() } } : {}),
+      });
+      const dossier = { taskId: "T1", trigger: "gate-fail", journalTail: "[]", transcript: "", diff: "", gates: [] };
+      const consultChannels = channels.filter((c) => c.model !== "fake-3");
+      const consultWalk = async () => {
+        const invocations: ConsultInvocation[] = [];
+        const v = await consult(dossier, cfg, [fake], driver, repo, dir, { channels: consultChannels, onInvocation: (inv) => invocations.push(inv) });
+        return { ...v, invocations };
+      };
+      const verdict = await consultWalk();
+      // failover: the preferred fake-2 seat answers unparseably, then the fake-1 pin answers; and a
+      // walk where every seat fails. Each launched seat is recorded, failed ones included.
+      cfg.consult = { ...cfg.consult, prefer: ["fake:fake-2"] };
+      fake.unparseableConsult.add("fake-2");
+      const failover = await consultWalk();
+      fake.unparseableConsult.add("fake-1");
+      const allFailed = await consultWalk();
+      return { fake, results, verdict, failover, allFailed };
+    };
+
+    for (const transport of ["direct", "driver"] as const) {
+      for (const seatEffort of ["medium", undefined] as const) {
+        const { fake, results, verdict, failover, allFailed } = await run(transport, seatEffort);
+        const label = `${transport} ${seatEffort ?? "unset"}`;
+        expect(results.every((r) => r.pass), label).toBe(true);
+        for (const role of ["judge", "review", "consult"]) {
+          const calls = fake.calls.filter((c) => c.role === role);
+          expect(calls.length, `${label} ${role}`).toBeGreaterThan(0);
+          for (const call of calls) expect(call.effort, `${label} ${role}`).toBe(seatEffort);
+        }
+        // the record says what each seat launched at: the effort, or no key at all for the CLI default
+        for (const gate of ["acceptance", "review"]) {
+          const spans = results.find((r) => r.gate === gate)!.meta!.invocations as Array<{ effort?: Effort }>;
+          expect(spans.length, `${label} ${gate}`).toBeGreaterThan(0);
+          for (const span of spans) expect(span.effort, `${label} ${gate}`).toBe(seatEffort);
+        }
+        expect(verdict.action).toBe("retry");
+        expect(verdict.effort, label).toBe(seatEffort);
+        const seatRecord = (model: string, vendor: string, outcome: "completed" | "failed") =>
+          ({ adapter: "fake", model, vendor, ...(seatEffort ? { effort: seatEffort } : {}), outcome });
+        const shape = (v: typeof verdict) => v.invocations.map(({ reason: _reason, ...rest }) => rest);
+        expect(shape(verdict), label).toEqual([seatRecord("fake-1", "fake-a", "completed")]);
+        expect(failover.action, label).toBe("retry");
+        expect(failover.model, label).toBe("fake-1");
+        expect(shape(failover), label).toEqual([seatRecord("fake-2", "fake-b", "failed"), seatRecord("fake-1", "fake-a", "completed")]);
+        expect(allFailed.action, label).toBe("human");
+        expect(shape(allFailed), label).toEqual([seatRecord("fake-2", "fake-b", "failed"), seatRecord("fake-1", "fake-a", "failed")]);
+        for (const inv of [...failover.invocations, ...allFailed.invocations]) expect(inv.reason, label).toBeTruthy();
+      }
+    }
+  }, 120_000);
 });

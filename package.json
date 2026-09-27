@@ -1,6 +1,6 @@
 {
   "name": "tickmarkr",
-  "version": "2.6.1",
+  "version": "2.6.2",
   "description": "Spec in, verified work out.",
   "type": "module",
   "license": "MIT",
@@ -80,6 +80,7 @@
         "scripts/assert-test-file-count.sh",
         "scripts/emit-schema.ts",
         "scripts/probe-rig.mjs",
+        "scripts/run-ci-vitest.sh",
         "specs/export-selftest.spec.md"
       ],
       "prefixes": [

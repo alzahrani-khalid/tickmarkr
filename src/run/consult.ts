@@ -1,8 +1,9 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { getAdapter } from "../adapters/registry.js";
-import type { WorkerAdapter } from "../adapters/types.js";
+import { configuredEffort, type WorkerAdapter } from "../adapters/types.js";
 import type { TickmarkrConfig } from "../config/config.js";
+import type { Effort } from "../graph/schema.js";
 import type { ExecutorDriver, Slot } from "../drivers/types.js";
 import { bannerShell, paneDispatchCommand } from "../brand.js";
 import { dewrapPaneVerdict, extractVerdictJson, gateExitTrailer, gatePaneName, generateVerdictNonce, verdictNonceLine } from "../gates/llm.js";
@@ -27,6 +28,20 @@ export interface ConsultVerdict {
   adapter?: string;
   model?: string;
   vendor?: string;
+  // OBS-1182: the answering seat's launch effort; absent = it ran at the CLI's default.
+  effort?: Effort;
+  // OBS-1182: every seat actually launched, in order — failed seats included. consult() reports them
+  // through opts.onInvocation; the daemon attaches them here so the verdict row journals each one.
+  invocations?: ConsultInvocation[];
+}
+
+export interface ConsultInvocation {
+  adapter: string;
+  model: string;
+  vendor: string;
+  effort?: Effort;
+  outcome: "completed" | "failed";
+  reason: string;
 }
 
 const MAX_RETRY_GUIDANCE_LINES = 10;
@@ -194,7 +209,9 @@ export async function consult(
   // via SlotOpts.owned; without it the legacy gatePaneName shape survives (non-daemon callers/tests).
   // v1.54 T1: channels — the daemon's doctor-filtered live channel list; prefer-seat liveness is
   // judged against it only (never rebuilt from config, which would select installed-but-unauthed seats).
-  opts: { keep?: boolean; onSlot?: (slot: Slot) => void; runId?: string; channels?: Array<{ adapter: string; model?: string; vendor?: string; channel?: "sub" | "api"; tier?: string }> } = {},
+  // OBS-1182: onInvocation hears every launched seat — its identity, effort and outcome — failed seats
+  // included, so a seat that never produced the verdict still reaches the journal.
+  opts: { keep?: boolean; onSlot?: (slot: Slot) => void; onInvocation?: (inv: ConsultInvocation) => void; runId?: string; channels?: Array<{ adapter: string; model?: string; vendor?: string; channel?: "sub" | "api"; tier?: string }> } = {},
 ): Promise<ConsultVerdict> {
   const n = ++consultSeq;
   const nonce = generateVerdictNonce();
@@ -208,18 +225,18 @@ export async function consult(
   // One seat = the WHOLE invoke-and-parse unit, both visibility branches (OBS-69 class: a headless-only
   // failover would leave the production pane path hard-failing on seat one). A null verdict retains
   // the classifier's cause when extraction failed; parsed content rejections deliberately have none.
-  const invokeSeat = async (seatAdapter: string, seatModel: string, seatIdx: number): Promise<ConsultParseResult> => {
+  const invokeSeat = async (seatAdapter: string, seatModel: string, seatIdx: number, effort: Effort | undefined): Promise<ConsultParseResult> => {
     const adapter = getAdapter(seatAdapter, adapters);
     let out: string;
     if (cfg.visibility.llm === "headless") {
-      const r = await sh(adapter.headlessCommand(promptFile, seatModel), cwd, cfg.consult.stallMinutes * 60_000);
+      const r = await sh(adapter.headlessCommand(promptFile, seatModel, effort), cwd, cfg.consult.stallMinutes * 60_000);
       out = r.stdout + r.stderr;
     } else {
       // OBS-1009: the pane runs the HEADLESS command. A seeded interactive session answers on screen
       // but never exits, so the exit trailer after it never runs, the wait runs to the stall cap and
       // the 300-line read is a TUI frame. The headless command exits, the trailer prints, and the
       // pane is harvested through dewrap exactly like a judge or review seat.
-      const command = adapter.headlessCommand(promptFile, seatModel);
+      const command = adapter.headlessCommand(promptFile, seatModel, effort);
       // T8: role-first pane name for fleet visibility (consult · T2); consultSeq stays on the dossier artifact only
       const slot = await driver.slot(cwd, gatePaneName("consult", d.taskId), {
         label: `CONSULT ${d.taskId}`,
@@ -295,8 +312,13 @@ export async function consult(
   }
 
   for (const [i, seat] of allowedSeats.entries()) {
+    // OBS-1182: each seat launches at its own configured effort, never the worker's.
+    const effort = configuredEffort(cfg, seat);
+    const record = (outcome: ConsultInvocation["outcome"], reason: string) =>
+      opts.onInvocation?.({ ...seatIdentity(seat), ...(effort ? { effort } : {}), outcome, reason });
     try {
-      const parsed = await invokeSeat(seat.adapter, seat.model, i);
+      const parsed = await invokeSeat(seat.adapter, seat.model, i, effort);
+      record(parsed.verdict ? "completed" : "failed", parsed.verdict ? "verdict" : `verdict unparseable${parsed.cause ? ` (${parsed.cause})` : ""}`);
       if (parsed.verdict) {
         const excludeProvider = parsed.verdict.excludeAdapter
           ? excludedProviderFromDossier(d, parsed.verdict.excludeAdapter)
@@ -308,10 +330,12 @@ export async function consult(
             notes: `${parsed.verdict.notes} — excluded provider ${excludeProvider}`,
           } : {}),
           ...seatIdentity(seat),
+          ...(effort ? { effort } : {}),
         };
       }
-    } catch {
+    } catch (e) {
       // failed seat (unknown adapter, dead driver/pane, shell error) — fall to the next entry
+      record("failed", `seat error: ${e instanceof Error ? e.message : String(e)}`.slice(0, 200));
     }
   }
   return {

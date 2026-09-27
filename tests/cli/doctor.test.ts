@@ -54,6 +54,36 @@ test("test: doctor run over a state directory whose recent journals hold two dem
   expect(quiet).not.toContain("review seats demoted");
 });
 
+test("doctor shows unreadable review history as unknown versus a measured zero, so inventing a clean history from a corrupt journal fails", async () => {
+  const reviewedOnce = (repo: string) => {
+    const journal = Journal.create(repo, "run-20260920-000001-0000000000000001");
+    journal.append("run-start", undefined, { branch: "test" });
+    journal.append("gate-result", "T1", { gate: "review", pass: true, reviewer: "qwen:qwen3.8-max", details: "ok" });
+    journal.append("run-end", undefined, {});
+  };
+  const measured = makeRepo({ "keep.txt": "x" });
+  reviewedOnce(measured);
+  const clean = await doctor(["--"], measured, [stub("fixture")], { banner: false });
+  expect(clean).toMatch(/qwen:qwen3\.8-max\s+0 review no-verdicts in the last 1 completed run$/m);
+  expect(clean).not.toContain("unknown — ");
+
+  // a newer journal whose middle row is torn: its review events cannot be counted, so no zero is claimed
+  const corrupt = makeRepo({ "keep.txt": "x" });
+  reviewedOnce(corrupt);
+  const tornDir = join(corrupt, ".tickmarkr", "runs", "run-20260920-000002-0000000000000002");
+  mkdirSync(tornDir, { recursive: true });
+  writeFileSync(join(tornDir, "journal.jsonl"), [
+    JSON.stringify({ ts: "2026-09-20T00:00:02.000Z", event: "run-start", data: {} }),
+    '{"ts":"2026-09-20T00:00:03.000Z","event":"review-no-verdict","data":{"reviewer":"qwen:qwe',
+    JSON.stringify({ ts: "2026-09-20T00:00:04.000Z", event: "run-end", data: {} }),
+    "",
+  ].join("\n"));
+  const unknown = await doctor(["--"], corrupt, [stub("fixture")], { banner: false });
+  expect(unknown).toMatch(/qwen:qwen3\.8-max\s+unknown — at least 0 in the last 1 completed run; 1 run journal unreadable/);
+  expect(unknown).toMatch(/unreadable\s+unknown — run-20260920-000002-0000000000000002 did not parse/);
+  expect(unknown).not.toMatch(/qwen:qwen3\.8-max\s+0 review no-verdicts/);
+});
+
 describe("OBS-141 kimi doctor turn probe", () => {
   const stubKimi = (authed: boolean, note: string) =>
     ({
@@ -1176,4 +1206,62 @@ test("Production doctor’s probe preflight exposes configured model-call scope,
   expect(unavailableAdapter).toContain("fixture:fixture-1 unavailable (adapter not installed)");
   expect(probe).toHaveBeenCalledOnce();
   expect(modelCall).toHaveBeenCalledTimes(2);
+});
+
+describe("OBS-1143 an unknown alias identity stays conservatively denied", () => {
+  const opusDenyCfg = `tiers:
+  claude-code:
+    vendor: anthropic
+    channel: sub
+    models:
+      fable: null
+      opus: frontier
+      sonnet: null
+      haiku: null
+routing:
+  deny:
+    models: [claude-code:claude-opus-5]
+  map:
+    implement: { pool: { mode: any, channels: [claude-code:opus] } }
+`;
+  const spec = "<!-- tickmarkr:spec -->\n## T1: Keep the widget observable\n- goal: Keep widgetValue observable through widgetValue.\n- shape: implement\n- complexity: 2\n- files: src/widget.ts, tests/widget.test.ts\n- acceptance:\n  - test: widgetValue returns one | suite: tests/widget.test.ts\n";
+  const refusal = "routing.map.implement.pool claude-code:opus fully disallowed by routing.deny (claude-code:claude-opus-5)";
+  const opusAdapter = () => ({
+    id: "claude-code",
+    vendor: "anthropic",
+    probe: async () => ({ installed: true, authed: true, models: [] }),
+    channels: (cfg: any) => channelsFromConfig("claude-code", cfg),
+    headlessCommand: vi.fn(() => "printf OK"),
+  }) as unknown as WorkerAdapter;
+  const repoFor = () => {
+    const repo = makeRepo({ "feature.spec.md": spec, "src/widget.ts": "export const widgetValue = () => 1;\n" });
+    withOverlay(repo, opusDenyCfg);
+    return repo;
+  };
+  const strictCompile = (repo: string) => compileCommand(["feature.spec.md", "--strict", "--dry-run"], repo, undefined);
+
+  test("test: doctor and strict compile preserve conservative denial for an unknown opus identity versus the allowed observed identity, so treating an unknown alias as proven newer fails", async () => {
+    // no doctor cache at all: compile reads what is cached and never spends a probe to learn more
+    const uncached = repoFor();
+    const probeAll = vi.spyOn(registry, "probeAll");
+    await expect(strictCompile(uncached)).rejects.toThrow(refusal);
+    expect(probeAll).not.toHaveBeenCalled();
+    probeAll.mockRestore();
+
+    for (const [identity, admitted] of [[undefined, false], ["claude-opus-5-5", true]] as const) {
+      const repo = repoFor();
+      const out = await doctor(["--"], repo, [opusAdapter()], { banner: false, resolveClaudeAliasIdentity: () => identity });
+      const saved = JSON.parse(readFileSync(join(repo, ".tickmarkr", "doctor.json"), "utf8"));
+      expect(saved["claude-code"].modelAuth?.opus?.identity).toBe(identity);
+      if (admitted) {
+        expect(out).not.toContain("deny∩prefer:");
+        expect(out).toMatch(/opus\s+frontier\s.*denied=—/);
+        await expect(strictCompile(repo)).resolves.toMatch(/validated feature\.spec\.md/);
+      } else {
+        expect(out).toContain(`deny∩prefer: ${refusal}`);
+        expect(out).toMatch(/opus\s+frontier\s.*denied=claude-code:claude-opus-5/);
+        await expect(strictCompile(repo)).rejects.toThrow(refusal);
+      }
+    }
+  }, 60_000);
 });
