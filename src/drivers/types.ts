@@ -1,6 +1,16 @@
 import type { JournalEvent } from "../run/journal.js";
 // group: role-tab consolidation (VIS-04) — same-group slots share one ref-counted tab (herdr only)
-export interface Slot { id: string; name: string; cwd: string; tabId?: string; group?: string }
+// readScreen (OBS-1205): the optional rendered-screen read of the driver that created this slot —
+// the terminal's painted frame, where a cursor-drawn modal has text that its byte stream does not.
+// It rides the SLOT, not the driver object, because every daemon wrapper (the tracked driver, the
+// held worker transport) forwards the slot untouched but forwards only a fixed method list, so a
+// driver method would never reach the seed that needs it. Absent: the driver has no rendered
+// surface and callers use `read`. It throws when the frame is unreadable or not provably the
+// slot's own terminal; a caller must treat that as "nothing seen", never as a reason to fall back.
+export interface Slot {
+  id: string; name: string; cwd: string; tabId?: string; group?: string;
+  readScreen?: () => Promise<string>;
+}
 export type NotifyTier = "routine" | "attention" | "decision";
 export interface NotifyOpts { tier?: NotifyTier; sound?: "none" | "done" | "request" }
 
@@ -174,8 +184,8 @@ export function canonicalizeLegacyName(name: string, runId: string): OwnedName {
   if (w) return { role: "worker", taskId: w[1], attempt: Number(w[2]), runId: `run-${w[3]}` };
   const g = GATE_ROLE_RE.exec(name);
   if (g) {
-    const retry = g[2].endsWith("-r1");
-    return { role: g[1] as OwnedRole, taskId: retry ? g[2].slice(0, -3) : g[2], attempt: retry ? 1 : 0, runId };
+    const hop = /-r([1-9])$/.exec(g[2]);
+    return { role: g[1] as OwnedRole, taskId: hop ? g[2].slice(0, -hop[0].length) : g[2], attempt: hop ? Number(hop[1]) : 0, runId };
   }
   if (NARRATOR_RE.test(name)) return { role: "watch", taskId: "run", attempt: 0, runId };
   return { role: "other", taskId: name, attempt: 0, runId };
@@ -203,6 +213,12 @@ export interface ExecutorDriver {
   focus?(target: FocusTarget): Promise<FocusResult>;
   describe?(slot: Slot): SlotPlacement | Promise<SlotPlacement> | undefined;
   slot(cwd: string, name: string, opts?: SlotOpts): Promise<Slot>;
+  // OBS-1109/OBS-1203: READ-ONLY binding of THIS instance to an owned pane an earlier daemon created,
+  // so a resumed daemon can read an interrupted attempt's trailer. Never allocates, reclaims, closes
+  // or leases: it binds only on ownership evidence (the full owned name, the task checkout) and throws
+  // on zero, ambiguous or foreign candidates — the throw is the caller's decline. Optional: a driver
+  // without it keeps ordinary recovery.
+  adopt?(slot: Slot): Promise<Slot>;
   run(slot: Slot, cmd: string): Promise<void>;
   waitOutput(slot: Slot, pattern: string, timeoutMs: number, opts?: { regex?: boolean }): Promise<boolean>;
   waitAgentStatus(slot: Slot, status: string, timeoutMs: number): Promise<boolean>;

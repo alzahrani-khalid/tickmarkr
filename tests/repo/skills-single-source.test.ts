@@ -222,6 +222,16 @@ describe.skipIf(skipReason !== undefined)(suiteName, () => {
       expect(lstatSync(installed).isSymbolicLink(), `${name} must be a symlink`).toBe(true);
       expect(readlinkSync(installed)).toBe(join("..", "..", "..", "skills", name, "SKILL.md"));
       expect(readFileSync(installed)).toEqual(readFileSync(canonical));
+      if (name === "tickmarkr-loop") {
+        // The installed twin is mode 120000: its unchanged link exposes canonical edits.
+        for (const path of [canonical, installed]) {
+          const text = readFileSync(path, "utf8");
+          expect(text).toContain("`--recheck --park <line>@<ts>`");
+          expect(text).toContain("explicitly recorded empty survivors array (`[]`)");
+          expect(text).toContain("plain approve dispatches a worker");
+          expect(text).toContain("ordinary stall park (no `reapFailure`) stays approve-only");
+        }
+      }
     }
   });
 

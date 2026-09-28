@@ -208,6 +208,8 @@ worker. Other parks have different permitted decisions:
 | Human gate / other non-gate park | Plain approve records permission to dispatch. |
 | Attempt cap | Plain approve grants a fresh attempt budget; prior routing exclusions remain. |
 | Infrastructure | Plain approve or `--recheck`; recheck reruns the declared battery and satisfies no gate. |
+| Stall with a recorded `reapFailure` (the worker's process census was unreadable or had survivors) | `--recheck` bound to that park's token re-verifies the parked attempt's owned census: only an explicitly recorded empty survivors array (`[]`) releases its harvested commits to the declared battery, with no worker; a missing, unreadable or surviving census re-parks the stall (new token, still approve/recheck). Plain approve dispatches a worker. |
+| Ordinary stall (no `reapFailure`) | Plain approve only — it dispatches a worker; `--recheck` refuses. |
 | Failed review gate | `--waive` satisfies only that identified gate; `--uphold` funds one fixed attempt carrying findings; `--recheck` reruns the battery. |
 | Other failed gate | `--waive` or `--recheck`; plain approve refuses. |
 | Tombstone / gate failure without identifying evidence | Diagnostic only; no invented decision. |

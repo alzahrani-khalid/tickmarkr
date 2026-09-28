@@ -1,9 +1,11 @@
-import { writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { parseArgs } from "node:util";
 import { ttyVisual } from "../../adapters/model-lints.js";
 import { addUsage, type TokenUsage } from "../../adapters/types.js";
 import { dim, rule, title } from "../../brand.js";
 import { loadConfig } from "../../config/config.js";
+import type { BaselineCommand } from "../../gates/baseline.js";
 import { modelProvider } from "../../gates/review.js";
 import { buildProofBundle, gateDeclined } from "../../report/bundle.js";
 import { compareRuns } from "../../report/compare.js";
@@ -22,6 +24,7 @@ import {
   baselineProvenanceOf, fingerprintsOf, forgivenFingerprints, forgivenGateRow, formatBaselineProvenance, formatFingerprints,
   formatForgiven, formatTipProof, runEndTipProof,
 } from "../../run/daemon.js";
+import { formatSpan, WALL_PRIORITY_TEXT, wallBudget, wallBudgetFacts } from "../../run/wall-budget.js";
 import { deriveRunCockpitData } from "../../tui/cockpit/derive.js";
 
 const n = (x: number) => x.toLocaleString("en-US"); // explicit locale — CI/darwin flake guard
@@ -86,6 +89,42 @@ const wallClock = (start?: JournalEvent, end?: JournalEvent): string => {
   const seconds = Math.round((to - from) / 1_000);
   const minutes = Math.floor(seconds / 60);
   return minutes ? `${minutes}m ${seconds % 60}s` : `${seconds}s`;
+};
+
+// OBS-1201: the disjoint wall budget, or why the journal cannot give one — never a zeroed table.
+const wallFacts = (events: JournalEvent[]): Array<[string, string]> => {
+  const budget = wallBudget(events);
+  if (!budget) return [["window", "not measurable — the journal names no run-start with a readable timestamp"]];
+  return [["window", `${formatSpan(budget.wallMs)} — each instant counted once, by priority ${WALL_PRIORITY_TEXT}; task-time sums concurrent spans`], ...wallBudgetFacts(budget)];
+};
+
+// OBS-634: the four numbers the baseline capture already measured for the test command. A capture that
+// measured nothing says so; a missing number is not measurable, never a zero.
+const suiteTelemetry = (entry: BaselineCommand | undefined): string => {
+  if (!entry) return "not recorded — this run's baseline holds no test capture";
+  if (entry.infra) return `not measurable — the baseline capture returned no verdict (${entry.invalidCause ?? "infra"})`;
+  if (typeof entry.durationMs !== "number" || !Number.isFinite(entry.durationMs)) return "not recorded — the baseline predates capture timing";
+  const unmeasured = "not measurable (the runner named no per-file durations)";
+  const sum = entry.fileDurationSumMs;
+  const parallelism = entry.impliedParallelism;
+  const longest = entry.longestFile;
+  return [
+    `wall ${formatSpan(entry.durationMs)}`,
+    `file-sum ${typeof sum === "number" ? formatSpan(sum) : unmeasured}`,
+    `implied parallelism ${typeof parallelism === "number" ? parallelism.toFixed(2) : unmeasured}`,
+    `longest file ${longest ? `${longest.file} ${formatSpan(longest.durationMs)}` : unmeasured}`,
+    ...(typeof entry.fileCount === "number" ? [`${entry.fileCount} files`] : []),
+  ].join(" · ");
+};
+
+/** The run's own baseline.json test entry; absent or unreadable reads as not recorded. */
+const baselineTestEntry = (runDir: string): BaselineCommand | undefined => {
+  try {
+    const baseline = JSON.parse(readFileSync(join(runDir, "baseline.json"), "utf8")) as { commands?: Record<string, BaselineCommand> };
+    return baseline.commands?.test;
+  } catch {
+    return undefined;
+  }
 };
 
 const detail = (value: unknown): string => typeof value === "string" || typeof value === "number" ? String(value) : EM;
@@ -220,7 +259,7 @@ const fingerprintClauses = (data: Record<string, unknown>): string => {
 };
 
 // VIS-07 / REC-01: derived only from the run journal, telemetry, and local configuration.
-export function renderMarkdownRecord(runId: string, events: JournalEvent[], prices: ChannelCost[] = [], rows: TelemetryRow[] = []): string {
+export function renderMarkdownRecord(runId: string, events: JournalEvent[], prices: ChannelCost[] = [], rows: TelemetryRow[] = [], suite?: BaselineCommand): string {
   const runStart = events.find((e) => e.event === "run-start");
   const runEnd = [...events].reverse().find((e) => e.event === "run-end");
   const baseRef = typeof runStart?.data.baseRef === "string" ? runStart.data.baseRef : EM;
@@ -266,6 +305,11 @@ export function renderMarkdownRecord(runId: string, events: JournalEvent[], pric
     `- **gate failures:** ${[...gateFailures.entries()].map(([gate, failures]) => `${gate}: ${failures}`).join(", ") || "none recorded"}`,
     `- **consults:** ${events.filter((e) => e.event === "consult-verdict").length}`,
     `- **escalations:** ${events.filter((e) => e.event === "escalation").length}`,
+    "",
+    "## Wall budget",
+    "",
+    ...wallFacts(events).map(([label, fact]) => `- **${label}:** ${fact}`),
+    `- **suite telemetry (baseline test capture):** ${suiteTelemetry(suite)}`,
     "",
   ];
   lines.push("## Channels", "");
@@ -349,7 +393,7 @@ export function renderMarkdownRecord(runId: string, events: JournalEvent[], pric
   return lines.join("\n").trimEnd() + "\n";
 }
 
-function textReport(runId: string, events: JournalEvent[], rows: TelemetryRow[], cwd: string): string {
+function textReport(runId: string, events: JournalEvent[], rows: TelemetryRow[], cwd: string, suite?: BaselineCommand): string {
   // one group per adapter:model, carrying channel + the folded usage across its rows
   const groups = new Map<string, { channel: string; rows: TelemetryRow[] }>();
   for (const r of rows) {
@@ -417,6 +461,10 @@ function textReport(runId: string, events: JournalEvent[], rows: TelemetryRow[],
     `tickmark rate: ${gateRan ? Math.round((100 * gatePass) / gateRan) : 0}% (${gatePass}/${gateRan})${declinedCount ? ` · declined: ${declinedCount}` : ""}`,
     `escalations: ${escalations} · National Office consults: ${consults} · quota failovers: ${failovers}`,
     "",
+    "wall budget — exposed wall, disjoint:",
+    ...wallFacts(events).map(([label, fact]) => `  ${label.padEnd(14)} ${fact}`),
+    `  ${"suite".padEnd(14)} ${suiteTelemetry(suite)}`,
+    "",
     "spend — tokens (measured where observed):",
     ...tokenLines,
     "spend — money:",
@@ -436,7 +484,7 @@ const stylizeReport = (out: string): string => {
   if (!ttyVisual()) return out;
   return out
     .replace(/^.*$/m, (first) => `${title(first)}\n${rule()}`) // non-global /m ⇒ first line only
-    .replace(/^(engagement summary — audit trail:|spend — tokens[^\n]*|spend — money:|learning \([^\n]*)$/gm, (l) => dim(l));
+    .replace(/^(engagement summary — audit trail:|wall budget — [^\n]*|spend — tokens[^\n]*|spend — money:|learning \([^\n]*)$/gm, (l) => dim(l));
 };
 
 export async function report(argv: string[], cwd = process.cwd()): Promise<string> {
@@ -457,6 +505,7 @@ export async function report(argv: string[], cwd = process.cwd()): Promise<strin
   const events = j.read();
   const rows = j.readTelemetry();
   const cfg = loadConfig(cwd);
+  const suite = baselineTestEntry(j.dir);
 
   let bundleNote = "";
   if (values.bundle) {
@@ -485,7 +534,7 @@ export async function report(argv: string[], cwd = process.cwd()): Promise<strin
   }
 
   if (values.md) {
-    return bundleNote + renderMarkdownRecord(runId, events, estimateCosts(rows, cfg.cost), rows) + comparison;
+    return bundleNote + renderMarkdownRecord(runId, events, estimateCosts(rows, cfg.cost), rows, suite) + comparison;
   }
-  return bundleNote + stylizeReport(textReport(runId, events, rows, cwd)) + comparison;
+  return bundleNote + stylizeReport(textReport(runId, events, rows, cwd, suite)) + comparison;
 }

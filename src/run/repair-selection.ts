@@ -4,10 +4,18 @@ export interface RepairSelectionDecision {
   selectTests: boolean;
   requiredFiles: string[];
   reason: "no-test-failure" | "known-failing-files" | "legacy-test-failure"
-    | "unattributed-test-failure" | "full-suite-failure";
+    | "unattributed-test-failure";
 }
 
 type SelectionEvent = Pick<JournalEvent, "event" | "taskId" | "data">;
+
+/** OBS-1199: repair selection is on unless a config says otherwise, independent of the optional
+ * execution budget (which stays subprocess-only). Either explicit `false` turns it off. */
+export function repairSelectionEnabled(cfg?: {
+  executionPolicy?: { repairSelection?: unknown }; gates?: { repairSelection?: unknown };
+}): boolean {
+  return cfg?.executionPolicy?.repairSelection !== false && cfg?.gates?.repairSelection !== false;
+}
 
 /** These are literal repository-relative identities. Existence and selection support are checked
  * against the current worktree by the gate; this journal fold cannot establish either. */
@@ -45,16 +53,19 @@ export function repairSelectionDecision(
       distrust ??= "unattributed-test-failure";
       continue;
     }
-    // A replacement full-suite failure follows a passing screen in the current pipeline. No
-    // ordinary full-suite failure establishes that a selector safely covers the failed behavior.
-    if (data.fullSuite === true) {
-      distrust ??= "full-suite-failure";
-      continue;
-    }
-    const selected = fileIdentities(data.selectedTests);
+    // OBS-1199: a full-suite red counts only when it positively says it was full — the replacement
+    // after a screen (`fullSuite`), or an ordinary full run whose recorded selection decision says
+    // so — and names its failing files. Those files join every later screen even when no selector
+    // reaches them; the merge candidate still runs the complete suite. No attribution means full.
     const failing = fileIdentities(data.failingFiles);
-    if (!selected || !failing || failing.some((file) => !selected.includes(file))
-      || (data.fullSuite !== undefined && data.fullSuite !== false)) {
+    const selected = fileIdentities(data.selectedTests);
+    const decision = data.selectionDecision as { scope?: unknown } | null | undefined;
+    const replacement = data.fullSuite === true;
+    const ordinaryFull = data.fullSuite === undefined && data.selectedTests === undefined
+      && typeof decision === "object" && decision !== null && decision.scope === "full";
+    const screen = (data.fullSuite === undefined || data.fullSuite === false) && selected !== undefined
+      && failing !== undefined && failing.every((file) => selected.includes(file));
+    if (!failing || !(replacement || ordinaryFull || screen)) {
       distrust ??= "unattributed-test-failure";
       continue;
     }

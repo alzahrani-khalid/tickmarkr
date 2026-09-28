@@ -903,3 +903,44 @@ export function orcaBoardDriver(board: OrcaDriver): ExecutorDriver {
     retireLostWatch: board.retireLostWatch.bind(board),
   };
 }
+
+/** OBS-1205: the box rules a cursor-drawn modal leaves on the cursor STREAM — no `Trust` text at all. */
+export const CURSOR_MODAL_RULES = ["╭────────────────────────────────────╮", "│", "╰────────────────────────────────────╯"];
+
+/**
+ * OBS-1205 (v2.6.2 run …0149 T23): kimi draws its folder-trust modal with cursor addressing, so a live
+ * Orca terminal's STREAM carries only box rules while its RENDERED screen paints the modal. This wraps
+ * `fake.exec` to serve that terminal: the create whose command carries `launch` paints `screen` over a
+ * rules-only stream, and while `answers` is not false an Enter (`send --text "" --enter`) landing on it
+ * repaints the screen as `ready` and prints `ready` on the stream, once. `enters` counts every Enter
+ * any terminal accepted.
+ */
+export function cursorModalExec(
+  fake: FakeOrca,
+  o: { launch: string; screen: string; ready: string; answers?: boolean },
+): { exec: OrcaExec; enters: () => number } {
+  let enters = 0;
+  const modal = new Set<string>();
+  const exec: OrcaExec = async (args, cwd, timeoutMs) => {
+    const r = await fake.exec(args, cwd, timeoutMs);
+    if (r.code !== 0) return r;
+    if (args[1] === "create" && (flag(args, "--command") ?? "").includes(o.launch)) {
+      const handle = String((JSON.parse(r.stdout) as { result: { terminal: { handle: string } } }).result.terminal.handle);
+      const t = fake.of(handle)!;
+      t.lines.push(...CURSOR_MODAL_RULES);
+      t.screenLines = o.screen.split("\n");
+      modal.add(handle);
+    } else if (args[1] === "send" && args.includes("--enter") && flag(args, "--text") === "") {
+      enters++;
+      const handle = flag(args, "--terminal") ?? "";
+      if (modal.has(handle) && o.answers !== false) {
+        modal.delete(handle);
+        const t = fake.of(handle)!;
+        t.screenLines = o.ready.split("\n");
+        t.lines.push(...o.ready.split("\n"));
+      }
+    }
+    return r;
+  };
+  return { exec, enters: () => enters };
+}

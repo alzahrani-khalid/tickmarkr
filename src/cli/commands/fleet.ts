@@ -7,6 +7,7 @@ import { CATALOG_REFRESH_TIMEOUT_MS, formatCatalogRefreshLegs, type CatalogFetch
 import { CLAUDE_ALIAS_IDENTITY_STAMPS, type ClaudeAlias, readClaudeAliasIdentity } from "../../adapters/claude-code.js";
 import type { BillingChannel, WorkerAdapter } from "../../adapters/types.js";
 import {
+  ConfigError,
   fleetEditableFromConfig,
   fleetEditableEquals,
   formatFleetPrint,
@@ -24,6 +25,7 @@ import {
   TIER_RANK,
   type FleetOverlayWrite,
   type FleetEditable,
+  type LowerLayerModelOverrides,
   type MapEntry,
   type RoutingMode,
   type Tier,
@@ -442,8 +444,10 @@ export async function assembleFleetEditor(
   type StagedDeny = FleetStagedDeny;
   const stagedDenyOf = (editable: FleetEditable): StagedDeny =>
     Object.fromEntries(DENY_SCOPES.map((scope) => [stagedDenyKeyOf(scope), editable[scope.key] ?? []])) as StagedDeny;
-  const stagedEditable = (map: Record<string, MapEntry>, deny: StagedDeny): FleetEditable => ({
-    ...structuredClone(initial),
+  // OBS-1188: previews stage no effort, so both sides drop efforts — the writer then needs no lower layers
+  const previewInitial = { ...structuredClone(initial), efforts: undefined };
+  const stagedEditable = (map: Record<string, MapEntry>, deny: StagedDeny) => ({
+    ...structuredClone(previewInitial),
     ...Object.fromEntries(DENY_SCOPES.map((scope) => [scope.key, deny[stagedDenyKeyOf(scope)]])),
     // OBS-1046: the allow complement is staged beside the deny lists, never folded into them
     allowOut: deny.allowOut ?? initial.allowOut,
@@ -464,7 +468,7 @@ export async function assembleFleetEditor(
     let preview: CandidatePreview;
     try {
       const bytes = renderFleetOverlayWrite(currentRepoOverlayText(cwd), {
-        initial,
+        initial: previewInitial,
         edited: stagedEditable(map, deny),
         universe,
         ...(mode !== rm.mode.mode ? { mode } : {}),
@@ -817,8 +821,22 @@ export async function assembleFleetEditor(
   const initialJudge = `${cfg.judge.adapter}:${cfg.judge.model}`;
   let pendingWrite: FleetOverlayWrite | null = null;
   // OBS-1182: the layers under the repo overlay, read raw, so clearing an effort masks an inherited
-  // one even when those layers only validate beside repo fields.
-  const lowerOverrides = lowerLayerModelOverrides({ globalDir });
+  // one even when those layers only validate beside repo fields. OBS-1188: re-read at every review
+  // and save, never an assembly-time snapshot; an unreadable read keeps the last good one for the
+  // preview only — the save guard below refuses it.
+  let lowerOverrides: LowerLayerModelOverrides = {};
+  // OBS-1188: the reviewed bytes are the only bytes that may land. Re-rendered from the repo overlay
+  // and lower layers as they are NOW; any difference is a stale preview. Null = still current.
+  const stalePreview = (write: FleetOverlayWrite, reviewed: string, prior = currentRepoOverlayText(cwd)): string | null => {
+    const lower = lowerLayerModelOverrides({ globalDir });
+    if (!lower.ok) return lower.error;
+    try {
+      if (renderFleetOverlayWrite(prior, { ...write, lowerOverrides: lower.overrides }) === reviewed) return null;
+    } catch (error) {
+      return (error as Error).message;
+    }
+    return "stale preview — the repo overlay or a lower config layer changed after the review diff was rendered; press w to review what would be written now";
+  };
   const reviewOverlay = (state: FleetEditorState): FleetOverlayReview => {
     const staged = structuredClone(initial) as FleetEditable;
     // OBS-994/FL-1, OBS-1099 add.1: every schema-enumerated deny scope rides the same review/write funnel
@@ -853,6 +871,8 @@ export async function assembleFleetEditor(
       pendingWrite = null;
       return { kind: "empty" };
     }
+    const lower = lowerLayerModelOverrides({ globalDir });
+    if (lower.ok) lowerOverrides = lower.overrides;
     const write: FleetOverlayWrite = {
       initial,
       edited: staged,
@@ -877,17 +897,20 @@ export async function assembleFleetEditor(
     } catch {
       poolNotes = [];
     }
+    const notes = [...(lower.ok ? [] : [`${lower.error} — y will be refused`]), ...poolNotes];
     return {
       kind: "diff",
       before,
       after,
       diff: unifiedYamlDiff(before, after, path),
       path,
-      ...(poolNotes.length ? { notes: poolNotes } : {}),
+      ...(notes.length ? { notes } : {}),
     };
   };
-  const reloadGuard = io.reloadGuard
+  const loaderGuard = io.reloadGuard
     ?? ((bytes: string) => overlayBytesLoadError(cwd, bytes, { globalDir }));
+  // OBS-1188: a stale preview or an unreadable lower layer answers on the same error channel as the loader
+  const reloadGuard = (bytes: string) => (pendingWrite && stalePreview(pendingWrite, bytes)) || loaderGuard(bytes);
 
   const props: FleetEditorProps = {
     ageMs: doctorAgeMs(cwd),
@@ -934,7 +957,17 @@ export async function assembleFleetEditor(
     // one write only after the component-rendered diff confirm and the production reload guard.
     const write = pendingWrite;
     if (!write) throw new Error("fleet write reached confirmation without a staged overlay mutation");
-    writeFleetOverlay(result.review.path, (prior) => renderFleetOverlayWrite(prior, write));
+    // OBS-1188: re-checked against the bytes on disk at write time; a refusal throws before the temp file exists
+    try {
+      writeFleetOverlay(result.review.path, (prior) => {
+        const stale = stalePreview(write, result.review.after, prior);
+        if (stale !== null) throw new ConfigError(stale);
+        return result.review.after;
+      });
+    } catch (error) {
+      if (error instanceof ConfigError) return `fleet: nothing written — ${error.message}`;
+      throw error;
+    }
     // OBS-529: a freshly classified model has no probe verdict (doctor probes CONFIGURED models,
     // and it was not configured at probe time), so it stays unroutable — invisible in every
     // picker — until the next probe. Name the step, or the classify flow reads as broken.

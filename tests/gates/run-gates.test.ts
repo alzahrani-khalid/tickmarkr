@@ -1,5 +1,5 @@
 import { execSync } from "node:child_process";
-import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
@@ -1567,3 +1567,97 @@ describe("review empty-output note", () => {
   });
 });
 
+
+describe("OBS-635 — an in-battery full green is revalidated after the semantic gates", () => {
+  test("runGates revalidates tree command baseline environment resolution capacity protocol lifecycle and full manifest after semantic oracles, so changed identity or oracle dirt cannot reuse an earlier full green whereas an unchanged complete identity can", async () => {
+    // Each oracle runs AFTER the full suite spoke in the battery. The identity is recomputed as one
+    // key over every component; these members move the tree, the environment and the capacity.
+    const corpus: Array<{ shape: string; oracle: string; before?: () => void; onAcceptance?: () => void; runs: string[]; pass: boolean }> = [
+      { shape: "unchanged complete identity", oracle: "true", runs: [""], pass: true },
+      { shape: "tree moved by a committing oracle", oracle: "echo moved > moved.txt && git add -A && git commit -q --no-gpg-sign -m oracle", runs: ["", ""], pass: true },
+      { shape: "environment moved by an ignored lockfile", oracle: "echo '{}' > package-lock.json", runs: ["", ""], pass: true },
+      { shape: "capacity moved during semantics", oracle: "true", onAcceptance: () => { process.env.VITEST_MAX_FORKS = "1"; }, runs: ["", ""], pass: true },
+      { shape: "runner NODE_OPTIONS moved during semantics", oracle: "true", onAcceptance: () => { process.env.NODE_OPTIONS = "--max-old-space-size=4096"; }, runs: ["", ""], pass: true },
+      { shape: "runner PATH moved during semantics", oracle: "true", onAcceptance: () => { process.env.PATH = `${priorPath}:/nonexistent-tickmarkr-runner`; }, runs: ["", ""], pass: true },
+      // D-598: npm is unreachable for the whole round, so both identities carry lifecycle "unknown"
+      // and hash equal; an unmeasurable policy is never an unchanged one — the full suite reruns.
+      { shape: "unmeasurable lifecycle on both sides", oracle: "true", before: () => {
+        delete process.env.npm_config_ignore_scripts; delete process.env.NPM_CONFIG_IGNORE_SCRIPTS;
+        process.env.PATH = "/usr/bin:/bin"; process.env.NPM_CONFIG_USERCONFIG = join(mkdtempSync(join(tmpdir(), "tkr-npmrc-")), ".npmrc");
+      }, runs: ["", ""], pass: true },
+      { shape: "oracle dirt", oracle: "echo dirt > oracle-dirt.txt", runs: [""], pass: false },
+    ];
+    const priorForks = process.env.VITEST_MAX_FORKS;
+    const priorOptions = process.env.NODE_OPTIONS;
+    const priorPath = process.env.PATH;
+    const priorUserconfig = process.env.NPM_CONFIG_USERCONFIG;
+    const priorIgnore = process.env.npm_config_ignore_scripts;
+    const priorIgnoreUpper = process.env.NPM_CONFIG_IGNORE_SCRIPTS;
+    const restore = (key: string, value: string | undefined) => { if (value === undefined) delete process.env[key]; else process.env[key] = value; };
+    try {
+      for (const member of corpus) {
+        process.env.VITEST_MAX_FORKS = "2";
+        restore("NODE_OPTIONS", priorOptions);
+        restore("PATH", priorPath);
+        restore("NPM_CONFIG_USERCONFIG", priorUserconfig);
+        restore("npm_config_ignore_scripts", priorIgnore);
+        restore("NPM_CONFIG_IGNORE_SCRIPTS", priorIgnoreUpper);
+        member.before?.();
+        const { repo, baseRef } = corpusRepo();
+        const base = await baseRef;
+        writeFileSync(join(repo, ".gitignore"), "argv.log\nmiss.flag\npackage-lock.json\n");
+        writeFileSync(join(repo, "src/a.ts"), "import { deep } from \"./deep.js\";\nexport const a = () => deep() + 5;\n");
+        commitAll(repo, "work");
+        const ends: GateEvent[] = [];
+        const { results } = await gates(
+          { gates: [...DETERMINISTIC, "acceptance"], files: ["**"], acceptance: [{ oracle: "command", command: member.oracle }] },
+          repo, base, { test: "sh run.sh" },
+          { selectTests: false, onGate: (e) => {
+            if (e.phase === "start" && e.gate === "acceptance") member.onAcceptance?.();
+            if (e.phase === "end") ends.push(e);
+          } },
+        );
+        const verdict = results.find((r) => r.gate === "test")!;
+        const shape = member.shape;
+        expect({ shape, runs: argvLines(repo).slice(1) }).toEqual({ shape, runs: member.runs });
+        expect({ shape, pass: results.every((r) => r.pass) }).toEqual({ shape, pass: member.pass });
+        expect({ shape, test: verdict.pass }).toEqual({ shape, test: member.pass });
+        // A rerun is the merge candidate's own full suite, never the earlier green reused.
+        if (member.runs.length === 2) expect({ shape, full: verdict.meta?.fullSuite, reused: verdict.meta?.reused }).toEqual({ shape, full: true, reused: undefined });
+        if (!member.pass) expect(verdict.meta).toMatchObject({ dirtyWorktree: true, dirtyAtRoundEnd: true });
+        expect({ shape, lastTestEnd: ends.filter((e) => e.gate === "test").at(-1) }).toEqual({ shape, lastTestEnd: expect.objectContaining({ result: verdict }) });
+      }
+    } finally {
+      restore("VITEST_MAX_FORKS", priorForks);
+      restore("NODE_OPTIONS", priorOptions);
+      restore("PATH", priorPath);
+      restore("NPM_CONFIG_USERCONFIG", priorUserconfig);
+      restore("npm_config_ignore_scripts", priorIgnore);
+      restore("NPM_CONFIG_IGNORE_SCRIPTS", priorIgnoreUpper);
+    }
+
+    // The full manifest, through a manifested runner: an oracle writes an ignored generated test the
+    // runner collects. No tree, command or environment component moves, so only the rediscovered
+    // manifest can withdraw the earlier green; an unchanged manifest keeps it.
+    for (const generated of [false, true]) {
+      const repo = makeRepo({
+        ".gitignore": "node_modules/\ntests/generated.test.ts\n",
+        "src/a.ts": "export const a = 1;\n",
+        "tests/a.test.ts": 'import { a } from "../src/a"; test("alpha", () => expect(a).toBeGreaterThan(0));\n',
+        "package.json": JSON.stringify({ type: "module", scripts: { test: "vitest run --globals" } }),
+      });
+      symlinkSync(join(import.meta.dirname, "../../node_modules"), join(repo, "node_modules"), "dir");
+      const base = await gitHead(repo);
+      writeFileSync(join(repo, "src/a.ts"), "export const a = 2;\n");
+      commitAll(repo, "work");
+      const oracle = generated ? `echo 'test("generated", () => expect(1).toBe(1));' > tests/generated.test.ts` : "true";
+      const { results } = await gates({ gates: [...DETERMINISTIC, "acceptance"], files: ["**"], acceptance: [{ oracle: "command", command: oracle }] },
+        repo, base, { test: "vitest run --globals" }, { selectTests: false });
+      const verdict = results.find((r) => r.gate === "test")!;
+      expect({ generated, pass: results.every((r) => r.pass), full: verdict.meta?.fullSuite, reused: verdict.meta?.reused, manifest: verdict.meta?.manifest })
+        .toEqual(generated
+          ? { generated, pass: true, full: true, reused: undefined, manifest: ["tests/a.test.ts", "tests/generated.test.ts"] }
+          : { generated, pass: true, full: undefined, reused: undefined, manifest: ["tests/a.test.ts"] });
+    }
+  }, 120_000);
+});

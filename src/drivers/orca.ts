@@ -644,6 +644,7 @@ interface OrcaSlotState {
   recoveries: number;
   recovering: boolean;
   unavailable?: string; // latched: the slot can no longer be addressed, ever
+  swept?: boolean; // this driver's reconcile already closed the terminal: close() has nothing left to do
 }
 
 export interface OrcaDriverOpts {
@@ -807,7 +808,8 @@ export class OrcaDriver implements ExecutorDriver {
         this.pendingProjects.delete(owned.taskId);
       }
     }
-    return { id, name: title, cwd: worktree, group: opts?.group };
+    const slot: Slot = { id, name: title, cwd: worktree, group: opts?.group, readScreen: () => this.readScreen(slot) };
+    return slot;
   }
 
   /**
@@ -1283,7 +1285,7 @@ export class OrcaDriver implements ExecutorDriver {
       throw new OrcaUnavailableError(family, `exited-shaped stream page: show answered by runtime ${show.runtimeId}, not the bound ${st.runtimeId}`, show.raw, "exited");
     }
     this.liveShowTerm(family, st, show);
-    const screen = await this.readScreen(st);
+    const screen = await this.screenFrame(st);
     if (screen.source !== "screen") {
       throw new OrcaUnavailableError(family, `exited-shaped stream page and no rendered screen for ${st.handle}`, blind.raw, "exited");
     }
@@ -1291,7 +1293,7 @@ export class OrcaDriver implements ExecutorDriver {
   }
 
   /** A rendered-frame liveness read. `--screen` and `--cursor` are mutually exclusive in Orca. */
-  private async readScreen(st: OrcaSlotState): Promise<{ term: Record<string, unknown>; source: string }> {
+  private async screenFrame(st: OrcaSlotState): Promise<{ term: Record<string, unknown>; source: string }> {
     const env = await this.terminalOp("status", st, (h) => this.call("read", [
       "terminal", "read", "--terminal", h, "--screen",
     ], this.cliCwd(st)));
@@ -1301,6 +1303,20 @@ export class OrcaDriver implements ExecutorDriver {
       throw new OrcaError("read", `screen read reports source ${source ?? "absent"}, not screen or screen-unavailable`, env.raw);
     }
     return { term, source };
+  }
+
+  /**
+   * OBS-1205: the public rendered-screen read a slot carries (Slot.readScreen). Kimi draws its trust
+   * modal with cursor addressing, so the stream holds the box rules and no `Trust` text while the
+   * painted frame shows `❯ Trust this folder`. Same ownership discipline as every read — bound
+   * runtime, addressed handle, running status — and a frame the runtime could not render is
+   * unreadable, never an empty screen a caller could read as "no modal".
+   */
+  async readScreen(slot: Slot): Promise<string> {
+    const st = this.state(slot);
+    const { term, source } = await this.screenFrame(st);
+    if (source !== "screen") throw new OrcaUnavailableError("read", `no rendered screen for ${st.handle}`, "");
+    return this.tailText("read", term, "");
   }
 
   /** A single UNPAGED tail read — exactly what the caller asked for and nothing more. Markers split
@@ -1379,7 +1395,7 @@ export class OrcaDriver implements ExecutorDriver {
       // reporting even when the show record alone would still look connected (show carries no
       // status field of its own, so a terminal can report "unknown"/"exited" on read while its
       // show row still says connected — the read leg is the only place that catches that).
-      const screen = await this.readScreen(st);
+      const screen = await this.screenFrame(st);
       if (`${st.runtimeId}:${st.handle}:${st.recoveries}` !== gen) {
         continue;
       }
@@ -1529,7 +1545,7 @@ export class OrcaDriver implements ExecutorDriver {
   async sendKey(slot: Slot, key: string): Promise<void> {
     const st = this.state(slot);
     this.assertAvailable("send", st);
-    if (key === "enter") {
+    if (key === "enter" || key === "Enter") { // "Enter": every adapter's declared trust key (OBS-1205)
       await this.sendText(st, "");
       return;
     }
@@ -1564,7 +1580,7 @@ export class OrcaDriver implements ExecutorDriver {
       if (stages.includes("turn_started")) return true;
       const deadline = this.time.now() + NUDGE_ECHO_TIMEOUT_MS;
       for (;;) {
-        const screen = await this.readScreen(st);
+        const screen = await this.screenFrame(st);
         // ponytail: "composer emptied" is "the text is no longer on the frame" — a TUI that keeps the
         // submitted turn on screen reads as undelivered until the timeout; the receipt stage is primary.
         if (screen.source === "screen") {
@@ -1951,7 +1967,7 @@ export class OrcaDriver implements ExecutorDriver {
     }
     const st = this.slots.get(slot.id);
     if (!st) return;
-    if (st.handle) {
+    if (st.handle && !st.swept) {
       await this.closeTerminal(st);
     }
     this.slots.delete(slot.id);
@@ -2116,6 +2132,12 @@ export class OrcaDriver implements ExecutorDriver {
             recoveries: 0,
             recovering: false,
           });
+          // A kept slot whose attempt the journal fold already retired (a seed readiness deadline
+          // parks one) can still hold this exact terminal; its own close() must not re-address a
+          // handle this driver just closed, or the run-end sweep latches on the vanished tab.
+          for (const st of this.slots.values()) {
+            if (st.handle === c.paneId && st.runtimeId === env.runtimeId) st.swept = true;
+          }
         } catch { /* vanished, stale, or no longer provably ours — never a blind retry */ }
       }
     } catch { /* cosmetic — visibility hygiene never fails the run */ }

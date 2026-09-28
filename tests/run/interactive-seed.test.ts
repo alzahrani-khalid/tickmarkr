@@ -9,7 +9,7 @@ import type { Assignment, InteractiveSeed, WorkerAdapter } from "../../src/adapt
 import { SubprocessDriver } from "../../src/drivers/subprocess.js";
 import type { ExecutorDriver, Slot } from "../../src/drivers/types.js";
 import { runDaemon, resetEarlyLaunchLivenessMsForTests, setEarlyLaunchLivenessMsForTests } from "../../src/run/daemon.js";
-import { runInteractiveSeed } from "../../src/run/interactive-seed.js";
+import { runInteractiveSeed, SeedReadinessError } from "../../src/run/interactive-seed.js";
 import { Journal } from "../../src/run/journal.js";
 import { COMMIT, setupRepo, T } from "../helpers/tmprepo.js";
 
@@ -257,13 +257,13 @@ test("an adapter whose trust modal appears before its readiness banner has that 
   // consulted only after runInteractiveSeed returns. Same adapter, same recorded ordering.
   const late = makeKimiModalDriver(promptFile);
   const seedOnly = { run: late.driver.run, waitOutput: late.driver.waitOutput, read: late.driver.read };
+  // OBS-1205 add.1: the readiness deadline is a delivery-readiness failure, thrown, not a returned launch.
   const unreached = await runInteractiveSeed({
     driver: seedOnly, slot: late.slot, adapter: kimi,
     assignment: KIMI_ASSIGNMENT, promptFile, taskTimeoutMinutes: 0.02,
-  });
-  expect(unreached.seedFailed).toBe(true);
-  expect(unreached.seedError).toMatch(/readiness pattern not seen/);
-  expect(unreached.trustAnswered).toBe(false);
+  }).then(() => undefined, (error: unknown) => error);
+  expect(unreached).toBeInstanceOf(SeedReadinessError);
+  expect(String((unreached as Error).message)).toMatch(/readiness pattern not seen/);
   expect(late.keys).toEqual([]);
   expect(late.log).not.toContain("ready");
   expect(late.log).not.toContain(`run:${late.seedCmd}`);
@@ -273,7 +273,6 @@ test("an adapter whose trust modal appears before its readiness banner has that 
   expect(matchesTrustDialog(late.pane(), kimi.trustDialog)).toBe(true);
   await late.driver.sendKey(late.slot, KIMI_TRUST_DIALOG.key);
   expect(late.keys).toEqual([KIMI_TRUST_DIALOG.key]); // a key, but the seed already failed closed
-  expect(unreached.seedFailed).toBe(true);
 
   // ARM C — the same ordering, painted LATE. "Before the readiness banner" is not "immediately":
   // a cold CLI can spend a minute starting up before it raises the gate, and an observation window
@@ -387,11 +386,15 @@ describe("daemon interactive seed path (fake adapter, zero tokens)", () => {
     const s = await runDaemon(repo, { adapters: [new SeedFakeAdapter(scriptPath)], runId: "run-ready", driver });
     expect(s.done).toEqual([]);
     expect(s.human).toEqual(["T1"]);
-    expect(runs).toEqual([SEED.launch("fake-1")]);
+    // Every delivery was a launch — the escalation ladder relaunches — and none was the seed line.
+    expect(runs.length).toBeGreaterThan(0);
+    expect(runs.every((cmd) => cmd.startsWith("launch-tui "))).toBe(true);
     expect(runs).not.toContain(SEED.seedLine(promptFile));
     expect(waits.some((w) => w.pattern === SEED.readinessMatch)).toBe(true);
-    const wr = Journal.open(repo, "run-ready").read().find((e) => e.event === "worker-result");
-    expect(wr?.data.finished).toBe(false);
+    // OBS-1205 add.1: a launch that never became ready never received the brief — no launch, no result.
+    const events = Journal.open(repo, "run-ready").read();
+    expect(events.filter((e) => e.event === "delivery-readiness-failed")).toHaveLength(runs.length);
+    expect(events.some((e) => e.event === "worker-launch" || e.event === "worker-result")).toBe(false);
   }, 30_000);
 
   test("after injecting the seed line the daemon reads the pane back and treats a submission that never left the input box as a failure rather than a false start", async () => {

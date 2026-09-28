@@ -13,7 +13,7 @@ import { compileSource } from "../../src/compile/index.js";
 import { compileNative } from "../../src/compile/native.js";
 import { criticalPathHits, declaredReviewPolicy, DEFAULT_CONFIG, effectiveReviewPolicy, isReviewLeafPath, repoOverlayPath } from "../../src/config/config.js";
 import { captureBaseline } from "../../src/gates/baseline.js";
-import { fetchTaskDiff, isReviewClosureMismatch, matchClosureId, modelProvider, pickReviewer, renderPriorMaterials, type ReviewVerdict, reviewGate } from "../../src/gates/review.js";
+import { fetchTaskDiff, isGarbageReview, isReviewClosureMismatch, matchClosureId, modelProvider, pickReviewer, renderPriorMaterials, type ReviewVerdict, reviewGate } from "../../src/gates/review.js";
 import { extractJson, extractPromptNonce } from "../../src/gates/llm.js";
 import { runGates } from "../../src/gates/run-gates.js";
 import { gitHead } from "../../src/run/git.js";
@@ -139,13 +139,21 @@ test("test: a task declaring no out of scope items renders delivered and saved r
     block approval. For a minor concern you have decided not to block on, set "defer": true and give a
     one-line "rationale" — it is recorded in the review, never dropped.
     A fix you prescribe that would break suites outside the task's declared write scope (files[]) is a scope finding, never a material one.
+    Each material finding names the class of defect it belongs to and binds that class to the goal clause or
+    acceptance criterion it violates (or to the regression this diff introduces), states its input → consequence,
+    and marks its evidence executed (you ran the reproducer), static (you traced it by reading) or blocked (it
+    could not run here). Blocked evidence never turns a finding into a pass, and a worker's own case table or
+    enumeration never resolves a finding: judge the diff itself.
 
     Respond with ONLY this JSON:
-    {"nonce": "<nonce>", "approve": true|false, "resolved": [], "reraised": [], "findings": [{"note": "...", "severity": "material"|"minor", "defer": false, "rationale": ""}], "comments": [{"path": "path/to/file", "line": 42, "body": "actionable feedback"}]}
+    {"nonce": "<nonce>", "approve": true|false, "resolved": [], "reraised": [], "findings": [{"note": "...", "severity": "material"|"minor", "defer": false, "rationale": ""}], "comments": [{"path": "path/to/file", "line": 42, "body": "actionable feedback", "finding": 1}]}
     For every prior material, put its fingerprint in exactly one of resolved (verified fixed) or reraised
     (still a blocking defect). Use only the listed fingerprints; never omit one or put it in both lists.
     Approve iff no material finding remains and every prior material is resolved.
     The top-level comments array is optional. Use it only for actionable line-anchored feedback.
+    A comment's optional "finding" names its parent: the 1-based index of its entry in findings, or a prior
+    fingerprint copied from above. A comment anchored to a deferred entry or a resolved prior does not block;
+    a comment naming no parent stays open.
 
     ## Response requirement
     Your reply must end with exactly ONE JSON object whose "nonce" is "<nonce>" — this brief's nonce, never one from an earlier brief. A valid example (a rejection; replace every value with your own verdict):
@@ -157,6 +165,25 @@ test("test: a task declaring no out of scope items renders delivered and saved r
   const empty = await captureSavedReview(mkTask({ outOfScope: [] }));
   expect(normalize(empty.delivered)).toBe(baseline);
   expect(normalize(empty.saved)).toBe(baseline);
+});
+
+// D-618 / C-1: a regression the diff introduces is a material binding of its own. Binding it only to the goal
+// clause or criterion the regressed behaviour served narrows the bar to what the spec happened to name.
+test("test: the material rubric binds a finding to the goal clause, the criterion, or the regression this diff introduces, so a rubric that demands a goal or criterion binding for regressions fails", async () => {
+  const prompt = await captureReviewPrompt();
+  expect(prompt).toContain("acceptance criterion it violates (or to the regression this diff introduces), states its input → consequence,");
+  expect(prompt).not.toContain("never to the regression alone");
+});
+
+// C-12 (T7 L2015 → L2052 in run …0171): a delivered material whose prose mentions "unparseable" excluded the task's only reviewer.
+test("test: a delivered material rejection whose note mentions unparseable keeps its reviewer while a malformed verdict excludes it, so a prose match on the word fails", async () => {
+  const { repo, base } = repoWithCommit();
+  const fake = fakeWith({ review: { approve: false, findings: [{ note: "judge.ts:9 retains both rows without unparseable=true", severity: "material", defer: false, rationale: "" }] } });
+  const delivered = await reviewGate(mkTask(), repo, base, author, CH, [fake], DEFAULT_CONFIG);
+  expect(delivered.pass).toBe(false);
+  expect(delivered.details).toContain("unparseable");
+  expect(isGarbageReview(delivered)).toBe(false);
+  expect(isGarbageReview({ ...delivered, meta: { ...delivered.meta, unparseable: true } })).toBe(true);
 });
 
 test("test: a review round for a task declaring out of scope items renders them under an out of scope heading between the prior materials and the diff stating a finding inside them is not material, so a brief that omits them fails", async () => {
@@ -290,13 +317,21 @@ test("test: a task whose files[] names no test file receives a brief that says n
     block approval. For a minor concern you have decided not to block on, set "defer": true and give a
     one-line "rationale" — it is recorded in the review, never dropped.
     A fix you prescribe that would break suites outside the task's declared write scope (files[]) is a scope finding, never a material one.
+    Each material finding names the class of defect it belongs to and binds that class to the goal clause or
+    acceptance criterion it violates (or to the regression this diff introduces), states its input → consequence,
+    and marks its evidence executed (you ran the reproducer), static (you traced it by reading) or blocked (it
+    could not run here). Blocked evidence never turns a finding into a pass, and a worker's own case table or
+    enumeration never resolves a finding: judge the diff itself.
 
     Respond with ONLY this JSON:
-    {"nonce": "<nonce>", "approve": true|false, "resolved": [], "reraised": [], "findings": [{"note": "...", "severity": "material"|"minor", "defer": false, "rationale": ""}], "comments": [{"path": "path/to/file", "line": 42, "body": "actionable feedback"}]}
+    {"nonce": "<nonce>", "approve": true|false, "resolved": [], "reraised": [], "findings": [{"note": "...", "severity": "material"|"minor", "defer": false, "rationale": ""}], "comments": [{"path": "path/to/file", "line": 42, "body": "actionable feedback", "finding": 1}]}
     For every prior material, put its fingerprint in exactly one of resolved (verified fixed) or reraised
     (still a blocking defect). Use only the listed fingerprints; never omit one or put it in both lists.
     Approve iff no material finding remains and every prior material is resolved.
     The top-level comments array is optional. Use it only for actionable line-anchored feedback.
+    A comment's optional "finding" names its parent: the 1-based index of its entry in findings, or a prior
+    fingerprint copied from above. A comment anchored to a deferred entry or a resolved prior does not block;
+    a comment naming no parent stays open.
 
     ## Response requirement
     Your reply must end with exactly ONE JSON object whose "nonce" is "<nonce>" — this brief's nonce, never one from an earlier brief. A valid example (a rejection; replace every value with your own verdict):
@@ -1951,13 +1986,21 @@ test("test: a round given no operator context over identical task diff plus carr
     block approval. For a minor concern you have decided not to block on, set "defer": true and give a
     one-line "rationale" — it is recorded in the review, never dropped.
     A fix you prescribe that would break suites outside the task's declared write scope (files[]) is a scope finding, never a material one.
+    Each material finding names the class of defect it belongs to and binds that class to the goal clause or
+    acceptance criterion it violates (or to the regression this diff introduces), states its input → consequence,
+    and marks its evidence executed (you ran the reproducer), static (you traced it by reading) or blocked (it
+    could not run here). Blocked evidence never turns a finding into a pass, and a worker's own case table or
+    enumeration never resolves a finding: judge the diff itself.
 
     Respond with ONLY this JSON:
-    {"nonce": "<nonce>", "approve": true|false, "resolved": [], "reraised": [], "findings": [{"note": "...", "severity": "material"|"minor", "defer": false, "rationale": ""}], "comments": [{"path": "path/to/file", "line": 42, "body": "actionable feedback"}]}
+    {"nonce": "<nonce>", "approve": true|false, "resolved": [], "reraised": [], "findings": [{"note": "...", "severity": "material"|"minor", "defer": false, "rationale": ""}], "comments": [{"path": "path/to/file", "line": 42, "body": "actionable feedback", "finding": 1}]}
     For every prior material, put its fingerprint in exactly one of resolved (verified fixed) or reraised
     (still a blocking defect). Use only the listed fingerprints; never omit one or put it in both lists.
     Approve iff no material finding remains and every prior material is resolved.
     The top-level comments array is optional. Use it only for actionable line-anchored feedback.
+    A comment's optional "finding" names its parent: the 1-based index of its entry in findings, or a prior
+    fingerprint copied from above. A comment anchored to a deferred entry or a resolved prior does not block;
+    a comment naming no parent stays open.
 
     ## Response requirement
     Your reply must end with exactly ONE JSON object whose "nonce" is "<nonce>" — this brief's nonce, never one from an earlier brief. A valid example (a rejection; replace every value with your own verdict):
@@ -2032,13 +2075,21 @@ test("test: a round given no operator context over identical task diff plus carr
     block approval. For a minor concern you have decided not to block on, set "defer": true and give a
     one-line "rationale" — it is recorded in the review, never dropped.
     A fix you prescribe that would break suites outside the task's declared write scope (files[]) is a scope finding, never a material one.
+    Each material finding names the class of defect it belongs to and binds that class to the goal clause or
+    acceptance criterion it violates (or to the regression this diff introduces), states its input → consequence,
+    and marks its evidence executed (you ran the reproducer), static (you traced it by reading) or blocked (it
+    could not run here). Blocked evidence never turns a finding into a pass, and a worker's own case table or
+    enumeration never resolves a finding: judge the diff itself.
 
     Respond with ONLY this JSON:
-    {"nonce": "<nonce>", "approve": true|false, "resolved": [], "reraised": [], "findings": [{"note": "...", "severity": "material"|"minor", "defer": false, "rationale": ""}], "comments": [{"path": "path/to/file", "line": 42, "body": "actionable feedback"}]}
+    {"nonce": "<nonce>", "approve": true|false, "resolved": [], "reraised": [], "findings": [{"note": "...", "severity": "material"|"minor", "defer": false, "rationale": ""}], "comments": [{"path": "path/to/file", "line": 42, "body": "actionable feedback", "finding": 1}]}
     For every prior material, put its fingerprint in exactly one of resolved (verified fixed) or reraised
     (still a blocking defect). Use only the listed fingerprints; never omit one or put it in both lists.
     Approve iff no material finding remains and every prior material is resolved.
     The top-level comments array is optional. Use it only for actionable line-anchored feedback.
+    A comment's optional "finding" names its parent: the 1-based index of its entry in findings, or a prior
+    fingerprint copied from above. A comment anchored to a deferred entry or a resolved prior does not block;
+    a comment naming no parent stays open.
 
     ## Response requirement
     Your reply must end with exactly ONE JSON object whose "nonce" is "<nonce>" — this brief's nonce, never one from an earlier brief. A valid example (a rejection; replace every value with your own verdict):

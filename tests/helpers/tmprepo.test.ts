@@ -2,7 +2,7 @@ import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { describe, expect, test } from "vitest";
-import { makeRepo, makeTestTempDir, recordTmpdirChild, TEST_TEMP_ROOT, TMPDIR_CHILD_ENV, TMPDIR_CHILD_TEST } from "./tmprepo.js";
+import { CHILD_REPORT_DEADLINE_MS, makeRepo, makeTestTempDir, readChildReport, recordTmpdirChild, TEST_TEMP_ROOT, TMPDIR_CHILD_ENV, TMPDIR_CHILD_TEST } from "./tmprepo.js";
 
 const CHILD_ENV = "TICKMARKR_TMPREPO_CHILD";
 const CHILD_TEST = "child runner: plant one fixture repository and hold it until released";
@@ -30,13 +30,40 @@ function spawnRunner(outFile: string): Promise<number | null> {
   return new Promise((resolve) => child.on("exit", (code) => resolve(code)));
 }
 
-async function waitFor(file: string): Promise<{ pid: number; repo: string; root: string }> {
-  for (let i = 0; i < 600; i++) {
-    if (existsSync(file)) return JSON.parse(readFileSync(file, "utf8"));
-    await sleep(100);
-  }
-  throw new Error(`child runner never reported to ${file}`);
-}
+type Report = { pid: number; repo: string; root: string };
+const waitFor = (file: string) => readChildReport<Report>(file);
+
+describe("child-report reader (OBS-1200)", () => {
+  test("test: the tmprepo child-report reader returns a complete report when its writer creates an empty file before delayed JSON completion but fails a permanently malformed report at the existing deadline, so an early parse exception or unbounded wait fails", async () => {
+    const dir = makeTestTempDir("tickmarkr-report-");
+    const report = { pid: 7, repo: join(dir, "r"), root: dir };
+
+    // the writer's create-then-write schedule: an empty file, then a partial prefix, then the whole report
+    const delayed = join(dir, "delayed.json");
+    writeFileSync(delayed, "");
+    const writer = (async () => {
+      await sleep(250);
+      writeFileSync(delayed, JSON.stringify(report).slice(0, 12));
+      await sleep(250);
+      writeFileSync(delayed, JSON.stringify(report));
+    })();
+    const started = Date.now();
+    await expect(readChildReport<Report>(delayed)).resolves.toEqual(report);
+    expect(Date.now() - started).toBeGreaterThanOrEqual(450);
+    await writer;
+
+    // a report that never completes fails at the deadline, naming its bytes — never before, never later
+    const malformed = join(dir, "malformed.json");
+    writeFileSync(malformed, "{ not json");
+    const deadline = 700;
+    const before = Date.now();
+    await expect(readChildReport(malformed, deadline)).rejects.toThrow(/incomplete after 700 ms: "\{ not json"/);
+    const elapsed = Date.now() - before;
+    expect(elapsed).toBeGreaterThanOrEqual(deadline);
+    expect(elapsed).toBeLessThan(deadline + 2_000);
+    expect(CHILD_REPORT_DEADLINE_MS).toBe(60_000); // the production caller keeps the 600 × 100 ms bound
+  }, 20_000);
+});
 
 describe("battery hygiene: per-runner temp namespaces (OBS-1054)", () => {
   test("test: two vitest runners of one suite file started in parallel each create their fixtures under a namespace root that carries that runner's process id and a nonce, and a deliberate removal of one runner's whole namespace root leaves the other runner's fixture repository and its .git/objects intact, so a helper whose directories share one flat prefix across runners fails", async () => {

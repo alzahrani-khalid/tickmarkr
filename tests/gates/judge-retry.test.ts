@@ -15,7 +15,7 @@ import { buildTaskPrompt } from "../../src/adapters/prompt.js";
 import { shq, type Assignment, type BillingChannel, type WorkerAdapter } from "../../src/adapters/types.js";
 import { DEFAULT_CONFIG } from "../../src/config/config.js";
 import { captureBaseline } from "../../src/gates/baseline.js";
-import { type GateEvent, runGates } from "../../src/gates/run-gates.js";
+import { type GateEvent, judgeContradictions, runGates } from "../../src/gates/run-gates.js";
 import { extractVerdictJson, runHeadless, verdictNonceLine } from "../../src/gates/llm.js";
 import { validateGraph } from "../../src/graph/schema.js";
 import { buildDossierPrompt } from "../../src/run/consult.js";
@@ -382,4 +382,26 @@ describe("GATE-09 fake judge array — counter advances ONLY on TICKMARKR-JUDGE 
     );
     expect(got).toEqual(inconsistent);
   });
+});
+
+// C-3 (D-669, verify of T7's merged diff): the contradiction check compared only the newest prior carrying the
+// key, so PASS(A) → FAIL(B) → fresh FAIL(A) skipped adjudication and funded a repair on an unconfirmed FAIL.
+test("test: a fresh FAIL on blob A after PASS on A then FAIL on B is a contradiction against the PASS on A, so comparing only the newest prior fails", async () => {
+  const repo = makeRepo({ "src/x.ts": "A\n" });
+  const git = (c: string) => execSync(`git ${c}`, { cwd: repo, encoding: "utf8" }).trim();
+  const commitA = git("rev-parse HEAD");
+  writeFileSync(join(repo, "src/x.ts"), "B\n");
+  git("commit -qam b --no-gpg-sign");
+  const commitB = git("rev-parse HEAD");
+  writeFileSync(join(repo, "src/x.ts"), "A\n");
+  git("commit -qam a-again --no-gpg-sign");
+  const head = git("rev-parse HEAD");
+  const row = (met: boolean) => [{ id: "c1", key: "k1", met, paths: ["src/x.ts"] }];
+  // priorJudgments is newest-first: FAIL on B, then PASS on A.
+  const priors = [{ commit: commitB, criteria: row(false) }, { commit: commitA, criteria: row(true) }];
+  expect(await judgeContradictions(repo, head, row(false), priors))
+    .toEqual([{ id: "c1", met: false, priorMet: true, priorCommit: commitA, paths: ["src/x.ts"] }]);
+  // The newest comparable prior decides: a FAIL already recorded on A (after the PASS) is no contradiction.
+  const confirmed = [{ commit: head, criteria: row(false) }, ...priors];
+  expect(await judgeContradictions(repo, head, row(false), confirmed)).toEqual([]);
 });

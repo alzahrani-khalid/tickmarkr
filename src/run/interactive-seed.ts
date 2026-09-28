@@ -1,4 +1,5 @@
 import { matchesTrustDialog, type Assignment, type WorkerAdapter } from "../adapters/types.js";
+import { DeliveryReadinessError } from "../drivers/herdr.js";
 import type { ExecutorDriver, Slot } from "../drivers/types.js";
 
 export interface InteractiveSeedResult {
@@ -25,6 +26,19 @@ const TRUST_PANE_ROWS = 80;
 
 type SeedDriver = Pick<ExecutorDriver, "run" | "waitOutput" | "read" | "sendKey">;
 
+// OBS-1205 add.1: a launch whose readiness never appeared never received the brief, so its deadline is
+// the delivery-readiness class (OBS-142: the interface never became interactive), not a launched
+// worker. Thrown as that class, the daemon's existing catch journals `delivery-readiness-failed`,
+// closes the slot and walks the escalation ladder to a failover — with no `worker-launch` row, which is
+// where a funded repair's findings expire, so the repair the seed never delivered stays owed.
+export class SeedReadinessError extends DeliveryReadinessError {
+  constructor(waitedMs: number, transcript: string, readinessMatch: string) {
+    super(waitedMs, transcript);
+    this.name = "SeedReadinessError";
+    this.message = `seed readiness pattern not seen after ${waitedMs}ms: ${readinessMatch}`;
+  }
+}
+
 // v1.89 T19 / OBS-406: wait for readiness, answering a fingerprint-matched trust modal at most ONCE
 // on the way. The daemon's own trust loop runs only after runInteractiveSeed returns, and this wait
 // is exactly the window the modal blocks in — a declaration consulted only there is unreachable
@@ -40,22 +54,32 @@ async function awaitReadiness(opts: {
   const { driver, slot, readinessMatch, deadline } = opts;
   const dialog = opts.adapter.trustDialog;
   const left = () => Math.max(0, deadline - Date.now());
+  // Every wait below is awaited, and the budget can run out inside any of them (OrcaDriver.waitOutput
+  // checks its sweep before its clock). Readiness a wait returns after the deadline is expired — it may
+  // be what a key pressed at the edge produced — and a launch whose deadline passed has already
+  // failed, so neither a key nor a seed follows it. Both branches apply it.
+  const expired = () => Date.now() >= deadline;
+  const readyInTime = async (ms: number) => (await driver.waitOutput(slot, readinessMatch, ms)) && !expired();
   // Nothing this launch could answer (no declaration, an honest {kind:"none"}, or a driver with no
-  // keystroke surface): the single long wait, byte-identical to pre-T19 behaviour.
+  // keystroke surface): the single long wait, pre-T19 behaviour plus the post-await deadline check.
   if (!dialog || dialog.kind === "none" || !driver.sendKey) {
-    return { ready: await driver.waitOutput(slot, readinessMatch, left()), trustAnswered: false };
+    return { ready: await readyInTime(left()), trustAnswered: false };
   }
   let trustAnswered = false;
-  while (!trustAnswered && left() > 0) {
-    if (await driver.waitOutput(slot, readinessMatch, Math.min(TRUST_POLL_MS, left()))) {
+  while (!trustAnswered && !expired()) {
+    if (await readyInTime(Math.min(TRUST_POLL_MS, left()))) {
       return { ready: true, trustAnswered };
     }
     let paneText: string;
     try {
-      paneText = await driver.read(slot, TRUST_PANE_ROWS);
+      // OBS-1205: a cursor-drawn modal has text only on the RENDERED frame, so the slot's screen read
+      // is preferred when its driver has one. An unreadable or foreign frame is a failed read, never
+      // a cue to match the stream instead; drivers without a screen keep polling `read`.
+      paneText = await (slot.readScreen ? slot.readScreen() : driver.read(slot, TRUST_PANE_ROWS));
     } catch {
       continue; // a failed read is not a matched modal — keep observing, spend nothing
     }
+    if (expired()) break; // the wait or the read outlived the budget: no key after the deadline
     if (!matchesTrustDialog(paneText, dialog)) continue;
     // Review round 7 (material): the latch is spent BEFORE the awaited send, not after it. A send
     // that dispatches the key and THEN rejects is ambiguous — the keystroke may already be in the
@@ -74,7 +98,8 @@ async function awaitReadiness(opts: {
       /* dispatched-then-rejected: never retried here, and never re-tried by the daemon either */
     }
   }
-  return { ready: await driver.waitOutput(slot, readinessMatch, left()), trustAnswered };
+  // An expired budget gets no closing sweep: a zero-length wait still reads the terminal once.
+  return { ready: !expired() && await readyInTime(left()), trustAnswered };
 }
 
 // v1.69 T6: launch-then-seed handoff for adapters whose real TUI cannot be argv-seeded.
@@ -98,6 +123,8 @@ export async function runInteractiveSeed(opts: {
 
   // `trustAnswered` rides EVERY return below, including both early ones: the daemon initializes its
   // per-slot latch from it, and an omission there reads as "no key was sent" — the second-Enter defect.
+  // The readiness deadline throws instead; `onTrustAnswered` already carried the latch out.
+  const launchedAt = Date.now();
   const { ready, trustAnswered } = await awaitReadiness({
     driver: opts.driver,
     slot: opts.slot,
@@ -107,9 +134,7 @@ export async function runInteractiveSeed(opts: {
     ...(opts.onTrustAnswered ? { onTrustAnswered: opts.onTrustAnswered } : {}),
   });
   const banner = await opts.driver.read(opts.slot, 1000);
-  if (!ready) {
-    return { output: banner, seedFailed: true, seedError: `readiness pattern not seen: ${seed.readinessMatch}`, trustAnswered };
-  }
+  if (!ready) throw new SeedReadinessError(Date.now() - launchedAt, banner, seed.readinessMatch);
 
   let sessionId: string | undefined;
   if (seed.confirmBanner) {

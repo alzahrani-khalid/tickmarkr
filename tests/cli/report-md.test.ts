@@ -1,4 +1,4 @@
-import { cpSync, mkdirSync, readdirSync } from "node:fs";
+import { cpSync, mkdirSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import { renderMarkdownRecord, report } from "../../src/cli/commands/report.js";
@@ -328,5 +328,109 @@ describe("tickmarkr report --md (REC-01 execution record)", () => {
         await expect(report([runId, "--md"], repo)).resolves.toBeTypeOf("string");
       });
     }
+  });
+});
+
+// OBS-1201 / OBS-634: lineage and suite telemetry print what was measured and name what was not.
+describe("OBS-1201 evidence lineage and OBS-634 suite telemetry", () => {
+  const t = (s: number) => new Date(Date.parse("2026-09-28T00:00:00.000Z") + s * 1_000).toISOString();
+  const seed = (repo: string, runId: string, events: JournalEvent[], baseline?: unknown) => {
+    const j = Journal.create(repo, runId);
+    writeFileSync(join(j.dir, "journal.jsonl"), events.map((e) => JSON.stringify(e)).join("\n") + "\n");
+    if (baseline !== undefined) writeFileSync(join(j.dir, "baseline.json"), JSON.stringify(baseline));
+  };
+  const testEntry = (entry: Record<string, unknown>) => ({ commands: { test: { exitCode: 0, fingerprints: [], ...entry } } });
+
+  test("production reports expose fresh invocation replay reuse counts alongside measured suite-wall file-sum parallelism longest-file values versus unknown interrupted unmatched legacy history, so reused evidence counted fresh or unknown printed zero fails", async () => {
+    const repo = makeRepo({ "keep.txt": "x\n" });
+    // Measured: one fresh suite, its journal replay and a cache reuse — both copies carry the duration.
+    seed(repo, "run-measured", [
+      { ts: t(0), event: "run-start", data: { baseRef: "base" } },
+      { ts: t(0), event: "task-dispatch", taskId: "T1", data: { attempt: 0 } },
+      { ts: t(0), event: "worker-launch", taskId: "T1", data: { attempt: 0 } },
+      { ts: t(10), event: "worker-result", taskId: "T1", data: { ok: true } },
+      { ts: t(40), event: "gate-result", taskId: "T1", data: { gate: "test", pass: true, durationMs: 30_000, nonce: "n1" } },
+      { ts: t(50), event: "gate-result", taskId: "T1", data: { gate: "test", pass: true, replayedFromAttempt: 0, durationMs: 30_000, nonce: "n1" } },
+      { ts: t(55), event: "gate-result", taskId: "T2", data: { gate: "test", pass: true, reused: true, durationMs: 30_000, evidenceReceipt: { invocationId: "n1" } } },
+      { ts: t(60), event: "run-end", data: { done: ["T1", "T2"], failed: [], human: [], blocked: [], pending: [] } },
+    ], testEntry({
+      durationMs: 600_000, fileDurationSumMs: 1_800_000, impliedParallelism: 3, fileCount: 12,
+      longestFile: { file: "tests/slow.test.ts", durationMs: 240_000 },
+    }));
+    const suite = "wall 10m 0s · file-sum 30m 0s · implied parallelism 3.00 · longest file tests/slow.test.ts 4m 0s · 12 files";
+    const md = await report(["run-measured", "--md"], repo);
+    expect(md).toContain("- **gate evidence:** fresh 1 · replay 1 · reuse 1 · unknown 0");
+    expect(md).toContain("- **test:** 30s (50%) · task-time 30s"); // the copies add no service
+    expect(md).toContain(`- **suite telemetry (baseline test capture):** ${suite}`);
+    const text = await report(["run-measured"], repo);
+    expect(text).toContain("fresh 1 · replay 1 · reuse 1 · unknown 0");
+    expect(text).toContain(suite);
+
+    // A held screen ran fresh and its full suite came from the cache: the one merge-candidate row is
+    // a reuse AND a fresh screen whose measured interval is test service. Its replayed copy and a bare
+    // reuse add no time.
+    seed(repo, "run-screen", [
+      { ts: t(0), event: "run-start", data: { baseRef: "base" } },
+      { ts: t(0), event: "phase-start", taskId: "T1", data: { phase: "gates" } },
+      { ts: t(0), event: "phase-start", taskId: "T1", data: { phase: "gate:test", gate: "test" } },
+      { ts: t(10), event: "phase-start", taskId: "T1", data: { phase: "gate:test", gate: "test" } },
+      { ts: t(12), event: "gate-result", taskId: "T1", data: {
+        gate: "test", pass: true, reused: true, fullSuite: true, durationMs: 6_000, selectedDurationMs: 6_000, fullDurationMs: 0,
+        evidenceReceipt: { invocationId: "n-cached" },
+      } },
+      { ts: t(14), event: "gate-result", taskId: "T1", data: { gate: "test", pass: true, reused: true, fullSuite: true, replayedFromAttempt: 0, selectedDurationMs: 6_000 } },
+      { ts: t(15), event: "gate-result", taskId: "T2", data: { gate: "test", pass: true, reused: true, evidenceReceipt: { invocationId: "n-cached" } } },
+      { ts: t(20), event: "run-end", data: { done: ["T1", "T2"], failed: [], human: [], blocked: [], pending: [] } },
+    ]);
+    const screened = await report(["run-screen", "--md"], repo);
+    expect(screened).toContain("- **test:** 6s (30%) · task-time 6s");
+    expect(screened).toContain("- **gate evidence:** fresh 1 · replay 0 · reuse 3 · unknown 0");
+
+    // Legacy and cut history: rows without durations, a dispatch with no launch row, a launch, a wait
+    // and a gate start cut by a restart, a launch, a wait and a gate start never matched — and no
+    // baseline capture at all.
+    seed(repo, "run-legacy", [
+      { ts: t(0), event: "run-start", data: { baseRef: "base" } },
+      { ts: t(0), event: "task-dispatch", taskId: "T1", data: { attempt: 0 } },
+      { ts: t(1), event: "worker-launch", taskId: "T1", data: { attempt: 0 } },
+      { ts: t(2), event: "suite-wait", taskId: "T1", data: { count: 1 } },
+      { ts: t(3), event: "phase-start", taskId: "T1", data: { phase: "gate:test", gate: "test" } },
+      { ts: t(5), event: "run-resume", data: {} },
+      { ts: t(6), event: "worker-launch", taskId: "T2", data: { attempt: 0 } },
+      { ts: t(7), event: "suite-wait", taskId: "T2", data: { count: 1 } },
+      { ts: t(8), event: "task-dispatch", taskId: "T3", data: { attempt: 0 } },
+      { ts: t(8), event: "gate-result", taskId: "T1", data: { gate: "build", pass: true, details: "exit 0" } },
+      { ts: t(9), event: "gate-result", taskId: "T1", data: { gate: "test", pass: true, details: "ok" } },
+      { ts: t(9), event: "phase-start", taskId: "T1", data: { phase: "judge", gate: "acceptance" } },
+      { ts: t(10), event: "run-end", data: { done: ["T1"], failed: [], human: [], blocked: [], pending: [] } },
+    ]);
+    const legacy = await report(["run-legacy", "--md"], repo);
+    expect(legacy).toContain("- **interruption:** 2s (20%) · task-time 2s");
+    expect(legacy).toContain("- **test:** unknown — 1 row without a duration · 1 cut by a restart\n");
+    expect(legacy).toContain("- **semantics:** unknown — 1 unmatched\n");
+    expect(legacy).toContain("- **other-gate:** unknown — 1 row without a duration");
+    expect(legacy).toContain("- **worker:** unknown — 1 dispatch without a launch row · 1 unmatched · 1 cut by a restart");
+    expect(legacy).toContain("- **queue:** unknown — 1 unmatched · 1 cut by a restart");
+    expect(legacy).toContain("- **gate evidence:** fresh 0 · replay 0 · reuse 0 · unknown 2");
+    expect(legacy).toContain("- **suite telemetry (baseline test capture):** not recorded — this run's baseline holds no test capture");
+    expect(legacy).not.toMatch(/\*\*(?:test|semantics|worker|queue|other-gate):\*\* 0s/u);
+
+    // A capture that returned no verdict, and one whose runner named no per-file timing.
+    seed(repo, "run-infra", [{ ts: t(0), event: "run-start", data: {} }, { ts: t(1), event: "run-end", data: {} }],
+      testEntry({ infra: true, invalidCause: "ceiling-kill", durationMs: 1_800_000, fileDurationSumMs: null, impliedParallelism: null, longestFile: null }));
+    expect(await report(["run-infra", "--md"], repo))
+      .toContain("- **suite telemetry (baseline test capture):** not measurable — the baseline capture returned no verdict (ceiling-kill)");
+    seed(repo, "run-no-files", [{ ts: t(0), event: "run-start", data: {} }, { ts: t(1), event: "run-end", data: {} }],
+      testEntry({ durationMs: 5_000, fileDurationSumMs: null, impliedParallelism: null, longestFile: null }));
+    const unmeasured = "not measurable (the runner named no per-file durations)";
+    expect(await report(["run-no-files", "--md"], repo)).toContain(
+      `- **suite telemetry (baseline test capture):** wall 5s · file-sum ${unmeasured} · implied parallelism ${unmeasured} · longest file ${unmeasured}`,
+    );
+
+    // No run-start: no window to partition, said as such rather than a table of zeros.
+    seed(repo, "run-no-start", [{ ts: t(0), event: "task-dispatch", taskId: "T1", data: {} }]);
+    const noStart = await report(["run-no-start", "--md"], repo);
+    expect(noStart).toContain("- **window:** not measurable — the journal names no run-start with a readable timestamp");
+    expect(noStart).not.toContain("- **test:**");
   });
 });

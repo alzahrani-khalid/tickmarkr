@@ -19,6 +19,7 @@ const files = ["tests/ordinary.test.ts", "tests/cockpit/sweep.test.ts", "tests/c
 function seed(repo: string) {
   cpSync(join(root, "src"), join(repo, "src"), { recursive: true });
   cpSync(join(root, "vitest.config.ts"), join(repo, "vitest.config.ts"));
+  cpSync(join(root, "scripts/vitest-lease.ts"), join(repo, "scripts/vitest-lease.ts")); // the config's globalSetup
   writeFileSync(join(repo, ".gitignore"), readFileSync(join(root, ".gitignore"), "utf8") + "\nnode_modules\n");
   writeFileSync(join(repo, "package.json"), JSON.stringify({ type: "module" }));
   mkdirSync(join(repo, "tests"), { recursive: true });
@@ -65,7 +66,9 @@ async function run(repo: string, record: string, extra: string[] = [], cache?: s
 function assertLocal(record: any, repo: string, base = join(repo, ".vitest-cache")) {
   if (existsSync(repo) && base.startsWith(repo + "/")) base = realpathSync(repo) + base.slice(repo.length);
   expect(record.root === base || record.root.startsWith(base + "/"), JSON.stringify(record)).toBe(true);
-  expect(record.projects.map((p: any) => p.name)).toEqual(["suite", "sync-heavy", "keys-ledger", "built-cli", "signal-reaper"]);
+  // OBS-634 add: the CI guard isolates sync-heavy; locally its members pool into `suite`
+  const syncHeavy = process.env.TICKMARKR_CI_LEAN_REPORTERS === "1" ? ["sync-heavy"] : [];
+  expect(record.projects.map((p: any) => p.name)).toEqual(["suite", ...syncHeavy, "keys-ledger", "built-cli", "signal-reaper"]);
   for (const p of record.projects) {
     expect(p.dir === base || p.dir.startsWith(base + "/"), p.dir).toBe(true);
     expect(p.single).toBe(p.name !== "suite");

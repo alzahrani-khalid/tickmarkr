@@ -1169,7 +1169,9 @@ describe("OBS-1107 carry verification reads content, not hashes (fake adapter, z
       const [empty0, shared0, own0] = first!.data.attempted as string[];
       expect(first!.data, variant).toMatchObject({ carried: [shared0, own0], accounted: [empty0] });
       expect(evs.filter((e) => e.event === "work-loss" || e.event === "repair-cancelled"), variant).toEqual([]);
-      expect(evs.filter((e) => e.event === "repair-dispatch"), variant).toHaveLength(1);
+      // the empty-commit repair's red is a cached COPY of one observation (OBS-1106), so it draws the
+      // second bounded repair instead of tripping the fingerprint cap
+      expect(evs.filter((e) => e.event === "repair-dispatch"), variant).toHaveLength(2);
 
       const taskWt = worktreePath(repo, `tickmarkr/${runId}--T1`);
       const [shared, own, empty] = (await shOk("git log --reverse --format=%H HEAD~3..HEAD", taskWt)).trim().split("\n");
@@ -2523,7 +2525,6 @@ describe("T2 a passing review does not drop what it deferred (fake adapter, zero
 
 describe("RT-2 red replay", () => {
   test("test: a repair attempt whose gate subject digest equals the previous attempt's red gate-result digest journals a gate-replayed row naming that attempt and the replayed gate, runs no gate command, and parks or escalates exactly as the prior red did, while a repair attempt on a different digest runs every declared gate command, so an unchanged tree that re-runs the battery fails", async () => {
-    const runs: JournalEvent[][] = [];
     for (const changed of [false, true]) {
       const runId = "run-red-replay";
       const { repo, fake } = setupRepo(
@@ -2546,7 +2547,6 @@ describe("RT-2 red replay", () => {
       const summary = await runDaemon(repo, { adapters: [fake], runId });
       expect(summary.human).toEqual(["T1"]);
       const events = Journal.open(repo, runId).read();
-      runs.push(events);
       const rows = events.filter((e) => e.event === "gate-result");
       const prior = rows.filter((e) => e.data.attempt === 0);
       const next = rows.filter((e) => e.data.attempt === 1);
@@ -2561,18 +2561,31 @@ describe("RT-2 red replay", () => {
         expect(next.map((e) => e.data.details)).toEqual(prior.map((e) => e.data.details));
         expect(next.every((e) => e.data.replayedFromAttempt === 0 && e.data.durationMs === undefined)).toBe(true);
         expect(next[0]!.data.commit).toBe(prior[0]!.data.commit);
-        expect(replayed.map((e) => e.data.gate)).toEqual(prior.map((e) => e.data.gate));
-        expect(replayed.every((e) => e.data.attempt === 1 && e.data.priorAttempt === 0
-          && e.data.commit === prior[0]!.data.commit)).toBe(true);
+        const replayed1 = replayed.filter((e) => e.data.attempt === 1);
+        expect(replayed1.map((e) => e.data.gate)).toEqual(prior.map((e) => e.data.gate));
+        expect(replayed1.every((e) => e.data.priorAttempt === 0 && e.data.commit === prior[0]!.data.commit)).toBe(true);
+        // The replayed red is dispositioned exactly as the prior red was — the ordinary next repair on
+        // the same gates. Being a COPY of that red (OBS-1106), it never reaches the fingerprint cap by
+        // itself: the cap waits for a second FRESH execution of the same failure.
+        const repairs = events.filter((e) => e.event === "repair-attempt");
+        expect(repairs.slice(0, 2).map((e) => e.data.charge)).toEqual([1, 2]);
+        expect(repairs[1]!.data.gates).toEqual(repairs[0]!.data.gates);
+        const cap = events.findIndex((e) => e.event === "gate-fingerprint-cap");
+        const freshReds = events.flatMap((e, i) => e.event === "gate-result" && e.data.gate === "acceptance" && e.data.pass === false
+          && e.data.replayedFromAttempt === undefined && e.data.reused !== true ? [i] : []);
+        expect(freshReds.length).toBeGreaterThanOrEqual(2);
+        expect(cap).toBeGreaterThan(freshReds[1]!);
       }
       const commands = readFileSync(log, "utf8").trim().split("\n");
-      expect(commands).toEqual(changed ? ["build", "lint", "test", "build", "lint", "test"] : ["build", "lint", "test"]);
+      if (changed) expect(commands).toEqual(["build", "lint", "test", "build", "lint", "test"]);
+      else {
+        expect(commands.slice(0, 3)).toEqual(["build", "lint", "test"]);
+        // every build the log records belongs to a battery that executed; no replay ran a command
+        expect(commands.filter((c) => c === "build")).toHaveLength(rows.filter((e) => e.data.gate === "build"
+          && e.data.replayedFromAttempt === undefined && e.data.reused !== true).length);
+      }
       expect(events.filter((e) => e.event === "gate-fingerprint-cap")).toHaveLength(1);
     }
-    const disposition = (events: JournalEvent[]) => events
-      .filter((e) => ["escalation", "consult-verdict", "task-human"].includes(e.event))
-      .map((e) => [e.event, e.data]);
-    expect(disposition(runs[0]!)).toEqual(disposition(runs[1]!));
   }, 120_000);
 
   test("test: a worker result that is not ok with a summary naming a repository path outside the task's files[] produces a park reason carrying that path as a files[] repair hint, while a not-ok result whose summary names no path produces a park reason with no hint, so a refusal text that never reaches the park reason fails", async () => {

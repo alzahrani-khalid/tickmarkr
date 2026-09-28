@@ -92,6 +92,28 @@ export function rankPreferredChannels<C extends ChannelSeat>(
 export const reviewPreferenceTieBreak = (a: BillingChannel, b: BillingChannel): number =>
   TIER_RANK[b.tier] - TIER_RANK[a.tier] || Number(a.channel === "api") - Number(b.channel === "api");
 
+// OBS-1185: the floor route() resolves, shared with plan's display — a task hint at or above the
+// configured (or mode-compiled) floor wins; otherwise the configured floor stands.
+export function resolvedFloor(task: Task, cfg: TickmarkrConfig): { tier: Tier; source: "task" | "config" } | undefined {
+  const taskFloor = task.routingHints?.floor;
+  const configFloor = cfg.routing.floors[task.shape];
+  if (taskFloor && (!configFloor || TIER_RANK[taskFloor] >= TIER_RANK[configFloor])) return { tier: taskFloor, source: "task" };
+  return configFloor ? { tier: configFloor, source: "config" } : undefined;
+}
+
+// OBS-1187: a declared map pool is the shape's closed candidate set for EVERY dispatch — demotion,
+// retry-ban failover, tier climb, recycling and resume draw inside it, never from the open fleet.
+export const taskPool = (task: Task, cfg: TickmarkrConfig) => cfg.routing.map[task.shape]?.pool;
+
+/** Park-reason suffix naming the pool an exhausted re-dispatch stayed inside; empty when unpooled. */
+export const poolExhaustion = (task: Task, cfg: TickmarkrConfig): string => {
+  const pool = taskPool(task, cfg);
+  return pool ? ` — routing.map.${task.shape}.pool (${pool.mode}: ${pool.channels.join(", ")}) is exhausted` : "";
+};
+
+export const inTaskPool = (task: Task, cfg: TickmarkrConfig, key: string): boolean =>
+  taskPool(task, cfg)?.channels.includes(key) ?? true;
+
 function ladderFor(task: Task, entry?: { escalate?: boolean }): LadderStep[] {
   const escalate = task.routingHints?.escalate ?? entry?.escalate ?? true;
   return escalate ? ["retry", "escalate", "consult", "human"] : ["retry", "consult", "human"];
@@ -241,9 +263,7 @@ export function route(task: Task, cfg: TickmarkrConfig, channels: BillingChannel
   };
 
   const taskFloor = task.routingHints?.floor;
-  const mapPinFloor = taskFloor && (!advisoryFloor || TIER_RANK[taskFloor] >= TIER_RANK[advisoryFloor])
-    ? { tier: taskFloor, source: "task" }
-    : advisoryFloor ? { tier: advisoryFloor, source: "config" } : undefined;
+  const mapPinFloor = resolvedFloor(task, cfg);
   const lintMapPinFloor = (tier: Tier, what: "pin" | "pool" = "pin") => {
     if (mapPinFloor && TIER_RANK[tier] < TIER_RANK[mapPinFloor.tier]) {
       lints.push(`${task.id} (${task.shape}): map ${what} routes ${tier}, below ${mapPinFloor.source} floor ${mapPinFloor.tier} — map ${what}s are supreme`);
@@ -409,9 +429,10 @@ export function route(task: Task, cfg: TickmarkrConfig, channels: BillingChannel
     eligible = spreadStatic(sortedStatic);
     spreadDecided = channelKey(eligible[0]) !== channelKey(sortedStatic[0]);
   }
+  const resolved = resolvedFloor(task, cfg);
   const bound =
-    taskFloor && TIER_RANK[taskFloor] >= TIER_RANK[baseTier] ? `floor ${taskFloor} (task hint${src})` :
-    floor ? `floor ${floor} (config floors)` :
+    resolved?.source === "task" ? `floor ${resolved.tier} (task hint${src})` :
+    resolved ? `floor ${resolved.tier} (config floors)` :
     "tier cheap (default)";
   // name the key that actually broke the tie: prefer outranks the marginal-cost/tier keys, so if the
   // winner matched a prefer entry, prefer decided it — not "cheapest sufficient tier" (ROUTE-03, WR-01)
@@ -425,12 +446,14 @@ export function route(task: Task, cfg: TickmarkrConfig, channels: BillingChannel
 
 function candidatePool(
   current: Assignment,
+  task: Task,
+  cfg: TickmarkrConfig,
   channels: BillingChannel[],
   tried: string[],
   tierPredicate: (tier: Tier) => boolean,
   exclude?: ReadonlySet<string>,
 ): BillingChannel[] {
-  channels = withoutExcluded(channels, exclude);
+  channels = withoutExcluded(channels, exclude).filter((c) => inTaskPool(task, cfg, channelKey(c)));
   const triedKeys = new Set(tried);
   const triedIdentities = new Set(tried.map((key) => {
     const channel = channels.find((c) => channelKey(c) === key);
@@ -474,7 +497,7 @@ export function nextChannel(
   // profile-dependent filter. NO exploration bonus here (route():110 has one; a probe on the
   // failure path would spend a real retry). Absent profile ⇒ every score is 0 ⇒ third key
   // all-ties ⇒ the stable sort preserves the exact v1.7 candidate ORDER.
-  const pool = candidatePool(current, channels, tried, (tier) => TIER_RANK[tier] >= TIER_RANK[current.tier], exclude);
+  const pool = candidatePool(current, task, cfg, channels, tried, (tier) => TIER_RANK[tier] >= TIER_RANK[current.tier], exclude);
   const candidates = rankFailoverCandidates(pool, task, cfg, profile);
   return candidates.length ? toAssignment(candidates[0]) : null;
 }
@@ -535,7 +558,7 @@ export function climbChannel(
     return pick ? makeClimbPick(pick, false, "no higher tier") : null;
   }
 
-  const higherPool = candidatePool(current, channels, tried, (tier) => TIER_RANK[tier] > TIER_RANK[current.tier], exclude);
+  const higherPool = candidatePool(current, task, cfg, channels, tried, (tier) => TIER_RANK[tier] > TIER_RANK[current.tier], exclude);
   if (higherPool.length > 0) {
     const candidates = rankFailoverCandidates(higherPool, task, cfg, profile);
     return makeClimbPick(toAssignment(candidates[0]), true);

@@ -181,6 +181,15 @@ test("rolePaneNameFromPrompt folds -r1 on a canonical name into attempt+1", () =
   expect(parseOwnedName(rolePaneNameFromPrompt("TICKMARKR-JUDGE\n## Task T4: x", `${base}-r1`))).not.toBeNull();
 });
 
+// C-3 (D-669): the adjudicator hop (-r2) never shares an owned name with the judge-flake retry (-r1).
+test("rolePaneNameFromPrompt folds the adjudicator's -r2 into attempt+2, distinct from the -r1 retry", () => {
+  const base = owned("judge", "T4", 0, RUN);
+  const prompt = "TICKMARKR-JUDGE\n## Task T4: x";
+  expect(rolePaneNameFromPrompt(prompt, `${base}-r2`)).toBe(owned("judge", "T4", 2, RUN));
+  expect(rolePaneNameFromPrompt(prompt, `${base}-r2`)).not.toBe(rolePaneNameFromPrompt(prompt, `${base}-r1`));
+  expect(rolePaneNameFromPrompt(prompt, "judge-fallback-r2")).toBe("judge · T4-r2");
+});
+
 // ---- daemon-level: a reconciling fake driver over the subprocess driver -------------------------
 // capWaitMs: bound every waitOutput so a post-termination zombie wait (e.g. the judge's 900s
 // window polling a closed slot's stale buffer) dies within seconds of the test ending.

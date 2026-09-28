@@ -2,8 +2,13 @@ import { readFileSync } from "node:fs";
 import { runInNewContext } from "node:vm";
 import ts from "typescript";
 import { describe, expect, it } from "vitest";
-import { newestPark, permittedDecisionVerbs } from "../../src/cli/commands/approve.js";
-import { PARK_KINDS, type JournalEvent } from "../../src/run/journal.js";
+import { newestPark, parkToken, permittedDecisionVerbs, readJournalEvents } from "../../src/cli/commands/approve.js";
+import { status } from "../../src/cli/commands/status.js";
+import { graphDefinitionHash, loadGraph } from "../../src/graph/graph.js";
+import { Journal, PARK_KINDS, type JournalEvent } from "../../src/run/journal.js";
+import { deriveRunDecisions } from "../../src/tui/cockpit/decision-actions.js";
+import { applySetupDecisionsKey, deriveParkedDecisions, initialSetupDecisionsSession, setupDecisionVerbs } from "../../src/tui/cockpit/setup-cockpit.js";
+import { setupRepo, T } from "../helpers/tmprepo.js";
 import {
   BLOCKER_KINDS, projectOperatorSummary,
   type OperatorDecisionSnapshot, type OperatorSummaryTask,
@@ -217,5 +222,51 @@ describe("operator summary", () => {
     const result = runInNewContext(`${compiled}\nJSON.stringify(exports.projectOperatorSummary(tasks, snapshots))`, realm,
       { timeout: 1000, contextCodeGeneration: { strings: false, wasm: false } });
     expect(JSON.parse(result)).toEqual(projectOperatorSummary(tasks, snapshots));
+  });
+});
+
+// OBS-1202: the bound reapFailure stall decision reaches every decision consumer through the one
+// production table — the Run view's decisions, the legacy setup cockpit bridge, and the status /
+// operator summaries — each keeping the park's `<line>@<ts>` token. An ordinary stall stays approve-only.
+describe("reapFailure stall parks across decision consumers (OBS-1202)", () => {
+  it("production Run/setup decisions plus status/operator summaries preserve the bound park token while offering approve/recheck for recorded reapFailure stall parks versus approve only for ordinary stall parks, so a missing bridge or invented ordinary-stall recheck fails", async () => {
+    const { repo } = setupRepo([T("T1"), T("T2")], { tasks: {} });
+    const runId = "run-reap-decisions";
+    const j = Journal.create(repo, runId);
+    const assignment = { adapter: "fake", model: "fake-1", channel: "sub", tier: "frontier" };
+    j.append("run-start", undefined, { baseRef: "HEAD", commands: {}, graphDefinitionHash: graphDefinitionHash(loadGraph(repo)) });
+    for (const id of ["T1", "T2"]) j.append("task-dispatch", id, { assignment, attempt: 0 });
+    j.append("task-human", "T1", { kind: "stall", reason: "worker could not be reaped before harvest: worker group 4242 cleanup unknown", reapFailure: "worker group 4242 cleanup unknown" });
+    j.append("task-human", "T2", { kind: "stall", reason: "worker stalled with no output" });
+    const { events, sourceIndexes } = readJournalEvents(j);
+    const tokens = new Map(["T1", "T2"].map((id) => [id, parkToken(newestPark(events, id, sourceIndexes)!)!]));
+    const expected = new Map([["T1", ["approve", "recheck"]], ["T2", ["approve"]]]);
+
+    // the Run view's decisions
+    const run = deriveRunDecisions(j);
+    expect(run.map((d) => [d.taskId, [...d.verbs], parkToken(d.park)])).toEqual(
+      ["T1", "T2"].map((id) => [id, expected.get(id), tokens.get(id)]));
+
+    // the legacy setup cockpit bridge, and the key that names a recheck on it
+    const setup = deriveParkedDecisions(j);
+    expect(setup.map((d) => [d.taskId, [...setupDecisionVerbs(d)], d.park])).toEqual(
+      ["T1", "T2"].map((id) => [id, expected.get(id), tokens.get(id)]));
+    const recheckT1 = applySetupDecisionsKey(initialSetupDecisionsSession(), { input: "r", key: {} }, setup);
+    expect(recheckT1.session.confirming).toEqual({ verb: "recheck", taskId: "T1", park: tokens.get("T1") });
+    const onT2 = applySetupDecisionsKey(initialSetupDecisionsSession(), { input: "", key: { downArrow: true } }, setup).session;
+    expect(applySetupDecisionsKey(onT2, { input: "r", key: {} }, setup).session.confirming).toBeNull();
+
+    // the operator summary projected from those production decisions
+    const summaries = projectOperatorSummary(["T1", "T2"].map((id) => task({ id })), run);
+    for (const s of summaries) {
+      expect(s.blocker!.permittedActions).toEqual(expected.get(s.taskId));
+      expect(s.blocker!.nextAction).toBe(`Choose a decision: ${expected.get(s.taskId)!.join(", ")} (--park ${tokens.get(s.taskId)})`);
+    }
+
+    // ...and the status command's rendering of the same summaries
+    const out = (await status([runId], repo)).replace(/\s+/g, " ");
+    expect(out).toContain(`next action Choose a decision: approve, recheck (--park ${tokens.get("T1")})`);
+    expect(out).toContain(`next action Choose a decision: approve (--park ${tokens.get("T2")})`);
+    expect(out).not.toContain(`recheck (--park ${tokens.get("T2")})`);
   });
 });

@@ -11,6 +11,7 @@ import { graphDefinitionHash, loadGraph, tickmarkrDir, saveGraph } from "../../s
 import { validateGraph } from "../../src/graph/schema.js";
 import { runDaemon } from "../../src/run/daemon.js";
 import { gitHead } from "../../src/run/git.js";
+import * as journalModule from "../../src/run/journal.js";
 import { Journal, type JournalEvent } from "../../src/run/journal.js";
 import { COMMIT, makeRepo, setupRepo, T } from "../helpers/tmprepo.js";
 
@@ -691,5 +692,82 @@ describe("OBS-1109 resume harvest across repeated resumes (fake adapter, zero to
       expect(dispatches[0]!.data.attempt).toBe(1);
       expect(git(repo, "show", `tickmarkr/${runId}:t1.txt`)).toBe("done");
     }
+  }, 120_000);
+
+  // OBS-1204: the resume spare is frozen ONCE from the rows before this daemon's run-resume. A task
+  // launched after it (T2) is this daemon's own work: it is never scanned as interrupted, and its pane
+  // retires at its terminal sweep exactly as in a fresh run. Every sweep is recorded with the journal
+  // it was computed from; the host opens a pane under each owned worker name the daemon allocates.
+  test("a resumed production daemon spares only attempts launched before its own run-resume row and retires post-resume terminal panes as a fresh daemon does, so scanning and sparing every new launch as interrupted fails", async () => {
+    const sweepsOf = async (mode: "resumed" | "fresh") => {
+      const runId = `run-freeze-${mode}`;
+      const { repo, fake } = setupRepo([T("T1"), T("T2", { deps: ["T1"] })], { tasks: {
+        T1: [{ shell: `echo done > t1.txt && ${COMMIT} t1`, result: { ok: true, summary: "t1 done" } }],
+        T2: [{ shell: `echo done > t2.txt && ${COMMIT} t2`, result: { ok: true, summary: "t2 done" } }],
+      } });
+      const base = await gitHead(repo);
+      const host = new PaneHost();
+      const t1 = formatOwnedName({ role: "worker", taskId: "T1", attempt: 0, runId });
+      if (mode === "resumed") {
+        const wt = await new SubprocessDriver().worktree(repo, `tickmarkr/${runId}--T1`, base);
+        writeFileSync(join(wt, "harvest.txt"), "finished\n");
+        git(wt, "add", "-A");
+        git(wt, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "--no-gpg-sign", "-qm", "finished work");
+        await seedJournal(repo, runId, [
+          { event: "task-dispatch", taskId: "T1", data: { assignment: fake2, attempt: 0, workerDispatchOrdinal: 0 } },
+          { event: "worker-launch", taskId: "T1", data: { attempt: 0, nonce, dispatchScript: join(repo, ".tickmarkr", "T1-a0.sh"), slot: { id: "pane-t1", name: t1, cwd: wt } } },
+        ]);
+        host.panes.set(t1, finishedPane);
+      }
+      const sweeps: Array<{ desired: Set<string>; rows: JournalEvent[] }> = [];
+      const inner = hostDriver(host);
+      const driver: ExecutorDriver = {
+        ...inner,
+        slot: async (cwd: string, name: string, o?: SlotOpts) => {
+          const allocated = await inner.slot(cwd, name, o);
+          const owned = o?.owned ? formatOwnedName(o.owned) : name;
+          if (parseOwnedName(owned)?.role === "worker") host.panes.set(owned, "working…\n");
+          return allocated;
+        },
+        reconcile: async (desired, id, opts) => {
+          sweeps.push({ desired: new Set(desired), rows: Journal.open(repo, runId).read() });
+          await inner.reconcile!(desired, id, opts);
+        },
+      };
+      const scans = vi.spyOn(journalModule, "interruptedAttempt");
+      let t2Scans: JournalEvent[][];
+      try {
+        const s = await runDaemon(repo, { adapters: [fake], runId, resume: mode === "resumed", driver });
+        expect(s.done.sort()).toEqual(["T1", "T2"]);
+      } finally {
+        t2Scans = scans.mock.calls.filter(([, id]) => id === "T2").map(([rows]) => rows);
+        scans.mockRestore();
+      }
+      const t2 = formatOwnedName({ role: "worker", taskId: "T2", attempt: 0, runId });
+      const has = (rows: JournalEvent[], event: string, taskId: string) => rows.some((e) => e.event === event && e.taskId === taskId);
+      // T2's terminal sweep: the first one whose journal carries T2's task-done
+      const t2Done = sweeps.find((w) => has(w.rows, "task-done", "T2"))!;
+      return { host, t1, t2, sweeps, t2Done, has, t2Scans };
+    };
+
+    const resumed = await sweepsOf("resumed");
+    // the pre-resume attempt is spared at the startup sweep, harvested, and never redone
+    expect(resumed.sweeps[0]!.desired.has(resumed.t1)).toBe(true);
+    // ...and its spare lapses once the harvest is journaled: no later sweep keeps it
+    const afterHarvest = resumed.sweeps.filter((w) => w.rows.some((e) => e.event === "worker-result-harvested"));
+    expect(afterHarvest.length).toBeGreaterThan(0);
+    expect(afterHarvest.every((w) => !w.desired.has(resumed.t1))).toBe(true);
+    // the post-resume launch is never scanned as interrupted: T2 is folded ONCE, at the freeze, before it launched
+    expect(resumed.t2Scans).toHaveLength(1);
+    expect(resumed.t2Scans.every((rows) => !resumed.has(rows, "worker-launch", "T2"))).toBe(true);
+    // no sweep after T2's launch desires its pane through a spare once the fold retires it
+    expect(resumed.t2Done.desired.has(resumed.t2)).toBe(false);
+    expect(resumed.host.closed).toContain(resumed.t2);
+
+    const fresh = await sweepsOf("fresh");
+    // parity with a fresh daemon: T2's pane retires at the same terminal sweep, and a fresh run scans nothing
+    expect(fresh.t2Done.desired.has(fresh.t2)).toBe(false);
+    expect(fresh.host.closed).toContain(fresh.t2);
+    expect(fresh.t2Scans).toEqual([]);
   }, 120_000);
 });

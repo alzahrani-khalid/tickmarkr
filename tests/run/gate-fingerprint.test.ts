@@ -1,5 +1,17 @@
+import { createHash } from "node:crypto";
+import { writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { stringify } from "yaml";
 import { describe, expect, test } from "vitest";
-import { GATE_FINGERPRINT_CAP, identicalGateFailures, normalizeGateFailure, type JournalEvent } from "../../src/run/journal.js";
+import type { Assignment } from "../../src/adapters/types.js";
+import { loadConfig } from "../../src/config/config.js";
+import { SubprocessDriver } from "../../src/drivers/subprocess.js";
+import { graphDefinitionHash, loadGraph } from "../../src/graph/graph.js";
+import { runDaemon } from "../../src/run/daemon.js";
+import { gitHead, shGit, shGitOk, verificationProtocol } from "../../src/run/git.js";
+import { GATE_FINGERPRINT_CAP, identicalGateFailures, Journal, normalizeGateFailure, type JournalEvent } from "../../src/run/journal.js";
+import { ensureIntegration, integrationBranch } from "../../src/run/merge.js";
+import { COMMIT, setupRepo, T } from "../helpers/tmprepo.js";
 
 // T34 tracked fixture: the two recorded T21 gate-test details from run-20260805-164546, at
 // 2026-08-05T17:33:02.522Z and 2026-08-05T18:11:01.544Z, captured VERBATIM from that run's journal
@@ -261,3 +273,160 @@ describe("gate fingerprint — mkdtemp suffix (T3)", () => {
   });
 });
 
+
+// OBS-1106 residual: occurrences are independent observations. A journal replay or a verdict-cache
+// hit of one red is a COPY of it; only a fresh execution is a second occurrence.
+describe("gate fingerprint — copied evidence is one occurrence (OBS-1106)", () => {
+  const ASSIGNMENT: Assignment = { adapter: "fake", model: "fake-1", channel: "sub", tier: "frontier" };
+  const NAMED = "echo 'FAIL t1.test.ts > reads one'; echo 'AssertionError: expected one to be two'; exit 1";
+  const TIMEOUT = "echo 'FAIL t1.test.ts > slow'; echo 'Error: Test timed out in 5000ms.'; exit 1";
+  const of = (evs: JournalEvent[], event: string) => evs.filter((e) => e.event === event && e.taskId === "T1");
+  const testRows = (evs: JournalEvent[]) => of(evs, "gate-result").filter((e) => e.data.gate === "test");
+  const fresh = (e: JournalEvent) => e.data.reused !== true && typeof e.data.replayedFromAttempt !== "number" && e.data.replayMeasurement !== true;
+  const occurrences = (evs: JournalEvent[], red: JournalEvent) =>
+    identicalGateFailures(evs, "T1", "test", normalizeGateFailure(String(red.data.details)));
+  /** Worker steps: the first lands t1.txt, every later one lands `later` (nothing, or a new commit). */
+  const repoWith = (red: string, later: (i: number) => string) => setupRepo(
+    [T("T1", { gates: ["build", "test", "lint", "evidence", "scope", "acceptance"] })],
+    {
+      consult: { action: "human", notes: "operator decides" },
+      tasks: { T1: [
+        { shell: `echo one > t1.txt && ${COMMIT} t1`, result: { ok: true, summary: "t1" } },
+        ...Array.from({ length: 8 }, (_, i) => ({ shell: later(i), result: { ok: true, summary: `step ${i}` } })),
+      ] },
+    },
+    stringify({ gates: { build: "true", test: `[ ! -f t1.txt ] || { ${red}; }`, lint: "true" } }),
+  );
+
+  test("test: the production daemon counts cache or journal copies as one failure across resume and forces a fresh execution after a no-commit timeout repair versus counting an independent repeated red as two, so copied evidence buying a fingerprint-cap escalation fails", async () => {
+    // ---- journal copy across resume: a pre-resume red, replayed by a repair that lands nothing ----
+    {
+      const runId = "run-copy-resume";
+      const commands = { build: "true", test: "[ ! -f work.txt ] || { " + NAMED + "; }", lint: "true" };
+      const { repo, fake } = setupRepo(
+        [T("T1", { files: ["work.txt"] })],
+        { consult: { action: "human", notes: "operator decides" },
+          tasks: { T1: Array.from({ length: 4 }, () => ({ shell: "true", result: { ok: true, summary: "nothing to change" } })) } },
+        stringify({ gates: commands }),
+      );
+      const base = await gitHead(repo);
+      const branch = integrationBranch(loadConfig(repo), runId);
+      await ensureIntegration(repo, branch, base);
+      const wt = await new SubprocessDriver().worktree(repo, `${branch}--T1`, base);
+      writeFileSync(join(wt, "work.txt"), "landed work\n");
+      await shGitOk("git add work.txt && git commit --no-gpg-sign -m work", wt);
+      const history = await shGit(`git log --reverse --format='%T%x00%an%x00%ae%x00%cn%x00%ce%x00%B%x1e' ${base}..${await gitHead(wt)}`, wt);
+      const subject = createHash("sha256").update(history.stdout).digest("hex");
+      const details = "failing tests:\n FAIL t1.test.ts > reads one\nAssertionError: expected one to be two";
+      const j = Journal.create(repo, runId);
+      j.append("run-start", undefined, { pid: 111_113, baseRef: base, commands, branch, graphDefinitionHash: graphDefinitionHash(loadGraph(repo)) });
+      j.append("task-dispatch", "T1", { assignment: ASSIGNMENT, attempt: 0, retryMode: "fresh" });
+      j.append("worker-launch", "T1", {});
+      j.append("worker-result", "T1", { ok: true, summary: "landed", deviations: [], finished: true, exitCode: 0 });
+      j.phaseStart("T1", "gates");
+      j.append("gate-result", "T1", { gate: "build", verification: verificationProtocol(), commit: subject, attempt: 0, pass: true });
+      j.append("gate-result", "T1", { gate: "test", verification: verificationProtocol(), commit: subject, attempt: 0, pass: false, details,
+        evidenceReceipt: { invocationId: "inv-original" } });
+      j.append("repair-attempt", "T1", { repair: 1, charge: 1, of: 2, gates: ["test"], commits: 1, findings: `test: ${details}` });
+      j.append("run-end", undefined, { runId, branch, done: [], failed: [], human: [], blocked: [], pending: ["T1"] });
+      writeFileSync(join(j.dir, "baseline.json"), JSON.stringify({
+        commands: Object.fromEntries(Object.keys(commands).map((gate) => [gate, { exitCode: 0, fingerprints: [] }])),
+      }));
+      await runDaemon(repo, { adapters: [fake], runId, resume: true });
+      const all = Journal.open(repo, runId).read();
+      const post = all.slice(all.map((e) => e.event).lastIndexOf("run-resume") + 1);
+      const replayed = testRows(post).filter((e) => e.data.replayedFromAttempt === 0);
+      expect(replayed.length).toBeGreaterThan(0);
+      expect(replayed[0]!.data).toMatchObject({ pass: false, commit: subject, attempt: 1 });
+      // the replay is the pre-resume observation restated: ONE occurrence, so no cap on the copy
+      expect(occurrences(all.slice(0, all.indexOf(replayed[0]!) + 1), replayed[0]!)).toBe(1);
+      const firstCap = all.findIndex((e) => e.event === "gate-fingerprint-cap" && e.taskId === "T1");
+      const freshReds = all.map((e, i) => [e, i] as const).filter(([e]) => e.event === "gate-result" && e.taskId === "T1"
+        && e.data.gate === "test" && e.data.pass === false && fresh(e));
+      if (firstCap !== -1) expect(freshReds.length >= 2 && freshReds[1]![1] < firstCap, "a cap needs two independent observations").toBe(true);
+      expect(of(post, "gate-fingerprint-cap").filter((e) => e.data.attempt === 2)).toEqual([]);
+    }
+    // ---- cache and journal copies in one live run: nothing after the first red is new evidence -----
+    {
+      const runId = "run-copy-live";
+      const { repo, fake } = repoWith(NAMED, () => "true");
+      await runDaemon(repo, { adapters: [fake], runId });
+      const all = Journal.open(repo, runId).read();
+      const reds = testRows(all).filter((e) => e.data.pass === false);
+      const copies = reds.filter((e) => !fresh(e));
+      expect(reds.length).toBeGreaterThan(1);
+      // both copy paths ran: the repair's journal replay and the fresh retry's verdict-cache hit
+      expect(copies.some((e) => typeof e.data.replayedFromAttempt === "number")).toBe(true);
+      expect(copies.some((e) => e.data.reused === true)).toBe(true);
+      expect(reds.filter(fresh)).toHaveLength(1);
+      expect(occurrences(all, reds.at(-1)!)).toBe(1);
+      expect(of(all, "gate-fingerprint-cap")).toEqual([]);
+    }
+    // ---- a no-commit repair on a timeout red executes fresh: no replay, no cached red --------------
+    {
+      const runId = "run-timeout-fresh";
+      const { repo, fake } = repoWith(TIMEOUT, () => "true");
+      await runDaemon(repo, { adapters: [fake], runId });
+      const all = Journal.open(repo, runId).read();
+      const forced = of(all, "gate-fresh-forced");
+      expect(forced.length).toBe(1);
+      expect(forced[0]!.data).toMatchObject({ gate: "test", attempt: 1, priorAttempt: 0, reason: "no-commit-timeout-red" });
+      const a1 = testRows(all).filter((e) => e.data.attempt === 1);
+      expect(a1.length).toBe(1);
+      expect(fresh(a1[0]!)).toBe(true);
+      expect(of(all, "gate-replayed").filter((e) => e.data.attempt === 1)).toEqual([]);
+      expect(of(all, "gate-reused-verdict").filter((e) => e.data.gate === "test")).toEqual([]);
+      // the fresh re-observation IS independent evidence: a repeated timeout reaches the cap there
+      expect(occurrences(all.slice(0, all.indexOf(a1[0]!) + 1), a1[0]!)).toBe(GATE_FINGERPRINT_CAP);
+      const cap = of(all, "gate-fingerprint-cap")[0]!;
+      expect(cap.data).toMatchObject({ gate: "test", occurrences: GATE_FINGERPRINT_CAP, attempt: 2 });
+      // and it is forced ONCE: no second forced execution after the cap owns the next move
+      expect(forced).toHaveLength(1);
+    }
+    // ---- across resume: a crash after the no-commit timeout repair finished but before its gates, or
+    // inside its forced battery before the test row, still owes that one fresh execution -------------
+    for (const cut of ["after-repair-result", "inside-forced-battery"] as const) {
+      const runId = `run-timeout-fresh-crash-${cut}`;
+      const { repo, fake } = repoWith(TIMEOUT, () => "true");
+      await runDaemon(repo, { adapters: [fake], runId });
+      const journal = Journal.open(repo, runId);
+      const lived = journal.read();
+      const repairResult = lived.findIndex((e, i) => e.event === "worker-result" && e.taskId === "T1"
+        && lived.slice(0, i).some((d) => d.event === "task-dispatch" && d.taskId === "T1" && d.data.attempt === 1));
+      const forcedRow = lived.findIndex((e) => e.event === "gate-fresh-forced" && e.taskId === "T1");
+      expect(repairResult, cut).toBeGreaterThan(-1);
+      expect(forcedRow, cut).toBeGreaterThan(repairResult);
+      // the crash: nothing after the cut reached the ledger (the live fresh red included)
+      const kept = lived.slice(0, (cut === "after-repair-result" ? repairResult : forcedRow) + 1);
+      expect(testRows(kept).map((e) => e.data.attempt), cut).toEqual([0]);
+      writeFileSync(join(journal.dir, "journal.jsonl"), kept.map((e) => JSON.stringify(e)).join("\n") + "\n");
+      await runDaemon(repo, { adapters: [fake], runId, resume: true });
+      const all = Journal.open(repo, runId).read();
+      const post = all.slice(all.map((e) => e.event).lastIndexOf("run-resume") + 1);
+      expect(of(post, "gate-fresh-forced")[0]?.data, cut).toMatchObject({ gate: "test", resumed: true, reason: "no-commit-timeout-red" });
+      // the resume battery EXECUTED the test gate: no cached red and no replay re-stated attempt 0's
+      const red = testRows(post)[0]!;
+      expect(red.data.pass, cut).toBe(false);
+      expect(fresh(red), cut).toBe(true);
+      const battery = post.slice(0, post.indexOf(red) + 1);
+      expect(of(battery, "gate-reused-verdict").filter((e) => e.data.gate === "test"), cut).toEqual([]);
+      expect(of(battery, "gate-rerun").map((e) => e.data), cut).toMatchObject([{ gate: "test", bypass: "timeout-fresh" }]);
+      // that fresh red is the second independent observation: the cap, not a copy, owns the next move
+      expect(occurrences(all.slice(0, all.indexOf(red) + 1), red), cut).toBe(GATE_FINGERPRINT_CAP);
+    }
+    // ---- an independent repeated red (a new commit each attempt) counts as two ---------------------
+    {
+      const runId = "run-independent";
+      const { repo, fake } = repoWith(NAMED, (i) => `echo ${i} > t${i + 2}.txt && ${COMMIT} more${i}`);
+      await runDaemon(repo, { adapters: [fake], runId });
+      const all = Journal.open(repo, runId).read();
+      const reds = testRows(all).filter((e) => e.data.pass === false);
+      expect(reds.slice(0, 2).every(fresh)).toBe(true);
+      expect(new Set(reds.slice(0, 2).map((e) => e.data.commit)).size).toBe(2);
+      expect(occurrences(all.slice(0, all.indexOf(reds[1]!) + 1), reds[1]!)).toBe(GATE_FINGERPRINT_CAP);
+      const cap = of(all, "gate-fingerprint-cap")[0]!;
+      expect(cap.data).toMatchObject({ gate: "test", occurrences: GATE_FINGERPRINT_CAP, attempt: 2 });
+      expect(all.indexOf(cap)).toBeGreaterThan(all.indexOf(reds[1]!));
+    }
+  }, 300_000);
+});

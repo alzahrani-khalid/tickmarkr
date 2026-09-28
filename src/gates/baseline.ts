@@ -1,10 +1,11 @@
 import { createHash, randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { type EvidenceArtifact, type GateEvidenceReceipt, type ShellReceipt } from "../run/protocol.js";
-import { existsSync, readFileSync, mkdirSync, readdirSync, statSync, unlinkSync, writeFileSync, rmdirSync } from "node:fs";
+import { EVICTION_TOMBSTONE_LIMIT, EVICTION_TOMBSTONES_FILE, type EvictionTombstone, parseEvictionTombstones } from "../run/receipt-resolver.js";
+import { existsSync, readFileSync, mkdirSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync, rmdirSync } from "node:fs";
 import { availableParallelism, loadavg, tmpdir } from "node:os";
-import { join } from "node:path";
-import type { TickmarkrConfig } from "../config/config.js";
+import { basename, join } from "node:path";
+import { DEFAULT_EVIDENCE_QUOTA_BYTES, type TickmarkrConfig } from "../config/config.js";
 import type { AcceptanceItem } from "../graph/schema.js";
 import { dependencyLinkRefusal, DEFAULT_SHELL_TIMEOUT_MS, describeCapacity, type RunCapacity, sameCapacity, sh, type ShellOptions, type ShResult } from "../run/git.js";
 import { executionSignal } from "../run/execution-budget.js";
@@ -41,20 +42,71 @@ export interface GateEvidenceOptions {
   write?: (path: string, bytes: Buffer) => void;
 }
 export const EVIDENCE_TAIL_BYTES = 16 * 1024;
-export const EVIDENCE_RUN_QUOTA_BYTES = 8 * 1024 * 1024;
+/** The default per-run quota; `gates.evidenceQuotaBytes` in config overrides it (OBS-1140). */
+export const EVIDENCE_RUN_QUOTA_BYTES = DEFAULT_EVIDENCE_QUOTA_BYTES;
 
-export function redactGateOutput(text: string, env: NodeJS.ProcessEnv): string {
-  // One pass over the original bytes: replacing an environment value must not break a token
-  // recognizer, and a short environment value must not rewrite the redaction marker itself.
+export type RedactionCounts = NonNullable<GateEvidenceReceipt["redaction"]["counts"]>;
+/** Benign environment locations substituted by name; every other redaction is material. */
+const BENIGN_ENV_KEYS = ["HOME", "TMPDIR"] as const;
+
+const REDACTION_CATEGORIES = ["token", "assignment", "secretEnv", "benignEnv"] as const;
+
+/**
+ * OBS-1139: every category scans the ORIGINAL text on its own; overlapping spans then merge into one
+ * span counted once under its highest-priority member — token, assignment, secret environment, benign
+ * HOME/TMPDIR — so precedence never depends on which match starts first. Counts only: never a value.
+ */
+export function classifyGateOutput(text: string, env: NodeJS.ProcessEnv): { text: string; counts: RedactionCounts } {
+  // HOME/TMPDIR substitute by name at any length; "/" alone would rewrite every path separator.
+  const benign = BENIGN_ENV_KEYS.flatMap(key => { const value = env[key]; return value && value.length > 1 ? [{ value, label: `$${key}` }] : []; });
   // Short operational values (0, true, vi, test) occur throughout ordinary diagnostics.
-  // Only secret-named keys justify redacting short values.
-  const values = [...new Set(Object.entries(env)
-    .filter(([key, value]) => !!value && (value.length >= 8 || /KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|AUTH/i.test(key)))
-    .map(([, value]) => value!))]
-    .sort((a, b) => b.length - a.length).map(v => v.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+  // Only secret-named keys justify redacting short values. A secret-named value that happens to equal
+  // HOME/TMPDIR stays a secret candidate: precedence decides the span, never candidate pruning.
+  const secrets = [...new Set(Object.entries(env)
+    .filter(([key, value]) => !!value && !(BENIGN_ENV_KEYS as readonly string[]).includes(key)
+      && (value.length >= 8 || /KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|AUTH/i.test(key)))
+    .map(([, value]) => value!))];
+  const literal = (v: string) => v.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const tokens = String.raw`\b(?:sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9_]{16,}|github_pat_[A-Za-z0-9_]{16,}|AKIA[A-Z0-9]{16}|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)\b`;
   const assignments = String.raw`(?:authorization\s*:\s*bearer|(?:api[_-]?key|token|password|secret)\s*[:=])\s*[^\s"']+`;
-  return text.replace(new RegExp([tokens, assignments, ...values].join("|"), "gi"), "[REDACTED]");
+  // Every value scans the original text on its own: an alternation would consume the first match and
+  // skip a longer overlapping value's tail, so precedence is resolved on the collected spans instead.
+  const scan = (source: string, rank: number, label?: string) =>
+    [...text.matchAll(new RegExp(source, "gi"))].map(m => ({ start: m.index, end: m.index + m[0].length, rank, label }));
+  const spans = [
+    ...scan(tokens, 0), ...scan(assignments, 1),
+    ...secrets.flatMap(v => scan(literal(v), 2)),
+    ...benign.flatMap(b => scan(literal(b.value), 3, b.label)),
+  ].sort((a, b) => a.start - b.start || b.end - a.end);
+  const merged: typeof spans = [];
+  for (const span of spans) {
+    const last = merged.at(-1);
+    if (!last || span.start >= last.end) { merged.push({ ...span }); continue; }
+    // C-11 (D-673): a benign value nested in (or identical to) another is one location, named by the containing
+    // span, which sorts first. Only a PARTIAL overlap of two different benign values is ambiguous: withhold it.
+    if (last.rank === 3 && span.rank === 3 && last.label !== span.label && span.end > last.end) last.rank = 2;
+    else last.rank = Math.min(last.rank, span.rank);
+    last.end = Math.max(last.end, span.end);
+  }
+  const counts: RedactionCounts = { token: 0, assignment: 0, secretEnv: 0, benignEnv: 0 };
+  let out = "", at = 0;
+  for (const { start, end, rank, label } of merged) {
+    counts[REDACTION_CATEGORIES[rank]!]++;
+    out += text.slice(at, start) + (rank === 3 ? label! : "[REDACTED]");
+    at = end;
+  }
+  return { text: out + text.slice(at), counts };
+}
+
+export function redactGateOutput(text: string, env: NodeJS.ProcessEnv): string {
+  return classifyGateOutput(text, env).text;
+}
+
+/** Material means bytes were withheld; a benign location substitution withholds nothing. */
+export const redactionMaterial = (c: RedactionCounts): boolean => c.token + c.assignment + c.secretEnv > 0;
+
+function readEvictionTombstones(root: string): EvictionTombstone[] {
+  try { return parseEvictionTombstones(readFileSync(join(root, EVICTION_TOMBSTONES_FILE))); } catch { return []; }
 }
 
 /** Resolve a snapshot reference against actual bytes: eviction never fabricates a live artifact. */
@@ -101,7 +153,10 @@ export function beginGateEvidence(cwd: string, gate: string, command: string, op
         exitCode: observed?.exitCode ?? null, signal: observed?.signal ?? null,
         timedOut: observed ? observed.outcome === "timed-out" : null,
       };
-      const clean = [redactGateOutput(stdout, env), redactGateOutput(stderr, env)];
+      const classified = [classifyGateOutput(stdout, env), classifyGateOutput(stderr, env)];
+      const clean = classified.map(c => c.text);
+      const counts: RedactionCounts = { token: 0, assignment: 0, secretEnv: 0, benignEnv: 0 };
+      for (const c of classified) for (const k of Object.keys(counts) as (keyof RedactionCounts)[]) counts[k] += c.counts[k];
       const refs = clean.map((text, i): EvidenceArtifact => {
         const bytes = Buffer.from(text);
         const tail = bytes.subarray(-EVIDENCE_TAIL_BYTES);
@@ -120,17 +175,35 @@ export function beginGateEvidence(cwd: string, gate: string, command: string, op
           lock = join(dir, ".write-lock");
           const quota = opts.quotaBytes !== undefined && Number.isFinite(opts.quotaBytes)
             ? Math.max(0, Math.floor(opts.quotaBytes)) : EVIDENCE_RUN_QUOTA_BYTES;
+          // An empty artifact costs no quota, so it is never evicted: every eviction frees bytes.
           const files = readdirSync(dir).filter(f => /^[a-zA-Z0-9-]+-(stdout|stderr)\.log$/.test(f)).map(f => ({ path: join(dir, f), stat: statSync(join(dir, f)) }))
-            .sort((a, b) => a.stat.mtimeMs - b.stat.mtimeMs || a.path.localeCompare(b.path));
+            .filter(f => f.stat.size > 0).sort((a, b) => a.stat.mtimeMs - b.stat.mtimeMs || a.path.localeCompare(b.path));
           let total = files.reduce((sum, f) => sum + f.stat.size, 0);
           const incoming = refs.reduce((sum, ref) => sum + ref.retainedBytes, 0);
-          if (incoming > quota) throw new Error("evidence quota cannot retain this invocation");
-          while (files.length && total + incoming > quota) {
+          // OBS-1140: the quota binds what is already retained too, so a resumed run at zero quota keeps
+          // zero bytes. An invocation larger than the whole quota is expired at birth; older artifacts
+          // are evicted only as far as the quota itself demands, never for bytes that could not fit.
+          const fits = incoming <= quota;
+          const evicted: EvictionTombstone[] = [];
+          while (files.length && total + (fits ? incoming : 0) > quota) {
             const oldest = files.shift()!;
+            const bytes = readFileSync(oldest.path);
             unlinkSync(oldest.path); total -= oldest.stat.size;
+            evicted.push({ path: `gate-evidence/${basename(oldest.path)}`, sha256: createHash("sha256").update(bytes).digest("hex"), retainedBytes: bytes.length });
           }
-          for (const [i, ref] of refs.entries()) {
-            (opts.write ?? writeFileSync)(join(root, ref.path), Buffer.from(clean[i]!).subarray(-EVIDENCE_TAIL_BYTES));
+          if (evicted.length) {
+            // Identity-bound (path + hash + length) and bounded: the newest 256 survive a restart.
+            const tombstones = join(root, EVICTION_TOMBSTONES_FILE);
+            writeFileSync(`${tombstones}.tmp`, JSON.stringify([...readEvictionTombstones(root), ...evicted].slice(-EVICTION_TOMBSTONE_LIMIT)));
+            renameSync(`${tombstones}.tmp`, tombstones);
+          }
+          if (!fits) {
+            availability = "expired";
+            for (const ref of refs) ref.availability = "expired";
+          } else {
+            for (const [i, ref] of refs.entries()) {
+              (opts.write ?? writeFileSync)(join(root, ref.path), Buffer.from(clean[i]!).subarray(-EVIDENCE_TAIL_BYTES));
+            }
           }
         } catch {
           availability = "capture-failed";
@@ -145,7 +218,7 @@ export function beginGateEvidence(cwd: string, gate: string, command: string, op
       }
       return { invocationId, ...(nonce ? { nonce } : {}),
         subject: { runId: opts.runId ?? "standalone", taskId: opts.taskId ?? null, attempt: opts.attempt ?? null, gate, subjectCommit },
-        termination, availability, redaction: { material: clean[0] !== stdout || clean[1] !== stderr }, stdout: refs[0]!, stderr: refs[1]! };
+        termination, availability, redaction: { material: redactionMaterial(counts), counts }, stdout: refs[0]!, stderr: refs[1]! };
     },
   };
 }

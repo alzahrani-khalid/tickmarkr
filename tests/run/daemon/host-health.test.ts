@@ -204,3 +204,39 @@ test("a host that degrades after baseline parks the task infra without starting 
   expect(readFileSync(marker, "utf8")).toBe("suite\n"); // baseline only
   expect(rows.some(row => row.event === "suite-budget" || row.event === "merge")).toBe(false);
 });
+
+test("test: the production daemon probes every one of twenty occupied-suite polls but writes at most two steady healthy observations and records each healthy degraded unreadable recovery transition, so journal dedupe skipping admission probes or hiding a transition fails", async () => {
+  const { repo, fake, marker } = fixture();
+  // OBS-1190: the first admission waits through 26 occupied polls: 20 steady healthy, then two degraded,
+  // two unreadable and two recovered; every later poll is free and healthy.
+  const OCCUPIED = 26;
+  let polls = 0, samples = 0;
+  const samplesAtPoll: number[] = [];
+  setSuiteWaitCeilingForTests(60_000);
+  setLiveSuiteCountForTests(async () => { samplesAtPoll.push(samples); return ++polls <= OCCUPIED ? 1 : 0; });
+  setHostLatencySampleForTests(async () => {
+    samples++;
+    if (polls >= 21 && polls <= 22) return 90; // 4.5 × the 20 ms reference: degraded
+    if (polls >= 23 && polls <= 24) return null; // unreadable
+    return 20;
+  });
+  const runId = "run-host-dedupe";
+  const summary = await runDaemon(repo, { adapters: [fake], runId });
+  expect(summary.done).toEqual(["T1"]);
+  expect(existsSync(marker)).toBe(true);
+  // Every occupied poll probed the host once (three samples) before the next census.
+  expect(samplesAtPoll.length).toBeGreaterThan(OCCUPIED);
+  for (let poll = 0; poll < OCCUPIED; poll++) expect(samplesAtPoll[poll + 1]! - samplesAtPoll[poll]!, `poll ${poll + 1}`).toBe(3);
+  const rows = Journal.open(repo, runId).read();
+  const observations = rows.filter(row => row.event === "host-observation");
+  const states = observations.map(row => row.data.state);
+  const firstDegraded = states.indexOf("degraded");
+  expect(firstDegraded).toBeGreaterThan(0);
+  expect(states.slice(0, firstDegraded).every(state => state === "healthy")).toBe(true);
+  expect(firstDegraded).toBeLessThanOrEqual(2);
+  expect(states.slice(firstDegraded)).toEqual(["degraded", "unreadable", "healthy"]);
+  expect(observations.find(row => row.data.state === "degraded")?.data).toMatchObject({ medianMs: 90, referenceMs: 20 });
+  expect(observations.find(row => row.data.state === "unreadable")?.data).toMatchObject({ medianMs: null, samplesMs: [null, null, null] });
+  // The degraded-state rows still name each degraded and unreadable poll.
+  expect(rows.filter(row => row.event === "host-degraded").map(row => row.data.medianMs)).toEqual([90, 90, null, null]);
+}, 60_000);

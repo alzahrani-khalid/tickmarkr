@@ -129,7 +129,13 @@ Run offers only validated park verbs: human/attempt-cap/other non-gate parks all
 infra allows approve or `--recheck`; review gate-fail allows `--waive`, `--uphold` or
 `--recheck`; other gate-fail allows waive/recheck. Waive satisfies only the identified
 failed gate, uphold funds a fixed attempt carrying review findings, and recheck reruns the
-declared battery without satisfying a gate. Attempt-cap approval resets the budget while
+declared battery without satisfying a gate. A stall park that recorded a `reapFailure`
+(unreadable or surviving worker census) allows approve or `--recheck --park <line>@<ts>`:
+recheck re-verifies that attempt's owned census and gates its harvested commits with no
+worker only with an explicitly recorded empty survivors array (`[]`) — a missing,
+unreadable or surviving census
+re-parks the stall under a new token — while plain approve dispatches a worker. An
+ordinary stall park (no `reapFailure`) stays approve-only; `--recheck` refuses it. Attempt-cap approval resets the budget while
 retaining routing exclusions. Tombstones and failures without identified gate evidence
 are diagnostic-only. Decisions cannot be undone; stale or duplicate decisions refuse.
 

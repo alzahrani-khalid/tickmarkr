@@ -1263,6 +1263,8 @@ export type ParkedDecision = {
   readonly tombstone: boolean;
   /** OBS-1178: the park's `<line>@<ts>` token — the confirmed write binds to it via `--park`. */
   readonly park?: string;
+  /** OBS-1202: a stall park's recorded reap failure — the one stall park recheck may release. */
+  readonly reapFailure?: string;
 };
 
 /**
@@ -1333,6 +1335,7 @@ export function deriveParkedDecisions(
       failedGate,
       tombstone: isTombstonePark(kind, reason),
       ...(typeof parked?.ts === "string" ? { park: bindingToken({ line: lines[parkedIndex]!, ts: parked.ts }) } : {}),
+      ...(kind === "stall" && typeof parked?.data.reapFailure === "string" ? { reapFailure: parked.data.reapFailure } : {}),
     });
   }
   return decisions;
@@ -1390,6 +1393,8 @@ export type SetupDecisionsKeyResult = {
  */
 export function setupDecisionVerbs(decision: ParkedDecision): readonly SetupDecisionVerb[] {
   if (decision.tombstone) return [];
+  // OBS-1202: the production table's census-recovery row; an ordinary stall stays approve-only.
+  if (decision.kind === "stall" && decision.reapFailure !== undefined) return ["approve", "recheck"];
   if (decision.kind !== "gate-fail") return ["approve"];
   if (decision.failedGate === undefined) return [];
   return decision.failedGate === "review" ? ["waive", "uphold", "recheck"] : ["waive", "recheck"];

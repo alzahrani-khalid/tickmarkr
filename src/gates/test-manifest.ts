@@ -1,7 +1,9 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash, randomBytes } from "node:crypto";
 import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { performance } from "node:perf_hooks";
 import { TEST_REPORTER_SOURCE } from "./test-reporter.js";
 import { shq } from "../adapters/types.js";
 import { beginGateEvidence, redactGateOutput, type GateEvidenceOptions, type BaselineFileDuration } from "./baseline.js";
@@ -208,15 +210,21 @@ export function verifyManifestReport(opts: {
   report: TestReport | undefined;
   killedFile?: string;
   hangBudgetMs?: number;
+  /** Active elapsed time (detected suspend subtracted) versus raw wall service at the kill. */
+  hangActiveMs?: number;
+  hangWallMs?: number;
 }): ManifestVerdict {
-  const { manifest, nonce, exitCode, report, killedFile, hangBudgetMs } = opts;
+  const { manifest, nonce, exitCode, report, killedFile, hangBudgetMs, hangActiveMs, hangWallMs } = opts;
 
   if (killedFile !== undefined) {
+    const service = hangActiveMs !== undefined && hangWallMs !== undefined
+      ? ` (${Math.round(hangActiveMs)}ms active of ${Math.round(hangWallMs)}ms wall)` : "";
     return {
       kind: "infra",
       pass: false,
-      details: `infra hang: "${killedFile}" started and did not complete within its ${hangBudgetMs}ms budget — killed, its process group is gone`,
-      meta: { classification: "infra", infra: true, kind: "hang", file: killedFile, hangBudgetMs },
+      details: `infra hang: "${killedFile}" started and did not complete within its ${hangBudgetMs}ms budget${service} — killed, its process group is gone`,
+      meta: { classification: "infra", infra: true, kind: "hang", file: killedFile, hangBudgetMs,
+        ...(hangActiveMs !== undefined ? { activeMs: hangActiveMs, wallMs: hangWallMs } : {}) },
     };
   }
 
@@ -383,6 +391,50 @@ export function fileHangBudgetMs(file: string, baselineDurations?: readonly Base
   return Math.min(ceiling, known === undefined ? FILE_HANG_SLACK * longest : Math.max(FILE_HANG_SLACK * known, longest));
 }
 
+/**
+ * OBS-953 (+add): a per-file hang budget counted in raw wall time charged a lid-close to the file that
+ * was running. Each poll compares how far the wall clock and the monotonic clock advanced since the
+ * last one. Wall advancing more than monotonic by over CLOCK_JUMP_SLACK_MS is a DETECTED discontinuity
+ * (`host-suspend`): its offset is subtracted from the active elapsed time of every file started before
+ * it ended. A poll that arrives overdue while both clocks advanced together is recorded as `unknown`
+ * and subtracts nothing — an ambiguous gap never excuses an active hang. Whether the host really slept
+ * is not provable from these clocks (a manually set clock jumps the same way); only the offset is.
+ */
+export const CLOCK_JUMP_SLACK_MS = 1_000;
+export interface HostInterruption {
+  kind: "host-suspend" | "unknown";
+  /** Wall time of the previous poll and of the poll that observed the gap. */
+  from: number;
+  to: number;
+  wallMs: number;
+  monoMs: number;
+  /** The wall-over-monotonic offset of a detected suspend; 0 for an unknown gap. */
+  subtractedMs: number;
+}
+export interface HangClocks { wall: () => number; mono: () => number }
+const systemClocks: HangClocks = { wall: () => Date.now(), mono: () => performance.now() };
+let hangClocks = systemClocks;
+export const setHangClocksForTests = (clocks: HangClocks): void => { hangClocks = clocks; };
+export const resetHangClocksForTests = (): void => { hangClocks = systemClocks; };
+
+/** A poll gap worth recording, or undefined for an on-time poll. */
+export function classifyPollGap(prev: { wall: number; mono: number }, now: { wall: number; mono: number }, pollMs: number): HostInterruption | undefined {
+  const wallMs = now.wall - prev.wall;
+  const monoMs = now.mono - prev.mono;
+  const gap = { from: prev.wall, to: now.wall, wallMs, monoMs };
+  if (wallMs - monoMs > CLOCK_JUMP_SLACK_MS) return { kind: "host-suspend", ...gap, subtractedMs: wallMs - monoMs };
+  if (monoMs > pollMs + CLOCK_JUMP_SLACK_MS) return { kind: "unknown", ...gap, subtractedMs: 0 };
+  return undefined;
+}
+/** The detected suspend a file started at `startedAt` sat through. */
+const suspendedSince = (interruptions: readonly HostInterruption[], startedAt: number): number =>
+  interruptions.reduce((sum, i) => sum + Math.min(i.subtractedMs, Math.max(0, i.to - Math.max(i.from, startedAt))), 0);
+
+// The daemon journals each interruption where it ran (task gate, tip verify); no sink, no journal row.
+const interruptionSink = new AsyncLocalStorage<(interruption: HostInterruption) => void>();
+export const runWithInterruptionSink = <T>(sink: (interruption: HostInterruption) => void, run: () => Promise<T>): Promise<T> =>
+  interruptionSink.run(sink, run);
+
 export interface ManifestRunResult {
   evidenceReceipt: GateEvidenceReceipt;
   evidenceReceipts: GateEvidenceReceipt[];
@@ -392,6 +444,10 @@ export interface ManifestRunResult {
   report: TestReport | undefined;
   killedFile?: string;
   hangBudgetMs?: number;
+  /** A hang's active elapsed time (suspend subtracted) and its raw wall service, kept apart. */
+  hangActiveMs?: number;
+  hangWallMs?: number;
+  interruptions: HostInterruption[];
   /** The child's own pid (its process GROUP id too, since it is spawned detached) — for a caller
    * that wants to prove the group is really gone after a hang kill (`process.kill(-pid, 0)` throws). */
   pid?: number;
@@ -422,18 +478,30 @@ export function runManifestedTest(
   let pid: number | undefined;
   let killedFile: string | undefined;
   let hangBudgetMs: number | undefined;
+  let hangActiveMs: number | undefined;
+  let hangWallMs: number | undefined;
   let poll: ReturnType<typeof setInterval> | undefined;
+  const interruptions: HostInterruption[] = [];
+  const sink = interruptionSink.getStore();
+  let last = { wall: hangClocks.wall(), mono: hangClocks.mono() };
   const checkHang = (atCeiling = false) => {
+    const at = { wall: hangClocks.wall(), mono: hangClocks.mono() };
+    const gap = classifyPollGap(last, at, pollMs);
+    last = at;
+    if (gap) { interruptions.push(gap); sink?.(gap); }
     const report = readTestReport(opts.reportPath);
     if (!report || report.nonce !== opts.nonce) return;
-    const now = Date.now();
     for (const file of opts.manifest) {
       const startedAt = report.started[file];
       if (startedAt === undefined || file in report.completed) continue;
       const budget = fileHangBudgetMs(file, opts.baselineDurations, overallCeilingMs, opts.longestFile);
-      if (now - startedAt >= budget || (atCeiling && budget === overallCeilingMs)) {
+      const wallMs = at.wall - startedAt;
+      const activeMs = wallMs - suspendedSince(interruptions, startedAt);
+      if (activeMs >= budget || (atCeiling && budget === overallCeilingMs)) {
         killedFile = file;
         hangBudgetMs = budget;
+        hangActiveMs = activeMs;
+        hangWallMs = wallMs;
         if (!atCeiling) controller.abort();
         return;
       }
@@ -446,6 +514,7 @@ export function runManifestedTest(
       pid = childPid;
       // Neither the per-file clocks nor the command ceiling includes lease queue time.
       clearInterval(poll);
+      last = { wall: hangClocks.wall(), mono: hangClocks.mono() };
       poll = setInterval(checkHang, pollMs);
     },
   }).then((result) => {
@@ -454,7 +523,7 @@ export function runManifestedTest(
       evidenceReceipt, evidenceReceipts: [...evidence.history, evidenceReceipt],
       exitCode: result.signalExit ? undefined : result.code,
       stdout: result.stdout, stderr: result.stderr,
-      report: readTestReport(opts.reportPath), killedFile, hangBudgetMs, pid,
+      report: readTestReport(opts.reportPath), killedFile, hangBudgetMs, hangActiveMs, hangWallMs, interruptions, pid,
     };
   }).catch((error: unknown) => {
     if (error instanceof Error) {
@@ -617,8 +686,10 @@ export async function evaluateManifestedTest(cmd: string, cwd: string, opts: {
       pollMs: 20,
     });
     let verdict = verifyManifestReport({ manifest: files, nonce, exitCode: invoked.exitCode,
-      report: invoked.report, killedFile: invoked.killedFile, hangBudgetMs: invoked.hangBudgetMs });
+      report: invoked.report, killedFile: invoked.killedFile, hangBudgetMs: invoked.hangBudgetMs,
+      hangActiveMs: invoked.hangActiveMs, hangWallMs: invoked.hangWallMs });
     evidenceReceipts.push(...invoked.evidenceReceipts);
+    const interruptions = [...invoked.interruptions];
     const stranded = strandedSingleForkFiles(files, nonce, invoked);
     if (stranded) {
       const first = invoked.report!;
@@ -641,8 +712,10 @@ export async function evaluateManifestedTest(cmd: string, cwd: string, opts: {
         longestFile: opts.longestFile, overallCeilingMs: opts.overallCeilingMs ?? DEFAULT_FILE_HANG_BUDGET_MS, pollMs: 20,
       });
       evidenceReceipts.push(...invoked.evidenceReceipts);
+      interruptions.push(...invoked.interruptions);
       verdict = verifyManifestReport({ manifest: stranded, nonce, exitCode: invoked.exitCode,
-        report: invoked.report, killedFile: invoked.killedFile, hangBudgetMs: invoked.hangBudgetMs });
+        report: invoked.report, killedFile: invoked.killedFile, hangBudgetMs: invoked.hangBudgetMs,
+      hangActiveMs: invoked.hangActiveMs, hangWallMs: invoked.hangWallMs });
       // An all-skipped retry may contribute lifecycle accounting, but only the combined manifest
       // can establish executed success. Never rewrite either invocation's persisted certificate.
       if (verdict.pass || verdict.meta.noExecutedModules) {
@@ -673,11 +746,15 @@ export async function evaluateManifestedTest(cmd: string, cwd: string, opts: {
         + [...runnerErrors,
           stdoutTail.toString(), stderrTail.toString()].filter(Boolean).map(text => `\n${text}`).join("")
       : "";
+    // The interruption is reported beside the verdict, never folded into it or into raw wall service.
+    const interrupted = interruptions.length
+      ? `\nhost interruptions: ${interruptions.map(i => `${i.kind} ${Math.round(i.wallMs)}ms wall / ${Math.round(i.monoMs)}ms monotonic, ${Math.round(i.subtractedMs)}ms subtracted`).join("; ")}`
+      : "";
     return { evidenceReceipt, evidenceReceipts, pass: verdict.pass, kind: verdict.kind,
-      details: verdict.details + diagnostics,
+      details: verdict.details + interrupted + diagnostics,
       classification: verdict.meta.classification as "infra" | "regression" | undefined,
       meta: { ...verdict.meta, nonce, manifest: files, manifestPath, listingCommand: invocation.listing, verification,
-        ...(recovery ? { recovery, retryable: false } : {}),
+        ...(recovery ? { recovery, retryable: false } : {}), ...(interruptions.length ? { interruptions } : {}),
         spawnedCommand, processExit: invoked.exitCode, pid: invoked.pid, stdoutPath, stderrPath },
       exitCode: invoked.exitCode ?? -1, reportPath };
   } catch (error) {

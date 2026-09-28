@@ -624,7 +624,7 @@ export function taskProjectionText(row: TaskRow, journal: readonly JournalRow[] 
     `blocker ${blocker ? `${blocker.kind} ${at(evidence.blocker)}` : "none"}`,
     `next ${blocker?.nextAction == null ? fieldReading(undefined) : `${blocker.nextAction} ${at(evidence.nextAction)}`}`,
     ...(harvest?.suspectedStalledHarvest ? [`${STALL_MARKER} · launch ${at(evidence.launch)} · ${harvest.nudgeFailures} nudge failed ${at(evidence.nudge)} · ${harvest.pageCount} paged ${at(evidence.page)} · no worker-result`] : []),
-  ].reduce((text, part) => `${text} · ${part}`);
+  ].join(" · ");
 }
 
 /**
@@ -643,13 +643,18 @@ function undispatchedProjectionText(row: TaskRow, journal: readonly JournalRow[]
     MISSING_EVIDENCE,
     ...(showBlocker ? [`blocker ${blocker.kind} ${at(evidence.blocker)}`] : []),
     ...(showNext ? [`next ${blocker.nextAction} ${at(evidence.nextAction)}`] : []),
-  ].reduce((text, part) => `${text} · ${part}`);
+  ].join(" · ");
 }
 
 type ProjectionEvidence = {
-  readonly identity?: number; readonly phase?: number; readonly build?: number;
-  readonly blocker?: number; readonly nextAction?: number;
-  readonly launch?: number; readonly nudge?: number; readonly page?: number;
+  readonly identity?: number;
+  readonly phase?: number;
+  readonly build?: number;
+  readonly blocker?: number;
+  readonly nextAction?: number;
+  readonly launch?: number;
+  readonly nudge?: number;
+  readonly page?: number;
 };
 
 /**

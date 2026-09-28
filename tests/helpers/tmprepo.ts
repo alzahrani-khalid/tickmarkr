@@ -1,6 +1,6 @@
 import { execFileSync, execSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { mkdirSync, mkdtempSync, rmdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { FakeAdapter } from "../../src/adapters/fake.js";
@@ -81,6 +81,29 @@ export const recordTmpdirChild = (name: string): TmpdirChildRecord => {
   writeFileSync(join(process.env[TMPDIR_CHILD_ENV]!, name), JSON.stringify(record));
   return record;
 };
+
+/** The child-report reader's deadline: 600 polls at 100 ms, the bound tmprepo.test.ts always waited. */
+export const CHILD_REPORT_DEADLINE_MS = 60_000;
+const CHILD_REPORT_POLL_MS = 100;
+
+/**
+ * OBS-1200: a child runner's report is created before it is complete — `writeFileSync` opens (an
+ * empty file exists) and then writes, and a reader that parses on first sight throws on the empty
+ * or partial bytes. Read until the file parses as JSON; a report still unparseable at the deadline
+ * fails with its last bytes named, so a permanently malformed report is one bounded failure.
+ */
+export async function readChildReport<T = unknown>(file: string, deadlineMs = CHILD_REPORT_DEADLINE_MS): Promise<T> {
+  const until = Date.now() + deadlineMs;
+  let last = "";
+  for (;;) {
+    if (existsSync(file)) {
+      last = readFileSync(file, "utf8");
+      try { return JSON.parse(last) as T; } catch { /* created, not yet complete — poll again */ }
+    }
+    if (Date.now() >= until) throw new Error(`child report ${file} incomplete after ${deadlineMs} ms: ${JSON.stringify(last.slice(-200))}`);
+    await new Promise((r) => setTimeout(r, Math.min(CHILD_REPORT_POLL_MS, Math.max(1, until - Date.now()))));
+  }
+}
 
 /** Removes exactly the directories this runner recorded — never a prefix sweep, never the root's other
  * children, and never the live TMPDIR (mid-file callers would strand every later temporary). */

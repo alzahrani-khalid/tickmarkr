@@ -14,7 +14,7 @@ import { shOk } from "../../../src/run/git.js";
 import { Journal, type JournalEvent } from "../../../src/run/journal.js";
 import { alive, exited, ownedFailures, type Proc, type PsTable, psTable, runOwned, teardownTree } from "../../helpers/owned-process.js";
 import { COMMIT, setupRepo, T, TEST_BASE_TMPDIR_ENV } from "../../helpers/tmprepo.js";
-import { conflictPair, heldAfterRelease, releaseAll, releaseIndex, releaseOn, type WorkerBarrier, workerBarrier } from "../../helpers/worker-barrier.js";
+import { conflictPair, heldAfterRelease, lastRows, Q1_SCHEDULES, type Q1Schedule, q1Violations, releaseAll, releaseIndex, releaseOn, type WorkerBarrier, workerBarrier } from "../../helpers/worker-barrier.js";
 
 type Id = "T1" | "T2";
 const other = (id: Id): Id => (id === "T1" ? "T2" : "T1");
@@ -104,34 +104,47 @@ describe("fixture ordering by events (fake adapter, zero tokens)", () => {
     for (const first of ORDERS) await expectConflictOrder(`run-order-conflict-${first}`, first);
   }, 120_000);
 
-  test("test: the production daemon completes Q-1 retries with distinct task files under either merge order, so sharing ok.txt until one retry has nothing to commit fails", async () => {
+  test("test: the production daemon Q-1 fixture delivers both distinct task commits in either merge order under delayed release or consult completion versus a one-task terminal summary, so diagnostics must expose the last five rows on a missing commit", async () => {
     const fixture = (name: string) => fileURLToPath(new URL(`../../fixtures/quota/${name}`, import.meta.url));
     const dump = (name: string) => `cat ${shq(fixture(name))}; exit 1`;
     for (const f of ["run3522-T2-a0.out", "run3522-T2-a2.out"]) expect(QUOTA_RE.test(readFileSync(fixture(f), "utf8"))).toBe(true);
-    for (const first of ORDERS) {
-      const held = other(first);
-      const runId = `run-order-q1-${first}`;
-      const b = workerBarrier(`${runId}-${held}`);
-      const ok = (id: Id) => `echo ok > ${id}.txt && ${COMMIT} ${id}`;
-      const { repo, fake } = setupRepo([T("T1"), T("T2")], {
-        consult: { action: "retry", notes: "a no-trailer exit is not a channel verdict" },
-        tasks: {
-          [first]: [{ shell: dump("run3522-T2-a0.out") }, { shell: ok(first), result: { ok: true, summary: first } }],
-          [held]: [{ shell: dump("run3522-T2-a2.out") }, { shell: `${b.hold} && ${ok(held)}`, result: { ok: true, summary: held } }],
-        },
-      });
-      const s = await runDaemon(repo, { adapters: [fake], runId, narrate: releaseOn(b, "merge", first) }).finally(() => releaseAll(b));
-      const rows = events(repo, runId);
-      // a loaded-host red names each task's last rows, so the undelivered task's cause is on the record
-      const tail = (id: Id) => rows.filter((e) => e.taskId === id).slice(-5).map((e) => `${e.event} ${JSON.stringify(e.data).slice(0, 160)}`);
-      expect(s.done.sort(), `${runId} — T1: ${tail("T1").join(" | ")} — T2: ${tail("T2").join(" | ")}`).toEqual(["T1", "T2"]);
-      expectHeldAfterRelease(rows, b, held, "merge", first);
-      expect(rows.some((e) => e.event === "quota-failover"), runId).toBe(false);
-      expect(rows.filter((e) => e.event === "merge").map((e) => e.taskId), runId).toEqual([first, held]);
-      // each retry committed its own file, so both landed on the integration tip
-      const tree = await shOk(`git ls-tree -r --name-only ${s.branch}`, repo);
-      expect(tree, runId).toContain("T1.txt");
-      expect(tree, runId).toContain("T2.txt");
+    const ok = (id: Id) => `echo ok > ${id}.txt && ${COMMIT} ${id}`;
+    let witness: { first: Id; held: Id; schedule: Q1Schedule; barrier: WorkerBarrier; rows: JournalEvent[]; tree: string } | undefined;
+    for (const schedule of Q1_SCHEDULES) {
+      for (const first of ORDERS) {
+        const held = other(first);
+        const runId = `run-order-q1-${schedule.on}-${first}`;
+        const b = workerBarrier(`${runId}-${held}`);
+        const { repo, fake } = setupRepo([T("T1"), T("T2")], {
+          consult: { action: "retry", notes: "a no-trailer exit is not a channel verdict" },
+          tasks: {
+            [first]: [{ shell: dump("run3522-T2-a0.out") }, { shell: ok(first), result: { ok: true, summary: first } }],
+            [held]: [{ shell: dump("run3522-T2-a2.out") }, { shell: `${b.hold} && ${ok(held)}`, result: { ok: true, summary: held } }],
+          },
+        });
+        const s = await runDaemon(repo, { adapters: [fake], runId, narrate: releaseOn(b, schedule.on, first) }).finally(() => releaseAll(b));
+        const rows = events(repo, runId);
+        const tree = await shOk(`git ls-tree -r --name-only ${s.branch}`, repo);
+        expect(q1Violations({ runId, first, held, schedule, barrier: b, done: s.done, rows, tree })).toEqual([]);
+        witness ??= { first, held, schedule, barrier: b, rows, tree };
+      }
+    }
+
+    // versus a one-task terminal summary: the same rows judged with the held task undelivered must name
+    // exactly that task's last five rows (never its sixth-last, never the delivered task's merge) on both the
+    // missing done entry and the missing commit
+    const w = witness!;
+    const heldRows = w.rows.filter((e) => e.taskId === w.held);
+    expect(heldRows.length).toBeGreaterThan(5);
+    const red = q1Violations({ runId: "run-order-q1-partial", ...w, done: [w.first], tree: w.tree.split("\n").filter((f) => f !== `${w.held}.txt`).join("\n") });
+    expect(red).toHaveLength(2);
+    const tail = lastRows(w.rows, w.held);
+    expect(tail).toHaveLength(5);
+    for (const v of red) {
+      expect(v).toMatch(new RegExp(`: ${w.held}(\\.txt)? `));
+      for (const row of tail) expect(v).toContain(row);
+      expect(v).not.toContain(`${heldRows.at(-6)!.event} ${JSON.stringify(heldRows.at(-6)!.data).slice(0, 160)}`);
+      expect(v).not.toContain(lastRows(w.rows, w.first).find((row) => row.startsWith("merge ")));
     }
   }, 120_000);
 });

@@ -1,12 +1,14 @@
-import { execFileSync, execSync } from "node:child_process";
+import { execFile, execFileSync, execSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { promisify } from "node:util";
 import { describe, expect, test } from "vitest";
 import { FakeAdapter } from "../../src/adapters/fake.js";
 import { shq } from "../../src/adapters/types.js";
 import { acceptanceGate, auditAcceptanceCorpus, testFiltered } from "../../src/gates/acceptance.js";
 import { validateGraph } from "../../src/graph/schema.js";
+import { SYNC_HEAVY_TESTS } from "../../vitest.config.js";
 import { makeRepo } from "../helpers/tmprepo.js";
 
 function noCall(): FakeAdapter {
@@ -343,6 +345,40 @@ function listRepositoryAllProjects(): ListedTest[] {
   );
 }
 
+// The projects the acceptance corpus oracle requires a listing to name. Under the CI guard
+// (TICKMARKR_CI_LEAN_REPORTERS=1) sync-heavy stays its own isolated project; locally (OBS-634 add)
+// its members pool into `suite`, and every other project survives in both modes.
+const ORACLE_PROJECTS = {
+  local: ["suite", "keys-ledger", "built-cli", "signal-reaper"],
+  ci: ["suite", "sync-heavy", "keys-ledger", "built-cli", "signal-reaper"],
+} as const;
+type ListingMode = keyof typeof ORACLE_PROJECTS;
+const currentListingMode = (): ListingMode => process.env.TICKMARKR_CI_LEAN_REPORTERS === "1" ? "ci" : "local";
+
+async function listRepositoryFiles(mode: ListingMode): Promise<ListedTest[]> {
+  const env: NodeJS.ProcessEnv = { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" };
+  delete env.TICKMARKR_CI_LEAN_REPORTERS;
+  if (mode === "ci") env.TICKMARKR_CI_LEAN_REPORTERS = "1";
+  const { stdout } = await promisify(execFile)(
+    vitestBin, ["list", "--configLoader", "runner", "--filesOnly", "--json"],
+    { cwd: repoRoot, env, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 },
+  );
+  return parsedJson<ListedTest[]>(stdout, "[");
+}
+
+test("test: a real Vitest listing under the production configuration names every project the acceptance corpus oracle expects in both the pooled local mode and the isolated CI mode, so a project dropped by pooling fails", async () => {
+  const syncHeavy = SYNC_HEAVY_TESTS.map((file) => join(repoRoot, file));
+  for (const mode of ["local", "ci"] as const) {
+    const listed = await listRepositoryFiles(mode);
+    expect(new Set(listed.map((entry) => entry.projectName)), mode).toEqual(new Set(ORACLE_PROJECTS[mode]));
+    // the members the pooling moves are still listed, once, in the project this mode assigns them
+    for (const file of syncHeavy) {
+      expect(listed.filter((entry) => entry.file === file).map((entry) => entry.projectName), `${mode} ${file}`)
+        .toEqual([mode === "ci" ? "sync-heavy" : "suite"]);
+    }
+  }
+}, 120_000);
+
 t6AcceptanceTest(
   `enumerate every spec path from the corpus filesystem, require each path to yield parsed acceptance items or a named parse failure, then match those items against Vitest's JSON listing from every configured project; include one bad spec and one test outside suite so an omitted path or project cannot pass`,
   () => {
@@ -356,7 +392,7 @@ t6AcceptanceTest(
 
     const listed = listRepositoryAllProjects();
     expect(new Set(listed.map((entry) => entry.projectName)))
-      .toEqual(new Set(["suite", "built-cli", "signal-reaper", "sync-heavy", "keys-ledger"]));
+      .toEqual(new Set(ORACLE_PROJECTS[currentListingMode()]));
     const outsideTest = listed.find((entry) => entry.projectName !== "suite")!;
     const outsideCriterion = runnerVisibleName(outsideTest.name);
     // A suite-project control drawn from the listing itself, so suite-project matching is proven

@@ -10,12 +10,12 @@ import { filesGlob } from "../graph/files-glob.js";
 import { renderAcceptanceItem, type Task, TIERS } from "../graph/schema.js";
 import { getAdapter } from "../adapters/registry.js";
 import { shOk } from "../run/git.js";
-import { carryReviewFindings, observedReviewFingerprints, reviewFingerprintMatches, structuredFindings, type StructuredFinding, UNIDENTIFIED } from "../run/journal.js";
+import { carryReviewFindings, isDeferredFinding, observedReviewFingerprints, reviewFingerprintMatches, structuredFindings, type StructuredFinding, UNIDENTIFIED } from "../run/journal.js";
 import { redactSecrets } from "../run/redact.js";
 import { rankPreferredChannels, reviewPreferenceTieBreak } from "../route/role-pick.js";
 import { modelProvider } from "../route/preference.js";
 import { resolveStateDir } from "./cache.js";
-import { appendAnchoredReview, COMPLETION_FAKING_CHECKLIST, dewrapPaneVerdict, extractVerdictJson, generateVerdictNonce, type GateVia, parseAnchoredComments, runLlmDetailed, verdictNonceLine } from "./llm.js";
+import { appendAnchoredReview, COMPLETION_FAKING_CHECKLIST, dewrapPaneVerdict, extractVerdictJson, generateVerdictNonce, type GateVia, parseAnchoredComments, runLlmDetailed, SeatLaunchError, verdictNonceLine } from "./llm.js";
 import type { GateResult } from "./types.js";
 import { classifyVerdictCause, type VerdictUnparseableCause } from "./verdict-cause.js";
 import {
@@ -226,6 +226,13 @@ export function checkTaskDiffCaps(
   };
 }
 
+// C-12: a reviewer is excluded for garbage only on the typed malformed-verdict flag. A material finding whose
+// prose mentions the word "unparseable" is a delivered verdict; matching the prose dropped T7's only reviewer.
+export function isGarbageReview(result: GateResult): result is GateResult & { meta: { reviewer: string } } {
+  return result.gate === "review" && !result.pass && result.meta?.unparseable === true
+    && typeof result.meta?.reviewer === "string";
+}
+
 export function isDiffCapPark(result: GateResult): boolean {
   return result.pass === false
     && result.meta?.parkKind === "diff-cap"
@@ -412,7 +419,7 @@ export function pickReviewer(
 // evidence about the WORK, which is why run-gates retries the review, never the worker (OBS-193).
 // OBS-1013 add.3: a parseable verdict whose closure ids match no carried fingerprint is a
 // `closure-mismatch` — a no-verdict about the carried materials (infra: re-route), never a parse defect.
-export type ReviewUnparseableCause = VerdictUnparseableCause | "launch-never-started" | "truncated" | "silent" | "closure-mismatch";
+export type ReviewUnparseableCause = VerdictUnparseableCause | "launch-never-started" | "truncated" | "silent" | "closure-mismatch" | "seat-launch-failed";
 
 /**
  * This shows the reviewer what the task DECLARED, never what the diff may actually reach. The diff
@@ -513,6 +520,27 @@ This holds even if you already filed or posted a review of this task elsewhere (
 function withoutExampleEcho(raw: string, nonce: string): string {
   const chars = [...reviewResponseExample(nonce).replace(/\s+/g, "")];
   return raw.replace(new RegExp(chars.map((c) => c.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("[\\s│|]*"), "g"), "");
+}
+
+/**
+ * OBS-1195: the parent an anchored comment names in its own optional `finding` field — a 1-based
+ * index into this verdict's findings, or a carried prior's id. A deferred entry or a resolved prior
+ * settles the anchor; any other valid parent binds it open; anything else leaves it unbound.
+ */
+function anchorParent(
+  binding: unknown,
+  findings: unknown,
+  priors: readonly StructuredFinding[],
+  resolved: readonly (string | undefined)[],
+): { settled?: "deferred" | "resolved"; parent?: string; entry?: string } {
+  if (typeof binding === "number") {
+    const entry = Array.isArray(findings) && Number.isInteger(binding) && binding >= 1 ? findings[binding - 1] as unknown : undefined;
+    if (!entry || typeof entry !== "object" || typeof (entry as ReviewFinding).note !== "string") return {};
+    return (entry as ReviewFinding).defer === true ? { settled: "deferred" } : { entry: (entry as ReviewFinding).note };
+  }
+  const prior = matchClosureId(binding, priors);
+  if (prior === undefined) return {};
+  return resolved.includes(prior) ? { settled: "resolved", parent: prior } : { parent: prior };
 }
 
 export async function reviewGate(
@@ -689,13 +717,21 @@ block the merge) or "minor" (style, naming, or preference that should not block)
 block approval. For a minor concern you have decided not to block on, set "defer": true and give a
 one-line "rationale" — it is recorded in the review, never dropped.
 A fix you prescribe that would break suites outside the task's declared write scope (files[]) is a scope finding, never a material one.
+Each material finding names the class of defect it belongs to and binds that class to the goal clause or
+acceptance criterion it violates (or to the regression this diff introduces), states its input → consequence,
+and marks its evidence executed (you ran the reproducer), static (you traced it by reading) or blocked (it
+could not run here). Blocked evidence never turns a finding into a pass, and a worker's own case table or
+enumeration never resolves a finding: judge the diff itself.
 
 Respond with ONLY this JSON:
-{"nonce": "${nonce}", "approve": true|false, "resolved": [], "reraised": [], "findings": [{"note": "...", "severity": "material"|"minor", "defer": false, "rationale": ""}], "comments": [{"path": "path/to/file", "line": 42, "body": "actionable feedback"}]}
+{"nonce": "${nonce}", "approve": true|false, "resolved": [], "reraised": [], "findings": [{"note": "...", "severity": "material"|"minor", "defer": false, "rationale": ""}], "comments": [{"path": "path/to/file", "line": 42, "body": "actionable feedback", "finding": 1}]}
 For every prior material, put its fingerprint in exactly one of resolved (verified fixed) or reraised
 (still a blocking defect). Use only the listed fingerprints; never omit one or put it in both lists.
 Approve iff no material finding remains and every prior material is resolved.
 The top-level comments array is optional. Use it only for actionable line-anchored feedback.
+A comment's optional "finding" names its parent: the 1-based index of its entry in findings, or a prior
+fingerprint copied from above. A comment anchored to a deferred entry or a resolved prior does not block;
+a comment naming no parent stays open.
 
 ${responseRequirement}
 `;
@@ -727,7 +763,10 @@ ${responseRequirement}
   if (briefPath) {
     try { writeFileSync(briefPath, redactSecrets(prompt)); savedBrief = briefPath; } catch { savedBrief = undefined; }
   }
-  const llm = await runLlmDetailed(
+  const provider = modelProvider(reviewer.model, reviewer.vendor);
+  let llm: Awaited<ReturnType<typeof runLlmDetailed>>;
+  try {
+    llm = await runLlmDetailed(
     getAdapter(reviewer.adapter, adapters),
     reviewer.model,
     prompt,
@@ -746,6 +785,16 @@ ${responseRequirement}
     cfg.review.timeoutMs,
     reviewer.effort, // OBS-1182: the picked seat's own effort, never the author's
   );
+  } catch (error) {
+    if (!(error instanceof SeatLaunchError)) throw error;
+    // OBS-1168(b): the seat never launched, so there is no verdict and nothing about the WORK. A typed
+    // no-verdict re-routes to another seat in run-gates; an exhausted pool is an infra park.
+    return { gate: "review", pass: false,
+      details: `review dispatch failed — ${error.message} (reviewer ${reviewer.adapter}:${reviewer.model}; vendor: ${reviewer.vendor}; provider: ${provider}; cause: seat-launch-failed) — failing closed`,
+      meta: { ...policyMeta, ...rotationMeta, ...floorMeta, reviewer: channelKey(reviewer), reviewerTier: reviewer.tier,
+        vendor: reviewer.vendor, provider, noVerdict: true, classification: "infra", infra: true,
+        cause: "seat-launch-failed" satisfies ReviewUnparseableCause, ...(savedBrief ? { briefPath: savedBrief } : {}) } };
+  }
   const raw = llm.output;
   let saved: string | undefined;
   if (artifactDir) {
@@ -756,7 +805,6 @@ ${responseRequirement}
       saved = undefined; // persistence is evidence, not a gate input — never fail the gate on it
     }
   }
-  const provider = modelProvider(reviewer.model, reviewer.vendor);
   // A pane's own dewrap stops at the first parseable nonce-bound object; once the example's echo is gone
   // a genuinely wrapped verdict behind it is reconstructed here, exactly as llm.ts would have.
   const echoFree = withoutExampleEcho(raw, nonce);
@@ -796,6 +844,8 @@ ${responseRequirement}
         ...(cause === "malformed-verdict" ? { unparseable: true } : { noVerdict: true, classification: "infra", infra: true }),
         cause,
         ...(closureMismatch ? { resolved: v?.resolved, reraised: v?.reraised, carriedFingerprints: priorIds.flatMap(observedReviewFingerprints) } : {}),
+        // OBS-1196: a whole verdict that breaks the closure protocol was DELIVERED; only undelivered bytes are re-asked.
+        ...(closureInvalid ? { closureInvalid: true } : {}),
         bytes, seatAuthoredBytes: bytes,
         ...(saved ? { rawPath: saved } : {}),
         ...(savedBrief ? { briefPath: savedBrief } : {}),
@@ -813,24 +863,25 @@ ${responseRequirement}
   if (reraised.length) {
     if (decided.pass) decided.headline = "requested changes";
     decided.pass = false;
-    // A reviewer may also restate a re-raised material in findings. Preserve the original
-    // prose once so an unchanged defect keeps the same failure brief across repair rounds.
-    for (const finding of reraised) {
-      const line = `- [material] ${finding.note}`;
-      if (!decided.lines.includes(line)) decided.lines.push(line);
-    }
   }
-  const prose = `reviewer ${reviewer.adapter}:${reviewer.model} (vendor: ${reviewer.vendor}; provider: ${provider}): ${decided.headline}${decided.lines.length ? "\n" + decided.lines.join("\n") : ""}`;
-  const details = appendAnchoredReview(prose, v);
+  // OBS-1195: an anchor leaves the blocking set only through an explicit, unambiguous parent
+  // disposition: its own `finding` names a deferred entry of this verdict or a prior it resolved.
+  // Path coincidence binds nothing; an unbound or ambiguous anchor stays open exactly as before.
+  const comments = parseAnchoredComments(v);
+  const rawComments = (comments.length ? v.comments : []) as unknown as Array<Record<string, unknown>>;
+  const resolvedIds = (v.resolved ?? []).map((id) => matchClosureId(id, priorIds));
+  const anchors = comments.map((comment, i) => ({ ...comment, ...anchorParent(rawComments[i]?.finding, v.findings, priorIds, resolvedIds) }));
+  const openAnchors = { comments: anchors.filter((a) => !a.settled) };
+  const settledAnchors = anchors.flatMap((a, i) => a.settled
+    ? [{ path: a.path, line: a.line, body: a.body, disposition: a.settled, finding: rawComments[i]!.finding }] : []);
   // Only the verdict's anchors may supply missing evidence, and only when unambiguous.
   // Reuse the journal's path normalization without changing legacy details-only parsing.
-  const anchoredPaths = new Set(parseAnchoredComments(v).map((comment) => {
-    const anchor = structuredFindings("review", `- ${comment.path}:${comment.line} — anchor`)
+  const anchorRow = (comment: { path: string; line: number; body: string }) =>
+    structuredFindings("review", `- ${comment.path}:${comment.line} — ${comment.body}`)
       .find((finding) => finding.class === "review:anchored");
-    return anchor?.path ?? comment.path;
-  }));
+  const anchoredPaths = new Set(comments.map((comment) => anchorRow({ ...comment, body: "anchor" })?.path ?? comment.path));
   const anchoredPath = anchoredPaths.size === 1 ? [...anchoredPaths][0] : undefined;
-  const ownDetails = appendAnchoredReview(ownLines.join("\n"), v);
+  const ownDetails = appendAnchoredReview(ownLines.join("\n"), openAnchors);
   const currentRows = (ownDetails.trim() ? structuredFindings("review", ownDetails) : [])
     .map((finding) => finding.path === UNIDENTIFIED && anchoredPath
       ? { ...finding, path: anchoredPath, fingerprint: `${finding.class}|${anchoredPath}|${finding.symbol}` }
@@ -850,7 +901,46 @@ ${responseRequirement}
   const unambiguousRows = linkedRows.map((finding) => finding.reraisedFrom
     && linkedRows.filter((row) => row.reraisedFrom === finding.reraisedFrom).length > 1
     ? { ...finding, reraisedFrom: undefined } : finding);
-  const carriedRows = carryReviewFindings(reraised, unambiguousRows);
+  // OBS-1195: a deferred entry echoing a prior's id names that prior as the concern it defers. The
+  // link rides the row for the journal's anchor fold only; a deferral never re-seats a material chain.
+  // A prior any material row restates — even ambiguously, its link cleared above — is claimed, not
+  // deferred: the deferral gets no link, so its bound anchors stay open (fail closed).
+  const claimed = new Set(linkedRows.map((row) => row.reraisedFrom).filter((id) => id !== undefined));
+  const rows = unambiguousRows.map((finding) => {
+    if (!isDeferredFinding(finding)) return finding;
+    const entry = v.findings?.find((entry) => entry && typeof entry === "object" && entry.note === finding.note);
+    const id = matchClosureId(entry?.reraised, reraised);
+    return id && !claimed.has(id) ? { ...finding, reraisedFrom: id } : finding;
+  });
+  // OBS-1195: current prose is rendered once. A prior's original wording is echoed only when no
+  // current finding positively binds it; a bound chain keeps that spelling as lineage instead.
+  for (const finding of reraised) {
+    const line = `- [material] ${finding.note}`;
+    const bound = unambiguousRows.some((row) => row.reraisedFrom === finding.fingerprint);
+    if (!bound && !decided.lines.includes(line)) decided.lines.push(line);
+  }
+  const prose = `reviewer ${reviewer.adapter}:${reviewer.model} (vendor: ${reviewer.vendor}; provider: ${provider}): ${decided.headline}${decided.lines.length ? "\n" + decided.lines.join("\n") : ""}`;
+  const details = appendAnchoredReview(prose, openAnchors);
+  // OBS-1195: a prior's `reraisedFrom` is the link an EARLIER verdict drew. Carried forward unrestated,
+  // it would read as this verdict's own material claim on that parent and block the anchor fold from
+  // honouring an explicit deferral of it. Lineage lives in observedFingerprints; drop the stale link.
+  const carried = carryReviewFindings(reraised.map(({ reraisedFrom: _stale, ...prior }) => prior), rows);
+  // An open anchor bound to a current entry names that entry's carried chain, only when unique.
+  const parentOf = (anchor: (typeof anchors)[number]): string | undefined => {
+    if (anchor.entry === undefined) return anchor.parent;
+    const owners = carried.filter((f) => f.class !== "review:anchored" && f.note === anchor.entry);
+    return owners.length === 1 ? owners[0]!.fingerprint : undefined;
+  };
+  const carriedRows = carried.map((finding) => {
+    if (finding.class !== "review:anchored") return finding;
+    // Every comment spelling this row must name the same parent, else the anchor stays unbound.
+    const parents = new Set(anchors.filter((a) => {
+      const row = a.settled ? undefined : anchorRow(a);
+      return row?.path === finding.path && row.note === finding.note;
+    }).map(parentOf));
+    const [parent] = parents;
+    return parents.size === 1 && parent ? { ...finding, boundTo: parent } : finding;
+  });
   return {
     gate: "review",
     pass: decided.pass,
@@ -865,6 +955,7 @@ ${responseRequirement}
         reraisedMatches: (v.reraised ?? []).map((id) => matchClosureId(id, priorIds)).filter((id): id is string => id !== undefined),
       } : {}),
       ...(!decided.pass ? { findings: carriedRows } : {}),
+      ...(settledAnchors.length ? { settledAnchors } : {}),
       ...(saved ? { rawPath: saved } : {}),
       ...(savedBrief ? { briefPath: savedBrief } : {}),
     },

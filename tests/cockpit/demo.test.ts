@@ -466,8 +466,112 @@ describe("cockpit demo captures", () => {
     ]) {
       expect(source).toContain(component);
     }
-    expect(source).not.toContain(".join(");
   });
+
+  test("test: the production final and screen-soak capture paths reproduce the committed Run frames after projection collapse and the demo asserts visible facts regardless of join or reduce spelling, so a stale-height frame or hidden fact passing the source grep fails", async () => {
+    const { captureShellOutput } = await import("../../src/tui/cockpit/capture.js");
+    const { MISSING_EVIDENCE } = await import("../../src/tui/cockpit/run-view.js");
+    const { initialRunInteractionState } = await import("../../src/tui/cockpit/keys.js");
+    const { LONG_TASK_ID, shellFixture } = await import("../fixtures/cockpit/final/capture-fixture.js");
+    const { mountShell } = await import("../fixtures/cockpit/final/mount.js");
+    const { REPLAYED_SOAK_RECORDS, replayFramePath, replaySoakRecord } = await import("../fixtures/screen-soak/test-support.js");
+    const FINAL = join(import.meta.dirname, "../fixtures/cockpit/final");
+    const SIZES = [[120, 40], [80, 24]] as const;
+
+    /** The Run leaf's body rows paged to its end, as the production shell paints them. */
+    const leafTail = async (cwd: string, runId: string, columns: number, rows: number): Promise<string[]> => {
+      const shell = await mountShell(cwd, runId, columns, rows);
+      try {
+        await shell.send("4");
+        await shell.send("\x1b[6~");
+        return stripAnsi(shell.frame()).split("\n")
+          .filter((line) => line.startsWith("│"))
+          .map((line) => {
+            const cells = line.split("│");
+            return (cells.length >= 5 ? cells[2]! : cells[1]!).trimEnd();
+          });
+      } finally {
+        await shell.close();
+      }
+    };
+    /** The projection rows above the verdict panel, re-joined; the row touching the verdict is never blank. */
+    const clausesAboveVerdict = (body: readonly string[], label: string): string => {
+      const verdict = body.findIndex((line) => line.startsWith("VERDICT / "));
+      expect(verdict, `${label} reaches the verdict panel`).toBeGreaterThan(0);
+      expect(body[verdict - 1]!.trim(), `${label} keeps no padding above the verdict`).not.toBe("");
+      return body.slice(0, verdict).join("");
+    };
+
+    // Final capture path: the committed Run frames are its bytes, and paging to the leaf's end
+    // shows the collapsed clauses — recorded blocker and action included — sitting on the verdict.
+    const fixture = shellFixture();
+    try {
+      for (const [columns, rows] of SIZES) {
+        const frame = await captureShellOutput({ ...fixture, view: "run", columns, rows });
+        expect(readFileSync(join(FINAL, `run.${columns}x${rows}.txt`), "utf8"), `run.${columns}x${rows}.txt`).toBe(`${frame}\n`);
+        const clauses = clausesAboveVerdict(await leafTail(fixture.cwd, fixture.runId, columns, rows), `final ${columns}x${rows}`);
+        expect(clauses).toContain("T3 · missing evidence · blocker dependency-wait (no journal row) · next Wait for prerequisites: T2 (no journal row)");
+        expect(clauses.endsWith(`${LONG_TASK_ID} · ${MISSING_EVIDENCE}`)).toBe(true);
+      }
+    } finally {
+      fixture.close();
+    }
+
+    // Screen-soak capture path: each sealed record's own journal replayed through the production capture
+    // at both geometries must reproduce its committed replay-run frame. Its population dispatched every
+    // task, so the collapse never reaches it. The measured last-frame.ansi predates the projection panel
+    // and stays the duration evidence captured; replay frames live beside the final shell frames.
+    for (const record of REPLAYED_SOAK_RECORDS) {
+      const replay = replaySoakRecord(record);
+      try {
+        const events = replay.raw.trim().split("\n").map((line) => JSON.parse(line) as { event: string; taskId?: string });
+        const taskIds = new Set(events.flatMap((event) => event.taskId === undefined ? [] : [event.taskId]));
+        expect(taskIds.size, record).toBeGreaterThan(0);
+        for (const id of taskIds) {
+          expect(events.some((event) => event.event === "task-dispatch" && event.taskId === id), `${record} ${id} dispatched`).toBe(true);
+        }
+        for (const [columns, rows] of SIZES) {
+          const frame = await captureShellOutput({ cwd: replay.cwd, runId: replay.runId, view: "run", columns, rows });
+          expect(readFileSync(replayFramePath(record, columns, rows), "utf8"), `soak-${record}.${columns}x${rows}.txt`).toBe(`${frame}\n`);
+          const clauses = clausesAboveVerdict(await leafTail(replay.cwd, replay.runId, columns, rows), `${record} ${columns}x${rows}`);
+          expect(clauses).toContain("T1 · ");
+          expect(clauses).not.toContain(MISSING_EVIDENCE);
+        }
+        const committed = readFileSync(join(import.meta.dirname, "../fixtures/screen-soak/records", record, "last-frame.ansi"), "utf8");
+        expect(stripAnsi(committed)).toContain("| RUN |");
+        expect(stripAnsi(committed)).not.toContain("PROJECTION");
+      } finally {
+        replay.close();
+      }
+    }
+
+    // The demo: every task row's projection facts are visible in its opened detail, however the
+    // source spells their composition — a fact hidden from the frame fails, a spelling never does.
+    const { cockpit, data } = await loadFrame();
+    const taskRows = cockpit.deriveRunViewRows(data, "tasks");
+    expect(taskRows.length).toBeGreaterThan(0);
+    for (const row of taskRows) {
+      const frame = await renderComponent(createElement(cockpit.RunCockpitFrame, {
+        data,
+        columns: 140,
+        rows: 24,
+        interaction: { ...initialRunInteractionState(), activeView: "tasks", selection: row.id, opened: row.id },
+      }));
+      const lines = frame.split("\n");
+      const start = lines.findIndex((line) => line.includes("TASK DETAIL"));
+      const end = lines.findIndex((line, index) => index > start && line.includes("╚"));
+      expect(start, row.id).toBeGreaterThan(-1);
+      const visible = lines.slice(start + 2, end)
+        .map((line) => (line.split("║")[1] ?? "").trim().replace(/^↳ /u, ""))
+        .filter((line) => line !== "")
+        .join(" ");
+      expect(visible, row.id).toBe(row.text);
+      const taskRow = data.taskRows.find((task) => row.id === `task:${task.taskId}`)!;
+      for (const fact of cockpit.taskProjectionText(taskRow, data.journalRows).split(" · ")) {
+        expect(visible, `${row.id} shows ${fact}`).toContain(fact);
+      }
+    }
+  }, 60000);
 
   test("test: the version the header shows is resolved from the running binary rather than from the repository manifest, and is accompanied by the preflight indicator", async () => {
     const { frame } = await loadFrame("9.8.7");

@@ -11,9 +11,9 @@ import { batteryPriority, chainDepth, dispatchWaves, graphDefinitionHash, loadGr
 import { filesGlob } from "../../graph/files-glob.js";
 import { renderAcceptanceItem, type RunGraph, type Task, type TaskStatus } from "../../graph/schema.js";
 import { pendingDaemonApprovalActions, resolveRunMode } from "../../run/daemon.js";
-import { disallowedBy, excludedChannels, exclusionLine, routingEntrySeatLines } from "../../route/preference.js";
+import { disallowedBy, excludedChannels, exclusionLine, observedSeat, routingEntrySeatLines } from "../../route/preference.js";
 import { decayWeight, HALF_LIFE_RUNS, staffLedEvidence } from "../../route/profile.js";
-import { route, RoutingError } from "../../route/router.js";
+import { resolvedFloor, route, RoutingError } from "../../route/router.js";
 import { auditNamedTestOracles, listVitestTests, type VitestListResult } from "../../gates/acceptance.js";
 import { modelId, modelProvider, pickReviewer } from "../../gates/review.js";
 import { Journal, loadRoutingProfile, readProfileCursor, recordedGraphDefinitionHash, RUNS_WINDOW, type JournalEvent } from "../../run/journal.js";
@@ -252,7 +252,9 @@ export async function plan(
     ...(runLine ? [runLine] : []),
     "",
   ];
-  const judgeDeny = disallowedBy(cfg.judge, cfg.routing, "judge");
+  // OBS-1186: the judge seat is judged under doctor's cached identity for that exact channel — the
+  // runtime judge's rule; unknown stays conservative (alias-family deny).
+  const judgeDeny = disallowedBy(observedSeat(health, cfg.judge.adapter, cfg.judge.model), cfg.routing, "judge");
   if (judgeDeny?.by === "deny") {
     lines.push(
       `REFUSAL OBS-576: judge seat ${cfg.judge.adapter}:${cfg.judge.model} is removed by flat routing.deny (${judgeDeny.entry}) — move worker-only policy to routing.deny.workers`,
@@ -261,9 +263,11 @@ export async function plan(
   }
   const entrySeats = routingEntrySeatLines(cfg);
   if (entrySeats.length) lines.push(...entrySeats, "");
-  const derivation = (shape: string): string | null => {
-    const floor = cfg.routing.floors[shape];
-    return floor ? `    floor ${floor} ← ${mode.provenance[shape] ?? "config floors"}` : null;
+  // OBS-1185: the floor route() resolved for THIS task — a task hint over the configured/mode floor.
+  const derivation = (t: Task): string | null => {
+    const floor = resolvedFloor(t, cfg);
+    if (!floor) return null;
+    return `    floor ${floor.tier} ← ${floor.source === "task" ? "task hint" : mode.provenance[t.shape] ?? "config floors"}`;
   };
   const excluded = excludedChannels(cfg, adapters, health);
   if (excluded.length) lines.push(exclusionLine(excluded), "");
@@ -421,7 +425,7 @@ export async function plan(
         `    review: ${review.line}${review.cost ? ` ~$${review.cost.toFixed(2)}` : ""}`,
         chainLine(t),
       );
-      const d = derivation(t.shape);
+      const d = derivation(t);
       if (d) lines.push(d);
       if (r.deviation) {
         deviations++;
@@ -441,7 +445,7 @@ export async function plan(
       if (!(e instanceof RoutingError)) throw e;
       const msg = `${e.message}${exclusionReason(e.message)}`;
       lines.push(`  ${t.id.padEnd(6)} ${t.shape.padEnd(10)} !! ${msg}`, chainLine(t));
-      const d = derivation(t.shape);
+      const d = derivation(t);
       if (d) lines.push(d);
       lints.push(`${t.id}: unroutable — ${msg}`);
     }

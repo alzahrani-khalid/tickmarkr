@@ -975,6 +975,13 @@ acceptance is required on every task (a nested list of observable outcomes).
     - Enumerating one axis exhaustively is what hides the others. A spec that guards PARTIAL coverage
       site-by-site, member-by-member, can be defeated wholesale by CONDITIONAL coverage, which leaves
       every enumeration satisfied. After you enumerate, ask what a single flag would do to the whole set.
+    - A GOAL STATING AN INVARIANT OVER "every", "never" OR "any" CARRIES ITS CLOSED CASE TABLE AS A
+      CRITERION: the in-scope consumers, bridges, operations and event sequences it ranges over, each a
+      row a test exercises. An unenumerated invariant is repaired one edge per review round while every
+      round re-judges the accumulated diff (OBS-1019 add.2). The table binds author and reviewer, never a
+      worker's claim: each review material binds its declared class to the goal clause or criterion it
+      violates through input-to-consequence evidence marked executed, static or blocked. A worker's own
+      table alone never silences a real finding, and blocked evidence is never a pass.
     - EVERY CRITERION NAMES THE PAIR IT DISCRIMINATES: the correct case that MUST PASS, and the
       neighbouring plausible-wrong or false-clean case that MUST FAIL. Two easy examples that both pass are
       not discrimination — they are two ways of being green, and the wrong half is the whole point: it is

@@ -7,7 +7,7 @@ import { DEFAULT_DIFF_CAP } from "../config/config.js";
 import { type Effort, renderAcceptanceItem, type AcceptanceItem, type Task } from "../graph/schema.js";
 import { sh } from "../run/git.js";
 import { checkTaskDiffCaps, fetchTaskDiff, isProtectedEvidence, setAsideReceiptPath } from "./review.js";
-import { appendAnchoredReview, COMPLETION_FAKING_CHECKLIST, extractVerdictJson, generateVerdictNonce, type LlmVia, runLlm, verdictNonceLine } from "./llm.js";
+import { appendAnchoredReview, COMPLETION_FAKING_CHECKLIST, extractVerdictJson, generateVerdictNonce, type LlmVia, runLlm, SeatLaunchError, verdictNonceLine } from "./llm.js";
 import type { GateResult } from "./types.js";
 import { classifyVerdictCause } from "./verdict-cause.js";
 import { reviewableLogicDiff } from "./artifact-manifest.js";
@@ -396,6 +396,9 @@ function citesChangedLocation(evidence: string | EvidenceCitation, changed: Map<
   return changed.get(evidence.path)?.has(evidence.line) ?? false;
 }
 
+/** OBS-1151: one criterion of a parsed judge verdict, as the contradiction check compares it. */
+export interface JudgedCriterion { id: string; criterion: string; met: boolean; paths: string[] }
+
 export interface AcceptanceGateOpts {
   // the repo's test command (detectGateCommands); named-test oracles filter through it via -t.
   // Absent ⇒ a test oracle fails closed (cannot run a named test deterministically without a runner).
@@ -507,9 +510,17 @@ Each criteria[].evidence MUST be a structured citation {"path", "line"} whose "p
 The top-level comments array is optional. Use it only for actionable line-anchored feedback.
 `;
   // OBS-1182: an unset seat passes no effort argument at all — the CLI default, and the call shape callers pin.
-  const raw = await (judge.effort
-    ? runLlm(judge.adapter, judge.model, prompt, worktree, via, JUDGE_TIMEOUT_MS, judge.effort)
-    : runLlm(judge.adapter, judge.model, prompt, worktree, via, JUDGE_TIMEOUT_MS));
+  let raw: string;
+  try {
+    raw = await (judge.effort
+      ? runLlm(judge.adapter, judge.model, prompt, worktree, via, JUDGE_TIMEOUT_MS, judge.effort)
+      : runLlm(judge.adapter, judge.model, prompt, worktree, via, JUDGE_TIMEOUT_MS));
+  } catch (error) {
+    if (!(error instanceof SeatLaunchError)) throw error;
+    // OBS-1168(b): no seat, no verdict — run-gates re-routes the judge or parks infra; never a worker charge.
+    return { gate: "acceptance", pass: false, details: `${warn}${detBlock}judge dispatch failed — ${error.message} — failing closed`,
+      meta: { unparseable: true, cause: "seat-launch-failed", judge: channelKey({ adapter: judge.adapter.id, model: judge.model }) } };
+  }
   const extracted = extractVerdictJson<JudgeVerdict>(raw, nonce);
   if (!extracted) {
     const cause = classifyVerdictCause(raw, nonce, "pass");
@@ -540,5 +551,16 @@ The top-level comments array is optional. Use it only for actionable line-anchor
   if (!v.pass) lines.push("judge verdict pass=false");
   lines.push(...inconsistencies);
   const prose = warn + detBlock + (lines.join("\n") || "judge passed");
-  return { gate: "acceptance", pass, details: appendAnchoredReview(prose, extracted) };
+  // OBS-1151: each criterion's canonical text, ruling and the paths its evidence cites. A legacy quote
+  // cites no path, so its criterion has no comparable subject (missing evidence is unknown). An
+  // inconsistent verdict (a duplicate row ruling both ways, a missing id) carries NO judgment: it is not
+  // a comparable subject, and as an adjudicator it can confirm nothing — run-gates parks it infra.
+  const judgment: JudgedCriterion[] | undefined = inconsistencies.length ? undefined : v.criteria.flatMap((row) => {
+    const index = expectedIds.indexOf(row.criterion);
+    if (index < 0) return [];
+    return [{ id: row.criterion, criterion: renderAcceptanceItem(judgeItems[index]!), met: row.met,
+      paths: typeof row.evidence === "string" ? [] : [row.evidence.path] }];
+  });
+  return { gate: "acceptance", pass, details: appendAnchoredReview(prose, extracted),
+    meta: { judge: channelKey({ adapter: judge.adapter.id, model: judge.model }), ...(judgment ? { judgment } : {}) } };
 }

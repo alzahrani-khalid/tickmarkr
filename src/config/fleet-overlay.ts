@@ -1,6 +1,6 @@
 // Fleet-overlay mutation, serialization, and diff rendering for the `tickmarkr fleet` write path.
 import { isMap, isScalar, isSeq, parseDocument, stringify, visit } from "yaml";
-import { DENY_SCOPES, type DenyScope, type FleetEditable, type FleetUniverseRow, type MapEntry, type RoutingMode, type Tier, universeCovers, universeEntryMatches } from "./config.js";
+import { DENY_SCOPES, type DenyScope, type FleetEditable, type FleetUniverseRow, type LowerLayerModelOverrides, type MapEntry, type RoutingMode, type Tier, universeCovers, universeEntryMatches } from "./config.js";
 
 // OBS-1099 add.1: the writer ranges over the schema-derived scopes. The flat (all-seats) scopes
 // take part in the membership/allow-form write; every nested scope (routing.deny.workers.*) is a
@@ -26,7 +26,7 @@ function sortedUnique(xs: string[]): string[] {
   return [...new Set(xs)].sort();
 }
 
-export type FleetOverlayWrite = {
+type FleetOverlayWriteFields = {
   initial: FleetEditable;
   edited: FleetEditable;
   mode?: RoutingMode;
@@ -41,10 +41,18 @@ export type FleetOverlayWrite = {
   // exclusion sets write the minimal routing.allow membership form and tombstone the deny
   // adapters/models scopes; absent ⇒ the legacy deny-array write, byte-identical to before.
   universe?: FleetUniverseRow[];
+};
+
+// OBS-1188: only a write whose editables provably carry no efforts keeps the pre-effort contract.
+type EffortFree = FleetEditable & { efforts?: undefined };
+
+export type FleetOverlayWrite = FleetOverlayWriteFields & (
   // OBS-1182: tiers.<adapter>.modelOverrides as the layers BELOW the repo overlay (defaults +
   // global) resolve them, so clearing an effort masks an inherited one instead of revealing it.
-  lowerOverrides?: Record<string, Record<string, Record<string, unknown>>>;
-};
+  // OBS-1188: an effort write cannot be built without them — no blind guess stands in.
+  | { lowerOverrides: LowerLayerModelOverrides }
+  | { initial: EffortFree; edited: EffortFree; lowerOverrides?: undefined }
+);
 
 // The minimal routing.allow form for an exclusion-set membership write: whole adapter ids for
 // fully-in adapters, adapter:model keys for partially-in ones, nothing for fully-out ones.
@@ -404,34 +412,37 @@ export function renderFleetOverlayWrite(priorBytes: string, write: FleetOverlayW
     for (const model of new Set([...Object.keys(efforts(initial)[adapter] ?? {}), ...Object.keys(efforts(edited)[adapter] ?? {})])) {
       const after = efforts(edited)[adapter]?.[model];
       if (efforts(initial)[adapter]?.[model] === after) continue;
+      // OBS-1188: the type already demands lower state here; this refuses a cast/JS caller before the
+      // bytes are returned, so a blind effort write never reaches disk.
+      const lowerAll = write.lowerOverrides;
+      if (!lowerAll) {
+        throw new Error(`fleet write: the effort edit on ${adapter}:${model} needs the lower config layers' model overrides — refusing to write it blind`);
+      }
       const override = ["tiers", adapter, "modelOverrides", model];
       if (after !== undefined) {
         // Setting beneath a tombstone (the override, or modelOverrides above it) lifts it, and
         // deepMerge would restore what it masked: re-mask each lower-layer key it covered — sibling
-        // models, then this override's vendor/channel (unknown lower ⇒ both, blind).
+        // models, then this override's own keys.
         // ponytail: tiers.<adapter> itself tombstoned is unreachable here — its models, and so a tier, are masked too.
         const tombstoned = (depth: number) => {
           const node = doc.getIn(override.slice(0, depth), true);
           return node !== undefined && !isMap(node);
         };
-        const lowerModels = write.lowerOverrides?.[adapter] ?? {};
+        const lowerModels = lowerAll[adapter] ?? {};
         const remask: string[][] = [];
         if (tombstoned(3)) for (const other of Object.keys(lowerModels)) if (other !== model) remask.push([...override.slice(0, 3), other]);
         if (tombstoned(3) || tombstoned(4)) {
-          for (const key of write.lowerOverrides ? Object.keys(lowerModels[model] ?? {}) : ["vendor", "channel"]) {
-            if (key !== "effort") remask.push([...override, key]);
-          }
+          for (const key of Object.keys(lowerModels[model] ?? {})) if (key !== "effort") remask.push([...override, key]);
         }
         setScalarPreservingComment(doc, [...override, "effort"], after);
         for (const path of remask) setScalarPreservingComment(doc, path, null);
         continue;
       }
       // Clearing means no effort in the MERGED config: drop the repo key, then mask an effort the
-      // lower layers still declare (unknown lower ⇒ a repo that never held the key inherited it).
-      const held = doc.getIn([...override, "effort"]) !== undefined;
+      // lower layers still declare.
       deleteAt(doc, [...override, "effort"]);
-      const lower = write.lowerOverrides?.[adapter]?.[model];
-      const maskEffort = write.lowerOverrides ? lower?.effort !== undefined : !held;
+      const lower = lowerAll[adapter]?.[model];
+      const maskEffort = lower?.effort !== undefined;
       const repoNode = doc.getIn(override, true);
       const { effort: _masked, ...rest } = { ...lower, ...(isMap(repoNode) ? repoNode.toJSON() as object : {}) };
       if (Object.values(rest).some((v) => v !== null && v !== undefined)) {

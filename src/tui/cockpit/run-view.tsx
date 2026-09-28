@@ -246,8 +246,10 @@ export interface TaskProjection {
   readonly build: ProjectionField;
   readonly blocker: ProjectionField;
   readonly nextAction: ProjectionField;
-  /** OBS-1048: present only when the newest launched attempt has failed nudges, pages and no worker-result. OBS-1104: neverDispatched collapses that task's line. */
-  readonly stalled?: ProjectionField; readonly neverDispatched?: true;
+  /** OBS-1048: present only when the newest launched attempt has failed nudges, pages and no worker-result. */
+  readonly stalled?: ProjectionField;
+  /** OBS-1104: a task with no recorded dispatch collapses its line to one missing-evidence clause. */
+  readonly neverDispatched?: true;
 }
 
 export const STALL_MARKER = "⚠ stalled harvest suspected";
@@ -323,8 +325,11 @@ export function projectRunTasks(snapshot: OperatorSnapshot, rows: readonly RunEv
     const blocker: ProjectionField = { label: `blocker ${blk ? `${blk.kind}${blk.diagnostic ? ` · ${blk.diagnostic}` : ""}` : "none"}`, ...(blk && blockerRow ? { line: blockerRow.line } : {}) };
     const nextAction: ProjectionField = { label: `next ${blk?.nextAction ?? "none"}`, ...(blk?.nextAction && blockerRow ? { line: blockerRow.line } : {}) };
     // OBS-1048 harvest, chronological: the newest worker-launch opens the attempt; a later worker-result retires it.
-    let launched: number | undefined, launchedAttempt: number | undefined, returned = false;
-    const nudges: number[] = [], pages: number[] = [];
+    let launched: number | undefined;
+    let launchedAttempt: number | undefined;
+    let returned = false;
+    const nudges: number[] = [];
+    const pages: number[] = [];
     // Finding 1: only rows of the launched attempt count; a row without an attempt belongs to it (derive.ts attemptHarvests).
     const ofLaunched = (d: Record<string, unknown>) => launched !== undefined && (ordinal(d.attempt) ?? launchedAttempt) === launchedAttempt;
     for (const r of own) {
@@ -456,15 +461,20 @@ function undispatchedProjectionLine(p: TaskProjection): string {
 }
 
 /**
- * Rows the projection panel paints. A never-dispatched clause is shorter than the field line it
- * replaces; the shell's content counter is the panel's wrapped height, and the pinned run frames
- * record that counter. Blank rows keep the block as tall as the field lines were.
+ * Rows the projection panel paints: each task's clause at its own wrapped height (OBS-1193). A
+ * never-dispatched clause is shorter than the field line it replaces, so the block is shorter too;
+ * the shell's content counter reads that real height and the pinned run frames record it.
  */
-function projectionBlockRows(projections: readonly TaskProjection[], wrap: (text: string) => string[]): readonly { readonly key: string; readonly line: string; readonly strong: boolean }[] {
-  const shown = projections.flatMap((p) => wrap(projectionLine(p)).map((line, i) => ({ key: `${p.taskId}:${i}`, line, strong: p.stalled !== undefined && i === 0 })));
-  const prior = projections.flatMap((p) => wrap(recordedProjectionLine(p)));
-  const pad = Math.max(0, prior.length - shown.length);
-  return [...shown, ...Array.from({ length: pad }, (_, i) => ({ key: `projection-pad:${i}`, line: " ", strong: false }))];
+function projectionBlockRows(
+  projections: readonly TaskProjection[],
+  wrap: (text: string) => string[],
+): readonly { readonly key: string; readonly line: string; readonly strong: boolean }[] {
+  return projections.flatMap((p) =>
+    wrap(projectionLine(p)).map((line, i) => ({
+      key: `${p.taskId}:${i}`,
+      line,
+      strong: p.stalled !== undefined && i === 0,
+    })));
 }
 
 /** The Run body: the approved board (BD-1) over the fold, then the selected task's detail panels. */

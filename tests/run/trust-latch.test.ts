@@ -5,10 +5,13 @@ import {
   KIMI_TRUST_PANE, type InteractiveSeed, type TrustDialog, type WorkerAdapter,
 } from "../../src/adapters/types.js";
 import { DeliveryReadinessError } from "../../src/drivers/herdr.js";
+import { OrcaDriver, type OrcaExec } from "../../src/drivers/orca.js";
 import { SubprocessDriver } from "../../src/drivers/subprocess.js";
-import type { ExecutorDriver } from "../../src/drivers/types.js";
+import { formatOwnedName, type ExecutorDriver, type Slot } from "../../src/drivers/types.js";
 import { runDaemon } from "../../src/run/daemon.js";
+import { runInteractiveSeed, SeedReadinessError } from "../../src/run/interactive-seed.js";
 import { Journal } from "../../src/run/journal.js";
+import { cursorModalExec, FakeOrca } from "../helpers/fake-orca.js";
 import { setupRepo, T } from "../helpers/tmprepo.js";
 
 // v1.89 T19 / OBS-406. T1 owns WHICH declaration may be answered; this file owns WHEN and HOW OFTEN.
@@ -239,4 +242,155 @@ test("an adapter declaring no dialog receives no key at any point in the lifecyc
   expect(run.keyedSlots).toEqual([]);
   expect(Journal.open(run.repo, "run-trust-latch-none").read()
     .some((e) => e.event === "trust-auto-answer")).toBe(false);
+}, 60_000);
+
+// OBS-1205: the seed's trust poll through the PRODUCTION OrcaDriver, whose slots carry the rendered
+// screen read. Every Enter is counted on the fake runtime itself, so "one key" is the transport's own
+// record rather than a spy on the seed.
+const ORCA_WT = "/tmp/orca-trust-latch/T1";
+const ORCA_TITLE = formatOwnedName({ role: "worker", taskId: "T1", attempt: 0, runId: "run-orca-latch" });
+const ORCA_READY = "TUI ready";
+
+async function orcaSeed(
+  label: string,
+  wrap: (fake: FakeOrca, inner: OrcaExec) => OrcaExec,
+  paint?: (fake: FakeOrca) => void,
+  answers = false,
+) {
+  const fake = new FakeOrca({ trackedWorktrees: [ORCA_WT], echoSends: false });
+  // `answers: false`: the modal stays up after any Enter, so a second poll would find it again.
+  const modal = cursorModalExec(fake, { launch: "launch-tui", screen: KIMI_TRUST_PANE, ready: ORCA_READY, answers });
+  const driver = new OrcaDriver({ pollMs: 20, exec: wrap(fake, modal.exec) });
+  const slot = await driver.slot(ORCA_WT, ORCA_TITLE);
+  const answered: string[] = [];
+  const pending = runInteractiveSeed({
+    driver: {
+      run: async (s, cmd) => { await driver.run(s, cmd); paint?.(fake); },
+      waitOutput: driver.waitOutput.bind(driver), read: driver.read.bind(driver), sendKey: driver.sendKey.bind(driver),
+    },
+    slot, adapter: { trustDialog: KIMI_TRUST_DIALOG, interactiveSeed: SEED } as unknown as WorkerAdapter,
+    assignment: { adapter: "fake", model: "fake-1", channel: "sub", tier: "frontier" },
+    promptFile: "/tmp/orca-trust-latch/prompt.md", taskTimeoutMinutes: 0.03,
+    onTrustAnswered: () => { answered.push(label); },
+  });
+  const error = await pending.then(() => undefined, (e: unknown) => e);
+  return { fake, slot, error, answered, enters: modal.enters() };
+}
+
+test("runInteractiveSeed sends zero further keys after a dispatched-then-rejected Enter or an unreadable foreign screen versus polling the existing surface for drivers lacking screen support, so a second Enter fails", async () => {
+  // ARM A — the Enter reaches the terminal (the runtime records it) and THEN the transport refuses.
+  // The modal stays painted for the rest of the deadline, so every later poll would match it again.
+  const rejected = await orcaSeed("rejected", (fake, inner) => async (args, cwd, timeoutMs) => {
+    const r = await inner(args, cwd, timeoutMs);
+    if (args[1] !== "send" || args[args.indexOf("--text") + 1] !== "") return r;
+    return { code: 1, stderr: "", stdout: JSON.stringify({ ok: false, error: { code: "terminal_not_writable", message: "dispatched, then refused" }, _meta: { runtimeId: "rt-1" } }) };
+  });
+  expect(rejected.slot.readScreen).toBeTypeOf("function");
+  expect(rejected.enters).toBe(1); // the runtime's own count: one Enter, never a retry
+  expect(rejected.fake.sent.get(rejected.fake.last()!.handle)).toEqual([""]);
+  expect(rejected.answered).toEqual(["rejected"]); // the latch left before the ambiguous send resolved
+  expect(rejected.error).toBeInstanceOf(SeedReadinessError); // the deadline, not a second attempt
+  expect(rejected.fake.last()!.screenLines?.join("\n")).toContain(KIMI_TRUST_DIALOG.fingerprint);
+
+  // ARM B — the screen read answers for ANOTHER terminal, while this terminal's stream carries the
+  // cursor fingerprint. An unreadable frame is "nothing seen": no key, and no fallback to the stream.
+  const foreign = await orcaSeed("foreign", (_fake, inner) => async (args, cwd, timeoutMs) => {
+    const r = await inner(args, cwd, timeoutMs);
+    if (args[1] !== "read" || !args.includes("--screen") || r.code !== 0) return r;
+    const env = JSON.parse(r.stdout) as { result: { terminal: Record<string, unknown> } };
+    env.result.terminal.handle = "term_lookalike";
+    return { ...r, stdout: JSON.stringify(env) };
+  }, (fake) => { fake.last()!.lines.push(...KIMI_TRUST_PANE.split("\n")); });
+  expect(foreign.fake.last()!.lines.join("\n")).toContain(KIMI_TRUST_DIALOG.fingerprint);
+  expect(foreign.fake.calls.filter((c) => c[1] === "read" && c.includes("--screen")).length).toBeGreaterThan(1);
+  expect(foreign.enters).toBe(0);
+  expect(foreign.answered).toEqual([]);
+  expect(foreign.error).toBeInstanceOf(SeedReadinessError);
+
+  // ARM C — a driver with no rendered surface: its slot carries no screen read, so the poll stays on
+  // `read`, finds the modal there, and answers it exactly once.
+  const keys: string[] = [];
+  let reads = 0;
+  let pane = "";
+  const slot: Slot = { id: "p1", name: ORCA_TITLE, cwd: ORCA_WT };
+  const r = await runInteractiveSeed({
+    driver: {
+      run: async (_s, cmd) => { if (cmd.startsWith("launch-tui ")) pane = KIMI_TRUST_PANE; },
+      waitOutput: async (_s, pattern, ms) => {
+        if (pane.includes(pattern)) return true;
+        await new Promise((res) => setTimeout(res, Math.min(ms, 50)));
+        return pane.includes(pattern);
+      },
+      read: async () => { reads++; return pane; },
+      sendKey: async (_s, key) => { keys.push(key); pane = `banner\n${ORCA_READY}\n> `; },
+    },
+    slot, adapter: { trustDialog: KIMI_TRUST_DIALOG, interactiveSeed: SEED } as unknown as WorkerAdapter,
+    assignment: { adapter: "fake", model: "fake-1", channel: "sub", tier: "frontier" },
+    promptFile: "/tmp/orca-trust-latch/prompt.md", taskTimeoutMinutes: 0.03,
+  });
+  expect(slot.readScreen).toBeUndefined();
+  expect(reads).toBeGreaterThan(0);
+  expect(keys).toEqual([KIMI_TRUST_DIALOG.key]);
+  expect(r.trustAnswered).toBe(true);
+  expect(r.seedFailed).toBe(false);
+}, 60_000);
+
+// Review (material): every step of the trust poll is awaited, and the seed deadline can pass inside
+// any of them. Both arms use a modal that DOES take the Enter and paint readiness, so a key or a
+// readiness accepted after the deadline would launch the channel instead of failing it over.
+const ORCA_DEADLINE_MS = 0.03 * 60_000;
+const sleep = (ms: number) => new Promise((res) => setTimeout(res, ms));
+const isSeedLine = (text: string) => text === SEED.seedLine("/tmp/orca-trust-latch/prompt.md");
+
+test("a trust poll whose screen read or readiness sweep returns after the seed deadline sends no late key and submits no seed", async () => {
+  // ARM A — the screen read returns after the deadline, still showing the modal. The Enter it would
+  // license lands after the deadline, and the closing sweep would then read the readiness it painted.
+  const lateScreen = await orcaSeed("late-screen", (_fake, inner) => async (args, cwd, timeoutMs) => {
+    if (args[1] === "read" && args.includes("--screen")) await sleep(ORCA_DEADLINE_MS);
+    return inner(args, cwd, timeoutMs);
+  }, undefined, true);
+  expect(lateScreen.fake.calls.some((c) => c[1] === "read" && c.includes("--screen"))).toBe(true);
+  expect(lateScreen.enters).toBe(0);
+  expect(lateScreen.answered).toEqual([]);
+  expect(lateScreen.error).toBeInstanceOf(SeedReadinessError);
+  expect([...lateScreen.fake.sent.values()].flat().some(isSeedLine)).toBe(false);
+
+  // ARM B — the Enter lands in time and the modal paints readiness, but the sweep that reads it
+  // returns after the deadline: expired readiness, so no seed line follows it.
+  let entered = false;
+  const lateReady = await orcaSeed("late-ready", (_fake, inner) => async (args, cwd, timeoutMs) => {
+    if (args[1] === "send" && args.includes("--enter") && args[args.indexOf("--text") + 1] === "") entered = true;
+    else if (entered && args[1] === "read" && !args.includes("--screen")) await sleep(ORCA_DEADLINE_MS);
+    return inner(args, cwd, timeoutMs);
+  }, undefined, true);
+  expect(lateReady.enters).toBe(1);
+  expect(lateReady.answered).toEqual(["late-ready"]);
+  expect(lateReady.fake.last()!.lines).toContain(ORCA_READY); // readiness WAS painted — just too late
+  expect(lateReady.error).toBeInstanceOf(SeedReadinessError);
+  expect([...lateReady.fake.sent.values()].flat().some(isSeedLine)).toBe(false);
+}, 60_000);
+
+// Review round 2 (material): the no-dialog branch is one long wait, and OrcaDriver.waitOutput checks
+// its sweep before its clock — a sweep that returns after the deadline must still be expired readiness.
+test("a no-dialog seed whose readiness sweep returns after the deadline fails closed and submits no seed", async () => {
+  const fake = new FakeOrca({ trackedWorktrees: [ORCA_WT], echoSends: false });
+  let launched = false;
+  const exec: OrcaExec = async (args, cwd, timeoutMs) => {
+    if (launched && args[1] === "read" && !args.includes("--screen")) await sleep(ORCA_DEADLINE_MS);
+    return fake.exec(args, cwd, timeoutMs);
+  };
+  const driver = new OrcaDriver({ pollMs: 20, exec });
+  const slot = await driver.slot(ORCA_WT, ORCA_TITLE);
+  const error = await runInteractiveSeed({
+    driver: {
+      run: async (s, cmd) => { await driver.run(s, cmd); fake.last()!.lines.push(ORCA_READY); launched = true; },
+      waitOutput: driver.waitOutput.bind(driver), read: driver.read.bind(driver), sendKey: driver.sendKey.bind(driver),
+    },
+    slot, adapter: { interactiveSeed: SEED } as unknown as WorkerAdapter,
+    assignment: { adapter: "fake", model: "fake-1", channel: "sub", tier: "frontier" },
+    promptFile: "/tmp/orca-trust-latch/prompt.md", taskTimeoutMinutes: 0.03,
+  }).then(() => undefined, (e: unknown) => e);
+  expect(fake.last()!.lines).toContain(ORCA_READY); // readiness WAS painted — the sweep read it too late
+  expect(error).toBeInstanceOf(SeedReadinessError);
+  expect([...fake.sent.values()].flat().some(isSeedLine)).toBe(false);
 }, 60_000);

@@ -1,15 +1,21 @@
 import { execFileSync } from "node:child_process";
 import { mkdirSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { expect, test, vi } from "vitest";
+import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { shq } from "../../src/adapters/types.js";
 import { approve } from "../../src/cli/commands/approve.js";
 import { SubprocessDriver } from "../../src/drivers/subprocess.js";
 import { graphDefinitionHash, loadGraph, saveGraph, taskDefinitionFingerprint } from "../../src/graph/graph.js";
 import { runDaemon } from "../../src/run/daemon.js";
+import { resetHostLatencySampleForTests, setHostLatencySampleForTests } from "../../src/run/host-health.js";
 import * as stall from "../../src/run/stall.js";
 import { applyScopeAmendments, engagementReleased, Journal, recordedGraphDefinitionHash, replayScopeAmendments } from "../../src/run/journal.js";
-import { COMMIT, setupRepo, T } from "../helpers/tmprepo.js";
+import { COMMIT, makeTestTempDir, setupRepo, T } from "../helpers/tmprepo.js";
+
+// These daemons test scope amendment, not host admission: a pinned latency sample keeps a loaded
+// suite host from holding a worker start behind a degraded-host wait past the live polls below.
+beforeEach(() => { setHostLatencySampleForTests(async () => 20); });
+afterEach(() => { resetHostLatencySampleForTests(); });
 
 const criterion = "test: approving a scope-request park with files against a live daemon journals graph-rehash naming both hashes and the approval, the next dispatch row carries the amended files[] and a fresh session with no halt row while an unrelated running task keeps its attempt, a second approval of the same revision is refused, the same approval without files is refused naming the flag, a resume over a recompiled graph that equals the approved graph except for the amendment re-applies it and journals the rehash before dispatch, and a resume over a graph whose task goal, acceptance, deps or floor changed beyond the amendment is refused with the recorded identity unmoved and nothing dispatched, so an amendment that needs a halt, a resume override, or a recompile to survive, or a replay onto a changed definition, fails";
 
@@ -371,3 +377,53 @@ test("test: the approve command printed on a scope request park lists exactly th
   expect(notifications.join("\n")).not.toMatch(/--files[^\n]*ghost/);
   expect(events.some((e) => e.event === "scope-hint-unresolved" && (e.data.paths as string[]).includes("ghost/missing.txt"))).toBe(true);
 }, 60_000);
+
+// OBS-1072 add.2: a runner that colors its output (SGR) or hyperlinks its paths (OSC 8) must not hand
+// the worker terminal bytes, nor let a control-glued token become a scope hint. The journal row keeps
+// the raw bytes; only the human-facing excerpt — scope hints and the repair brief — is made readable.
+test("test: production scope extraction delivers the real test path in readable worker text after SGR OSC control removal versus preserving a plain excerpt byte-for-byte, so ESC or an escape-derived path reaching the brief fails", async () => {
+  const path = "tests/needed.test.ts";
+  const ESC = "\x1b";
+  for (const mode of ["controls", "plain"] as const) {
+    const dir = makeTestTempDir("tickmarkr-ansi-");
+    const out = join(dir, "red.txt");
+    writeFileSync(out, mode === "controls"
+      ? ` FAIL  ${ESC}[31m${path}${ESC}[39m > reads one\n`
+        + `AssertionError: expected ${ESC}]8;;file:///repo/${path}${ESC}\\${path}${ESC}]8;;${ESC}\\ to be green${ESC}[0m\n`
+      : ` FAIL  ${path} > reads one\nAssertionError: expected ${path} to be green\n`);
+    const { repo, fake } = setupRepo([T("T1", { files: ["owned.txt"], gates: ["build", "test", "lint", "evidence", "scope", "acceptance"] })], {
+      consult: { action: "human", notes: "operator decides" },
+      tasks: { T1: [{ shell: `echo one > owned.txt && ${COMMIT} owned`, result: { ok: true, summary: "owned" } },
+        { shell: "true", result: { ok: true, summary: "nothing" } }] },
+    }, `gates: { build: "true", lint: "true", test: "[ ! -f owned.txt ] || { cat ${out}; exit 1; }" }\n`);
+    mkdirSync(join(repo, "tests"), { recursive: true });
+    writeFileSync(join(repo, path), "// the detection site\n");
+    execFileSync("git", ["add", path], { cwd: repo });
+    execFileSync("git", ["commit", "--no-gpg-sign", "-q", "-m", "detection site"], { cwd: repo });
+    const id = `run-ansi-${mode}`;
+    await runDaemon(repo, { adapters: [fake], runId: id, approvalWindowMs: 0 });
+    const journal = Journal.open(repo, id);
+    const events = journal.read().filter((e) => e.taskId === "T1");
+    const red = events.find((e) => e.event === "gate-result" && e.data.gate === "test" && e.data.pass === false)!;
+    const details = String(red.data.details);
+    const findings = String(events.find((e) => e.event === "repair-attempt")!.data.findings);
+    const prompt = readFileSync(join(journal.dir, "prompts", "T1-a1.md"), "utf8");
+    // no control-glued token was ever offered as a scope hint
+    const candidates = events.filter((e) => e.event === "scope-hint-unresolved").flatMap((e) => e.data.paths as string[]);
+    expect(candidates.filter((c) => c.includes(ESC) || /\[\d+m|\]8;;|\x07/.test(c)), mode).toEqual([]);
+    if (mode === "controls") {
+      // raw evidence keeps its bytes; the worker reads the real path, readable, with no ESC anywhere
+      expect(details).toContain(ESC);
+      for (const text of [findings, prompt]) {
+        expect(text).not.toContain(ESC);
+        expect(text).not.toMatch(/\[3\dm|\]8;;/);
+        expect(text).toContain(`FAIL  ${path} > reads one`);
+      }
+    } else {
+      expect(details).not.toContain(ESC);
+      expect(findings).toContain(`test: ${details}`);
+      expect(prompt).toContain(`test: ${details}`);
+    }
+  }
+}, 120_000);
+

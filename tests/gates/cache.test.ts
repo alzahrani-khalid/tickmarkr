@@ -637,7 +637,7 @@ gates:
       result: { ok: true, summary: "", deviations: [], raw: "" },
       commands, baseline, channels: [], adapters: [adapter], cfg,
     });
-    // b) merge-candidate full suite reuses the run's verdict
+    // b) the full suite reuses the run's verdict — OBS-635: before any screen is bought
     const selectScreen = await runGates(task, {
       worktree: taskWorktree, baseRef,
       author: { adapter: "fake", model: "fake-1", channel: "sub", tier: "frontier" },
@@ -647,7 +647,8 @@ gates:
     });
     const fullGate = selectScreen.results.find((r) => r.gate === "test")!;
     expect(fullGate.pass).toBe(true);
-    expect(fullGate.meta?.fullSuite).toBe(true);
+    expect(fullGate.meta?.selectedTests).toBeUndefined();
+    expect(fullGate.meta?.selectionDecision).toMatchObject({ scope: "full", reason: "full-green-cache" });
     expect(fullGate.details).toMatch(/reused/i);
 
     // c) Standalone must first execute, then reuse only its own greens.
@@ -755,24 +756,29 @@ gates:
     const taskRows = events.filter(e => e.taskId === "T1");
     const lintRows = taskRows.filter(e => e.event === "gate-result" && e.data.gate === "lint");
     const buildRows = taskRows.filter(e => e.event === "gate-result" && e.data.gate === "build");
-    expect(lintRows.map(e => e.data.attempt)).toEqual([0, 1]);
-    expect(lintRows.map(e => e.data.pass)).toEqual([false, false]);
-    expect(lintRows[1]!.data.details).toBe(lintRows[0]!.data.details);
+    const attempts = lintRows.map(e => e.data.attempt as number);
+    expect(attempts.length).toBeGreaterThan(2);
+    expect(attempts).toEqual(attempts.map((_, i) => i));
+    expect(lintRows.every(e => e.data.pass === false && e.data.details === lintRows[0]!.data.details)).toBe(true);
     expect(lintRows[0]!.data.reused).not.toBe(true);
+    expect(lintRows.slice(1).every(e => e.data.reused === true)).toBe(true);
     expect(lintRows[1]!.data).toMatchObject({ reused: true, evidenceReceipt: lintRows[0]!.data.evidenceReceipt });
     const reuseRows = taskRows.filter(e => e.event === "gate-reused-verdict");
-    expect(reuseRows).toHaveLength(1);
-    expect(reuseRows[0]!.data).toMatchObject({ gate: "lint", pass: false });
+    expect(reuseRows.length).toBeGreaterThan(1);
+    expect(reuseRows.every(e => e.data.gate === "lint" && e.data.pass === false)).toBe(true);
     expect(String(reuseRows[0]!.data.details)).toContain("reused verdict (identity: gate=lint");
-    expect(buildRows.map(e => e.data.attempt)).toEqual([0, 1]);
+    expect(buildRows.map(e => e.data.attempt)).toEqual(attempts);
     expect(buildRows.every(e => e.data.pass === true && e.data.reused !== true)).toBe(true);
     expect(buildRows[1]!.data.evidenceReceipt).not.toEqual(buildRows[0]!.data.evidenceReceipt);
     const invocations = readFileSync(calls, "utf8").trim().split("\n")
       .filter(line => line.includes(`tickmarkr-${runId}--T1`));
-    expect(invocations.filter(line => line.startsWith("build:"))).toHaveLength(2);
+    expect(invocations.filter(line => line.startsWith("build:")))
+      .toHaveLength(buildRows.filter(e => typeof e.data.replayedFromAttempt !== "number").length);
     expect(invocations.filter(line => line.startsWith("lint:"))).toHaveLength(1);
-    expect(taskRows.filter(e => e.event === "gate-fingerprint-cap" && e.data.gate === "lint")).toHaveLength(1);
-    expect(taskRows.filter(e => e.event === "escalation").map(e => e.data.attempt)).toEqual([1, 2]);
+    // OBS-1106: every red after the first is a COPY of one execution — one occurrence, so no copy
+    // buys the fingerprint cap; each retry is still charged exactly once on the ladder
+    expect(taskRows.filter(e => e.event === "gate-fingerprint-cap")).toEqual([]);
+    expect(taskRows.filter(e => e.event === "escalation").map(e => e.data.attempt)).toEqual(attempts.map((a) => a + 1));
   });
 });
 

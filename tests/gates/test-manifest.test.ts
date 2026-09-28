@@ -7,7 +7,7 @@ import { expect, test } from "vitest";
 import { DEFAULT_CONFIG } from "../../src/config/config.js";
 import { captureBaseline, compareToBaseline, type Baseline, type BaselineCommand } from "../../src/gates/baseline.js";
 import { runGates, testCommandForFiles } from "../../src/gates/run-gates.js";
-import { discoverTestManifest, fileHangBudgetMs, isVitestTestCommand, readTestReport, singleForkRetryCommand, verifyManifestReport } from "../../src/gates/test-manifest.js";
+import { discoverTestManifest, fileHangBudgetMs, isVitestTestCommand, readTestReport, resetHangClocksForTests, setHangClocksForTests, singleForkRetryCommand, verifyManifestReport } from "../../src/gates/test-manifest.js";
 import { TEST_REPORTER_SOURCE } from "../../src/gates/test-reporter.js";
 import { preserveWorktree, shGitOk, VERIFICATION_PROTOCOL } from "../../src/run/git.js";
 import { SubprocessDriver } from "../../src/drivers/subprocess.js";
@@ -1032,3 +1032,96 @@ test("held", async () => {
   expect(alive(completed.held!)).toBe(false);
   expect(alive(-completed.run.pid!)).toBe(false);
 }, 150_000);
+
+/** OBS-953: a stand-in runner that starts tests/a.test.ts, marks it started, and either completes the
+ * suite after 1.5 s ("finish") or never completes it ("stall"). The gate's clocks jump once the mark exists. */
+function clockFault(f: Fixture, mode: "finish" | "stall") {
+  const started = join(f.repo, `${mode}-${randomBytes(4).toString("hex")}.started.receipt`);
+  mkdirSync(join(f.repo, "node_modules/.bin"), { recursive: true });
+  writeFileSync(join(f.repo, "node_modules/.bin/vitest"), `#!/usr/bin/env node
+const fs = require('fs'), path = require('path');
+const args = process.argv.slice(2), files = ['tests/a.test.ts', 'tests/b.test.ts'];
+if (args[0] === 'list') { console.log(JSON.stringify(files.map(file => ({ file: path.resolve(file), name: file })))); process.exit(0); }
+const now = Date.now(), out = process.env.TICKMARKR_TEST_REPORT;
+const report = { nonce: process.env.TICKMARKR_TEST_NONCE, requested: files, started: { [files[0]]: now }, completed: {} };
+fs.writeFileSync(out, JSON.stringify(report));
+fs.writeFileSync(${JSON.stringify(started)}, '');
+if (${JSON.stringify(mode)} === 'stall') setInterval(() => {}, 1000);
+else setTimeout(() => {
+  const at = Date.now();
+  report.started = Object.fromEntries(files.map(f => [f, now]));
+  report.completed = Object.fromEntries(files.map(f => [f, { at, status: 'passed' }]));
+  report.certificate = { at, exitCode: 0 };
+  fs.writeFileSync(out, JSON.stringify(report));
+  process.exit(0);
+}, 1500);
+`, { mode: 0o755 });
+  return started;
+}
+
+test("test: production task/tip gates classify a 156-second wall-only jump as interruption versus thirty-one active seconds as hang against a thirty-second budget, recording equal-clock overdue gaps as unknown without subtracting them", async () => {
+  const { Journal } = await import("../../src/run/journal.js");
+  const { verifyIntegrationTipCached } = await import("../../src/run/daemon.js");
+  const { performance } = await import("node:perf_hooks");
+  // tests/a.test.ts measured 10 s at baseline: its budget is 3 × 10 s = 30 s under a 120 s battery ceiling.
+  const timing: Partial<BaselineCommand> = { fileDurations: [{ file: "tests/a.test.ts", durationMs: 10_000 }], ceilingMs: 120_000 };
+  expect(fileHangBudgetMs("tests/a.test.ts", timing.fileDurations, timing.ceilingMs)).toBe(30_000);
+  const jumpOnce = (started: string, wallMs: number, monoMs: number) => setHangClocksForTests({
+    wall: () => Date.now() + (existsSync(started) ? wallMs : 0),
+    mono: () => performance.now() + (existsSync(started) ? monoMs : 0),
+  });
+  const cmd = "vitest run --globals";
+  try {
+    for (const surface of ["task", "tip"] as const) {
+      const outcome = async (f: Fixture) => {
+        if (surface === "task") {
+          const row = await round(f, cmd, timing);
+          return { pass: row.pass, details: row.details, meta: row.meta ?? {}, journal: [] as Array<{ event: string; data: Record<string, unknown> }> };
+        }
+        const journal = Journal.create(f.repo, `run-clock-${randomBytes(4).toString("hex")}`);
+        journal.append("run-start", undefined, { commands: { test: cmd } });
+        const failed = await verifyIntegrationTipCached(f.repo, { test: cmd }, journal, { baseline: baseline(cmd, timing) });
+        const rows = journal.read();
+        const tip = rows.find(r => r.event === (failed ? "tip-verify-failed" : "tip-verify"))!;
+        return { pass: !failed, details: String(tip.data.details), meta: {}, journal: rows };
+      };
+
+      // Wall advances 156 s while the monotonic clock does not: a detected suspend, subtracted.
+      const suspended = fixture(false);
+      jumpOnce(clockFault(suspended, "finish"), 156_000, 0);
+      const interrupted = await outcome(suspended);
+      expect(interrupted.pass, interrupted.details).toBe(true);
+      expect(interrupted.details).toMatch(/host interruptions: host-suspend 15\d{4}ms wall \/ \d+ms monotonic, 15\d{4}ms subtracted/);
+      if (surface === "task") {
+        const [gap] = interrupted.meta.interruptions as Array<Record<string, number | string>>;
+        expect(gap).toMatchObject({ kind: "host-suspend" });
+        expect(gap!.subtractedMs as number).toBeGreaterThanOrEqual(156_000 - 1_000);
+        expect(gap!.wallMs as number).toBeGreaterThanOrEqual(156_000);
+      } else {
+        const rows = interrupted.journal.filter(r => r.event === "host-suspend");
+        expect(rows).toHaveLength(1);
+        expect(rows[0]!.data.subtractedMs as number).toBeGreaterThanOrEqual(156_000 - 1_000);
+      }
+
+      // Both clocks advance 31 s together in one overdue poll: recorded unknown, subtracted nothing,
+      // so 31 active seconds against the 30 s budget is a hang.
+      const active = fixture(false);
+      jumpOnce(clockFault(active, "stall"), 31_000, 31_000);
+      const hung = await outcome(active);
+      expect(hung.pass).toBe(false);
+      expect(hung.details).toMatch(/infra hang: "tests\/a\.test\.ts" started and did not complete within its 30000ms budget \(3\d{4}ms active of 3\d{4}ms wall\)/);
+      expect(hung.details).toMatch(/host interruptions: unknown 3\d{4}ms wall \/ 3\d{4}ms monotonic, 0ms subtracted/);
+      expect(hung.details).not.toContain("host-suspend");
+      if (surface === "task") {
+        expect(hung.meta).toMatchObject({ classification: "infra", kind: "hang", file: "tests/a.test.ts", hangBudgetMs: 30_000 });
+        expect(hung.meta.activeMs as number).toBeGreaterThanOrEqual(31_000);
+        expect(hung.meta.activeMs).toBe(hung.meta.wallMs);
+        expect(hung.meta.interruptions).toEqual([expect.objectContaining({ kind: "unknown", subtractedMs: 0 })]);
+      } else {
+        expect(hung.journal.filter(r => r.event === "host-poll-overdue").map(r => r.data.subtractedMs)).toEqual([0]);
+        expect(hung.journal.some(r => r.event === "host-suspend")).toBe(false);
+      }
+      resetHangClocksForTests();
+    }
+  } finally { resetHangClocksForTests(); }
+}, 90_000);

@@ -2,6 +2,41 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v2.6.3 — the run spends its time on the work
+
+**v2.6.3** cuts repeated verification and repair laps without weakening a gate. Trusted repair selection and pooled suites reduce duplicate test screens. Infrastructure-shaped reds are adjudicated before a worker is charged. Semantic disagreement is resolved without an unfounded charge. Recovery finds finished work, and test capacity is accounted through leases and active time. Run `run-20260927-122129-0000000000000171`: 15/15 merged over two laps, green at run-end (done 15; failed, human, blocked and pending empty; tip build/test/lint fresh on e9f444a5, 385 test files).
+
+- **T1 — qualified sync-heavy suites run pooled (OBS-634).**
+- **T2 — the walkthrough cites stable symbols (OBS-1192).**
+- **T3 — the Orca trust modal is read through the production driver (OBS-1205).**
+- **T4 — trusted repair selection is on by default, and duplicate screens are skipped (OBS-635, OBS-1199).** A qualified green of the complete suite on the exact identity is reused before a screen is bought. A screen priced at 75 % or more of the full suite runs the full suite instead.
+- **T5 — infrastructure-shaped reds are adjudicated before a repair is charged (OBS-1106, OBS-1072).**
+- **T6 — repair briefs cover the declared class, and current findings render once (OBS-1019, OBS-1195).**
+- **T7 — semantic delivery and judge disagreement resolve without an unfounded worker charge (OBS-1168, OBS-1196, OBS-1151).**
+- **T8 — runtime routing stays inside its pool and its observed identity (OBS-1185, OBS-1186, OBS-1187).**
+- **T9 — finished work is recovered through bound rechecks and owned-pane adoption (OBS-1202, OBS-1203, OBS-1204).**
+- **T10 — test capacity is accounted through leases and active time (OBS-953, OBS-1190, OBS-880, OBS-1071).**
+  - Per-file hang budgets count active time. A detected wall-clock jump is subtracted, and an ambiguous gap is recorded but not subtracted.
+  - Host observations are journaled on a change of state.
+  - Every runner in this repository shares one suite lease.
+- **T11 — evidence redaction and quota expiry are explicit (OBS-1139, OBS-1140).** Overlapping redaction spans are resolved by precedence: token, then assignment, then secret environment value, then benign `$HOME`/`$TMPDIR`. A secret whose value equals or overlaps `$HOME` is withheld whole.
+- **T12 — Fleet effort edits use the current lower-layer state (OBS-1188).**
+- **T13 — reports show disjoint wall accounting and measured suite telemetry (OBS-1201, OBS-634).**
+- **T14 — the Run projection's height follows its content (OBS-1193, OBS-1197).**
+- **T15 — recovery fixtures are deterministic (OBS-1189, OBS-1200).**
+- **Close fixes (overseer, each verified by `tickmarkr verify`).**
+  - The review rubric again counts a regression the diff introduces as material on its own (T6 had narrowed it).
+  - The daemon excludes a reviewer only on a malformed verdict. It no longer excludes one whose valid finding happens to contain the word "unparseable".
+  - The TESTING.md section T10 could not land in-run is added.
+  - A fresh judgment is compared with the newest prior ruling on identical code, so a FAIL that reverses an earlier PASS on the same code is confirmed by a second judge before it charges a repair. The adjudicating judge gets its own pane name, distinct from the judge-retry pane.
+  - The repository's test lease kills every paused test process on cancellation, even when a later process listing fails.
+  - Evidence redaction treats nested or identical `$HOME`/`$TMPDIR` values as one benign location, instead of withholding them as a secret.
+  - The CI log classifier behind `grade-ci.sh` and the public CI wrapper counts only Vitest's own timeout message, not a test that prints a timeout fingerprint, so a clean suite is no longer graded red.
+
+**Measured, and not met.** T1's pooling did not shorten the suite's serial tail. It stayed at about 225 s (target about 60 s), and the stranded single-fork retry still fired on 11 of 25 post-T1 full suites (2.6.2: 5 of 12). The tail moved into the retry rather than disappearing.
+
+**Known and queued for v2.6.4.** The default codex model catalog still seeds a retired model (`gpt-5.6-sol`). Model choices will come from each machine's init/doctor/fleet probes.
+
 ## v2.6.2 — the run keeps honest books
 
 **v2.6.2** makes the run's accounts match what happened: failed infrastructure is not billed as worker repair, an approval acts only on the park it was written for, forgiven failures name their baseline, and effort, routing and review context are carried to the invocation that uses them. Run `run-20260925-234935-0000000000000149`: 23/23 merged over five laps, green at run-end (done 23; failed, human, blocked and pending empty; tip build, test and lint fresh on 2e38361d, 380 test files). Every review ran against another vendor than the task's authors. For T6, T8 and T9, whose commits carried both Anthropic and OpenAI authors, no such reviewer existed, so each got an out-of-band third-vendor review before its review gate was waived.

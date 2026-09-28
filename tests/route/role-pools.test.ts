@@ -8,13 +8,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import { FakeAdapter } from "../../src/adapters/fake.js";
-import { allAdapters, discoverChannels, rolePools } from "../../src/adapters/registry.js";
+import { allAdapters, discoverChannels, rolePools, writeDoctor } from "../../src/adapters/registry.js";
+import { plan } from "../../src/cli/commands/plan.js";
 import { type Assignment, type AuthHealth, type BillingChannel, channelKey, channelsFromConfig, shq, type WorkerAdapter } from "../../src/adapters/types.js";
 import { DEFAULT_CONFIG, loadConfig, type TickmarkrConfig } from "../../src/config/config.js";
 import { SubprocessDriver } from "../../src/drivers/subprocess.js";
 import { captureBaseline } from "../../src/gates/baseline.js";
 import { pickReviewer, reviewGate } from "../../src/gates/review.js";
 import { runGates } from "../../src/gates/run-gates.js";
+import { saveGraph, tickmarkrDir } from "../../src/graph/graph.js";
 import { validateGraph } from "../../src/graph/schema.js";
 import { pickRole } from "../../src/route/role-pick.js";
 import { consult, type Dossier } from "../../src/run/consult.js";
@@ -325,3 +327,101 @@ test("test: the strict role picker refuses absent role-level prefer versus produ
   expect(beta.calls).toEqual([]);
   expect(omega.calls).toEqual(["om-1", "om-1"]);
 });
+
+// OBS-1186: every runtime seat judges its deny under the exact identity doctor cached for that channel.
+test("test: production judge consult dispatches plus plan accept observed claude-opus-5-5 for opus under a claude-opus-5 deny versus refusing denied or unknown identity across primary retry preferred fallback seats, so one identity-blind outcome fails", async () => {
+  const probedAt = "2026-09-27T00:00:00.000Z";
+  const JUDGED_PASS = { pass: true, criteria: [{ criterion: "c1", met: true, reason: "r" }] };
+  // "observed" = doctor cached opus → claude-opus-5-5; "unknown" = no identity cached (conservative alias-family deny);
+  // "denied" = observed, but the deny names the observed id itself.
+  const cases = [
+    { name: "observed", identity: "claude-opus-5-5", deny: "claude-opus-5", admitted: true },
+    { name: "unknown", identity: undefined, deny: "claude-opus-5", admitted: false },
+    { name: "denied", identity: "claude-opus-5-5", deny: "claude-opus-5-5", admitted: false },
+  ] as const;
+  const authOf = (models: string[], identity?: string) => Object.fromEntries(models.map((m) =>
+    [m, { authed: true, probedAt, ...(m === "opus" && identity ? { identity } : {}) }]));
+
+  for (const c of cases) {
+    // ── primary judge: the configured seat fake:opus ──
+    {
+      const { repo, base } = repoWithCommit();
+      const judge = countingFake([JUDGED_PASS]);
+      const ctx = await judgeCtx(repo, base, judge, "opus", [`fake:${c.deny}`]);
+      const health: Record<string, AuthHealth> = { fake: { installed: true, authed: true, modelAuth: authOf(["opus"], c.identity) } };
+      const acc = (await runGates(mkTask(), { ...ctx, health })).results.find((r) => r.gate === "acceptance")!;
+      expect(acc.pass, `${c.name}: ${acc.details}`).toBe(c.admitted);
+      expect(judge.calls, c.name).toEqual(c.admitted ? ["opus"] : []);
+      if (!c.admitted) expect(acc.details, c.name).toContain(`routing.deny (fake:${c.deny})`);
+    }
+    // ── retry judge: fake:fake-2 flakes; the failover seat comes from the production judge pool ──
+    {
+      const { repo, base } = repoWithCommit();
+      const judge = countingFake(["not a verdict at all", JUDGED_PASS]);
+      const pool: BillingChannel[] = [
+        { adapter: "fake", vendor: "fake-b", model: "fake-2", channel: "api", tier: "frontier" },
+        { adapter: "fake", vendor: "anthropic", model: "opus", channel: "sub", tier: "frontier" },
+      ];
+      judge.channels = () => pool;
+      const health: Record<string, AuthHealth> = { fake: { installed: true, authed: true, modelAuth: authOf(["fake-2", "opus"], c.identity) } };
+      const ctx = await judgeCtx(repo, base, judge, "fake-2", [`fake:${c.deny}`]);
+      const judgeChannels = discoverChannels(ctx.cfg, [judge], health, "judge");
+      const acc = (await runGates(mkTask(), { ...ctx, judgeChannels, health })).results.find((r) => r.gate === "acceptance")!;
+      expect((acc.meta!.judgeRetry as { retried: string }).retried, c.name).toBe(c.admitted ? "fake:opus" : "fake:fake-2");
+      expect(judge.calls, c.name).toEqual(["fake-2", c.admitted ? "opus" : "fake-2"]);
+    }
+    // ── preferred consult: alpha:opus ranks first; the production discovery pool carries its identity ──
+    {
+      const { cfg, health, adapters, alpha, omega } = preferredFleet();
+      cfg.tiers.alpha = { vendor: "a-vendor", channel: "sub", models: { opus: "frontier" } };
+      cfg.consult.prefer = ["alpha:opus"];
+      cfg.routing.deny = { models: [`alpha:${c.deny}`] };
+      health.alpha = { installed: true, authed: true, models: ["opus"], modelAuth: authOf(["opus"], c.identity) };
+      const v = await consult(dossier, cfg, adapters, new SubprocessDriver(), "/tmp", runDir(), {
+        channels: discoverChannels(cfg, adapters, health, "consult"), health,
+      });
+      expect(`${v.adapter}:${v.model}`, c.name).toBe(c.admitted ? "alpha:opus" : "omega:om-1");
+      expect(alpha.calls, c.name).toEqual(c.admitted ? ["opus"] : []);
+      expect(omega.calls, c.name).toEqual(c.admitted ? [] : ["om-1"]);
+      // the seat's own runtime rule, not discovery alone: the same channel offered without its identity is refused
+      const blind = await consult(dossier, cfg, adapters, new SubprocessDriver(), "/tmp", runDir(), {
+        channels: discoverChannels(cfg, adapters, health, "consult").map(({ identity: _, ...rest }) => rest), health,
+      });
+      expect(`${blind.adapter}:${blind.model}`, c.name).toBe("omega:om-1");
+    }
+    // ── pinned (fallback) consult: omega:opus, no live prefer seat ──
+    {
+      const { cfg, health, adapters, omega } = preferredFleet();
+      cfg.consult = { ...cfg.consult, adapter: "omega", model: "opus", prefer: ["alpha:missing"] };
+      cfg.routing.deny = { models: [`omega:${c.deny}`] };
+      health.omega = { installed: true, authed: true, models: ["opus"], modelAuth: authOf(["opus"], c.identity) };
+      const v = await consult(dossier, cfg, adapters, new SubprocessDriver(), "/tmp", runDir(), { channels: [], health });
+      if (c.admitted) {
+        expect(v, c.name).toMatchObject({ adapter: "omega", model: "opus", notes: "pin" });
+        expect(omega.calls, c.name).toEqual(["opus"]);
+      } else {
+        expect(v, c.name).toMatchObject({ action: "human", notes: expect.stringContaining(`routing.deny (omega:${c.deny})`) });
+        expect(omega.calls, c.name).toEqual([]);
+      }
+    }
+    // ── plan renders the judge refusal by the same identity rule, from doctor's cache (no probe) ──
+    {
+      const repo = makeRepo({ "keep.txt": "x\n" });
+      saveGraph(repo, validateGraph({
+        version: 1, spec: { source: "prd", paths: ["p"], hash: "h" },
+        tasks: [{ id: "T1", title: "t", goal: "g", shape: "chore", complexity: 2, acceptance: ["a"] }],
+      }));
+      const doctorHealth = Object.fromEntries(adapters.map((a) => [a.id, {
+        installed: true, authed: true,
+        modelAuth: { ...authedModels(a.channels(DEFAULT_CONFIG).map((ch) => ch.model)), ...(a.id === "claude-code" ? authOf(["opus"], c.identity) : {}) },
+      }]));
+      writeDoctor(repo, doctorHealth);
+      writeFileSync(join(tickmarkrDir(repo), "config.yaml"),
+        `judge: { adapter: claude-code, model: opus }\nrouting: { deny: { models: ["claude-code:${c.deny}"] } }\n`);
+      const out = await plan([], repo, adapters);
+      const refusal = out.split("\n").find((l) => l.startsWith("REFUSAL OBS-576: judge seat claude-code:opus"));
+      if (c.admitted) expect(refusal, c.name).toBeUndefined();
+      else expect(refusal, c.name).toContain(`(claude-code:${c.deny})`);
+    }
+  }
+}, 120_000);

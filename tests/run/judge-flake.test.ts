@@ -5,12 +5,18 @@
 // This test reproduces the shape in-suite through the REAL runDaemon (zero tokens, FakeAdapter):
 // a garbage-then-good judge script. ON UNFIXED HEAD: two task-dispatches + an escalation event;
 // AFTER THE FIX: one dispatch, zero escalations, task-done — the judge was retried, the worker never billed.
-import { readFileSync } from "node:fs";
+import { execSync } from "node:child_process";
+import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
+import { FakeAdapter } from "../../src/adapters/fake.js";
+import { shq, type BillingChannel } from "../../src/adapters/types.js";
+import { graphDefinitionHash, loadGraph, tickmarkrDir } from "../../src/graph/graph.js";
+import { judgmentSubjectKey } from "../../src/gates/run-gates.js";
+import { gitHead } from "../../src/run/git.js";
 import { Journal } from "../../src/run/journal.js";
 import { runDaemon } from "../../src/run/daemon.js";
-import { COMMIT, setupRepo, T } from "../helpers/tmprepo.js";
+import { authedModels, COMMIT, setupRepo, T } from "../helpers/tmprepo.js";
 
 describe("GATE-09 judge-flake attribution (daemon level, fake adapter, zero tokens)", () => {
   test("garbage-then-good judge: one dispatch, zero escalations, task-done (SC-1)", async () => {
@@ -191,5 +197,98 @@ describe("GATE-09 judge-flake attribution (daemon level, fake adapter, zero toke
       expect.objectContaining({ taskId: "T1", channel: "fake:fake-1", outcome: "failed" }),
       expect.objectContaining({ taskId: "T1", channel: "fake:fake-2", outcome: "done" }),
     ]);
+  });
+}, 120000);
+
+// T7 (OBS-1151 add.1): the contradiction key is PER CRITERION over the files its verdict cites, plus the
+// canonical criterion, the task's declared bounds and the operator context — never the whole task diff.
+// A resume over a journaled earlier judgment keeps comparing on those keys.
+describe("per-criterion cited-file judgment keys across resume (production daemon, zero tokens)", () => {
+  class Judge extends FakeAdapter {
+    calls = 0;
+    constructor(path: string, public override id: string, private met: boolean[], private tier: BillingChannel["tier"] = "frontier") {
+      super(path);
+      this.vendor = id;
+    }
+    override async probe() {
+      return { installed: true, authed: true, version: "fake", models: [this.id], modelAuth: authedModels([this.id]) };
+    }
+    override channels(): BillingChannel[] {
+      return [{ adapter: this.id, model: this.id, vendor: this.vendor, channel: "api", tier: this.tier }];
+    }
+    override headlessCommand(file: string): string {
+      const prompt = readFileSync(file, "utf8");
+      const nonce = /VERDICT_NONCE:\s*([0-9a-f]+)/i.exec(prompt)?.[1] ?? "";
+      if (prompt.startsWith("TICKMARKR-REVIEW")) {
+        const carried = [...prompt.matchAll(/^Fingerprint: (.+)$/gm)].map((m) => m[1]!);
+        return `printf '%s' ${shq(JSON.stringify({ nonce, approve: true, resolved: carried, reraised: [], findings: [] }))}`;
+      }
+      if (!prompt.startsWith("TICKMARKR-JUDGE")) return "true";
+      const met = this.met[Math.min(this.calls++, this.met.length - 1)]!;
+      return `printf '%s' ${shq(JSON.stringify({ nonce, pass: met, criteria: [{ criterion: "c1", met, reason: "a.txt", evidence: { path: "a.txt", line: 1 } }] }))}`;
+    }
+  }
+  class CheapAuthor extends FakeAdapter {
+    override channels(): BillingChannel[] { return [{ ...super.channels()[0]!, tier: "cheap" }]; }
+  }
+  const write = (files: Record<string, string>, msg: string) => ({
+    shell: `${Object.entries(files).map(([p, c]) => `printf '%s\\n' ${shq(c)} > ${p}`).join(" && ")} && ${COMMIT} ${msg}`,
+    result: { ok: true, summary: msg },
+  });
+
+  // Seeds an earlier PASS of c1 over a.txt = "A", b.txt = "old" (its key built from `prior`), then resumes:
+  // the worker writes `wrote`, the primary judge now FAILs c1 citing a.txt, and the distinct judge would
+  // side with the earlier PASS — so a detected contradiction parks, and an undetected one is simply fresh.
+  async function resumeOver(runId: string, wrote: Record<string, string>, prior: { criterion?: string; files?: string[]; operatorContext?: string } = {}) {
+    const { repo, scriptPath } = setupRepo([T("T1")], { tasks: { T1: [write(wrote, "w0"), write({ "a.txt": "A-fixed" }, "w1")] }, consult: { action: "retry", notes: "fix it" } });
+    writeFileSync(join(tickmarkrDir(repo), "config.yaml"), [
+      "concurrency: 1", "routing:", "  escalateTier: \"off\"", "  floors: { implement: cheap }",
+      "judge: { adapter: judge-a, model: judge-a }", "consult: { adapter: fake, model: fake-1 }",
+      "review: { required: true, prefer: [seat-r], timeoutMs: 5000 }", "",
+    ].join("\n"));
+    const env = { ...process.env, GIT_INDEX_FILE: join(repo, ".git", "prior-index") };
+    const git = (args: string, input?: string) => execSync(`git ${args}`, { cwd: repo, encoding: "utf8", env, input }).trim();
+    git("read-tree HEAD");
+    for (const [path, content] of Object.entries({ "a.txt": "A", "b.txt": "old" })) {
+      git(`update-index --add --cacheinfo 100644,${git("hash-object -w --stdin", `${content}\n`)},${path}`);
+    }
+    const commit = git(`commit-tree ${git("write-tree")} -p HEAD -m prior`);
+    git(`update-ref refs/tickmarkr/test-prior ${commit}`);
+    const task = loadGraph(repo).tasks[0]!;
+    const key = judgmentSubjectKey({ ...task, ...(prior.files ? { files: prior.files } : {}) }, prior.criterion ?? "done", prior.operatorContext);
+    const journal = Journal.create(repo, runId);
+    journal.append("run-start", undefined, { baseRef: await gitHead(repo), commands: {}, graphDefinitionHash: graphDefinitionHash(loadGraph(repo)) });
+    journal.append("gate-result", "T1", { gate: "acceptance", pass: true, details: "✓ c1: a.txt",
+      judgment: { commit, judge: "judge-z:judge-z", criteria: [{ id: "c1", key, met: true, paths: ["a.txt"] }] } });
+    writeFileSync(join(journal.dir, "baseline.json"), JSON.stringify({ commands: {} }));
+    const second = new Judge(scriptPath, "judge-b", [true]);
+    const summary = await runDaemon(repo, { runId, resume: true, adapters: [
+      new CheapAuthor(scriptPath), new Judge(scriptPath, "judge-a", [false, true]), second, new Judge(scriptPath, "seat-r", [true], "mid"),
+    ] });
+    const rows = Journal.open(repo, runId).read().filter((row) => row.taskId === "T1");
+    return { summary, second, disagreements: rows.filter((row) => row.event === "judge-disagreement"), dispatches: rows.filter((row) => row.event === "task-dispatch") };
+  }
+
+  test("production judging compares identical cited-file keys across resume despite changes to unrelated task files but treats changed cited blobs criteria bounds or operator context as fresh, so a whole-diff key hiding a contradiction fails", async () => {
+    // Only b.txt changed: the whole diff differs, the cited a.txt does not — the reversal is caught.
+    const same = await resumeOver("run-key-same", { "a.txt": "A", "b.txt": "new" });
+    expect(same.disagreements).toHaveLength(1);
+    expect(same.disagreements[0]!.data).toMatchObject({ disputed: [expect.objectContaining({ id: "c1", paths: ["a.txt"] })] });
+    expect(same.second.calls).toBe(1);
+    expect(same.summary.human).toEqual(["T1"]);
+    expect(same.dispatches).toHaveLength(1);
+    // A changed cited blob, criterion, declared bounds or operator context is a new subject: judged fresh.
+    for (const [runId, wrote, prior] of [
+      ["run-key-blob", { "a.txt": "A2", "b.txt": "old" }, {}],
+      ["run-key-criterion", { "a.txt": "A", "b.txt": "new" }, { criterion: "done, as first worded" }],
+      ["run-key-bounds", { "a.txt": "A", "b.txt": "new" }, { files: ["elsewhere/**"] }],
+      ["run-key-context", { "a.txt": "A", "b.txt": "new" }, { operatorContext: "- an earlier ruling" }],
+    ] as const) {
+      const fresh = await resumeOver(runId, wrote, prior);
+      expect(fresh.disagreements, runId).toEqual([]);
+      expect(fresh.second.calls, runId).toBe(0);
+      expect(fresh.summary.done, runId).toEqual(["T1"]);
+      expect(fresh.dispatches, runId).toHaveLength(2);
+    }
   });
 }, 120000);

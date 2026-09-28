@@ -1,5 +1,5 @@
 import { HOST_PROBE_SAMPLE_MS, HOST_PROBE_SAMPLES, HostDegradedError, hostDegraded, observeHost, type HostObservation } from "./host-health.js";
-import { VITEST_CACHE_ENV, worktreeVitestCache } from "../gates/test-manifest.js";
+import { runWithInterruptionSink, VITEST_CACHE_ENV, worktreeVitestCache, type HostInterruption } from "../gates/test-manifest.js";
 import { COMMAND_LEASE_TOKEN_ENV, commandLeaseEnvironment, CommandLeases, currentCommandLeaseToken, isRunnerCommand, runWithCommandLease, withCommandLease } from "./lease.js";
 import { execFileSync, spawn } from "node:child_process";
 import { createHash, type Hash, randomBytes } from "node:crypto";
@@ -23,8 +23,8 @@ import { DeliveryReadinessError } from "../drivers/herdr.js";
 import { driverEvidence, type DriverChoice } from "../drivers/index.js";
 import { herdrSealShellPrefix, MAX_BUF, SubprocessDriver } from "../drivers/subprocess.js";
 import { formatOwnedName, type ExecutorDriver, type Slot } from "../drivers/types.js";
-import { type Baseline, type BaselineProvenance, captureBaseline, detectGateCommands, detectVacuousOracles } from "../gates/baseline.js";
-import { runGates, type GateContext, type GateEvent } from "../gates/run-gates.js";
+import { type Baseline, type BaselineProvenance, captureBaseline, detectGateCommands, detectVacuousOracles, type GateEvidenceOptions } from "../gates/baseline.js";
+import { reobserveTestFiles, runGates, type GateContext, type GateEvent } from "../gates/run-gates.js";
 import { isInfraResult } from "../gates/cache.js";
 import type { GateResult } from "../gates/types.js";
 import { filesGlob } from "../graph/files-glob.js";
@@ -33,17 +33,17 @@ import { GATE_NAMES, type GateName, type RunGraph, type Task } from "../graph/sc
 import { distFingerprint } from "../cli/commands/version.js";
 import { augmentRetryBrief, consult, renderRetryGuidance, type ConsultInvocation, type ConsultVerdict } from "./consult.js";
 import { executionSignal, remainingExecutionMs, withExecutionBudget, withoutExecutionBudget, ExecutionBudgetExceeded } from "./execution-budget.js";
-import { repairSelectionDecision } from "./repair-selection.js";
+import { repairSelectionDecision, repairSelectionEnabled } from "./repair-selection.js";
 import { failureDisposition, reserveInfrastructureRetry } from "./recovery.js";
 import { runEnvironment } from "./environment.js";
 import { changeRepresented, cleanupRunWorktrees, deriveForkCap, FORK_CAP_ENV, gitHead, linkNodeModules, npmDependencyInstallCommand, npmDependencyManifestChanged, PRESERVE_COMMIT_SUBJECT, PRESERVE_PRODUCER_TRAILER, preserveWorktree, type PreserveProducer, producerFields, resolvedCapacity, runWithForkBudget, runWithVerificationBudget, type RunCapacity, sameCapacity, sameVerification, sh, shGit, SUITE_PARENT_ENV, verificationProtocol, WORKTREE_LAYOUT_CONTRACT, worktreePath } from "./git.js";
 import { runInteractiveSeed, type InteractiveSeedResult } from "./interactive-seed.js";
 import { classifyRepairDisposition, resolveScopeHints } from "./repair-disposition.js";
-import { applyScopeAmendments, activeRetryBan, interruptedAttempt, RESUME_HARVEST_SOURCE, resumeHarvestAuthor, approvalAction, APPROVAL_REFUSED, bindingToken, effectiveEvents, foldDecisions, physicalLine, staleApprovals, classifyTaskFailure, classifyWorkerResultCause, deferredReviewFindings, engagementComparable, formatPriorFindingEvidence, GATE_FINGERPRINT_CAP, GATE_SATISFIED_RELEASE, identicalGateFailures, isDeferredFinding, journaledFailureBrief, Journal, loadRoutingProfile, newRunId, normalizeGateFailure, outstandingConsultGuidance, outstandingReviewFindings, pendingApprovalActions, pendingRechecks, pendingRepairFindings, phaseForGate, readPriorRunEvidence, recordedTaskFailureKind, RECHECK_RELEASE, renderStructuredReviewFinding, repairReachSinceApproval, repairsSinceApproval, reviewRoundsSinceApproval, runHasEnded, standingRulings, structuredFindings, upheldFeedbackByTask, type CurrentAttemptGateReplay, type JournalEvent, type ParkKind, type ResumeState, type RetryMode, type StructuredFinding } from "./journal.js";
-import { gateReviewerFloor, isDiffCapPark, pickReviewer } from "../gates/review.js";
+import { applyScopeAmendments, activeRetryBan, interruptedAttempt, RESUME_HARVEST_SOURCE, resumeHarvestAuthor, approvalAction, APPROVAL_REFUSED, bindingToken, effectiveEvents, foldDecisions, physicalLine, staleApprovals, classifyTaskFailure, classifyWorkerResultCause, deferredReviewFindings, engagementComparable, formatPriorFindingEvidence, GATE_FINGERPRINT_CAP, GATE_SATISFIED_RELEASE, identicalGateFailures, isDeferredFinding, journaledFailureBrief, Journal, loadRoutingProfile, newRunId, normalizeGateFailure, outstandingConsultGuidance, readableExcerpt, receiptOrigin, outstandingReviewFindings, pendingApprovalActions, pendingRechecks, pendingRepairFindings, phaseForGate, priorJudgments, readPriorRunEvidence, recordedTaskFailureKind, reraisedReviewChains, RECHECK_RELEASE, renderStructuredReviewFinding, repairReachSinceApproval, repairsSinceApproval, reviewRoundsSinceApproval, runHasEnded, standingRulings, structuredFindings, upheldFeedbackByTask, type CurrentAttemptGateReplay, type JournalEvent, type ParkKind, type ResumeState, type RetryMode, type StructuredFinding } from "./journal.js";
+import { gateReviewerFloor, isDiffCapPark, isGarbageReview, pickReviewer } from "../gates/review.js";
 import { acquireApprovalSerialization, acquireRunLock, isPidLive, releaseRunLock } from "./lock.js";
 import { ensureIntegration, integrationBranch, integrationHead, mergeTask, reusedTipEvidence, verifyIntegrationTip } from "./merge.js";
-import { climbChannel, marginalCostRank, nextChannel, route } from "../route/router.js";
+import { climbChannel, inTaskPool, marginalCostRank, nextChannel, poolExhaustion, route, taskPool } from "../route/router.js";
 import { desiredPanes } from "./reconcile.js";
 import { readTierLiveness, readWatchBoard, supervisionPresencePath } from "./supervision.js";
 import {
@@ -485,6 +485,34 @@ function classifyInfraResult(g: GateResult): void {
   g.meta = { ...g.meta, classification: "infra", infra: true };
 }
 
+// OBS-1106 residual: a red whose assertion is a timeout or a wall-clock budget, and the runner-level
+// diagnostics (never-started files, a worker RPC timeout) that make such a red infrastructure-SHAPED.
+// Shape alone never parks anything: it only buys one isolated re-observation before a charge. A
+// fresh-fingerprint section masks digits to `#`, so both spellings of a number are read.
+const TIMEOUT_SHAPED_RE = /\b(?:Test|Hook) timed out in (?:\d+|#)\s*ms\b|\bexpected (?:\d+|#)(?:\.(?:\d+|#))? to be (?:less than|below)(?: or equal to)? (?:\d+|#)/i;
+const RUNNER_INFRA_DIAGNOSTIC_RE = /\bnever-started (?:[1-9]\d*|#)(?![\d#])|\[vitest-worker\]: Timeout calling\b/;
+const timeoutShaped = (details: string) => TIMEOUT_SHAPED_RE.test(readableExcerpt(details));
+const ATTRIBUTED_FILE_RE = /^\s*(?:FAIL|×|✗)\s+(?:\|[^|\n]*\|\s+)?(\S+\.(?:test|spec)\.[cm]?[jt]sx?)\b/gm;
+/** The failing files a red attributes to itself: the runner's own list, else its FAIL headlines. */
+const attributedFailingFiles = (g: GateResult): string[] => [...new Set(
+  Array.isArray(g.meta?.failingFiles) && g.meta.failingFiles.length
+    ? g.meta.failingFiles.filter((f): f is string => typeof f === "string")
+    : [...readableExcerpt(g.details).matchAll(ATTRIBUTED_FILE_RE)].map((m) => m[1]!.replace(/^\.\//, "")),
+)].sort();
+const metaFiles = (v: unknown): string[] | undefined => Array.isArray(v) ? v.filter((f): f is string => typeof f === "string") : undefined;
+/** D-607: the files a rerun OBSERVABLY ran — the runner's manifest, the only complete selection
+ * evidence. Never the requested selection, and never the per-file lines a runner printed: a runner that
+ * ignores file arguments and reports only its failures looks isolated while it ran the whole suite.
+ * Undefined without a manifest, and the rerun is then ambiguous. */
+const observedSelection = (g: GateResult): string[] | undefined => {
+  const ran = metaFiles(g.meta?.manifest);
+  return ran?.length ? [...new Set(ran)].sort() : undefined;
+};
+/** D-607: on the manifest path only the reporter's own attribution counts — a `FAIL path` line inside
+ * captured stdout is text, not attribution. Headline lexing is for runners without a reporter. */
+const rerunFailingFiles = (g: GateResult): string[] =>
+  metaFiles(g.meta?.manifest) ? [...new Set(metaFiles(g.meta?.failingFiles) ?? [])].sort() : attributedFailingFiles(g);
+
 // v1.85 T3: the gates whose failure IS a deterministic measurement — a machine re-ran a command over a
 // tree and printed the same bytes. Those are the failures the fingerprint cap governs (the ruling names
 // it a "deterministic-gate" cap): a third identical answer to a question already answered twice is the
@@ -572,19 +600,38 @@ function repairDiffFilesCut(diff: Buffer, cap: number, names: readonly string[])
 function repairFindingsBrief(results: GateResult[]): string {
   return results.filter(gateFailed).map((g) => {
     const evidence = g.meta?.failureEvidence;
-    return `${g.gate}: ${g.details}` + (Array.isArray(evidence) && evidence.length
+    return `${g.gate}: ${readableExcerpt(g.details)}` + (Array.isArray(evidence) && evidence.length
       ? `\nAssertion evidence:\n${JSON.stringify(evidence, null, 2)}` : "");
   }).join("\n\n");
 }
 
-/** The fix-only contract: the findings verbatim, then the diff content of the work already landed. */
-function repairBrief(findings: string, diff: string, baseRef: string): string {
+// OBS-1019 add.2: the order a repeated review chain earns in place of the smallest-edit order.
+const REPAIR_CLASS_SENTENCE = "Before editing a chain reraised more than once, enumerate the in-scope consumers,"
+  + " bridges, operations and event sequences as a closed case table; repair every implicated member and verify"
+  + " the accumulated diff against that table.";
+
+/**
+ * The fix-only contract: the findings verbatim, then the diff content of the work already landed.
+ * OBS-1019 add.2: a first finding stays bounded to the smallest edit. A chain a review has re-raised
+ * more than once was chased edge by edge while every round re-judged the accumulated diff, so it owes
+ * the whole class instead: a closed case table inside the declared bounds, never beyond them.
+ */
+function repairBrief(findings: string, diff: string, baseRef: string, repeated: ReadonlyArray<{ finding: StructuredFinding; reraises: number }> = []): string {
   const repair = { findings, diff };
   return [
-    "## Repair attempt — fix ONLY what these findings name",
+    repeated.length ? "## Repair attempt — repair the whole class these findings name" : "## Repair attempt — fix ONLY what these findings name",
     "The commits from your prior attempt are already in this worktree and their diff is reproduced"
-    + " below. Do NOT re-implement that work, do not start over, and do not revert it: make the"
-    + " smallest change that resolves every finding, then commit.",
+    + " below. Do NOT re-implement that work, do not start over, and do not revert it: "
+    + (repeated.length ? "resolve every member of the case table below, then commit." : "make the smallest change that resolves every finding, then commit."),
+    ...(repeated.length ? [
+      "",
+      "### Repeated review chains — repair the class, not the next edge",
+      // Fingerprint and count only: the finding's prose is already quoted once, below or under its heading.
+      ...repeated.map(({ finding, reraises }) => `- \`${finding.fingerprint}\` re-raised ${reraises} times`),
+      REPAIR_CLASS_SENTENCE,
+      "The table stays inside the task's declared write scope (files[]) and never narrows its goal or an"
+      + " acceptance criterion; the reviewer judges the accumulated diff, not the table.",
+    ] : []),
     "",
     "### Failing gate findings (verbatim)",
     repair.findings,
@@ -1032,7 +1079,7 @@ export function formatTipProof(p: TipProof): string {
 // The child uses the same verifier and capacity; only the daemon writes lifecycle verdict rows.
 async function cancellableTipBattery(
   intWt: string, commands: Record<string, string>, runDir: string,
-  baseline: Baseline | undefined, signal: AbortSignal,
+  baseline: Baseline | undefined, signal: AbortSignal, evidence: GateEvidenceOptions = {},
 ): Promise<Awaited<ReturnType<typeof verifyIntegrationTip>>> {
   signal.throwIfAborted();
   const extension = import.meta.url.endsWith(".ts") ? "ts" : "js";
@@ -1082,9 +1129,9 @@ async function cancellableTipBattery(
       finally { process.send({ type: 'lease-release', id }); }
     };
     let input = ''; for await (const chunk of process.stdin) input += chunk;
-    const { intWt, commands, runDir, baseline, capacity } = JSON.parse(input);
+    const { intWt, commands, runDir, baseline, capacity, evidence } = JSON.parse(input);
     try {
-      const result = await runWithVerificationBudget(capacity, () => runWithCommandLease(lease, () => verifyIntegrationTip(intWt, commands, runDir, baseline)));
+      const result = await runWithVerificationBudget(capacity, () => runWithCommandLease(lease, () => verifyIntegrationTip(intWt, commands, runDir, baseline, evidence)));
       if (!cancelled) process.stdout.write(JSON.stringify(result.map(row => ({ ...row, capacity: [...commandCapacities].reverse().find(([command]) => command === row.cmd || command.startsWith(row.cmd + " "))?.[1] ?? capacity }))));
     } catch (error) { if (!cancelled) throw error; }
     finally { process.disconnect(); }
@@ -1126,7 +1173,7 @@ async function cancellableTipBattery(
   });
   signal.addEventListener("abort", cancel, { once: true });
   child.stdin!.on("error", () => { /* exit/abort is reported by finished */ });
-  child.stdin!.end(JSON.stringify({ intWt, commands, runDir, baseline, capacity: resolvedCapacity() }));
+  child.stdin!.end(JSON.stringify({ intWt, commands, runDir, baseline, capacity: resolvedCapacity(), evidence }));
   try {
     if (signal.aborted) cancel();
     await finished;
@@ -1152,7 +1199,7 @@ export async function verifyIntegrationTipCached(
   intWt: string,
   commands: Record<string, string>,
   journal: Journal,
-  opts: { lastMergedTask?: string; baseline?: Baseline; signal?: AbortSignal } = {},
+  opts: { lastMergedTask?: string; baseline?: Baseline; signal?: AbortSignal; evidence?: GateEvidenceOptions } = {},
 ): Promise<boolean> {
   opts.signal?.throwIfAborted();
   const cmdHash = commandsHash(commands);
@@ -1190,9 +1237,9 @@ export async function verifyIntegrationTipCached(
     return false;
   }
   let tipFailed = false;
-  for (const r of await (opts.signal
-    ? cancellableTipBattery(intWt, commands, journal.dir, opts.baseline, opts.signal)
-    : verifyIntegrationTip(intWt, commands, journal.dir, opts.baseline))) {
+  for (const r of await runWithInterruptionSink(journalInterruption(journal, undefined), () => opts.signal
+    ? cancellableTipBattery(intWt, commands, journal.dir, opts.baseline, opts.signal, opts.evidence)
+    : verifyIntegrationTip(intWt, commands, journal.dir, opts.baseline, opts.evidence))) {
     const measuredCapacity = (r as typeof r & { capacity?: RunCapacity }).capacity ?? capacity;
     const evidence = r.reused ? reusedTipEvidence(r) : {
       ...(r.originRunRoot ? { originRunRoot: r.originRunRoot } : {}),
@@ -1225,6 +1272,13 @@ export async function verifyIntegrationTipCached(
   }
   return tipFailed;
 }
+
+/** OBS-953: a detected wall-over-monotonic discontinuity journals `host-suspend` (its offset was
+ * subtracted from active test time); an overdue poll whose clocks advanced together journals
+ * `host-poll-overdue` (recorded, never subtracted). */
+const journalInterruption = (journal: Journal, taskId: string | undefined) => (interruption: HostInterruption): void => {
+  journal.append(interruption.kind === "host-suspend" ? "host-suspend" : "host-poll-overdue", taskId, { ...interruption });
+};
 
 async function commitsAheadOfRef(base: string, head: string, cwd: string): Promise<string[]> {
   if (head === base) return [];
@@ -2055,6 +2109,9 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
   // > repo > global > default. The resolved cfg carries mode-compiled floors; route() never sees the mode.
   const rm = resolveRunMode(repoRoot, { flag: opts.mode, spec: graph.mode, globalDir: opts.globalDir });
   const cfg = rm.cfg;
+  // OBS-1199: the effective repair-selection default is resolved apart from the optional execution
+  // budget, so an absent policy selects on every driver; a resume keeps what the run recorded.
+  let repairSelection = repairSelectionEnabled(cfg);
   if (opts.resume) {
     const start = Journal.open(repoRoot, runId).read().find((e) => e.event === "run-start");
     const snapshot = start?.data.effectivePolicy;
@@ -2066,6 +2123,11 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     // Historical runs did not opt in; current settings cannot grant them a new allowance.
     cfg.executionPolicy = recorded?.config?.executionPolicy === undefined
       ? undefined : ExecutionPolicySchema.parse(recorded.config.executionPolicy);
+    const recordedGates = (recorded?.config as { gates?: { repairSelection?: unknown } } | undefined)?.gates;
+    if (recordedGates?.repairSelection !== undefined && typeof recordedGates.repairSelection !== "boolean") {
+      throw new Error("cannot restore malformed recorded repair selection");
+    }
+    repairSelection = repairSelectionEnabled({ executionPolicy: cfg.executionPolicy, gates: recordedGates });
   }
   if (cfg.executionPolicy && driver.id !== "subprocess") {
     throw new Error("experimental executionPolicy currently requires the subprocess driver");
@@ -2484,6 +2546,18 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     void promise.finally(() => hostChecks.delete(promise)).catch(() => {});
     return promise;
   };
+  // OBS-1190: every admission poll still probes (the probe gates admission), but the journal keeps only
+  // the first observation and each change of state or reference — healthy, degraded, unreadable,
+  // recovered — the way suite-wait already dedupes by count. A steady wait no longer floods the journal.
+  let journaledHost: string | undefined;
+  const journalObservation = (taskId: string | undefined, observation: HostObservation, resuming: boolean) => {
+    const state = observation.medianMs === null ? "unreadable"
+      : hostReferenceMs !== undefined && hostDegraded(observation, hostReferenceMs) ? "degraded" : "healthy";
+    const key = `${state}:${hostReferenceMs ?? ""}`;
+    if (key === journaledHost) return;
+    journaledHost = key;
+    journal.append("host-observation", taskId, { ...observation, referenceMs: hostReferenceMs ?? null, resuming, state });
+  };
   const recordReference = (observation: HostObservation) => {
     if (observation.medianMs === null) return;
     journal.append("host-reference", undefined, { ...observation });
@@ -2507,7 +2581,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       const probeBudget = HOST_PROBE_SAMPLE_MS * HOST_PROBE_SAMPLES;
       if (!observation || (!first && remaining >= probeBudget)) {
         observation = await observeHost(signal, remaining > 0 ? Math.min(probeBudget, remaining) : undefined);
-        journal.append("host-observation", taskId, { ...observation, referenceMs: hostReferenceMs ?? null, resuming });
+        journalObservation(taskId, observation, resuming);
       }
       first = false;
       if (hostReferenceMs === undefined && observation.medianMs !== null) recordReference(observation);
@@ -2547,7 +2621,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
   const initializeHost = () => trackHost((async () => {
     const signal = hostSignal();
     const observation = await observeHost(signal);
-    journal.append("host-observation", undefined, { ...observation, referenceMs: hostReferenceMs ?? null, resuming: !!opts.resume });
+    journalObservation(undefined, observation, !!opts.resume);
     if (hostReferenceMs === undefined) recordReference(observation);
     if (opts.resume || observation.medianMs === null) await admitHost(undefined, signal, observation, !!opts.resume);
   })());
@@ -2585,14 +2659,14 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         waited = true;
         journal.append("suite-wait", taskId, { count, ...(gate ? { gate } : {}) });
       }, SUITE_POLL_MS, signal);
-    }, async () => {
+    }, () => runWithInterruptionSink(journalInterruption(journal, taskId), async () => {
       try {
         const result = await run();
         // Some command oracles turn launch errors into results. Admission failure still parks infra.
         if (hostFailure) throw hostFailure;
         return result;
       } finally { if (taskId) activeGatePhases.delete(taskId); }
-    });
+    }));
   };
 
   let baseRef: string;
@@ -2797,20 +2871,33 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
   // owns listing/parsing/closing. Cosmetic by contract: failures are swallowed and subprocess has no
   // reconcile (optional chain → no-op), so gates and the oracle suite never feel this. keepPanes
   // "forever" is the keep-everything debug override — it disables the sweep entirely.
-  const resuming = !!opts.resume;
+  // OBS-1109: an interrupted attempt's pane is evidence — its nonce-bound trailer decides whether
+  // the attempt is harvested, declined as foreign, or recovered — so the fold's run-resume clear
+  // must not reach it before harvestInterruptedAttempt has read it and reaped its processes. Only a
+  // resumed daemon can hold such an attempt: a fresh run's sweep is the baseline sweep.
+  // OBS-1204: the set is FROZEN here, once, from the rows up to this daemon's own run-resume row: an
+  // attempt launched after it is this daemon's own and reconciles exactly as in a fresh run. Each
+  // frozen spare lapses for good once its harvest, decline or a superseding dispatch is journaled.
+  const resumeInterrupted = new Map<string, { attempt: number; nonce: string }>();
+  if (opts.resume) {
+    const rows = journal.read();
+    let resumedAt = rows.length - 1;
+    while (resumedAt >= 0 && rows[resumedAt]!.event !== "run-resume") resumedAt--;
+    const prior = rows.slice(0, resumedAt + 1);
+    for (const t of graph.tasks) {
+      const owned = interruptedAttempt(prior, t.id);
+      if (owned?.launch) resumeInterrupted.set(t.id, { attempt: owned.attempt, nonce: owned.launch.nonce });
+    }
+  }
   const reconcile = async (sweep?: { spareLiveLlm?: boolean }) => {
     if (keepForever) return;
     try {
       const rows = journal.read();
       const desired = desiredPanes(rows, runId);
-      // OBS-1109: an interrupted attempt's pane is evidence — its nonce-bound trailer decides whether
-      // the attempt is harvested, declined as foreign, or recovered — so the fold's run-resume clear
-      // must not reach it before harvestInterruptedAttempt has read it and reaped its processes. Once
-      // that harvest (or a superseding dispatch) is journaled the fold no longer names it: swept then.
-      // Only a resumed daemon can hold such an attempt: a fresh run's sweep is the baseline sweep.
-      if (resuming) for (const t of graph.tasks) {
-        const owned = interruptedAttempt(rows, t.id);
-        if (owned?.launch) desired.add(formatOwnedName({ role: "worker", taskId: t.id, attempt: owned.attempt, runId }));
+      for (const [taskId, frozen] of resumeInterrupted) {
+        const owned = interruptedAttempt(rows, taskId);
+        if (owned?.launch?.nonce !== frozen.nonce) resumeInterrupted.delete(taskId);
+        else desired.add(formatOwnedName({ role: "worker", taskId, attempt: frozen.attempt, runId }));
       }
       // The watch pane is never the DRIVER sweep's candidate (panesToClose spares role "watch":
       // herdr's watches bookkeeping lives in close(), and a raw pane-close in the sweep would
@@ -2923,6 +3010,79 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     await driver.notify(`tickmarkr ${runId}: ${t.id} needs a human — ${reason}${token ? `\npark ${token} — bind the decision with \`--park ${token}\`` : ""}`, { tier: "attention" });
   };
 
+  // OBS-1106 residual: a retry that landed nothing on a timeout-class red re-observes it ONCE fresh:
+  // neither a journal replay nor the verdict cache may re-state that red. Owed when the prior round's
+  // test red sits on this very subject, is timeout-shaped, and has not yet been observed twice
+  // independently — once it has, the fingerprint cap owns the next move. Read from the journal alone,
+  // so the live gate loop and a resume battery decide alike.
+  const owesTimeoutRefresh = (t: Task, priorRows: JournalEvent[], commit: string): boolean => {
+    const red = priorRows.find((e) => e.event === "gate-result" && e.data.gate === "test" && e.data.pass === false
+      && e.data.skipped !== true && e.data.commit === commit && typeof e.data.details === "string" && timeoutShaped(e.data.details));
+    return red !== undefined
+      && identicalGateFailures(journal.read(), t.id, "test", normalizeGateFailure(String(red.data.details))) < GATE_FINGERPRINT_CAP;
+  };
+
+  // OBS-1106 residual: before a timeout or wall-budget red accompanied by runner infra diagnostics is
+  // charged, its attributed failing files are re-run ONCE, on the same checkout, under the suite
+  // lease. Only a reproduced assertion is charged. A pass, an infra rerun, a rerun naming none of the
+  // files, or an unattributable red parks with the ORIGINAL red journaled and unresolved: the rerun is
+  // diagnostic, never a verdict, so it can neither green the gate nor permit a merge. Returns true
+  // when it parked.
+  const adjudicateInfraShapedRed = async (t: Task, results: GateResult[], wt: string, subject: string, attempt: number,
+    replayed: boolean, parkInfra: (reason: string) => Promise<void>): Promise<boolean> => {
+    const red = results.find((g) => g.gate === "test" && gateFailed(g) && !isInfraResult(g)
+      && timeoutShaped(g.details) && RUNNER_INFRA_DIAGNOSTIC_RE.test(g.details));
+    if (!red || commands.test === undefined) return false;
+    // The observation this red states: its subject, its fingerprint and, when it carries one, its
+    // receipt's invocation. A copy (journal replay, cache hit) is never re-run when THAT observation's
+    // adjudication is on the ledger — its recorded outcome decides, so a crash after the adjudication
+    // but before its park still parks. A crash before the adjudication leaves none, so the copy is
+    // adjudicated now. A fresh red always is.
+    const fingerprint = normalizeGateFailure(red.details);
+    const observation = receiptOrigin({ evidenceReceipt: red.evidenceReceipt ?? red.meta?.evidenceReceipt,
+      evidenceReceipts: red.evidenceReceipts ?? red.meta?.evidenceReceipts });
+    const recorded = replayed || red.meta?.reused === true
+      ? journal.read().reverse().find((e) => e.taskId === t.id && e.event === "gate-reobserved"
+        && e.data.commit === subject && e.data.fingerprint === fingerprint
+        && (observation === undefined || e.data.observation === undefined || e.data.observation === observation))
+      : undefined;
+    let files: string[] = [];
+    let outcome: "reproduced" | "passed" | "ambiguous" | "unattributed" = "unattributed";
+    let selection: string[] | undefined;
+    if (recorded) {
+      files = Array.isArray(recorded.data.files) ? recorded.data.files.filter((f): f is string => typeof f === "string") : [];
+      outcome = ["reproduced", "passed", "unattributed"].includes(String(recorded.data.outcome)) ? recorded.data.outcome as typeof outcome : "ambiguous";
+    } else {
+      for (const file of attributedFailingFiles(red)) {
+        if (posix.normalize(file) === file && !file.startsWith("../") && !file.startsWith("/") && existsSync(join(wt, file))) files.push(file);
+      }
+      let rerun: GateResult | undefined;
+      if (files.length) {
+        rerun = await withCommandContext(t.id, () => reobserveTestFiles(wt, commands.test!, baseline, files, journal.dir))
+          .catch((error: unknown): GateResult => ({ gate: "test", pass: false, details: `infra: rerun failed: ${error instanceof Error ? error.message : String(error)}`, meta: { infra: true } }));
+        classifyInfraResult(rerun);
+        // Reproduced only by failure evidence the rerun ATTRIBUTES to one of exactly these files, from an
+        // OBSERVED selection that was exactly these files (D-607): a path merely printed in output, a
+        // positional filter that also collected another file, or a runner that ignored the file
+        // arguments and reported no manifest of its selection, says nothing about the original red.
+        const failing = rerunFailingFiles(rerun);
+        selection = observedSelection(rerun);
+        const isolated = selection !== undefined && selection.length === files.length
+          && files.every((file) => selection!.includes(file)) && failing.every((file) => files.includes(file));
+        outcome = rerun.pass ? "passed" : isolated && !isInfraResult(rerun) && failing.length ? "reproduced" : "ambiguous";
+      }
+      journal.append("gate-reobserved", t.id, {
+        gate: "test", attempt, commit: subject, fingerprint, ...(observation ? { observation } : {}), files, outcome,
+        ...(selection ? { selection } : {}),
+        ...(rerun ? { pass: rerun.pass, details: rerun.details } : {}),
+        ...(rerun?.evidenceReceipt ? { evidenceReceipt: rerun.evidenceReceipt } : {}),
+      });
+    }
+    if (outcome === "reproduced") return false;
+    await parkInfra(`test: timeout-shaped red with runner infra diagnostics was not reproduced by one isolated rerun of ${files.length ? files.join(", ") : "its attributed files (none attributable)"} (${outcome}); the original red stands unresolved — recheck to re-measure:\n${readableExcerpt(red.details)}`);
+    return true;
+  };
+
   // OBS-547: cross-reference a scope red against the prediction this run already computed. Every hard
   // offender predicted ⇒ an AUTHORING defect whose repair is pre-written: journal the classification
   // with the verbatim files[] lines and park unchargeable. It owes nothing to the quality machinery —
@@ -2943,7 +3103,8 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     const verdict = scopeRed?.meta?.collateral as ScopeCollateralVerdict | undefined;
     const worker = journal.read().reverse().find((e) => e.taskId === t.id && e.event === "worker-result");
     const disposition = classifyRepairDisposition({
-      results, files: t.files, inventory: changed,
+      // OBS-1072 add.2: hints are lexed from the readable excerpt, never from terminal control bytes.
+      results: results.map((g) => ({ ...g, details: readableExcerpt(g.details) })), files: t.files, inventory: changed,
       refusalSummary: worker?.data.ok === false && typeof worker.data.summary === "string" ? worker.data.summary : undefined,
     });
     for (const diagnostic of disposition.diagnostics) {
@@ -3048,7 +3209,13 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     if (changed) saveGraph(repoRoot, graph);
   };
 
+  // OBS-1168(c): every gate callback is bound to the engagement that asked for it. Once the scheduler
+  // settles that engagement (done, parked or failed), a late sibling's event is dropped, never journaled.
+  const engagements = new Map<string, object>();
   const execTask = async (t: Task): Promise<void> => {
+    const engagement = {};
+    engagements.set(t.id, engagement);
+    const liveEngagement = () => engagements.get(t.id) === engagement;
     const approvalAction = pendingDaemonApprovalActions(journal.read()).get(t.id);
     const fundedRerun = approvalAction?.authority === "worker";
     const startMs = Date.now();
@@ -3132,8 +3299,10 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     // OBS-1161: no `attempts > 0` guard — every release already clears lastAssignment in the replay,
     // and a lastAssignment at zero attempts is a first dispatch whose capacity requeue was taken back:
     // the seat is still in force, so restore it instead of failing over its own tried[] entry early.
+    // OBS-1187: a restored seat must still be a member of the task's pool (the operator may have closed it).
     if (!hintsChanged && rs?.lastAssignment
         && channels.some((c) => channelKey(c) === channelKey(rs.lastAssignment!))
+        && inTaskPool(t, cfg, channelKey(rs.lastAssignment))
         && !demotedChannels.has(channelKey(rs.lastAssignment!))) {
       assignment = rs.lastAssignment; // restore the consult-chosen assignment (bypasses route()'s static re-pick)
     } else if (!hintsChanged && rs && rs.tried.length && !t.routingHints?.pin) {
@@ -3159,7 +3328,8 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     const lastApproval = taskHistory.map((e) => e.event).lastIndexOf("task-approved");
     const priorClimb = taskHistory.slice(lastApproval + 1).reverse().find((e) => e.event === "tier-escalated");
     if (!hintsChanged && priorClimb && taskHistory.indexOf(priorClimb) > taskHistory.map((e) => e.event).lastIndexOf("task-dispatch")) {
-      const target = channels.find((c) => channelKey(c) === priorClimb.data.to && !demotedChannels.has(channelKey(c)));
+      const target = channels.find((c) => channelKey(c) === priorClimb.data.to && !demotedChannels.has(channelKey(c))
+        && inTaskPool(t, cfg, channelKey(c)));
       if (target) assignment = seatAssignment(target);
     }
     // pre-kill invariant: tried always contains the current assignment. Spread, never alias the
@@ -3197,7 +3367,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       workerDispatchOrdinal: previousDispatch?.data.workerDispatchOrdinal ?? null,
     });
     if (bootstrapExhausted === channelKey(assignment)) { // a later tier-climb restore may have moved it off
-      await park(t, `${bootstrapExhausted} failed at bootstrap and no eligible channel remains after resume`, "infra",
+      await park(t, `${bootstrapExhausted} failed at bootstrap and no eligible channel remains after resume${poolExhaustion(t, cfg)}`, "infra",
         assignment, rs?.attempts ?? 0, startMs, 0, 0, undefined, 0, "fresh", { cause: "bootstrap", channel: bootstrapExhausted });
       return;
     }
@@ -3208,18 +3378,31 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       if (e.name === "review-no-verdict" && typeof e.payload.reviewer === "string") {
         if (!badReviewers.includes(e.payload.reviewer)) badReviewers.push(e.payload.reviewer);
       }
+      // OBS-1196: a seat whose same-subject re-emission delivered a valid verdict was a delivery flake,
+      // not a bad reviewer — it stays seatable for this task's later rounds.
+      if (e.name === "review-reemission" && e.payload.delivered === true && typeof e.payload.reviewer === "string") {
+        const at = badReviewers.indexOf(e.payload.reviewer);
+        if (at >= 0) badReviewers.splice(at, 1);
+      }
     };
     // Keep the measured siblings, including a red judge, while replacing only a missing review.
     // Every dispatched seat is excluded for this task, so the loop is bounded by the eligible pool.
     const runReviewRecovery = async (task: Task, ctx: GateContext, allowSelection = true) => {
       ctx.authorizeInfraRetry = cfg.executionPolicy?.boundedInfrastructure
         ? (subject, cause) => reserveInfrastructureRetry(journal.read(), task.id, subject, journal.append.bind(journal), cause) : undefined;
-      if (cfg.executionPolicy?.repairSelection && allowSelection) {
+      if (repairSelection && allowSelection) {
         const decision = repairSelectionDecision(journal.read(), task.id, true);
         ctx.selectTests = decision.selectTests;
         ctx.requiredRepairTests = decision.requiredFiles;
         ctx.selectionReason = decision.reason;
+      } else if (repairSelection) {
+        // A recheck runs the full suite; its recorded scope keeps a red there attributable.
+        ctx.selectTests = false;
+        ctx.selectionReason = "recheck-full-suite";
       }
+      // OBS-1151: every round judges fresh; the journal's earlier judgments (this run and before a
+      // resume) are only the subjects a reversed ruling is compared against.
+      ctx.priorJudgments = priorJudgments(journal.read(), task.id);
       // Resume and ordinary verification share this boundary. Count persisted rounds so a
       // resumed daemon cannot reuse a previous round's identity within the same attempt.
       ctx.buildReceiptIdentity = {
@@ -3323,9 +3506,9 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           ...(typeof g.meta.producer === "string" ? { producer: g.meta.producer } : {}),
           ...(typeof g.meta.producerAttempt === "number" ? { producerAttempt: g.meta.producerAttempt } : {}),
         } : {}),
-        ...(cfg.executionPolicy && !g.pass ? { disposition: failureDisposition(g) } : {}),
+        ...((cfg.executionPolicy || repairSelection) && !g.pass ? { disposition: failureDisposition(g) } : {}),
         ...Object.fromEntries(["runnerInfraRerun", "hostStarvedRerun", "recoveryBlocked", "failingFiles", "selectionDecision", "failureEvidence",
-          "forgivenFingerprints", "freshFingerprints", "baselineProvenance"]
+          "forgivenFingerprints", "freshFingerprints", "baselineProvenance", "judgment", "adjudication", "judgeDisagreement", "interruptions"]
           .filter((key) => g.meta?.[key] !== undefined).map((key) => [key, g.meta![key]])),
         // OBS-540: preserve terminal-vs-retryable infra exactly. normalizeGateOutcome deliberately
         // defaults a legacy infra row to retryable, so dropping an explicit false here reverses the
@@ -3351,7 +3534,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         } : {}),
         ...(g.gate === "review" && typeof g.meta?.reviewer === "string" ? {
           reviewer: g.meta.reviewer,
-          ...Object.fromEntries(["cause", "seatAuthoredBytes", "bytes", "rawPath", "briefPath", "timeoutMs", "unparseable", "noVerdict", "resolved", "reraised", "reviewerFloor", "reviewerFloorCause", "reviewerTier"]
+          ...Object.fromEntries(["cause", "seatAuthoredBytes", "bytes", "rawPath", "briefPath", "timeoutMs", "unparseable", "noVerdict", "resolved", "reraised", "settledAnchors", "reviewerFloor", "reviewerFloorCause", "reviewerTier"]
             .filter((key) => g.meta?.[key] !== undefined).map((key) => [key, g.meta![key]])),
           ...(typeof g.meta.vendor === "string" ? { vendor: g.meta.vendor } : {}),
           ...(typeof g.meta.provider === "string" ? { provider: g.meta.provider } : {}),
@@ -3482,7 +3665,8 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       if (!next?.climbed) return;
       const from = channelKey(assignment);
       const to = channelKey(next);
-      const poolBefore = channels.filter((c) => !tried.includes(channelKey(c)) && !demotedChannels.has(channelKey(c))).map(channelKey);
+      const poolBefore = channels.filter((c) => !tried.includes(channelKey(c)) && !demotedChannels.has(channelKey(c))
+        && inTaskPool(t, cfg, channelKey(c))).map(channelKey);
       journal.append("tier-escalated", t.id, {
         attempt, cause, gate: gate.gate, fingerprint: normalizeGateFailure(gate.details).slice(0, 500),
         from, to, fromTier: assignment.tier, toTier: next.tier, poolBefore,
@@ -3542,13 +3726,15 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     // on artificial scarcity; MAX_ATTEMPTS and the review round cap are the real bounds. Only a
     // fleet whose every channel is DEMOTED (verified dead: auth/setup/provider outage) has nothing
     // left to spawn — that case alone still parks.
+    // OBS-1187: shared with the demotion seam's pooled recycle so neither relaunches an escalated adapter.
+    const recycleExcluded = (): string[] =>
+      [channelKey(assignment), ...channels.filter((c) => escalatedAdapters.has(c.adapter)).map(channelKey)];
     const failoverOrRecycle = (site: "consult-reroute" | "dead-channel"): Assignment | null => {
       const next = failover(site);
       if (next) return next;
       // OBS-1169: a vendor escalated away from stays out of the recycle pool until its release —
       // recycling any of its channels, launched or not, would launch the broken bootstrap again.
-      const recycleExcluded = [channelKey(assignment), ...channels.filter((c) => escalatedAdapters.has(c.adapter)).map(channelKey)];
-      const recycled = nextChannel(assignment, t, cfg, channels, recycleExcluded, profile, demotedChannels)
+      const recycled = nextChannel(assignment, t, cfg, channels, recycleExcluded(), profile, demotedChannels)
         ?? (demotedChannels.has(channelKey(assignment)) ? null : assignment);
       if (recycled) journal.append("channel-recycle", t.id, { site, channel: channelKey(recycled) });
       return recycled;
@@ -3569,7 +3755,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         // D-07: consult panes self-clean when the verdict is read (keepLlm) — only "forever" keeps them.
         // v1.54 T1: channels = this run's doctor-filtered live list — consult.prefer seat liveness
         // is judged against it, never rebuilt from config (installed-but-unauthed seats would stall).
-        { keep: keepLlm, onSlot: keepLlm ? (s: Slot) => keptSlots.push(s) : undefined, onInvocation: (inv) => invocations.push(inv), runId, channels: pools.consult },
+        { keep: keepLlm, onSlot: keepLlm ? (s: Slot) => keptSlots.push(s) : undefined, onInvocation: (inv) => invocations.push(inv), runId, channels: pools.consult, health },
       );
       // A lone answering seat is already the row's adapter/model/vendor/effort; the list is journaled
       // only when a seat failed, so the row never repeats itself and a failed seat never vanishes.
@@ -3614,7 +3800,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           if (!tried.includes(k)) tried.push(k);
           return true;
         }
-        await park(t, "consult said reroute but every channel is demoted (verified dead) — nothing left to spawn", "reroute-exhausted", assignment, attempts, startMs, gateFails, consults, tokens, metered, retryMode);
+        await park(t, `consult said reroute but every channel is demoted (verified dead) — nothing left to spawn${poolExhaustion(t, cfg)}`, "reroute-exhausted", assignment, attempts, startMs, gateFails, consults, tokens, metered, retryMode);
         return false;
       }
       await park(t, `consult verdict: ${v.action} — ${v.notes}`, trigger, assignment, attempts, startMs, gateFails, consults, tokens, metered, retryMode); // decompose|human
@@ -3690,19 +3876,18 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       // died. A pane the driver cannot read is DECLINED, never classified: an unreadable pane proves
       // neither a matching trailer nor the absence of a foreign one, so it is neither harvested nor
       // gated as trailerless evidence. A driver whose terminals outlive it (Orca) adopts the owned
-      // terminal: bound only on ownership evidence — the journaled owned title AND the task checkout —
-      // never a title alone. The journaled slot.id is NEVER trusted across daemon instances: a fresh
-      // driver numbers its slots from one again, so an interrupted task's old id can name whatever
-      // terminal THIS instance bound under that id (another task's adoption or allocation).
+      // terminal (Orca) or pane (Herdr, OBS-1203): bound only on ownership evidence — the journaled owned
+      // name AND the task checkout — never a name alone. The journaled slot.id is NEVER trusted across
+      // daemon instances: a fresh driver numbers its slots from one again, so an interrupted task's old
+      // id can name whatever terminal THIS instance bound under that id (another task's adoption or allocation).
       // A driver with no read-only adoption is declined BEFORE anything is bound: slot() allocates —
       // herdr's reclaims the same-named pane (closing the evidence unread) and holds a dispatch lease
       // only run() releases — so it is never an adoption fallback; that driver keeps ordinary recovery.
-      const adopt = (driver as { adopt?: (s: Slot) => Promise<Slot> }).adopt;
-      if (!adopt) return decline("no read-only adoption on this driver");
+      if (!driver.adopt) return decline("no read-only adoption on this driver");
       let ownedSlot: Slot;
       let pane: string;
       try {
-        ownedSlot = await adopt.call(driver, slot);
+        ownedSlot = await driver.adopt(slot);
         pane = await driver.read(ownedSlot, PANE_READ_ROWS);
       } catch (error) {
         return decline(`pane unreadable: ${error instanceof Error ? error.message : String(error)}`);
@@ -3726,6 +3911,46 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       return found.assignment;
     };
     const harvestAuthor = rs && !satisfiedGate && !replayedGates && !recheck ? await harvestInterruptedAttempt() : undefined;
+    // OBS-1202: a recheck bound to a stall park that recorded a reapFailure re-verifies the parked
+    // attempt's owned census through the same reapWorker a live harvest uses, BEFORE any gate reads
+    // its tree. Only a complete, empty census releases the harvested commits to the battery; an
+    // unreadable (null) or surviving census keeps the task parked on the same kind — a stall carrying
+    // the fresh reapFailure, bound by its own new token — and no worker is funded either way. Plain
+    // approve on that park keeps its dispatch semantics.
+    if (recheck) {
+      const approvalRow = effectiveEvents(journal.read()).reverse()
+        .find((e) => e.taskId === t.id && e.event === "task-approved" && e.data.release === RECHECK_RELEASE);
+      if (typeof approvalRow?.data.reapFailure === "string") {
+        const launch = [...journal.read()].reverse().find((e) => e.taskId === t.id && e.event === "worker-launch");
+        const owned = launch?.data.slot as Slot | undefined;
+        let uncertain: string | undefined;
+        if (typeof launch?.data.nonce !== "string" || typeof launch.data.dispatchScript !== "string"
+          || typeof owned?.name !== "string" || typeof owned.cwd !== "string") {
+          uncertain = "the parked attempt recorded no launch ownership evidence";
+        } else {
+          const key: Slot = { ...owned };
+          workerOwners.set(key, { taskId: t.id, attempt: Number(launch.data.attempt ?? 0),
+            groupFile: `${launch.data.dispatchScript}.${launch.data.nonce}.pgid`, marker: launch.data.dispatchScript,
+            identities: new Map(), descendants: new Map() });
+          try {
+            await reapWorker(key);
+            // reapWorker returns normally for a null census when no ownership file was readable (a
+            // missing .pgid/.session with no descendants); recovery needs a RECORDED empty census.
+            const census = reapReports.get(key)?.survivors;
+            if (!Array.isArray(census) || census.length > 0) {
+              uncertain = `worker group ${reapReports.get(key)?.processGroup ?? "unknown"} census unrecorded`;
+            }
+          } catch (error) {
+            uncertain = error instanceof Error ? error.message : String(error);
+          }
+        }
+        if (uncertain !== undefined) {
+          await park(t, `worker could not be reaped before recheck: ${uncertain}`, "stall", null,
+            rs?.attempts ?? 0, startMs, gateFails, consults, tokens, metered, retryMode, { reapFailure: uncertain });
+          return;
+        }
+      }
+    }
     resumeGateReplay: if (satisfiedGate || replayedGates || recheck || harvestAuthor) {
       const taskBase = await integrationHead(intWt);
       taskBases.set(t.id, taskBase);
@@ -3947,7 +4172,21 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         }
         await trackedDriver.project?.(t.id, "in-review");
         await waitForBaseline(t.id);
+        // OBS-1106 residual: the live loop's timeout refresh, decided again from the journal, so a crash
+        // cannot launder the copy it forbids. A harvested retry that landed nothing owes it exactly as
+        // the live loop would have; a crash inside a forced battery before its test row still owes it.
+        const lastRound = (() => {
+          const own = journal.read().filter((e) => e.taskId === t.id);
+          return own.slice(own.map((e) => e.event === "phase-start" && e.data.phase === "gates").lastIndexOf(true) + 1);
+        })();
+        const freshTimeout = !recheck && !satisfiedGate && (
+          (harvestAuthor !== undefined && owesTimeoutRefresh(t, lastRound, gateSubject.commit))
+          || (lastRound.some((e) => e.event === "gate-fresh-forced" && e.data.commit === gateSubject!.commit)
+            && !lastRound.some((e) => e.event === "gate-result" && e.data.gate === "test")));
         journal.phaseStart(t.id, "gates");
+        if (freshTimeout) {
+          journal.append("gate-fresh-forced", t.id, { gate: "test", attempt: gateSubject.attempt, commit: gateSubject.commit, reason: "no-commit-timeout-red", resumed: true });
+        }
         const { results } = await withCommandContext(t.id,
           async () => runReviewRecovery(resumedTask, {
           carriedAuthors: await subjectAuthors(journal.read(), t.id, wt, taskBase),
@@ -3955,7 +4194,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           carriedFindings: outstandingReviewFindings(journal.read(), t.id),
           operatorContext,
           worktree: wt, baseRef: taskBase, result: priorResult, author: gateAuthor,
-          commands, baseline, channels: pools.review, judgeChannels: pools.judge, adapters, cfg, artifactDir: journal.dir,
+          commands, baseline, channels: pools.review, judgeChannels: pools.judge, health, adapters, cfg, artifactDir: journal.dir,
           collateral: collateral.get(t.id) ?? [],
           // a recheck re-verifies a human's release: it never selects tests down, it runs the suite.
           via: cfg.visibility.llm === "pane"
@@ -3973,7 +4212,9 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           // flaking seat is re-asked on every task.
           reviewNoVerdicts,
           recheck, // OBS-1055: a recheck discards cached reds — the battery re-measures what the operator questioned
+          cachedRedBypass: freshTimeout ? "timeout-fresh" : undefined,
           onGate: async (e) => {
+            if (!liveEngagement()) return;
             if (e.phase === "start") {
               notePhaseStart(e);
               journal.phaseStart(t.id, phaseForGate(e.gate), { gate: e.gate, index: e.index, total: e.total, ...(e.parentAt === undefined ? {} : { parallel: true }) });
@@ -3989,10 +4230,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
             inParallelOrder(g.gate as GateName, () => {
               journalGateResult(g);
               noteReviewRetry(g);
-              if (g.gate === "review" && !g.pass && /unparseable/.test(g.details)
-                  && typeof g.meta?.reviewer === "string") {
-                badReviewers.push(g.meta.reviewer);
-              }
+              if (isGarbageReview(g)) badReviewers.push(g.meta.reviewer);
             });
           },
         }, false));
@@ -4038,6 +4276,8 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           // erase an EARLIER chargeable attempt and attribute the park to the assignment the rewind
           // restored. Ask the journal which state this is, and take the classified dispatch's own
           // assignment back with it.
+          if (await adjudicateInfraShapedRed(t, results, wt, gateSubject.commit, rs?.attempts ?? 0, false, (reason) =>
+            park(t, reason, "infra", gateAuthor, rs?.attempts ?? 0, startMs, gateFails, consults, tokens, metered, retryMode))) return;
           const classified = journal.classifiedDispatch(t.id);
           if (await dispositionScopeRed(t, results, classified?.assignment ?? gateAuthor,
             classified ? (rs?.attempts ?? 0) : Math.max(0, (rs?.attempts ?? 0) - 1),
@@ -4176,11 +4416,19 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       }
       // OBS-57: a demoted channel must not be re-dispatched on consult retry or provider requeue.
       if (demotedChannels.has(channelKey(assignment))) {
-        const next = nextChannel(assignment, t, cfg, channels, tried, profile, demotedChannels);
+        // OBS-1187: a pooled task recycles a live pool member (OBS-202) before it may park naming the pool;
+        // it never keeps a demoted seat and never leaves the pool.
+        const pooled = taskPool(t, cfg) !== undefined;
+        const next = nextChannel(assignment, t, cfg, channels, tried, profile, demotedChannels)
+          ?? (pooled ? nextChannel(assignment, t, cfg, channels, recycleExcluded(), profile, demotedChannels) : null);
         if (next) {
           assignment = next;
           const k = channelKey(next);
           if (!tried.includes(k)) tried.push(k);
+        } else if (pooled) {
+          await park(t, `${channelKey(assignment)} is demoted (verified dead) and no live pool member remains${poolExhaustion(t, cfg)}`,
+            "reroute-exhausted", assignment, attempt, startMs, gateFails, consults, tokens, metered, retryMode);
+          return;
         }
       }
       // v1.29: consume the prior gate-failed session once. Same channel + known under-threshold context
@@ -4206,7 +4454,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           gate: banned, from: channelKey(assignment), to: next ? channelKey(next) : null,
         });
         if (!next) {
-          await park(t, gateFailApprovalReason(t.id, `identical ${banned} failure twice this engagement — an identical retry is banned and no untried channel is left`),
+          await park(t, gateFailApprovalReason(t.id, `identical ${banned} failure twice this engagement — an identical retry is banned and no untried channel is left${poolExhaustion(t, cfg)}`),
             "gate-fail", assignment, attempt, startMs, gateFails, consults, tokens, metered, retryMode);
           return;
         }
@@ -4424,10 +4672,18 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           ? `${new TextDecoder().decode(rawBytes.subarray(0, cap))}\n… diff truncated at gates.diffCap (${cap} bytes)`
           + `\nPARTIAL DIFF: the diff above is incomplete; files cut by the cap: ${droppedFiles.join(", ") || "(unknown)"}`
           : raw.stdout;
-        const brief = repairBrief(repairFindings, diff, taskBase);
+        const repeated = reraisedReviewChains(journaledSoFar, t.id).filter((chain) => chain.reraises > 1);
+        const brief = repairBrief(repairFindings, diff, taskBase, repeated);
         // anything the live brief holds beyond the journaled findings (a consult's guidance) is kept:
         // a repair adds the diff and the fix-only contract, it never subtracts what was already known.
-        feedback = feedback && !brief.includes(feedback) ? `${brief}\n\n${feedback}` : brief;
+        // OBS-1195: a resumed upheld repair re-derives the same review bytes on both carries; when the
+        // repair already quotes them verbatim they are said once, and the operator's uphold line stays.
+        // Both carries had their deferrals cut above, so the quote is compared after the same cut.
+        const upheldQuote = upheldFeedback ? withoutDeferrals(`review: ${upheldFeedback}`) : undefined;
+        const rest = upheldQuote && brief.includes(upheldQuote)
+          ? feedback.replace(upheldQuote, "").replace(/\n{3,}/g, "\n\n").trim()
+          : feedback;
+        feedback = rest && !brief.includes(rest) ? `${brief}\n\n${rest}` : brief;
         journal.append("repair-dispatch", t.id, { workerDispatchOrdinal, diffBytes: Buffer.byteLength(diff, "utf8"), capped, ...(capped ? { droppedFiles } : {}) });
       }
       if (feedback || priorNamed.length > 0) {
@@ -5700,7 +5956,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           attempt--; // the dead bootstrap bought no worker turn
           continue;
         }
-        await park(t, `${from} failed at bootstrap after ${retries} same-channel retry and no eligible channel remains`, "infra",
+        await park(t, `${from} failed at bootstrap after ${retries} same-channel retry and no eligible channel remains${poolExhaustion(t, cfg)}`, "infra",
           assignment, attempt, startMs, gateFails, consults, tokens, metered, retryMode, { cause: "bootstrap", channel: from, retries });
         return;
       }
@@ -5810,7 +6066,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           tried.push(channelKey(next));
           continue;
         }
-        await park(t, `capacity exhausted on ${from} after ${requeues} requeues and no eligible channel at floor`, "quota",
+        await park(t, `capacity exhausted on ${from} after ${requeues} requeues and no eligible channel at floor${poolExhaustion(t, cfg)}`, "quota",
           assignment, attempt + 1, startMs, gateFails, consults, tokens, metered, retryMode, { cause: "capacity", channel: from, requeues });
         return;
       }
@@ -5871,7 +6127,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           tried.push(channelKey(next));
           continue;
         }
-        await park(t, "quota exhausted on every eligible channel", "quota", assignment, attempt + 1, startMs, gateFails, consults, tokens, metered, retryMode);
+        await park(t, `quota exhausted on every eligible channel${poolExhaustion(t, cfg)}`, "quota", assignment, attempt + 1, startMs, gateFails, consults, tokens, metered, retryMode);
         return;
       }
       // v1.65 T1: typed dead-channel failure — the parse boundary classified this no-trailer result
@@ -5914,7 +6170,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           continue;
         }
         const chargedAttempts = adapterStartupFailure || startupFailure ? attempt : attempt + 1;
-        await park(t, `dead channel (${dead}) and no eligible channel remains`, "reroute-exhausted", assignment, chargedAttempts, startMs, gateFails, consults, tokens, metered, retryMode);
+        await park(t, `dead channel (${dead}) and no eligible channel remains${poolExhaustion(t, cfg)}`, "reroute-exhausted", assignment, chargedAttempts, startMs, gateFails, consults, tokens, metered, retryMode);
         return;
       }
       if (!finished) {
@@ -5963,6 +6219,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         }
       }
       const onGate = async (e: GateEvent) => {
+        if (!liveEngagement()) return;
         if (e.phase === "start") {
           notePhaseStart(e);
           journal.phaseStart(t.id, phaseForGate(e.gate), { gate: e.gate, index: e.index, total: e.total, ...(e.parentAt === undefined ? {} : { parallel: true }) });
@@ -5996,9 +6253,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           journalGateResult(g);
           noteReviewRetry(g);
           // v1.1 failover: never re-ask a reviewer channel that produced garbage for this task
-          if (g.gate === "review" && !g.pass && /unparseable/.test(g.details) && typeof g.meta?.reviewer === "string") {
-            badReviewers.push(g.meta.reviewer);
-          }
+          if (isGarbageReview(g)) badReviewers.push(g.meta.reviewer);
         });
       };
       let results: GateResult[] = [];
@@ -6014,12 +6269,16 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         // sees the replay, without buying another command or reviewer invocation.
         const taskEvents = journal.read().filter((e) => e.taskId === t.id);
         const previousRound = taskEvents.map((e) => e.event === "phase-start" && e.data.phase === "gates").lastIndexOf(true);
-        const previousRows = retryMode === "repair"
-          ? taskEvents.slice(previousRound + 1).filter((e) => e.event === "gate-result"
-            && e.data.attempt === attempt - 1)
-          : [];
+        const lastRoundRows = taskEvents.slice(previousRound + 1).filter((e) => e.event === "gate-result"
+          && e.data.attempt === attempt - 1);
+        const previousRows = retryMode === "repair" ? lastRoundRows : [];
+        // OBS-1106 residual: see owesTimeoutRefresh — the replay below and the verdict cache are both refused.
+        const freshTimeout = !explicitlyFundedAttempt && owesTimeoutRefresh(t, lastRoundRows, gateSubject.commit);
         journal.phaseStart(t.id, "gates");
-        const replay = !explicitlyFundedAttempt && previousRows.length > 0
+        if (freshTimeout) {
+          journal.append("gate-fresh-forced", t.id, { gate: "test", attempt, priorAttempt: attempt - 1, commit: gateSubject.commit, reason: "no-commit-timeout-red" });
+        }
+        const replay = !explicitlyFundedAttempt && !freshTimeout && previousRows.length > 0
           && previousRows.every((e) => e.data.commit === gateSubject!.commit)
           && previousRows.some((e) => e.data.pass === false && e.data.skipped !== true);
         if (replay) {
@@ -6050,10 +6309,10 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
             carriedFindings: outstandingFindings,
             operatorContext,
             worktree: wt, baseRef: taskBase, result, author: assignment,
-            commands, baseline, channels: pools.review, judgeChannels: pools.judge, adapters, cfg, artifactDir: journal.dir,
+            commands, baseline, channels: pools.review, judgeChannels: pools.judge, health, adapters, cfg, artifactDir: journal.dir,
             collateral: collateral.get(t.id) ?? [],
             selectTests: !testGateFailed,
-            cachedRedBypass: explicitlyFundedAttempt ? "operator-rerun" : undefined,
+            cachedRedBypass: explicitlyFundedAttempt ? "operator-rerun" : freshTimeout ? "timeout-fresh" : undefined,
             via: cfg.visibility.llm === "pane"
               ? {
                   driver: trackedDriver,
@@ -6173,6 +6432,8 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         await park(t, `${capTrip.gate}: ${capTrip.details}`, "diff-cap", assignment, attempt + 1, startMs, gateFails, consults, tokens, metered, retryMode);
         return;
       }
+      if (await adjudicateInfraShapedRed(t, results, wt, gateSubject!.commit, attempt, gateSubject!.replayedFromAttempt !== undefined, (reason) =>
+        park(t, reason, "infra", assignment, attempt + 1, startMs, gateFails, consults, tokens, metered, retryMode))) return;
       // OBS-547: who pays for this red is decided by the run's collateral prediction (see
       // dispositionScopeRed) — an authoring defect parks unchargeable before any accounting below.
       if (await dispositionScopeRed(t, results, assignment, attempt, startMs, gateFails, consults, tokens, metered, retryMode, await treeOrDiffPaths(taskBase, wt))) return;
@@ -6395,6 +6656,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       for (const t of ready) {
         const p = executeWithPolicy(t)
           .catch(async (err) => {
+            engagements.delete(t.id);
             const cleanupErrors: { slot: string; attempt: number; error: string }[] = [];
             for (const [slot, owner] of workerOwners) {
               if (owner.taskId !== t.id || !liveSlots.has(slot)) continue;
@@ -6451,7 +6713,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
             journal.telemetry({ taskId: t.id, shape: t.shape, adapter: "-", model: "-", channel: "-", attempts: 0, outcome: "failed", durationMs: 0 });
             await reconcile({ spareLiveLlm: true }); // task-failed is a terminal event
           })
-          .finally(() => inflight.delete(t.id));
+          .finally(() => { inflight.delete(t.id); engagements.delete(t.id); });
         inflight.set(t.id, p);
       }
       if (inflight.size === 0) {
@@ -6543,7 +6805,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       let tipFailed: boolean;
       try {
         const verification = withCommandContext(undefined,
-          () => verifyIntegrationTipCached(intWt, commands, journal, { lastMergedTask, baseline, signal: controller.signal }), controller.signal);
+          () => verifyIntegrationTipCached(intWt, commands, journal, { lastMergedTask, baseline, signal: controller.signal, evidence: { quotaBytes: cfg.gates?.evidenceQuotaBytes } }), controller.signal);
         activeTipVerify = { controller, settled: verification.then(() => {}, () => {}) };
         tipFailed = await verification;
       } catch (error) {

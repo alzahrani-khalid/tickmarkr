@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import ts from "typescript";
 import { expect, test } from "vitest";
 import { parse, stringify } from "yaml";
 
@@ -15,6 +16,7 @@ import {
   lowerLayerModelOverrides,
   renderFleetOverlayWrite,
   type FleetEditable,
+  type FleetOverlayWrite,
 } from "../../src/config/config.js";
 import { disallowedBy } from "../../src/route/preference.js";
 import { makeRepo } from "../helpers/tmprepo.js";
@@ -31,6 +33,12 @@ const editable = (over: Partial<FleetEditable> = {}): FleetEditable => ({
 });
 
 const occurrences = (text: string, fragment: string) => text.split(fragment).length - 1;
+
+const lowerOf = (globalDir: string) => {
+  const lower = lowerLayerModelOverrides({ globalDir });
+  if (!lower.ok) throw new Error(lower.error);
+  return lower.overrides;
+};
 
 test("test: a fleet write preserves every routing key and routing-side comment essay it did not author, proven member by member over the closed set of overlay content — a comment-essay fixture, an unknown-routing-key fixture, a prefer-list fixture and a null-tombstone fixture", () => {
   const prior = [
@@ -844,7 +852,7 @@ test.each(effortOverlayCases)("effort overlay validates and preserves vendor/cha
           if (next === undefined) delete edited.efforts[adapter][model];
           else edited.efforts[adapter][model] = next;
           writeFleetOverlay(path, (bytes) => renderFleetOverlayWrite(bytes, {
-            initial, edited, lowerOverrides: lowerLayerModelOverrides({ globalDir }),
+            initial, edited, lowerOverrides: lowerOf(globalDir),
           }));
           // loadConfig validates every merged model override, including the nonempty refinement.
           const { effort: actual, ...after } = channel();
@@ -861,4 +869,173 @@ test.each(effortOverlayCases)("effort overlay validates and preserves vendor/cha
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("test: Fleet reviewing and saving effort beneath modelOverrides null remasks every lower sibling from a newly edited global layer versus rejecting a stale preview or malformed lower YAML through the overlay error channel, so lost sibling metadata or a raw exception fails", async () => {
+  const repo = makeRepo({ "keep.txt": "x" });
+  const globalDir = mkdtempSync(join(tmpdir(), "tickmarkr-fleet-lower-g-"));
+  const globalPath = join(globalDir, "config.yaml");
+  const overlayPath = join(repo, ".tickmarkr", "config.yaml");
+  const models = ["codex-a", "codex-b", "codex-c", "codex-d"];
+  // the global layer declares vendor/channel metadata per named sibling; the repo's null masks all of it
+  const lowerSiblings = (...siblings: string[]) => writeFileSync(globalPath, stringify({
+    tiers: { codex: { modelOverrides: Object.fromEntries(siblings.map((m) => [m, { vendor: "azure", channel: "api" }])) } },
+  }));
+  lowerSiblings("codex-b");
+  mkdirSync(join(repo, ".tickmarkr"), { recursive: true });
+  writeFileSync(overlayPath, stringify({ tiers: { codex: {
+    models: Object.fromEntries(models.map((m) => [m, "frontier"])),
+    modelOverrides: null,
+  } } }));
+  const adapter: WorkerAdapter = {
+    id: "codex",
+    vendor: "openai",
+    probe: async () => ({ installed: true, authed: true, models: [] }),
+    channels: (c) => channelsFromConfig("codex", c),
+    headlessCommand: () => "codex",
+    interactiveCommand: () => null,
+    invoke: () => ({ command: "codex" }),
+    parse: () => ({ ok: false, summary: "unused", deviations: [], raw: "" }),
+    listModels: async () => [],
+  };
+  registry.writeDoctor(repo, {
+    codex: {
+      installed: true,
+      authed: true,
+      version: "fake",
+      models,
+      modelAuth: Object.fromEntries(models.map((m) => [m, { authed: true, probedAt: "2026-09-27T00:00:00.000Z" }])),
+    },
+  });
+  const assembled = await assembleFleetEditor(repo, [adapter], {}, { globalDir });
+  if ("unavailable" in assembled) throw new Error(assembled.unavailable);
+  const { props, commit } = assembled;
+  const state = {
+    denyAdapters: props.initialDenyAdapters,
+    denyModels: props.initialDenyModels,
+    denyWorkersAdapters: props.initialDenyWorkersAdapters,
+    denyWorkersModels: props.initialDenyWorkersModels,
+    classifications: [],
+    efforts: { codex: { "codex-a": "low" as const } },
+    selectedMode: props.initialMode,
+    map: props.initialMap,
+    steering: props.initialSteering,
+  };
+  const review = () => {
+    const staged = props.reviewOverlay(state);
+    if (staged.kind !== "diff") throw new Error("an effort edit must stage a diff");
+    return staged;
+  };
+  const masked = (bytes: string) => parse(bytes).tiers.codex.modelOverrides;
+
+  // the global layer gains a sibling AFTER the editor assembled: the review re-reads it
+  lowerSiblings("codex-b", "codex-c");
+  const first = review();
+  expect(masked(first.after)).toMatchObject({ "codex-a": { effort: "low" }, "codex-b": null, "codex-c": null });
+  expect(props.reloadGuard(first.after)).toBeNull();
+
+  // the global layer changes after the review: y is refused on the overlay error channel, and so is a save
+  lowerSiblings("codex-b", "codex-c", "codex-d");
+  const priorBytes = readFileSync(overlayPath, "utf8");
+  expect(props.reloadGuard(first.after)).toMatch(/^stale preview/);
+  expect(commit({ kind: "write", review: first })).toMatch(/^fleet: nothing written — stale preview/);
+  expect(readFileSync(overlayPath, "utf8")).toBe(priorBytes);
+
+  // malformed lower YAML: review, guard and save each answer with the named error, never a raw exception
+  writeFileSync(globalPath, "tiers: [unclosed\n");
+  const broken = review();
+  expect(broken.notes?.[0]).toContain(`lower config layer ${globalPath} is malformed YAML`);
+  expect(props.reloadGuard(broken.after)).toContain(`lower config layer ${globalPath} is malformed YAML`);
+  expect(commit({ kind: "write", review: broken })).toMatch(/^fleet: nothing written — lower config layer .* is malformed YAML/);
+  // a non-map where the lower overrides belong is malformed too — never an empty lower layer
+  writeFileSync(globalPath, stringify({ tiers: { codex: { modelOverrides: ["codex-b"] } } }));
+  expect(props.reloadGuard(review().after)).toContain("tiers.codex.modelOverrides is not a map");
+  expect(readFileSync(overlayPath, "utf8")).toBe(priorBytes);
+
+  // the repaired global layer: the re-review remasks every current sibling, y passes and the save lands
+  lowerSiblings("codex-b", "codex-c", "codex-d");
+  const masking = channelsFromConfig("codex", loadConfig(repo, { globalDir }));
+  const fresh = review();
+  expect(masked(fresh.after)).toMatchObject({ "codex-a": { effort: "low" }, "codex-b": null, "codex-c": null, "codex-d": null });
+  expect(props.reloadGuard(fresh.after)).toBeNull();
+  expect(commit({ kind: "write", review: fresh })).toMatch(/^fleet: wrote /);
+  expect(readFileSync(overlayPath, "utf8")).toBe(fresh.after);
+  const saved = channelsFromConfig("codex", loadConfig(repo, { globalDir }));
+  for (const model of models) {
+    const expected = masking.find((c) => c.model === model);
+    expect(expected?.vendor).toBe("openai"); // the repo's null masked the global azure/api metadata
+    expect(saved.find((c) => c.model === model)).toEqual(model === "codex-a" ? { ...expected, effort: "low" } : expected);
+  }
+});
+
+test("test: Fleet persists an effort write only with complete lower-layer input while a non-effort edit retains its existing contract, so an effort call omitting lower state compiling or reaching disk fails", () => {
+  // compile time: the writer's own type, checked by the compiler the build uses
+  const probe = join(import.meta.dirname, "__fleet_effort_contract__.ts");
+  const source = [
+    'import { renderFleetOverlayWrite } from "../../src/config/fleet-overlay.js";',
+    'import type { FleetEditable, LowerLayerModelOverrides } from "../../src/config/config.js";',
+    "declare const staged: FleetEditable;",
+    "declare const lower: LowerLayerModelOverrides;",
+    "const plain = { denyAdapters: [], denyModels: [], tiers: {}, map: {}, floors: {} };",
+    'renderFleetOverlayWrite("", { initial: staged, edited: staged, lowerOverrides: lower });',
+    'renderFleetOverlayWrite("", { initial: plain, edited: { ...plain, floors: { spec: "frontier" } } });',
+    'renderFleetOverlayWrite("", { initial: staged, edited: staged });',
+  ].join("\n");
+  const options: ts.CompilerOptions = {
+    strict: true,
+    noEmit: true,
+    skipLibCheck: true,
+    target: ts.ScriptTarget.ES2022,
+    module: ts.ModuleKind.NodeNext,
+    moduleResolution: ts.ModuleResolutionKind.NodeNext,
+    jsx: ts.JsxEmit.ReactJSX,
+  };
+  const host = ts.createCompilerHost(options);
+  const { getSourceFile, fileExists, readFile } = host;
+  host.getSourceFile = (name, language, ...rest) =>
+    name === probe ? ts.createSourceFile(name, source, language) : getSourceFile.call(host, name, language, ...rest);
+  host.fileExists = (name) => name === probe || fileExists.call(host, name);
+  host.readFile = (name) => (name === probe ? source : readFile.call(host, name));
+  const program = ts.createProgram([probe], options, host);
+  const file = program.getSourceFile(probe)!;
+  const errorLines = program.getSemanticDiagnostics(file)
+    .map((d) => file.getLineAndCharacterOfPosition(d.start ?? 0).line + 1);
+  expect(errorLines).toEqual([8]); // only the effort-capable call without lower state
+
+  // runtime: a cast/JS caller omitting lower state is refused before the temp file exists
+  const root = mkdtempSync(join(tmpdir(), "tickmarkr-effort-lower-"));
+  const globalDir = join(root, "global");
+  mkdirSync(globalDir);
+  writeFileSync(join(globalDir, "config.yaml"), stringify({
+    tiers: { codex: { modelOverrides: { m1: { vendor: "azure", channel: "api" }, m2: { vendor: "azure" } } } },
+  }));
+  const path = join(root, "config.yaml");
+  const prior = stringify({ tiers: { codex: { modelOverrides: null } } });
+  writeFileSync(path, prior);
+  const initial = editable();
+  const withEffort = editable({ efforts: { codex: { m1: "low" } } });
+  const blind = { initial, edited: withEffort } as unknown as FleetOverlayWrite;
+  expect(() => writeFleetOverlay(path, (bytes) => renderFleetOverlayWrite(bytes, blind)))
+    .toThrow("the effort edit on codex:m1 needs the lower config layers' model overrides");
+  expect(readFileSync(path, "utf8")).toBe(prior);
+  expect(existsSync(`${path}.tmp`)).toBe(false);
+
+  // an unreadable lower layer yields no input to write with
+  const brokenDir = join(root, "broken");
+  mkdirSync(brokenDir);
+  writeFileSync(join(brokenDir, "config.yaml"), "tiers: [unclosed\n");
+  expect(lowerLayerModelOverrides({ globalDir: brokenDir })).toMatchObject({ ok: false });
+
+  // the same edit with the complete lower read persists, re-masking what lifting the tombstone exposed
+  writeFleetOverlay(path, (bytes) => renderFleetOverlayWrite(bytes, { initial, edited: withEffort, lowerOverrides: lowerOf(globalDir) }));
+  const overrides = parse(readFileSync(path, "utf8")).tiers.codex.modelOverrides;
+  expect(overrides.m1).toEqual({ effort: "low", vendor: null, channel: null });
+  expect(overrides.m2).toBeNull();
+
+  // a non-effort edit keeps its contract: no lower state, the same bytes as ever
+  const floorsOnly = { initial, edited: editable({ floors: { spec: "frontier" } }) } as FleetOverlayWrite;
+  expect(renderFleetOverlayWrite(prior, floorsOnly)).toBe(`${prior}routing:\n  floors:\n    spec: frontier\n`);
+  const unchangedEffort = editable({ efforts: { codex: { m1: "high" } } });
+  expect(renderFleetOverlayWrite(prior, { initial: unchangedEffort, edited: { ...unchangedEffort, floors: { spec: "frontier" } } } as FleetOverlayWrite))
+    .toBe(renderFleetOverlayWrite(prior, floorsOnly));
 });

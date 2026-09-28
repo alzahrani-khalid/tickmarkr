@@ -6,7 +6,7 @@ import { pathToFileURL } from "node:url";
 import { describe, expect, test, vi } from "vitest";
 import { channelKey } from "../../src/adapters/types.js";
 import { buildDossierPrompt, type Dossier } from "../../src/run/consult.js";
-import { ATTEMPT_CAP_RELEASE, appendProfileDiscount, engagementComparable, formatJournalNarration, gateResultJournalData, Journal, newRunId, parseRunId, readAllTelemetry, readProfileDiscounts, recordedGraphDefinitionHash, REVIEW_UPHELD_RELEASE, TelemetryRowSchema } from "../../src/run/journal.js";
+import { ATTEMPT_CAP_RELEASE, appendProfileDiscount, engagementComparable, formatJournalNarration, gateResultJournalData, Journal, newRunId, outstandingReviewFindings, parseRunId, readAllTelemetry, readProfileDiscounts, recordedGraphDefinitionHash, REVIEW_UPHELD_RELEASE, structuredFindings, TelemetryRowSchema } from "../../src/run/journal.js";
 import { foldPairIntegrity, type DecisionEventWrite } from "../../src/run/protocol.js";
 import { MASK, redactSecrets } from "../../src/run/redact.js";
 
@@ -917,5 +917,42 @@ describe("T5 profile-discounts state file", () => {
       { runId: "run-20200101-000000", weight: 0, reason: "vacuous" },
       { runId: "run-20200102-000000", taskId: "T2", weight: 0.5, reason: "OBS-51" },
     ]);
+  });
+});
+
+// OBS-1195 repair (D-616): an anchor bound to a parent this verdict explicitly defers retires even when the
+// verdict repeats the bound comment, and a link an EARLIER verdict drew (carried metadata) never counts as
+// this verdict's material claim on that parent. An unbound repeat and a parent this verdict itself claims
+// as material stay open — ambiguity is never retired.
+describe("outstandingReviewFindings — bound anchors retire on explicit deferral (OBS-1195)", () => {
+  const gate = (data: Record<string, unknown>) => ({ ts: "2026-09-27T00:00:00.000Z", event: "gate-result", taskId: "T1", data: { gate: "review", pass: false, ...data } });
+  const [parent] = structuredFindings("review", "- [material] src/page.ts:3 — page() double-counts the header");
+  const anchor = { ...structuredFindings("review", "- src/page.ts:3 — header counted twice here").find((f) => f.class === "review:anchored")!, boundTo: parent!.fingerprint };
+  const deferral = { ...structuredFindings("review", "- [deferred: the empty page renders no header] src/page.ts:3 — page() header count is off by one only on the empty page")[0]!, reraisedFrom: parent!.fingerprint };
+  const round1 = gate({ resolved: [], reraised: [], findings: [parent, anchor] });
+
+  test("a deferring verdict that repeats the bound comment does not re-seat the retired anchor, while an unbound repeat stays open", () => {
+    const loose = structuredFindings("review", "- src/page.ts:3 — unbound misc note").find((f) => f.class === "review:anchored")!;
+    const round2 = gate({ resolved: [], reraised: [parent!.fingerprint], findings: [parent, deferral, anchor, loose] });
+    const notes = outstandingReviewFindings([round1, round2], "T1").map((f) => f.note);
+    expect(notes).not.toContain(anchor.note);
+    expect(notes).toContain(loose.note);
+    expect(notes).toContain(parent!.note);
+    expect(notes).toContain(deferral.note);
+  });
+
+  test("a stale carried reraisedFrom is lineage, not a material claim; a claim named in this verdict's reraised list keeps the anchor open", () => {
+    // The chain was once spelled `older`; round 2 restated it and drew the link. Round 3 carries that
+    // link unrestated while deferring the chain by its older spelling: the link claims nothing now.
+    const older = "review:material|src/page.ts|page#0000000000ab";
+    const chain = { ...parent!, observedFingerprints: [older, parent!.fingerprint] };
+    const deferOlder = { ...deferral, reraisedFrom: older };
+    const stale = { ...chain, reraisedFrom: older };
+    const seeded = gate({ resolved: [], reraised: [], findings: [chain, anchor] });
+    const round2 = gate({ resolved: [], reraised: [parent!.fingerprint], findings: [stale, deferOlder] });
+    expect(outstandingReviewFindings([seeded, round2], "T1").map((f) => f.note)).not.toContain(anchor.note);
+    // The same link, named in this verdict's own reraised list, is a live material claim: ambiguous, open.
+    const round2Claimed = gate({ resolved: [], reraised: [older], findings: [stale, deferOlder] });
+    expect(outstandingReviewFindings([seeded, round2Claimed], "T1").map((f) => f.note)).toContain(anchor.note);
   });
 });

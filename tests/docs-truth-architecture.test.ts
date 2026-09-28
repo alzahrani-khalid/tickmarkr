@@ -1,5 +1,6 @@
 import { existsSync, lstatSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
+import * as ts from "typescript";
 import { describe, expect, test } from "vitest";
 import { parseWorkerResult } from "../src/adapters/prompt.js";
 import { GATE_NAMES, validateGraph } from "../src/graph/schema.js";
@@ -13,6 +14,31 @@ const repoRoot = join(import.meta.dirname, "..");
 const codebaseDocs = join(repoRoot, "docs", "codebase");
 
 const walkthroughPath = join(repoRoot, "docs/operator-progress.md");
+const symbolCitations = [
+  ["src/run/activity.ts", "projectActivity"],
+  ["src/tui/cockpit/run-view.tsx", "projectRunTasks"],
+  ["src/tui/cockpit/evidence-view.tsx", "deriveEvidenceView"],
+  ["src/run/operator-page-summary.ts", "foldOperatorPages"],
+  ["src/tui/cockpit/decision-actions.ts", "applyDecisionKey"],
+] as const;
+
+function resolveSymbolCitation(prose: string, file: string, symbol: string, source: string): { startLine: number; endLine: number } {
+  const citations = [...prose.matchAll(/\]\(\.\.\/(src\/[^)#]+\.tsx?)(?:#([^)]*))?\)/g)]
+    .filter((match) => match[1] === file && match[2]?.startsWith("symbol="))
+    .map((match) => match[2]);
+  expect(citations, `${file}: expected one citation to ${symbol}`).toEqual([`symbol=${symbol}`]);
+
+  const parsed = ts.createSourceFile(file, source, ts.ScriptTarget.Latest, true,
+    file.endsWith(".tsx") ? ts.ScriptKind.TSX : ts.ScriptKind.TS);
+  const declarations = parsed.statements.filter((node): node is ts.FunctionDeclaration =>
+    ts.isFunctionDeclaration(node) && node.name?.text === symbol &&
+    ts.getModifiers(node)?.some((modifier) => modifier.kind === ts.SyntaxKind.ExportKeyword) === true);
+  expect(declarations, `${file}: missing or ambiguous exported declaration ${symbol}`).toHaveLength(1);
+  const declaration = declarations[0]!;
+  const startLine = parsed.getLineAndCharacterOfPosition(declaration.getStart(parsed)).line + 1;
+  const endLine = parsed.getLineAndCharacterOfPosition(declaration.getEnd() - 1).line + 1;
+  return { startLine, endLine };
+}
 
 // Skip this suite when the repo-only walkthrough is absent from the exported tree.
 describe.skipIf(!existsSync(walkthroughPath))("docs-truth: operator progress walkthrough", () => {
@@ -40,18 +66,31 @@ describe.skipIf(!existsSync(walkthroughPath))("docs-truth: operator progress wal
     expect(summaries.map(s => [s.blocker?.kind, s.blocker?.decisionRequired])).toEqual([
       ["human-decision", true], ["retry", false], ["cooldown", false], ["dependency-wait", false],
     ]);
-    // A citation must land on the named declaration, not merely on an existing file.
-    for (const [file, declaration] of [
-      ["src/run/activity.ts", "export function projectActivity("],
-      ["src/tui/cockpit/run-view.tsx", "export function projectRunTasks("],
-      ["src/tui/cockpit/evidence-view.tsx", "export function deriveEvidenceView("],
-      ["src/run/operator-page-summary.ts", "export function foldOperatorPages("],
-      ["src/tui/cockpit/decision-actions.ts", "export function applyDecisionKey("],
-    ]) {
-      const source = readFileSync(join(repoRoot, file!), "utf8").split("\n");
-      const line = source.findIndex(text => text.startsWith(declaration!)) + 1;
-      expect(line, declaration).toBeGreaterThan(0);
-      expect(prose).toContain(`../${file}#L${line}`);
+  });
+
+  test("Changed walkthrough lines resolve all five declared symbol citations after their declarations move versus rejecting a missing symbol instead of preserving obsolete line numbers", () => {
+    const prose = readFileSync(walkthroughPath, "utf8");
+    for (const [file, symbol] of symbolCitations) {
+      const source = readFileSync(join(repoRoot, file), "utf8");
+      const original = resolveSymbolCitation(prose, file, symbol, source);
+      const moved = resolveSymbolCitation(prose, file, symbol, "\n\n" + source);
+      expect(moved.startLine).toBe(original.startLine + 2);
+      expect(moved.endLine).toBe(original.endLine + 2);
+      expect(() => resolveSymbolCitation(prose, file, symbol,
+        source.replace(`export function ${symbol}(`, `export function missing${symbol}(`))).toThrow();
+    }
+  });
+
+  test("test: the production documentation-truth guard resolves each of the five cited symbols to its live declaration span after source movement versus failing on a missing symbol, so an existing file with the wrong declaration cannot validate the citation", () => {
+    const prose = readFileSync(walkthroughPath, "utf8");
+    for (const [file, symbol] of symbolCitations) {
+      const source = readFileSync(join(repoRoot, file), "utf8");
+      const span = resolveSymbolCitation(prose, file, symbol, source);
+      expect(source.split("\n")[span.startLine - 1]).toMatch(new RegExp(`^export function ${symbol}\\(`));
+      expect(span.endLine).toBeGreaterThanOrEqual(span.startLine);
+      expect(resolveSymbolCitation(prose, file, symbol, "\n" + source).startLine).toBe(span.startLine + 1);
+      expect(() => resolveSymbolCitation(prose, file, symbol,
+        source.replace(`export function ${symbol}(`, "export function wrongDeclaration("))).toThrow();
     }
   });
 

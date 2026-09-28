@@ -101,15 +101,18 @@ export function gatePaneName(role: GatePaneRole, taskId: string, suffix = ""): s
 // T2 ownership contract: a canonical owned fallback (the daemon's nameFor now emits one) passes
 // through untouched; run-gates' "-r1" judge-retry suffix becomes attempt+1 so the retry pane's name
 // stays contract-parseable (tickmarkr:judge:<task>:1:<runId>) instead of a corrupted-runId shape.
+// C-3 (D-669): the hop suffix is -r<N> — the judge-flake retry is -r1 and the adjudicator -r2, so the two
+// never share an owned name (a retained retry pane must not shadow the adjudicator's slot).
 export function rolePaneNameFromPrompt(prompt: string, fallback: string): string {
-  const retry = fallback.endsWith("-r1");
-  const base = retry ? fallback.slice(0, -3) : fallback;
+  const hop = /-r([1-9])$/.exec(fallback);
+  const suffix = hop ? hop[0] : "";
+  const base = hop ? fallback.slice(0, -suffix.length) : fallback;
   const owned = parseOwnedName(base);
-  if (owned) return retry ? formatOwnedName({ ...owned, attempt: owned.attempt + 1 }) : base;
+  if (owned) return hop ? formatOwnedName({ ...owned, attempt: owned.attempt + Number(hop[1]) }) : base;
   const id = prompt.match(/## Task ([^\n:]+):/)?.[1];
   if (!id) return fallback;
-  if (prompt.startsWith("TICKMARKR-JUDGE")) return gatePaneName("judge", id, retry ? "-r1" : "");
-  if (prompt.startsWith("TICKMARKR-REVIEW")) return gatePaneName("review", id, retry ? "-r1" : "");
+  if (prompt.startsWith("TICKMARKR-JUDGE")) return gatePaneName("judge", id, suffix);
+  if (prompt.startsWith("TICKMARKR-REVIEW")) return gatePaneName("review", id, suffix);
   return fallback;
 }
 
@@ -340,6 +343,15 @@ export function reviewSeatOutput(raw: string, nonce: string, adapterBannerRows: 
   return trailer ? seat.slice(0, trailer.index) : seat;
 }
 
+/** OBS-1168(b): a judge/review seat whose pane could not be created or launched. Typed so the gates can
+ * contain it as seat recovery (another seat) or an infra park — never as a worker failure. */
+export class SeatLaunchError extends Error {
+  constructor(public readonly seat: string, cause: unknown) {
+    super(`seat ${seat} failed to launch: ${cause instanceof Error ? cause.message : String(cause)}`);
+    this.name = "SeatLaunchError";
+  }
+}
+
 export const REVIEW_FIRST_LIVENESS_MS = 30_000;
 // OBS-1039: a seat that wrote ten bytes and went quiet escaped the zero-byte beat and sat to the
 // ceiling. Below this many seat-authored bytes at the first beat the seat is `silent` — demoted and
@@ -406,9 +418,14 @@ async function runViaDriverDetailed(
       adapter.headlessCommand(pf, model, effort),
       gateExitTrailer(nonce),
     ].join("\n"));
-    slot = await via.driver.slot(cwd, rolePaneNameFromPrompt(prompt, via.name), via.label ? { label: via.label } : undefined);
-    via.onSlot?.(slot);
-    await via.driver.run(slot, paneDispatchCommand(scriptPath));
+    try {
+      slot = await via.driver.slot(cwd, rolePaneNameFromPrompt(prompt, via.name), via.label ? { label: via.label } : undefined);
+      via.onSlot?.(slot);
+      await via.driver.run(slot, paneDispatchCommand(scriptPath));
+    } catch (error) {
+      forceClose = true; // a half-launched pane is closed, never kept
+      throw new SeatLaunchError(`${adapter.id}:${model}`, error);
+    }
     if (via.driver.sendKey) {
       try {
         if (matchesTrustDialog(await via.driver.read(slot, 400), adapter.trustDialog)) {

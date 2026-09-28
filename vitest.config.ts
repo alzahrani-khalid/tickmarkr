@@ -73,8 +73,24 @@ export const resolveForkCap = (value: string | undefined): number => {
 // this list is ONLY its members with a produced CI red (RULING-1890-CI-DESIGN option c: own
 // serial CI step, no rpc tuning, no class-wide absorption — an unknown red does not belong
 // here). ci.public.yml runs this project as a separate step so the main suite's worker channel
-// never carries their sync work; locally they simply serialize in one fork.
+// never carries their sync work.
+// OBS-634 add (v2.6.3 T1): that isolation is a 2-core-CI remedy, so only the CI guard keeps it.
+// Locally the members pool in `suite` under its fork cap instead of paying their ~221 s as a
+// one-fork tail while five forks idle; their generous leaf ceiling moves with them per file
+// (SYNC_HEAVY_LEAF_CEILINGS, applied by tests/setup.ts), and every other file keeps 20 s.
 export const SYNC_HEAVY_TESTS = ["tests/cockpit/sweep.test.ts", "tests/docs-truth-testing.test.ts"];
+export const SYNC_HEAVY_TIMEOUT_MS = 1_200_000; // generous by ruling: these members starve their own RPC under load
+export const SYNC_HEAVY_LEAF_CEILINGS: Record<string, number> = Object.fromEntries(
+  SYNC_HEAVY_TESTS.map((file) => [file, SYNC_HEAVY_TIMEOUT_MS]),
+);
+export const leanCiGuard = (): boolean => process.env.TICKMARKR_CI_LEAN_REPORTERS === "1";
+
+declare module "vitest" {
+  interface ProvidedContext {
+    // root-relative test file → testTimeout that tests/setup.ts applies before that file collects
+    leafCeilings: Record<string, number>;
+  }
+}
 
 // OBS-1141: the executed ledger has a size-derived leaf budget and real mutation children.
 // Keep it separate from sync-heavy's no-inline-timeout law; projects schedule whole files.
@@ -83,18 +99,28 @@ export const KEYS_LEDGER_TESTS = [
   "tests/e2e/forced-stall.e2e.test.ts",
 ];
 
-export const createVitestConfig = (forkCapValue: string | undefined) => defineConfig({
+export const VITEST_LEASE_HOOK = "./scripts/vitest-lease.ts";
+
+export const createVitestConfig = (forkCapValue: string | undefined, lean = leanCiGuard()) => defineConfig({
   cacheDir: worktreeVitestCache(process.cwd(), process.env[VITEST_CACHE_ENV]),
   test: {
     setupFiles: ["tests/setup.ts"], // v1.51 T2: scrub leaked TICKMARKR_QUALITY/NO_EXPLORE (gate hermeticity)
+    // OBS-880 suite (2) / OBS-1071: worker, reviewer and gate suites of this clone share one file lease
+    // (scripts/vitest-lease.ts); `vitest list` and a repository-less cwd take none.
+    globalSetup: [VITEST_LEASE_HOOK],
     testTimeout: 20000,
+    // The fork budget lives on the ROOT: vitest 3.2.7 builds one forks pool from the root config
+    // (and VITEST_MAX_FORKS), so a project-level maxForks is never read — a bare local run fanned out
+    // to ~cores-1 while `suite` claimed 6 (OBS-634 add, measured: 8 files, project cap 3, 8 live).
+    // singleFork projects still run one file at a time after the parallel fan-out.
+    poolOptions: { forks: { maxForks: resolveForkCap(forkCapValue) } },
     // GO-10 cycle-2 final candidate (threads reverted: 45 isolation-semantics fails at local
     // proof): the 2-core CI host answers worker birpc BETWEEN reporter/coverage rendering work,
     // and the fixed 60s worker->host timeout fires at the suite tail with every test green.
     // Trim host-side rendering under an env guard so CI's host answers inside the window;
     // local runs keep full reporters. Env-only delta: run commands and the ci-platform pin
     // stay byte-stable.
-    ...(process.env.TICKMARKR_CI_LEAN_REPORTERS === "1" ? { reporters: ["dot" as const] } : {}),
+    ...(lean ? { reporters: ["dot" as const] } : {}),
     // Each project owns a Vite server; set its cacheDir explicitly as well as the root.
     // Leave test.cache untouched so --no-cache keeps disabling result persistence.
     projects: [
@@ -104,13 +130,15 @@ export const createVitestConfig = (forkCapValue: string | undefined) => defineCo
         test: {
           name: "suite",
           include: ["tests/**/*.test.ts"],
-          exclude: [...configDefaults.exclude, ...DIST_COUPLED_TESTS, ...SIGNAL_REAPER_TESTS, ...SYNC_HEAVY_TESTS, ...KEYS_LEDGER_TESTS],
-          // the only PARALLEL project — the other projects already pin singleFork, so this is the one
-          // that was running at ~cores-1 while the daemon believed it had said 6.
-          poolOptions: { forks: { maxForks: resolveForkCap(forkCapValue) } },
+          // the only PARALLEL project; the sync-heavy members join it outside the CI guard
+          exclude: [
+            ...configDefaults.exclude, ...DIST_COUPLED_TESTS, ...SIGNAL_REAPER_TESTS,
+            ...(lean ? SYNC_HEAVY_TESTS : []), ...KEYS_LEDGER_TESTS,
+          ],
+          provide: { leafCeilings: SYNC_HEAVY_LEAF_CEILINGS },
         },
       },
-      {
+      ...(lean ? [{
         extends: true,
         cacheDir: worktreeVitestCache(process.cwd(), process.env[VITEST_CACHE_ENV]),
         test: {
@@ -118,9 +146,9 @@ export const createVitestConfig = (forkCapValue: string | undefined) => defineCo
           include: SYNC_HEAVY_TESTS,
           exclude: [...configDefaults.exclude, ...DIST_COUPLED_TESTS],
           poolOptions: { forks: { singleFork: true } },
-          testTimeout: 1_200_000, // generous by ruling: these members starve their own RPC under load
+          testTimeout: SYNC_HEAVY_TIMEOUT_MS,
         },
-      },
+      }] : []),
       {
         extends: true,
         cacheDir: worktreeVitestCache(process.cwd(), process.env[VITEST_CACHE_ENV]),
@@ -162,7 +190,7 @@ export const createVitestConfig = (forkCapValue: string | undefined) => defineCo
       // GO-10: json-summary alone under the CI guard — thresholds enforce off the coverage map
       // regardless of reporter; text/html rendering is pure host-side crunch the 2-core runner
       // pays while the worker's last onTaskUpdate waits.
-      ...(process.env.TICKMARKR_CI_LEAN_REPORTERS === "1" ? { reporter: ["json-summary" as const] } : {}),
+      ...(lean ? { reporter: ["json-summary" as const] } : {}),
       include: [
         "src/graph/**", "src/route/**", "src/gates/**", "src/run/**",
         "src/config/**", "src/compile/**", "src/adapters/**", "src/drivers/**", "src/cli/**",

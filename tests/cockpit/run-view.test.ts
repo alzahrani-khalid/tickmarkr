@@ -52,7 +52,7 @@ import {
   type RunEvidenceRow,
   type RunViewSession,
 } from "../../src/tui/cockpit/run-view.js";
-import { cellWidth } from "../../src/tui/cockpit/width.js";
+import { cellWidth, wrapCells } from "../../src/tui/cockpit/width.js";
 import { ttyInput } from "../helpers/tty-input.js";
 
 /* ------------------------------------------------------------------------ */
@@ -947,6 +947,75 @@ describe("T9 — projection per agent with source references and honest locators
     expect(waitText).toContain("blocker dependency-wait");
     expect(waitText).toContain("next Wait for prerequisites: T2");
     expect(waitText).not.toMatch(/identity |phase |build /u);
+  });
+
+  test("test: production Run frames at 80 or 120 columns size an undispatched projection to its real wrapped clause including its recorded blocker/action versus a dispatched multi-field projection, so retained padding or a lost fact fails", async () => {
+    const root = repo();
+    const graph = graphOf(["T1", "T2", "T3"], { T2: ["T1"] });
+    const j = Journal.create(root, T9_RUN);
+    j.append("run-start", undefined, { graphDefinitionHash: graphDefinitionHash(graph), branch: "fixture" });
+    // T1 dispatches, builds and parks on review: every field is recorded.
+    j.append("task-dispatch", "T1", { assignment: ASSIGNMENT, attempt: 0, worktree: "/wt/T1", pane: "pane-T1", alarmMs: 600000 });
+    launch(j, "T1", 0, { id: "p-11", name: ownedWorker("T1", 0) });
+    j.append("worker-result", "T1", { attempt: 0, ok: true, finished: true, role: "worker", agent: "fake:fake-1" });
+    j.append("phase-start", "T1", { phase: "gates", attempt: 0 });
+    j.append("build-receipt", "T1", { gate: "build", outcome: "completed", confirmedStart: true, exitCode: 0, durationMs: 12, attribution: { runId: T9_RUN, taskId: "T1", attempt: 0, gateRound: 1, invocation: "build#1" } });
+    j.append("gate-result", "T1", { gate: "review", pass: false, attempt: 0, details: "review red" });
+    j.append("task-human", "T1", { kind: "gate-fail", reason: "review red" });
+    // T2 waits on T1 and T3 parks before any dispatch: neither has identity, phase or build, both record a blocker.
+    j.append("task-human", "T3", { kind: "human-gate", reason: 'humanGate: "Task T3" requires approval before dispatch' });
+
+    const { rows, snapshot } = readRun(root, T9_RUN, graph);
+    const decisions = deriveRunDecisions(Journal.open(root, T9_RUN), graph);
+    const projections = projectRunTasks(snapshot, rows, graph, decisions, T9_RUN);
+    const by = Object.fromEntries(projections.map((p) => [p.taskId, p]));
+    expect(by.T1!.neverDispatched).toBeUndefined();
+    expect(by.T2!.neverDispatched).toBe(true);
+    expect(by.T3!.neverDispatched).toBe(true);
+    const parkLine = lineOfEvent(root, (e) => e.event === "task-human" && e.taskId === "T3");
+    expect(by.T3!.blocker.line).toBe(parkLine);
+    expect(by.T3!.nextAction.line).toBe(parkLine);
+    // The facts each collapsed clause must still carry.
+    const kept = (id: string) => [by[id]!.blocker.label, by[id]!.nextAction.label];
+    expect(kept("T2")).toEqual(["blocker dependency-wait", "next Wait for prerequisites: T1"]);
+    for (const fact of kept("T3")) expect(projectionLine(by.T3!), fact).toContain(fact);
+    expect(projectionLine(by.T3!)).toContain(`#L${parkLine}`);
+    // The five-field line a collapsed task would otherwise be sized to.
+    const fieldLine = (id: string) => [id, ...[by[id]!.identity, by[id]!.phase, by[id]!.build, by[id]!.blocker, by[id]!.nextAction]
+      .map((f) => `${f.label} ${f.line === undefined ? "(no journal row)" : `#L${f.line}`}`)].join(" · ");
+    expect(projectionLine(by.T1!)).toBe(fieldLine("T1"));
+
+    for (const columns of [80, 120]) {
+      const inner = columns - 4;
+      const wrapped = (text: string) => wrapCells(text, inner).map((line) => line.trimEnd());
+      const frame = (await drawRun(root, T9_RUN, initialRunViewSession(), columns, graph)).split("\n");
+      const title = frame.findIndex((line) => line.includes("PROJECTION / every task"));
+      const first = frame.findIndex((line, i) => i > title && line.startsWith("│ T1 · "));
+      const end = frame.findIndex((line, i) => i > first && line.startsWith("╰"));
+      expect(title, `${columns}`).toBeGreaterThan(-1);
+      expect(first, `${columns}`).toBeGreaterThan(title);
+      const body = frame.slice(first, end).map((line) => line.replace(/^│ /u, "").replace(/ │$/u, "").trimEnd());
+      expect(body.filter((line) => line.trim() === ""), `${columns} columns paint no padding row`).toEqual([]);
+      // The panel is exactly each task's own wrapped clause, in task order.
+      expect(body, `${columns} columns`).toEqual(projections.flatMap((p) => wrapped(projectionLine(p))));
+      let row = 0;
+      const drawn: Record<string, string> = {};
+      for (const p of projections) {
+        const height = wrapped(projectionLine(p)).length;
+        drawn[p.taskId] = body.slice(row, row + height).join("");
+        row += height;
+      }
+      // The dispatched task keeps its fields; the collapsed ones are shorter than those fields and keep their facts.
+      for (const f of [by.T1!.identity, by.T1!.phase, by.T1!.build, by.T1!.blocker, by.T1!.nextAction]) expect(drawn.T1, f.label).toContain(f.label);
+      for (const id of ["T2", "T3"]) {
+        expect(drawn[id], `${columns} ${id}`).toBe(projectionLine(by[id]!));
+        expect(drawn[id]!.startsWith(`${id} · missing evidence · `), `${columns} ${id}`).toBe(true);
+        for (const fact of kept(id)) expect(drawn[id], `${columns} ${id} keeps ${fact}`).toContain(fact);
+        expect(drawn[id]).not.toMatch(/identity |phase |build /u);
+        expect(wrapped(projectionLine(by[id]!)).length, `${columns} ${id}`).toBeLessThan(wrapped(fieldLine(id)).length);
+      }
+      expect(drawn.T3).toContain(`#L${parkLine}`);
+    }
   });
 
   test("a pane locator the driver cannot verify a stale one and an ambiguous one render as unavailable with the recorded evidence reachable and no other terminal is selected by title provider or task id, so a guessed replacement tab fails", async () => {

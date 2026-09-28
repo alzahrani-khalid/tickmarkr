@@ -384,7 +384,8 @@ const ShapeGateParticipationSchema = z
 
 export const ExecutionPolicySchema = z.object({
   boundedInfrastructure: z.boolean().default(false),
-  repairSelection: z.boolean().default(false),
+  // OBS-1199: absent inherits the effective default (on); an explicit false stays off.
+  repairSelection: z.boolean().optional(),
   taskExecutionLimitMs: z.number().int().positive(),
 }).strict();
 
@@ -467,6 +468,12 @@ export const TickmarkrConfigSchema = z.object({
     tipTest: z.string(),
     lint: z.string(),
     diffCap: z.number().int().positive(),
+    // OBS-1140: per-run gate-evidence byte quota; the oldest artifacts are evicted (and tombstoned)
+    // past it. Zero retains zero artifact bytes. Evidence retention never changes a gate's pass bit.
+    evidenceQuotaBytes: z.number().int().nonnegative(),
+    // OBS-1199: repair rounds screen known failing files plus affected tests before the full suite
+    // that still decides every merge. On unless false here or in executionPolicy, on every driver.
+    repairSelection: z.boolean(),
     byShape: z.partialRecord(z.enum(SHAPES), ShapeGateParticipationSchema).optional(),
   }).partial(),
   scope: z.object({
@@ -550,6 +557,8 @@ function assertSeededModelWindows(): void {
     }
   }
 }
+
+export const DEFAULT_EVIDENCE_QUOTA_BYTES = 8 * 1024 * 1024;
 
 export const DEFAULT_CONFIG: TickmarkrConfig = {
   concurrency: 3,
@@ -723,7 +732,7 @@ export const DEFAULT_CONFIG: TickmarkrConfig = {
     },
   },
   pricing: { cheap: 0.1, mid: 0.5, frontier: 2.5 },
-  gates: { diffCap: DEFAULT_DIFF_CAP },
+  gates: { diffCap: DEFAULT_DIFF_CAP, evidenceQuotaBytes: DEFAULT_EVIDENCE_QUOTA_BYTES },
   judge: { adapter: "claude-code", model: "fable" },
   // R3: no `policy` floor — the neutral floor leaves the compiler's per-task assignment standing, so
   // the path-keyed rule is reachable out of the box rather than raised to full by construction.
@@ -887,16 +896,42 @@ export function loadConfigWithMode(
   return { cfg: r.data, mode: resolveRoutingMode(r.data, [globalCfg, repoCfg]) };
 }
 
+/** OBS-1182: tiers.<adapter>.modelOverrides as the layers under the repo overlay resolve them. */
+export type LowerLayerModelOverrides = Record<string, Record<string, Record<string, unknown>>>;
+
 /** OBS-1182: tiers.<adapter>.modelOverrides as the layers under the repo overlay (defaults + global)
  *  merge them. Read raw, never schema-validated: a lower layer may only validate beside repo fields
- *  (global `vendor: null` completed by a repo vendor) and its override metadata is still inherited. */
-export function lowerLayerModelOverrides(opts: { globalDir?: string } = {}): Record<string, Record<string, Record<string, unknown>>> {
+ *  (global `vendor: null` completed by a repo vendor) and its override metadata is still inherited.
+ *  OBS-1188: an unparseable global file, or a non-map where this path expects a map, is an error —
+ *  never an empty lower layer, which would silently drop the metadata a write must re-mask. */
+export function lowerLayerModelOverrides(
+  opts: { globalDir?: string } = {},
+): { ok: true; overrides: LowerLayerModelOverrides } | { ok: false; error: string } {
   const isMap = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
-  const merged: unknown = deepMerge(structuredClone(DEFAULT_CONFIG), readYaml(join(opts.globalDir ?? globalConfigDir(), "config.yaml")));
-  const tiers = isMap(merged) && isMap(merged.tiers) ? merged.tiers : {};
-  return Object.fromEntries(Object.entries(tiers).map(([adapter, entry]) => [adapter, Object.fromEntries(
-    Object.entries(isMap(entry) && isMap(entry.modelOverrides) ? entry.modelOverrides : {}).filter(([, o]) => isMap(o)),
-  ) as Record<string, Record<string, unknown>>]));
+  const path = join(opts.globalDir ?? globalConfigDir(), "config.yaml");
+  let global: unknown;
+  try {
+    global = readYaml(path);
+  } catch (error) {
+    return { ok: false, error: `lower config layer ${path} is malformed YAML: ${(error as Error).message.replace(/\s+/g, " ").trim()}` };
+  }
+  const malformed = (at: string) => ({ ok: false as const, error: `lower config layer ${path} is malformed: ${at} is not a map` });
+  // deepMerge replaces a map with any non-map the global declares, so the merged shape is the global's
+  const merged: unknown = deepMerge(structuredClone(DEFAULT_CONFIG), global);
+  if (!isMap(merged)) return malformed("the document");
+  const tiers = merged.tiers ?? {}; // a global `tiers: null` tombstone leaves no lower tiers
+  if (!isMap(tiers)) return malformed("tiers");
+  const overrides: LowerLayerModelOverrides = {};
+  for (const [adapter, entry] of Object.entries(tiers)) {
+    if (!isMap(entry)) return malformed(`tiers.${adapter}`);
+    const models = entry.modelOverrides ?? {};
+    if (!isMap(models)) return malformed(`tiers.${adapter}.modelOverrides`);
+    for (const [model, override] of Object.entries(models)) {
+      if (!isMap(override)) return malformed(`tiers.${adapter}.modelOverrides.${model}`);
+    }
+    overrides[adapter] = models as Record<string, Record<string, unknown>>;
+  }
+  return { ok: true, overrides };
 }
 
 export function loadConfig(repoRoot: string, opts: { globalDir?: string } = {}): TickmarkrConfig {

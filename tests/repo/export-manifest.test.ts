@@ -300,6 +300,7 @@ describe("export boundary — fail-closed dual-context allowlist manifest", () =
       "scripts/emit-schema.ts",
       "scripts/probe-rig.mjs",
       "scripts/run-ci-vitest.sh",
+      "scripts/vitest-lease.ts", // vitest.config.ts globalSetup (OBS-880 suite lease)
       "skills/tickmarkr-loop/SKILL.md",
       "skills/tickmarkr-auto/SKILL.md",
       "skills/tickmarkr-overseer/SKILL.md",

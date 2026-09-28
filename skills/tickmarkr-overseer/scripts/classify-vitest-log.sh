@@ -44,7 +44,10 @@ awk -v esc="$esc" '
     gsub(/\^\[\[[0-9;]*m/, "", line); gsub(esc "\\[[0-9;]*m", "", line)
     sub(/^[^\t]*\t[^\t]*\t[0-9T:.-]+Z[ ]?/, "", line)
   }
-  line ~ /Test timed out|Error: Hook timed out/ { timedout++ }
+  # The Vitest timeout message carries its millisecond count; a test that PRINTS a fingerprint normalized
+  # to #ms (the daemon OBS-1106 notifications) is output, not a timed-out test. A real timeout also fails
+  # its test, so the summary failed count still reds it.
+  line ~ /(Test|Hook) timed out in [0-9]+ ?ms/ { timedout++ }
   line ~ /ERROR: Coverage for .* does not meet .*threshold/ { coverage++ }
   line ~ /^npm (error|ERR!) signal / { signals++ }
   line ~ /^(⎯)+ Unhandled Errors (⎯)+[ \t]*$/ { if (armed) close_block(); opening = 1; next }

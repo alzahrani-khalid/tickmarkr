@@ -51,6 +51,8 @@ export interface NewestPark {
   failedGate: string | undefined;
   /** A pre-dispatch human gate whose reason marks it permanent by design (see isTombstonePark). */
   tombstone: boolean;
+  /** OBS-1202: a stall park's recorded reap failure (task-human data.reapFailure) — its census is unproven. */
+  reapFailure?: string;
 }
 
 /**
@@ -81,6 +83,7 @@ export function newestPark(
       index: i, line: sourceIndexes?.[i] === undefined ? physicalLine(events, i) : sourceIndexes[i]! + 1, ts: typeof e.ts === "string" ? e.ts : undefined, kind, reason,
       approveCommand: typeof e.data.approveCommand === "string" ? e.data.approveCommand : undefined,
       failedGate: failedGateBeforePark(events, taskId, i), tombstone: isTombstonePark(kind, reason),
+      ...(kind === "stall" && typeof e.data.reapFailure === "string" ? { reapFailure: e.data.reapFailure } : {}),
     };
   }
   return undefined;
@@ -109,19 +112,23 @@ export function newestFailure(events: readonly JournalEvent[], taskId: string, s
 }
 
 /**
- * FINAL §3.3's decision menu as data: human-gate/attempt-cap/other non-gate parks → approve; infra →
- * approve or recheck; review gate-fail → waive/uphold/recheck; other gate-fail → waive/recheck; a
+ * FINAL §3.3's decision menu as data: human-gate/attempt-cap/other non-gate parks → approve; infra, and
+ * a stall park that recorded a reapFailure (OBS-1202), → approve or recheck; review gate-fail →
+ * waive/uphold/recheck; other gate-fail → waive/recheck; a
  * gate-fail park with no failed-gate evidence, or a tombstone → nothing (a diagnostic, never a
  * fabricated verb). The refusals in `approve` below enforce the same table; this is the one place a
  * surface may read it from, so what a menu offers and what the command accepts cannot drift.
  */
-export function permittedDecisionVerbs(park: Pick<NewestPark, "kind" | "failedGate" | "tombstone"> | undefined): readonly DecisionVerb[] {
+export function permittedDecisionVerbs(park: Pick<NewestPark, "kind" | "failedGate" | "tombstone" | "reapFailure"> | undefined): readonly DecisionVerb[] {
   if (!park || park.tombstone || park.kind === "scope-request") return [];
   if (park.kind === "gate-fail") {
     if (park.failedGate === undefined) return [];
     return park.failedGate === "review" ? ["waive", "uphold", "recheck"] : ["waive", "recheck"];
   }
   if (park.kind === "infra") return ["approve", "recheck"];
+  // OBS-1202: an unreadable reap census parks finished work; recheck re-verifies that census and gates the
+  // harvested commits with no worker. An ordinary stall recorded no census failure: approve alone.
+  if (park.kind === "stall" && park.reapFailure !== undefined) return ["approve", "recheck"];
   // OBS-1084: an authoring park whose newest gate row is a red tool gate is a runner report (a load
   // flake in an unowned suite), so the battery re-runs on the preserved ref with no worker.
   if (park.kind === "authoring" && isToolGate(park.failedGate)) return ["approve", "recheck"];
@@ -269,6 +276,7 @@ export async function approve(argv: string[], cwd = process.cwd()): Promise<stri
   const gateFailPark = park?.kind === "gate-fail";
   const infraPark = park?.kind === "infra" || park?.kind === "diff-cap";
   const authoringRunnerPark = park?.kind === "authoring" && isToolGate(park.failedGate);
+  const reapFailurePark = park?.kind === "stall" && park.reapFailure !== undefined;
   const failedGate = gateFailPark || authoringRunnerPark ? park?.failedGate : undefined;
   const parkBinding = requireBound(runId, taskId, bound, park?.ts === undefined ? undefined : { line: park.line, ts: park.ts }, "park");
   if (namedGate !== undefined && namedGate !== park?.failedGate) {
@@ -331,7 +339,10 @@ export async function approve(argv: string[], cwd = process.cwd()): Promise<stri
     return disposition(cwd, runId, "fund-fixed-attempt", `upheld the reviewer for ${taskId} in ${runId} — by ${by}`, serialization.contended);
   }
   if (recheck) {
-    if ((!gateFailPark || !failedGate) && !infraPark && !authoringRunnerPark) {
+    if (park?.kind === "stall" && !reapFailurePark) {
+      throw new Error(`--recheck applies to a stall park only when it recorded a reapFailure (census recovery); ${taskId}'s stall park recorded none — plain approve dispatches a worker; refusing`);
+    }
+    if ((!gateFailPark || !failedGate) && !infraPark && !authoringRunnerPark && !reapFailurePark) {
       throw new Error(`--recheck applies to a gate-fail, infra, diff-cap or red-tool-gate authoring park; ${taskId}'s newest park is ${String(lastHuman?.data.kind ?? "none")} with failed gate ${failedGate ?? "none"} — refusing`);
     }
     journal.append("task-approved", taskId, {
@@ -344,9 +355,11 @@ export async function approve(argv: string[], cwd = process.cwd()): Promise<stri
       // carry gate so their durable release row identifies the red tool gate that made recheck admissible.
       ...(failedGate ? { failedGate } : {}),
       ...(authoringRunnerPark && failedGate ? { gate: failedGate } : {}),
+      // OBS-1202: the daemon re-verifies the parked attempt's owned census before any gate runs.
+      ...(reapFailurePark ? { reapFailure: park!.reapFailure } : {}),
       ...(reviewRoundCeiling === undefined ? {} : { reviewRoundCeiling }),
     });
-    return disposition(cwd, runId, "re-dispatch", `re-checking ${taskId} in ${runId} — by ${by}; ${failedGate ? `failed gate ${failedGate}` : `${park!.kind} park`}; no gate marked satisfied`, serialization.contended);
+    return disposition(cwd, runId, "re-dispatch", `re-checking ${taskId} in ${runId} — by ${by}; ${failedGate ? `failed gate ${failedGate}` : reapFailurePark ? "reapFailure stall park; the owned census is re-verified before the gates" : `${park!.kind} park`}; no gate marked satisfied`, serialization.contended);
   }
   if (waive) {
     if (!gateFailPark || !failedGate) {

@@ -38,6 +38,7 @@ import { isPidLive, runLockRunId, runStatusLine } from "../../run/lock.js";
 import { normalizeGateOutcome, type GateOutcomeKind } from "../../run/outcome.js";
 import { desiredPanes } from "../../run/reconcile.js";
 import { normalizeStallSnapshot } from "../../run/stall.js";
+import { formatSpan, wallBudget, wallBudgetFacts } from "../../run/wall-budget.js";
 import { armWatchSupervision, observeNamedRun, WATCH_OWNER_ENV, readSupervision, supervisionText } from "../../run/supervision.js";
 import {
   deriveRunCockpitData,
@@ -989,6 +990,8 @@ type RenderedFrame = {
   hotPhase?: LivePhase;
   runId?: string;
   workerPhases: LivePhase[];
+  /** The journal rows this frame was folded from, so a caller adds facts from the same bytes. */
+  events: JournalEvent[];
 };
 
 type StatusEngagement = {
@@ -1356,6 +1359,7 @@ const renderFrame = (
       ...(hotPhase ? { hotPhase } : {}),
       ...(runId ? { runId } : {}),
       workerPhases: [...phases.values()].filter((phase) => phase.phase === "worker"),
+      events,
     };
   }
 
@@ -1580,7 +1584,21 @@ const renderFrame = (
     ...(hotPhase ? { hotPhase } : {}),
     ...(runId ? { runId } : {}),
     workerPhases: [...phases.values()].filter((phase) => phase.phase === "worker"),
+    events,
   };
+};
+
+// OBS-1201: the one-shot print closes with where the run's wall went (src/run/wall-budget.ts). A
+// window of zero length measured nothing, so it prints nothing; watch frames are untouched. Rows wrap
+// to the board width, so narrowing costs rows, never columns.
+const wallBudgetLines = (events: readonly JournalEvent[]): string[] => {
+  const budget = wallBudget(events);
+  if (!budget || budget.wallMs <= 0) return [];
+  const columns = Math.max(40, process.stdout.columns ?? 120);
+  return [
+    `  wall budget ${formatSpan(budget.wallMs)} · each instant once, by priority`,
+    ...wallBudgetFacts(budget).map(([label, fact]) => `    ${label} ${fact}`),
+  ].flatMap((line) => wrapCells(line, columns, { continuationPrefix: "      " }));
 };
 
 /**
@@ -1616,7 +1634,9 @@ export async function status(argv: string[], cwd = process.cwd(), opts: StatusOp
   // The task-table frame owns its own two-row brand lockup; the four-row global banner would
   // create the second header the approved replacement removes.
   if (!argv.includes("--watch")) {
-    return renderFrame(cwd, binaryVersion, opts.now?.() ?? Date.now(), 0, undefined, false, namedRunId).content;
+    const frame = renderFrame(cwd, binaryVersion, opts.now?.() ?? Date.now(), 0, undefined, false, namedRunId);
+    const wall = wallBudgetLines(frame.events);
+    return wall.length ? [frame.content, "", ...wall].join("\n") : frame.content;
   }
 
   const eventStream = argv.some((arg) => arg === "--events" || arg === "--jsonl" || arg === "--decision-events");

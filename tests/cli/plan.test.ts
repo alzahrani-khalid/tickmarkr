@@ -1220,3 +1220,40 @@ describe("LN-1 climb telemetry and uncapped collateral lints (RULING-231-09, OBS
     expect(firstDirectIdx).toBeLessThan(firstIndirectIdx);
   });
 });
+
+// OBS-1185: the floor line names the floor route() resolved for that task, never the shape's mode floor alone.
+describe("OBS-1185 plan floor follows routing", () => {
+  test("plan displays frontier from a task hint over a mid mode floor and otherwise names the configured or mode floor used by routing, so printing mid for the frontier-routed task fails", async () => {
+    const repo = makeRepo({ "keep.txt": "x\n" });
+    saveGraph(repo, validateGraph({
+      version: 1, spec: { source: "prd", paths: ["p"], hash: "h" },
+      tasks: [
+        { id: "T1", title: "t", goal: "hinted", shape: "implement", complexity: 3, acceptance: ["a"], routingHints: { floor: "frontier" } },
+        { id: "T2", title: "t", goal: "mode floor", shape: "implement", complexity: 3, acceptance: ["a"] },
+        { id: "T3", title: "t", goal: "configured floor", shape: "chore", complexity: 2, acceptance: ["a"], routingHints: { floor: "cheap" } },
+      ],
+    }));
+    writeDoctor(repo, DOCTOR5);
+    withOverlay(repo, "routing: { floors: { chore: mid } }\n");
+    const out = await plan([], repo);
+    const block = (id: string) => {
+      const lines = out.split("\n");
+      const at = lines.findIndex((l) => l.startsWith(`  ${id} `));
+      const end = lines.findIndex((l, i) => i > at && /^ {2}T\d/.test(l));
+      return lines.slice(at, end === -1 ? undefined : end);
+    };
+    const tier = (id: string) => /\[(?:sub|api)\/(\w+)\]/.exec(block(id)[0]!)?.[1];
+    // T1 routed frontier on its task hint, and the plan says so with the hint as its source
+    expect(tier("T1")).toBe("frontier");
+    expect(block("T1")[0]).toContain("floor frontier (task hint");
+    expect(block("T1")).toContain("    floor frontier ← task hint");
+    expect(block("T1").some((l) => /^ {4}floor mid\b/.test(l))).toBe(false);
+    // without a hint the mode-compiled floor routes and is named with its mode provenance
+    expect(tier("T2")).toBe("mid");
+    expect(block("T2")).toContain("    floor mid ← mode risk-based");
+    // a hint below the configured floor loses: the configured floor routes and is named
+    expect(tier("T3")).toBe("mid");
+    expect(block("T3")[0]).toContain("floor mid (config floors)");
+    expect(block("T3")).toContain("    floor mid ← config floors");
+  });
+});

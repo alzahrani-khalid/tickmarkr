@@ -74,7 +74,7 @@ describe("OBS-1169: a worker CLI bootstrap death keeps its own account", () => {
     expect(of(b, "consult-verdict")).toHaveLength(0);
 
     // the same exit-one with no trailer is a real work failure — charged, its carried commit harvested,
-    // the replayed red counted as occurrence two — when it carries no bootstrap text, and equally when
+    // its red counted — when it carries no bootstrap text, and equally when
     // the bootstrap wording sits outside the startup prefix: after a tool frame (the worker's own
     // command said it), or at the tail of a row-saturated read whose origin has scrolled away
     const said = JSON.stringify("Error: account/read failed during TUI bootstrap (code -32603)");
@@ -96,9 +96,21 @@ describe("OBS-1169: a worker CLI bootstrap death keeps its own account", () => {
       expect(of(w, "bootstrap-retry"), name).toHaveLength(0);
       expect(of(w, "worker-result-harvested"), name).toHaveLength(1);
       expect(of(w, "worker-result-harvested")[0]!.data.commits, name).toHaveLength(name === "committed" ? 2 : 1);
-      expect(failedTests(w), name).toHaveLength(2);
-      expect(of(w, "gate-fingerprint-cap").map((e) => e.data), name).toMatchObject([{ gate: "test", occurrences: 2 }]);
-      expect(s2.done, name).toEqual([]);
+      const reds = failedTests(w);
+      expect(reds.length, name).toBeGreaterThanOrEqual(2);
+      if (name === "committed") {
+        // its own commit is a new subject: the red is re-executed, an independent second occurrence
+        expect(reds[1]!.data.replayedFromAttempt, name).toBeUndefined();
+        expect(of(w, "gate-fingerprint-cap").map((e) => e.data), name).toMatchObject([{ gate: "test", occurrences: 2 }]);
+        expect(s2.done, name).toEqual([]);
+      } else {
+        // OBS-1106: nothing landed, so the red is REPLAYED — a copy of attempt 0's observation, not a
+        // second occurrence — and the failure is charged as work: the second bounded repair is drawn
+        expect(reds[1]!.data.replayedFromAttempt, name).toBe(0);
+        expect(of(w, "gate-fingerprint-cap"), name).toEqual([]);
+        expect(of(w, "repair-attempt").map((e) => e.data.charge), name).toEqual([1, 2]);
+        expect(repairsSinceApproval(w, "T1"), name).toBe(2);
+      }
     }
   }, 240_000);
 
@@ -239,4 +251,26 @@ describe("OBS-1169: a worker CLI bootstrap death keeps its own account", () => {
     expect(of(five.after, "worker-launch")).toHaveLength(0);
     expect(of(five.after, "task-human").map((r) => r.data)).toMatchObject([{ kind: "infra", cause: "bootstrap", channel: "fake:fake-1" }]);
   }, 300_000);
+
+  // OBS-1187 × OBS-1169: the demotion seam's pooled recycle keeps the bootstrap exclusion — pool member A
+  // escalated away at bootstrap, B demotes on consult retry, and the task parks naming the pool, never back on A.
+  test("a pooled demotion recycle never relaunches a bootstrap-escalated pool member", async () => {
+    const SILENT = { shell: "true" }; // no trailer, no commit: two windows demote the channel
+    const { repo, scriptPath } = setupRepo([T("T1")], { consult: { action: "retry", notes: "again" }, tasks: { T1: [BOOT, BOOT, BOOT] } },
+      "approvalWindowMs: 1\nrouting:\n  map:\n    implement:\n      pool: { mode: ordered, channels: [fake:fake-1, other:o-1] }\n");
+    const otherScript = join(makeTestTempDir("tickmarkr-other-"), "s.json");
+    writeFileSync(otherScript, JSON.stringify({
+      judge: { pass: true, criteria: [{ criterion: "c1", met: true, reason: "ok" }] }, review: { approve: true, issues: [] }, consult: HUMAN,
+      tasks: { T1: [SILENT, SILENT, SILENT, SILENT] },
+    }));
+    const s = await runDaemon(repo, { adapters: [new SoloFake(scriptPath), new OtherAdapter(otherScript)], runId: "run-boot-demote-pool" });
+    expect(s.human).toEqual(["T1"]);
+    const e = evs(repo, "run-boot-demote-pool");
+    const trace = of(e, "task-dispatch").map(seatOf).join(" ");
+    expect(of(e, "bootstrap-failover").map((r) => r.data), trace).toMatchObject([{ from: "fake:fake-1", to: "other:o-1" }]);
+    expect(of(e, "channel-demotion").map((r) => r.data.channel), trace).toEqual(["other:o-1"]);
+    expect(of(e, "task-dispatch").map(seatOf), trace).toEqual(["fake:fake-1", "fake:fake-1", "other:o-1", "other:o-1"]);
+    expect(String(of(e, "task-human").at(-1)?.data.reason), trace)
+      .toContain("routing.map.implement.pool (ordered: fake:fake-1, other:o-1) is exhausted");
+  }, 120_000);
 });

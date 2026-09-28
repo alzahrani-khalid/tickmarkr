@@ -233,6 +233,26 @@ describe("grade-ci.sh job-log controls", () => {
     expect(accepted.stdout).toContain("VITEST_LOG verdict=RPC_ONLY");
   });
 
+  test("test: a complete RPC-only run whose test prints the daemon's normalized timeout fingerprint on stdout is forgiven by the wrapper and graded GREEN, while Vitest's own timed-out message with its millisecond count stays RED, so a classifier that counts a test's printed output as a timed-out test fails", () => {
+    const { grade, wrap } = fixture();
+    // OBS-1106's daemon tests print fingerprints normalized to '#ms'; Vitest's own message always carries digits.
+    const printed = "stdout | tests/run/daemon/x.test.ts > case\nfailing tests:\nFAIL tests/slow.test.ts > slow\n\nnew failure fingerprints vs baseline (secondary):\nError: Test timed out in #ms.\n\n";
+    const rpcOnly = printed + block(RPC) + summary(1);
+    const ci = wrap(rpcOnly, 1);
+    expect(ci.status, ci.stdout).toBe(0);
+    expect(ci.stdout).toContain("VITEST_LOG verdict=RPC_ONLY");
+    const job = ghJobLog(rpcOnly + "##[error]Process completed with exit code 1.\n") + "\n" + ORACLE;
+    const graded = grade(10, job, "fingerprint", "failure");
+    expect(graded.status, graded.stdout).toBe(0);
+    expect(graded.stdout).toMatch(/^test: oracle=.* timedout=0 /m);
+    expect(graded.stdout).toContain("test: GREEN");
+    const real = " FAIL  tests/slow.test.ts > waits\nError: Test timed out in 5000ms.\n" + block(RPC)
+      + summary(1, "1 failed | 7 passed | 2 skipped (10)", "1 failed | 39 passed | 3 skipped (43)");
+    expect(wrap(real, 1).status).toBe(1);
+    expect(grade(10, ghJobLog(real + "##[error]Process completed with exit code 1.\n") + "\n" + ORACLE, "real", "failure").stdout)
+      .toMatch(/^test: oracle=.* timedout=1 .*\ntest: RED$/m);
+  });
+
   test.skipIf(!existsSync(TWIN_DIR))("the canonical and installed graders are byte-identical executable files (skipped on the exported tree: .claude/skills is absent)", async () => {
     const fs = await import("node:fs");
     for (const script of [SCRIPT, CLASSIFIER]) {

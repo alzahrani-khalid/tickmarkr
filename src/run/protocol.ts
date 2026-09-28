@@ -55,6 +55,17 @@ export const EvidenceArtifactSchema = z.object({
   if (ref.truncated !== (ref.droppedBytes > 0)) ctx.addIssue({ code: "custom", message: "truncation must agree with dropped bytes" });
   if (ref.availability === "available" && ref.sha256 === null) ctx.addIssue({ code: "custom", message: "available bytes require a hash" });
 });
+// OBS-1139: one count per original span, never a value. A legacy receipt carries `material` alone and
+// keeps it as recorded; a counted one must agree — benign HOME/TMPDIR substitutions are never material.
+const RedactionCountsSchema = z.object({
+  token: z.number().int().nonnegative(),
+  assignment: z.number().int().nonnegative(),
+  secretEnv: z.number().int().nonnegative(),
+  benignEnv: z.number().int().nonnegative(),
+}).strict();
+export const RedactionSchema = z.object({ material: z.boolean(), counts: RedactionCountsSchema.optional() }).strict()
+  .refine(r => !r.counts || r.material === (r.counts.token + r.counts.assignment + r.counts.secretEnv > 0),
+    { message: "material must agree with the token, assignment and secret-environment counts" });
 export const GateEvidenceReceiptSchema = z.object({
   invocationId: NonEmptyStringSchema,
   nonce: NonEmptyStringSchema.optional(),
@@ -72,7 +83,7 @@ export const GateEvidenceReceiptSchema = z.object({
     timedOut: z.boolean().nullable(),
   }).strict(),
   availability: z.enum(EVIDENCE_AVAILABILITIES),
-  redaction: z.object({ material: z.boolean() }).strict(),
+  redaction: RedactionSchema,
   stdout: EvidenceArtifactSchema,
   stderr: EvidenceArtifactSchema,
 }).strict();

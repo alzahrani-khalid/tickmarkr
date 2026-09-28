@@ -1594,13 +1594,14 @@ describe("resume harvest: an interrupted finished attempt is gated, never redisp
     expect(() => git(repo, "show", `tickmarkr/${runId}:redo.txt`)).toThrow();
   }, 90_000);
 
-  // D-546: HerdrDriver has no read-only adoption. Its slot() is an ALLOCATION — a fresh tab whose
-  // reclaimStaleLabel closes the original same-named pane before its trailer is read, holding a dispatch
-  // lease only run() releases — so it is never an adoption fallback. The resume declines the harvest
-  // and Herdr keeps ordinary recovery, whatever trailer the pane holds. The `herdr` binary is a stub
-  // that records every invocation and emulates the pane registry; the live CLI is never reached.
-  test("a resume through the production HerdrDriver declines a matching or foreign trailer without allocating, closing or leasing a pane", async () => {
-    for (const mode of ["matching", "foreign"] as const) {
+  // OBS-1203: HerdrDriver.slot() is an ALLOCATION — a fresh tab whose reclaimStaleLabel closes the
+  // original same-named pane before its trailer is read, holding a dispatch lease only run() releases
+  // (D-546) — so the resume binds the surviving pane through the driver's READ-ONLY adopt instead: exactly
+  // one pane carrying the full owned label, whose herdr-reported cwd is the task checkout, which is its
+  // own git checkout. The `herdr` binary is a stub that records every invocation and emulates the pane
+  // registry; the live CLI is never reached.
+  test("the resumed production daemon harvests a matching trailer through a fresh HerdrDriver adopting one owned label cwd and checkout proof without allocating closing or leasing a pane, versus declining zero ambiguous or foreign matches, so redoing completed work fails", async () => {
+    for (const mode of ["matching", "zero", "ambiguous", "foreign-cwd", "foreign-nonce", "unreadable"] as const) {
       const { repo, fake } = setupRepo([T("T1")], { tasks: { T1: [
         { shell: `echo redo > redo.txt && ${COMMIT} redo`, result: { ok: true, summary: "redone" } },
       ] } });
@@ -1616,7 +1617,7 @@ describe("resume harvest: an interrupted finished attempt is gated, never redisp
       const nonce = "4e4d4e4d";
       const dispatchScript = join(journal.dir, "T1-a0.sh");
       writeFileSync(dispatchScript, "sleep 30\n");
-      const slot = { id: "w1:pOWNED", name: formatOwnedName({ role: "worker", taskId: "T1", attempt: 0, runId }), cwd: wt };
+      const slot = { id: "w1:pSTALE", name: formatOwnedName({ role: "worker", taskId: "T1", attempt: 0, runId }), cwd: wt };
       journal.append("task-dispatch", "T1", { assignment: fake2, attempt: 0, workerDispatchOrdinal: 0, retryMode: "fresh" });
       journal.append("worker-launch", "T1", { attempt: 0, retryMode: "fresh", nonce, dispatchScript, driver: "herdr", slot });
       const dir = makeTestTempDir("tickmarkr-herdr-stub-");
@@ -1624,18 +1625,30 @@ describe("resume harvest: an interrupted finished attempt is gated, never redisp
       const panes = join(dir, "panes.txt");
       const pane = join(dir, "owned-pane.txt");
       writeFileSync(log, "");
-      writeFileSync(panes, `w1:pOWNED ${slot.name}\n`);
-      writeFileSync(pane, `working…\nTICKMARKR_RESULT_${mode === "matching" ? nonce : "deadbeef"} {"ok":true,"summary":"t1 finished before the daemon died","deviations":[]}\n`);
+      const other = formatOwnedName({ role: "worker", taskId: "T2", attempt: 0, runId });
+      // the pane registry the dead daemon left behind: id, label, the shell's cwd as herdr reports it
+      const rows = {
+        matching: [["w1:pOWNED", slot.name, wt]],
+        "foreign-nonce": [["w1:pOWNED", slot.name, wt]],
+        zero: [["w1:pOTHER", other, wt]],
+        ambiguous: [["w1:pOWNED", slot.name, wt], ["w1:pTWIN", slot.name, wt]],
+        "foreign-cwd": [["w1:pOWNED", slot.name, repo]],
+        unreadable: [["w1:pOWNED", slot.name, wt]],
+      }[mode];
+      const registry = rows.map((r) => `${r.join("\t")}\n`).join("");
+      writeFileSync(panes, registry);
+      writeFileSync(pane, `working…\nTICKMARKR_RESULT_${mode === "foreign-nonce" ? "deadbeef" : nonce} {"ok":true,"summary":"t1 finished before the daemon died","deviations":[]}\n`);
       const bin = join(dir, "herdr");
       writeFileSync(bin, [
         "#!/bin/bash",
         `printf '%s\\n' "$*" >> ${shq(log)}`,
         'case "$1 $2" in',
-        `  "pane list") printf '{"result":{"panes":['; sep=; while read -r id label; do printf '%s{"pane_id":"%s","label":"%s"}' "$sep" "$id" "$label"; sep=,; done < ${shq(panes)}; echo ']}}' ;;`,
-        `  "pane read") [ "$3" = w1:pOWNED ] && cat ${shq(pane)} ;;`,
+        `  "pane list") printf '{"result":{"panes":['; sep=; while IFS=$'\\t' read -r id label cwd; do printf '%s{"pane_id":"%s","label":"%s","cwd":"%s"}' "$sep" "$id" "$label" "$cwd"; sep=,; done < ${shq(panes)}; echo ']}}' ;;`,
+        // unreadable: adoption proves ownership, but the evidence read itself fails — never an empty pane
+        mode === "unreadable" ? `  "pane read") echo 'pane read failed' >&2; exit 1 ;;` : `  "pane read") [ "$3" = w1:pOWNED ] && cat ${shq(pane)} ;;`,
         `  "tab create") echo '{"result":{"tab":{"tab_id":"w1:t1"},"root_pane":{"pane_id":"w1:pNEW"}}}' ;;`,
-        `  "pane rename") printf '%s %s\\n' "$3" "$4" >> ${shq(panes)}; echo '{}' ;;`,
-        `  "pane close") grep -v "^$3 " ${shq(panes)} > ${shq(`${panes}.tmp`)}; mv ${shq(`${panes}.tmp`)} ${shq(panes)}; echo '{}' ;;`,
+        `  "pane rename") printf '%s\\t%s\\t%s\\n' "$3" "$4" "$PWD" >> ${shq(panes)}; echo '{}' ;;`,
+        `  "pane close") awk -F'\\t' -v id="$3" '$1 != id' ${shq(panes)} > ${shq(`${panes}.tmp`)}; mv ${shq(`${panes}.tmp`)} ${shq(panes)}; echo '{}' ;;`,
         "  *) echo '{}' ;;",
         "esac",
       ].join("\n"));
@@ -1647,18 +1660,14 @@ describe("resume harvest: an interrupted finished attempt is gated, never redisp
       if (prior === undefined) delete process.env.HERDR_WORKSPACE_ID;
       else process.env.HERDR_WORKSPACE_ID = prior;
       const inner = new SubprocessDriver();
-      // the interrupted attempt's owned name goes through the real HerdrDriver; the recovery dispatch runs headless
-      const herdrSlots = new Set<Slot>();
+      // the interrupted attempt's owned pane is bound through the real HerdrDriver; a recovery dispatch runs headless
+      const adopted = new Set<Slot>();
       const driver: ExecutorDriver = {
         id: "herdr", interactive: false,
-        slot: async (cwd: string, name: string, o?: Parameters<ExecutorDriver["slot"]>[2]) => {
-          if (name !== slot.name) return inner.slot(cwd, name);
-          const s = await herdr.slot(cwd, name, o);
-          herdrSlots.add(s);
-          return s;
-        },
-        read: (s: Slot, lines: number) => herdrSlots.has(s) ? herdr.read(s, lines) : inner.read(s, lines),
-        close: (s: Slot) => herdrSlots.has(s) ? herdr.close(s) : inner.close(s),
+        slot: inner.slot.bind(inner),
+        adopt: async (s: Slot) => { const a = await herdr.adopt(s); adopted.add(a); return a; },
+        read: (s: Slot, lines: number) => adopted.has(s) ? herdr.read(s, lines) : inner.read(s, lines),
+        close: (s: Slot) => adopted.has(s) ? herdr.close(s) : inner.close(s),
         run: inner.run.bind(inner), waitOutput: inner.waitOutput.bind(inner), waitAgentStatus: inner.waitAgentStatus.bind(inner),
         status: inner.status.bind(inner), notify: inner.notify.bind(inner), worktree: inner.worktree.bind(inner),
       } as ExecutorDriver;
@@ -1666,17 +1675,39 @@ describe("resume harvest: an interrupted finished attempt is gated, never redisp
       expect(s.done).toEqual(["T1"]);
       const all = journal.read();
       const post = all.slice(all.findIndex((e) => e.event === "run-resume") + 1);
-      // declined before anything is bound: no pane allocated, renamed, run into or closed
+      // adoption only LISTS and READS: no pane allocated, renamed, run into or closed, whatever the outcome
       const calls = readFileSync(log, "utf8").split("\n").filter(Boolean);
+      expect(calls).toContain("pane list");
       expect(calls.filter((c) => /^(tab (create|close|rename)|pane (split|rename|run|close|send))/.test(c))).toEqual([]);
-      expect(readFileSync(panes, "utf8")).toBe(`w1:pOWNED ${slot.name}\n`);
+      expect(readFileSync(panes, "utf8")).toBe(registry);
       // ...and no dispatch lease is left holding the driver's delivery chain
       let free = false;
       void (herdr as unknown as { deliverySerial: Promise<unknown> }).deliverySerial.then(() => { free = true; });
       await new Promise((r) => setImmediate(r));
       expect(free).toBe(true);
+      if (mode === "matching") {
+        expect(calls.filter((c) => c.startsWith("pane read")).every((c) => c.startsWith("pane read w1:pOWNED "))).toBe(true);
+        expect(calls.some((c) => c.startsWith("pane read"))).toBe(true);
+        const harvests = post.filter((e) => e.event === "worker-result-harvested");
+        expect(harvests).toHaveLength(1);
+        expect(harvests[0]!.data).toMatchObject({ attempt: 0, source: "resume", trailer: true, summary: "t1 finished before the daemon died" });
+        expect(post.find((e) => e.event === "worker-result")!.data).toMatchObject({ finished: true, ok: true, attempt: 0, source: "resume" });
+        expect(post.filter((e) => e.event === "task-dispatch" || e.event === "worker-launch" || e.event === "resume-harvest-declined")).toEqual([]);
+        expect(post.find((e) => e.event === "task-done")!.data.assignment).toEqual(fake2);
+        expect(git(repo, "show", `tickmarkr/${runId}:harvest.txt`)).toBe("finished before the daemon died");
+        expect(() => git(repo, "show", `tickmarkr/${runId}:redo.txt`)).toThrow();
+        continue;
+      }
       const declined = post.findIndex((e) => e.event === "resume-harvest-declined");
-      expect(post[declined]!.data).toEqual({ attempt: 0, reason: "no read-only adoption on this driver" });
+      expect(post[declined]!.data).toEqual({ attempt: 0, reason: {
+        "foreign-nonce": "foreign-nonce",
+        zero: expect.stringMatching(/^pane unreadable: herdr adopt: no pane carries the owned label /),
+        ambiguous: expect.stringMatching(/^pane unreadable: herdr adopt: 2 panes carry the owned label /),
+        "foreign-cwd": expect.stringMatching(/^pane unreadable: herdr adopt: pane w1:pOWNED .* not the task checkout .* — foreign$/),
+        unreadable: expect.stringMatching(/^pane unreadable: herdr pane read w1:pOWNED failed \(exit 1\)/),
+      }[mode] });
+      // a declined adoption never reads a pane it could not prove it owns
+      if (mode !== "foreign-nonce" && mode !== "unreadable") expect(calls.filter((c) => c.startsWith("pane read"))).toEqual([]);
       expect(post.filter((e) => ["worker-result-harvested", "worker-process-reaped"].includes(e.event) && e.data.attempt === 0)).toEqual([]);
       expect(post.some((e) => e.event === "worker-result" && e.data.source === "resume")).toBe(false);
       const dispatches = post.filter((e) => e.event === "task-dispatch");
@@ -1684,5 +1715,5 @@ describe("resume harvest: an interrupted finished attempt is gated, never redisp
       expect(post.indexOf(dispatches[0]!)).toBeGreaterThan(declined);
       expect(git(repo, "show", `tickmarkr/${runId}:redo.txt`)).toBe("redo");
     }
-  }, 90_000);
+  }, 180_000);
 });

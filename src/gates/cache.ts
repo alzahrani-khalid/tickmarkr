@@ -84,8 +84,20 @@ export async function getWorktreeTree(worktree: string): Promise<string> {
   }
 }
 
+/** OBS-635: environment inputs a runner child reads that capacity and lifecycle do not already bind.
+ * ponytail: a named list, not the whole env (pids and terminal vars would defeat every reuse); extend
+ * it when another variable is shown to change what a runner executes. */
+export const RUNNER_ENV_KEYS = ["PATH", "NODE_OPTIONS", "NODE_PATH", "NODE_ENV", "TZ"] as const;
+
+export function runnerInputsHash(env: NodeJS.ProcessEnv = process.env): string {
+  return createHash("sha256").update(canonicalJson(Object.fromEntries(RUNNER_ENV_KEYS.map((k) => [k, env[k] ?? null]))))
+    .digest("hex").slice(0, 16);
+}
+
 export interface GateEnvironmentInput {
   nodeRuntime?: string;
+  /** the runner inputs hash; defaults to this process's (runnerInputsHash) */
+  runner?: string;
   lockfile?: string;
   worktree?: string;
   capacity?: RunCapacity;
@@ -97,6 +109,7 @@ export interface GateEnvironmentInput {
 
 export interface EnvironmentParts {
   nodeRuntime: string;
+  runner: string;
   lockfile: string;
   capacity: RunCapacity;
   selectedSet?: readonly string[];
@@ -105,6 +118,7 @@ export interface EnvironmentParts {
 
 export function environmentFingerprint(env: GateEnvironmentInput): { fingerprint: string; parts: EnvironmentParts } {
   const nodeRuntime = env.nodeRuntime ?? process.version;
+  const runner = env.runner ?? runnerInputsHash();
   const lockfile = env.lockfile ?? (env.worktree ? lockfileHash(env.worktree) : "no-lockfile");
   const cap = env.capacity ?? resolvedCapacity();
   const capacity: RunCapacity = { forkCap: cap.forkCap, cores: cap.cores };
@@ -126,6 +140,7 @@ export function environmentFingerprint(env: GateEnvironmentInput): { fingerprint
   // explicit `false` and an npmrc `false` are the same policy for the child that ran.
   const payload = canonicalJson({
     nodeRuntime,
+    runner,
     lockfile,
     capacity,
     resolution,
@@ -136,7 +151,7 @@ export function environmentFingerprint(env: GateEnvironmentInput): { fingerprint
   const fingerprint = createHash("sha256").update(payload).digest("hex").slice(0, 16);
   return {
     fingerprint,
-    parts: { nodeRuntime, lockfile, capacity, selectedSet, verification },
+    parts: { nodeRuntime, runner, lockfile, capacity, selectedSet, verification },
   };
 }
 
@@ -212,7 +227,7 @@ export function verificationIdentityKey(id: VerificationIdentity): string {
 export function formatReusedDetails(originalDetails: string, id: VerificationIdentity): string {
   const unadorned = originalDetails.replace(/^reused verdict \(identity: [^)]+\):\s*/, "");
   const envDesc = id.envParts
-    ? ` [node=${id.envParts.nodeRuntime}, lockfile=${id.envParts.lockfile}, capacity=${describeCapacity(id.envParts.capacity)}${id.envParts.selectedSet ? `, selected=${id.envParts.selectedSet.join(",")}` : ""}, protocol=${id.envParts.verification.protocol}, lifecycle=${id.envParts.verification.lifecycle} (${id.envParts.verification.source})]`
+    ? ` [node=${id.envParts.nodeRuntime}, runner=${id.envParts.runner}, lockfile=${id.envParts.lockfile}, capacity=${describeCapacity(id.envParts.capacity)}${id.envParts.selectedSet ? `, selected=${id.envParts.selectedSet.join(",")}` : ""}, protocol=${id.envParts.verification.protocol}, lifecycle=${id.envParts.verification.lifecycle} (${id.envParts.verification.source})]`
     : "";
   const gate = id.gate ?? "gate";
   const prefix = `reused ${id.scope === "tip" ? "tip " : ""}verdict (identity: gate=${gate} tree=${id.tree}${id.worktree ? ` worktree=${id.worktree}` : ""} command=${id.command} baseline=${id.baseline} env=${id.environment}${envDesc})`;

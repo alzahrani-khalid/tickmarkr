@@ -1,25 +1,26 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { CommandReceiptAttribution, ShellReceipt } from "../run/protocol.js";
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { loadavg, tmpdir } from "node:os";
 import { join, posix } from "node:path";
-import { type Assignment, type BillingChannel, channelKey, configuredEffort, shq, type WorkerAdapter, type WorkerResult } from "../adapters/types.js";
+import { type Assignment, type AuthHealth, type BillingChannel, channelKey, configuredEffort, shq, type WorkerAdapter, type WorkerResult } from "../adapters/types.js";
 import { type TickmarkrConfig, TIER_RANK } from "../config/config.js";
 import { getAdapter } from "../adapters/registry.js";
 import { type Effort, GATE_NAMES, type GateName, type Task } from "../graph/schema.js";
-import { acceptanceGate } from "./acceptance.js";
+import { acceptanceGate, type JudgedCriterion } from "./acceptance.js";
 import { type Baseline, type RetryOptions, type GateEvidenceOptions, compareToBaseline, effectiveCeilingMs, waitForCalmWindow, calmWindowReady } from "./baseline.js";
 import { evidenceGate } from "./evidence.js";
 import { captureLlmOutput, type GateVia } from "./llm.js";
-import { disallowedBy } from "../route/preference.js";
+import type { Slot } from "../drivers/types.js";
+import { disallowedBy, observedSeat } from "../route/preference.js";
 import { marginalCostRank } from "../route/router.js";
 import { carriedAuthorVendors, gateReviewerFloor, pickReviewer, type PriorReviewer, reviewGate } from "./review.js";
 import { scopeGate } from "./scope.js";
-import { evaluateManifestedTest, isVitestTestCommand } from "./test-manifest.js";
+import { discoverTestManifest, evaluateManifestedTest, isVitestTestCommand, VITEST_CACHE_ENV, worktreeVitestCache } from "./test-manifest.js";
 import type { GateResult } from "./types.js";
 import { executionSignal } from "../run/execution-budget.js";
 import { failureDisposition, type VerificationRetryCause } from "../run/recovery.js";
-import { dependencyLinkRefusal, preserveWorktree, type PreserveProducer, producerFields, shGit, resolvedCapacity, verificationProtocol } from "../run/git.js";
+import { dependencyLinkRefusal, FORK_CAP_ENV, preserveWorktree, type PreserveProducer, producerFields, ROUTING_ENV_SEAMS, shGit, resolvedCapacity, SUITE_PARENT_ENV, verificationProtocol } from "../run/git.js";
 import { type StructuredFinding, type JudgeInvocationEvidence, withJudgeInvocationEvidence } from "../run/journal.js";
 import {
   computeVerificationIdentity,
@@ -178,12 +179,16 @@ export interface GateContext {
   // v1.87 T2: the judge-role pool for the GATE-09 failover pick. Absent means no alternate seat;
   // the configured judge remains the only truthful fallback and review channels are never judges.
   judgeChannels?: BillingChannel[];
+  /** OBS-1186: doctor's cached verdict — the observed identity of the configured judge seat. Absent ⇒ unknown (conservative deny). */
+  health?: Record<string, AuthHealth> | null;
   adapters: WorkerAdapter[];
   cfg: TickmarkrConfig;
   via?: GateVia; // v1.1: present → judge/review run as visible named agents through the driver
   carriedFindings?: readonly StructuredFinding[];
   /** Approval reason bound to this attempt; guidance, never criterion or closure authority. */
   operatorContext?: string;
+  /** OBS-1151: this task's earlier parsed judgments, newest first (the journal's, so they survive resume). */
+  priorJudgments?: readonly PriorJudgment[];
   excludeReviewers?: string[]; // v1.1: reviewer channels that produced garbage for this task (failover)
   demotedReviewers?: Set<string>;
   // OBS-1025 add.2: run-scoped no-verdict causes per reviewer seat; a seat at two leaves the rotation for the run.
@@ -191,8 +196,9 @@ export interface GateContext {
   // OBS-1055: this round is an operator recheck — it re-MEASURES, so a cached RED verdict is discarded
   // and the gate re-runs (a cached green is not what the recheck questions and may replay).
   recheck?: boolean;
-  /** Explicit worker funding requires fresh red measurements, never a gate waiver. */
-  cachedRedBypass?: "operator-rerun";
+  /** Explicit worker funding requires fresh red measurements, never a gate waiver. OBS-1106: so does
+   * a retry that landed nothing on a timeout-class red — its one fresh re-observation. */
+  cachedRedBypass?: "operator-rerun" | "timeout-fresh";
   // OBS-1033: channel keys of the seats that authored the carried commits (the task's tried list) —
   // a reviewer of that vendor is excluded for the round, never handed its own work to approve.
   carriedAuthors?: readonly string[];
@@ -335,6 +341,38 @@ export function testCommandForFiles(testCmd: string, files: string[]): string {
   return `${testCmd}${fwd} ${files.map(shq).join(" ")}`;
 }
 
+/** OBS-635: a screen costing at least this share of the full suite runs the full suite instead. */
+export const SCREEN_PROMOTION_RATIO = 0.75;
+
+/**
+ * The screen's share of the full suite's cost, from the per-file durations the harness measured at
+ * baseline capture — never a worker's timing. Undefined (unknown) unless every selected file has a
+ * measured duration and the measured total is positive; unknown keeps the conservative screen path.
+ */
+export function screenCostRatio(baseline: Baseline, selected: readonly string[]): number | undefined {
+  const entry = baseline.commands.test;
+  const files = entry?.infra ? undefined : entry?.fileDurations;
+  if (!files?.length) return undefined;
+  const cost = new Map(files.map((f) => [f.file, f.durationMs]));
+  const total = files.reduce((sum, f) => sum + f.durationMs, 0);
+  if (!(total > 0) || selected.some((file) => !cost.has(file))) return undefined;
+  return selected.reduce((sum, file) => sum + cost.get(file)!, 0) / total;
+}
+
+/** OBS-635: the full manifest the runner lists NOW, under the environment evaluateManifestedTest's own
+ * discovery receives (test-manifest.ts manifestEnvironment), so it compares with the one a verdict
+ * certified. Undefined when the runner cannot list — an unlisted manifest certifies nothing. */
+async function listFullManifest(cmd: string, worktree: string): Promise<string[] | undefined> {
+  const env: NodeJS.ProcessEnv = { ...process.env, PATH: `${join(worktree, "node_modules/.bin")}:${process.env.PATH ?? ""}`,
+    [VITEST_CACHE_ENV]: worktreeVitestCache(worktree),
+    [FORK_CAP_ENV]: String(resolvedCapacity().forkCap), [SUITE_PARENT_ENV]: String(process.pid) };
+  for (const key of [...ROUTING_ENV_SEAMS, "VITEST", "TEST", "VITEST_WORKER_ID", "VITEST_POOL_ID"]) delete env[key];
+  const dir = mkdtempSync(join(tmpdir(), "tickmarkr-full-manifest-"));
+  try {
+    return (await discoverTestManifest(cmd, worktree, { dir, nonce: randomUUID(), env })).files;
+  } catch { return undefined; } finally { rmSync(dir, { recursive: true, force: true }); }
+}
+
 /** The manifest-report path for a detected vitest test command — never the stdout-count/file-count path. */
 async function runVitestManifestGate(
   worktree: string,
@@ -377,6 +415,27 @@ async function runVitestManifestGate(
   };
 }
 
+/** A retry base no runner invocation parses. evaluateManifestedTest builds its stranded single-fork
+ * retry from the base it is handed, and one it cannot parse throws before any spawn — so this base
+ * disables that inner recovery: a worker-RPC-stranded re-observation comes back infra (the caller
+ * parks it as ambiguous) instead of launching a second execution. */
+export const REOBSERVATION_RETRY_BASE = "tickmarkr-reobservation-refuses-stranded-retry";
+
+/** OBS-1106 residual: ONE isolated re-observation of a timeout-shaped red's attributed failing files on
+ * the same checkout, narrowed exactly as a screen is. Never cached and never a verdict: the caller
+ * keeps the original red and reads this only to decide whether that red is chargeable. Exactly one
+ * execution — the bounded infra/host-starved retries and the stranded single-fork recovery are all
+ * refused, so a diagnostic never buys more. */
+export async function reobserveTestFiles(worktree: string, testCmd: string, baseline: Baseline, files: string[], artifactDir?: string): Promise<GateResult> {
+  const cmd = testCommandForFiles(testCmd, files);
+  if (!isVitestTestCommand(testCmd, worktree))
+    return (await compareToBaseline(worktree, { test: cmd }, baseline, ["test"], { selected: files, authorizeRetry: () => false }))[0]!;
+  const r = await runVitestManifestGate(worktree, cmd, baseline, files, artifactDir, { retryBaseCommand: REOBSERVATION_RETRY_BASE });
+  // fail closed whatever a recovery did: a re-observation never reads a recovered verdict
+  return r.meta?.recovery === undefined ? r
+    : { ...r, pass: false, meta: { ...r.meta, classification: "infra", infra: true, retryable: false, recoveryRefused: true } };
+}
+
 const SIGNAL_EXIT_RE = /\b(?:SIGTERM|SIGKILL|signal\s+(?:9|15)|exit(?:s|ed|\s+code)?\s+(?:137|143))\b/i;
 const FAILURE_IDENTITY_RE = /\b(?:AssertionError|FAIL\s+\S|Tests?\s+\d+\s+failed|expected\s+.+\s+to\s+)\b/i;
 
@@ -390,6 +449,57 @@ function classifySignalOnlyTest(g: GateResult): void {
   g.meta = { ...g.meta, classification: "infra", infra: true, retryable: false, kind: "signal-exit" };
 }
 
+/** OBS-1151: one parsed judgment as the journal keeps it — the judged commit, the seat, and per criterion
+ * its subject key, ruling and cited paths. Never a verdict to reuse: only a subject to compare against. */
+export interface PriorJudgment {
+  commit: string;
+  judge?: string;
+  criteria: ReadonlyArray<{ id: string; key: string; met: boolean; paths: readonly string[] }>;
+}
+
+/** OBS-1151: a criterion's comparable subject — its canonical text, the task's declared bounds and the
+ * operator context. The cited files' blobs are compared separately, over the union of both citations. */
+export function judgmentSubjectKey(task: Pick<Task, "files" | "outOfScope">, criterion: string, operatorContext?: string): string {
+  return createHash("sha256").update(JSON.stringify([criterion, [...task.files].sort(), [...(task.outOfScope ?? [])].sort(), operatorContext ?? ""])).digest("hex");
+}
+
+async function blobAt(worktree: string, commit: string, path: string): Promise<string | undefined> {
+  const r = await shGit(`git rev-parse --verify --quiet ${shq(`${commit}:${path}`)}`, worktree);
+  return r.code === 0 && r.stdout.trim() ? r.stdout.trim() : undefined;
+}
+
+export interface JudgeContradiction { id: string; met: boolean; priorMet: boolean; priorCommit: string; paths: string[] }
+
+/** OBS-1151: the criteria whose fresh ruling reverses the newest prior ruling on the same subject key whose
+ * cited paths hold the identical blob at both commits (older comparable priors are still found behind a
+ * newer prior on different blobs). A citation-less side or an
+ * unreadable blob is unknown, never identical — that criterion's fresh ruling is simply fresh. */
+export async function judgeContradictions(
+  worktree: string, head: string,
+  fresh: PriorJudgment["criteria"], priors: readonly PriorJudgment[],
+): Promise<JudgeContradiction[]> {
+  const found: JudgeContradiction[] = [];
+  for (const c of fresh) {
+    if (!c.paths.length) continue;
+    // C-3 (D-669): the comparable prior is the NEWEST one on identical cited blobs, not the newest one
+    // carrying the key — PASS(A) → FAIL(B) → fresh FAIL(A) must still be adjudicated against PASS(A).
+    for (const prior of priors) {
+      const was = prior.criteria.find((q) => q.key === c.key);
+      if (!was || !was.paths.length) continue;
+      const paths = [...new Set([...was.paths, ...c.paths])].sort();
+      let identical = true;
+      for (const path of paths) {
+        const [before, now] = await Promise.all([blobAt(worktree, prior.commit, path), blobAt(worktree, head, path)]);
+        if (!before || !now || before !== now) { identical = false; break; }
+      }
+      if (!identical) continue;
+      if (was.met !== c.met) found.push({ id: c.id, met: c.met, priorMet: was.met, priorCommit: prior.commit, paths });
+      break;
+    }
+  }
+  return found;
+}
+
 export async function runGates(
   task: Task,
   ctx: GateContext,
@@ -399,6 +509,8 @@ export async function runGates(
     artifactDir: ctx.artifactDir,
     runId: ctx.buildReceiptIdentity?.runId ?? ctx.artifactDir ?? "standalone",
     taskId: task.id, attempt: ctx.buildReceiptIdentity?.attempt ?? 0,
+    // OBS-1140: task and standalone gates honour the configured quota, not the built-in default.
+    quotaBytes: ctx.cfg.gates?.evidenceQuotaBytes,
     ...ctx.evidence,
   };
   // Receipt identity belongs to this round, never to a cached verdict. Each call from the shell
@@ -435,6 +547,9 @@ export async function runGates(
     await receiptNotes;
   };
   let selectionDecision: Record<string, unknown> | undefined;
+  // OBS-635: the identity a full suite measured inside the battery, revalidated after semantics.
+  let fullInBattery = false;
+  let batteryFullIdentity: VerificationIdentity | undefined;
   let commits: string[] = [];
   // Check before cache identity, npm policy probes, or any gate command.
   const dependencyRefusal = dependencyLinkRefusal(ctx.worktree);
@@ -467,6 +582,26 @@ export async function runGates(
     await ctx.onGate?.({ phase: "note", gate, name: reason === "recheck" ? "recheck-rerun" : "gate-rerun",
       payload: { gate, reason: "cached-red-discarded", ...(reason === "recheck" ? {} : { bypass: reason }) }, result: hit });
     return true;
+  };
+  // OBS-1168(c): every judge/review seat this round opens, so a failed sibling can cancel the other.
+  // A cancelled round dispatches, re-routes and publishes nothing more; its closed seats' own errors
+  // are consequences of the cancel, never a second failure.
+  // A seat whose creation was still pending at the cancel is refused before dispatch: onSlot runs inside
+  // llm.ts's launch guard, so the throw closes (and awaits) that half-launched pane and never runs it.
+  const semanticSlots = new Set<Slot>();
+  const closing: Promise<unknown>[] = [];
+  const via: GateVia | undefined = ctx.via && {
+    ...ctx.via, onSlot: (slot) => {
+      semanticSlots.add(slot);
+      ctx.via!.onSlot?.(slot);
+      if (cancelled) throw new Error("semantic round cancelled before dispatch");
+    },
+  };
+  let cancelled = false;
+  const cancelSemantic = () => {
+    if (cancelled) return;
+    cancelled = true;
+    for (const slot of semanticSlots) closing.push(via!.driver.close(slot).catch(() => {}));
   };
   const shapeGates = ctx.cfg.gates.byShape?.[task.shape];
   const enabled = (g: GateName) =>
@@ -781,6 +916,28 @@ export async function runGates(
     };
   };
 
+  const fullTestIdentity = () => computeVerificationIdentity({
+    worktree: ctx.worktree,
+    gate: "test",
+    scope: ctx.verificationScope,
+    command: ctx.commands.test!,
+    baseline: ctx.baseline,
+    selectedSet: undefined,
+    capacity: resolvedCapacity(),
+  });
+  // OBS-635: a full green answers only for the manifest it certified. The tree identity cannot see an
+  // ignored generated test the runner would collect, so every full-green reuse rediscovers the
+  // runner's listing and requires the verdict's to equal it; a runner without a listing is bound by
+  // its identity alone. Reads before the semantic gates share one listing; `listing` resets after them.
+  let listing: Promise<string[] | undefined> | undefined;
+  const certifiesFullManifest = async (verdict: { pass: boolean; meta?: Record<string, unknown> }): Promise<boolean> => {
+    if (!verdict.pass || !isVitestTestCommand(ctx.commands.test!, ctx.worktree)) return true;
+    const certified = verdict.meta?.manifest;
+    const current = await (listing ??= listFullManifest(ctx.commands.test!, ctx.worktree));
+    return Array.isArray(certified) && current !== undefined
+      && certified.length === current.length && [...certified].sort().every((file, i) => file === current[i]);
+  };
+
   // shell tools vs the shared baseline
   const retryOptions = (identity: VerificationIdentity | undefined): RetryOptions => ctx.authorizeInfraRetry
     ? { authorizeRetry: (cause) => ctx.authorizeInfraRetry!(identity ? verificationIdentityKey(identity) : "",
@@ -810,7 +967,7 @@ export async function runGates(
         const hit = verdictStore.get(identity);
         if (hit) classifySignalOnlyTest(hit); // Older entries predate classification at the write seam.
         if (hit && identity && !isInfraResult(hit) && (hit.pass || (ctx.verificationScope ?? "battery") === "battery")
-            && !(await discardCachedRed(g, hit))) {
+            && !(await discardCachedRed(g, hit)) && (g !== "test" || selected !== undefined || await certifiesFullManifest(hit))) {
           r = formatReusedRow(hit, identity);
           cached = true;
           if (g === "build") await noBuild("reused-result", "verdict reused; no fresh build ran in this invocation");
@@ -831,6 +988,10 @@ export async function runGates(
       }
       // the screen's interval IS the test gate's first interval, so the split needs no second clock
       if (g === "test" && selected) selectedDurationMs = spans.get("test")?.durationMs ?? 0;
+      if (g === "test" && !selected) {
+        fullInBattery = true;
+        batteryFullIdentity = identity;
+      }
       // The pre-battery check proves the tree clean ONCE; a command that exits 0 having rewritten a
       // tracked file makes it dirty again, and every gate after it — including the next shell gate,
       // which would then run against bytes HEAD does not hold — inherits that. So re-check after each
@@ -938,7 +1099,9 @@ export async function runGates(
     // v1.87 T2: the judge is a configured seat like any other — check it against the operator's
     // policy BEFORE spending a dispatch on it. disallowedBy carries the whole deny grammar (adapter,
     // model, or adapter:model), so a model-scoped deny cannot slip past an adapter-id-only read.
-    const judgeDenied = disallowedBy({ adapter: ctx.cfg.judge.adapter, model: ctx.cfg.judge.model }, ctx.cfg.routing, "judge");
+    // OBS-1186: under the exact cached identity of that channel, as compile, doctor and route read it.
+    const judgeSeat = observedSeat(ctx.health, ctx.cfg.judge.adapter, ctx.cfg.judge.model);
+    const judgeDenied = disallowedBy(judgeSeat, ctx.cfg.routing, "judge");
     if (judgeDenied) {
       return {
         result: {
@@ -951,8 +1114,8 @@ export async function runGates(
       };
     }
     const judgeAdapter = getAdapter(ctx.cfg.judge.adapter, ctx.adapters);
-    const jvia = ctx.via
-      ? { driver: ctx.via.driver, keep: ctx.via.keep, onSlot: ctx.via.onSlot, name: ctx.via.nameFor("judge", judgeAdapter.id), label: ctx.via.labelFor("judge") }
+    const jvia = via
+      ? { driver: via.driver, keep: via.keep, onSlot: via.onSlot, name: via.nameFor("judge", judgeAdapter.id), label: via.labelFor("judge") }
       : undefined;
     // v1.19 (T2): testCmd threads the detected test runner to the gate so named-test oracles run
     // deterministically (filtered via -t) before any LLM judge dispatch.
@@ -998,6 +1161,51 @@ export async function runGates(
       }
       return captured.value;
     };
+    const judgePool = () => (ctx.judgeChannels ?? []).filter((c) => disallowedBy(c, ctx.cfg.routing, "judge") === null);
+    const rankJudges = (pool: BillingChannel[]) => [...pool]
+      .sort((x, y) => TIER_RANK[y.tier] - TIER_RANK[x.tier] || marginalCostRank(x) - marginalCostRank(y));
+    // OBS-1151 (+add.1): the fresh judgment always stands on its own reading — a prior PASS is never
+    // reused. Only a criterion that REVERSES the newest prior ruling on the same subject key over
+    // identical cited blobs needs a second, distinct judge; agreement stands (a sound FAIL included),
+    // and a split, no distinct eligible seat or an unreadable adjudication parks for the operator.
+    const adjudicate = async (fresh: GateResult): Promise<GateResult> => {
+      const primary = String(fresh.meta?.judge ?? channelKey({ adapter: ctx.cfg.judge.adapter, model: ctx.cfg.judge.model }));
+      const head = await shGit("git rev-parse HEAD", ctx.worktree);
+      const commit = head.code === 0 ? head.stdout.trim() : "";
+      const criteria = (fresh.meta!.judgment as JudgedCriterion[]).map((c) => ({
+        id: c.id, key: judgmentSubjectKey(task, c.criterion, ctx.operatorContext), met: c.met, paths: c.paths,
+      }));
+      const record: PriorJudgment = { commit, judge: primary, criteria };
+      const stamped: GateResult = { ...fresh, meta: { ...fresh.meta, judgment: record } };
+      if (!commit || !ctx.priorJudgments?.length) return commit ? stamped : { ...fresh, meta: { ...fresh.meta, judgment: undefined } };
+      const disputed = await judgeContradictions(ctx.worktree, commit, criteria, ctx.priorJudgments);
+      if (!disputed.length) return stamped;
+      await ctx.onGate?.({ phase: "note", gate: "acceptance", name: "judge-disagreement", payload: { primary, commit, disputed } });
+      const park = (why: string, adjudicator?: string): GateResult => ({
+        gate: "acceptance", pass: false,
+        details: `judge disagreement on ${disputed.map((d) => d.id).join(", ")}: ${primary} reverses an earlier ruling over identical cited blobs (${[...new Set(disputed.flatMap((d) => d.paths))].join(", ")}) — ${why}; parked for an operator ruling, no worker charge`,
+        meta: { classification: "infra", infra: true, retryable: false, cause: "judge-disagreement", judge: primary,
+          judgeDisagreement: { primary, ...(adjudicator ? { adjudicator } : {}), disputed, outcome: why } },
+      });
+      const primaryAdapter = primary.slice(0, primary.indexOf(":"));
+      // One DISTINCT seat: never the primary channel, a different adapter when the pool has one.
+      const pool = judgePool().filter((c) => channelKey(c) !== primary);
+      const seat = rankJudges(pool.filter((c) => c.adapter !== primaryAdapter))[0] ?? rankJudges(pool)[0];
+      if (!seat) return park("no distinct eligible judge is available");
+      const adjudicator = channelKey(seat);
+      const seatAdapter = getAdapter(seat.adapter, ctx.adapters);
+      const seatVia = via
+        ? { driver: via.driver, keep: via.keep, onSlot: via.onSlot, name: via.nameFor("judge", seatAdapter.id) + "-r2", label: via.labelFor("judge") }
+        : undefined;
+      const second = await invokeJudge(seatAdapter, seat.model, seatVia, configuredEffort(ctx.cfg, seat));
+      const rulings = Array.isArray(second.meta?.judgment) ? second.meta.judgment as JudgedCriterion[] : undefined;
+      // A citation-less ruling cannot be compared, so it confirms nothing (invented evidence is already unparseable,
+      // and an internally inconsistent verdict carries no judgment rows at all).
+      if (second.meta?.unparseable === true || !rulings) return park("the adjudicating judge returned no readable verdict", adjudicator);
+      const agreed = disputed.every((d) => rulings.some((r) => r.id === d.id && r.met === d.met && r.paths.length > 0));
+      if (!agreed) return park("the adjudicating judge split from the fresh ruling", adjudicator);
+      return { ...stamped, meta: { ...stamped.meta, adjudication: { primary, adjudicator, criteria: disputed.map((d) => d.id), agreed: true } } };
+    };
     // OBS-1182: every judge seat launches at its OWN configured effort, never the worker's.
     let a = await invokeJudge(judgeAdapter, ctx.cfg.judge.model, jvia, configuredEffort(ctx.cfg, ctx.cfg.judge));
     // GATE-09: an unparseable judge verdict retries the JUDGE exactly once on a failover channel — never
@@ -1013,7 +1221,7 @@ export async function runGates(
     // If no other adapter is live, the exclusion degrades to a channel-level reroute within the same
     // adapter so a single-adapter fleet still retries (matching the daemon's unknown-excludeAdapter
     // degradation path).
-    if (a.meta?.unparseable === true && typeof a.meta.judge === "string") {
+    if (!cancelled && a.meta?.unparseable === true && typeof a.meta.judge === "string") {
       const flakedKey = a.meta.judge;
       const flakedAdapter = flakedKey.slice(0, flakedKey.indexOf(":"));
       const pick = (pool: BillingChannel[]) => pool
@@ -1027,17 +1235,21 @@ export async function runGates(
       const sameAdapter = pick(judgePool.filter((c) => c.adapter === flakedAdapter && channelKey(c) !== flakedKey));
       // Prefer a different adapter; if the fleet only has one adapter, retry on a different channel of
       // that adapter; if the fleet has only one channel, fall back to the original judge config.
-      const retry = crossAdapter ?? sameAdapter ?? { adapter: ctx.cfg.judge.adapter, model: ctx.cfg.judge.model };
+      const retry = crossAdapter ?? sameAdapter ?? judgeSeat;
       const retryAdapter = getAdapter(retry.adapter, ctx.adapters);
-      const retryJvia = ctx.via
+      const retryJvia = via
         // unconditional -r1 suffix: under keepPanes:forever a same-channel retry cannot collide with the
         // still-open first pane (herdr agent_name_taken regression, research Pitfall 4)
-        ? { driver: ctx.via.driver, keep: ctx.via.keep, onSlot: ctx.via.onSlot, name: ctx.via.nameFor("judge", retryAdapter.id) + "-r1", label: ctx.via.labelFor("judge") }
+        ? { driver: via.driver, keep: via.keep, onSlot: via.onSlot, name: via.nameFor("judge", retryAdapter.id) + "-r1", label: via.labelFor("judge") }
         : undefined;
       // the retry IS a second acceptanceGate call: one code path, one parser, zero new parse leniency.
       a = await invokeJudge(retryAdapter, retry.model, retryJvia, configuredEffort(ctx.cfg, retry));
       a = { ...a, meta: { ...a.meta, judgeRetry: { flaked: flakedKey, retried: channelKey({ adapter: retry.adapter, model: retry.model }) } } };
     }
+    // OBS-1168(b): the re-routed seat could not launch either — no seat produced a verdict, so this is
+    // an infra park over whatever the deterministic gates proved, never a charge against the worker.
+    if (a.meta?.cause === "seat-launch-failed") a = { ...a, meta: { ...a.meta, classification: "infra", infra: true, retryable: false } };
+    else if (!cancelled && Array.isArray(a.meta?.judgment)) a = await adjudicate(a);
     // No dispatch, no key: a deterministic-oracle round writes no `invocations` field rather than an
     // empty array a reader could mistake for "measured, and it cost nothing".
     return { result: invocationSpans.length ? { ...a, meta: { ...a.meta, invocations: invocationSpans } } : a, invocations };
@@ -1057,6 +1269,7 @@ export async function runGates(
       const captured = await captureLlmDispatches(ctx.adapters, run);
       invocations.push(...captured.invocations);
       const rv = captured.value;
+      if (cancelled) return rv; // a cancelled seat's non-answer says nothing about the seat
       if (rv.meta?.noVerdict === true || rv.meta?.unparseable === true) {
         await ctx.onGate?.({ phase: "note", gate: "review", name: "review-no-verdict", payload: { ...rv.meta }, result: rv });
         if (typeof rv.meta.reviewer === "string") {
@@ -1086,7 +1299,7 @@ export async function runGates(
     const priorReviewers = [...(ctx.priorReviewers ?? []), ...(ctx.excludeReviewers ?? [])];
     const carriedAuthors = ctx.carriedAuthors ?? [];
     let exclusions = [...(ctx.excludeReviewers ?? []), ...retired];
-    let rv = await dispatch((adapters) => reviewGate(task, ctx.worktree, ctx.baseRef, ctx.author, ctx.channels, adapters, ctx.cfg, ctx.via, exclusions, ctx.artifactDir, ctx.reviewHistory, ctx.demotedReviewers, ctx.carriedFindings, priorReviewers, carriedAuthors, ctx.operatorContext));
+    let rv = await dispatch((adapters) => reviewGate(task, ctx.worktree, ctx.baseRef, ctx.author, ctx.channels, adapters, ctx.cfg, via, exclusions, ctx.artifactDir, ctx.reviewHistory, ctx.demotedReviewers, ctx.carriedFindings, priorReviewers, carriedAuthors, ctx.operatorContext));
     // OBS-193/574: an unparseable review verdict retries the REVIEW, preferring a different adapter. Only
     // a single-adapter eligible pool may fall back to another channel on the flaked adapter. The flaked
     // verdict never enters results; an exhausted pool preserves its cause.
@@ -1096,9 +1309,32 @@ export async function runGates(
     let retryPrior = [...priorReviewers];
     const routes: string[] = [];
     let hop = 0;
-    while ((rv.meta?.unparseable === true || rv.meta?.noVerdict === true) && typeof rv.meta.reviewer === "string") {
+    // OBS-1196: seats already re-asked after a malformed verdict — once per seat, so never unbounded.
+    const reemitted = new Set<string>();
+    while (!cancelled && (rv.meta?.unparseable === true || rv.meta?.noVerdict === true) && typeof rv.meta.reviewer === "string") {
       hop++;
       const flaked = rv.meta.reviewer;
+      const retryVia = via
+        ? { ...via, nameFor: (role: "judge" | "review", adapter: string) => via!.nameFor(role, adapter) + `-r${hop}` }
+        : undefined;
+      // OBS-1196: a malformed (unparseable) verdict is a delivery defect of THIS seat, not a reason to drop it. Ask the
+      // same seat once more on the same subject; reviewGate mints a fresh nonce, so only a new, whole,
+      // nonce-bound verdict can answer — the malformed bytes are never salvaged into one.
+      if (rv.meta.cause === "malformed-verdict" && rv.meta.closureInvalid !== true && !reemitted.has(flaked)) {
+        reemitted.add(flaked);
+        const others = ctx.channels.map(channelKey).filter((key) => key !== flaked);
+        const again = await dispatch((adapters) => reviewGate(
+          task, ctx.worktree, ctx.baseRef, ctx.author, ctx.channels, adapters, ctx.cfg,
+          retryVia, others, ctx.artifactDir, ctx.reviewHistory, ctx.demotedReviewers, ctx.carriedFindings, retryPrior, carriedAuthors, ctx.operatorContext,
+        ));
+        if (again.meta?.noEligibleReviewer !== true) {
+          await ctx.onGate?.({ phase: "note", gate: "review", name: "review-reemission", payload: { reviewer: flaked, cause: "malformed-verdict",
+            delivered: again.meta?.unparseable !== true && again.meta?.noVerdict !== true }, result: again });
+          routes.push(`review re-emission (same seat, fresh nonce): ${flaked} produced a malformed verdict; asked once more`);
+          rv = { ...again, details: `${routes.join("\n")}\n${again.details}`, meta: { ...again.meta, reviewReemission: { reviewer: flaked } } };
+          continue;
+        }
+      }
       const emptyOutput = rv.meta.cause === "empty-output";
       if (emptyOutput) {
         await ctx.onGate?.({
@@ -1107,9 +1343,6 @@ export async function runGates(
           result: { ...rv, meta: { ...rv.meta, skipped: true } },
         });
       }
-      const retryVia = ctx.via
-        ? { ...ctx.via, nameFor: (role: "judge" | "review", adapter: string) => ctx.via!.nameFor(role, adapter) + `-r${hop}` }
-        : undefined;
       const flakedAdapter = flaked.slice(0, flaked.indexOf(":"));
       const adapterExclusions = ctx.channels.filter((c) => c.adapter === flakedAdapter).map(channelKey);
       // RF-1: the retry filters by the floor reviewGate resolves — author tier, task floor, review.floor
@@ -1148,11 +1381,14 @@ export async function runGates(
         break;
       }
     }
-    if (rv.meta?.noVerdict === true) {
+    if (rv.meta?.noVerdict === true
+        || (rv.meta?.unparseable === true && rv.meta.closureInvalid !== true && typeof rv.meta.reviewer === "string")) {
       // Terminal: every eligible seat returned no verdict. The carried materials stay open — an infra
       // row is not a passing review — and the sibling judge result is untouched beside it.
+      // OBS-1196: an exhausted pool of UNDELIVERED (unparseable) verdicts is the same non-verdict: an infra
+      // park, never a worker retry. A delivered verdict that breaks the closure protocol keeps its path.
       const carried = (ctx.carriedFindings ?? []).filter((f) => f.class === "review:material").map((f) => f.fingerprint);
-      rv = { ...rv, meta: { ...rv.meta, classification: "infra", infra: true, carriedFindings: carried } };
+      rv = { ...rv, meta: { ...rv.meta, noVerdict: true, classification: "infra", infra: true, carriedFindings: carried } };
     }
     return invocations.length ? { ...rv, meta: { ...rv.meta, invocations } } : rv;
   };
@@ -1207,10 +1443,23 @@ export async function runGates(
       selectionReason = "required-repair-test-unavailable";
     } else selected = [...new Set([...selected, ...required])].sort();
   }
-  if (ctx.selectionReason) selectionDecision = {
-    scope: selected ? "selected" : "full", reason: selected ? selectionReason
-      : selectionReason === "known-failing-files" ? "unsupported-selection-full-suite" : selectionReason,
+  // OBS-635: a screen buys nothing when the full suite that must follow it already has a qualified
+  // green on this exact identity (read BEFORE any screen), or when the harness-measured screen costs
+  // at least 75 % of it — then the full suite runs in the battery instead. Unknown timing keeps the
+  // screen. A selected-only green never answers here: its identity names its selection.
+  let promotion: { reason: string; costRatio?: number } | undefined;
+  if (selected) {
+    const hit = verdictStore.get(await fullTestIdentity());
+    const costRatio = screenCostRatio(ctx.baseline, selected);
+    if (hit?.pass === true && !isInfraResult(hit) && await certifiesFullManifest(hit)) promotion = { reason: "full-green-cache" };
+    else if (costRatio !== undefined && costRatio >= SCREEN_PROMOTION_RATIO) promotion = { reason: "screen-cost-promoted", costRatio };
+    if (promotion) selected = undefined;
+  }
+  if (ctx.selectionReason || promotion) selectionDecision = {
+    scope: selected ? "selected" : "full", reason: promotion?.reason ?? (selected ? selectionReason
+      : selectionReason === "known-failing-files" ? "unsupported-selection-full-suite" : selectionReason),
     requiredFiles: [...(ctx.requiredRepairTests ?? [])],
+    ...(promotion?.costRatio !== undefined ? { costRatio: promotion.costRatio } : {}),
   };
   await runBattery(selected ? { ...ctx.commands, test: testCommandForFiles(ctx.commands.test!, selected) } : ctx.commands,
     selected, enabled("test") ? ["test"] : []);
@@ -1233,17 +1482,59 @@ export async function runGates(
     // enough: an acceptance-first await withholds a completed review behind a slow/hung judge and a
     // process death can lose that already-earned verdict. The returned result is still sorted into
     // GATE_NAMES order by done(); the event stream truthfully records each independent completion.
-    const judged = judging?.then((outcome) =>
-      withJudgeInvocationEvidence(outcome.invocations, () => record(outcome.result)));
-    const reviewed = reviewing?.then((outcome) => record(outcome));
-    if (executionSignal()) {
-      // A cancelled sibling still owns a process until it unwinds; do not settle the task early.
-      const settled = await Promise.allSettled([judged, reviewed]);
-      const rejected = settled.find((result) => result.status === "rejected");
-      if (rejected?.status === "rejected") throw rejected.reason;
-      executionSignal()?.throwIfAborted();
-    } else await Promise.all([judged, reviewed]);
+    // OBS-1168(c): a sibling that throws, or that ends seatless (no seat could launch, so the round can
+    // only park infra), cancels the other — its seats are closed — and the round still AWAITS it, with
+    // or without an execution policy, so no verdict of a settled round publishes after its engagement.
+    const seatless = (r: GateResult) => r.meta?.cause === "seat-launch-failed" && r.meta?.infra === true;
+    let failure: { reason: unknown } | undefined;
+    const fail = (reason: unknown) => {
+      if (!cancelled) failure ??= { reason };
+      cancelSemantic();
+    };
+    const judged = judging?.then(async (outcome) => {
+      if (cancelled) return;
+      await withJudgeInvocationEvidence(outcome.invocations, () => record(outcome.result));
+      if (seatless(outcome.result)) cancelSemantic();
+    }).catch(fail);
+    const reviewed = reviewing?.then(async (outcome) => {
+      if (cancelled) return;
+      await record(outcome);
+      if (seatless(outcome)) cancelSemantic();
+    }).catch(fail);
+    // ponytail: a headless seat has no slot to close; it is awaited to its own timeout, never abandoned.
+    await Promise.all([judged, reviewed]);
+    await Promise.all(closing);
+    if (failure) throw failure.reason;
+    executionSignal()?.throwIfAborted();
     if (failed()) return done();
+  }
+
+  // OBS-635: the semantic gates ran oracles and vendor CLIs in this worktree after an in-battery full
+  // suite spoke, and its green stands only for the identity it measured. Oracle dirt withdraws it; a
+  // changed or unmeasurable identity — tree, command, baseline, environment, dependency resolution,
+  // capacity, protocol, lifecycle, full manifest — buys a fresh merge-candidate suite below.
+  let rerunFull = false;
+  listing = undefined;
+  if (fullInBattery && ctx.commands.test !== undefined && (enabled("acceptance") || enabled("review"))) {
+    const dirt = await dirtyWorktree();
+    if (dirt) {
+      const refusal = withTelemetry(await dirtyRoundRefusal("test", dirt));
+      results[results.findIndex((r) => r.gate === "test")] = refusal;
+      await ctx.onGate?.({ phase: "end", gate: "test", result: refusal });
+      return done();
+    }
+    const now = await fullTestIdentity();
+    // D-598: an unmeasurable lifecycle on either side is not comparable to anything (VerdictStore R41
+    // refuses it); two `unknown`s hashing equal is not an unchanged identity, so the suite reruns.
+    const measurable = (id: VerificationIdentity | undefined) => id?.envParts?.verification?.lifecycle !== "unknown";
+    rerunFull = !now || !batteryFullIdentity || !measurable(now) || !measurable(batteryFullIdentity)
+      || verificationIdentityKey(now) !== verificationIdentityKey(batteryFullIdentity)
+      || !(await certifiesFullManifest(results.find((r) => r.gate === "test")!));
+    if (rerunFull) {
+      // The in-battery row keeps its own interval; the replacement measures from zero.
+      spans.delete("test");
+      loadSamples.delete("test");
+    }
   }
 
   // The merge-candidate round: every other gate is green, so THIS round is the one that can merge —
@@ -1252,7 +1543,7 @@ export async function runGates(
   // screen's entry in the returned record (one `test` entry), and `fullSuite` says which suite spoke
   // while `selectedTests` keeps what the screen ran. In the stream, a held screen is superseded (one
   // `test` end event); a published screen keeps its own earlier event and this is the second.
-  if (selected) {
+  if (selected || rerunFull) {
     await emitStart("test");
     // This is the last shell command a round can run — the judge's named-test oracle (acceptance.ts)
     // may have run one before it, and every gate between the battery and here reads commits only, so
@@ -1263,19 +1554,11 @@ export async function runGates(
     let cached = false;
     let identity: VerificationIdentity | undefined;
     if (ctx.commands.test !== undefined) {
-      identity = await computeVerificationIdentity({
-        worktree: ctx.worktree,
-        gate: "test",
-        scope: ctx.verificationScope,
-        command: ctx.commands.test,
-        baseline: ctx.baseline,
-        selectedSet: undefined,
-        capacity: resolvedCapacity(),
-      });
+      identity = await fullTestIdentity();
       const hit = verdictStore.get(identity);
       if (hit) classifySignalOnlyTest(hit);
       if (hit && identity && !isInfraResult(hit) && (hit.pass || (ctx.verificationScope ?? "battery") === "battery")
-          && !(await discardCachedRed("test", hit))) {
+          && !(await discardCachedRed("test", hit)) && await certifiesFullManifest(hit)) {
         full = formatReusedRow(hit, identity);
         cached = true;
         await noteReuse("test", full, identity);

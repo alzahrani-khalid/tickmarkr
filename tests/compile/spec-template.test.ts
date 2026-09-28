@@ -379,3 +379,19 @@ describe("spec template — T17 out-of-scope bound, caller pin sweep, end-to-end
     expect(carriesEveryExistingLaw(section)).toBe(true);
   });
 });
+
+// OBS-1019 add.2 + OBS-1195: an invariant goal carries its closed case table, and a review material binds
+// its declared class to a goal/criterion with evidence marked executed/static/blocked — a worker table alone
+// never closes one. Additive: every existing criterion law and both anchor sections survive.
+test("the initialised spec requires an invariant goal's closed case table and binds each review material to a goal or criterion through executed static or blocked evidence, so a worker table alone cannot silence a real finding", async () => {
+  const written = await initialisedSpec();
+  const section = criterionSection(written);
+  const law = section.slice(section.indexOf("A GOAL STATING AN INVARIANT"));
+  expect(law).toMatch(/^A GOAL STATING AN INVARIANT OVER "every", "never" OR "any" CARRIES ITS CLOSED CASE TABLE/);
+  for (const member of ["consumers", "bridges, operations and event sequences"]) expect(law).toContain(member);
+  expect(law).toMatch(/binds its declared class to the goal clause or criterion it\s+violates through input-to-consequence evidence marked executed, static or blocked/);
+  expect(law).toMatch(/A worker's own\s+table alone never silences a real finding/);
+  expect(carriesEveryExistingLaw(section)).toBe(true);
+  expect(written.indexOf("WHICH SIDE OF A RUN INHERITS ENVIRONMENT")).toBeGreaterThan(-1);
+  expect(written.indexOf("ORDERING AND OWNERSHIP:")).toBeGreaterThan(written.indexOf("A GOAL STATING AN INVARIANT"));
+});

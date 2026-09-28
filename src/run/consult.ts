@@ -1,7 +1,7 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { getAdapter } from "../adapters/registry.js";
-import { configuredEffort, type WorkerAdapter } from "../adapters/types.js";
+import { type AuthHealth, configuredEffort, type WorkerAdapter } from "../adapters/types.js";
 import type { TickmarkrConfig } from "../config/config.js";
 import type { Effort } from "../graph/schema.js";
 import type { ExecutorDriver, Slot } from "../drivers/types.js";
@@ -10,7 +10,7 @@ import { dewrapPaneVerdict, extractVerdictJson, gateExitTrailer, gatePaneName, g
 import type { GateResult } from "../gates/types.js";
 import { classifyVerdictCause, type VerdictUnparseableCause } from "../gates/verdict-cause.js";
 import { rankPreferredChannels } from "../route/role-pick.js";
-import { disallowedBy, routingModelProvider } from "../route/preference.js";
+import { disallowedBy, observedSeat, routingModelProvider } from "../route/preference.js";
 import { sh } from "./git.js";
 import { redactSecrets } from "./redact.js";
 import { filterLlmTranscript } from "./stall.js";
@@ -211,7 +211,8 @@ export async function consult(
   // judged against it only (never rebuilt from config, which would select installed-but-unauthed seats).
   // OBS-1182: onInvocation hears every launched seat — its identity, effort and outcome — failed seats
   // included, so a seat that never produced the verdict still reaches the journal.
-  opts: { keep?: boolean; onSlot?: (slot: Slot) => void; onInvocation?: (inv: ConsultInvocation) => void; runId?: string; channels?: Array<{ adapter: string; model?: string; vendor?: string; channel?: "sub" | "api"; tier?: string }> } = {},
+  // OBS-1186: health — doctor's cached verdict, the observed identity of the pinned seat (absent ⇒ unknown, conservative).
+  opts: { keep?: boolean; onSlot?: (slot: Slot) => void; onInvocation?: (inv: ConsultInvocation) => void; runId?: string; channels?: Array<{ adapter: string; model?: string; vendor?: string; channel?: "sub" | "api"; tier?: string; identity?: string }>; health?: Record<string, AuthHealth> | null } = {},
 ): Promise<ConsultVerdict> {
   const n = ++consultSeq;
   const nonce = generateVerdictNonce();
@@ -283,10 +284,11 @@ export async function consult(
   const live = (opts.channels ?? []).filter(
     (c): c is typeof c & { model: string } => typeof c.model === "string",
   );
-  const seats: Array<{ adapter: string; model: string }> = rankPreferredChannels(
+  // Ranking keeps each live channel's observed identity; the pin carries its cached identity too.
+  const seats: Array<{ adapter: string; model: string; identity?: string }> = rankPreferredChannels(
     live.filter((c) => disallowedBy(c, cfg.routing, "consult") === null), cfg.consult.prefer,
   );
-  seats.push({ adapter: cfg.consult.adapter, model: cfg.consult.model });
+  seats.push(observedSeat(opts.health, cfg.consult.adapter, cfg.consult.model));
   // v1.87 T2: a consult seat reads the code, so it passes through the operator's policy exactly like
   // a worker does. The filter runs AFTER the pin is pushed, so the final pinned seat is checked by
   // the same rule as every prefer entry — and disallowedBy carries the full deny grammar (adapter,

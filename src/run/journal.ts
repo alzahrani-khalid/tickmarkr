@@ -382,6 +382,8 @@ export interface StructuredFinding {
   observedFingerprints?: string[];
   /** Prior id validated against the reviewer's reraised list by the review gate. */
   reraisedFrom?: string;
+  /** OBS-1195: an anchor's explicitly named parent chain; it retires when that chain is resolved. */
+  boundTo?: string;
   /** Resolved definition AND defect identity; bare symbol spelling is never lineage. */
   codeIdentity?: { definition: string; defect: string };
 }
@@ -836,18 +838,47 @@ export function normalizeGateFailure(details: string): string {
 // are excluded because the interrupted attempt already bought the result they confirm.
 export const GATE_FINGERPRINT_CAP = 2;
 
+/** The invocation a gate row's receipt names — the identity of the execution that observed it. */
+export const receiptOrigin = (data: Record<string, unknown>): string | undefined => {
+  const receipt = data.evidenceReceipt ?? (Array.isArray(data.evidenceReceipts) ? data.evidenceReceipts[0] : undefined);
+  const id = receipt && typeof receipt === "object" ? (receipt as { invocationId?: unknown }).invocationId : undefined;
+  return typeof id === "string" && id ? `invocation:${id}` : undefined;
+};
+
+// OBS-1106 residual: occurrences are independent OBSERVATIONS, not rows. A journal replay
+// (`replayedFromAttempt`) and a verdict-cache hit (`reused`) re-state a measurement another row
+// already bought, so each resolves to that row's origin — its receipt's invocation when it carries
+// one, else the attempt (replay) or the newest observation on the same subject (cache) — and one
+// observation counts once however many copies the ledger holds, across resume. Only a fresh
+// execution mints a new origin.
 export function identicalGateFailures(events: JournalEvent[], taskId: string, gate: string, normalized: string): number {
-  let n = 0;
-  for (const e of effectiveEvents(events)) { // OBS-1178: a refused or unsound approval is no new engagement
-    if (e.taskId !== taskId) continue;
-    if (e.event === "task-approved") n = 0;
-    else if (e.event === "gate-result" && e.data.gate === gate && e.data.pass === false
-             && e.data.replayMeasurement !== true
-             && typeof e.data.details === "string"
-             && normalizeGateFailure(e.data.details) === normalized) n++;
-  }
-  return n;
+  const counted = new Set<string>();
+  const byAttempt = new Map<number, string>();
+  const bySubject = new Map<string, string>();
+  effectiveEvents(events).forEach((e, i) => { // OBS-1178: a refused or unsound approval is no new engagement
+    if (e.taskId !== taskId) return;
+    if (e.event === "task-approved") { counted.clear(); return; }
+    if (e.event !== "gate-result" || e.data.gate !== gate) return;
+    const commit = typeof e.data.commit === "string" ? e.data.commit : undefined;
+    const origin = typeof e.data.replayedFromAttempt === "number"
+      ? byAttempt.get(e.data.replayedFromAttempt) ?? receiptOrigin(e.data) ?? `attempt:${e.data.replayedFromAttempt}`
+      : e.data.reused === true
+        ? receiptOrigin(e.data) ?? (commit ? bySubject.get(commit) : undefined) ?? `reused:${commit ?? i}`
+        : receiptOrigin(e.data) ?? `row:${i}`;
+    if (typeof e.data.attempt === "number") byAttempt.set(e.data.attempt, origin);
+    if (commit) bySubject.set(commit, origin);
+    if (e.data.pass === false && e.data.replayMeasurement !== true && typeof e.data.details === "string"
+        && normalizeGateFailure(e.data.details) === normalized) counted.add(origin);
+  });
+  return counted.size;
 }
+
+// OBS-1072 add.2: the controls a terminal would consume — OSC strings (ESC ] … BEL/ST), CSI sequences
+// (SGR included), other ESC sequences and stray C0 bytes but tab and newline. Applied only to the
+// human-facing excerpts a worker brief or a scope hint reads; the journal row, the receipt bytes and
+// the failure fingerprint keep the raw text.
+const TERMINAL_CONTROL_RE = /\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?|\x1b\[[0-?]*[ -/]*[@-~]|\x1b[ -/]*[0-~]?|[\x00-\x08\x0b-\x1f\x7f]/g;
+export const readableExcerpt = (text: string): string => text.replace(TERMINAL_CONTROL_RE, "");
 
 /** What each funded repair's next battery actually reached. A repair spends its budget only
  * when that battery reaches one of the gates it was funded to fix; an earlier red is evidence that
@@ -1023,7 +1054,7 @@ export function journaledFailureBrief(events: JournalEvent[], taskId: string): s
     else if (BOOTSTRAP_DEATH.has(e.event)) rows = [...spent, ...rows];
     else if (e.event === "task-approved" && e.data.release === GATE_SATISFIED_RELEASE) rows = [];
     else if (e.event === "gate-result" && e.data.pass === false && e.data.skipped !== true
-             && typeof e.data.details === "string") rows.push(`${e.data.gate}: ${e.data.details}`);
+             && typeof e.data.details === "string") rows.push(`${e.data.gate}: ${readableExcerpt(e.data.details)}`);
     else if (e.event === "delivery-readiness-failed" && typeof e.data.transcript === "string") {
       rows.push(`dispatch: delivery readiness failed after ${e.data.waitedMs}ms; pane transcript:\n${e.data.transcript}`);
     } else if (e.event === "task-failed" && e.data.kind === "dispatch" && typeof e.data.error === "string") {
@@ -1064,6 +1095,15 @@ export function observedReviewFingerprints(finding: StructuredFinding): string[]
 }
 
 const reviewNoteIdentity = (note: string): string => note.replace(LINE_REF_RE, "").replace(/\s+/g, " ").trim();
+
+/** OBS-1195: the anchor row a verdict's recorded settled comment spells, or undefined if malformed. */
+function settledAnchorRow(anchor: unknown): StructuredFinding | undefined {
+  if (!anchor || typeof anchor !== "object") return undefined;
+  const { path, line, body, disposition } = anchor as Record<string, unknown>;
+  if (typeof path !== "string" || !Number.isInteger(line) || typeof body !== "string") return undefined;
+  if (disposition !== "deferred" && disposition !== "resolved") return undefined;
+  return structuredFindings("review", `- ${path}:${line} — ${body}`).find((finding) => finding.class === "review:anchored");
+}
 
 function distinctReviewFinding(row: StructuredFinding): StructuredFinding {
   const identity = JSON.stringify([reviewNoteIdentity(row.note), row.codeIdentity ?? null]);
@@ -1165,6 +1205,25 @@ export function carryReviewFindings(priors: readonly StructuredFinding[], rows: 
  * after round re-seats ONE fingerprint, and a revised rationale replaces the prior rationale on that
  * row. N rounds of the same concern therefore carry the newest accepted explanation once, not N rows.
  */
+/** OBS-1151: this task's journaled judgments, newest first — subjects to compare a fresh ruling against,
+ * never verdicts to reuse. A row without a well-formed judgment (legacy, park, unparseable) is skipped. */
+export function priorJudgments(events: readonly JournalEvent[], taskId: string): Array<{
+  commit: string; judge?: string; criteria: Array<{ id: string; key: string; met: boolean; paths: string[] }>;
+}> {
+  const out: ReturnType<typeof priorJudgments> = [];
+  for (const e of events) {
+    const j = e.taskId === taskId && e.event === "gate-result" && e.data.gate === "acceptance" ? e.data.judgment : undefined;
+    if (!j || typeof j !== "object") continue;
+    const { commit, judge, criteria } = j as Record<string, unknown>;
+    if (typeof commit !== "string" || !commit || !Array.isArray(criteria)) continue;
+    const rows = criteria.filter((c): c is { id: string; key: string; met: boolean; paths: string[] } =>
+      !!c && typeof c.id === "string" && typeof c.key === "string" && typeof c.met === "boolean"
+      && Array.isArray(c.paths) && c.paths.every((p: unknown) => typeof p === "string"));
+    out.unshift({ commit, ...(typeof judge === "string" ? { judge } : {}), criteria: rows });
+  }
+  return out;
+}
+
 export function outstandingReviewFindings(events: JournalEvent[], taskId: string): StructuredFinding[] {
   let open: StructuredFinding[] = [];
   for (const e of effectiveEvents(events)) { // OBS-1178: only an effective review waive retires findings
@@ -1178,6 +1237,9 @@ export function outstandingReviewFindings(events: JournalEvent[], taskId: string
     if (e.data.unparseable === true || e.data.noVerdict === true || e.data.cause !== undefined) continue;
     // A failed review can resolve one chain while re-raising another. Only observed, uniquely
     // matched spellings retire a chain; skipped/no-verdict rows were excluded above.
+    // OBS-1195: every parent chain this verdict resolved or explicitly deferred; an anchor bound to one
+    // retires whether it was carried in or restated by this same verdict.
+    const retiredParents = new Set<string>();
     if (Array.isArray(e.data.resolved)) {
       const resolved = e.data.resolved;
       const settled = new Set(resolved.flatMap((id) => {
@@ -1185,7 +1247,41 @@ export function outstandingReviewFindings(events: JournalEvent[], taskId: string
           && observedReviewFingerprints(finding).some((fp) => reviewFingerprintMatches(id, fp)));
         return matches.length === 1 ? matches : [];
       }));
+      // OBS-1195: an anchor explicitly bound to a settled chain retires with it; unbound ones stay.
+      for (const id of [...settled].flatMap(observedReviewFingerprints)) retiredParents.add(id);
       open = open.filter((finding) => !settled.has(finding));
+    }
+    // OBS-1195: a failed verdict that restates a bound anchor's parent ONLY as a deferral (its deferred
+    // entry echoes the prior's id and no material entry claims it) has explicitly deferred that parent,
+    // so the anchor retires. The parent chain itself keeps whatever the closure lists said of it.
+    // A material row's `reraisedFrom` is this verdict's claim only when its own reraised list names that
+    // id; a link an earlier verdict drew (carried metadata) is lineage and claims nothing here. Without a
+    // reraised list to check against, every link counts as a claim — fail closed.
+    const rows = findingRows(e, "review");
+    const reraisedHere = Array.isArray(e.data.reraised) ? e.data.reraised.filter((id): id is string => typeof id === "string") : undefined;
+    const claimedByMaterial = new Set(rows.filter((row) => !isDeferredFinding(row) && row.reraisedFrom
+      && (reraisedHere === undefined || reraisedHere.some((id) => reviewFingerprintMatches(id, row.reraisedFrom!)))).map((row) => row.reraisedFrom));
+    const deferredParents = rows.filter((row) => isDeferredFinding(row) && row.reraisedFrom && !claimedByMaterial.has(row.reraisedFrom))
+      .map((row) => row.reraisedFrom!);
+    for (const finding of open) {
+      if (finding.class !== "review:material" || !observedReviewFingerprints(finding).some((fp) => deferredParents.includes(fp))) continue;
+      for (const id of observedReviewFingerprints(finding)) retiredParents.add(id);
+    }
+    const boundToRetired = (finding: StructuredFinding) => finding.boundTo !== undefined && retiredParents.has(finding.boundTo);
+    open = open.filter((finding) => !boundToRetired(finding));
+    // OBS-1195: a later verdict that re-anchors a carried anchor to a deferred entry or a resolved prior
+    // settles that anchor explicitly. Only its own identity (path, symbol and note), uniquely matched,
+    // retires it; a bare path coincidence binds nothing.
+    if (Array.isArray(e.data.settledAnchors)) {
+      const retired = new Set(e.data.settledAnchors.flatMap((anchor) => {
+        const row = settledAnchorRow(anchor);
+        // Identity, not fingerprint: a collision-disambiguated anchor carries a `symbol#hash` spelling.
+        const matches = row ? open.filter((finding) => finding.class === "review:anchored" && finding.path === row.path
+          && (finding.symbol === row.symbol || finding.symbol.startsWith(`${row.symbol}#`))
+          && reviewNoteIdentity(finding.note) === reviewNoteIdentity(row.note)) : [];
+        return matches.length === 1 ? matches : [];
+      }));
+      open = open.filter((finding) => !retired.has(finding));
     }
     if (e.data.pass !== false) {
       // a later review PASSED on this task: every finding it BLOCKED on is settled …
@@ -1195,9 +1291,35 @@ export function outstandingReviewFindings(events: JournalEvent[], taskId: string
       // waved it through is not the release that accepts it. Retiring on omission would drop it on
       // the very next round — the same silent drop by a different door.
       open = carryReviewFindings(open, findingRows(e, "review").filter(isDeferredFinding));
-    } else open = carryReviewFindings(open, findingRows(e, "review"));
+    } else {
+      // OBS-1195: a repeated comment bound to a parent this verdict resolved or deferred is not re-seated.
+      open = carryReviewFindings(open, rows).filter((finding) => !boundToRetired(finding));
+    }
   }
   return open;
+}
+
+/**
+ * OBS-1019 add.2: each outstanding material chain with the number of valid review verdicts that
+ * re-raised it since the last review pass or review-gate waive. Only a chain's own observed spellings
+ * count, so an unrelated finding sharing a path never lengthens it.
+ */
+export function reraisedReviewChains(events: JournalEvent[], taskId: string): Array<{ finding: StructuredFinding; reraises: number }> {
+  let verdicts: JournalEvent[] = [];
+  for (const e of effectiveEvents(events)) {
+    if (e.taskId !== taskId) continue;
+    if (e.event === "task-approved" && e.data.release === GATE_SATISFIED_RELEASE && e.data.gate === "review") verdicts = [];
+    if (e.event !== "gate-result" || e.data.gate !== "review" || e.data.skipped === true) continue;
+    if (e.data.unparseable === true || e.data.noVerdict === true || e.data.cause !== undefined) continue;
+    verdicts = e.data.pass === false ? [...verdicts, e] : [];
+  }
+  return outstandingReviewFindings(events, taskId)
+    .filter((finding) => finding.class === "review:material")
+    .map((finding) => ({
+      finding,
+      reraises: verdicts.filter((e) => Array.isArray(e.data.reraised) && e.data.reraised
+        .some((id) => observedReviewFingerprints(finding).some((fp) => reviewFingerprintMatches(id, fp)))).length,
+    }));
 }
 
 /** The findings a funded repair must carry into the next dispatch, or undefined if none is pending. */

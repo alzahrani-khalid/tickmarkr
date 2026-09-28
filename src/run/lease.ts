@@ -104,6 +104,38 @@ export interface RepositoryLeaseOptions {
   signal?: AbortSignal;
   /** Called once per distinct holder the waiter is queued behind. */
   onWait?: (holder: RepositoryLeaseHolder) => void;
+  /** The token a descendant inherited; defaults to REPOSITORY_LEASE_TOKEN_ENV. */
+  inherited?: string;
+}
+
+/** OBS-880/1071: the file lease's token, exported to the holder's descendants for the span it is held
+ * so a nested runner (a gate's suite under `tickmarkr verify`, a mutation child inside a leased suite)
+ * reenters instead of waiting on its own ancestor. Deliberately NOT COMMAND_LEASE_TOKEN_ENV: the
+ * installed daemon clears and rewrites that in-process token, and a command-lease token never names
+ * this file. Environment text alone proves nothing: see `reentrantHolder`. */
+export const REPOSITORY_LEASE_TOKEN_ENV = "TICKMARKR_REPOSITORY_LEASE_TOKEN";
+
+/** The strict ancestors of this process, from one `ps` snapshot; empty when unreadable (fail closed). */
+const ancestorPids = (): Promise<Set<number>> => new Promise((ok) => execFile("ps", ["-A", "-o", "pid=,ppid="], { encoding: "utf8" }, (error, stdout) => {
+  const parent = new Map<number, number>();
+  if (!error) for (const line of stdout.split("\n")) {
+    const [pid, ppid] = line.trim().split(/\s+/).map(Number);
+    if (Number.isInteger(pid) && Number.isInteger(ppid)) parent.set(pid!, ppid!);
+  }
+  const seen = new Set<number>();
+  for (let pid = error ? 0 : process.ppid; pid > 1 && !seen.has(pid); pid = parent.get(pid) ?? 0) seen.add(pid);
+  ok(seen);
+}));
+
+/** Reentry is identity-bound: the inherited token must name the record at THIS repository's lease path
+ * right now, its holder must be alive, and that holder must be a strict ancestor of this process. A
+ * forged, stale (released or superseded), foreign-repository or command-lease token matches no record;
+ * an in-process sibling is not a descendant — each of those waits like any other runner. */
+export async function reentrantHolder(path: string, inherited: string | undefined): Promise<RepositoryLeaseHolder | undefined> {
+  if (!inherited) return undefined;
+  const holder = readHolder(path);
+  if (holder?.token !== inherited || holder.pid === process.pid || !alive(holder.pid)) return undefined;
+  return (await ancestorPids()).has(holder.pid) ? holder : undefined;
 }
 
 const LEASE_FILE = "tickmarkr-runner.lease";
@@ -254,6 +286,8 @@ const inspectAndReserve = (path: string, mine: RepositoryLeaseHolder): { acquire
 
 export async function withRepositoryLease<T>(cwd: string, run: () => Promise<T>, opts: RepositoryLeaseOptions = {}): Promise<T> {
   const path = await repositoryLeasePath(cwd);
+  // A descendant of the live holder runs inside its ancestor's reservation and releases nothing.
+  if (await reentrantHolder(path, opts.inherited ?? process.env[REPOSITORY_LEASE_TOKEN_ENV])) return run();
   const pollMs = opts.pollMs ?? 1_000;
   const mine: RepositoryLeaseHolder = { pid: process.pid, cwd, at: Date.now(), token: randomUUID() };
   let waitingOn: number | undefined;
@@ -264,9 +298,17 @@ export async function withRepositoryLease<T>(cwd: string, run: () => Promise<T>,
     if (attempt.holder && attempt.holder.pid !== waitingOn) { waitingOn = attempt.holder.pid; opts.onWait?.(attempt.holder); }
     await new Promise((wake) => setTimeout(wake, pollMs));
   }
+  // Exported before run() so every descendant forked or spawned during the hold can reenter; restored
+  // at release unless another reservation in this process has since exported its own.
+  const exported = process.env[REPOSITORY_LEASE_TOKEN_ENV];
+  process.env[REPOSITORY_LEASE_TOKEN_ENV] = mine.token;
   try {
     return await run();
   } finally {
+    if (process.env[REPOSITORY_LEASE_TOKEN_ENV] === mine.token) {
+      if (exported === undefined) delete process.env[REPOSITORY_LEASE_TOKEN_ENV];
+      else process.env[REPOSITORY_LEASE_TOKEN_ENV] = exported;
+    }
     // Release is serialized with reclamation/acquisition and removes only this generation.
     await withMutationLock(path, pollMs, undefined, () => {
       if (readHolder(path)?.token === mine.token) unlinkSync(path);

@@ -122,6 +122,12 @@ function normJournal(events: JournalEvent[], repo: string, runId: string, baseRe
     if (row.event === "merge" && typeof row.data.commit === "string") {
       row = { ...row, data: { ...row.data, commit: "<COMMIT>" } };
     }
+    // OBS-1151: a judgment names the commit it judged — repository-specific exactly like a merge commit.
+    if (row.event === "gate-result" && row.data.judgment && typeof row.data.judgment === "object") {
+      const judgment = row.data.judgment as Record<string, unknown>;
+      expect(judgment.commit).toMatch(/^[0-9a-f]{40}$/);
+      row = { ...row, data: { ...row.data, judgment: { ...judgment, commit: "<COMMIT>" } } };
+    }
     if (row.event === "worktree-recreation") {
       const d = row.data as { attempted?: string[]; carried?: string[] };
       row = {

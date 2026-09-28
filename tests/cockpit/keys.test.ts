@@ -1,6 +1,7 @@
 import {
   copyFileSync,
   cpSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
@@ -557,7 +558,9 @@ function makeBranchSandbox(): string {
   for (const directory of ["src", "tests", "fixtures"] as const) {
     cpSync(join(PROJECT_ROOT, directory), join(sandbox, directory), { recursive: true });
   }
-  for (const file of ["package.json", "tsconfig.json", "vitest.config.ts"] as const) {
+  // scripts/vitest-lease.ts is the production config's globalSetup (the suite lease hook)
+  mkdirSync(join(sandbox, "scripts"));
+  for (const file of ["package.json", "tsconfig.json", "vitest.config.ts", "scripts/vitest-lease.ts"] as const) {
     copyFileSync(join(PROJECT_ROOT, file), join(sandbox, file));
   }
   symlinkSync(join(PROJECT_ROOT, "node_modules"), join(sandbox, "node_modules"), "dir");

@@ -17,7 +17,7 @@ import { gateReviewerFloor, pickReviewer, reviewGate } from "../../src/gates/rev
 import { type GateEvent, runGates } from "../../src/gates/run-gates.js";
 import { validateGraph } from "../../src/graph/schema.js";
 import { runDaemon } from "../../src/run/daemon.js";
-import { Journal } from "../../src/run/journal.js";
+import { Journal, observedReviewFingerprints, outstandingReviewFindings } from "../../src/run/journal.js";
 import { authedModels, COMMIT, makeRepo, setupRepo, T } from "../helpers/tmprepo.js";
 
 // command-typed acceptance keeps the judge deterministic (no fake-judge subprocess per round —
@@ -502,4 +502,172 @@ describe("unparseable cause + raw persistence (OBS-196)", () => {
     expect(r.meta?.cause).toBe("empty-output");
     expect(String(r.details)).toMatch(/cause: empty-output/);
   });
+});
+
+// OBS-1195: a failed review re-printed a prior's ORIGINAL prose beside the reviewer's current restatement,
+// anchors were retired by nothing but a pass, and a deferral's anchor was filed as blocking. The fold now
+// renders current prose once, retires an anchor only through an explicit resolved/deferred parent, and
+// keeps every unbound or ambiguous finding open — the pass bit and the review bar are untouched.
+describe("OBS-1195 — current material rendered once, anchors retired only by explicit dispositions", () => {
+  class ScriptedSeat extends DaemonSeat {
+    constructor(path: string, private verdictFor: (round: number, prior: string[]) => object) {
+      super(path, "seat-a", "frontier", "approve");
+    }
+    override headlessCommand(file: string): string {
+      const prompt = readFileSync(file, "utf8");
+      if (!/TICKMARKR-REVIEW/.test(prompt)) return "true";
+      this.calls++;
+      const nonce = /VERDICT_NONCE:\s*([0-9a-f]+)/i.exec(prompt)![1];
+      const prior = [...prompt.matchAll(/^Fingerprint: (.+)$/gm)].map((m) => m[1]!);
+      return `printf '%s' ${shq(JSON.stringify({ nonce, ...this.verdictFor(this.calls, prior) }))}`;
+    }
+  }
+
+  test("test: production review plus resumed repair renders each current material exactly once under explicit resolved or deferred anchor dispositions versus retaining ambiguous findings as open, so duplicated stale prose or an outstanding retired anchor fails", async () => {
+    const A = "src/rows.ts:1 — rows() drops the last row";
+    const B = "src/page.ts:3 — page() double-counts the header";
+    const B2 = "src/page.ts:3 — page() still counts the header twice after the fix";
+    const C = "src/sync.ts:4 — sync() races the writer";
+    const C1 = "src/sync.ts:4 — sync() still races when the writer retries";
+    const C2 = "src/sync.ts:7 — sync() races the flush path";
+    const D = "src/label.ts:2 — label wording is terse";
+    const E = "src/sync.ts:4 — sync() retry backoff is unbounded";
+    const F = "src/flush.ts:2 — flush() drops buffered rows on close";
+    const F2 = "src/flush.ts:2 — flush() drop is bounded by the close retry";
+    const B3 = "src/page.ts:3 — page() header count is off by one only on the empty page";
+    const [anchorA, anchorD, anchorLoose, anchorResolved, anchorB, anchorC, anchorC2, anchorF] =
+      ["last row lost here", "terse label", "unbound misc note", "rows fixed here", "header counted twice here",
+        // anchorC and anchorC2 share path and symbol (`sync`) with different notes: the second is collision-disambiguated.
+        "sync() backoff unbounded here", "sync() flush path unbounded here", "buffered rows dropped here"];
+    // Bound to C and never re-parented: C's restatement is ambiguous, so E's echo of C must not defer it.
+    const anchorW = "writer lock unguarded here";
+    const attempt = (n: number) => ({ shell: `echo ${n} > t1.txt && ${COMMIT} a${n}`, result: { ok: true, summary: `a${n}` } });
+    const { repo, fake, scriptPath } = setupRepo(
+      [T("T1", { routingHints: { pin: { via: "fake", model: "fake-1" } }, files: ["t1.txt"], gates: ["build", "test", "lint", "evidence", "scope", "review"] })],
+      { tasks: { T1: [1, 2, 3, 4].map(attempt) } },
+      "review: { required: true, prefer: [seat-a] }\nrouting: { deny: { workers: { adapters: [seat-a] } } }\n",
+    );
+    fake.channels = () => [{ adapter: "fake", model: "fake-1", vendor: "fake-a", channel: "sub", tier: "frontier" }];
+    const runId = "run-obs1195-render-once";
+    const journal = () => Journal.open(repo, runId);
+    const idOf = (note: string) => outstandingReviewFindings(journal().read(), "T1").find((f) => f.note === note)!.fingerprint;
+    const seat = new ScriptedSeat(scriptPath, (round) => {
+      if (round === 1) return {
+        approve: false, resolved: [], reraised: [],
+        findings: [
+          { note: A, severity: "material" }, { note: B, severity: "material" }, { note: C, severity: "material" },
+          { note: D, severity: "minor", defer: true, rationale: "cosmetic; callers keep the old label" },
+          { note: F, severity: "material" },
+        ],
+        comments: [
+          { path: "src/rows.ts", line: 1, body: anchorA, finding: 1 },
+          { path: "src/label.ts", line: 2, body: anchorD, finding: 4 },
+          { path: "src/misc.ts", line: 9, body: anchorLoose },
+          { path: "src/sync.ts", line: 4, body: anchorC, finding: 3 },
+          { path: "src/sync.ts", line: 7, body: anchorC2, finding: 3 },
+          { path: "src/flush.ts", line: 2, body: anchorF, finding: 5 },
+          { path: "src/writer.ts", line: 5, body: anchorW, finding: 3 },
+        ],
+      };
+      if (round === 2) {
+        const [a, b, c, f] = [idOf(A), idOf(B), idOf(C), idOf(F)];
+        return {
+          approve: false, resolved: [a], reraised: [b, c, f],
+          // B is restated in new words and bound; C is claimed by two rows, so neither binds it;
+          // F is still listed as reraised but restated ONLY as a deferral — its parent is explicitly deferred.
+          findings: [
+            { note: B2, severity: "material", reraised: b },
+            { note: C1, severity: "material", reraised: c },
+            { note: C2, severity: "material", reraised: c },
+            // E echoes C while two material rows still claim it: C is claimed, not deferred.
+            { note: E, severity: "minor", defer: true, rationale: "the writer lock bounds retries today", reraised: c },
+            { note: F2, severity: "minor", defer: true, rationale: "the close retry re-flushes the buffer", reraised: f },
+          ],
+          // Both anchors carried from round 1 (bound to C) are explicitly re-parented to the deferral.
+          comments: [
+            { path: "src/rows.ts", line: 1, body: anchorResolved, finding: a },
+            { path: "src/page.ts", line: 3, body: anchorB, finding: b },
+            { path: "src/sync.ts", line: 4, body: anchorC, finding: 4 },
+            { path: "src/sync.ts", line: 7, body: anchorC2, finding: 4 },
+          ],
+        };
+      }
+      const open = outstandingReviewFindings(journal().read(), "T1").filter((f) => f.class === "review:material");
+      if (round === 3) {
+        // B2 was restated as a MATERIAL in round 2 (its row carries reraisedFrom=b). This verdict defers
+        // it and nothing else claims it: that historical link must not read as a current material claim.
+        const b2 = idOf(B2);
+        return {
+          approve: false, resolved: open.map((f) => f.fingerprint).filter((id) => id !== b2), reraised: [b2],
+          findings: [{ note: B3, severity: "minor", defer: true, rationale: "the empty page renders no header", reraised: b2 }],
+        };
+      }
+      return { approve: true, resolved: open.map((f) => f.fingerprint), reraised: [], findings: [] };
+    });
+    const workerBriefs: string[] = [];
+    const invoke = fake.invoke.bind(fake);
+    fake.invoke = (task, cwd, a, ctx) => {
+      workerBriefs.push(readFileSync(ctx.promptFile, "utf8"));
+      return invoke(task, cwd, a, ctx);
+    };
+    const adapters = [fake, seat];
+
+    expect((await runDaemon(repo, { adapters, runId })).human).toEqual(["T1"]); // round cap after round 2
+    const reviews = () => journal().read().filter((e) => e.event === "gate-result" && e.data.gate === "review");
+    const [round1, round2] = reviews();
+    // The review bar is unchanged: both rounds block, and round 2 still names its three materials.
+    expect([round1!.data.pass, round2!.data.pass]).toEqual([false, false]);
+    const details2 = String(round2!.data.details);
+    expect(details2).toContain("requested changes (3 material)");
+    // Current prose once; the bound prior's stale wording is lineage only; the ambiguous prior stays verbatim.
+    const count = (text: string, needle: string) => text.split(needle).length - 1;
+    expect([B2, C, C1, C2, F].map((note) => count(details2, note))).toEqual([1, 1, 1, 1, 1]);
+    expect(count(details2, B)).toBe(0);
+    // Settled anchors are recorded on the row with their disposition, never as blocking prose.
+    expect(round1!.data.settledAnchors).toEqual([{ path: "src/label.ts", line: 2, body: anchorD, disposition: "deferred", finding: 4 }]);
+    expect(round2!.data.settledAnchors).toMatchObject([
+      { path: "src/rows.ts", body: anchorResolved, disposition: "resolved" },
+      { path: "src/sync.ts", line: 4, body: anchorC, disposition: "deferred", finding: 4 },
+      { path: "src/sync.ts", line: 7, body: anchorC2, disposition: "deferred", finding: 4 },
+    ]);
+    expect(String(round1!.data.details)).not.toContain(anchorD);
+    for (const anchor of [anchorC, anchorC2, anchorF, anchorW]) expect(String(round1!.data.details)).toContain(anchor);
+    // The collision-disambiguated anchor carries a `symbol#hash` spelling and was still bound to C.
+    const round1Anchors = (round1!.data.findings as { class: string; note: string; symbol: string; boundTo?: string }[]).filter((f) => f.class === "review:anchored");
+    expect(round1Anchors.find((f) => f.note === anchorC2)).toMatchObject({ symbol: expect.stringMatching(/^sync#/), boundTo: idOf(C) });
+    for (const anchor of [anchorResolved, anchorC, anchorC2]) expect(details2).not.toContain(anchor);
+
+    const open = outstandingReviewFindings(journal().read(), "T1");
+    const byNote = (note: string) => open.filter((f) => f.note === note);
+    expect(byNote(B2)).toHaveLength(1);
+    const priorB = (round1!.data.findings as { note: string; fingerprint: string }[]).find((f) => f.note === B)!.fingerprint;
+    expect(observedReviewFingerprints(byNote(B2)[0]!)).toContain(priorB); // lineage, not prose
+    for (const note of [C, C1, C2, F, anchorLoose, anchorB, anchorW]) expect(byNote(note), note).toHaveLength(1);
+    // A carried anchor re-anchored to a deferral retires even when collision-disambiguated, and one whose
+    // parent the failed verdict explicitly deferred retires too; C and F themselves stay open (the bar holds).
+    for (const note of [A, B, anchorA, anchorResolved, anchorD, anchorC, anchorC2, anchorF]) expect(byNote(note), note).toHaveLength(0);
+    expect(open.filter((f) => f.class.startsWith("review:deferred")).map((f) => f.note)).toEqual([D, E, F2]);
+
+    // Resume the parked task: the resumed repair brief is what the next worker actually reads.
+    await approve([runId, "T1", "--uphold", "--review-rounds", "2"], repo);
+    expect((await runDaemon(repo, { adapters, runId, resume: true })).done).toEqual(["T1"]);
+    expect(workerBriefs).toHaveLength(4);
+    const resumed = workerBriefs[2]!;
+    // Round 3 deferred B2's parent explicitly. The anchor bound to it retires even though round 2's
+    // material row carried a reraisedFrom link to the same parent; B2 itself stays open (reraised).
+    const all = journal().read();
+    const round3 = all.filter((e) => e.event === "gate-result" && e.data.gate === "review")[2]!;
+    expect(round3.data.pass).toBe(false);
+    const afterRound3 = outstandingReviewFindings(all.slice(0, all.indexOf(round3) + 1), "T1");
+    expect(afterRound3.filter((f) => f.note === anchorB)).toHaveLength(0);
+    expect(afterRound3.filter((f) => f.note === B2)).toHaveLength(1);
+    expect(afterRound3.filter((f) => f.class.startsWith("review:deferred")).map((f) => f.note)).toEqual([D, E, F2, B3]);
+    expect(resumed).toContain("## Repair attempt — fix ONLY what these findings name");
+    for (const note of [B2, C, C1, C2, F, F2, anchorLoose, anchorB, anchorW, D, E]) expect(count(resumed, note), note).toBe(1);
+    for (const note of [B, A, anchorA, anchorResolved, anchorD, anchorC, anchorC2, anchorF]) expect(count(resumed, note), note).toBe(0);
+    // The deferral is said once, under the only heading true of it.
+    const deferredAt = resumed.indexOf("## Deferred review findings");
+    expect(deferredAt).toBeGreaterThan(-1);
+    expect(resumed.indexOf(D)).toBeGreaterThan(deferredAt);
+  }, 180_000);
 });

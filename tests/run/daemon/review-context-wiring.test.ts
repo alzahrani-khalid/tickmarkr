@@ -221,3 +221,66 @@ test("test: production worker and review briefs retain A before B after an inter
   expect(journaledFailureBrief(journal().read(), "T1")).toEqual([`approval: ${A}`, `approval: ${B}`]);
   for (const brief of [...workerBriefs, ...reviewBriefs]) expect(brief).not.toContain(W);
 }, 180_000);
+
+// OBS-1019 add.2: a spot repair per round buys the next edge of the same class while every review
+// re-judges the accumulated diff. The class order is earned by a chain re-raised more than once — never
+// by a first finding, and never by a single reraise.
+test("test: the production daemon repair brief at the second reraise requires a closed table of consumers bridges operations and sequences within the task bounds whereas the first isolated finding remains bounded, so a smallest-edit-only order after a repeated chain fails", async () => {
+  const attempt = (n: number) => ({ shell: `echo ${n} > t1.txt && ${COMMIT} a${n}`, result: { ok: true, summary: `a${n}` } });
+  const { repo, fake, scriptPath } = setupRepo(
+    [T("T1", { ...pin, files: ["t1.txt"], gates: ["build", "test", "lint", "evidence", "scope", "review"] })],
+    { tasks: { T1: [1, 2, 3, 4].map(attempt) } },
+    "review: { required: true, prefer: [seat-a] }\nrouting: { deny: { workers: { adapters: [seat-a] } } }\n",
+  );
+  fake.channels = () => [{ adapter: "fake", model: "fake-1", vendor: fake.vendor, channel: "sub", tier: "frontier" }];
+  const workerBriefs: string[] = [];
+  const invoke = fake.invoke.bind(fake);
+  fake.invoke = (task, cwd, a, ctx) => {
+    workerBriefs.push(readFileSync(ctx.promptFile, "utf8"));
+    return invoke(task, cwd, a, ctx);
+  };
+  const NOTE = "src/rows.ts:1 — rows() drops the last row of every page";
+  // The decided class sentence (D-576), pinned verbatim rather than read back from the module under test.
+  const CLASS_ORDER = "Before editing a chain reraised more than once, enumerate the in-scope consumers, bridges, operations"
+    + " and event sequences as a closed case table; repair every implicated member and verify the accumulated diff against that table.";
+  let rounds = 0;
+  const seat = new ReviewSeat(scriptPath, "seat-a", "vendor-a");
+  seat.headlessCommand = (file) => {
+    const text = readFileSync(file, "utf8");
+    const nonce = extractPromptNonce(text);
+    const prior = [...text.matchAll(/^Fingerprint: (.+)$/gm)].map((m) => m[1]!);
+    // Rounds 1-3 hold the same material (restated with its carried id); round 4 resolves it.
+    return `printf '%s\\n' ${shq(JSON.stringify(++rounds < 4
+      ? { nonce, approve: false, resolved: [], reraised: prior, findings: [{ note: NOTE, severity: "material", ...(prior[0] ? { reraised: prior[0] } : {}) }] }
+      : { nonce, approve: true, resolved: prior, reraised: [], findings: [] }))}`;
+  };
+  const adapters = [fake, seat];
+  const runId = "run-repair-class-table";
+  const journal = () => Journal.open(repo, runId);
+
+  // Round 1 (first isolated finding) funds repair 1; round 2 (first reraise) funds repair 2 and parks at the round cap.
+  expect((await runDaemon(repo, { adapters, runId })).human).toEqual(["T1"]);
+  await approve([runId, "T1", "--uphold", "--review-rounds", "3"], repo);
+  // Attempt 3 carries repair 2; round 3 is the SECOND reraise and funds the class-table repair; round 4 passes.
+  expect((await runDaemon(repo, { adapters, runId, resume: true })).done).toEqual(["T1"]);
+  const reviews = journal().read().filter((e) => e.event === "gate-result" && e.data.gate === "review");
+  expect(reviews.map((e) => [e.data.pass, (e.data.reraised as unknown[] | undefined)?.length ?? 0])).toEqual([[false, 0], [false, 1], [false, 1], [true, 0]]);
+  expect(journal().read().filter((e) => e.event === "repair-dispatch")).toHaveLength(3);
+  expect(workerBriefs).toHaveLength(4);
+  const [, afterFirstFinding, afterFirstReraise, afterSecondReraise] = workerBriefs as [string, string, string, string];
+
+  const bounded = "make the smallest change that resolves every finding, then commit.";
+  for (const brief of [afterFirstFinding, afterFirstReraise]) {
+    expect(brief).toContain("## Repair attempt — fix ONLY what these findings name");
+    expect(brief).toContain(bounded);
+    expect(brief).toContain(NOTE);
+    expect(brief).not.toContain(CLASS_ORDER);
+  }
+  expect(afterSecondReraise).toContain("## Repair attempt — repair the whole class these findings name");
+  expect(afterSecondReraise).toContain(CLASS_ORDER);
+  expect(afterSecondReraise).toContain("- `review:material|src/rows.ts|rows` re-raised 2 times");
+  expect(afterSecondReraise.split(NOTE)).toHaveLength(2); // the chain's prose is quoted once, not again in the table
+  expect(afterSecondReraise).toContain("The table stays inside the task's declared write scope (files[]) and never narrows its goal");
+  // The false-clean shape: a repeated chain still handed only the smallest-edit order.
+  expect(afterSecondReraise).not.toContain(bounded);
+}, 180_000);

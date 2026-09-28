@@ -7,6 +7,7 @@ import { consumePaneLaunchIntent, PANE_IDENTITY_ENV, paneIdentityLine } from "..
 import { createWorktree, sh } from "../run/git.js";
 import { Journal, type JournalEvent } from "../run/journal.js";
 import { readSupervision, readWatchBoard, requestWatchBoardStop, reserveWatchBoard, stopWatchBoard, WATCH_OWNER_ENV } from "../run/supervision.js";
+import { canonicalWorktreePath } from "./orca.js";
 import { herdrSealShellPrefix } from "./subprocess.js";
 import { canonicalizeLegacyName, formatOwnedName, panesToClose, parseOwnedName, type ExecutorDriver, type FocusTarget, type FocusResult, type NotifyOpts, type OwnedName, type PanesToCloseOpts, type Slot, type SlotOpts } from "./types.js";
 
@@ -87,6 +88,8 @@ interface PaneListRow {
   pane_id?: string;
   tab_id?: string;
   workspace_id?: string;
+  /** The pane shell's working directory as herdr reports it. */
+  cwd?: string;
 }
 
 interface ReconcileJournalHandle {
@@ -206,6 +209,8 @@ export class HerdrDriver implements ExecutorDriver {
   private deliverySerial: Promise<unknown> = Promise.resolve();
   private dispatchLeases = new WeakMap<Slot, DispatchLease>();
   private deliveredPanes = new WeakMap<Slot, string>();
+  /** OBS-1203: slots bound by adopt() — their reads are harvest evidence, so a failed read throws. */
+  private adoptedSlots = new WeakSet<Slot>();
   private inputBoxes = new WeakMap<Slot, InputBox>();
   // OBS-253: the adapter-declared bootstrap this slot has already delivered. A fresh pane is a bare
   // shell, so it is the only thing that can put a TUI back under a typed turn that has to move.
@@ -521,6 +526,47 @@ export class HerdrDriver implements ExecutorDriver {
     // label (without group) → dedicated labeled tab via tabSlot's third param: no groups-map entry, no
     // refcount, no groupSerial, no degrade latch — dedicated tabs have no shared state to guard (SUP-01).
     return slot; // label undefined → defaults to name (today's behavior)
+  }
+
+  /**
+   * OBS-1203: bind THIS instance, READ-ONLY, to the pane an earlier daemon created for an owned slot,
+   * so a resumed daemon can read the interrupted attempt's trailer. slot() is never a substitute: it
+   * allocates a tab, reclaimStaleLabel closes the very pane holding the evidence, and it holds a
+   * dispatch lease only run() releases. Binding needs ownership evidence, never a label alone: exactly
+   * one pane carries the FULL owned label, herdr reports that pane's cwd as the journaled task
+   * checkout, and that path is a git checkout whose own top level it is. Zero, ambiguous or foreign
+   * candidates throw — the caller's decline. `pane list` and `git rev-parse` are the only calls made.
+   */
+  async adopt(slot: Slot): Promise<Slot> {
+    if (!parseOwnedName(slot.name)) throw new Error(`herdr adopt: slot ${slot.name} carries no owned label — nothing to adopt`);
+    const listed = await this.herdr("pane list");
+    let panes: PaneListRow[];
+    try {
+      const parsed: unknown = JSON.parse(listed.stdout).result?.panes;
+      if (listed.code !== 0 || !Array.isArray(parsed)) throw new Error("no panes array");
+      panes = parsed;
+    } catch {
+      throw new Error(`herdr adopt: pane list unreadable (exit ${listed.code}) — cannot prove ownership of ${slot.name}`);
+    }
+    const owned = panes.filter((p) => p.label === slot.name && typeof p.pane_id === "string" && p.pane_id);
+    if (owned.length !== 1) {
+      throw new Error(`herdr adopt: ${owned.length === 0 ? "no pane carries" : `${owned.length} panes carry`} the owned label ${slot.name}`);
+    }
+    const pane = owned[0]!;
+    const checkout = canonicalWorktreePath(slot.cwd);
+    if (typeof pane.cwd !== "string" || canonicalWorktreePath(pane.cwd) !== checkout) {
+      throw new Error(`herdr adopt: pane ${pane.pane_id} labelled ${slot.name} sits in ${pane.cwd ?? "an unreported cwd"}, not the task checkout ${checkout} — foreign`);
+    }
+    const top = await sh("git rev-parse --show-toplevel", checkout);
+    if (top.code !== 0 || canonicalWorktreePath(top.stdout.trim()) !== checkout) {
+      throw new Error(`herdr adopt: ${checkout} is not its own git checkout — no checkout proof for ${slot.name}`);
+    }
+    const adopted: Slot = { id: pane.pane_id!, name: slot.name, cwd: slot.cwd,
+      ...(pane.tab_id === undefined ? {} : { tabId: pane.tab_id }), ...(slot.group === undefined ? {} : { group: slot.group }) };
+    // Reads go to the pane ownership was proven on, never to a later re-resolution of the label.
+    this.deliveredPanes.set(adopted, pane.pane_id!);
+    this.adoptedSlots.add(adopted);
+    return adopted;
   }
 
   // today's per-slot tab path, plus the VIS-04 orphan reap
@@ -1206,6 +1252,10 @@ export class HerdrDriver implements ExecutorDriver {
   async read(slot: Slot, lines: number): Promise<string> {
     const pane = await this.paneId(slot);
     const r = await this.herdr(`pane read ${shq(pane)} --source recent-unwrapped --lines ${lines}`, slot.cwd);
+    // OBS-1203 review: an adopted pane's read decides a resume harvest; a failed read proves neither a
+    // trailer nor its absence, so it throws (the caller's decline) rather than read as an empty pane.
+    // ponytail: other slots keep the historical empty-on-failure read; widen once seed/consult callers catch.
+    if (r.code !== 0 && this.adoptedSlots.has(slot)) throw new Error(`herdr pane read ${pane} failed (exit ${r.code}): ${r.stderr || r.stdout}`);
     return r.stdout;
   }
 

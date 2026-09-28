@@ -1,0 +1,40 @@
+tickmarkr capture | RUN | run-screen-soak
+1 Home  4 Run  5 Evidence | content | 1–33/42 | 9 hidden
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+│1 Home         │RUN / RUNNING · 0/? merged | current-cycle tip PENDING | RUNNING | not comparab│1 Home                │
+│4 Run          │ tickmarkr  run-screen-soak  │  0/? done  │  0 esc  │  1h34m                   │4 Run                 │
+│5 Evidence     │                                                                               │5 Evidence            │
+│               │  ▌ TASKS   0 journal tasks merged · graph absent                              │Tab Focus             │
+│CLI:           │                                                                               │Enter Open            │
+│fleet          │         area            deps          task                                    │a Actions             │
+│plan           │         bu te li ev sc ac re   channel     att  note                          │PageUp/PageDown Page  │
+│doctor         │    ───────────────────────────────────────────────────────────────────────────│? Keys                │
+│               │  ❯ T1   —               —                                                     │q Quit                │
+│               │         ·  ·  ·  ·  ·  ·  ·    fake:fixtu  1                                  │+ Widen shortcuts     │
+│               │         in flight                                                             │- Narrow shortcuts    │
+│               │                                                                               │                      │
+│               │    area    SPEC · FLEET · RUN · GATE · UI · DOCS · REPO                       │                      │
+│               │    gates   bu build  te test  li lint  ev evidence  sc scope  ac acceptance  r│                      │
+│               │            ✔ passed   ✖ failed   · pending   ─ not declared (acceptance and re│                      │
+│               │                                                                               │                      │
+│               │───────────────────────────────────────────────────────────────────────────────│                      │
+│               │                                                                               │                      │
+│               │  ▌ WHERE THE EFFORT WENT   dispatches · review rounds · human parks — top 1 of│                      │
+│               │                                                                               │                      │
+│               │    T1    ███████████████████  1 dispatch · 0 review · 0 park                  │                      │
+│               │                                                                               │                      │
+│               │    legend  █ dispatch  █ review round  █ human park                           │                      │
+│               │                                                                               │                      │
+│               │SELECTED / T1                                                                  │                      │
+│               │state running · attempt 0 · dispatches 1 · path unknown · pane unknown ·       │                      │
+│               │ alarm unknown · locator unavailable — no worker-launch for attempt 0          │                      │
+│               │outcome filter all (x cycles) · 7 of 7 gates shown                             │                      │
+│               │- build      not run                                                           │                      │
+│               │- test       not run                                                           │                      │
+│               │- lint       not run                                                           │                      │
+│               │- evidence   not run                                                           │                      │
+│               │- scope      not run                                                           │                      │
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+RUNNING | MERGED 0/? | CURRENT TIP PENDING | fresh
+Tab Focus | Enter Open | a Actions | ? Keys | q Quit
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────

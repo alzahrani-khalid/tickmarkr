@@ -2,8 +2,9 @@
 // (isInfraResult) governs classification, the journal row and repair admission, so a result carrying
 // only an infra fingerprint or classification — no `meta.infra` — is still parked, never repaired.
 // Zero tokens: fake adapter, subprocess driver, scripted gate commands.
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { stringify } from "yaml";
 import { afterEach, describe, expect, test, vi } from "vitest";
@@ -17,7 +18,7 @@ import { runDaemon } from "../../../src/run/daemon.js";
 import { gitHead, shGit, shGitOk, verificationProtocol } from "../../../src/run/git.js";
 import { Journal, repairReachSinceApproval, repairsSinceApproval, type JournalEvent } from "../../../src/run/journal.js";
 import { ensureIntegration, integrationBranch } from "../../../src/run/merge.js";
-import { COMMIT, setupRepo, T } from "../../helpers/tmprepo.js";
+import { COMMIT, makeTestTempDir, setupRepo, T } from "../../helpers/tmprepo.js";
 
 const rows = (repo: string, runId: string) => Journal.open(repo, runId).read();
 const afterResume = (all: JournalEvent[]): JournalEvent[] => all.slice(all.map((e) => e.event).lastIndexOf("run-resume") + 1);
@@ -99,8 +100,11 @@ describe("OBS-1106 — infrastructure rechecks repark without buying a repair", 
       await runDaemon(repo, { adapters: [fake], runId, resume: true });
       const post = afterResume(rows(repo, runId));
       const funded = of(post, "repair-attempt");
-      expect(funded).toHaveLength(1);
+      // bounded: the repair lands nothing, so its battery REPLAYS the red — a copy of one observation,
+      // not a second occurrence (OBS-1106 residual) — and the ladder draws its second repair, no more
+      expect(funded.map((e) => e.data.charge)).toEqual([1, 2]);
       expect(funded[0]!.data).toMatchObject({ charge: 1, gates: ["test"] });
+      expect(of(post, "gate-fingerprint-cap")).toEqual([]);
       expect(funded[0]!.data.findings).toContain("FAIL t1.test.ts");
       expect(of(post, "task-dispatch")[0]?.data.retryMode).toBe("repair");
       expect(testRows(post).every((e) => e.data.infra === undefined)).toBe(true);
@@ -127,7 +131,7 @@ describe("OBS-1106 — infrastructure rechecks repark without buying a repair", 
         expect(of(post, "repair-attempt")).toEqual([]);
         expect(of(post, "task-dispatch")).toEqual([]);
       } else {
-        expect(of(post, "repair-attempt")).toHaveLength(1);
+        expect(of(post, "repair-attempt").map((e) => e.data.charge)).toEqual([1, 2]); // the replay is a copy (OBS-1106)
         expect(of(post, "task-dispatch")[0]?.data.retryMode).toBe("repair");
       }
     }
@@ -275,3 +279,177 @@ describe("OBS-1106 — infrastructure rechecks repark without buying a repair", 
     }
   }, 180_000);
 });
+
+// OBS-1106 residual: a timeout or wall-budget red that arrives with runner infra diagnostics is
+// re-observed ONCE, isolated to its attributed failing files, before anything is charged for it.
+describe("OBS-1106 — infra-shaped reds are re-observed before a charge", () => {
+  const SLOW = "tests/slow.test.ts";
+  const TIMEOUT = "echo 'Error: Test timed out in 5000ms.'";
+  // The runner-level diagnostic block the vitest manifest path appends to a red's details
+  // (test-manifest.ts: the never-started count, then the runner's own errors and output tails).
+  const NEVER_STARTED = "\nclassification: regression; runner-level diagnostic: never-started 3; reporter errors 0; runner vitest";
+  const WORKER_RPC = "\nclassification: regression; runner-level diagnostic: never-started 0; reporter errors 1; runner vitest\nError: [vitest-worker]: Timeout calling \"onTaskUpdate\"";
+  /** A scripted runner cannot emit that block itself, so it is attached where the manifest path would. */
+  const withDiagnostic = (diagnostic: string) => {
+    const original = gateRunner.runGates;
+    vi.spyOn(gateRunner, "runGates").mockImplementation((task, ctx, ...rest) => original(task, {
+      ...ctx,
+      onGate: async (event) => {
+        if (event.phase === "end" && event.result.gate === "test" && !event.result.pass) event.result.details += diagnostic;
+        await ctx.onGate?.(event);
+      },
+    }, ...rest));
+  };
+  /** The full run is a timeout-shaped red; a narrowed invocation (a file argument) is the rerun. */
+  const repoWith = (diagnostic: string, timeout: string, rerun: string) => {
+    withDiagnostic(diagnostic);
+    const dir = makeTestTempDir("tickmarkr-reobserve-");
+    const script = join(dir, "gate.sh");
+    writeFileSync(script, [
+      "[ -f t1.txt ] || exit 0",
+      `if [ $# -gt 0 ]; then echo "rerun $*" >> ${JSON.stringify(join(dir, "reruns.log"))}; ${rerun}; fi`,
+      `echo 'FAIL ${SLOW} > slow'; ${timeout}; exit 1`,
+    ].join("\n") + "\n");
+    const made = setupRepo(
+      [T("T1", { gates: ["build", "test", "lint", "evidence", "scope", "acceptance"] })],
+      { consult: { action: "human", notes: "operator decides" },
+        tasks: { T1: [{ shell: `echo one > t1.txt && ${COMMIT} t1`, result: { ok: true, summary: "t1" } },
+          ...Array.from({ length: 4 }, () => ({ shell: "true", result: { ok: true, summary: "nothing" } }))] } },
+      stringify({ gates: { build: "true", test: `sh ${script}`, lint: "true" } }),
+    );
+    mkdirSync(join(made.repo, "tests"), { recursive: true });
+    writeFileSync(join(made.repo, SLOW), "// the attributed failing file\n");
+    execFileSync("git", ["add", SLOW], { cwd: made.repo });
+    execFileSync("git", ["commit", "--no-gpg-sign", "-q", "-m", "slow test"], { cwd: made.repo });
+    return { ...made, reruns: join(dir, "reruns.log") };
+  };
+  const firstRound = (evs: JournalEvent[]) => {
+    const second = evs.findIndex((e) => e.taskId === "T1" && e.event === "task-dispatch" && e.data.attempt === 1);
+    return second === -1 ? evs : evs.slice(0, second);
+  };
+
+  test("test: the production daemon charges only a reproduced assertion after one isolated rerun of attributed timeout or wall-budget failures accompanied by never-started or worker-RPC diagnostics, versus parking a pass or ambiguous rerun under the unresolved original red", async () => {
+    const WALL = "echo 'AssertionError: expected 1180 to be less than 1000'";
+    // ---- a pass or an ambiguous rerun parks under the unresolved original red, charging nothing -----
+    for (const [runId, diagnostic, shape, rerun, outcome] of [
+      ["run-reobserve-pass", WORKER_RPC, TIMEOUT, "exit 0", "passed"],
+      ["run-reobserve-pass-wall", NEVER_STARTED, WALL, "exit 0", "passed"],
+      // D-607 round 2: a runner without a manifest reporter proves nothing about its selection — even a
+      // rerun that fails exactly the attributed file is ambiguous, whatever the red's shape or diagnostic
+      ["run-reobserve-no-manifest-never-started", NEVER_STARTED, TIMEOUT, `echo 'FAIL ${SLOW} > slow'; echo 'AssertionError: expected 1 to be 2'; exit 1`, "ambiguous"],
+      ["run-reobserve-no-manifest-worker-rpc", WORKER_RPC, WALL, `echo 'FAIL ${SLOW} > slow'; echo 'AssertionError: expected 1 to be 2'; exit 1`, "ambiguous"],
+      ["run-reobserve-ambiguous", NEVER_STARTED, TIMEOUT, "echo 'Error: spawn EAGAIN'; exit 1", "ambiguous"],
+      ["run-reobserve-unnamed", WORKER_RPC, TIMEOUT, "echo 'something else broke'; exit 1", "ambiguous"],
+      // the rerun PRINTS the original path, but attributes its failure to another file: no reproduction
+      ["run-reobserve-unrelated", NEVER_STARTED, TIMEOUT,
+        `echo ' ✓ ${SLOW} (1 test)'; echo 'FAIL tests/other.test.ts > other'; echo 'AssertionError: expected 1 to be 2'; exit 1`, "ambiguous"],
+      // D-607: a runner that ignored the file argument and reported a wider run fails the file again
+      // under the same contention — its OBSERVED selection is not the isolated one, so no charge
+      ["run-reobserve-ignored-args", WORKER_RPC, TIMEOUT,
+        `echo ' ✓ tests/a.test.ts (3 tests)'; echo 'FAIL ${SLOW} > slow'; echo 'AssertionError: expected 1 to be 2'; exit 1`, "ambiguous"],
+      // D-607: the original path as a stdout substring beside an unattributed assertion is not attribution
+      ["run-reobserve-substring", NEVER_STARTED, TIMEOUT,
+        `echo 'stdout | see ${SLOW} for the fixture'; echo 'AssertionError: expected 1 to be 2'; exit 1`, "ambiguous"],
+    ] as const) {
+      const { repo, fake, reruns } = repoWith(diagnostic, shape, rerun);
+      const summary = await runDaemon(repo, { adapters: [fake], runId });
+      vi.restoreAllMocks();
+      expect(summary.human, runId).toEqual(["T1"]);
+      expect(summary.done, runId).toEqual([]);
+      const all = rows(repo, runId);
+      expect(readFileSync(reruns, "utf8").split("\n").filter(Boolean), runId).toEqual([`rerun ${SLOW}`]);
+      expect(of(all, "gate-reobserved").map((e) => e.data.outcome), runId).toEqual([outcome]);
+      const park = of(all, "task-human").at(-1)!;
+      expect(park.data.kind, runId).toBe("infra");
+      expect(park.data.reason, runId).toContain(`not reproduced by one isolated rerun of ${SLOW} (${outcome})`);
+      expect(park.data.reason, runId).toContain("the original red stands unresolved");
+      // the original red is still the test gate's only verdict: never replaced, never greened, no merge
+      const reds = testRows(all);
+      expect(reds.map((e) => e.data.pass), runId).toEqual([false]);
+      expect(of(all, "merge"), runId).toEqual([]);
+      expect(of(all, "task-done"), runId).toEqual([]);
+      expect(of(all, "repair-attempt"), runId).toEqual([]);
+      expect(of(all, "task-dispatch"), runId).toHaveLength(1);
+      expect(repairsSinceApproval(all, "T1"), runId).toBe(0);
+    }
+    // ---- only a manifested rerun can reproduce, and only from an isolated selection: the ordinary
+    // repair is charged for a reproduced assertion; a positional filter that also collected another file
+    // (`tests/slow.test.tsx`) is ambiguous even with the original file failing ----
+    // D-607: on the manifest path only the reporter's attribution counts — a `FAIL <path>` line the test's
+    // own stdout printed, with the reporter attributing nothing, is ambiguous; and a rerun reporting no
+    // manifest (per-file lines are not complete selection evidence) cannot prove isolation
+    for (const [runId, diagnostic, shape, manifest, failingFiles, outcome] of [
+      ["run-reobserve-manifest-isolated", NEVER_STARTED, TIMEOUT, [SLOW], [SLOW], "reproduced"],
+      ["run-reobserve-manifest-isolated-wall", WORKER_RPC, WALL, [SLOW], [SLOW], "reproduced"],
+      ["run-reobserve-manifest-wider", NEVER_STARTED, TIMEOUT, [SLOW, "tests/slow.test.tsx"], [SLOW], "ambiguous"],
+      ["run-reobserve-manifest-stdout-fail-line", NEVER_STARTED, TIMEOUT, [SLOW], [], "ambiguous"],
+      ["run-reobserve-no-selection-evidence", WORKER_RPC, TIMEOUT, undefined, [SLOW], "ambiguous"],
+    ] as const) {
+      const { repo, fake } = repoWith(diagnostic, shape, "exit 0");
+      const reobserve = vi.spyOn(gateRunner, "reobserveTestFiles").mockResolvedValue({ gate: "test", pass: false,
+        details: `test report names failing fingerprint(s):\nFAIL ${SLOW} > slow\nAssertionError: expected 1 to be 2`,
+        meta: { classification: "regression", failingTests: [`${SLOW} > slow`], failingFiles: [...failingFiles], ...(manifest ? { manifest: [...manifest] } : {}) } });
+      const summary = await runDaemon(repo, { adapters: [fake], runId });
+      expect(reobserve.mock.calls[0]!.slice(3, 4), runId).toEqual([[SLOW]]);
+      vi.restoreAllMocks();
+      const round = firstRound(rows(repo, runId));
+      expect(of(round, "gate-reobserved").map((e) => e.data.outcome), runId).toEqual([outcome]);
+      if (manifest) expect(of(round, "gate-reobserved")[0]!.data.selection, runId).toEqual([...manifest].sort());
+      if (outcome === "reproduced") {
+        // the ORIGINAL red is the charged evidence; the rerun is no gate-result row of its own
+        expect(testRows(round).map((e) => e.data.pass), runId).toEqual([false]);
+        expect(of(round, "repair-attempt").map((e) => e.data), runId).toMatchObject([{ charge: 1, gates: ["test"] }]);
+        expect(of(round, "task-human"), runId).toEqual([]);
+      } else {
+        expect(summary.human, runId).toEqual(["T1"]);
+        expect(of(round, "repair-attempt"), runId).toEqual([]);
+        expect(of(round, "task-human").at(-1)!.data.kind, runId).toBe("infra");
+      }
+    }
+  }, 600_000);
+
+  // A process that dies after the red is persisted leaves a cached copy for the resume to find. Whether
+  // that copy may be charged is decided by the ledger: with no adjudication of that observation the
+  // copy is re-observed now; with one, its recorded outcome parks it without a second rerun.
+  test("a copied red is adjudicated on resume unless its observation's adjudication is on the ledger, whose recorded outcome then decides without a second rerun", async () => {
+    for (const cut of ["before-adjudication", "after-adjudication"] as const) {
+      const runId = `run-reobserve-crash-${cut}`;
+      const { repo, fake, reruns } = repoWith(WORKER_RPC, TIMEOUT, "exit 0");
+      await runDaemon(repo, { adapters: [fake], runId });
+      vi.restoreAllMocks();
+      const journal = Journal.open(repo, runId);
+      const lived = journal.read();
+      const red = lived.findIndex((e) => e.event === "gate-result" && e.taskId === "T1" && e.data.gate === "test" && e.data.pass === false);
+      const adjudicated = lived.findIndex((e) => e.event === "gate-reobserved");
+      expect(red, cut).toBeGreaterThan(-1);
+      expect(adjudicated, cut).toBeGreaterThan(red);
+      expect(lived[adjudicated]!.data).toMatchObject({ outcome: "passed", commit: lived[red]!.data.commit });
+      // the crash: nothing after the persisted red (or after its adjudication) reached the ledger
+      writeFileSync(join(journal.dir, "journal.jsonl"), lived.slice(0, (cut === "before-adjudication" ? red : adjudicated) + 1)
+        .map((e) => JSON.stringify(e)).join("\n") + "\n");
+      withDiagnostic(WORKER_RPC);
+      const summary = await runDaemon(repo, { adapters: [fake], runId, resume: true });
+      vi.restoreAllMocks();
+      const post = afterResume(rows(repo, runId));
+      // the resume's red is the persisted observation's cached copy, not a new execution
+      expect(testRows(post)[0]!.data, cut).toMatchObject({ pass: false, reused: true, evidenceReceipt: lived[red]!.data.evidenceReceipt });
+      const reobserved = of(post, "gate-reobserved");
+      const reran = readFileSync(reruns, "utf8").split("\n").filter(Boolean);
+      if (cut === "before-adjudication") {
+        expect(reobserved.map((e) => e.data.outcome), cut).toEqual(["passed"]);
+        expect(reran, cut).toEqual([`rerun ${SLOW}`, `rerun ${SLOW}`]);
+      } else {
+        expect(reobserved, cut).toEqual([]);
+        expect(reran, cut).toEqual([`rerun ${SLOW}`]);
+      }
+      // either way the copy parks under its unresolved original red and buys nothing
+      expect(summary.human, cut).toEqual(["T1"]);
+      const park = of(post, "task-human").at(-1)!;
+      expect(park.data.kind, cut).toBe("infra");
+      expect(park.data.reason, cut).toContain(`not reproduced by one isolated rerun of ${SLOW} (passed)`);
+      expect(of(post, "repair-attempt"), cut).toEqual([]);
+      expect(of(post, "task-dispatch"), cut).toEqual([]);
+    }
+  }, 300_000);
+});
+

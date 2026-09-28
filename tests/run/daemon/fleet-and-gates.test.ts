@@ -17,7 +17,7 @@ import { validateGraph } from "../../../src/graph/schema.js";
 import { daemonEntrypoint, runDaemon, watchCommand } from "../../../src/run/daemon.js";
 import { gitHead, shOk } from "../../../src/run/git.js";
 import { journaledFailureBrief, Journal, reviewRoundsSinceApproval, runHasEnded } from "../../../src/run/journal.js";
-import { COMMIT, makeTestTempDir, setupRepo, T } from "../../helpers/tmprepo.js";
+import { authedModels, COMMIT, makeTestTempDir, setupRepo, T } from "../../helpers/tmprepo.js";
 import { releaseAll, releaseOn, workerBarrier } from "../../helpers/worker-barrier.js";
 
 
@@ -1276,4 +1276,78 @@ describe("SB-2 concurrent baseline capture", () => {
       vi.restoreAllMocks();
     }
   }, 30_000);
+});
+
+// OBS-1187: a declared map pool closes every re-dispatch seam, not only the first route.
+describe("OBS-1187 runtime routing stays inside the task pool", () => {
+  const POOL = ["fake:fake-1", "fake:fake-2"];
+  const EXTERNAL = "fake:fake-3"; // the fleet's only frontier channel — never a pool member
+  const key = (a: unknown) => `${(a as { adapter: string }).adapter}:${(a as { model: string }).model}`;
+  const poolRepo = (pool: "any" | "ordered" | undefined, scenario: "ladder" | "silent" | "demoted" | "resume") => {
+    const made = setupRepo([T("T1", {
+      files: ["src/a.ts"],
+      acceptance: [{ oracle: "command", command: "echo 'expected true in src/a.ts'; exit 1" }],
+    })], {
+      consult: { action: scenario === "silent" ? "reroute" : "retry", notes: "again" },
+      tasks: { T1: Array.from({ length: 12 }, (_, i) => scenario === "silent" || scenario === "demoted"
+        ? { shell: "true" } // no trailer: every window burns, the channel demotes, the ladder reroutes and recycles
+        : { shell: `mkdir -p src && echo v${i} > src/a.ts && ${COMMIT} c${i}`, result: { ok: true, summary: "done" } }) },
+    }, `approvalWindowMs: 1\nrouting:\n  escalateTier: on\n${pool ? `  map:\n    implement:\n      pool: { mode: ${pool}, channels: [${POOL.join(", ")}] }\n` : ""}`);
+    made.fake.channels = () => [
+      { adapter: "fake", vendor: "fake-a", model: "fake-1", channel: "sub", tier: "mid" },
+      { adapter: "fake", vendor: "fake-b", model: "fake-2", channel: "sub", tier: "mid" },
+      { adapter: "fake", vendor: "fake-c", model: "fake-3", channel: "api", tier: "frontier" },
+    ];
+    made.fake.probe = async () => ({ installed: true, authed: true, version: "fake", models: ["fake-1", "fake-2", "fake-3"], modelAuth: authedModels(["fake-1", "fake-2", "fake-3"]) });
+    return made;
+  };
+
+  test("the production daemon confines demotion retry-ban climb recycle resume dispatches to any or ordered pool members versus allowing an external frontier channel for an unpooled task, so dispatch outside an exhausted pool fails", async () => {
+    // ladder: identical reds → fingerprint cap → climb (no higher pool tier) → retry-ban failover.
+    // silent: trailer-less windows → consult reroute → failover, recycle, demotion, exhaustion.
+    // demoted: trailer-less windows → consult retry → the dispatch seam meets a demoted seat.
+    // resume: a journal whose last seat (fake-3) predates the pool resumes onto a member, never that seat.
+    for (const scenario of ["ladder", "silent", "demoted", "resume"] as const) {
+      for (const pool of ["any", "ordered", undefined] as const) {
+        const { repo, fake } = poolRepo(pool, scenario);
+        const runId = `run-pool-${scenario}-${pool ?? "open"}`;
+        if (scenario === "resume") {
+          const j = Journal.create(repo, runId);
+          j.append("run-start", undefined, { baseRef: await gitHead(repo), commands: {}, graphDefinitionHash: graphDefinitionHash(loadGraph(repo)) });
+          j.append("task-dispatch", "T1", { assignment: { adapter: "fake", model: "fake-1", channel: "sub", tier: "mid" }, attempt: 0 });
+          j.append("channel-demotion", "T1", { channel: "fake:fake-1", streak: 2 });
+          j.append("task-dispatch", "T1", { assignment: { adapter: "fake", model: "fake-3", channel: "api", tier: "frontier" }, attempt: 1 });
+          writeFileSync(join(j.dir, "baseline.json"), JSON.stringify({ commands: {} }));
+        }
+        await runDaemon(repo, { adapters: [fake], runId, resume: scenario === "resume" });
+        const all = Journal.open(repo, runId).read();
+        const from = scenario === "resume" ? all.findLastIndex((e) => e.event === "run-resume") + 1 : 0;
+        const rows = all.slice(from).filter((e) => e.taskId === "T1");
+        const trace = `${scenario}/${pool ?? "open"}: ${rows.map((e) => `${e.event}${e.event === "task-dispatch" ? `:${key(e.data.assignment)}` : ""}`).join(" ")}`;
+        const dispatched = rows.filter((e) => e.event === "task-dispatch").map((e) => key(e.data.assignment));
+        const moves = rows.flatMap((e) => e.event === "tier-escalated" || e.event === "retry-same-banned" ? [e.data.to]
+          : e.event === "channel-recycle" ? [e.data.channel] : e.event === "resume-restore" ? [key(e.data.assignment)] : [])
+          .filter((to) => to !== null);
+        if (!pool) {
+          // the open fleet still escalates, fails over or restores onto the external frontier seat
+          expect(dispatched, trace).toContain(EXTERNAL);
+          continue;
+        }
+        expect(dispatched.length, trace).toBeGreaterThan(0);
+        for (const k of [...dispatched, ...moves]) expect(POOL, trace).toContain(k);
+        expect(rows.some((e) => e.event === "tier-escalated"), trace).toBe(false);
+        const park = rows.filter((e) => e.event === "task-human").at(-1);
+        expect(park, trace).toBeDefined();
+        const named = `routing.map.implement.pool (${pool}: ${POOL.join(", ")}) is exhausted`;
+        if (scenario === "ladder") {
+          expect(rows.find((e) => e.event === "retry-same-banned")?.data.to, trace).toBe("fake:fake-2");
+        } else {
+          expect(String(park!.data.reason), trace).toContain(named);
+        }
+        if (scenario === "silent") expect(rows.some((e) => e.event === "channel-recycle"), trace).toBe(true);
+        if (scenario === "demoted") expect(rows.some((e) => e.event === "channel-demotion"), trace).toBe(true);
+        if (scenario === "resume") expect(rows.find((e) => e.event === "resume-restore")?.data.assignment, trace).toMatchObject({ model: "fake-2" });
+      }
+    }
+  }, 300_000);
 });

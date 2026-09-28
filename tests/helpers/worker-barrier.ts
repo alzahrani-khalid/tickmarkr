@@ -35,7 +35,12 @@ const BARRIER_POLL_S = 0.02;
 export function workerBarrier(name: string, boundMs = 120_000): WorkerBarrier {
   const path = join(makeTestTempDir("tickmarkr-barrier-"), `${name}.released`);
   const polls = Math.ceil(boundMs / (BARRIER_POLL_S * 1000));
-  const hold = `i=0; until test -e ${shq(path)}; do i=$((i+1)); if [ "$i" -ge ${polls} ]; then echo ${shq(`barrier ${name} never released`)} >&2; exit 1; fi; sleep ${BARRIER_POLL_S}; done`;
+  // OBS-1189: a held worker must print a byte BEFORE it waits. The daemon's print loop declares a
+  // pane that stays empty for EARLY_LAUNCH_LIVENESS_MS (60 s) after dispatch a dead channel — a real
+  // rule for a real worker — and a barrier held past that window on a loaded host (the releasing task's
+  // whole pipeline ran first) was concluded dead, its scripted retry spent, and the run closed with one
+  // task delivered. The announcement makes the hold a live, silent-by-choice worker, not a dead one.
+  const hold = `echo ${shq(`barrier ${name} held`)}; i=0; until test -e ${shq(path)}; do i=$((i+1)); if [ "$i" -ge ${polls} ]; then echo ${shq(`barrier ${name} never released`)} >&2; exit 1; fi; sleep ${BARRIER_POLL_S}; done`;
   let releasedOn: JournalEvent | undefined;
   return {
     name, path, hold,
@@ -90,6 +95,48 @@ export function heldAfterRelease(rows: JournalEvent[], b: WorkerBarrier, held: s
   const released = releaseIndex(rows, b);
   const result = rows.findLastIndex((e) => e.event === "worker-result" && e.taskId === held);
   if (released < 0 || result <= released) out.push(`${held} worker-result row ${result} is not after ${b.name}'s release row ${released}`);
+  return out;
+}
+
+/** A task's last `n` journal rows, event plus truncated data: the diagnostic a missing commit must carry. */
+export function lastRows(rows: JournalEvent[], taskId: string, n = 5): string[] {
+  return rows.filter((e) => e.taskId === taskId).slice(-n).map((e) => `${e.event} ${JSON.stringify(e.data).slice(0, 160)}`);
+}
+
+/**
+ * OBS-1189: the Q-1 fixture's release schedules. `held`'s retry waits on `first`'s row — its merge
+ * (delayed release: the held retry starts after the first commit landed, so merges are ordered) or its
+ * consult-verdict (consult completion: both retries run beside each other, so merges land in either
+ * order). Every schedule must still deliver BOTH distinct commits.
+ */
+export const Q1_SCHEDULES = [
+  { on: "merge", ordered: true },
+  { on: "task-done", ordered: true },
+  { on: "consult-verdict", ordered: false },
+] as const satisfies ReadonlyArray<{ on: string; ordered: boolean }>;
+export type Q1Schedule = (typeof Q1_SCHEDULES)[number];
+
+/**
+ * Every Q-1 fact the run fails to prove (empty when it holds): both tasks done, the held retry after
+ * its release row, no quota failover, both merges (in `first, held` order when the schedule orders
+ * them) and both task files on the integration tip. A one-task summary names the missing task's last
+ * five rows, so a loaded-host red carries the undelivered task's cause on the record.
+ */
+export function q1Violations(o: {
+  runId: string; first: string; held: string; schedule: Q1Schedule; barrier: WorkerBarrier;
+  done: string[]; rows: JournalEvent[]; tree: string;
+}): string[] {
+  const { runId, first, held, schedule, barrier, done, rows } = o;
+  const out: string[] = [];
+  for (const id of [first, held]) {
+    if (!done.includes(id)) out.push(`${runId}: ${id} not done — last rows: ${lastRows(rows, id).join(" | ")}`);
+    if (!o.tree.split("\n").includes(`${id}.txt`)) out.push(`${runId}: ${id}.txt missing from the integration tip — last rows: ${lastRows(rows, id).join(" | ")}`);
+  }
+  out.push(...heldAfterRelease(rows, barrier, held, schedule.on, first).map((v) => `${runId}: ${v}`));
+  if (rows.some((e) => e.event === "quota-failover")) out.push(`${runId}: a quota-failover row (the dumps are consult retries, never failovers)`);
+  const merges = rows.filter((e) => e.event === "merge").map((e) => e.taskId!);
+  const expected = schedule.ordered ? [first, held] : [first, held].sort();
+  if ((schedule.ordered ? merges : [...merges].sort()).join() !== expected.join()) out.push(`${runId}: merges [${merges}], expected ${schedule.ordered ? "" : "the set "}[${expected}]`);
   return out;
 }
 

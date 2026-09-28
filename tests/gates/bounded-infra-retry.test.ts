@@ -4,22 +4,23 @@ import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { compareToBaseline, resetCalmWindowForTests, setCalmWindowForTests, type Baseline } from "../../src/gates/baseline.js";
 import { DEFAULT_CONFIG } from "../../src/config/config.js";
 import { validateGraph } from "../../src/graph/schema.js";
-import { runGates } from "../../src/gates/run-gates.js";
+import { REOBSERVATION_RETRY_BASE, reobserveTestFiles, runGates } from "../../src/gates/run-gates.js";
 import { gitHead, shGitOk } from "../../src/run/git.js";
-import type { ManifestGateOutcome } from "../../src/gates/test-manifest.js";
+import { singleForkRetryCommand, type ManifestGateOutcome } from "../../src/gates/test-manifest.js";
 import { failureDisposition, reserveInfrastructureRetry, type VerificationRetryCause } from "../../src/run/recovery.js";
 import type { JournalEvent } from "../../src/run/journal.js";
 import { makeRepo } from "../helpers/tmprepo.js";
 
-const manifest = vi.hoisted(() => ({ calls: 0, outcomes: [] as ManifestGateOutcome[] }));
+const manifest = vi.hoisted(() => ({ calls: 0, outcomes: [] as ManifestGateOutcome[], args: [] as unknown[][] }));
 vi.mock("../../src/gates/test-manifest.js", async (original) => {
   const actual = await original<typeof import("../../src/gates/test-manifest.js")>();
   return { ...actual, evaluateManifestedTest: async (...args: Parameters<typeof actual.evaluateManifestedTest>) => {
+    manifest.args.push(args);
     if (!manifest.outcomes.length) return actual.evaluateManifestedTest(...args);
     return manifest.outcomes[Math.min(manifest.calls++, manifest.outcomes.length - 1)];
   } };
 });
-afterEach(() => { manifest.calls = 0; manifest.outcomes = []; });
+afterEach(() => { manifest.calls = 0; manifest.outcomes = []; manifest.args = []; });
 
 beforeEach(() => setCalmWindowForTests({ loadProvider: () => 0 }));
 afterEach(() => resetCalmWindowForTests());
@@ -181,4 +182,21 @@ test.each(["allowed", "denied", "busy"])("manifest path records its report recei
   expect(result.pass).toBe(allow);
   if (allow) expect(result.meta).toMatchObject({ reportPath: "/reports/final.json", runnerInfraRerun: { count: 1, waitedMs: expect.any(Number), firstReportPath: "/reports/first.json" } });
   else expect(result.meta).toMatchObject({ reportPath: "/reports/first.json", recoveryBlocked: expect.stringMatching(mode === "busy" ? /calm window/ : /allowance/) });
+});
+
+// OBS-1106 residual: the diagnostic re-observation is ONE execution. The manifested runner's stranded
+// single-fork recovery would launch a second after a worker RPC timeout, so the re-observation hands
+// it a retry base that refuses before any spawn, and reads whatever a recovery returned as infra.
+test("a diagnostic re-observation is one manifested execution whose stranded single-fork recovery refuses before any spawn and never a recovered verdict", async () => {
+  const repo = makeRepo({ "tests/a.test.ts": "export {};\n", "tests/b.test.ts": "export {};\n" });
+  manifest.outcomes = [{ pass: true, kind: "pass", details: "recovered", exitCode: 0, reportPath: "/reports/retry.json",
+    meta: { recovery: { firstNonce: "f", firstReportPath: "/reports/first.json", retryNonce: "r", files: ["tests/a.test.ts"] } } }];
+  const result = await reobserveTestFiles(repo, "vitest run", baseline, ["tests/a.test.ts", "tests/b.test.ts"]);
+  expect(manifest.calls).toBe(1);
+  const opts = manifest.args[0]![2] as { retryBaseCommand?: string };
+  expect(manifest.args[0]![0]).toBe("vitest run 'tests/a.test.ts' 'tests/b.test.ts'");
+  expect(opts.retryBaseCommand).toBe(REOBSERVATION_RETRY_BASE);
+  // the retry the recovery would build from that base cannot be formed, so no second process starts
+  expect(() => singleForkRetryCommand(opts.retryBaseCommand!, repo, ["tests/a.test.ts"], ["tests/b.test.ts"])).toThrow(/not a supported direct runner invocation/);
+  expect(result).toMatchObject({ pass: false, meta: { infra: true, retryable: false, recoveryRefused: true } });
 });

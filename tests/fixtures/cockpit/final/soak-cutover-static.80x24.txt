@@ -1,0 +1,24 @@
+tickmarkr capture | RUN | run-screen-soak
+1 Home  4 Run  5 Evidence | content | 1–17/42 | 25 hidden
+────────────────────────────────────────────────────────────────────────────────
+│RUN / RUNNING · 0/? merged | current-cycle tip PENDING | RUNNING | not compara│
+│ tickmarkr  run-screen-soak  │  0/? done  │  0 esc  │  0h00m                  │
+│                                                                              │
+│  ▌ TASKS   0 journal tasks merged · graph absent                             │
+│                                                                              │
+│         area            deps          task                                   │
+│         bu te li ev sc ac re   channel     att  note                         │
+│    ──────────────────────────────────────────────────────────────────────────│
+│  ❯ T1   —               —                                                    │
+│         ·  ·  ·  ·  ·  ·  ·    fake:fixtu  1                                 │
+│         in flight                                                            │
+│                                                                              │
+│    area    SPEC · FLEET · RUN · GATE · UI · DOCS · REPO                      │
+│    gates   bu build  te test  li lint  ev evidence  sc scope  ac acceptance  │
+│            ✔ passed   ✖ failed   · pending   ─ not declared (acceptance and r│
+│                                                                              │
+│──────────────────────────────────────────────────────────────────────────────│
+────────────────────────────────────────────────────────────────────────────────
+RUNNING | MERGED 0/? | CURRENT TIP PENDING | fresh
+Tab Focus | Enter Open | a Actions | ? Keys | q Quit
+────────────────────────────────────────────────────────────────────────────────

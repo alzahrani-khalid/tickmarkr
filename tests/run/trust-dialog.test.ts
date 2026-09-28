@@ -14,12 +14,14 @@ import { allAdapters, getAdapter } from "../../src/adapters/registry.js";
 import {
   CLAUDE_TRUST_PANE, CODEX_TRUST_PANE, CURSOR_TRUST_PANE, KIMI_MCP_TRUST_PANE, KIMI_TRUST_PANE,
   matchesTrustDialog, RECORDED_TRUST_PANES, TRUST_DIALOG_BLANK_MESSAGE, TRUST_DIALOG_UNRECORDED_MESSAGE,
-  type TrustDialog, type WorkerAdapter,
+  type InteractiveSeed, type TrustDialog, type WorkerAdapter,
 } from "../../src/adapters/types.js";
+import { OrcaDriver, type OrcaExec } from "../../src/drivers/orca.js";
 import { SubprocessDriver } from "../../src/drivers/subprocess.js";
-import type { ExecutorDriver } from "../../src/drivers/types.js";
+import { formatOwnedName, type ExecutorDriver } from "../../src/drivers/types.js";
 import { runDaemon } from "../../src/run/daemon.js";
 import { Journal } from "../../src/run/journal.js";
+import { cursorModalExec, FakeOrca } from "../helpers/fake-orca.js";
 import { COMMIT, setupRepo, T } from "../helpers/tmprepo.js";
 
 // v1.22 T5 / OBS-19: fingerprint-matched trust dialog gets one Enter; anything else pages.
@@ -440,3 +442,73 @@ test("the daemon keys the same pane bytes only for the captured declaration, nev
   expect(declined.notified.filter((m) => /blocked on a prompt/.test(m))).toHaveLength(1);
   expect(declined.human).toEqual(["T1"]);
 }, 60_000);
+
+// OBS-1205: kimi's modal as a live Orca terminal serves it — box rules on the stream, the modal only on
+// the rendered frame. Driven through runDaemon and the PRODUCTION OrcaDriver over the fake runtime.
+const ORCA_SEED: InteractiveSeed = {
+  launch: (model: string) => `launch-tui --model ${model}`,
+  readinessMatch: "TUI ready",
+  seedLine: (promptFile: string) => `Read ${promptFile} and do exactly what it says.`,
+};
+// The same words as prose — no selection cursor — which a live modal always renders and prose never does.
+const KIMI_TRUST_PROSE = "Kimi Code loads project-level MCP servers only in trusted folders: Trust this folder from settings.";
+
+async function runOrcaTrustScreen(runId: string, screen: string) {
+  const { repo, fake } = setupRepo(
+    [T("T1")],
+    { tasks: { T1: [{ shell: "true", result: { ok: true, summary: "seeded" } }] }, consult: { action: "human", notes: "operator must unblock" } },
+    "visibility:\n  worker: interactive\ntaskTimeoutMinutes: 0.03\n",
+  );
+  const seeded = fake as unknown as { interactiveSeed: InteractiveSeed; trustDialog: TrustDialog };
+  seeded.interactiveSeed = ORCA_SEED;
+  seeded.trustDialog = KIMI_TRUST_DIALOG;
+  const orca = new FakeOrca({ echoSends: false });
+  const modal = cursorModalExec(orca, { launch: "launch-tui", screen, ready: ORCA_SEED.readinessMatch });
+  // What the driver actually RECEIVED: each worker terminal's owned title, and every read's tail by surface.
+  const workers = new Map<string, string>();
+  const reads: { handle: string; screen: boolean; text: string }[] = [];
+  const exec: OrcaExec = async (args, cwd, timeoutMs) => {
+    const r = await modal.exec(args, cwd, timeoutMs);
+    if (r.code !== 0) return r;
+    const result = (JSON.parse(r.stdout) as { result: { terminal?: { handle: string; tail?: string[] } } }).result;
+    const title = args[args.indexOf("--title") + 1] ?? "";
+    if (args[1] === "create" && title.startsWith("tickmarkr:worker:T1:")) workers.set(result.terminal!.handle, title);
+    if (args[1] === "read" && workers.has(result.terminal?.handle ?? "")) {
+      reads.push({ handle: result.terminal!.handle, screen: args.includes("--screen"), text: (result.terminal!.tail ?? []).join("\n") });
+    }
+    return r;
+  };
+  const summary = await runDaemon(repo, { adapters: [fake as WorkerAdapter], runId, driver: new OrcaDriver({ pollMs: 20, exec }) });
+  const events = Journal.open(repo, runId).read().filter((e) => e.taskId === "T1");
+  return { summary, events, orca, enters: modal.enters(), workers, reads };
+}
+
+test("runDaemon using the production OrcaDriver reaches worker-launch after exactly one Enter when the stream lacks Trust and the owned screen shows the cursor-prefixed kimi modal, whereas prose without the cursor receives zero keys and reaches the seed deadline", async () => {
+  expect(matchesTrustDialog(KIMI_TRUST_PANE, KIMI_TRUST_DIALOG)).toBe(true);
+  const run = await runOrcaTrustScreen("run-orca-trust-modal", KIMI_TRUST_PANE);
+  // The stream never carried the modal's text — a stream-only poll could not have matched it — while
+  // the owned worker terminal's rendered frame did.
+  expect([...run.workers.values()]).toEqual([formatOwnedName({ role: "worker", taskId: "T1", attempt: 0, runId: "run-orca-trust-modal" })]);
+  const streamReads = run.reads.filter((r) => !r.screen);
+  expect(streamReads.length).toBeGreaterThan(0);
+  for (const r of streamReads) expect(r.text).not.toContain("Trust");
+  expect(run.reads.some((r) => r.screen && matchesTrustDialog(r.text, KIMI_TRUST_DIALOG))).toBe(true);
+  expect(run.enters).toBe(1);
+  const names = run.events.map((e) => e.event);
+  expect(names).toContain("worker-launch");
+  expect(names.indexOf("trust-auto-answer")).toBeLessThan(names.indexOf("worker-launch"));
+  expect(run.events.filter((e) => e.event === "trust-auto-answer").map((e) => e.data.phase)).toEqual(["seed"]);
+  expect(names).not.toContain("delivery-readiness-failed");
+
+  // Prose: the same words, no cursor. No key at any point; the seed waits out its deadline.
+  expect(matchesTrustDialog(KIMI_TRUST_PROSE, KIMI_TRUST_DIALOG)).toBe(false);
+  const prose = await runOrcaTrustScreen("run-orca-trust-prose", KIMI_TRUST_PROSE);
+  expect(prose.reads.some((r) => r.screen && r.text.includes("Trust this folder"))).toBe(true);
+  expect(prose.enters).toBe(0);
+  expect(prose.events.some((e) => e.event === "trust-auto-answer")).toBe(false);
+  const deadlines = prose.events.filter((e) => e.event === "delivery-readiness-failed");
+  expect(deadlines.length).toBe(prose.workers.size);
+  for (const d of deadlines) expect(Number(d.data.waitedMs)).toBeGreaterThanOrEqual(0.03 * 60_000);
+  expect(prose.events.some((e) => e.event === "worker-launch")).toBe(false);
+  expect(prose.summary.human).toEqual(["T1"]);
+}, 120_000);

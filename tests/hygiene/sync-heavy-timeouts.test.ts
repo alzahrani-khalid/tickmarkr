@@ -8,8 +8,10 @@ import { SYNC_HEAVY_TESTS } from "../../vitest.config.js";
  * members starve their own RPC under the parallel suite's load. An inline per-test timeout
  * (`}, 240_000)` or `{ timeout: … }`) silently overrides that ceiling — the 2.5.0 export proof
  * went red exactly this way (docs-truth-testing's 240 s override, written six days BEFORE the
- * ruling, fired under the 2.5.0-heavier suite while the file ran in 27 s at calm). The project
- * owns the ceiling; a member never overrides it.
+ * ruling, fired under the 2.5.0-heavier suite while the file ran in 27 s at calm). The config
+ * owns the ceiling — the sync-heavy project's testTimeout under the CI guard, and locally (OBS-634
+ * add) the per-file ceiling tests/setup.ts applies inside the pooled `suite` project; a member never
+ * overrides it.
  */
 
 const ROOT = join(__dirname, "..", "..");
