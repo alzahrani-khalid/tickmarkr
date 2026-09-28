@@ -81,7 +81,9 @@ class Reviewer extends FakeAdapter {
 const rowsOf = (repo: string, runId: string) => Journal.open(repo, runId).read();
 const taskRows = (rows: JournalEvent[], event: string) => rows.filter((row) => row.taskId === "T1" && row.event === event);
 
-describe("semantic seat delivery (production daemon, fake adapters, zero tokens)", () => {
+// C-14: each case drives whole production daemon runs (~6 s on a fast host); the 20 s unit default
+// timed out two of them on public CI's 2-core runner, so they carry a daemon-test budget like their siblings.
+describe("semantic seat delivery (production daemon, fake adapters, zero tokens)", { timeout: 120_000 }, () => {
   test("the production daemon spends one same-subject same-channel fresh-nonce retry on malformed reviewer delivery before an infrastructure park versus preserving a valid material red, so JSON salvage or an author debit fails", async () => {
     const reviewCfg = "review: { required: true, prefer: [seat-a], timeoutMs: 5000 }\n";
     // Malformed twice from the ONLY eligible reviewer: one re-emission on that seat, then an infra park.

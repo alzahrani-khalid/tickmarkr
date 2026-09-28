@@ -53,12 +53,16 @@ test("production receipt resolution exposes HOME/TMPDIR substitutions as nonmate
   expect(resolveReceiptRedaction(material.receipt)).toEqual({ material: true, counts: { token: 1, assignment: 1, secretEnv: 1, benignEnv: 1 } });
   // Precedence binds overlapping spans, not match order: an assignment whose value is a token counts as
   // the token, a benign TMPDIR overlapping a secret's tail is the secret, and a short HOME still substitutes.
-  const overlap = await run(`token=${token} /tmp/prefix-secret /root/.cache`,
-    { ...process.env, HOME: "/root", TMPDIR: "/tmp/prefix", SERVICE_SECRET: "prefix-secret" });
+  // C-14: the gate runs in a login shell with this env. bash stays silent when ~/.bash_profile is missing but
+  // prints any other open error, so an unreadable real HOME (/root on Linux CI) put "/root" on stderr as a
+  // second count. A short HOME that does not exist is silent on every host.
+  const shortHome = "/nx/home";
+  const overlap = await run(`token=${token} /tmp/prefix-secret ${shortHome}/.cache`,
+    { ...process.env, HOME: shortHome, TMPDIR: "/tmp/prefix", SERVICE_SECRET: "prefix-secret" });
   expect(overlap.bytes).toBe("[REDACTED] [REDACTED] $HOME/.cache");
   expect(resolveReceiptRedaction(overlap.receipt)).toEqual({ material: true, counts: { token: 1, assignment: 0, secretEnv: 1, benignEnv: 1 } });
   // An identical span (a secret whose value IS the HOME value) is the secret: withheld, never $HOME.
-  const identical = await run("cwd /root and /root/.cache", { ...process.env, HOME: "/root", SERVICE_SECRET: "/root" });
+  const identical = await run(`cwd ${shortHome} and ${shortHome}/.cache`, { ...process.env, HOME: shortHome, SERVICE_SECRET: shortHome });
   expect(identical.bytes).toBe("cwd [REDACTED] and [REDACTED]/.cache");
   expect(resolveReceiptRedaction(identical.receipt)).toEqual({ material: true, counts: { token: 0, assignment: 0, secretEnv: 2, benignEnv: 0 } });
   // A longer secret starting inside a shorter one is one span, withheld whole: no tail leaks.

@@ -269,7 +269,9 @@ async function bothParkScenario() {
   expect(parkKind("T1")).toBe("human-gate");
   expect(parkKind("T2")).toBe("human-gate");
   expect(parkKind("T3")).toBe("gate-fail"); // the second kind of park, same disclosure
-  expect(parkKind("T4")).toBe("gate-fail");
+  // C-14: once, on public macOS CI, T4 journaled nothing here (0 of 33 local repeats); say what it did if it recurs.
+  expect(parkKind("T4"), JSON.stringify({ t4: events.filter((e) => e.taskId === "T4").map((e) => e.event),
+    done: summary.done, human: summary.human, failed: summary.failed, blocked: summary.blocked, pending: summary.pending })).toBe("gate-fail");
   expect(events.filter((e) => e.event === "task-approved").map((e) => e.taskId).sort()).toEqual(["T1", "T3"]);
 
   // Live approvals are now enacted at task boundaries, even when the task later parks again for a new reason.
