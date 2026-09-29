@@ -1,6 +1,6 @@
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { HerdrDriver, type HerdrTimeSource } from "../../../src/drivers/herdr.js";
+import { HerdrDriver } from "../../../src/drivers/herdr.js";
 import { makeTestTempDir } from "../../helpers/tmprepo.js";
 import { root } from "./test-support.js";
 export type HostPane = { pane_id: string; label: string; workspace_id: string; tab_id?: string; cwd: string; launcherPid?: number; frame?: string };
@@ -13,7 +13,7 @@ export function boardHost() {
   const write = (state: HostState) => writeFileSync(path, JSON.stringify(state));
   write({ panes: [], next: 0, children: [] });
   const read = () => JSON.parse(readFileSync(path, "utf8")) as HostState;
-  return { path, read, write, driver: (time?: HerdrTimeSource) => new HerdrDriver(join(root, "tests/fixtures/screen-soak/fake-herdr.mjs"), undefined, time),
+  return { path, read, write, driver: () => new HerdrDriver(join(root, "tests/fixtures/screen-soak/fake-herdr.mjs")),
     calls: () => { try { return readFileSync(path + ".calls", "utf8").trim().split("\n").map(line => JSON.parse(line) as string[]); } catch { return []; } },
     dispose: () => {
       for (const pid of read().children) { try { process.kill(-pid, "SIGTERM"); } catch { /* already exited */ } }
