@@ -140,7 +140,9 @@ test("Run’s o action reaches the new driver focus capability using recorded ru
   let board: Slot | undefined;
   try {
     const { repo: keptRepo, fake } = setupRepo([T("T1", { humanGate: true })], {}, "visibility: { keepPanes: forever }\n");
-    const herdr = preservation.driver();
+    // C-15: public macOS CI missed the board's 5 s stop acknowledgement in this teardown; a quarter-speed clock
+    // gives every driver deadline in the case four times the real time (fail-closed waits only get longer).
+    const herdr = preservation.driver({ now: () => Date.now() / 4, sleep: (ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)) });
     class KeptBoard extends SubprocessDriver {
       async narrator(cwd: string, command: string, id?: string) { board = await herdr.narrator(cwd, command, id); return board; }
       override close(value: Slot) { return value.name.includes(":watch:") ? herdr.close(value) : super.close(value); }

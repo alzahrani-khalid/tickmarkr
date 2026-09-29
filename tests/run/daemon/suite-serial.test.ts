@@ -307,4 +307,4 @@ test("test: with task A held in review by a stalled reviewer and task B entering
       }
     } finally { writeFileSync(release, "go"); startB(); resetSpawnForTests(); resetLiveSuiteCountForTests(); }
   }
-}, 60_000);
+}, 180_000); // C-15: three daemon runs; a loaded coverage run missed 60 s

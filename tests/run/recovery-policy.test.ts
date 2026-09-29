@@ -159,8 +159,10 @@ test("an exhausted task cannot close a concurrently executing sibling's owned wo
   });
   const journal = Journal.create(repo, "run-budget-sibling");
   journal.append("run-start", undefined, { baseRef: await gitHead(repo), commands: {}, graphDefinitionHash: graphDefinitionHash(loadGraph(repo)),
-    effectivePolicy: { config: { executionPolicy: { boundedInfrastructure: true, taskExecutionLimitMs: 2500 } } } });
-  journal.append("execution-budget-reserved", "T1", { id: "prior", limitMs: 2500, reservedMs: 1700 });
+    // C-15: T1 keeps its 0.8 s remainder so it exhausts while T2 (sleep 1.1) runs; T2's own budget is sized for
+    // a slow runner, where 2.5 s for a worker plus five gates parked T2 on public macOS CI.
+    effectivePolicy: { config: { executionPolicy: { boundedInfrastructure: true, taskExecutionLimitMs: 10_000 } } } });
+  journal.append("execution-budget-reserved", "T1", { id: "prior", limitMs: 10_000, reservedMs: 9_200 });
   writeFileSync(join(journal.dir, "baseline.json"), JSON.stringify({ commands: {} }));
   const summary = await runDaemon(repo, { runId: journal.runId, resume: true, concurrency: 2, adapters: [fake], driver: new SubprocessDriver() });
   expect(summary.human).toEqual(["T1"]);
@@ -172,7 +174,7 @@ test("an exhausted task cannot close a concurrently executing sibling's owned wo
   expect(secondLaunch).toBeLessThan(firstPark);
   expect(secondDone).toBeGreaterThan(firstPark);
   expect(await shGitOk(`git show ${summary.branch}:second.txt`, repo)).toContain("survived");
-}, 7000);
+}, 30_000);
 
 
 test("human-released recheck runs full tests even when opted-in repair history permits selection", async () => {

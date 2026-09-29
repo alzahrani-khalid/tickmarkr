@@ -119,8 +119,8 @@ test(criterion, async () => {
   });
   // Always reap the blocked sibling, including when an assertion fails.
   try {
-    await expect.poll(() => existsSync(started), { timeout: 30_000 }).toBe(true);
-    await expect.poll(() => Journal.open(live.repo, id).read().some((e) => e.event === "task-human" && e.data.kind === "scope-request"), { timeout: 30_000 }).toBe(true);
+    await expect.poll(() => existsSync(started), { timeout: 60_000 }).toBe(true); // C-15: a loaded coverage run missed 30 s
+    await expect.poll(() => Journal.open(live.repo, id).read().some((e) => e.event === "task-human" && e.data.kind === "scope-request"), { timeout: 60_000 }).toBe(true);
     const journal = Journal.open(live.repo, id);
     const before = journal.read().length;
     await expect(approve([id, "T1"], live.repo)).rejects.toThrow("--files");
