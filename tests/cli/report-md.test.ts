@@ -1,7 +1,13 @@
-import { cpSync, mkdirSync, readdirSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { cpSync, mkdirSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import { renderMarkdownRecord, report } from "../../src/cli/commands/report.js";
+import { status } from "../../src/cli/commands/status.js";
+import { graphDefinitionHash, saveGraph } from "../../src/graph/graph.js";
+import { validateGraph } from "../../src/graph/schema.js";
+import { modelProvider } from "../../src/route/preference.js";
+import { cellWidth } from "../../src/tui/cockpit/width.js";
 import { Journal, type JournalEvent } from "../../src/run/journal.js";
 import { makeRepo } from "../helpers/tmprepo.js";
 
@@ -26,7 +32,8 @@ describe("tickmarkr report --md (REC-01 execution record)", () => {
     ];
     const out = renderMarkdownRecord("run-provider-review", events);
     expect(out).toContain("review: pass (same-provider — independence not established) — reviewer codex:gpt-5.6-sol");
-    expect(out).toContain("review-leg2: pass (supersedes daemon review) — reviewer kimi:kimi-code/k3 (vendor: moonshot; provider: moonshot)");
+    // CG1: a leg2 row with no validated owed-check discharge of its own claims no supersession.
+    expect(out).toContain("review-leg2: pass (unvalidated — no validated owed-check discharge; the daemon review stands) — reviewer kimi:kimi-code/k3 (vendor: moonshot; provider: moonshot)");
   });
 
   test("synthetic journal renders outcome, attempts, channels, gates, consult, merge commit", async () => {
@@ -432,5 +439,268 @@ describe("OBS-1201 evidence lineage and OBS-634 suite telemetry", () => {
     const noStart = await report(["run-no-start", "--md"], repo);
     expect(noStart).toContain("- **window:** not measurable — the journal names no run-start with a readable timestamp");
     expect(noStart).not.toContain("- **test:**");
+  });
+});
+
+// CG1 (v2.6.4): the lead's end-to-end first pass is folded from THIS journal's lineage, and a leg2
+// row's supersession is claimed only through its own validated owed-check discharge.
+describe("CG1 end-to-end first pass and leg2 attribution", () => {
+  const t = (s: number) => new Date(Date.parse("2026-09-29T00:00:00.000Z") + s * 1_000).toISOString();
+  const graphOf = (ids: string[]) => validateGraph({
+    version: 1,
+    spec: { source: "prd", paths: ["cg1"], hash: "cg1" },
+    tasks: ids.map((id) => ({ id, title: `task ${id}`, goal: `task ${id}`, shape: "implement", complexity: 3, acceptance: ["a"], status: "done" })),
+  });
+  const assignment = { adapter: "codex", model: "gpt-6-sol", channel: "sub", tier: "frontier" };
+  /** A journal builder: every row's ts is its index, and push returns the row's physical-line binding. */
+  const builder = () => {
+    const rows: JournalEvent[] = [];
+    const push = (event: string, taskId: string | undefined, data: Record<string, unknown> = {}) => {
+      rows.push({ ts: t(rows.length), event, ...(taskId ? { taskId } : {}), data });
+      return { line: rows.length, ts: rows.at(-1)!.ts };
+    };
+    return { rows, push };
+  };
+  const seed = (runId: string, ids: string[], rows: JournalEvent[]) => {
+    const repo = makeRepo({ "keep.txt": "x\n" });
+    saveGraph(repo, graphOf(ids));
+    const j = Journal.create(repo, runId);
+    writeFileSync(join(j.dir, "journal.jsonl"), rows.map((e) => JSON.stringify(e)).join("\n") + "\n");
+    return { repo, j };
+  };
+  const lead = async (repo: string, runId: string) => ({
+    md: (await report([runId, "--md"], repo)).split("\n"),
+    text: (await report([runId], repo)).split("\n"),
+    status: (await status([runId], repo)).split("\n"),
+  });
+
+  test("report and status render end-to-end first pass as zero successes from one park approve resume merge versus one success from one uninterrupted dispatch; missing predecessor or dispatch lineage reads unknown", async () => {
+    const run = (runId: string, build: (push: ReturnType<typeof builder>["push"]) => void, start: Record<string, unknown> = {}) => {
+      const { rows, push } = builder();
+      push("run-start", undefined, { baseRef: "base", graphDefinitionHash: graphDefinitionHash(graphOf(["T1"])), ...start });
+      build(push);
+      push("run-end", undefined, { done: ["T1"], failed: [], human: [], blocked: [], pending: [] });
+      return seed(runId, ["T1"], rows);
+    };
+    const parked = run("run-fp-parked", (push) => {
+      push("task-dispatch", "T1", { assignment, attempt: 0, workerDispatchOrdinal: 0 });
+      push("gate-result", "T1", { gate: "test", pass: false, details: "1 failed" });
+      const park = push("task-human", "T1", { kind: "gate-fail" });
+      push("task-approved", "T1", { by: "operator", release: "gate-satisfied", gate: "test", park });
+      push("run-resume", undefined, { pid: 2 });
+      push("task-done", "T1");
+      push("merge", "T1", { commit: "d".repeat(40) });
+    });
+    // The engagement-local telemetry reads this task as a first-attempt success — the false-clean case.
+    parked.j.telemetry({ taskId: "T1", shape: "implement", adapter: "codex", model: "gpt-6-sol", channel: "sub", attempts: 1, outcome: "done", durationMs: 1, firstAttemptOk: true });
+    const clean = run("run-fp-clean", (push) => {
+      push("task-dispatch", "T1", { assignment, attempt: 0, workerDispatchOrdinal: 0 });
+      push("gate-result", "T1", { gate: "test", pass: true });
+      push("task-done", "T1");
+      push("merge", "T1", { commit: "e".repeat(40) });
+    });
+    // The task rows alone read one clean dispatch at attempt 0 straight to its merge; the run rows do not:
+    // a run-end summary parked it and the run restarted before the merge.
+    const summaryParked = run("run-fp-summary-park", (push) => {
+      push("task-dispatch", "T1", { assignment, attempt: 0, workerDispatchOrdinal: 0 });
+      push("run-end", undefined, { done: [], failed: [], human: ["T1"], blocked: [], pending: [] });
+      push("run-resume", undefined, { pid: 2 });
+      push("task-done", "T1");
+      push("merge", "T1", { commit: "c".repeat(40) });
+    });
+    const restarted = run("run-fp-restarted", (push) => {
+      push("task-dispatch", "T1", { assignment, attempt: 0, workerDispatchOrdinal: 0 });
+      push("run-resume", undefined, { pid: 2 });
+      push("task-done", "T1");
+      push("merge", "T1", { commit: "9".repeat(40) });
+    });
+    const noDispatch = run("run-fp-no-dispatch", (push) => {
+      push("task-done", "T1");
+      push("merge", "T1", { commit: "f".repeat(40) });
+    });
+    const superseding = run("run-fp-supersedes", (push) => {
+      push("task-dispatch", "T1", { assignment, attempt: 0, workerDispatchOrdinal: 0 });
+      push("task-done", "T1");
+      push("merge", "T1", { commit: "a".repeat(40) });
+    }, { supersedes: "run-fp-old" });
+    // A park, approval, resume and merge whose dispatch is missing, or read in a run continuing an unread
+    // predecessor, has lost its lineage: unknown, never a known miss.
+    const parkedLineage = (push: ReturnType<typeof builder>["push"], dispatch: boolean) => {
+      if (dispatch) push("task-dispatch", "T1", { assignment, attempt: 0, workerDispatchOrdinal: 0 });
+      push("gate-result", "T1", { gate: "test", pass: false, details: "1 failed" });
+      const park = push("task-human", "T1", { kind: "gate-fail" });
+      push("task-approved", "T1", { by: "operator", release: "gate-satisfied", gate: "test", park });
+      push("run-resume", undefined, { pid: 2 });
+      push("task-done", "T1");
+      push("merge", "T1", { commit: "7".repeat(40) });
+    };
+    const parkedNoDispatch = run("run-fp-parked-no-dispatch", (push) => parkedLineage(push, false));
+    const parkedSuperseding = run("run-fp-parked-supersedes", (push) => parkedLineage(push, true), { supersedes: "run-fp-old" });
+    // The same park, approval, resume and merge — or one clean dispatch to its merge — whose first recorded
+    // dispatch cannot prove it was the task's first: past attempt 0, a lifetime ordinal past 0 (attempts
+    // reset at every release, the ordinal never does), or no recorded ordinal at all. The initial dispatch
+    // is missing or unproven, so neither the interruption nor the clean merge is classified.
+    const origins: Array<[string, Record<string, unknown>]> = [
+      ["attempt-1", { attempt: 1, workerDispatchOrdinal: 0 }],
+      ["ordinal-1", { attempt: 0, workerDispatchOrdinal: 1 }],
+      ["ordinal-unrecorded", { attempt: 0 }],
+    ];
+    const unproven = origins.flatMap(([name, origin]) => [
+      [run(`run-fp-parked-${name}`, (push) => {
+        push("task-dispatch", "T1", { assignment, ...origin });
+        push("gate-result", "T1", { gate: "test", pass: false, details: "1 failed" });
+        const park = push("task-human", "T1", { kind: "gate-fail" });
+        push("task-approved", "T1", { by: "operator", release: "gate-satisfied", gate: "test", park });
+        push("run-resume", undefined, { pid: 2 });
+        push("task-done", "T1");
+        push("merge", "T1", { commit: "6".repeat(40) });
+      }), `run-fp-parked-${name}`, "end-to-end first pass unknown (1 without lineage)"] as [{ repo: string }, string, string],
+      [run(`run-fp-${name}`, (push) => {
+        push("task-dispatch", "T1", { assignment, ...origin });
+        push("task-done", "T1");
+        push("merge", "T1", { commit: "b".repeat(40) });
+      }), `run-fp-${name}`, "end-to-end first pass unknown (1 without lineage)"] as [{ repo: string }, string, string],
+    ]);
+
+    const cases: Array<[{ repo: string }, string, string]> = [
+      [parked, "run-fp-parked", "end-to-end first pass 0/1"],
+      [clean, "run-fp-clean", "end-to-end first pass 1/1"],
+      [summaryParked, "run-fp-summary-park", "end-to-end first pass 0/1"],
+      [restarted, "run-fp-restarted", "end-to-end first pass 0/1"],
+      [noDispatch, "run-fp-no-dispatch", "end-to-end first pass unknown (1 without lineage)"],
+      [superseding, "run-fp-supersedes", "end-to-end first pass unknown (1 without lineage)"],
+      [parkedNoDispatch, "run-fp-parked-no-dispatch", "end-to-end first pass unknown (1 without lineage)"],
+      [parkedSuperseding, "run-fp-parked-supersedes", "end-to-end first pass unknown (1 without lineage)"],
+      ...unproven,
+    ];
+    for (const [{ repo }, runId, reading] of cases) {
+      const out = await lead(repo, runId);
+      expect(out.text[0], runId).toContain(reading);
+      expect(out.md[0], runId).toContain(reading);
+      expect(out.status[0], runId).toContain(reading);
+      // The one-line form carries the same lineage reading — an unknown one included.
+      expect(await status([runId, "--oneline"], repo), runId).toContain(` · ${reading} · `);
+      expect(out.md, runId).toContain(`- **end-to-end first pass:** ${reading.replace("end-to-end first pass ", "")} — this journal's dispatch, park, approval and merge lineage`);
+    }
+    // At 80 columns the unknown reading moves to a continuation row after the three lead lines, never above them.
+    const cols = Object.getOwnPropertyDescriptor(process.stdout, "columns");
+    Object.defineProperty(process.stdout, "columns", { configurable: true, value: 80 });
+    try {
+      const narrow = (await status(["run-fp-no-dispatch"], noDispatch.repo)).split("\n");
+      expect(narrow.slice(0, 3).map((line) => line.split(" ")[0])).toEqual(["finished", "time", "needs"]);
+      expect(narrow[3]).toBe("  finished: end-to-end first pass unknown (1 without lineage)");
+      // Report text wraps the same way: needs you stays the third line, EVERY row of the complete output
+      // fits — the telemetry heading and the wall window included — and no fact is dropped.
+      const text = (await report(["run-fp-no-dispatch"], noDispatch.repo)).split("\n");
+      expect(text.slice(0, 3).map((line) => line.split(" ")[0])).toEqual(["finished", "time", "needs"]);
+      expect(text[3]).toBe("  finished: end-to-end first pass unknown (1 without lineage)");
+      expect(text[4]).toBe("tickmarkr engagement — run-fp-no-dispatch");
+      for (const line of text) expect(cellWidth(line), line).toBeLessThanOrEqual(80);
+      const joined = text.join(" ").replace(/\s+/gu, " ");
+      expect(joined).toContain("engagement summary — audit trail: engagement-local telemetry, attempts restart at every resume");
+      expect(joined).toMatch(/window \S+ — each instant counted once, by priority [^\n]*; task-time sums concurrent spans/u);
+    } finally {
+      if (cols) Object.defineProperty(process.stdout, "columns", cols);
+      else delete (process.stdout as { columns?: number }).columns;
+    }
+    const parkedMd = (await lead(parked.repo, "run-fp-parked")).md;
+    expect(parkedMd).toContain("- **first-attempt rate (engagement-local telemetry):** 1/1 (100%) — attempts restart at every resume");
+  });
+
+  test("report labels engagement-local telemetry separately and attributes a leg2 supersession only to its validated matching discharge while refused wrong-task wrong-gate and unavailable-artifact records remain unvalidated", async () => {
+    const reviewer = { key: "claude-code:claude-opus-5-5", vendor: "anthropic" };
+    const author = { key: "codex:gpt-6-sol", vendor: "openai" };
+    const provider = modelProvider("claude-opus-5-5", "anthropic");
+    const { rows, push } = builder();
+    push("run-start", undefined, { baseRef: "base", graphDefinitionHash: graphDefinitionHash(graphOf(["T1", "T2", "T3", "T4"])) });
+    const obligation = (taskId: string, gate: string, digit: string) => ({
+      version: 1, id: `owed-${taskId}-${gate}`, runId: "run-leg2", taskId, gate, base: digit.repeat(40), head: digit.repeat(39) + "f",
+      subject: `subject-${taskId}`, patch: `patch-${taskId}`, patches: [`patch-${taskId}`], criteria: `criteria-${taskId}`, files: ["src/a.ts"],
+      authors: [author.key], declared: [author, reviewer], cause: "operator waive", evidence: "tickmarkr verify --record run-leg2",
+      disposition: "accepted-risk", known: true,
+    });
+    const obligations = { T1: obligation("T1", "review", "1"), T3: obligation("T3", "test", "3"), T4: obligation("T4", "review", "4") };
+    for (const [taskId, o] of Object.entries(obligations)) {
+      push("task-dispatch", taskId, { assignment, attempt: 0, workerDispatchOrdinal: 0 });
+      push("gate-result", taskId, { gate: o.gate, pass: false, details: `${o.gate} red` });
+      const park = push("task-human", taskId, { kind: "gate-fail" });
+      push("task-approved", taskId, { by: "operator", release: "gate-satisfied", gate: o.gate, park, obligation: o });
+      push("task-done", taskId);
+      push("merge", taskId, { commit: o.head });
+    }
+    push("task-dispatch", "T2", { assignment, attempt: 0, workerDispatchOrdinal: 0 });
+    push("gate-result", "T2", { gate: "review", pass: true, reviewer: reviewer.key, details: "reviewer claude-code:claude-opus-5-5 (anthropic): approved" });
+    push("task-done", "T2");
+    push("merge", "T2", { commit: "2".repeat(40) });
+    push("run-end", undefined, { done: ["T1", "T2", "T3", "T4"], failed: [], human: [], blocked: [], pending: [] });
+    const { repo, j } = seed("run-leg2", ["T1", "T2", "T3", "T4"], rows);
+
+    // verify --record after run-end: one hash-bound artifact per record, a discharge the fold accepts, then the leg2 row.
+    const reviewRow = { gate: "review", pass: true, meta: { reviewer: reviewer.key, vendor: reviewer.vendor, provider } };
+    const record = (taskId: string, o: typeof obligations.T1, gateRows: unknown[], leg2Task = taskId) => {
+      const artifactPath = join(j.dir, `verify-${taskId}.json`);
+      const bytes = Buffer.from(JSON.stringify({ base: o.base, head: o.head, mergeBase: o.base, green: true, files: o.files, criteria: o.criteria, gateRows }));
+      writeFileSync(artifactPath, bytes);
+      const bound = { mergeBase: o.base, head: o.head, artifactPath, artifactSha256: createHash("sha256").update(bytes).digest("hex") };
+      push("owed-check-discharged", taskId, { ids: [o.id], gates: [o.gate], mapping: "exact", criteria: o.criteria, ...bound, reviewer, authorChannels: [author] });
+      push("review-leg2", leg2Task, { base: o.base, author: author.key, artifactAvailability: "available", pass: true, reviewer: reviewer.key, vendor: reviewer.vendor, provider, details: "approved", ...bound });
+      return artifactPath;
+    };
+    record("T1", obligations.T1, [reviewRow]);
+    const t1Leg2 = rows.at(-1)!;
+    // wrong task: T2's leg2 row carries T1's validated proof, which discharged T1's check, not T2's.
+    rows.push({ ...t1Leg2, ts: t(rows.length), taskId: "T2" });
+    // Same task, artifact and range as T1's proof, but not its own: a failed capture-failed row and a
+    // passing row, each naming the author as reviewer, never borrow the sibling's validated discharge.
+    const authorSeat = { reviewer: author.key, vendor: author.vendor, provider: modelProvider("gpt-6-sol", "openai") };
+    rows.push({ ...t1Leg2, ts: t(rows.length), data: { ...t1Leg2.data, ...authorSeat, pass: false, artifactAvailability: "capture-failed" } });
+    rows.push({ ...t1Leg2, ts: t(rows.length), data: { ...t1Leg2.data, ...authorSeat } });
+    // wrong gate: T3's proof validly discharges a TEST check; its review row supersedes no review.
+    record("T3", obligations.T3, [{ gate: "test", pass: true }, reviewRow]);
+    const unavailable = record("T4", obligations.T4, [reviewRow]);
+    writeFileSync(join(j.dir, "journal.jsonl"), rows.map((e) => JSON.stringify(e)).join("\n") + "\n");
+
+    const leg2 = (md: string, taskId: string) =>
+      md.split("\n## ").find((section) => section.startsWith(`${taskId}\n`))!.split("\n").filter((line) => line.includes("review-leg2:"));
+    const supersedes = (id: string) => `review-leg2: pass (supersedes daemon review — validated discharge ${id}) — reviewer ${reviewer.key}`;
+    const unvalidated = `review-leg2: pass (unvalidated — no validated owed-check discharge; the daemon review stands) — reviewer ${reviewer.key}`;
+
+    const md = await report(["run-leg2", "--md"], repo);
+    const authorText = `reviewer ${author.key} (vendor: openai; provider: ${authorSeat.provider})`;
+    expect(leg2(md, "T1")).toEqual([
+      `  - ${supersedes("owed-T1-review")} (vendor: anthropic; provider: ${provider})`,
+      `  - review-leg2: fail (unvalidated — no validated owed-check discharge; the daemon review stands) — ${authorText}`,
+      `  - review-leg2: pass (unvalidated — no validated owed-check discharge; the daemon review stands) — ${authorText}`,
+    ]);
+    expect(leg2(md, "T2")).toEqual([`  - ${unvalidated} (vendor: anthropic; provider: ${provider})`]);
+    expect(leg2(md, "T3")).toEqual([`  - ${unvalidated} (vendor: anthropic; provider: ${provider})`]);
+    expect(leg2(md, "T4")).toEqual([`  - ${supersedes("owed-T4-review")} (vendor: anthropic; provider: ${provider})`]);
+    expect(md.split("\n")[2]).toBe("- needs you: outstanding 0 · 0 parked · 0 failed");
+
+    // The artifact goes away: T4's proof no longer revalidates, so its row stops claiming supersession.
+    rmSync(unavailable);
+    const after = await report(["run-leg2", "--md"], repo);
+    expect(leg2(after, "T1")).toEqual(leg2(md, "T1"));
+    expect(leg2(after, "T4")).toEqual([`  - ${unvalidated} (vendor: anthropic; provider: ${provider})`]);
+    expect(after.split("\n")[2]).toBe("- needs you: outstanding unknown · 0 parked · 0 failed · unknown: artifact unavailable");
+
+    // A proof written BEFORE its obligation validates nothing: folded where it was written it names no recorded
+    // obligation, so T1's leg2 row stops claiming supersession — moving it after the waive never lends it validity.
+    const t1Proof = rows.findIndex((e) => e.event === "owed-check-discharged" && e.taskId === "T1");
+    const t1Waive = rows.findIndex((e) => e.event === "task-approved" && e.taskId === "T1");
+    const early = [...rows.slice(0, t1Waive), rows[t1Proof]!, ...rows.slice(t1Waive).filter((_, i) => i + t1Waive !== t1Proof)];
+    // Every approval still binds its own park, at the physical line the move shifted it to.
+    const rebound = early.map((e) => e.event === "task-approved" && e.data.park
+      ? { ...e, data: { ...e.data, park: { ...(e.data.park as object), line: early.findIndex((p) => p.event === "task-human" && p.taskId === e.taskId) + 1 } } }
+      : e);
+    writeFileSync(join(j.dir, "journal.jsonl"), rebound.map((e) => JSON.stringify(e)).join("\n") + "\n");
+    const beforeObligation = await report(["run-leg2", "--md"], repo);
+    expect(leg2(beforeObligation, "T1")[0]).toBe(`  - ${unvalidated} (vendor: anthropic; provider: ${provider})`);
+    writeFileSync(join(j.dir, "journal.jsonl"), rows.map((e) => JSON.stringify(e)).join("\n") + "\n");
+
+    // The engagement-local telemetry is labelled apart from the lineage reading, on both report surfaces.
+    expect(after).toContain("- **first-attempt rate (engagement-local telemetry):** not measurable — attempts restart at every resume");
+    expect(after).toContain("- **end-to-end first pass:** 1/4 — this journal's dispatch, park, approval and merge lineage");
+    expect(await report(["run-leg2"], repo)).toContain("engagement summary — audit trail: engagement-local telemetry, attempts restart at every resume");
   });
 });

@@ -14,6 +14,9 @@ import { Journal, REVIEW_UPHELD_RELEASE } from "../../src/run/journal.js";
 import { acquireRunLock, releaseRunLock } from "../../src/run/lock.js";
 import { cellWidth } from "../../src/tui/cockpit/width.js";
 
+// CG1: status opens with its three lead lines (finished · time · needs you); the run header follows them.
+const headerLine = (out: string): string => out.split("\n").find((line) => !/^(finished|time|needs you:) /u.test(line))!;
+
 const mkRepo = () => mkdtempSync(join(tmpdir(), "tickmarkr-status-"));
 
 const seedJournal = (repo: string, runId: string, events: JournalEvent[]) => {
@@ -543,7 +546,7 @@ describe("v1.53 supersession in the status header", () => {
       { ts: new Date().toISOString(), event: "superseded", data: { by: "run-new" } },
     ]);
     const out = await status([], repo);
-    expect(out.split("\n")[0]).toContain("superseded by run-new"); // header line, not a task row
+    expect(headerLine(out)).toContain("superseded by run-new"); // header line, not a task row
   });
 });
 
@@ -849,7 +852,8 @@ test("test: status renders for each current task its recorded phase last evidenc
 
 test("test: the compact one-line form keeps its byte-pinned presentation while reading the same projection and the non-tty output stays byte-pinned around the task-title column, so a one-line drift or a changed pinned column fails", async () => {
   const repo = projectionFixture();
-  expect(await status(["--oneline"], repo)).toBe("run-projection · 0/3 done · verify unrecorded");
+  // CG1: the lead's facts follow — lineage first pass, the wall window, and the current needs-you fold.
+  expect(await status(["--oneline"], repo)).toBe("run-projection · 0/3 done · verify unrecorded · end-to-end first pass 0/0 · 0s wall · needs you: outstanding 0 · 1 parked · 0 failed");
   const out = await withStatusSurface(false, 120, () => status([], repo));
   expect(row(out, "T1").split("  B[")[0]).toBe("  [ ] T1 Preparing task");
   expect(row(out, "T2").split("  B[")[0]).toBe("  [ ] T2 Green task");

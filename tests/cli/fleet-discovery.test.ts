@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
@@ -450,7 +450,9 @@ test("no classification the operator made is lost between the keystroke and the 
   );
   expect(await result).toMatch(/^fleet: wrote /);
 
-  const written = readFileSync(join(repo, ".tickmarkr", "config.yaml"), "utf8");
+  // B2: the classification is a machine choice — it lands in the USER overlay, never the repo's
+  const written = readFileSync(join(globalDir, "config.yaml"), "utf8");
+  expect(existsSync(join(repo, ".tickmarkr", "config.yaml"))).toBe(false);
   const parsed = parse(written);
   expect(parsed.tiers?.nova).toMatchObject({
     vendor: "declared-vendor",
@@ -466,9 +468,12 @@ test("no classification the operator made is lost between the keystroke and the 
 
 test("test: after a workers-scope toggle is written the four role pools discovered from the loaded config and the route of an implement task agree row by row with the reach the browser showed and plan lists the toggled entry as reaching the worker seat, so a surface whose reach disagrees with discovery fails", async () => {
   const repo = makeRepo({ "keep.txt": "x" });
-  const globalDir = mkdtempSync(join(tmpdir(), "tickmarkr-fleet-reach-plan-g-"));
-  mkdirSync(join(repo, ".tickmarkr"), { recursive: true });
-  writeFileSync(join(repo, ".tickmarkr", "config.yaml"), [
+  // B2: the fleet policy under edit lives in the USER overlay, where the toggle is saved — the
+  // machine layer plan reads through XDG_CONFIG_HOME below
+  const xdg = mkdtempSync(join(tmpdir(), "tickmarkr-fleet-reach-plan-g-"));
+  const globalDir = join(xdg, "tickmarkr");
+  mkdirSync(globalDir);
+  writeFileSync(join(globalDir, "config.yaml"), [
     "tiers:",
     "  fake:",
     "    vendor: fake",
@@ -535,7 +540,14 @@ test("test: after a workers-scope toggle is written the four role pools discover
   expect(routed.assignment.model).toBe("fake-2");
 
   // plan lists the toggled entry as reaching the worker seat only
-  const planOut = await plan([], repo, [adapter]);
+  const xdgBefore = process.env.XDG_CONFIG_HOME;
+  process.env.XDG_CONFIG_HOME = xdg;
+  let planOut: string;
+  try {
+    planOut = await plan([], repo, [adapter]);
+  } finally {
+    process.env.XDG_CONFIG_HOME = xdgBefore;
+  }
   expect(planOut).toContain("routing.deny.workers.models 'fake:fake-1' reaches seats: worker");
 });
 

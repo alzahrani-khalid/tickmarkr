@@ -17,6 +17,7 @@ import { authorsNote, doneAuthors } from "../../run/operator-state.js";
 import { projectOperatorSummary, type OperatorTaskSummary } from "../../run/operator-summary.js";
 import { trackJournalRows } from "../../run/protocol.js";
 import { newestPark, permittedDecisionVerbs } from "./approve.js";
+import { currentOwed, endToEndFirstPass, firstPassText, leadLines, leadRows, needsYouText, wallText } from "./report.js";
 import {
   Journal,
   bindingToken,
@@ -561,6 +562,8 @@ export const shortGoal = (goal: string, max: number): string => {
 
 /** Columns the machine row always spends on the task title, however long its machinery segment runs. */
 const MACHINE_TITLE_FLOOR = 24;
+/** The plain print's own width when none is configured: its machine rows are laid out, and parsed whole, at it. */
+const MACHINE_COLUMNS = 120;
 
 // The approved task board derives an area from files[] rather than adding another graph field.
 // Known tickmarkr domains keep their reviewed names; other repositories fall back to their first
@@ -1236,7 +1239,7 @@ const renderFrame = (
   // SUP-01: derived by stat() alone, from THIS frame's clock. status stays a reader — nothing here
   // creates, touches or reaps a beat file, so an absent supervision dir stays absent.
   const supervision = readSupervision(cwd, now);
-  const width = process.stdout.columns ?? 120;
+  const width = process.stdout.columns ?? MACHINE_COLUMNS;
   const done = journalRowsOnly
     ? recordedDone(renderedTasks, taskRows)
     : effective.tasks.filter((task) => task.status === "done").length;
@@ -1252,6 +1255,16 @@ const renderFrame = (
   const phases = comparable && daemon.state !== "dead" ? livePhases(events) : new Map<string, LivePhase>();
   for (const taskId of phases.keys()) if (!taskIds.has(taskId)) phases.delete(taskId);
   const hotPhase = [...phases.values()].sort((a, b) => a.order - b.order).at(-1);
+  // CG1: the three lead lines — finished, wall, needs you from the CURRENT owed-check fold — open
+  // every frame, plain and terminal; the header below keeps every comparability, supersession and verify fact.
+  const lead = runId
+    ? leadLines(events, currentOwed(events, cwd), {
+      // The header's own rule: while the tip is unverified the tally never reads as a finished run.
+      tally: comparable ? tipPhase ? `${done}/${total} tasks done` : `${done}/${total} done` : NOT_COMPARABLE_CLAIM,
+      tip: verify ? `tip ${verify}` : "tip verify pending",
+      notes: supersededBy ? [`superseded by ${supersededBy}`] : [],
+    }).map(sanitizeTaskText)
+    : [];
 
   // OBS-738: recovery facts stay on the journal's two established reducers. The prefix fold keeps an
   // older journal equally readable by asking upheldFeedbackByTask what was active at that exact
@@ -1354,8 +1367,16 @@ const renderFrame = (
       ? `tickmarkr status${divider}${runLine ?? `run ${runId}`}${zone}${supersededBy ? `${divider}superseded by ${supersededBy}` : ""}${!comparable ? `${divider}${NOT_COMPARABLE_NOTICE}` : ""}${divider}${liveness(events, daemon, now).replaceAll(" · ", divider)}${verify ? `${divider}${verify}` : ""}${divider}${tipPhase ? `${done}/${total} tasks done${divider}run not verified` : `${done}/${total} done`}`
       : `tickmarkr status${zone}${divider}no runs yet${divider}${done}/${total} done`;
     const legendLine = `  gates: ${GATE_NAMES.map((gate) => `${GATE_KEYS[gate]} ${gate}`).join(divider)}`;
+    // At its machine width and wider the plain print keeps each machine row whole — one row per task and
+    // its evidence line after it, which consumers parse. A configured width narrower than that holds for
+    // EVERY row: one that overflows wraps beneath its own indent, its identity kept on the first.
+    const body = [header, legendLine, `  ${supervisionText(supervision, divider)}`, ...rows];
+    const wrapRow = (line: string): string[] => wrapCells(line, width, { continuationPrefix: `${/^ */u.exec(line)![0]}  ` });
     return {
-      content: [header, legendLine, `  ${supervisionText(supervision, divider)}`, ...rows].join("\n"),
+      content: [
+        ...leadRows(lead, width),
+        ...(width >= MACHINE_COLUMNS ? body : body.flatMap(wrapRow)),
+      ].join("\n"),
       ...(hotPhase ? { hotPhase } : {}),
       ...(runId ? { runId } : {}),
       workerPhases: [...phases.values()].filter((phase) => phase.phase === "worker"),
@@ -1565,6 +1586,7 @@ const renderFrame = (
   return {
     content: boardRows(
       [
+        ...leadRows(lead, boardColumns),
         ...headerRows,
         ...nowLine,
         supervisionLegend,
@@ -1622,7 +1644,12 @@ const oneLine = (cwd: string, namedRunId?: string): string => {
       `verify ${recordedVerify(record.events)}`,
     ]
     : [NOT_COMPARABLE_CLAIM, "verify unavailable"];
-  return sanitizeTaskText([record.runId, ...claims].join(" · "));
+  // CG1: the lead's facts in one line — lineage first pass, the wall window, and what needs you from
+  // the CURRENT fold, so a discharge after run-end moves this line too.
+  const { events } = record;
+  return sanitizeTaskText([
+    record.runId, ...claims, firstPassText(endToEndFirstPass(events)), wallText(events), needsYouText(events, currentOwed(events, cwd)),
+  ].join(" · "));
 };
 
 export async function status(argv: string[], cwd = process.cwd(), opts: StatusOpts = {}): Promise<string> {

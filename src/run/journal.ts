@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
@@ -7,7 +8,7 @@ import { channelKey, shq, TokenUsageSchema, type Assignment } from "../adapters/
 import type { TickmarkrConfig } from "../config/config.js";
 import { graphDefinitionHash, stateDirName, taskContentDigest, taskDefinitionFingerprint, tickmarkrDir } from "../graph/graph.js";
 import { GATE_NAMES, TIERS, type GateName, type RunGraph, type Task, type TaskStatus } from "../graph/schema.js";
-import { channelRouteIdentity } from "../route/preference.js";
+import { channelRouteIdentity, modelProvider } from "../route/preference.js";
 import { buildProfile, classify, type ProfileDiscount, type RoutingProfile } from "../route/profile.js";
 import {
   DecisionEventSchema,
@@ -17,6 +18,7 @@ import {
   type JournalSourceRow,
   type TrackedJournalRow,
 } from "./protocol.js";
+import { PRESERVE_COMMIT_SUBJECT, PRESERVE_PRODUCER_TRAILER } from "./git.js";
 import { normalizeGateOutcome } from "./outcome.js";
 import { redactSecrets } from "./redact.js";
 
@@ -2110,7 +2112,11 @@ export class Journal {
       ? (() => {
           const preservedRefs = [...preservedRefsByTask(priorEvents)].flatMap(([preservedTaskId, refs]) =>
             refs.map(({ ref, diffCommand }) => ({ taskId: preservedTaskId, ref, diffCommand })));
-          return preservedRefs.length > 0 ? { ...inputData, preservedRefs } : inputData;
+          const reduced = preservedRefs.length > 0 ? { ...inputData, preservedRefs } : inputData;
+          // C1: the terminal record carries the owed-check fold as of this append, revalidated from
+          // each discharge's artifact — a reopened journal re-reduces, it never copies a prior total.
+          // Canonical (validated) rows are strict and keep their schema; the live producer is the tuple.
+          return decisionRow ? reduced : { ...reduced, owedChecks: foldOwedChecks(priorEvents, join(this.dir, "..", "..", "..")) };
         })()
       : event === "resume-restore" && rowTaskId && upheldFeedbackByTask(effectiveEvents(priorEvents)).has(rowTaskId)
         ? {
@@ -2530,4 +2536,354 @@ export class Journal {
     return readJsonl(join(this.dir, "telemetry.jsonl"))
       .filter((row) => row && typeof row === "object" && "kind" in row && row.kind === "judge") as TelemetryRow[];
   }
+}
+
+// ── C1 (v2.6.4): owed checks ─────────────────────────────────────────────────────────────────────
+// A waiver accepts risk on ONE immutable subject. The same task-approved row that satisfies the gate
+// carries the obligation it leaves behind: run, task, gate, the exact base..head range and its
+// canonical subject, the acceptance criteria, the run-derived lifetime patch authors, the cause and
+// the evidence that would discharge it. The fold below is the only reader. It keeps every waiver as
+// accepted-risk history, subtracts a discharge only while its proof still revalidates, and answers
+// "unknown" — never zero — for a waiver without a well-formed obligation or a proof that no longer holds.
+
+export const OWED_CHECK_VERSION = 1 as const;
+export const OWED_DISCHARGE_EVENT = "owed-check-discharged" as const;
+
+export interface OwedCheck {
+  version: typeof OWED_CHECK_VERSION;
+  id: string;
+  runId: string;
+  taskId: string;
+  gate: GateName;
+  /** The immutable range the waived gate measured, and its canonical subject (daemon gateCommitSubject). */
+  base: string;
+  head: string;
+  subject: string;
+  /** Verbatim (whitespace-sensitive) patch identity of the whole range and of each commit, in order — the integration mapping key. */
+  patch: string;
+  patches: string[];
+  criteria: string;
+  /** The task's file scope at waive time: a discharge gates exactly this allowlist, never a wider one. */
+  files: string[];
+  authors: string[];
+  /** The channels this repository's adapters declared under its config at waive time (key → vendor):
+   *  the only seats a review discharge's reviewer and author channels may resolve to. */
+  declared: ChannelFact[];
+  cause: string;
+  evidence: string;
+  disposition: "accepted-risk";
+  known: boolean;
+  unknownReason?: string;
+}
+
+export interface OwedFold {
+  known: boolean;
+  debt: number | "unknown";
+  outstanding: OwedCheck[];
+  acceptedRisk: OwedCheck[];
+  discharged: string[];
+  unknown: Array<{ taskId?: string; gate?: string; reason: string }>;
+}
+
+const owedGit = (cwd: string, args: string[], input?: string): string => execFileSync("git", args, {
+  cwd, encoding: "utf8", maxBuffer: 64 * 1024 * 1024, ...(input === undefined ? { stdio: ["ignore", "pipe", "pipe"] } : { input }),
+});
+const sha256 = (text: string): string => createHash("sha256").update(text).digest("hex");
+
+export const owedCriteria = (acceptance: unknown): string => sha256(JSON.stringify(acceptance));
+
+/** The daemon's canonical gate subject for base..head (daemon.ts gateCommitSubject), byte for byte. */
+export const owedSubject = (cwd: string, base: string, head: string): string =>
+  sha256(owedGit(cwd, ["log", "--reverse", "--format=%T%x00%an%x00%ae%x00%cn%x00%ce%x00%B%x1e", `${base}..${head}`]));
+
+// Ownership joins on --stable ids (whitespace-blind: a re-indented carry keeps its author, which only
+// widens exclusions). Range identity uses --verbatim: re-indented content is a different program.
+const patchIdOf = (cwd: string, diff: string, mode: "--stable" | "--verbatim" = "--stable"): string | undefined =>
+  owedGit(cwd, ["patch-id", mode], diff).trim().split(/\s+/)[0] || undefined;
+
+/** Ordered verbatim patch ids of the commits in base..head; an empty commit authored no patch. */
+export const rangePatches = (cwd: string, base: string, head: string): string[] =>
+  owedGit(cwd, ["rev-list", "--reverse", `${base}..${head}`]).trim().split("\n").filter(Boolean)
+    .map((commit) => patchIdOf(cwd, owedGit(cwd, ["show", "--format=", "--binary", commit]), "--verbatim"))
+    .filter((id): id is string => id !== undefined);
+
+/** Verbatim patch identity of the whole change base..head introduces. */
+export const rangePatch = (cwd: string, base: string, head: string): string =>
+  patchIdOf(cwd, owedGit(cwd, ["diff", "--binary", base, head]), "--verbatim") ?? "empty";
+
+const COMMIT_ID = /^[0-9a-f]{40}([0-9a-f]{24})?$/;
+
+/**
+ * `head` is the task's own recorded integration merge of the obligation's range — exactly. Its first
+ * parent is `mergeBase`; its second parent replays the waived history source tree for source tree from
+ * a base with the waived base's tree (a carry may mint new commit objects, never new content — and
+ * patch ids alone ignore where a hunk lands); its tree is git's own clean merge of the two (no
+ * resolution, no amend); and it introduced the same ordered verbatim patch series and total patch.
+ * Squashed, reordered, relocated, re-indented, reverted or conflict-resolved history fails one of
+ * these and is refused as ambiguous; containment never counts.
+ * Both verify (before discharging) and the fold (re-reading every discharge) decide through here.
+ */
+export function integrationMapped(cwd: string, events: readonly JournalEvent[], o: OwedCheck, mergeBase: unknown, head: unknown): boolean {
+  if (typeof mergeBase !== "string" || typeof head !== "string" || !COMMIT_ID.test(mergeBase) || !COMMIT_ID.test(head)) return false;
+  if (!events.some((e) => e.event === "merge" && e.taskId === o.taskId && e.data.commit === head)) return false;
+  try {
+    const parents = owedGit(cwd, ["show", "-s", "--format=%P", head]).trim().split(" ");
+    if (parents.length !== 2 || parents[0] !== mergeBase) return false;
+    const [, carried] = parents as [string, string];
+    const tree = (rev: string) => owedGit(cwd, ["rev-parse", `${rev}^{tree}`]).trim();
+    const trees = (from: string, to: string) => owedGit(cwd, ["log", "--reverse", "--format=%T", `${from}..${to}`]).trim();
+    if (tree(owedGit(cwd, ["merge-base", mergeBase, carried]).trim()) !== tree(o.base) || trees(mergeBase, carried) !== trees(o.base, o.head)) return false;
+    // A conflicted merge-tree exits 1 and throws; a clean one prints its tree first.
+    if (owedGit(cwd, ["merge-tree", "--write-tree", mergeBase, carried]).trim().split("\n")[0] !== tree(head)) return false;
+    const series = rangePatches(cwd, mergeBase, carried);
+    return series.length === o.patches.length && series.every((id, i) => id === o.patches[i])
+      && rangePatch(cwd, mergeBase, head) === o.patch;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Lifetime patch authors of base..head, read from the run: the daemon's subjectAuthors fold
+ * (daemon.ts, not exported and not this task's to edit) restated synchronously so the waive row is
+ * written without yielding. Recreation rows name SOURCE hashes, so ownership joins by stable patch
+ * identity across changed commit objects; a gate-only restore (resume-restore's seat, a recreation
+ * after work started) never becomes an author. Unreadable history names an unknown author.
+ */
+export function owedAuthors(events: readonly JournalEvent[], taskId: string, cwd: string, base: string, head: string): string[] {
+  const cache = new Map<string, string | undefined>();
+  const patches = (commits: readonly string[]): Set<string> => {
+    const ids = new Set<string>();
+    for (const commit of commits) {
+      if (!cache.has(commit)) cache.set(commit, patchIdOf(cwd, owedGit(cwd, ["show", "--format=", "--binary", commit])));
+      const id = cache.get(commit);
+      if (id) ids.add(id);
+    }
+    return ids;
+  };
+  type Attempt = { author: string; incoming: Set<string> };
+  let current: Attempt | undefined;
+  let previous: Attempt | undefined;
+  let awaitingCarry = false;
+  const owners = new Map<string, Set<string>>();
+  const preservedOwner = new Map<string, string>();
+  const attribute = (ids: Set<string>, attempt: Attempt | undefined) => {
+    for (const id of ids) {
+      if (attempt?.incoming.has(id)) continue;
+      const authors = owners.get(id) ?? new Set<string>();
+      authors.add(preservedOwner.get(id) ?? attempt?.author ?? "unknown author (missing task-dispatch assignment)");
+      owners.set(id, authors);
+    }
+  };
+  try {
+    for (const row of events) {
+      if (row.taskId !== taskId) continue;
+      const preserved = [row.data.ref, row.data.preservedRef].find((v): v is string => typeof v === "string" && v.startsWith("refs/tickmarkr/preserved/"));
+      if (preserved) {
+        const [commit, subject, trailer] = owedGit(cwd, ["show", "-s", `--format=%H%n%s%n%(trailers:key=${PRESERVE_PRODUCER_TRAILER},valueonly)`, `${preserved}^{commit}`]).trim().split("\n");
+        if (commit && subject === PRESERVE_COMMIT_SUBJECT) {
+          const owner = typeof row.data.producer === "string" ? row.data.producer
+            : trailer?.trim().replace(/ attempt \d+$/, "") || "unknown author (legacy unattributed preservation)";
+          for (const id of patches([commit])) {
+            const prior = preservedOwner.get(id);
+            if (prior === undefined || prior === "unknown" || prior.startsWith("unknown author")) preservedOwner.set(id, owner);
+          }
+        }
+      }
+      if (row.event === "task-dispatch") {
+        previous = current;
+        const a = row.data.assignment as Partial<Assignment> | undefined;
+        current = { author: typeof a?.adapter === "string" && typeof a?.model === "string"
+          ? `${a.adapter}:${a.model}` : "unknown author (missing task-dispatch assignment)", incoming: new Set() };
+        awaitingCarry = true;
+      } else if (row.event === "worktree-recreation") {
+        const carried = patches(Array.isArray(row.data.carried) ? row.data.carried as string[] : []);
+        attribute(carried, awaitingCarry ? previous : current);
+        if (awaitingCarry && current) current.incoming = carried;
+        awaitingCarry = false;
+      } else if (["worker-launch", "worker-result", "gate-result", "task-human"].includes(row.event)) {
+        awaitingCarry = false;
+      }
+    }
+    const subject = patches(owedGit(cwd, ["rev-list", "--reverse", `${base}..${head}`]).trim().split("\n").filter(Boolean));
+    attribute(subject, current);
+    return [...new Set([...subject].flatMap((id) => [...(owners.get(id) ?? [])]))].sort();
+  } catch (error) {
+    return [`unknown author (${String(error).split("\n")[0]})`];
+  }
+}
+
+/**
+ * The obligation a waive of `gate` leaves on the task branch's current range. Synchronous on purpose:
+ * approve writes it into the waive row under the approval serialization without yielding, so a live
+ * daemon's boundary sees the same single append it always did. Anything not bound exactly — the
+ * waived row measured another subject, unreadable refs, unresolved authors, unreadable criteria — is
+ * recorded, never guessed, as known: false.
+ */
+export function captureOwedCheck(input: {
+  cwd: string; runId: string; taskId: string; gate: GateName; cause: string;
+  acceptance: unknown; files: unknown; declared: readonly ChannelFact[] | undefined;
+  taskRef: string; integrationRef: string; events: readonly JournalEvent[];
+}): OwedCheck {
+  const { cwd, runId, taskId, gate, events } = input;
+  let base = "unknown", head = "unknown", subject = "unknown", patch = "unknown";
+  let patches: string[] = [];
+  let authors: string[] = [];
+  let unknownReason: string | undefined;
+  try {
+    head = owedGit(cwd, ["rev-parse", "--verify", `${input.taskRef}^{commit}`]).trim();
+    base = owedGit(cwd, ["merge-base", input.integrationRef, head]).trim();
+    subject = owedSubject(cwd, base, head);
+    const measured = [...events].reverse().find((e) => e.taskId === taskId && e.event === "gate-result" && e.data.gate === gate);
+    if (measured?.data.commit !== subject) {
+      throw new Error(`the waived ${gate} row measured ${String(measured?.data.commit ?? "no subject")}, not ${input.taskRef}'s range`);
+    }
+    patches = rangePatches(cwd, base, head);
+    patch = rangePatch(cwd, base, head);
+    authors = owedAuthors(events, taskId, cwd, base, head);
+    if (!authors.length || authors.some((a) => a.startsWith("unknown"))) throw new Error(`unresolved patch authors: ${authors.join(", ") || "none"}`);
+  } catch (error) {
+    unknownReason = (error instanceof Error ? error.message : String(error)).split("\n")[0];
+  }
+  if (!Array.isArray(input.acceptance)) unknownReason ??= "task acceptance criteria unreadable";
+  const files = Array.isArray(input.files) && input.files.every((f) => typeof f === "string") ? input.files as string[] : undefined;
+  if (!files) unknownReason ??= "task file scope unreadable";
+  if (!input.declared?.length) unknownReason ??= "declared channels unreadable";
+  const criteria = Array.isArray(input.acceptance) ? owedCriteria(input.acceptance) : "unknown";
+  return {
+    version: OWED_CHECK_VERSION,
+    id: sha256(JSON.stringify([runId, taskId, gate, base, head, subject, criteria])).slice(0, 16),
+    runId, taskId, gate, base, head, subject, patch, patches, criteria, files: files ?? [], authors,
+    declared: [...(input.declared ?? [])].map(({ key, vendor }) => ({ key, vendor })), cause: input.cause,
+    evidence: `tickmarkr verify --base ${base} --task ${taskId} --record ${runId}: ${gate} passing on ${base}..${head} or on its recorded integration merge, reviewed outside the authors' vendors`,
+    disposition: "accepted-risk",
+    known: unknownReason === undefined,
+    ...(unknownReason === undefined ? {} : { unknownReason }),
+  };
+}
+
+/** A bound fact: a non-empty string that capture did not record as unknown. */
+const isBound = (v: unknown): v is string => typeof v === "string" && v !== "" && !v.startsWith("unknown");
+
+/** Every required field present and well-typed; anything else is malformed evidence, never a known check. */
+const isOwedCheck = (value: unknown, taskId: string | undefined, gate: unknown): value is OwedCheck => {
+  if (typeof value !== "object" || value === null) return false;
+  const o = value as Record<string, unknown>;
+  return o.version === OWED_CHECK_VERSION && o.known === true && o.disposition === "accepted-risk"
+    && o.taskId === taskId && o.gate === gate && (GATE_NAMES as readonly unknown[]).includes(o.gate)
+    && [o.id, o.runId, o.taskId, o.base, o.head, o.subject, o.patch, o.criteria].every(isBound)
+    && typeof o.cause === "string" && typeof o.evidence === "string"
+    && Array.isArray(o.patches) && o.patches.every(isBound)
+    && Array.isArray(o.authors) && o.authors.length > 0 && o.authors.every(isBound)
+    && Array.isArray(o.files) && o.files.every((f) => typeof f === "string")
+    && Array.isArray(o.declared) && o.declared.length > 0 && o.declared.every(isChannelFact);
+};
+
+export type ChannelFact = { key: string; vendor: string };
+const providerOf = (fact: ChannelFact): string => modelProvider(fact.key.slice(fact.key.indexOf(":") + 1), fact.vendor);
+/** A resolved channel: an `adapter:model` key and a bound vendor — never an empty or placeholder claim. */
+const isChannelFact = (f: unknown): f is ChannelFact => typeof f === "object" && f !== null
+  && typeof (f as ChannelFact).key === "string" && /^[^:\s]+:\S+$/.test((f as ChannelFact).key) && isBound((f as ChannelFact).vendor);
+
+/**
+ * The trusted channel identities, key → vendors: what this repository's adapters declared under its config
+ * when the waive was written, recorded on the obligation by approve. Declaration, not doctor health — a
+ * later logout does not revoke a proof, but a seat not declared (or declared under another vendor) never
+ * resolved. Read from the row, the fold resolves identically in every process and every checkout.
+ */
+const declaredVendors = (o: OwedCheck): Map<string, Set<string>> => {
+  const vendors = new Map<string, Set<string>>();
+  for (const c of o.declared) vendors.set(c.key, (vendors.get(c.key) ?? new Set()).add(c.vendor));
+  return vendors;
+};
+
+/** Why a discharge row no longer proves its obligation, re-read from its artifact; undefined when it does. */
+function dischargeProblem(row: JournalEvent, o: OwedCheck, events: readonly JournalEvent[], cwd: string): string | undefined {
+  const d = row.data;
+  if (row.taskId !== o.taskId) return "discharge names another task";
+  if (d.criteria !== o.criteria) return "discharge proved other criteria";
+  const exact = d.mapping === "exact" && d.mergeBase === o.base && d.head === o.head;
+  // The integration mapping is re-proved from git on every fold, never taken from the row's claims.
+  const integration = d.mapping === "integration" && integrationMapped(cwd, events, o, d.mergeBase, d.head);
+  if (!exact && !integration) return "discharge range does not bind the obligation";
+  let artifact: { head?: unknown; mergeBase?: unknown; green?: unknown; files?: unknown; criteria?: unknown; gateRows?: unknown };
+  try {
+    const bytes = readFileSync(String(d.artifactPath));
+    if (createHash("sha256").update(bytes).digest("hex") !== d.artifactSha256) return "artifact hash mismatch";
+    artifact = JSON.parse(bytes.toString("utf8")) ?? {};
+  } catch {
+    return "artifact unavailable";
+  }
+  if (artifact.head !== d.head || artifact.mergeBase !== d.mergeBase) return "artifact measured another range";
+  if (artifact.green !== true) return "artifact verdict is not green";
+  // The criteria the hash-bound evidence itself measured: the row's claim alone only repeats the obligation.
+  if (artifact.criteria !== o.criteria) return "artifact measured other criteria";
+  // The scope the waived task declared, exactly: a wider allowlist (--files '*') is weakened evidence.
+  if (JSON.stringify(artifact.files) !== JSON.stringify(o.files)) return "artifact gated another file scope";
+  const rows = (Array.isArray(artifact.gateRows) ? artifact.gateRows : []) as GateRowFact[];
+  const gateRow = rows.find((r) => r?.gate === o.gate && r.pass === true && r.meta?.skipped !== true);
+  if (!gateRow) return `artifact holds no passing ${o.gate} row`;
+  if (o.gate === "review") {
+    const reviewer = d.reviewer;
+    const authors = Array.isArray(d.authorChannels) ? d.authorChannels as unknown[] : [];
+    // The row's reviewer must be the seat the hash-bound review row recorded — key, vendor and provider.
+    if (!isChannelFact(reviewer) || gateRow.meta?.reviewer !== reviewer.key || gateRow.meta.vendor !== reviewer.vendor
+      || gateRow.meta.provider !== providerOf(reviewer)) return "unresolved reviewer";
+    // ...and a channel the waive recorded as declared under exactly that vendor: agreement between the row
+    // and the artifact only repeats a claim, so identity and vendor resolve against the obligation's own.
+    const declared = declaredVendors(o);
+    const resolves = (f: ChannelFact) => { const v = declared.get(f.key); return v?.size === 1 && v.has(f.vendor); };
+    // An author key stays excluded whatever vendor any row claims for it.
+    if (o.authors.includes(reviewer.key)) return "same-vendor reviewer (the reviewer is a recorded patch author)";
+    if (!resolves(reviewer)) return "unresolved reviewer (no declared channel with that identity and vendor)";
+    if (!authors.every(isChannelFact) || !o.authors.every((key) => authors.some((a) => a.key === key))) return "unresolved author channel";
+    if (authors.some((a) => authors.some((b) => a.key === b.key && a.vendor !== b.vendor))) return "unresolved author channel (inconsistent vendor claims)";
+    if (!authors.every(resolves)) return "unresolved author channel (no declared channel with that identity and vendor)";
+    if (authors.some((a) => a.vendor === reviewer.vendor || providerOf(a) === providerOf(reviewer))) return "same-vendor reviewer";
+  }
+  return undefined;
+}
+type GateRowFact = { gate?: unknown; pass?: unknown; meta?: { skipped?: unknown; reviewer?: unknown; vendor?: unknown; provider?: unknown } };
+
+/**
+ * The CURRENT owed-check fold: accepted-risk history, outstanding debt, and whether it is known.
+ * `cwd` is any checkout of the run's repository (integration discharges are re-proved from git).
+ * It never throws: a fold that cannot be computed is unknown debt, not a crash and never zero.
+ */
+export function foldOwedChecks(events: readonly JournalEvent[], cwd: string): OwedFold {
+  try {
+    return foldOwedChecksOrThrow(events, cwd);
+  } catch (error) {
+    return { known: false, debt: "unknown", outstanding: [], acceptedRisk: [], discharged: [], unknown: [{ reason: `owed-check fold failed: ${String(error).split("\n")[0]}` }] };
+  }
+}
+
+function foldOwedChecksOrThrow(events: readonly JournalEvent[], cwd: string): OwedFold {
+  const accepted = new Map<string, OwedCheck>();
+  const discharged = new Set<string>();
+  const unknown: OwedFold["unknown"] = [];
+  for (const e of effectiveEvents(events)) {
+    if (e.event === "task-approved" && e.data.release === GATE_SATISFIED_RELEASE) {
+      const o = e.data.obligation;
+      if (isOwedCheck(o, e.taskId, e.data.gate)) accepted.set(o.id, o);
+      else {
+        const recorded = typeof o === "object" && o !== null ? (o as { unknownReason?: unknown }).unknownReason : undefined;
+        unknown.push({ taskId: e.taskId, gate: String(e.data.gate), reason: o === undefined ? "legacy waiver without an owed-check obligation"
+          : typeof recorded === "string" ? recorded : "malformed owed-check obligation" });
+      }
+    } else if (e.event === OWED_DISCHARGE_EVENT) {
+      const ids = Array.isArray(e.data.ids) ? e.data.ids as unknown[] : [];
+      const problems = ids.map((id) => {
+        const o = accepted.get(String(id));
+        return o ? dischargeProblem(e, o, events, cwd) : "discharge names no recorded obligation";
+      });
+      const problem = ids.length ? problems.find((p) => p !== undefined) : "discharge names no obligation";
+      if (problem) unknown.push({ taskId: e.taskId, reason: problem });
+      else for (const id of ids) discharged.add(String(id));
+    }
+  }
+  const acceptedRisk = [...accepted.values()];
+  const outstanding = acceptedRisk.filter((o) => !discharged.has(o.id));
+  const known = unknown.length === 0;
+  return { known, debt: known ? outstanding.length : "unknown", outstanding, acceptedRisk, discharged: [...discharged], unknown };
 }

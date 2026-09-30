@@ -2,13 +2,14 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import ts from "typescript";
-import { expect, test } from "vitest";
+import { expect, onTestFinished, test } from "vitest";
 import { parse, stringify } from "yaml";
 
 import * as registry from "../../src/adapters/registry.js";
 import { channelsFromConfig, type WorkerAdapter } from "../../src/adapters/types.js";
 import { assembleFleetEditor, fleet, writeFleetOverlay } from "../../src/cli/commands/fleet.js";
 import {
+  DEFAULT_CONFIG,
   fleetEditableFromConfig,
   fleetRepoOverlayFromDelta,
   loadConfig,
@@ -659,9 +660,12 @@ test("finding 4: the universe-bearing membership write keeps an untouched flat d
 test("finding 2: the production preview loads the candidate bytes through the config loader's overlay seam — clearing an on-disk and a global workers deny returns both channels to the picker, and the staged routing equals the loader over the reviewed bytes", async () => {
   const repo = makeRepo({ "keep.txt": "x" });
   const globalDir = mkdtempSync(join(tmpdir(), "tickmarkr-fleet-preview-g-"));
-  writeFileSync(join(globalDir, "config.yaml"), "routing:\n  deny:\n    workers:\n      adapters: [fake]\n");
-  mkdirSync(join(repo, ".tickmarkr"), { recursive: true });
-  writeFileSync(join(repo, ".tickmarkr", "config.yaml"), [
+  // B2: Fleet writes the USER overlay, so the on-disk ban lives there and the lower-layer ban is a
+  // scoped defaults injection — the one layer under the user overlay
+  const seededRouting = DEFAULT_CONFIG.routing;
+  DEFAULT_CONFIG.routing = { ...structuredClone(seededRouting), deny: { workers: { adapters: ["fake"] } } };
+  onTestFinished(() => { DEFAULT_CONFIG.routing = seededRouting; });
+  writeFileSync(join(globalDir, "config.yaml"), [
     "tiers:",
     "  fake:",
     "    vendor: fake",
@@ -719,7 +723,8 @@ test("finding 2: the production preview loads the candidate bytes through the co
     steering: props.initialSteering,
   });
   if (review.kind !== "diff") throw new Error("clearing both worker bans must stage a diff");
-  const loaded = loadConfigWithMode(repo, { globalDir, repoOverlayText: review.after }).cfg;
+  expect(review.path).toBe(join(globalDir, "config.yaml"));
+  const loaded = loadConfigWithMode(repo, { globalDir, userOverlayText: review.after }).cfg;
   expect(loaded.routing.deny?.workers?.models).toBeUndefined();
   expect(loaded.routing.deny?.workers?.adapters).toBeUndefined();
   expect(props.stagedRouting?.(cleared)).toEqual({ ok: true, routing: loaded.routing });
@@ -871,22 +876,27 @@ test.each(effortOverlayCases)("effort overlay validates and preserves vendor/cha
   }
 });
 
-test("test: Fleet reviewing and saving effort beneath modelOverrides null remasks every lower sibling from a newly edited global layer versus rejecting a stale preview or malformed lower YAML through the overlay error channel, so lost sibling metadata or a raw exception fails", async () => {
+// B2: Fleet saves effort to the USER overlay, whose only lower layer is the defaults — so the
+// lower-layer fixture is a scoped DEFAULT_CONFIG injection (the loader clones the defaults per call).
+test("Fleet saving effort through a user modelOverrides tombstone remasks both lower sibling vendor and channel fields while preserving an unrelated model mask and rejecting a user or repo edit made after preview", async () => {
   const repo = makeRepo({ "keep.txt": "x" });
   const globalDir = mkdtempSync(join(tmpdir(), "tickmarkr-fleet-lower-g-"));
   const globalPath = join(globalDir, "config.yaml");
   const overlayPath = join(repo, ".tickmarkr", "config.yaml");
   const models = ["codex-a", "codex-b", "codex-c", "codex-d"];
-  // the global layer declares vendor/channel metadata per named sibling; the repo's null masks all of it
-  const lowerSiblings = (...siblings: string[]) => writeFileSync(globalPath, stringify({
-    tiers: { codex: { modelOverrides: Object.fromEntries(siblings.map((m) => [m, { vendor: "azure", channel: "api" }])) } },
-  }));
-  lowerSiblings("codex-b");
-  mkdirSync(join(repo, ".tickmarkr"), { recursive: true });
-  writeFileSync(overlayPath, stringify({ tiers: { codex: {
+  // the defaults declare vendor/channel metadata for two siblings; the user's null masks all of it
+  const seededCodex = DEFAULT_CONFIG.tiers.codex;
+  const lower = Object.fromEntries(["codex-a", "codex-b"].map((m) => [m, { vendor: "azure", channel: "api" }]));
+  DEFAULT_CONFIG.tiers.codex = { ...structuredClone(seededCodex), modelOverrides: lower };
+  onTestFinished(() => { DEFAULT_CONFIG.tiers.codex = seededCodex; });
+  const userBytes = `# my machine choices\n${stringify({ tiers: { codex: {
     models: Object.fromEntries(models.map((m) => [m, "frontier"])),
     modelOverrides: null,
-  } } }));
+  } } })}`;
+  writeFileSync(globalPath, userBytes);
+  mkdirSync(join(repo, ".tickmarkr"), { recursive: true });
+  const repoBytes = "concurrency: 2  # project execution preference\n";
+  writeFileSync(overlayPath, repoBytes);
   const adapter: WorkerAdapter = {
     id: "codex",
     vendor: "openai",
@@ -928,42 +938,46 @@ test("test: Fleet reviewing and saving effort beneath modelOverrides null remask
   };
   const masked = (bytes: string) => parse(bytes).tiers.codex.modelOverrides;
 
-  // the global layer gains a sibling AFTER the editor assembled: the review re-reads it
-  lowerSiblings("codex-b", "codex-c");
+  // the preview names the USER destination; lifting the tombstone remasks codex-a's vendor AND channel
+  // and keeps codex-b's mask
   const first = review();
-  expect(masked(first.after)).toMatchObject({ "codex-a": { effort: "low" }, "codex-b": null, "codex-c": null });
+  expect(first.path).toBe(globalPath);
+  expect(masked(first.after)).toEqual({ "codex-a": { effort: "low", vendor: null, channel: null }, "codex-b": null });
   expect(props.reloadGuard(first.after)).toBeNull();
 
-  // the global layer changes after the review: y is refused on the overlay error channel, and so is a save
-  lowerSiblings("codex-b", "codex-c", "codex-d");
-  const priorBytes = readFileSync(overlayPath, "utf8");
-  expect(props.reloadGuard(first.after)).toMatch(/^stale preview/);
-  expect(commit({ kind: "write", review: first })).toMatch(/^fleet: nothing written — stale preview/);
-  expect(readFileSync(overlayPath, "utf8")).toBe(priorBytes);
+  // a same-key USER edit after the preview (another process sets codex-a's effort): re-rendering the
+  // staged effort over it reproduces the reviewed bytes, so only the moved user bytes can refuse it
+  const racing = first.after.replace("effort: low", "effort: medium");
+  expect(racing).not.toBe(first.after);
+  writeFileSync(globalPath, racing);
+  expect(props.reloadGuard(first.after)).toMatch(/^stale preview — the user overlay/);
+  expect(commit({ kind: "write", review: first })).toMatch(/^fleet: nothing written — stale preview — the user overlay/);
+  expect(readFileSync(globalPath, "utf8")).toBe(racing);
+  const edited = `${userBytes}# edited after the preview\n`;
+  writeFileSync(globalPath, edited);
 
-  // malformed lower YAML: review, guard and save each answer with the named error, never a raw exception
-  writeFileSync(globalPath, "tiers: [unclosed\n");
-  const broken = review();
-  expect(broken.notes?.[0]).toContain(`lower config layer ${globalPath} is malformed YAML`);
-  expect(props.reloadGuard(broken.after)).toContain(`lower config layer ${globalPath} is malformed YAML`);
-  expect(commit({ kind: "write", review: broken })).toMatch(/^fleet: nothing written — lower config layer .* is malformed YAML/);
-  // a non-map where the lower overrides belong is malformed too — never an empty lower layer
-  writeFileSync(globalPath, stringify({ tiers: { codex: { modelOverrides: ["codex-b"] } } }));
-  expect(props.reloadGuard(review().after)).toContain("tiers.codex.modelOverrides is not a map");
-  expect(readFileSync(overlayPath, "utf8")).toBe(priorBytes);
+  // a REPO edit after the preview: refused the same way, although the user bytes are current
+  const second = review();
+  writeFileSync(overlayPath, `${repoBytes}# edited after the preview\n`);
+  expect(props.reloadGuard(second.after)).toMatch(/^stale preview — the repository overlay/);
+  expect(commit({ kind: "write", review: second })).toMatch(/^fleet: nothing written — stale preview — the repository overlay/);
+  expect(readFileSync(globalPath, "utf8")).toBe(edited);
 
-  // the repaired global layer: the re-review remasks every current sibling, y passes and the save lands
-  lowerSiblings("codex-b", "codex-c", "codex-d");
+  // re-reviewed against the current layers the save lands: only the user file changes, untouched
+  // comments survive, and only codex-a's effort changes in the merged seats
   const masking = channelsFromConfig("codex", loadConfig(repo, { globalDir }));
+  const repoNow = readFileSync(overlayPath, "utf8");
   const fresh = review();
-  expect(masked(fresh.after)).toMatchObject({ "codex-a": { effort: "low" }, "codex-b": null, "codex-c": null, "codex-d": null });
   expect(props.reloadGuard(fresh.after)).toBeNull();
-  expect(commit({ kind: "write", review: fresh })).toMatch(/^fleet: wrote /);
-  expect(readFileSync(overlayPath, "utf8")).toBe(fresh.after);
+  expect(commit({ kind: "write", review: fresh })).toBe(`fleet: wrote ${globalPath}`);
+  expect(readFileSync(globalPath, "utf8")).toBe(fresh.after);
+  expect(fresh.after).toContain("# my machine choices");
+  expect(fresh.after).toContain("# edited after the preview");
+  expect(readFileSync(overlayPath, "utf8")).toBe(repoNow);
   const saved = channelsFromConfig("codex", loadConfig(repo, { globalDir }));
   for (const model of models) {
     const expected = masking.find((c) => c.model === model);
-    expect(expected?.vendor).toBe("openai"); // the repo's null masked the global azure/api metadata
+    expect(expected).toMatchObject({ vendor: "openai", channel: "sub" }); // the user's null masked the default azure/api metadata
     expect(saved.find((c) => c.model === model)).toEqual(model === "codex-a" ? { ...expected, effort: "low" } : expected);
   }
 });

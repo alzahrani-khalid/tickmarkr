@@ -113,7 +113,7 @@ Before \`tickmarkr compile\` or \`tickmarkr run\`: run \`tickmarkr version\`, re
 
 ### Tip-verify-before-green
 
-A run is green only when ALL of these hold: the run-end event exists in the journal, tip verify is not "failed", AND the run-end summary's \`failed\`, \`human\`, \`blocked\` and \`pending\` buckets are every one of them empty. The shorter "run-end plus tip verify" form is NOT sufficient: a run ending \`done=[T1,T3,T4] human=[T2] tipVerify=passed\` is a closed PARTIAL run — three of four delivered, one parked — and calling it green is how a park becomes invisible. Never report green to the operator, tab titles, or records until every clause holds; when one does not, name the bucket that is not empty.
+A run is green only when ALL of these hold: the run-end event exists in the journal, tip verify is not "failed", the run-end summary's \`failed\`, \`human\`, \`blocked\` and \`pending\` buckets are every one of them empty, AND the owed checks in CURRENT \`tickmarkr status <runId>\` are outstanding empty AND known (\`outstanding 0\`; \`outstanding unknown\` is never empty). The shorter "run-end plus tip verify" form is NOT sufficient: a run ending \`done=[T1,T3,T4] human=[T2] tipVerify=passed\` is a closed PARTIAL run — three of four delivered, one parked — and calling it green is how a park becomes invisible. Empty execution buckets are not sufficient either (D-660): a run ending with every execution bucket empty and \`tipVerify=passed\` after an operator waived one review still owes that accepted-risk review check — status reads \`outstanding 1 (T7 review)\`, and \`tickmarkr run\` and \`resume\` exit 0 on execution alone — so it is execution complete, not green. Read the debt from CURRENT status, never from the run-end record: a \`tickmarkr verify --record <runId>\` discharge that lands after run-end moves current status to \`outstanding 0\` while the historical run-end row still carries 1, and only then is that run green; a legacy waiver without a recorded obligation reads \`outstanding unknown\` and is never green. Never report green to the operator, tab titles, or records until every clause holds; when one does not, name the bucket that is not empty, the outstanding checks, or the unknown debt.
 
 ### Verified handoffs
 
@@ -659,7 +659,8 @@ export async function init(argv: string[], cwd = process.cwd(), io: InitIO = {})
   const interactive = input.isTTY === true && output.isTTY === true && !(values.yes ?? false);
 
   // Act 1 — preferences. Only when the repo config does not exist yet: init never rewrites an
-  // operator's config; re-tuning is `tickmarkr fleet` (act 3 below still runs and writes overlays).
+  // operator's config; re-tuning is `tickmarkr fleet` (act 3 below still runs). Act 1 writes only
+  // project execution preferences; model choices are act 3's, saved to the USER overlay (B2).
   if (!repoConfigExists) {
     if (interactive) {
       emitBanner();
@@ -700,7 +701,8 @@ export async function init(argv: string[], cwd = process.cwd(), io: InitIO = {})
 
   // Act 3 — fleet. The compact discovery surface prints BETWEEN the acts so the operator reads
   // what the fleet browser (and its presets overlay, raised on the first Shapes entry) ranks
-  // with; the final summary then carries a pointer, not a repeat.
+  // with; the final summary then carries a pointer, not a repeat. Its confirmation is the shared
+  // Fleet actuator's: the reviewed choices land in the user overlay (gdir), never the repo's.
   if (interactive) {
     output.write(`${doc}\n`);
     doc = "discovery shown above — full matrix any time with `tickmarkr doctor`";

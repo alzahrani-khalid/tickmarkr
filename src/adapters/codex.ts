@@ -5,7 +5,7 @@ import type { TickmarkrConfig } from "../config/config.js";
 import type { Effort, Task } from "../graph/schema.js";
 import { probeVersion } from "./claude-code.js";
 import { parseWorkerResult } from "./prompt.js";
-import { type Assignment, type BillingChannel, channelsFromConfig, declareInputBox, type Invocation, MODEL_ID_RE, promptFitsArgv, shq, type TokenUsage, TokenUsageSchema, type TrustDialog, type TrustVerdict, type WorkerAdapter } from "./types.js";
+import { type Assignment, type BillingChannel, channelsFromConfig, declareInputBox, type Invocation, MODEL_ID_RE, type ModelRetirement, promptFitsArgv, shq, type TokenUsage, TokenUsageSchema, type TrustDialog, type TrustVerdict, type WorkerAdapter } from "./types.js";
 
 // SPEND-07: codex writes per-session JSONL to ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl — date-partitioned,
 // NOT cwd-keyed. session_meta.payload.cwd is FILE-SCOPED (one codex exec per cwd). token_count events carry
@@ -51,18 +51,34 @@ function codexSessionDayDirs(sessions: string, sinceMs: number): string[] {
 // Fails OPEN to { models: [] } on missing/corrupt cache. Version drift observed (installed CLI
 // 0.143.0 vs cache client_version 0.144.0, 2026-07-10) — hence the defensive try/catch and no shape
 // assumptions. CODEX_HOME is codex's own relocation env. fetchedAt is the honest codex knowledge age.
-export function readCodexModelsCache(path?: string): { models: string[]; fetchedAt?: string } {
+// v2.6.4 T2 (B1a): each listed entry's `upgrade` is the CLI's own retirement notice (0.159.0 cache,
+// 2026-09-29: gpt-5.5 → {model: gpt-5.6-sol, retirement_at: 2026-10-14T19:00:00Z}; every other listed
+// id carries upgrade: null). null records known clean; a malformed or absent `upgrade` records nothing,
+// so that id stays unknown. An unreadable cache returns no retirements at all (unknown, never clean).
+export function readCodexModelsCache(path?: string): { models: string[]; fetchedAt?: string; retirements?: Record<string, ModelRetirement | null> } {
   const p = path ?? join(process.env.CODEX_HOME || join(homedir(), ".codex"), "models_cache.json");
   try {
     const d = JSON.parse(readFileSync(p, "utf8"));
-    const models = (d.models ?? [])
-      .filter((m: any) => m?.visibility === "list" && typeof m.slug === "string" && m.slug.length > 0)
-      .map((m: any) => m.slug as string)
-      .filter((id: string) => MODEL_ID_RE.test(id));
-    return { models, fetchedAt: typeof d.fetched_at === "string" ? d.fetched_at : undefined };
+    const listed = (d.models ?? [])
+      .filter((m: any) => m?.visibility === "list" && typeof m.slug === "string" && m.slug.length > 0 && MODEL_ID_RE.test(m.slug));
+    const retirements: Record<string, ModelRetirement | null> = {};
+    for (const m of listed) {
+      const notice = codexRetirement(m.upgrade);
+      if (notice !== undefined) retirements[m.slug] = notice;
+    }
+    return { models: listed.map((m: any) => m.slug as string), fetchedAt: typeof d.fetched_at === "string" ? d.fetched_at : undefined, retirements };
   } catch {
     return { models: [] };
   }
+}
+
+function codexRetirement(upgrade: unknown): ModelRetirement | null | undefined {
+  if (upgrade === null) return null;
+  const u = upgrade as { retirement_at?: unknown; model?: unknown } | undefined;
+  if (typeof u?.retirement_at !== "string" || !Number.isFinite(Date.parse(u.retirement_at))) return undefined;
+  if (u.model === undefined) return { retiresAt: u.retirement_at };
+  // the successor id comes from an external file and is rendered in lints — same charset gate as slugs
+  return typeof u.model === "string" && MODEL_ID_RE.test(u.model) ? { retiresAt: u.retirement_at, successor: u.model } : undefined;
 }
 
 // tickmarkr worktrees keep their gitdir under the MAIN repo's .git/worktrees/<name> — outside the
@@ -269,6 +285,8 @@ export const codex: WorkerAdapter = {
   // v1.5 MODEL-05: codex reads an offline cache, so "now" would re-stamp an ancient cache fresh and the
   // 30-day staleness lint could never fire. Surface the cache's own fetched_at so doctor stamps the real age.
   listModelsFetchedAt: () => readCodexModelsCache().fetchedAt,
+  // v2.6.4 T2 (B1a): the cache's per-model retirement notices, persisted beside models in doctor.json.
+  listModelsRetirements: () => readCodexModelsCache().retirements,
   collectUsage(cwd: string, sinceMs: number): TokenUsage | undefined {
     try {
       const real = realpathSync(cwd);

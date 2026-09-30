@@ -13,6 +13,9 @@ import { graphDefinitionHash, tickmarkrDir, saveGraph } from "../../src/graph/gr
 import { GATE_NAMES, validateGraph } from "../../src/graph/schema.js";
 import type { JournalEvent } from "../../src/run/journal.js";
 
+// CG1: status opens with its three lead lines (finished · time · needs you); the run header follows them.
+const headerLine = (out: string): string => out.split("\n").find((line) => !/^(finished|time|needs you:) /u.test(line))!;
+
 // Counts the journal reads one frame performs. The wrapper calls straight through, so every other
 // test in this file sees the real filesystem — only the tally is added.
 const journalReads = vi.hoisted(() => ({ count: 0 }));
@@ -561,7 +564,7 @@ describe("status checklist rendering", () => {
         const out = await status([], repo);
         expect(out).not.toMatch(/\x1b\[/);
         expect(out).not.toMatch(/[☐✓✗⏸]/);
-        expect(out.split("\n")[0]).not.toContain("zone ");
+        expect(headerLine(out)).not.toContain("zone ");
         expect(row(out, "T1")).toContain("[x] T1");
         expect(row(out, "T2")).toContain("[!] T2");
         expect(row(out, "T3")).toContain("[ ] T3");
@@ -910,7 +913,7 @@ describe("status checklist rendering", () => {
       failedTipRunEnd(),
     ]);
 
-    const header = (await status([], repo)).split("\n")[0]!;
+    const header = headerLine(await status([], repo));
     expect(strip(header)).toContain("verify FAILED (test)");
     expect(strip(header)).toContain("2 fingerprints");
   });
@@ -1242,6 +1245,10 @@ describe("status checklist rendering", () => {
       (repo) => status([], repo),
       (out, lastRowTime) => {
         const golden =
+          // CG1: the three lead lines — finished, wall, needs you — open the plain print.
+          "finished 1/3 done · tip verify pending · end-to-end first pass unknown (1 without lineage)\n" +
+          "time 0s wall, each instant once\n" +
+          "needs you: outstanding 0 · 0 parked · 1 failed\n" +
           `tickmarkr status / run run-watch abandoned since ${lastRowTime} / last event 10m ago / daemon pid unknown / 1/3 done\n` +
           "  gates: B build / T test / L lint / E evidence / S scope / A acceptance / R review\n" +
           "  supervision: orchestrator ABSENT / orchestrator-context ABSENT / overseer ABSENT / overseer-context ABSENT / watch ABSENT\n" +

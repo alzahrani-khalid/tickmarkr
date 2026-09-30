@@ -10,6 +10,9 @@ import { runDaemon } from "../../src/run/daemon.js";
 import { cellWidth } from "../../src/tui/cockpit/width.js";
 import { setupRepo, T, COMMIT } from "../helpers/tmprepo.js";
 
+// CG1: status opens with its three lead lines (finished · time · needs you); the run header follows them.
+const headerLine = (out: string): string => out.split("\n").find((line) => !/^(finished|time|needs you:) /u.test(line))!;
+
 const mkRepo = () => mkdtempSync(join(tmpdir(), "tickmarkr-graph-hash-"));
 const GRAPH_HASH = "abc123";
 const OTHER_HASH = "def456";
@@ -134,7 +137,7 @@ describe("OBS-52 status graph-hash join guard", () => {
       await status(["--watch"], repo, { iterations: 1, sleep: async () => {} }),
     ];
     for (const out of snapshots) {
-      const header = out.split("\n")[0]!;
+      const header = headerLine(out);
       expect(header).not.toContain("recompiled");
       expect(header).not.toContain("not comparable");
       expect(header).not.toContain("tickmarkr run");
@@ -146,7 +149,7 @@ describe("OBS-52 status graph-hash join guard", () => {
     saveGraph(repo, graph(GRAPH_HASH, ["T1"]));
     seedJournal(repo, "run-unaudited", [runStart(OTHER_HASH)]);
 
-    const header = (await status([], repo)).split("\n")[0]!;
+    const header = headerLine(await status([], repo));
     expect(header).toContain("graph not comparable — recompiled since this run");
     expect(header).toMatch(/resum|audit/i);
     expect(header).not.toContain("tickmarkr run");

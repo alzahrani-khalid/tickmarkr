@@ -1351,3 +1351,53 @@ describe("OBS-1187 runtime routing stays inside the task pool", () => {
     }
   }, 300_000);
 });
+
+// W (D-718): the pool-member restore reads the router's one exclusion meaning. fake-3 is offered first
+// and outside the declared pool, so a rejected restore that left the pool would land there.
+describe("W (D-718) pooled resume restore by raw key and probed identity", () => {
+  const POOL = ["fake:fake-1", "fake:fake-alias", "fake:fake-2"];
+  const key = (a: unknown) => `${(a as { adapter: string }).adapter}:${(a as { model: string }).model}`;
+  const pooledRestore = async (runId: string, aliasIdentity: string | undefined, excluded: string) => {
+    const { repo, fake } = setupRepo([T("T1")], {
+      tasks: { T1: [{ shell: `echo ok > t1.txt && ${COMMIT} t1`, result: { ok: true, summary: "ok" } }] },
+    }, `routing:\n  map:\n    implement:\n      pool: { mode: any, channels: [${POOL.join(", ")}] }\n`);
+    fake.channels = () => [
+      { adapter: "fake", vendor: "fake-c", model: "fake-3", channel: "sub", tier: "frontier" },
+      { adapter: "fake", vendor: "fake-a", model: "fake-1", channel: "sub", tier: "frontier" },
+      { adapter: "fake", vendor: "fake-a", model: "fake-alias", channel: "api", tier: "frontier" },
+      { adapter: "fake", vendor: "fake-b", model: "fake-2", channel: "api", tier: "frontier" },
+    ];
+    const identities: Record<string, string | undefined> = {
+      "fake-3": "fake-served-3", "fake-1": "fake-served-1", "fake-alias": aliasIdentity, "fake-2": "fake-served-2",
+    };
+    fake.probe = async () => ({
+      installed: true, authed: true, version: "fake", models: Object.keys(identities),
+      modelAuth: Object.fromEntries(Object.entries(identities).map(([model, identity]) =>
+        [model, { authed: true, probedAt: "2026-09-29T00:00:00.000Z", ...(identity ? { identity } : {}) }])),
+    });
+    const j = Journal.create(repo, runId);
+    j.append("run-start", undefined, { baseRef: await gitHead(repo), commands: {}, graphDefinitionHash: graphDefinitionHash(loadGraph(repo)) });
+    j.append("task-dispatch", "T1", { assignment: { adapter: "fake", model: "fake-alias", channel: "api", tier: "frontier" }, attempt: 0 });
+    j.append("channel-exclusion", "T1", { channel: excluded, reason: "auth-required", kind: "dead-channel" });
+    writeFileSync(join(j.dir, "baseline.json"), JSON.stringify({ commands: {} }));
+    const s = await runDaemon(repo, { adapters: [fake], runId, resume: true });
+    expect(s.done).toEqual(["T1"]);
+    const all = Journal.open(repo, runId).read();
+    const post = all.slice(all.findLastIndex((e) => e.event === "run-resume") + 1).filter((e) => e.taskId === "T1");
+    return {
+      restored: key(post.find((e) => e.event === "resume-restore")?.data.assignment),
+      dispatched: post.filter((e) => e.event === "task-dispatch").map((e) => key(e.data.assignment)),
+    };
+  };
+
+  test("resumed runDaemon retains an offered unprobed assignment when its raw key is not excluded but rejects its directly excluded key and an alias with the same probed excluded identity while keeping the eligible declared pool", async () => {
+    const unprobed = await pooledRestore("run-w-pool-unprobed", undefined, "fake:fake-1");
+    expect(unprobed).toEqual({ restored: "fake:fake-alias", dispatched: ["fake:fake-alias"] });
+
+    const direct = await pooledRestore("run-w-pool-direct", undefined, "fake:fake-alias");
+    expect(direct).toEqual({ restored: "fake:fake-1", dispatched: ["fake:fake-1"] });
+
+    const probed = await pooledRestore("run-w-pool-probed", "fake-served-1", "fake:fake-1");
+    expect(probed).toEqual({ restored: "fake:fake-2", dispatched: ["fake:fake-2"] });
+  }, 240_000);
+});

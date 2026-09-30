@@ -79,10 +79,20 @@ function terminal() {
 
 const strip = (s: string) => s.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "");
 
+// B2: fleet saves the operator's choices to the USER overlay, so each fixture repo's policy lives in
+// its own user layer (the --global-dir the browser runs with); the repo overlay stays unwritten.
+const userDirs = new Map<string, string>();
+const userDirOf = (repo: string): string => {
+  const dir = userDirs.get(repo) ?? mkdtempSync(join(tmpdir(), "tickmarkr-fleet-reach-g-"));
+  userDirs.set(repo, dir);
+  return dir;
+};
+const overlayFile = (repo: string) => join(userDirOf(repo), "config.yaml");
+
 function setup() {
   const repo = makeRepo({ "keep.txt": "x" });
   mkdirSync(join(repo, ".tickmarkr"), { recursive: true });
-  writeFileSync(join(repo, ".tickmarkr", "config.yaml"), [
+  writeFileSync(overlayFile(repo), [
     "tiers:",
     "  fake:",
     "    vendor: fake",
@@ -121,7 +131,7 @@ function setup() {
       },
     },
   });
-  const globalDir = mkdtempSync(join(tmpdir(), "tickmarkr-fleet-reach-g-"));
+  const globalDir = userDirOf(repo);
   return { repo, adapter, globalDir };
 }
 
@@ -232,7 +242,7 @@ function policyRepo(models: string[], routing: string[], identities: Record<stri
     ...routing,
     "",
   ].join("\n");
-  writeFileSync(join(repo, ".tickmarkr", "config.yaml"), overlay);
+  writeFileSync(overlayFile(repo), overlay);
   registry.writeDoctor(repo, {
     fake: {
       installed: true,
@@ -246,7 +256,7 @@ function policyRepo(models: string[], routing: string[], identities: Record<stri
       }])),
     },
   });
-  const globalDir = mkdtempSync(join(tmpdir(), "tickmarkr-fleet-reach-g-"));
+  const globalDir = userDirOf(repo);
   return { repo, globalDir, overlay };
 }
 
@@ -309,7 +319,7 @@ test("finding 3: Space edits only the selected channel's own entry — an adapte
   expect(moved.out).toMatch(/^fleet: wrote /);
   const cfg = loadConfig(a.repo, { globalDir: a.globalDir });
   expect(cfg.routing.deny?.workers?.adapters).toEqual(["fake"]);
-  expect(readFileSync(join(a.repo, ".tickmarkr", "config.yaml"), "utf8"))
+  expect(readFileSync(overlayFile(a.repo), "utf8"))
     .toContain("adapters: [fake] # every fake channel stays off the worker seat");
   const fake2 = { adapter: "fake", model: "fake-2" };
   expect(exclusionCollector(fake2, cfg.routing, "judge")).toEqual([]);
@@ -327,7 +337,7 @@ test("finding 3: Space edits only the selected channel's own entry — an adapte
   expect(noticeAt).toBeGreaterThanOrEqual(0);
   expect(refused.frames[noticeAt]).toContain("routing.deny.adapters (fake)");
   expect(refused.frames.slice(noticeAt).join("\n")).toContain("reach: out · all seats — routing.deny.adapters (fake)");
-  expect(readFileSync(join(b.repo, ".tickmarkr", "config.yaml"), "utf8")).toBe(b.overlay);
+  expect(readFileSync(overlayFile(b.repo), "utf8")).toBe(b.overlay);
 });
 
 test("judge c3: one Space press re-scopes or clears exactly ONE of a channel's own entries — its adapter:model key first — while its identity and bare-model entries keep their reasons, and the row names the one entry it edited", async () => {
@@ -363,7 +373,7 @@ test("round 2 finding 1 (revised by OBS-1099): a bare-model workers deny shared 
   const twinAdapter: WorkerAdapter = { ...tierAdapter, id: "twin", vendor: "twin", channels: (cfg) => channelsFromConfig("twin", cfg) };
   const repo = makeRepo({ "keep.txt": "x" });
   mkdirSync(join(repo, ".tickmarkr"), { recursive: true });
-  writeFileSync(join(repo, ".tickmarkr", "config.yaml"), [
+  writeFileSync(overlayFile(repo), [
     "tiers:",
     "  fake:",
     "    vendor: fake",
@@ -387,17 +397,17 @@ test("round 2 finding 1 (revised by OBS-1099): a bare-model workers deny shared 
     fake: { installed: true, authed: true, version: "fake", models: ["fake-1", "fake-2"], modelAuth: { "fake-1": authed, "fake-2": authed } },
     twin: { installed: true, authed: true, version: "twin", models: ["fake-1"], modelAuth: { "fake-1": authed } },
   });
-  const globalDir = mkdtempSync(join(tmpdir(), "tickmarkr-fleet-reach-g-"));
+  const globalDir = userDirOf(repo);
   // OBS-1099: the bare id covers twin:fake-1 too, so promoting it from the fake:fake-1 row is
   // refused by name — the shared entry is neither widened for its sibling nor doubled by a flat deny
-  const before = readFileSync(join(repo, ".tickmarkr", "config.yaml"), "utf8");
+  const before = readFileSync(overlayFile(repo), "utf8");
   const { out, frames } = await browse(repo, globalDir, REACH_ALL + KEYS.q + KEYS.q, 200, [tierAdapter, twinAdapter]);
   expect(out).toBe("fleet: quit without writing");
   const notice = frames.find((f) => f.includes("Space edits only this channel's own entries"));
   expect(notice).toBeDefined();
   expect(notice).toContain("fake:fake-1 stays out · workers — routing.deny.workers.models (fake-1)");
   expect(frames.join("\n")).not.toContain("to routing.deny.models");
-  expect(readFileSync(join(repo, ".tickmarkr", "config.yaml"), "utf8")).toBe(before);
+  expect(readFileSync(overlayFile(repo), "utf8")).toBe(before);
   const cfg = loadConfig(repo, { globalDir });
   for (const channel of [{ adapter: "fake", model: "fake-1" }, { adapter: "twin", model: "fake-1" }]) {
     expect(exclusionCollector(channel, cfg.routing, "worker"), `${channel.adapter}:fake-1 worker`).not.toEqual([]);
@@ -411,7 +421,7 @@ test("round 2 finding 2: one Space press clears exactly ONE authored flat reason
   const one = await browse(a.repo, a.globalDir, REACH_IN + "w" + "y");
   expect(one.out).toMatch(/^fleet: wrote /);
   expect(one.frames.join("\n")).toContain("reach: out · all seats — routing.deny.adapters (fake:fake-1)");
-  expect(readFileSync(join(a.repo, ".tickmarkr", "config.yaml"), "utf8")).toContain("adapters: [fake:fake-1] # keep this reason");
+  expect(readFileSync(overlayFile(a.repo), "utf8")).toContain("adapters: [fake:fake-1] # keep this reason");
   const cfgA = loadConfig(a.repo, { globalDir: a.globalDir });
   expect(exclusionCollector({ adapter: "fake", model: "fake-1" }, cfgA.routing, "judge").map((s) => `${s.configPath} ${s.entry}`))
     .toContain("routing.deny.adapters fake:fake-1");
@@ -438,7 +448,7 @@ test("round 2 finding 3: an alias admitted by its resolved identity — bare or 
 
 // ── OBS-1046: one Space press edits one reason; an untouched scope keeps its bytes ────────────
 
-const overlayOf = (repo: string) => readFileSync(join(repo, ".tickmarkr", "config.yaml"), "utf8");
+const overlayOf = (repo: string) => readFileSync(overlayFile(repo), "utf8");
 
 test("test: over a universe of two channels with allow models naming the second and deny models naming the first the browser shows two reasons for the first, one Space press clears the deny reason alone, the written overlay keeps routing.allow, and the loaded policy still excludes the first channel by allow in every role, so a press that removes both reasons fails", async () => {
   const { repo, globalDir } = policyRepo(["one", "two"], ["  allow:", "    models: [fake:two]", "  deny:", "    models: [fake:one]"]);
@@ -905,7 +915,7 @@ test("review round 2 finding 1: a bare-model entry shared across two adapters na
   const twinAdapter: WorkerAdapter = { ...tierAdapter, id: "twin", vendor: "twin", channels: (cfg) => channelsFromConfig("twin", cfg) };
   const repo = makeRepo({ "keep.txt": "x" });
   mkdirSync(join(repo, ".tickmarkr"), { recursive: true });
-  writeFileSync(join(repo, ".tickmarkr", "config.yaml"), [
+  writeFileSync(overlayFile(repo), [
     "tiers:",
     "  fake:",
     "    vendor: fake",
@@ -928,7 +938,7 @@ test("review round 2 finding 1: a bare-model entry shared across two adapters na
     fake: { installed: true, authed: true, version: "fake", models: ["fake-1"], modelAuth: { "fake-1": authed } },
     twin: { installed: true, authed: true, version: "twin", models: ["fake-1"], modelAuth: { "fake-1": authed } },
   });
-  const globalDir = mkdtempSync(join(tmpdir(), "tickmarkr-fleet-reach-g-"));
+  const globalDir = userDirOf(repo);
   const viewed = await browse(repo, globalDir, KEYS.q, 200, [tierAdapter, twinAdapter]);
   expect(detailOf(viewed.frames, "covered by ")).toContain("covered by routing.deny.workers.models (fake-1) — shared: covers fake:fake-1, twin:fake-1 — l lifts that one entry");
   const lifted = await browse(repo, globalDir, "l" + "\r" + "w" + "y", 200, [tierAdapter, twinAdapter]);
@@ -990,7 +1000,7 @@ test("review round 3: a row whose folded alias is covered by the row's own expli
   // resolves to that id, so the row's own key covers the folded sibling — one shared entry
   const repo = makeRepo({ "keep.txt": "x" });
   mkdirSync(join(repo, ".tickmarkr"), { recursive: true });
-  writeFileSync(join(repo, ".tickmarkr", "config.yaml"), [
+  writeFileSync(overlayFile(repo), [
     "tiers:",
     "  fake:",
     "    vendor: anthropic",
@@ -1028,7 +1038,7 @@ test("review round 3: a row whose folded alias is covered by the row's own expli
       },
     },
   }));
-  const globalDir = mkdtempSync(join(tmpdir(), "tickmarkr-fleet-reach-g-"));
+  const globalDir = userDirOf(repo);
   // the folded row sits below the classified one; Space there classifies (unclassified rows are
   // never routed), so the shared entry's only edit path is the l control this row must expose
   const viewed = await browse(repo, globalDir, KEYS.down + KEYS.q, 260);

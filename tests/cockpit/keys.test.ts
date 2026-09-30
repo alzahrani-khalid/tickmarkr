@@ -1,15 +1,17 @@
+import { createHash } from "node:crypto";
 import {
   copyFileSync,
   cpSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   rmSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, relative } from "node:path";
 import { PassThrough } from "node:stream";
 import { fileURLToPath } from "node:url";
 import { render } from "ink";
@@ -75,6 +77,7 @@ import {
   type RunCockpitData,
 } from "../../src/tui/cockpit/run-cockpit.js";
 import { ownedFailures, runOwned } from "../helpers/owned-process.js";
+import { resolveForkCap } from "../../vitest.config.js";
 
 const SURFACE_DECLARED_BRANCH_MODULES = [
   "src/tui/cockpit/keys.ts",
@@ -553,56 +556,558 @@ type NamedTestResult = {
   readonly output: string;
 };
 
+const SANDBOX_DIRECTORIES = ["src", "tests", "fixtures"] as const;
+// scripts/vitest-lease.ts is the production config's globalSetup (the suite lease hook)
+const SANDBOX_FILES = ["package.json", "tsconfig.json", "vitest.config.ts", "scripts/vitest-lease.ts"] as const;
+
 function makeBranchSandbox(): string {
   const sandbox = mkdtempSync(join(tmpdir(), "tickmarkr-branch-ledger-"));
-  for (const directory of ["src", "tests", "fixtures"] as const) {
+  for (const directory of SANDBOX_DIRECTORIES) {
     cpSync(join(PROJECT_ROOT, directory), join(sandbox, directory), { recursive: true });
   }
-  // scripts/vitest-lease.ts is the production config's globalSetup (the suite lease hook)
   mkdirSync(join(sandbox, "scripts"));
-  for (const file of ["package.json", "tsconfig.json", "vitest.config.ts", "scripts/vitest-lease.ts"] as const) {
+  for (const file of SANDBOX_FILES) {
     copyFileSync(join(PROJECT_ROOT, file), join(sandbox, file));
   }
   symlinkSync(join(PROJECT_ROOT, "node_modules"), join(sandbox, "node_modules"), "dir");
   return sandbox;
 }
 
-async function runNamedLedgerTest(
-  sandbox: string,
-  entry: BranchLedgerEntry,
-): Promise<NamedTestResult> {
-  // OBS-1167 / D-478 add.1: the nested runner is an owned subprocess — at its bound (or on any exit) its
-  // whole tree, fork workers included, is torn down and awaited, and a runner that outlives it is red.
-  const run = await runOwned(process.execPath, [
-    VITEST_BIN,
-    "run",
-    entry.testFile,
-    "--configLoader",
-    "runner",
-    "--reporter=verbose",
-    "-t",
-    entry.testTitle,
-  ], {
-    cwd: sandbox,
-    ms: 45_000,
-    env: {
-      ...process.env,
-      // OBS-886 (the OBS-854 precedent): every nested run is a whole vitest process whose fork pool pre-spawns
-      // min(cpus-1, maxForks) workers; one ledger entry at a time inside a PARALLEL fork ran ≈60 s and starved
-      // the worker↔host birpc window (post-summary "Timeout calling onTaskUpdate" with every test green).
-      // The entries are awaited serially, so one fork per child costs nothing and ends the storm.
-      VITEST_MAX_FORKS: "1",
-      FORCE_COLOR: "0",
-      NO_COLOR: "1",
-    },
-  });
-  if (run.why === "expired") throw new Error(`${entry.branch}: named test exceeded 45 seconds`);
-  const owned = ownedFailures(run, entry.branch);
-  if (owned.length > 0) throw new Error(owned.join("; "));
-  return { status: run.exitCode, output: run.out + run.err };
+/** sha256 over every path and byte a ledger sandbox copied from the project (node_modules is a shared link). */
+function sandboxRevision(sandbox: string): string {
+  const files = [
+    ...SANDBOX_DIRECTORIES.flatMap((directory) =>
+      readdirSync(join(sandbox, directory), { recursive: true, withFileTypes: true })
+        .filter((dirent) => dirent.isFile())
+        .map((dirent) => relative(sandbox, join(dirent.parentPath, dirent.name)))),
+    ...SANDBOX_FILES,
+  ].sort();
+  const hash = createHash("sha256");
+  for (const file of files) hash.update(`${file}\0`).update(readFileSync(join(sandbox, file))).update("\0");
+  return hash.digest("hex");
 }
 
-function assertNamedTestPassed(entry: BranchLedgerEntry, result: NamedTestResult): void {
+/**
+ * Owned ledger child starts, their wall time, the assertion-body time the children themselves report
+ * (vitest's per-test durations in each child's JSON report) and the children that executed no test body,
+ * per process. Every ledger child this file starts goes through runLedgerChild, so this is its whole cost.
+ */
+const LEDGER_CHILDREN = { starts: 0, ms: 0, bodyMs: 0, noTest: 0 };
+
+/** The fork cap every ledger child runs under, and the one this process's own vitest config resolved. */
+const INNER_FORK_CAP = 1;
+const OUTER_FORK_CAP = resolveForkCap(process.env.VITEST_MAX_FORKS);
+
+/** What one named ledger run selects: a test title in a test file, labelled by the branch it proves. */
+type NamedLedgerTest = Pick<BranchLedgerEntry, "branch" | "testTitle"> & { readonly testFile: string };
+
+async function runNamedLedgerTest(
+  sandbox: string,
+  entry: NamedLedgerTest,
+): Promise<NamedTestResult> {
+  return runLedgerChild(sandbox, entry.testFile, [entry.testTitle], entry.branch);
+}
+
+const escapeRegExp = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/gu, "\\$&");
+
+/**
+ * The assertion-body milliseconds a child's JSON report records for the tests it executed, or null when it
+ * executed none (its named test deleted). A missing, unreadable or malformed report, or an executed test
+ * without a duration, fails the measurement rather than counting as zero body time.
+ */
+function reportedBodyMs(report: string, label: string): number | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(report, "utf8"));
+  } catch (error) {
+    throw new Error(`${label}: child wrote no readable JSON report (${error instanceof Error ? error.message : String(error)})`);
+  }
+  const files = (parsed as { testResults?: unknown } | null)?.testResults;
+  if (!Array.isArray(files)) throw new Error(`${label}: child JSON report carries no testResults`);
+  let executed = 0;
+  let bodyMs = 0;
+  for (const file of files as ({ assertionResults?: unknown } | null)[]) {
+    const assertions = file?.assertionResults;
+    if (!Array.isArray(assertions)) throw new Error(`${label}: child JSON report file carries no assertionResults`);
+    for (const assertion of assertions as { title?: string; status?: string; duration?: unknown }[]) {
+      if (assertion.status !== "passed" && assertion.status !== "failed") continue;
+      if (typeof assertion.duration !== "number" || !Number.isFinite(assertion.duration)) {
+        throw new Error(`${label}: executed test ${JSON.stringify(assertion.title)} reported no duration`);
+      }
+      executed += 1;
+      bodyMs += assertion.duration;
+    }
+  }
+  return executed === 0 ? null : bodyMs;
+}
+
+async function runLedgerChild(
+  sandbox: string,
+  testFile: string,
+  titles: readonly string[],
+  label: string,
+): Promise<NamedTestResult> {
+  LEDGER_CHILDREN.starts += 1;
+  const report = join(sandbox, `.ledger-report-${LEDGER_CHILDREN.starts}.json`);
+  const started = performance.now();
+  try {
+    // OBS-1167 / D-478 add.1: the nested runner is an owned subprocess — at its bound (or on any exit) its
+    // whole tree, fork workers included, is torn down and awaited, and a runner that outlives it is red.
+    const run = await runOwned(process.execPath, [
+      VITEST_BIN,
+      "run",
+      testFile,
+      "--configLoader",
+      "runner",
+      "--reporter=verbose",
+      "--reporter=json",
+      `--outputFile.json=${report}`,
+      "-t",
+      titles.length === 1 ? titles[0]! : `(?:${titles.map(escapeRegExp).join("|")})`,
+    ], {
+      cwd: sandbox,
+      ms: 45_000 * titles.length,
+      env: {
+        ...process.env,
+        // OBS-886 (the OBS-854 precedent): every nested run is a whole vitest process whose fork pool pre-spawns
+        // min(cpus-1, maxForks) workers; one ledger entry at a time inside a PARALLEL fork ran ≈60 s and starved
+        // the worker↔host birpc window (post-summary "Timeout calling onTaskUpdate" with every test green).
+        // The entries are awaited serially, so one fork per child costs nothing and ends the storm.
+        VITEST_MAX_FORKS: String(INNER_FORK_CAP),
+        FORCE_COLOR: "0",
+        NO_COLOR: "1",
+        // a named child never inherits a benchmark invocation's schedule or record path
+        TICKMARKR_KEYS_LEDGER_SCHEDULE: undefined,
+        TICKMARKR_KEYS_LEDGER_RECORD: undefined,
+      },
+    });
+    LEDGER_CHILDREN.ms += performance.now() - started;
+    if (run.why === "expired") throw new Error(`${label}: named test exceeded ${45 * titles.length} seconds`);
+    const owned = ownedFailures(run, label);
+    if (owned.length > 0) throw new Error(owned.join("; "));
+    const bodyMs = reportedBodyMs(report, label);
+    if (bodyMs === null) LEDGER_CHILDREN.noTest += 1;
+    else LEDGER_CHILDREN.bodyMs += bodyMs;
+    return { status: run.exitCode, output: run.out + run.err };
+  } finally {
+    rmSync(report, { force: true });
+  }
+}
+
+const ledgerIdentity = (entry: Pick<NamedLedgerTest, "testFile" | "testTitle">) =>
+  `${entry.testFile}\0${entry.testTitle}`;
+
+/**
+ * Proves each named test not yet in `passed` green ALONE, under the very `-t` selection its mutation run uses,
+ * then records it. Titles proved together share one worker: a test could pass on state a sibling left behind,
+ * and its mutation run alone would then fail whatever production does — evidence of nothing.
+ */
+async function proveBaselines(
+  sandbox: string,
+  entries: readonly NamedLedgerTest[],
+  passed: Set<string>,
+): Promise<void> {
+  for (const entry of entries) {
+    if (passed.has(ledgerIdentity(entry))) continue;
+    assertNamedTestPassed(entry, await runNamedLedgerTest(sandbox, entry));
+    passed.add(ledgerIdentity(entry));
+  }
+}
+
+/**
+ * A sandbox-only test file whose second test asserts nothing about production and passes only after the first
+ * has run in the same worker: the shape a baseline proved beside its siblings would wrongly accept.
+ */
+const SHARED_STATE_FIXTURE = "tests/cockpit/ledger-shared-state.test.ts";
+const SHARED_STATE_INIT_TITLE = "shared state fixture initializer sets the flag";
+const SHARED_STATE_DEPENDENT_TITLE = "shared state fixture assertion reads only the flag";
+const SHARED_STATE_FIXTURE_SOURCE = [
+  'import { expect, test } from "vitest";',
+  "let initialized = false;",
+  `test(${JSON.stringify(SHARED_STATE_INIT_TITLE)}, () => { initialized = true; });`,
+  `test(${JSON.stringify(SHARED_STATE_DEPENDENT_TITLE)}, () => { expect(initialized).toBe(true); });`,
+  "",
+].join("\n");
+
+/**
+ * The before schedule: TICKMARKR_KEYS_LEDGER_SCHEDULE=per-case runs the complete workload the way the cases ran
+ * before positive results were shared — each case proves its own baselines, deduplicated only within that case.
+ * The after schedule, "shared", proves each distinct baseline once for every case. Nothing else differs: both run
+ * every proof of every case (LEDGER_CASES) in that case's own callback-scoped sandbox, and both prove every
+ * baseline alone (proveBaselines). Only the paired benchmark's labelled invocation selects per-case, so the
+ * ordinary run never pays for it, and its child count is measured there, never assumed.
+ */
+const LEDGER_SCHEDULE: "shared" | "per-case" =
+  process.env.TICKMARKR_KEYS_LEDGER_SCHEDULE === "per-case" ? "per-case" : "shared";
+
+/**
+ * The cases of the complete ledger, in order, each in a sandbox of its own in both schedules — the boundaries the
+ * serialized case, the two sweeps and the construction-only arm always had, plus the next case proved alone.
+ */
+const LEDGER_CASES = ["serialized", "broken sweep", "construction-only", "missing-test sweep", "next alone"] as const;
+type LedgerCase = typeof LEDGER_CASES[number];
+
+const ABSENT_TEST_TITLE = "__absent named test__";
+
+type CompleteLedgerRecord = {
+  readonly schedule: typeof LEDGER_SCHEDULE;
+  /** sandboxRevision of every case sandbox — each must equal the first for a positive result to carry over. */
+  readonly revision: string;
+  readonly outerForkCap: number;
+  readonly innerForkCap: number;
+  /** The callback-scoped sandboxes opened, one per case, in the order the cases ran. */
+  readonly sandboxes: readonly LedgerCase[];
+  readonly baselines: ReadonlySet<string>;
+  readonly broken: readonly string[];
+  readonly missingTest: readonly string[];
+  /**
+   * Every mutation proof, labelled by its case, after which every ledger module and test file was byte-identical
+   * to its case sandbox's intact bytes — so it also lists which mutation proofs each case ran.
+   */
+  readonly restored: readonly string[];
+  readonly constructionOnlyRejected: boolean;
+  /** A named test that passes only after another selected test was rejected at its baseline. */
+  readonly sharedStateRejected: boolean;
+  readonly grownBudgetPassed: boolean;
+  readonly next: { readonly branch: string; readonly afterPredecessor: string; readonly alone: string };
+  readonly childStarts: number;
+  readonly noTestChildren: number;
+  readonly deletedTestChildren: number;
+  readonly setupMs: number;
+  readonly childTotalMs: number;
+  readonly bodyMs: number;
+};
+
+let completeLedger: Promise<CompleteLedgerRecord> | undefined;
+
+/**
+ * The complete compared workload — every ledger child this file starts, auxiliary proofs included — proved
+ * once per process and shared by every case that asserts it, each case in its own sandbox: the serialized case
+ * (the first entry's broken-production and missing-test proofs and the grown-ledger budget); the broken sweep
+ * (per entry a broken-production proof: its named test must fail); the construction-only arm and the
+ * shared-state baseline rejection; the missing-test sweep (per entry a deleted named test must NOT satisfy the
+ * proof, then a proof that throws after breaking production); and the case after a predecessor re-proved alone.
+ * Every mutation is followed by a byte comparison of every ledger module and test file. Any skipped or vacuous
+ * proof throws, failing every awaiting case.
+ */
+function proveCompleteLedger(): Promise<CompleteLedgerRecord> {
+  completeLedger ??= (async () => {
+    const from = { ...LEDGER_CHILDREN };
+    const shared = LEDGER_SCHEDULE === "shared";
+    const ledgerPaths = [...new Set(BRANCH_LEDGER.flatMap((entry) => [entry.module, entry.testFile]))];
+    let setupMs = 0;
+    let revision: string | undefined;
+    const sandboxes: LedgerCase[] = [];
+    const restored: string[] = [];
+    // Setup is the sandbox copy, its revision and teardown; a sandbox whose bytes differ from the first case's
+    // cannot inherit a positive result proved elsewhere, so it fails the ledger rather than being trusted.
+    const inCase = async (
+      name: LedgerCase,
+      run: (sandbox: string, expectRestored: (mutation: string) => void) => Promise<void>,
+    ) => {
+      let mark = performance.now();
+      await withBranchSandbox(async (sandbox) => {
+        const own = sandboxRevision(sandbox);
+        revision ??= own;
+        if (own !== revision) throw new Error(`${name}: sandbox bytes differ from the first case's sandbox`);
+        const read = () => ledgerPaths.map((path) => readFileSync(join(sandbox, path), "utf8"));
+        const intact = read();
+        sandboxes.push(name);
+        setupMs += performance.now() - mark;
+        await run(sandbox, (mutation) => {
+          const current = read();
+          const changed = ledgerPaths.filter((_, index) => current[index] !== intact[index]);
+          if (changed.length > 0) throw new Error(`${name}: ${mutation}: bytes not restored in ${changed.join(", ")}`);
+          restored.push(`${name}: ${mutation}`);
+        });
+        mark = performance.now();
+      });
+      setupMs += performance.now() - mark;
+    };
+    const provedBaselines = new Set<string>();
+    const caseSets: Set<string>[] = [];
+    // shared: one positive-result set for every case; per-case: each case proves its own baselines
+    const casePassed = () => {
+      if (shared) return provedBaselines;
+      const passed = new Set<string>();
+      caseSets.push(passed);
+      return passed;
+    };
+    const broken: string[] = [];
+    const missingTest: string[] = [];
+    let deletedTestChildren = 0;
+    let constructionOnlyRejected = false;
+    let sharedStateRejected = false;
+    let grownBudgetPassed = false;
+    const first = BRANCH_LEDGER[0];
+    const nextIndex = BRANCH_LEDGER.findIndex((entry, index) => index > 0
+      && entry.module !== BRANCH_LEDGER[index - 1]!.module
+      && entry.testFile !== BRANCH_LEDGER[index - 1]!.testFile);
+    if (nextIndex < 0) throw new Error("no ledger case follows a predecessor on another module and test file");
+    const next = BRANCH_LEDGER[nextIndex]!;
+    let afterPredecessor = "not run";
+    let alone = "not run";
+
+    await inCase("serialized", async (sandbox, expectRestored) => {
+      const passed = casePassed();
+      // This runs the named baseline, breaks the production arm, and requires that named test to fail.
+      await proveLedgerEntry(sandbox, first, passed);
+      expectRestored(`${first.branch}: passing mutation`);
+      // Removing the same test must then invalidate that evidence, not silently satisfy it.
+      await expect(proveLedgerEntry(sandbox, first, passed, { deleteNamedTest: true }))
+        .rejects.toThrow(/named test did not execute and fail/u);
+      deletedTestChildren += 1;
+      expectRestored(`${first.branch}: failing mutation`);
+      // Grow the real ledger in the sandbox, then collect its actual test registrations again.
+      // A flat timeout equal to today's formula must fail after this size perturbation.
+      const testPath = join(sandbox, KEYS_TEST);
+      const source = readFileSync(testPath, "utf8");
+      const grown = source.replace("const BRANCH_LEDGER = [", "const ORIGINAL_BRANCH_LEDGER = [")
+        .replace("// OBS-1141: local", "const BRANCH_LEDGER = [...ORIGINAL_BRANCH_LEDGER, ORIGINAL_BRANCH_LEDGER[0]];\n\n// OBS-1141: local");
+      expect(grown).not.toBe(source);
+      writeFileSync(testPath, grown);
+      try {
+        const budgetEntry = { ...first, testTitle: "ledger sweep budgets follow the runtime ledger size" };
+        assertNamedTestPassed(budgetEntry, await runNamedLedgerTest(sandbox, budgetEntry));
+      } finally {
+        writeFileSync(testPath, source);
+      }
+      grownBudgetPassed = true;
+      expectRestored("grown ledger budget");
+    });
+
+    await inCase("broken sweep", async (sandbox, expectRestored) => {
+      const passed = casePassed();
+      for (const [index, entry] of BRANCH_LEDGER.entries()) {
+        await proveLedgerEntry(sandbox, entry, passed);
+        broken.push(entry.branch);
+        if (index === nextIndex) afterPredecessor = "passed";
+        expectRestored(`${entry.branch}: passing mutation`);
+      }
+    });
+
+    await inCase("construction-only", async (sandbox, expectRestored) => {
+      const constructionOnly: BranchLedgerEntry = {
+        ...first,
+        branch: "test-owned construction-only arm",
+        breakProduction: (source) => source,
+      };
+      await expect(proveLedgerEntry(sandbox, constructionOnly, casePassed()))
+        .rejects.toThrow(/did not change production module/u);
+      constructionOnlyRejected = true;
+      expectRestored("construction-only arm");
+
+      // Selected together the dependent test passes; the ledger's baseline proof must still reject it, because
+      // alone — as its mutation run would select it — it fails whatever production does.
+      const fixturePath = join(sandbox, SHARED_STATE_FIXTURE);
+      writeFileSync(fixturePath, SHARED_STATE_FIXTURE_SOURCE);
+      try {
+        const together = await runLedgerChild(
+          sandbox,
+          SHARED_STATE_FIXTURE,
+          [SHARED_STATE_INIT_TITLE, SHARED_STATE_DEPENDENT_TITLE],
+          "shared-state fixture together",
+        );
+        if (together.status !== 0 || !/Tests\s+2 passed\b/u.test(stripAnsi(together.output))) {
+          throw new Error(`shared-state fixture did not pass with its initializer selected\n${together.output}`);
+        }
+        const initializer = { branch: "shared-state initializer", testFile: SHARED_STATE_FIXTURE, testTitle: SHARED_STATE_INIT_TITLE };
+        const dependent = { ...initializer, branch: "production-independent shared-state assertion", testTitle: SHARED_STATE_DEPENDENT_TITLE };
+        await expect(proveBaselines(sandbox, [initializer, dependent], new Set()))
+          .rejects.toThrow(/production-independent shared-state assertion: named baseline test did not execute and pass/u);
+      } finally {
+        rmSync(fixturePath, { force: true });
+      }
+      sharedStateRejected = true;
+    });
+
+    await inCase("missing-test sweep", async (sandbox, expectRestored) => {
+      const passed = casePassed();
+      for (const entry of BRANCH_LEDGER) {
+        await expect(proveLedgerEntry(sandbox, entry, passed, { deleteNamedTest: true }))
+          .rejects.toThrow(/named test did not execute and fail/u);
+        missingTest.push(entry.branch);
+        deletedTestChildren += 1;
+        expectRestored(`${entry.branch}: failing mutation`);
+        // Production is broken, then the proof throws before any child starts; its finally must restore both.
+        const absent = { ...entry, testTitle: ABSENT_TEST_TITLE };
+        await expect(proveLedgerEntry(sandbox, absent, new Set([ledgerIdentity(absent)]), { deleteNamedTest: true }))
+          .rejects.toThrow(/named test is absent/u);
+        expectRestored(`${entry.branch}: throwing mutation`);
+      }
+    });
+
+    // alone in both schedules: a fresh sandbox and no positive result carried in from any other case
+    await inCase("next alone", async (sandbox) => {
+      alone = await proveLedgerEntry(sandbox, next, new Set()).then(
+        () => "passed",
+        (error: unknown) => `rejected: ${String(error).split("\n")[0]}`,
+      );
+    });
+
+    const record: CompleteLedgerRecord = {
+      schedule: LEDGER_SCHEDULE,
+      revision: revision!,
+      outerForkCap: OUTER_FORK_CAP,
+      innerForkCap: INNER_FORK_CAP,
+      sandboxes,
+      baselines: new Set([...provedBaselines, ...caseSets.flatMap((passed) => [...passed])]),
+      broken,
+      missingTest,
+      restored,
+      constructionOnlyRejected,
+      sharedStateRejected,
+      grownBudgetPassed,
+      next: { branch: next.branch, afterPredecessor, alone },
+      childStarts: LEDGER_CHILDREN.starts - from.starts,
+      noTestChildren: LEDGER_CHILDREN.noTest - from.noTest,
+      deletedTestChildren,
+      setupMs,
+      childTotalMs: LEDGER_CHILDREN.ms - from.ms,
+      bodyMs: LEDGER_CHILDREN.bodyMs - from.bodyMs,
+    };
+    console.info(`keys ledger measurement ${JSON.stringify({
+      schedule: record.schedule,
+      outerForkCap: record.outerForkCap,
+      innerForkCap: record.innerForkCap,
+      sandboxes: record.sandboxes.length,
+      childStarts: record.childStarts,
+      noTestChildren: record.noTestChildren,
+      setupMs: Math.round(record.setupMs),
+      childTotalMs: Math.round(record.childTotalMs),
+      bodyMs: Math.round(record.bodyMs),
+    })}`);
+    return record;
+  })();
+  return completeLedger;
+}
+
+/** Every mutation proof the complete ledger must restore bytes after, by case, in the order it makes them. */
+const EXPECTED_RESTORED = [
+  ...["passing", "failing"].map((kind) => `serialized: ${BRANCH_LEDGER[0].branch}: ${kind} mutation`),
+  "serialized: grown ledger budget",
+  ...BRANCH_LEDGER.map((entry) => `broken sweep: ${entry.branch}: passing mutation`),
+  "construction-only: construction-only arm",
+  ...BRANCH_LEDGER.flatMap((entry) =>
+    ["failing", "throwing"].map((kind) => `missing-test sweep: ${entry.branch}: ${kind} mutation`)),
+];
+
+/** What one labelled benchmark invocation writes: its schedule's complete-ledger record as plain JSON. */
+type LedgerMeasurement = Omit<CompleteLedgerRecord, "baselines" | "next"> & {
+  readonly baselines: readonly string[];
+  readonly nextAlone: string;
+  /** Every ledger child the invocation's process started, counted apart from the record's own window. */
+  readonly processChildStarts: number;
+};
+
+const ledgerMeasurement = ({ baselines, next, ...ledger }: CompleteLedgerRecord): LedgerMeasurement => ({
+  ...ledger,
+  baselines: [...baselines].sort(),
+  nextAlone: next.alone,
+  processChildStarts: LEDGER_CHILDREN.starts,
+});
+
+/** The capacity the paired benchmark measures both schedules at. */
+const PAIRED_OUTER_FORK_CAP = 3;
+
+/** Every reason one invocation's measurement cannot stand for its schedule's complete ledger at paired capacity. */
+function measurementProblems(value: unknown, schedule: LedgerMeasurement["schedule"]): string[] {
+  if (typeof value !== "object" || value === null) return [`${schedule}: measurement absent`];
+  const m = value as Partial<LedgerMeasurement>;
+  const problems: string[] = [];
+  const fail = (what: string) => problems.push(`${schedule}: ${what}`);
+  const same = (actual: unknown, expected: readonly string[]) => Array.isArray(actual)
+    && actual.length === expected.length && actual.every((item, index) => item === expected[index]);
+  const branches = BRANCH_LEDGER.map((entry) => entry.branch);
+  if (m.schedule !== schedule) fail(`labelled ${JSON.stringify(m.schedule)}`);
+  if (typeof m.revision !== "string" || m.revision.length === 0) fail("no revision");
+  for (const key of [
+    "outerForkCap", "innerForkCap", "childStarts", "processChildStarts", "noTestChildren", "deletedTestChildren",
+    "setupMs", "childTotalMs", "bodyMs",
+  ] as const) {
+    if (typeof m[key] !== "number" || !Number.isFinite(m[key])) fail(`no ${key}`);
+  }
+  if (m.outerForkCap !== PAIRED_OUTER_FORK_CAP || m.innerForkCap !== INNER_FORK_CAP) {
+    fail(`ran at outer cap ${m.outerForkCap} / inner cap ${m.innerForkCap}`);
+  }
+  // the same cases in the same callback-scoped sandboxes and the same mutation proofs in each, for either schedule
+  if (!same(m.sandboxes, LEDGER_CASES)) fail("case sandboxes differ from the per-case boundaries");
+  if (!same(m.baselines, [...new Set(BRANCH_LEDGER.map(ledgerIdentity))].sort())) fail("baseline proofs incomplete");
+  if (!same(m.broken, branches)) fail("broken-production proofs incomplete");
+  if (!same(m.missingTest, branches)) fail("missing-test proofs incomplete");
+  if (!same(m.restored, EXPECTED_RESTORED)) fail("restoration proofs incomplete");
+  if (m.constructionOnlyRejected !== true) fail("construction-only arm not rejected");
+  if (m.sharedStateRejected !== true) fail("shared-state baseline not rejected");
+  if (m.grownBudgetPassed !== true) fail("grown ledger budget not proved");
+  if (m.nextAlone !== "passed") fail(`next case alone ${JSON.stringify(m.nextAlone)}`);
+  if (m.noTestChildren !== m.deletedTestChildren) fail("a child outside the deleted-test proofs executed no test");
+  if (m.childStarts !== m.processChildStarts) fail("children started outside the recorded ledger");
+  return problems;
+}
+
+/**
+ * Both labelled invocations measured, each running the complete proof workload in the per-case sandboxes at paired
+ * capacity, on one revision, and the shared count strictly below the per-case one — or a throw naming every
+ * reason it is not. Only the positive-result scope differs between them, so the fall is that sharing's saving.
+ */
+function compareLedgerPair(before: unknown, after: unknown): { before: LedgerMeasurement; after: LedgerMeasurement } {
+  const problems = [...measurementProblems(before, "per-case"), ...measurementProblems(after, "shared")];
+  if (problems.length === 0) {
+    const [perCase, shared] = [before, after] as LedgerMeasurement[];
+    if (perCase!.revision !== shared!.revision) problems.push("the invocations measured different revisions");
+    if (shared!.childStarts >= perCase!.childStarts) {
+      problems.push(`shared started ${shared!.childStarts} children, not fewer than per-case's ${perCase!.childStarts}`);
+    }
+  }
+  if (problems.length > 0) throw new Error(`keys ledger paired benchmark rejected: ${problems.join("; ")}`);
+  return { before: before as LedgerMeasurement, after: after as LedgerMeasurement };
+}
+
+/** Set only on a paired benchmark invocation: where it writes its measurement. */
+const LEDGER_RECORD_PATH = process.env.TICKMARKR_KEYS_LEDGER_RECORD || undefined;
+const BENCHMARK_INVOCATION_TITLE = "keys ledger benchmark invocation writes its schedule measurement";
+const BENCHMARK_INVOCATION_TIMEOUT_MS = 2 * BRANCH_LEDGER_LEAF_TIMEOUT_MS;
+
+/**
+ * One labelled invocation of this file, in a sandbox of its own (a lease-free copy of the same bytes), that runs
+ * only the invocation leaf at the paired outer cap; its measurement, or undefined when it wrote none.
+ */
+async function runBenchmarkInvocation(schedule: LedgerMeasurement["schedule"]): Promise<{ measured: unknown; ms: number }> {
+  let measured: unknown;
+  let ms = 0;
+  await withBranchSandbox(async (sandbox) => {
+    const record = join(sandbox, `.keys-ledger-${schedule}.json`);
+    const started = performance.now();
+    const run = await runOwned(process.execPath, [
+      VITEST_BIN, "run", KEYS_TEST, "--configLoader", "runner", "-t", escapeRegExp(BENCHMARK_INVOCATION_TITLE),
+    ], {
+      cwd: sandbox,
+      ms: BENCHMARK_INVOCATION_TIMEOUT_MS + 60_000,
+      env: {
+        ...process.env,
+        VITEST_MAX_FORKS: String(PAIRED_OUTER_FORK_CAP),
+        TICKMARKR_KEYS_LEDGER_SCHEDULE: schedule,
+        TICKMARKR_KEYS_LEDGER_RECORD: record,
+        TICKMARKR_KEYS_LEDGER_BENCHMARK: undefined,
+        FORCE_COLOR: "0",
+        NO_COLOR: "1",
+      },
+    });
+    ms = performance.now() - started;
+    if (run.why === "expired") throw new Error(`${schedule} benchmark invocation exceeded its bound`);
+    const owned = ownedFailures(run, `${schedule} benchmark invocation`);
+    if (owned.length > 0) throw new Error(owned.join("; "));
+    if (run.exitCode !== 0) throw new Error(`${schedule} benchmark invocation exited ${run.exitCode}\n${run.out}${run.err}`);
+    try {
+      measured = JSON.parse(readFileSync(record, "utf8"));
+    } catch {
+      measured = undefined;
+    }
+  });
+  return { measured, ms };
+}
+
+function assertNamedTestPassed(entry: Pick<NamedLedgerTest, "branch" | "testTitle">, result: NamedTestResult): void {
   const output = stripAnsi(result.output);
   if (
     result.status !== 0
@@ -664,11 +1169,7 @@ async function proveLedgerEntry(
   passed: Set<string>,
   options: { readonly deleteNamedTest?: boolean } = {},
 ): Promise<void> {
-  const testIdentity = `${entry.testFile}\0${entry.testTitle}`;
-  if (!passed.has(testIdentity)) {
-    assertNamedTestPassed(entry, await runNamedLedgerTest(sandbox, entry));
-    passed.add(testIdentity);
-  }
+  await proveBaselines(sandbox, [entry], passed);
 
   const modulePath = join(sandbox, entry.module);
   const originalProduction = readFileSync(modulePath, "utf8");
@@ -2354,48 +2855,28 @@ describe("executed cockpit branch ledger", () => {
 
   test("test: the serialized keys ledger still fails when a named production branch is broken or its named test is deleted and derives its timeout from ledger size, so replacing mutation evidence with a source assertion or a flat budget fails", async ({ task }) => {
     expect(task.timeout).toBe(BRANCH_LEDGER.length * 20_000 + 60_000);
-    await withBranchSandbox(async (sandbox) => {
-      const entry = BRANCH_LEDGER[0];
-      const passed = new Set<string>();
-      // This runs the named baseline, breaks the production arm, and requires that named test to fail.
-      await proveLedgerEntry(sandbox, entry, passed);
-      // Removing the same test must then invalidate that evidence, not silently satisfy it.
-      await expect(proveLedgerEntry(sandbox, entry, passed, { deleteNamedTest: true }))
-        .rejects.toThrow(/named test did not execute and fail/u);
-
-      // Grow the real ledger in the sandbox, then collect its actual test registrations again.
-      // A flat timeout equal to today's formula must fail after this size perturbation.
-      const testPath = join(sandbox, KEYS_TEST);
-      const source = readFileSync(testPath, "utf8");
-      const grown = source.replace("const BRANCH_LEDGER = [", "const ORIGINAL_BRANCH_LEDGER = [")
-        .replace("// OBS-1141: local", "const BRANCH_LEDGER = [...ORIGINAL_BRANCH_LEDGER, ORIGINAL_BRANCH_LEDGER[0]];\n\n// OBS-1141: local");
-      expect(grown).not.toBe(source);
-      writeFileSync(testPath, grown);
-      const budgetEntry = { ...entry, testTitle: "ledger sweep budgets follow the runtime ledger size" };
-      assertNamedTestPassed(budgetEntry, await runNamedLedgerTest(sandbox, budgetEntry));
-    });
+    // The complete ledger's serialized case, in its own sandbox, breaks the first entry's production arm and
+    // requires its named test to fail, requires the same proof to fail once that test is deleted, and
+    // re-collects a grown ledger.
+    const ledger = await proveCompleteLedger();
+    expect(ledger.sandboxes[0]).toBe("serialized");
+    expect(ledger.restored.filter((mutation) => mutation.startsWith("serialized: "))).toEqual([
+      `serialized: ${BRANCH_LEDGER[0].branch}: passing mutation`,
+      `serialized: ${BRANCH_LEDGER[0].branch}: failing mutation`,
+      "serialized: grown ledger budget",
+    ]);
+    expect(ledger.grownBudgetPassed).toBe(true);
   }, BRANCH_LEDGER_LEAF_TIMEOUT_MS);
 
   test("test: the branch ledger is proved by breaking each reachable branch and observing the test the entry names fail, not a weaker inline assertion beside it", async () => {
-    await withBranchSandbox(async (sandbox) => {
-      const passed = new Set<string>();
-      for (const entry of BRANCH_LEDGER) {
-        await proveLedgerEntry(sandbox, entry, passed);
-      }
-    });
+    const ledger = await proveCompleteLedger();
+    expect(ledger.broken).toEqual(BRANCH_LEDGER.map((entry) => entry.branch));
   }, BRANCH_LEDGER_LEAF_TIMEOUT_MS);
 
   test("test: a ledger broken arm breaks the production branch it names rather than code the test owns, so an arm that fails by construction without touching production makes the assertion fail", async () => {
-    await withBranchSandbox(async (sandbox) => {
-      const constructionOnly: BranchLedgerEntry = {
-        ...BRANCH_LEDGER[0],
-        branch: "test-owned construction-only arm",
-        breakProduction: (source) => source,
-      };
-      await expect(proveLedgerEntry(sandbox, constructionOnly, new Set()))
-        .rejects.toThrow(/did not change production module/u);
-    });
-  });
+    const ledger = await proveCompleteLedger();
+    expect(ledger.constructionOnlyRejected).toBe(true);
+  }, BRANCH_LEDGER_LEAF_TIMEOUT_MS);
 
   test("test: the ledger covers every module either surface declares, so a reachable branch in the capture, components or frame module is enumerated the same way as one in the key handlers", () => {
     expect(new Set(BRANCH_LEDGER.map((entry) => entry.module))).toEqual(
@@ -2404,12 +2885,155 @@ describe("executed cockpit branch ledger", () => {
   });
 
   test("deleting any test the ledger names makes the ledger itself fail rather than pass by silence", async () => {
-    await withBranchSandbox(async (sandbox) => {
-      const passed = new Set<string>();
-      for (const entry of BRANCH_LEDGER) {
-        await expect(proveLedgerEntry(sandbox, entry, passed, { deleteNamedTest: true }))
-          .rejects.toThrow(/named test did not execute and fail/u);
-      }
-    });
+    const ledger = await proveCompleteLedger();
+    expect(ledger.missingTest).toEqual(BRANCH_LEDGER.map((entry) => entry.branch));
   }, BRANCH_LEDGER_LEAF_TIMEOUT_MS);
+
+  test("test: the keys ledger discriminates intact production from broken production for every recorded branch and rejects deletion of its named test so a skipped or vacuous mutation proof fails", async () => {
+    const ledger = await proveCompleteLedger();
+    // intact production: every named test executed and passed alone, selected exactly as its mutation run selects it
+    expect(ledger.baselines).toEqual(new Set(BRANCH_LEDGER.map(ledgerIdentity)));
+    // a test that passes only beside the test that initializes its state was rejected, not taken as mutation evidence
+    expect(ledger.sharedStateRejected).toBe(true);
+    // broken production: every named test executed and failed
+    expect(ledger.broken).toEqual(BRANCH_LEDGER.map((entry) => entry.branch));
+    // deleted named test, baseline already proved: every proof was rejected rather than satisfied by silence
+    expect(ledger.missingTest).toEqual(BRANCH_LEDGER.map((entry) => entry.branch));
+    expect(ledger.noTestChildren).toBe(ledger.deletedTestChildren);
+  }, BRANCH_LEDGER_LEAF_TIMEOUT_MS);
+
+  test("test: the complete keys ledger executes every baseline positive broken-production and missing-test proof with fewer than 123 owned child starts at outer fork cap 3 and inner cap 1; unchanged 123-start work or a reduced count obtained by omitting a proof fails", async ({ task }) => {
+    const ledger = await proveCompleteLedger();
+    // every proof is present, so a lower count cannot come from omitting one
+    expect(ledger.baselines).toEqual(new Set(BRANCH_LEDGER.map(ledgerIdentity)));
+    expect(ledger.broken).toEqual(BRANCH_LEDGER.map((entry) => entry.branch));
+    expect(ledger.missingTest).toEqual(BRANCH_LEDGER.map((entry) => entry.branch));
+    expect(ledger.constructionOnlyRejected).toBe(true);
+    expect(ledger.sharedStateRejected).toBe(true);
+    expect(ledger.grownBudgetPassed).toBe(true);
+    expect(ledger.next.alone).toBe("passed");
+    // the count is every ledger child this process has started, auxiliary proofs included: none ran outside it
+    expect(ledger.childStarts).toBe(LEDGER_CHILDREN.starts);
+    // body time is accounted for every child: the only ones without an executed test are the deleted-test proofs
+    expect(ledger.noTestChildren).toBe(ledger.deletedTestChildren);
+    task.meta.keysLedger = {
+      schedule: ledger.schedule,
+      outerForkCap: ledger.outerForkCap,
+      innerForkCap: ledger.innerForkCap,
+      childStarts: ledger.childStarts,
+      noTestChildren: ledger.noTestChildren,
+      setupMs: ledger.setupMs,
+      childTotalMs: ledger.childTotalMs,
+      bodyMs: ledger.bodyMs,
+    };
+    // the task's fixed bound; the measured before/after comparison is the paired benchmark below
+    expect(ledger.childStarts).toBeLessThan(123);
+  }, BRANCH_LEDGER_LEAF_TIMEOUT_MS);
+
+  test("test: the keys ledger restores production and test bytes after passing failing and throwing mutations so the next case has the same result alone and after its predecessor", async () => {
+    const ledger = await proveCompleteLedger();
+    expect(ledger.restored).toEqual(EXPECTED_RESTORED);
+    expect(ledger.next.afterPredecessor).toBe("passed");
+    expect(ledger.next.alone).toBe(ledger.next.afterPredecessor);
+  }, BRANCH_LEDGER_LEAF_TIMEOUT_MS);
+
+  test("the paired keys ledger comparison rejects an absent measurement, a capacity or revision mismatch, incomplete proof coverage and a child count that did not strictly fall", () => {
+    // synthetic records: this proves the comparison's rejections, the benchmark leaf measures the real pair
+    const complete = (schedule: LedgerMeasurement["schedule"], childStarts: number): LedgerMeasurement => ({
+      schedule,
+      revision: "one revision",
+      outerForkCap: PAIRED_OUTER_FORK_CAP,
+      innerForkCap: INNER_FORK_CAP,
+      baselines: [...new Set(BRANCH_LEDGER.map(ledgerIdentity))].sort(),
+      broken: BRANCH_LEDGER.map((entry) => entry.branch),
+      missingTest: BRANCH_LEDGER.map((entry) => entry.branch),
+      sandboxes: [...LEDGER_CASES],
+      restored: EXPECTED_RESTORED,
+      constructionOnlyRejected: true,
+      sharedStateRejected: true,
+      grownBudgetPassed: true,
+      nextAlone: "passed",
+      childStarts,
+      processChildStarts: childStarts,
+      noTestChildren: 2,
+      deletedTestChildren: 2,
+      setupMs: 1,
+      childTotalMs: 1,
+      bodyMs: 1,
+    });
+    const before = complete("per-case", 10);
+    const after = complete("shared", 9);
+    expect(compareLedgerPair(before, after)).toEqual({ before, after });
+    expect(() => compareLedgerPair(undefined, after)).toThrow(/per-case: measurement absent/u);
+    expect(() => compareLedgerPair(before, undefined)).toThrow(/shared: measurement absent/u);
+    expect(() => compareLedgerPair(before, { ...after, bodyMs: undefined })).toThrow(/shared: no bodyMs/u);
+    expect(() => compareLedgerPair(before, { ...after, schedule: "per-case" })).toThrow(/shared: labelled "per-case"/u);
+    expect(() => compareLedgerPair(before, { ...after, outerForkCap: 6 })).toThrow(/shared: ran at outer cap 6 \/ inner cap 1/u);
+    expect(() => compareLedgerPair({ ...before, innerForkCap: 2 }, after)).toThrow(/per-case: ran at outer cap 3 \/ inner cap 2/u);
+    expect(() => compareLedgerPair(before, { ...after, revision: "another revision" })).toThrow(/different revisions/u);
+    expect(() => compareLedgerPair(before, { ...after, baselines: after.baselines.slice(1) }))
+      .toThrow(/shared: baseline proofs incomplete/u);
+    expect(() => compareLedgerPair(before, { ...after, broken: after.broken.slice(1) }))
+      .toThrow(/shared: broken-production proofs incomplete/u);
+    expect(() => compareLedgerPair(before, { ...after, missingTest: after.missingTest.slice(1) }))
+      .toThrow(/shared: missing-test proofs incomplete/u);
+    expect(() => compareLedgerPair(before, { ...after, restored: after.restored.slice(3) }))
+      .toThrow(/shared: restoration proofs incomplete/u);
+    // a before schedule that ran an extra proof, or its cases in one sandbox, is not the same workload
+    expect(() => compareLedgerPair({ ...before, restored: [...before.restored, "serialized: grown ledger budget"] }, after))
+      .toThrow(/per-case: restoration proofs incomplete/u);
+    expect(() => compareLedgerPair({ ...before, sandboxes: ["serialized"] }, after))
+      .toThrow(/per-case: case sandboxes differ from the per-case boundaries/u);
+    expect(() => compareLedgerPair(before, { ...after, sharedStateRejected: false }))
+      .toThrow(/shared: shared-state baseline not rejected/u);
+    expect(() => compareLedgerPair(before, { ...after, noTestChildren: 3 })).toThrow(/executed no test/u);
+    expect(() => compareLedgerPair(before, { ...after, processChildStarts: 10 })).toThrow(/outside the recorded ledger/u);
+    expect(() => compareLedgerPair(before, complete("shared", 10))).toThrow(/shared started 10 children, not fewer than per-case's 10/u);
+  });
+
+  // Run by the paired benchmark only (TICKMARKR_KEYS_LEDGER_RECORD names where the measurement goes).
+  test.runIf(LEDGER_RECORD_PATH !== undefined)(BENCHMARK_INVOCATION_TITLE, async () => {
+    const measurement = ledgerMeasurement(await proveCompleteLedger());
+    expect(measurementProblems(measurement, LEDGER_SCHEDULE)).toEqual([]);
+    writeFileSync(LEDGER_RECORD_PATH!, JSON.stringify(measurement));
+  }, BENCHMARK_INVOCATION_TIMEOUT_MS);
+
+  // The before/after measurement, opt-in because it runs the complete ledger twice more:
+  //   TICKMARKR_KEYS_LEDGER_BENCHMARK=1 npx vitest run tests/cockpit/keys.test.ts -t "paired benchmark"
+  // Measured 2026-09-30 (local darwin, revision 6cafa042…, outer cap 3 / inner cap 1, 5 sandboxes each side):
+  //   per-case 128 child starts, setup 972 ms, child total 204.8 s, body 9.3 s (its invocation: 208.1 s of overhead)
+  //   shared   102 child starts, setup 1008 ms, child total 163.3 s, body 5.4 s — 26 fewer starts, setup unchanged
+  test.runIf(process.env.TICKMARKR_KEYS_LEDGER_BENCHMARK === "1")("keys ledger paired benchmark measures the per-case and shared schedules in separate labelled invocations at outer fork cap 3 and inner cap 1 and requires a strict child-start reduction", async ({ task }) => {
+    const perCase = await runBenchmarkInvocation("per-case");
+    const shared = await runBenchmarkInvocation("shared");
+    const { before, after } = compareLedgerPair(perCase.measured, shared.measured);
+    const side = (m: LedgerMeasurement, invocationMs: number) => ({
+      sandboxes: m.sandboxes.length,
+      childStarts: m.childStarts,
+      noTestChildren: m.noTestChildren,
+      setupMs: Math.round(m.setupMs),
+      childTotalMs: Math.round(m.childTotalMs),
+      bodyMs: Math.round(m.bodyMs),
+      invocationMs: Math.round(invocationMs),
+      // the invocation's own vitest start, collection and reporting, outside setup and every ledger child
+      harnessMs: Math.round(invocationMs - m.setupMs - m.childTotalMs),
+    });
+    const pair = {
+      revision: after.revision,
+      outerForkCap: after.outerForkCap,
+      innerForkCap: after.innerForkCap,
+      before: side(before, perCase.ms),
+      after: side(after, shared.ms),
+      savedChildStarts: before.childStarts - after.childStarts,
+      // measuring the before schedule is extra work the ordinary run never does: its whole invocation, plus the
+      // benchmark's own two invocation starts, neither of which is counted in either side's childStarts
+      baselineMeasurementOverhead: {
+        invocationMs: Math.round(perCase.ms),
+        childStarts: before.childStarts,
+        benchmarkInvocationStarts: 2,
+      },
+    };
+    console.info(`keys ledger paired benchmark ${JSON.stringify(pair)}`);
+    task.meta.keysLedgerPair = pair;
+  }, 2 * (BENCHMARK_INVOCATION_TIMEOUT_MS + 120_000));
 });

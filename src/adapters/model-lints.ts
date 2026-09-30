@@ -6,7 +6,7 @@ import { filesGlob } from "../graph/files-glob.js";
 import type { Task } from "../graph/schema.js";
 import { piModelVendor } from "./pi.js";
 import { buildTaskPrompt } from "./prompt.js";
-import { channelKey, MODEL_ID_RE, type AuthHealth, type WorkerAdapter } from "./types.js";
+import { channelKey, MODEL_ID_RE, type AuthHealth, type ModelRetirement, type WorkerAdapter } from "./types.js";
 import { resolveCatalogModel, type CatalogModelEvidence, type CatalogReadResult } from "./catalog-remote.js";
 export const SEED_STAMPED = "2026-07-09";
 // knowledge past this age gets a "rerun tickmarkr doctor" nudge (BLOCKED_POLL_MS-style named constant).
@@ -577,6 +577,47 @@ export function preferEntryLints(
   return lints;
 }
 
+// v2.6.4 T2 (B1a): doctor.json is read without a schema (compat), so a stored notice is re-checked here —
+// anything but null (known clean) or a dated notice reads as unknown, never as clean.
+function storedRetirement(record: unknown, model: string): ModelRetirement | null | undefined {
+  if (!record || typeof record !== "object") return undefined;
+  const r = (record as Record<string, unknown>)[model];
+  if (r === null) return null;
+  const n = r as Partial<ModelRetirement> | undefined;
+  if (typeof n?.retiresAt !== "string" || !Number.isFinite(Date.parse(n.retiresAt))) return undefined;
+  if (n.successor === undefined) return { retiresAt: n.retiresAt };
+  return typeof n.successor === "string" && MODEL_ID_RE.test(n.successor) ? { retiresAt: n.retiresAt, successor: n.successor } : undefined;
+}
+
+// Configured AND listed models only — a configured id the CLI stopped listing already carries the
+// tombstone advisory. The CLI's notice is quoted as-is: its successor is the CLI's upgrade target, never
+// a tier or benchmark claim, and no model name or visibility is read as one. Advisory: routing unchanged.
+function retirementLints(id: string, listedConfigured: string[], record: unknown, nowMs: number): string[] {
+  const lints: string[] = [];
+  const unknown: string[] = [];
+  for (const model of listedConfigured) {
+    const notice = storedRetirement(record, model);
+    if (notice === undefined) {
+      unknown.push(model);
+      continue;
+    }
+    if (!notice) continue; // listed with no notice: known clean
+    const successor = notice.successor
+      ? `successor ${notice.successor} (named by the CLI — not a tier claim; classify it per benchmark policy)`
+      : "no successor named";
+    lints.push(nowMs >= Date.parse(notice.retiresAt)
+      ? `${id}: ${model} retired ${notice.retiresAt} per the CLI's notice; ${successor} — tombstone it (${model}: null overlay) or verify the id (advisory — routing unchanged)`
+      : `${id}: ${model} retires ${notice.retiresAt} per the CLI's notice; ${successor} — tombstone it (${model}: null overlay) before then (advisory — routing unchanged)`);
+  }
+  if (unknown.length) {
+    const why = record && typeof record === "object"
+      ? "the CLI's notice is absent or unreadable"
+      : "doctor record carries no CLI retirement notices; rerun tickmarkr doctor";
+    lints.push(`${id}: retirement unknown for ${unknown.join(", ")} — ${why}`);
+  }
+  return lints;
+}
+
 // Diffs detected models (doctor.json) against configured tiers, both directions, per installed adapter.
 // No `  ! ` prefix here — the consumer (doctor rows / plan lints) owns that. Pre-v1.5 doctor.json (models:[], no
 // modelsDetectedAt) is the compat baseline: `?.`/`?? []` everywhere, no zod (would reject old files).
@@ -584,8 +625,9 @@ export function modelLints(
   cfg: TickmarkrConfig,
   health: Record<string, AuthHealth>,
   adapters: WorkerAdapter[],
-  opts?: { tty?: boolean; stateDir?: string; overlayPreferShapes?: ReadonlySet<string> },
+  opts?: { tty?: boolean; stateDir?: string; overlayPreferShapes?: ReadonlySet<string>; now?: Date },
 ): string[] {
+  const nowMs = (opts?.now ?? new Date()).getTime();
   const cap = opts?.tty ? TTY_LINT_CAP : LINT_CAP;
   const doctorRef = opts?.tty ? doctorJsonRef(opts.stateDir ?? DEFAULT_STATE_DIR) : "";
   const lints: string[] = [];
@@ -620,6 +662,7 @@ export function modelLints(
         lints.push(`${id}: tiers lists ${model} — CLI no longer reports it; tombstone it (${model}: null overlay) or verify the id`);
       }
     }
+    if (adapter.listModelsRetirements) lints.push(...retirementLints(id, configured.filter((m) => detected.includes(m)), h?.modelRetirements, nowMs));
     const extra = collapseUnclassified(detected, new Set(configured));
     if (extra.length) {
       const shown = extra.slice(0, cap).map((row) => row.model).join(", ");
@@ -628,7 +671,7 @@ export function modelLints(
     }
     const at = h?.modelsDetectedAt;
     if (at) {
-      const days = Math.floor((Date.now() - Date.parse(at)) / DAY_MS); // completed days — never overstate age
+      const days = Math.floor((nowMs - Date.parse(at)) / DAY_MS); // completed days — never overstate age
       if (days >= MODEL_STALE_DAYS) lints.push(`${id}: model knowledge is ${days} days old — rerun tickmarkr doctor`);
     }
   }

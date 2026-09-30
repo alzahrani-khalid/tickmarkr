@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto";
-import { execSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync, execSync } from "node:child_process";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { writeDoctor } from "../../src/adapters/registry.js";
 import type { BillingChannel } from "../../src/adapters/types.js";
@@ -10,10 +11,13 @@ import {
 } from "../../src/cli/commands/verify.js";
 import { getVerdictStore } from "../../src/gates/cache.js";
 import { pickReviewer } from "../../src/gates/review.js";
-import { saveGraph } from "../../src/graph/graph.js";
+import { graphPath, saveGraph } from "../../src/graph/graph.js";
 import { validateGraph } from "../../src/graph/schema.js";
-import { Journal } from "../../src/run/journal.js";
-import { COMMIT, T, authedModels, makeRepo, makeTestTempDir } from "../helpers/tmprepo.js";
+import { approve } from "../../src/cli/commands/approve.js";
+import { runDaemon } from "../../src/run/daemon.js";
+import { foldOwedChecks, Journal, owedSubject, type JournalEvent, type OwedCheck } from "../../src/run/journal.js";
+import { withRepositoryLease } from "../../src/run/lease.js";
+import { COMMIT, T, authedModels, makeRepo, makeTestTempDir, setupRepo } from "../helpers/tmprepo.js";
 
 const git = (repo: string, command: string) => execSync(`git ${command}`, { cwd: repo, encoding: "utf8" }).trim();
 
@@ -307,3 +311,352 @@ test("test: one successful plus one failed executed command under healthy or inj
     expect(verdicts[1]).toEqual(verdicts[0]);
   }
 }, 60_000);
+
+test("test: verify semantic red exits 2 before a separate repository-lease holder releases whereas green reaches baseline/candidate tests after release; the ordered trace places cheap gates then concurrent semantics before leased tests", async () => {
+  const scratch = makeTestTempDir("tickmarkr-verify-trace-");
+  const trace = join(scratch, "trace.log");
+  writeFileSync(trace, "");
+  const repo = makeRepo({
+    "src.txt": "base\n",
+    "package.json": JSON.stringify({ scripts: Object.fromEntries(["build", "lint", "test"].map((g) => [g, `echo ${g} >> '${trace}'`])) }),
+  });
+  branch(repo);
+  writeDoctor(repo, { fake: { installed: true, authed: true, models: [], modelAuth: authedModels(["fake-1", "fake-2"]) } });
+  writeFileSync(join(repo, ".tickmarkr", "config.yaml"), "judge: { adapter: fake, model: fake-1 }\n");
+  const criteria = join(scratch, "criteria.md");
+  writeFileSync(criteria, "- the feature line is appended to src.txt\n");
+  const script = join(scratch, "script.json");
+  const scripted = (approve: boolean) => writeFileSync(script, JSON.stringify({
+    tasks: {}, judge: { pass: true, criteria: [{ criterion: "c1", met: true, reason: "appended" }] }, review: { approve, issues: approve ? [] : ["real defect"] },
+  }));
+  process.env.TICKMARKR_FAKE_SCRIPT = script;
+  // verify's stderr lands in the same file its commands append to, so one file is the real order.
+  vi.spyOn(console, "error").mockImplementation((line: unknown) => appendFileSync(trace, `${String(line)}\n`));
+  const tokens = () => readFileSync(trace, "utf8").split("\n").flatMap((line) => {
+    if (["build", "lint", "test", "released"].includes(line)) return [line];
+    const event = /^verify: (→|✓|✗) (\w+)/.exec(line);
+    if (event) return [`${event[1] === "→" ? "start" : "end"}:${event[2]}`];
+    return line.includes("waiting for the repository's runner lease") ? ["lease-wait"] : [];
+  });
+
+  let release!: () => void;
+  const releasing = new Promise<void>((r) => { release = r; });
+  let holding!: () => void;
+  const holds = new Promise<void>((r) => { holding = r; });
+  let released = false;
+  const holder = withRepositoryLease(repo, async () => { holding(); await releasing; }, { pollMs: 50 }).then(() => { released = true; });
+  await holds;
+
+  scripted(false);
+  const red = await verify(["--criteria", criteria, "--files", "src.txt"], repo);
+  expect(red.code, red.out).toBe(2);
+  expect(red.out).toContain("FAIL review");
+  expect(red.out).not.toMatch(/^(?:PASS|FAIL) test$/m);
+  expect(released).toBe(false); // the red answered while the holder still held the lease
+  expect(tokens()).not.toContain("lease-wait");
+  expect(tokens()).not.toContain("test");
+
+  // Fresh verdicts so the green's own trace shows every cheap command it ran.
+  getVerdictStore(join(repo, ".tickmarkr")).clear();
+  writeFileSync(trace, "");
+  scripted(true);
+  const pending = verify(["--criteria", criteria, "--files", "src.txt"], repo);
+  // A verify that settles before queueing on the lease fails here with its own output.
+  await Promise.race([
+    vi.waitFor(() => expect(tokens()).toContain("lease-wait"), { timeout: 60_000, interval: 50 }),
+    pending.then((r) => { throw new Error(`verify settled before queueing on the held lease:\n${r.out}`); }),
+  ]);
+  expect(tokens()).not.toContain("test");
+  appendFileSync(trace, "released\n");
+  release();
+  await holder;
+  const green = await pending;
+  expect(green.code, green.out).toBe(0);
+  const seen = tokens();
+  expect(seen.slice(0, 10)).toEqual(["start:build", "build", "end:build", "start:lint", "lint", "end:lint",
+    "start:evidence", "end:evidence", "start:scope", "end:scope"]);
+  expect(seen.slice(10, 12)).toEqual(["start:acceptance", "start:review"]); // both in flight before either answers
+  expect(seen.slice(12, 14).sort()).toEqual(["end:acceptance", "end:review"]);
+  expect(seen.slice(14)).toEqual(["lease-wait", "released", "build", "test", "start:test", "test", "end:test"]); // base rebuild + suite, then candidate
+}, 120_000);
+
+// ── C1: owed checks ─────────────────────────────────────────────────────────────────────────────
+const FAKE_DOCTOR = { fake: { installed: true, authed: true, models: [], modelAuth: authedModels(["fake-1", "fake-2"]) } };
+const dispatchRow = (model: string) => ({ attempt: 1, assignment: { adapter: "fake", model, channel: "sub", tier: "frontier" } });
+
+/** A zero-token owed-check repository: fake seats only (fake-1 is vendor fake-a, fake-2 is fake-b). */
+function owedRepo(): { repo: string; git: (c: string) => string } {
+  const repo = makeRepo({ "a.txt": "a\n" });
+  saveGraph(repo, validateGraph({ version: 1, spec: { source: "prd", paths: ["p"], hash: "h" }, tasks: [T("T1", { files: ["*.txt"] })] }));
+  writeFileSync(join(repo, ".tickmarkr", "config.yaml"), "judge: { adapter: fake, model: fake-1 }\n");
+  writeDoctor(repo, FAKE_DOCTOR);
+  const script = join(makeTestTempDir("tickmarkr-owed-"), "script.json");
+  writeFileSync(script, JSON.stringify({ tasks: {}, judge: { pass: true, criteria: [{ criterion: "c1", met: true, reason: "ok" }] }, review: { approve: true, issues: [] } }));
+  process.env.TICKMARKR_FAKE_SCRIPT = script;
+  vi.spyOn(console, "error").mockImplementation(() => {});
+  return { repo, git: (c: string) => git(repo, c) };
+}
+
+/** Park a review gate-fail on the task branch's current tip, then waive it through production approve. */
+async function parkAndWaive(repo: string, runId: string, journal: Journal): Promise<OwedCheck> {
+  const head = git(repo, `rev-parse tickmarkr/${runId}--T1`);
+  journal.append("gate-result", "T1", { gate: "review", pass: false, details: "red", commit: owedSubject(repo, git(repo, `merge-base tickmarkr/${runId} ${head}`), head) });
+  journal.append("task-human", "T1", { kind: "gate-fail", reason: "operator decision required" });
+  await approve([runId, "T1", "--waive", "--by", "operator", "--reason", `accepted ${runId}`], repo);
+  return [...journal.read()].reverse().find((e) => e.event === "task-approved")!.data.obligation as OwedCheck;
+}
+
+const commitFile = (repo: string, body: string, message: string) => {
+  writeFileSync(join(repo, "a.txt"), body);
+  execSync(`${COMMIT} ${message}`, { cwd: repo });
+};
+
+test("verify record excludes both contributing authors by stable patch ownership across changed commit objects and ignores a restored gate-only seat as an author while same-vendor review or author human cannot erase those exclusions", async () => {
+  const { repo, git: g } = owedRepo();
+  const later = { ...process.env, GIT_COMMITTER_DATE: "2026-09-30T12:00:00Z" }; // a carry mints NEW commit objects
+
+  // Two contributing authors: fake-1 lands c1; fake-2's attempt carries c1 (as a new object) and lands c2.
+  g("branch -f tickmarkr/run-two main");
+  g("checkout -q -B tickmarkr/run-two--T1 main");
+  commitFile(repo, "a\none\n", "one");
+  const c1 = g("rev-parse HEAD");
+  const two = Journal.create(repo, "run-two");
+  two.append("run-start", undefined, {});
+  two.append("task-dispatch", "T1", dispatchRow("fake-1"));
+  two.append("worker-launch", "T1", {});
+  two.append("task-dispatch", "T1", { ...dispatchRow("fake-2"), attempt: 2 });
+  g("reset -q --hard main");
+  execSync(`git cherry-pick ${c1}`, { cwd: repo, env: later, stdio: "ignore" });
+  expect(g("rev-parse HEAD")).not.toBe(c1);
+  two.append("worktree-recreation", "T1", { attempted: [c1], carried: [c1] });
+  two.append("worker-launch", "T1", {});
+  commitFile(repo, "a\none\ntwo\n", "two");
+  g("checkout -q main");
+  const both = await parkAndWaive(repo, "run-two", two);
+  expect(both).toMatchObject({ known: true, authors: ["fake:fake-1", "fake:fake-2"] });
+
+  // Neither `--author human` nor a same-vendor --author claim narrows the recorded exclusions: with
+  // both vendors excluded no reviewer can be seated, so the check stays owed.
+  g(`checkout -q --detach ${both.head}`);
+  for (const claim of ["human", "fake:fake-2"]) {
+    const result = await verify(["--task", "T1", "--no-acceptance", "--author", claim, "--record", "run-two"], repo);
+    expect(result.code, result.out).toBe(2);
+    expect(result.out).toContain("no cross-vendor reviewer available");
+    expect(result.out).toContain("owed checks for run-two: debt 1");
+  }
+  expect(foldOwedChecks(two.read(), repo)).toMatchObject({ known: true, debt: 1, outstanding: [{ id: both.id }] });
+
+  // A restored gate-only seat: fake-2 is restored to re-gate fake-1's carried patch and lands nothing.
+  g("checkout -q main");
+  g("branch -f tickmarkr/run-restored main");
+  g("checkout -q -B tickmarkr/run-restored--T1 main");
+  commitFile(repo, "a\nsolo\n", "solo");
+  const solo = g("rev-parse HEAD");
+  const restored = Journal.create(repo, "run-restored");
+  restored.append("run-start", undefined, {});
+  restored.append("task-dispatch", "T1", dispatchRow("fake-1"));
+  restored.append("worker-launch", "T1", {});
+  restored.append("gate-result", "T1", { gate: "acceptance", pass: false, details: "red" });
+  restored.append("task-human", "T1", { kind: "gate-fail", reason: "first park" });
+  restored.append("resume-restore", "T1", { attempts: 1, tried: ["fake:fake-1"], assignment: dispatchRow("fake-2").assignment });
+  g("reset -q --hard main");
+  execSync(`git cherry-pick ${solo}`, { cwd: repo, env: later, stdio: "ignore" });
+  restored.append("worktree-recreation", "T1", { attempted: [solo], carried: [solo] });
+  g("checkout -q main");
+  const one = await parkAndWaive(repo, "run-restored", restored);
+  expect(one).toMatchObject({ known: true, authors: ["fake:fake-1"] });
+  g(`checkout -q --detach ${one.head}`);
+  const ok = await verify(["--task", "T1", "--no-acceptance", "--author", "human", "--record", "run-restored"], repo);
+  expect(ok.code, ok.out).toBe(0);
+  expect(ok.out).toContain("owed checks for run-restored: debt 0");
+  const discharge = restored.read().find((e) => e.event === "owed-check-discharged")!;
+  expect(discharge.data).toMatchObject({ reviewer: { key: "fake:fake-2", vendor: "fake-b" }, authorChannels: [{ key: "fake:fake-1", vendor: "fake-a" }] });
+}, 240_000);
+
+test("approve waive followed by runDaemon restart persists exactly one accepted-risk obligation in the run-end row across carried replay or findings resets; verify record returns exit 0 debt 0 for validated proof versus exit 2 unknown debt for legacy missing or malformed evidence; accepted-risk history survives discharge", async () => {
+  const { repo, fake } = setupRepo([T("T1", { files: ["*.txt"] })], {
+    judge: { pass: false, criteria: [{ criterion: "c1", met: false, reason: "operator override required" }] },
+    review: { approve: true, issues: [] },
+    consult: { action: "human", notes: "operator must decide" },
+    tasks: { T1: [{ shell: `echo approved > approved.txt && ${COMMIT} approved`, result: { ok: true, summary: "implemented" } }] },
+  });
+  writeDoctor(repo, FAKE_DOCTOR);
+  const runId = "run-owed-restart";
+  expect((await runDaemon(repo, { adapters: [fake], runId })).human).toEqual(["T1"]);
+  await approve([runId, "T1", "--waive", "--by", "operator", "--reason", "D-2 restart"], repo);
+  const journal = Journal.open(repo, runId);
+  const obligation = journal.read().find((e) => e.event === "task-approved")!.data.obligation as OwedCheck;
+  expect(obligation).toMatchObject({ known: true, gate: "acceptance" });
+  expect((await runDaemon(repo, { adapters: [fake], runId, resume: true })).done).toEqual(["T1"]);
+  // A second restart of the finished run replays the waiver's history; it never mints a second check.
+  await runDaemon(repo, { adapters: [fake], runId, resume: true });
+  const runEnds = journal.read().filter((e) => e.event === "run-end");
+  expect(runEnds.length).toBeGreaterThanOrEqual(2);
+  for (const end of runEnds.slice(1)) {
+    expect(end.data.owedChecks).toMatchObject({ known: true, debt: 1, acceptedRisk: [{ id: obligation.id }], outstanding: [{ id: obligation.id }] });
+    expect((end.data.owedChecks as { acceptedRisk: unknown[] }).acceptedRisk).toHaveLength(1);
+  }
+
+  // Validated proof: the task's own integration merge, after run-end.
+  const merge = journal.read().find((e) => e.event === "merge" && e.taskId === "T1")!.data.commit as string;
+  const firstParent = git(repo, `rev-parse ${merge}^1`);
+  git(repo, `checkout -q --detach ${merge}`);
+  const script = join(makeTestTempDir("tickmarkr-owed-proof-"), "script.json");
+  writeFileSync(script, JSON.stringify({ tasks: {}, judge: { pass: true, criteria: [{ criterion: "c1", met: true, reason: "ok" }] }, review: { approve: true, issues: [] } }));
+  process.env.TICKMARKR_FAKE_SCRIPT = script;
+  vi.spyOn(console, "error").mockImplementation(() => {});
+
+  // Legacy and malformed evidence first: the same waiver row without (or with a broken) obligation.
+  const path = join(journal.dir, "journal.jsonl");
+  const original = readFileSync(path, "utf8");
+  const rewriteWaiver = (obligationValue: unknown) => writeFileSync(path, original.split("\n").map((line) => {
+    if (!line.includes('"task-approved"')) return line;
+    const row = JSON.parse(line) as JournalEvent;
+    const data = { ...row.data };
+    if (obligationValue === undefined) delete data.obligation; else data.obligation = obligationValue;
+    return JSON.stringify({ ...row, data });
+  }).join("\n"));
+  for (const broken of [undefined, null, { version: 1, id: obligation.id }, { ...obligation, runId: undefined }, { ...obligation, authors: [42] }]) {
+    rewriteWaiver(broken);
+    const legacy = await verify(["--base", firstParent, "--task", "T1", "--no-review", "--record", runId], repo);
+    expect(legacy.code, legacy.out).toBe(2);
+    expect(legacy.out).toContain(`owed checks for ${runId}: debt unknown`);
+    expect(foldOwedChecks(journal.read(), repo)).toMatchObject({ known: false, debt: "unknown" });
+  }
+  writeFileSync(path, original);
+
+  const proof = await verify(["--base", firstParent, "--task", "T1", "--no-review", "--record", runId], repo);
+  expect(proof.code, proof.out).toBe(0);
+  expect(proof.out).toContain(`owed checks for ${runId}: debt 0`);
+  expect(foldOwedChecks(journal.read(), repo)).toMatchObject({
+    known: true, debt: 0, outstanding: [], discharged: [obligation.id], acceptedRisk: [obligation],
+  });
+}, 240_000);
+
+test("verify record after run-end discharges a matching integration-range review obligation; terminal Journal append after reopen retains debt 0 for that eligible proof but restores unknown outstanding debt for artifact deletion hash mismatch wrong binding or a hash-valid matching-range proof with a same-vendor or unresolved reviewer", async () => {
+  const { repo, git: g } = owedRepo();
+  const runId = "run-owed-terminal";
+  g(`branch -f tickmarkr/${runId} main`);
+  g(`checkout -q -B tickmarkr/${runId}--T1 main`);
+  commitFile(repo, "a\nterminal\n", "terminal");
+  g("checkout -q main");
+  const journal = Journal.create(repo, runId);
+  journal.append("run-start", undefined, {});
+  journal.append("task-dispatch", "T1", dispatchRow("fake-1"));
+  journal.append("worker-launch", "T1", {});
+  const obligation = await parkAndWaive(repo, runId, journal);
+  g(`checkout -q tickmarkr/${runId}`);
+  g(`merge -q --no-ff tickmarkr/${runId}--T1 -m 'merge T1'`);
+  const merge = g("rev-parse HEAD");
+  journal.append("merge", "T1", { branch: `tickmarkr/${runId}--T1`, commit: merge });
+  const summary = { runId, branch: `tickmarkr/${runId}`, done: ["T1"], failed: [], human: [], blocked: [], pending: [] };
+  journal.append("run-end", undefined, summary);
+  expect(journal.read().at(-1)!.data.owedChecks).toMatchObject({ known: true, debt: 1 });
+
+  g(`checkout -q --detach ${merge}`);
+  const proof = await verify(["--base", "main", "--task", "T1", "--no-acceptance", "--record", runId], repo);
+  expect(proof.code, proof.out).toBe(0);
+  const discharge = journal.read().find((e) => e.event === "owed-check-discharged")!;
+  expect(discharge.data).toMatchObject({ ids: [obligation.id], mapping: "integration", head: merge, reviewer: { key: "fake:fake-2", vendor: "fake-b" } });
+
+  const reopened = () => Journal.open(repo, runId);
+  const terminal = () => { reopened().append("run-end", undefined, summary); return reopened().read().at(-1)!.data.owedChecks as { known: boolean; debt: unknown; outstanding: OwedCheck[] }; };
+  const eligible = () => expect(terminal()).toMatchObject({ known: true, debt: 0, outstanding: [] });
+  const restored = (reason: string) => {
+    const fold = terminal();
+    expect(fold).toMatchObject({ known: false, debt: "unknown", outstanding: [{ id: obligation.id }] });
+    expect(JSON.stringify(fold)).toContain(reason);
+  };
+  eligible();
+  // The seats resolve from the obligation's recorded declaration, so the fold answers the same in a
+  // fresh process that imports journal.ts alone (no CLI module, no fake adapter) and in a linked
+  // checkout with no local state.
+  expect(obligation.declared).toEqual(expect.arrayContaining([{ key: "fake:fake-1", vendor: "fake-a" }, { key: "fake:fake-2", vendor: "fake-b" }]));
+  const childEnv = { ...process.env };
+  delete childEnv.TICKMARKR_FAKE_SCRIPT;
+  const fresh = execFileSync(process.execPath, ["--import", "tsx", "--input-type=module", "-e", `
+    const { Journal } = await import(${JSON.stringify(pathToFileURL(join(import.meta.dirname, "../../src/run/journal.ts")).href)});
+    Journal.open(${JSON.stringify(repo)}, ${JSON.stringify(runId)}).append("run-end", undefined, ${JSON.stringify(summary)});
+    console.log(JSON.stringify(Journal.open(${JSON.stringify(repo)}, ${JSON.stringify(runId)}).read().at(-1).data.owedChecks));
+  `], { encoding: "utf8", env: childEnv });
+  expect(JSON.parse(fresh)).toMatchObject({ known: true, debt: 0, outstanding: [] });
+  const linked = join(makeTestTempDir("tickmarkr-owed-linked-"), "checkout");
+  g(`worktree add -q --detach ${linked} ${merge}`);
+  expect(foldOwedChecks(reopened().read(), linked)).toMatchObject({ known: true, debt: 0, discharged: [obligation.id] });
+
+  const artifactPath = String(discharge.data.artifactPath);
+  const artifactBytes = readFileSync(artifactPath);
+  const path = join(journal.dir, "journal.jsonl");
+  const original = readFileSync(path, "utf8");
+  const rewriteDischarge = (edit: (data: Record<string, unknown>) => Record<string, unknown>) => writeFileSync(path, original.split("\n").map((line) => {
+    if (!line.includes('"owed-check-discharged"')) return line;
+    const row = JSON.parse(line) as JournalEvent;
+    return JSON.stringify({ ...row, data: edit({ ...row.data }) });
+  }).join("\n"));
+  // A forged artifact whose hash the forged row carries: range and binding match, only the reviewer differs.
+  // By default the forged review row agrees with the row's claim (vendor, and provider = vendor for fake seats).
+  const forge = (reviewerKey: string | undefined, reviewer: { key: string; vendor: string } | undefined,
+    seat: Record<string, unknown> = reviewer ? { vendor: reviewer.vendor, provider: reviewer.vendor } : {}) => {
+    const artifact = JSON.parse(artifactBytes.toString("utf8")) as { gateRows: Array<{ gate: string; meta?: Record<string, unknown> }> };
+    const reviewRow = artifact.gateRows.find((r) => r.gate === "review")!;
+    reviewRow.meta = { ...reviewRow.meta, reviewer: reviewerKey, ...seat };
+    const bytes = Buffer.from(JSON.stringify(artifact, null, 2) + "\n");
+    const forged = join(dirname(artifactPath), `forged-${reviewerKey || "none"}.json`);
+    writeFileSync(forged, bytes);
+    rewriteDischarge((data) => ({ ...data, artifactPath: forged, artifactSha256: createHash("sha256").update(bytes).digest("hex"), reviewer }));
+  };
+
+  rmSync(artifactPath);
+  restored("artifact unavailable");
+  writeFileSync(artifactPath, artifactBytes);
+  eligible();
+
+  writeFileSync(artifactPath, Buffer.concat([artifactBytes, Buffer.from(" ")]));
+  restored("artifact hash mismatch");
+  writeFileSync(artifactPath, artifactBytes);
+  eligible();
+
+  // A genuine artifact of the same range and scope that measured other criteria: the row's criteria
+  // claim still matches the obligation, but the hash-bound evidence does not.
+  const graphBytes = readFileSync(graphPath(repo));
+  saveGraph(repo, validateGraph({ version: 1, spec: { source: "prd", paths: ["p"], hash: "h" }, tasks: [T("T1", { files: ["*.txt"], acceptance: ["something else"] })] }));
+  const other = JSON.parse((await verify(["--base", "main", "--task", "T1", "--no-acceptance", "--json"], repo)).out) as { green: boolean; artifactPath: string; artifactSha256: string };
+  writeFileSync(graphPath(repo), graphBytes);
+  expect(other.green).toBe(true);
+  rewriteDischarge((data) => ({ ...data, artifactPath: other.artifactPath, artifactSha256: other.artifactSha256 }));
+  restored("artifact measured other criteria");
+
+  rewriteDischarge((data) => ({ ...data, head: obligation.head })); // an integration row naming no recorded merge
+  restored("discharge range does not bind the obligation");
+  // A hash-valid artifact claiming the empty merge..merge range: the merge row exists and the patch is
+  // copied, but that range is not the merge of the waived series — the fold re-proves it from git.
+  const emptyBytes = Buffer.from(JSON.stringify({ ...JSON.parse(artifactBytes.toString("utf8")), mergeBase: merge }, null, 2) + "\n");
+  const emptyPath = join(dirname(artifactPath), "forged-empty-range.json");
+  writeFileSync(emptyPath, emptyBytes);
+  rewriteDischarge((data) => ({ ...data, mergeBase: merge, artifactPath: emptyPath, artifactSha256: createHash("sha256").update(emptyBytes).digest("hex") }));
+  restored("discharge range does not bind the obligation");
+  forge("fake:fake-1", { key: "fake:fake-1", vendor: "fake-a" });
+  restored("same-vendor reviewer");
+  // The author's own key stays excluded whatever vendor the forged row and review row claim for it.
+  forge("fake:fake-1", { key: "fake:fake-1", vendor: "fake-b" });
+  restored("the reviewer is a recorded patch author");
+  forge(undefined, undefined);
+  restored("unresolved reviewer");
+  forge("", { key: "", vendor: "" }); // string-typed but empty: not a resolved identity
+  restored("unresolved reviewer");
+  // The row's vendor claim must be the vendor the hash-bound review row recorded for that seat.
+  forge("fake:fake-2", { key: "fake:fake-2", vendor: "fake-z" }, { vendor: "fake-b", provider: "fake-b" });
+  restored("unresolved reviewer");
+  // Hash-valid, well-formed and self-consistent row and artifact naming a seat no adapter here declares,
+  // or a declared seat under a vendor it is not declared with: agreement is not resolution.
+  for (const [key, vendor] of [["not-installed:nonexistent-model", "nobody"], ["fake:fake-404", "fake-z"], ["fake:fake-2", "fake-z"]] as const) {
+    forge(key, { key, vendor });
+    restored("unresolved reviewer (no declared channel with that identity and vendor)");
+  }
+  // An author channel claimed under a vendor its adapter does not declare cannot move the exclusion.
+  rewriteDischarge((data) => ({ ...data, authorChannels: [{ key: "fake:fake-1", vendor: "fake-z" }] }));
+  restored("unresolved author channel (no declared channel with that identity and vendor)");
+  writeFileSync(path, original);
+  eligible();
+  expect(foldOwedChecks(reopened().read(), repo).acceptedRisk).toEqual([obligation]);
+}, 240_000);

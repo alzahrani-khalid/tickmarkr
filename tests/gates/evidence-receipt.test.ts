@@ -27,6 +27,14 @@ const retainedBytes = (root: string) => {
   catch { return 0; }
 };
 
+/** Run the production build gate over `text` with `env` and return the receipt plus the stdout bytes it retained. */
+const captureReceipt = async (artifactDir: string, text: string, env: NodeJS.ProcessEnv) => {
+  const repo = makeRepo({ "out.txt": text });
+  const [row] = await compareToBaseline(repo, { build: "cat out.txt" }, { commands: {} }, ["build"], { evidence: { artifactDir, env } });
+  const receipt = GateEvidenceReceiptSchema.parse(row!.evidenceReceipt);
+  return { receipt, bytes: readFileSync(join(artifactDir, receipt.stdout.path), "utf8") };
+};
+
 afterEach(() => { vi.restoreAllMocks(); });
 
 test("production receipt resolution exposes HOME/TMPDIR substitutions as nonmaterial versus token assignment secret-environment redactions as material using one count per original span, so double counting or secret metadata fails", async () => {
@@ -35,12 +43,7 @@ test("production receipt resolution exposes HOME/TMPDIR substitutions as nonmate
   const token = "ghp_Abcdefghijklmnopqrstuvwxyz123456789";
   const secret = `${home}/.credentials-value`; // a secret that CONTAINS the benign HOME value: one span, secret wins
   const env = { ...process.env, HOME: home, TMPDIR: tmp, SERVICE_TOKEN: token, RECEIPT_SECRET: secret };
-  const run = async (text: string, runEnv: NodeJS.ProcessEnv = env) => {
-    const repo = makeRepo({ "out.txt": text });
-    const [row] = await compareToBaseline(repo, { build: "cat out.txt" }, { commands: {} }, ["build"], { evidence: { artifactDir, env: runEnv } });
-    const receipt = GateEvidenceReceiptSchema.parse(row!.evidenceReceipt);
-    return { receipt, bytes: readFileSync(join(artifactDir, receipt.stdout.path), "utf8") };
-  };
+  const run = (text: string, runEnv: NodeJS.ProcessEnv = env) => captureReceipt(artifactDir, text, runEnv);
 
   const benign = await run(`cache at ${home}/.cache and scratch at ${tmp}build.log`);
   expect(benign.bytes).toBe("cache at $HOME/.cache and scratch at $TMPDIRbuild.log");
@@ -55,8 +58,9 @@ test("production receipt resolution exposes HOME/TMPDIR substitutions as nonmate
   // the token, a benign TMPDIR overlapping a secret's tail is the secret, and a short HOME still substitutes.
   // C-14: the gate runs in a login shell with this env. bash stays silent when ~/.bash_profile is missing but
   // prints any other open error, so an unreadable real HOME (/root on Linux CI) put "/root" on stderr as a
-  // second count. A short HOME that does not exist is silent on every host.
-  const shortHome = "/nx/home";
+  // second count. A short HOME that does not exist is silent on every host; four characters keeps it the
+  // shortest benign value the classifier still substitutes (baseline.ts requires length > 1).
+  const shortHome = "/n/h";
   const overlap = await run(`token=${token} /tmp/prefix-secret ${shortHome}/.cache`,
     { ...process.env, HOME: shortHome, TMPDIR: "/tmp/prefix", SERVICE_SECRET: "prefix-secret" });
   expect(overlap.bytes).toBe("[REDACTED] [REDACTED] $HOME/.cache");
@@ -85,6 +89,31 @@ test("production receipt resolution exposes HOME/TMPDIR substitutions as nonmate
   const forged = { ...material.receipt, redaction: { material: false, counts: { token: 1, assignment: 0, secretEnv: 0, benignEnv: 0 } } };
   expect(GateEvidenceReceiptSchema.safeParse(forged).success).toBe(false);
   expect(resolveReceiptRedaction(forged)).toEqual({ material: true, counts: null });
+});
+
+test("test: production receipt capture substitutes four-character HOME /n/h as benign while overlapping token assignment and secret values retain material counts and the expected redacted bytes", async () => {
+  const artifactDir = realpathSync(makeTestTempDir("evidence-short-home-"));
+  const home = "/n/h";
+  expect(home).toHaveLength(4);
+  const token = "ghp_Abcdefghijklmnopqrstuvwxyz123456789";
+  // HOME alone: substituted, nonmaterial, one benign span per occurrence.
+  const benign = await captureReceipt(artifactDir, `cache at ${home}/.cache and cwd ${home}`, { ...process.env, HOME: home });
+  expect(benign.bytes).toBe("cache at $HOME/.cache and cwd $HOME");
+  expect(resolveReceiptRedaction(benign.receipt)).toEqual({ material: false, counts: { token: 0, assignment: 0, secretEnv: 0, benignEnv: 2 } });
+  // A token assignment and a secret overlapping a benign TMPDIR beside the short HOME: the material spans
+  // keep their counts and bytes, and the short HOME is still $HOME rather than withheld or left raw.
+  const overlap = await captureReceipt(artifactDir, `token=${token} /tmp/prefix-secret ${home}/.cache`,
+    { ...process.env, HOME: home, TMPDIR: "/tmp/prefix", SERVICE_SECRET: "prefix-secret" });
+  expect(overlap.bytes).toBe("[REDACTED] [REDACTED] $HOME/.cache");
+  expect(resolveReceiptRedaction(overlap.receipt)).toEqual({ material: true, counts: { token: 1, assignment: 0, secretEnv: 1, benignEnv: 1 } });
+  // A secret whose value IS the short HOME wins the identical span: withheld, never $HOME.
+  const identical = await captureReceipt(artifactDir, `cwd ${home} and ${home}/.cache`, { ...process.env, HOME: home, SERVICE_SECRET: home });
+  expect(identical.bytes).toBe("cwd [REDACTED] and [REDACTED]/.cache");
+  expect(resolveReceiptRedaction(identical.receipt)).toEqual({ material: true, counts: { token: 0, assignment: 0, secretEnv: 2, benignEnv: 0 } });
+  for (const { receipt } of [benign, overlap, identical]) {
+    const serialised = JSON.stringify(receipt);
+    for (const value of [token, "prefix-secret", home]) expect(serialised).not.toContain(value);
+  }
 });
 
 test("production task standalone tip gates resolve quota evictions as expired after restart for zero tiny default eight-MiB quotas versus unexplained deletion as missing, so a caller ignoring the configured quota fails", async () => {

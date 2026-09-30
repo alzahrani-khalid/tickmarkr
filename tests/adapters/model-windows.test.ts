@@ -33,11 +33,16 @@ describe("cited model-window claims", () => {
       expect(() => loadModelWindowClaims(fixture), shape).toThrow();
     }
 
+    // v2.6.4 T3 (D-717): the seven Codex rows cite the installed CLI's own models_cache.json snapshot, which
+    // has no public URL; every other row still cites a web page.
+    const codexCliCacheRows = new Set(["gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.5", "gpt-5.6-terra", "gpt-5.6-luna"]);
     const loaded = loadModelWindowClaims(CITED_MODEL_WINDOWS);
     for (const claim of loaded) {
       expect(claim.modelId).not.toHaveLength(0);
       expect(claim.window).toBeGreaterThan(0);
-      expect(claim.source).toMatch(/^https:\/\//);
+      expect(claim.source, claim.modelId).toMatch(
+        codexCliCacheRows.has(claim.modelId) ? /^codex-cli:models_cache\.json#fetched_at=2026-09-29T16:09Z$/ : /^https:\/\//,
+      );
       expect(claim.readDate).toMatch(/^\d{4}-\d{2}-\d{2}$/);
       expect(claim).not.toHaveProperty("measured");
     }

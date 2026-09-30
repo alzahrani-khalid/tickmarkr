@@ -29,10 +29,8 @@ const TESTS_ROOT = join(REPO, "tests");
 const HYGIENE_FIX = join(import.meta.dirname, "../fixtures/hygiene");
 
 /** Allowlist is R2-only. Every entry needs a reason; freshness check asserts the excused pattern remains. */
-const ALLOWLIST: Record<string, string> = {
-  "tests/config/config.test.ts":
-    "post-bae863b MODEL-10 overlay-dedup pins; asserts only source-guaranteed types/absence-of-dupes and skips when the file is absent",
-};
+// B2: config.test.ts's hygiene checks now run over fixture overlays in a fresh sandbox — its entry retired.
+const ALLOWLIST: Record<string, string> = {};
 
 interface Violation {
   file: string;

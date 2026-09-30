@@ -36,6 +36,9 @@ export interface BillingChannel { adapter: string; vendor: string; model: string
 export const MODEL_PROBE_ERRORS = ["EMFILE", "EAGAIN", "ENFILE", "ENOMEM", "ENOSPC"] as const;
 export type ModelProbeError = typeof MODEL_PROBE_ERRORS[number];
 export interface ModelAuth { authed: boolean; reason?: string; probeError?: ModelProbeError; probedAt: string; identity?: string }
+// v2.6.4 T2 (B1a): a LISTED model's retirement notice, copied verbatim from the CLI's own cache —
+// never inferred from a model name. `successor` is the CLI's named upgrade target, not a tier claim.
+export interface ModelRetirement { retiresAt: string; successor?: string }
 export interface AuthHealth {
   installed: boolean; authed: boolean; version?: string; models: string[]; note?: string;
   // v1.5 MODEL-02: ISO timestamp — additive-optional, pre-v1.5 doctor.json lacks it, readers use ?.
@@ -49,6 +52,10 @@ export interface AuthHealth {
   // for routing unless cfg.routing.allowUnverifiedModels restores legacy compatibility.
   modelAuth?: Record<string, ModelAuth>;
   modelIdentities?: Record<string, string>;
+  // v2.6.4 T2 (B1a): per listed model — null = listed with NO retirement notice (known clean), a record
+  // = the CLI's notice. A missing key is unknown (the CLI's notice was absent or malformed); the whole
+  // field missing is unknown too (pre-2.6.4 doctor.json, unreadable cache). Advisory: routing never reads it.
+  modelRetirements?: Record<string, ModelRetirement | null>;
 }
 
 export function modelAuthed(health: AuthHealth | undefined, model: string, allowUnverifiedModels = false): boolean {
@@ -411,6 +418,9 @@ export interface WorkerAdapter {
   // when doctor last ran. Returning that lets doctor stamp modelsDetectedAt with the real cache age so
   // the 30-day staleness lint can fire on an ancient cache. undefined = no honest source → doctor uses now.
   listModelsFetchedAt?(): string | undefined;
+  // v2.6.4 T2 (B1a): cache-backed adapters that also carry the CLI's retirement notices (codex). Called
+  // ONLY by doctor, beside listModels. undefined = no readable source → doctor.json records unknown.
+  listModelsRetirements?(): Record<string, ModelRetirement | null> | undefined;
   // SPEND-01: harness-emitted structured usage ONLY, read POST-HOC from the CLI's own cwd-keyed store
   // (session JSONL / structured artifact the harness wrote). NEVER the pane transcript (driver.read —
   // v1.4 self-reference class) and NEVER the parsed trailer (TEL-01 best-liar class).

@@ -292,7 +292,7 @@ describe("O-5(c) floor: a below-floor under-cap mid channel is filtered before t
 // Goes red under a comparator that places bonus OR score above cost/tier inside a prefer entry.
 // ═══════════════════════════════════════════════════════════════════════════
 describe("O-6 intra-group: within one prefer entry, marginal cost and tier outrank bonus AND score", () => {
-  test("(a) BONUS leg: under-cap frontier codex:gpt-5.6-sol (bonus 0.6) loses to cheap codex:gpt-5.6-luna", () => {
+  test("(a) BONUS leg: under-cap frontier codex:gpt-5.6-sol (bonus 0.6) loses to cheap codex:gpt-6-luna", () => {
     const { repo, globalDir } = repoWithOverlay("routing:\n  map:\n    chore:\n      prefer: [\"codex\"]\n");
     const cfg = loadConfig(repo, { globalDir });
     const channels = channelsOf(cfg);
@@ -300,10 +300,11 @@ describe("O-6 intra-group: within one prefer entry, marginal cost and tier outra
     // prove the hostile frontier cell genuinely carries an exploration bonus
     expect(explorationBonus(cellOf(profile, "chore", "codex:gpt-5.6-sol", "sub"))).toBeCloseTo(0.6, 10);
     const r = route(mkTask("chore"), cfg, channels, profile);
-    expect(channelKey(r.assignment)).toBe("codex:gpt-5.6-luna"); // cheap (cost/tier) outranks bonus within the prefer group
+    // v2.6.4 T3: gpt-6-luna is the first cheap codex seed, so it wins the cheap tie by insertion order
+    expect(channelKey(r.assignment)).toBe("codex:gpt-6-luna"); // cheap (cost/tier) outranks bonus within the prefer group
   });
 
-  test("(b) SCORE leg: warm-good frontier codex:gpt-5.6-sol (score>0, bonus 0) loses to cheap codex:gpt-5.6-luna", () => {
+  test("(b) SCORE leg: warm-good frontier codex:gpt-5.6-sol (score>0, bonus 0) loses to cheap codex:gpt-6-luna", () => {
     const { repo, globalDir } = repoWithOverlay("routing:\n  map:\n    chore:\n      prefer: [\"codex\"]\n");
     const cfg = loadConfig(repo, { globalDir });
     const channels = channelsOf(cfg);
@@ -312,7 +313,7 @@ describe("O-6 intra-group: within one prefer entry, marginal cost and tier outra
     expect(explorationBonus(cellOf(profile, "chore", "codex:gpt-5.6-sol", "sub"))).toBe(0);
     expect(learnedScore(profile, "chore", "codex:gpt-5.6-sol", "sub")).toBeGreaterThan(0);
     const r = route(mkTask("chore"), cfg, channels, profile);
-    expect(channelKey(r.assignment)).toBe("codex:gpt-5.6-luna"); // cheap (cost/tier) outranks the score key within the prefer group
+    expect(channelKey(r.assignment)).toBe("codex:gpt-6-luna"); // cheap (cost/tier) outranks the score key within the prefer group
   });
 });
 

@@ -767,7 +767,7 @@ describe("v1.86 T3 autoPrefer deleted — plan and doctor surfaces", () => {
     withOverlay(repo, "routing:\n  map:\n    chore: { prefer: [codex] }\n");
     const out2 = await plan([], repo);
     expect(out2).toContain("via prefer");
-    expect(out2).toMatch(/T1.*codex:gpt-5.6-luna/);
+    expect(out2).toMatch(/T1.*codex:gpt-6-luna/); // v2.6.4 T3: the first cheap codex seed
     expect(out2).not.toContain("dead steering");
     expect(out2).not.toMatch(/\(auto\)/);
   });

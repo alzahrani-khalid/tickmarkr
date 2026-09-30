@@ -55,7 +55,7 @@ const seed = (repo: string, runId: string, ids: string[], events: (hash: string)
 };
 
 const landed = (taskId: string, second: number): JournalEvent[] => [
-  { ts: at(second), event: "task-dispatch", taskId, data: { assignment: { adapter: "fake", model: "fake-1" }, attempt: 0 } },
+  { ts: at(second), event: "task-dispatch", taskId, data: { assignment: { adapter: "fake", model: "fake-1" }, attempt: 0, workerDispatchOrdinal: 0 } },
   { ts: at(second + 1), event: "task-done", taskId, data: { attempts: 1 } },
   { ts: at(second + 2), event: "merge", taskId, data: { commit: `commit-${taskId}` } },
 ];
@@ -70,7 +70,7 @@ describe("compact one-line status form", () => {
       { ts: at(0), event: "run-start", data: { pid: process.pid, graphDefinitionHash: hash, commands: { test: "npm test" } } },
       ...landed("T1", 1),
       ...landed("T2", 4),
-      { ts: at(7), event: "task-dispatch", taskId: "T3", data: { assignment: { adapter: "fake", model: "fake-1" }, attempt: 0 } },
+      { ts: at(7), event: "task-dispatch", taskId: "T3", data: { assignment: { adapter: "fake", model: "fake-1" }, attempt: 0, workerDispatchOrdinal: 0 } },
     ]);
     // What the daemon writes between two reads: the last task lands and the run records its verdict.
     journal.armedPath = path;
@@ -90,8 +90,8 @@ describe("compact one-line status form", () => {
     // is the torn one: every task complete beside a verify the earlier snapshot had not yet seen.
     expect(line).not.toMatch(/3\/3 done.*unrecorded/u);
     expect([
-      "run-torn · 2/3 done · verify unrecorded",
-      "run-torn · 3/3 done · verify passed",
+      "run-torn · 2/3 done · verify unrecorded · end-to-end first pass 2/2 · 7s wall · needs you: outstanding 0 · 0 parked · 0 failed",
+      "run-torn · 3/3 done · verify passed · end-to-end first pass 3/3 · 10s wall · needs you: outstanding 0 · 0 parked · 0 failed",
     ]).toContain(line);
     expect(line.split("\n")).toHaveLength(1);
   });
@@ -115,7 +115,8 @@ describe("compact one-line status form", () => {
     expect(verifiedGates.every((event) => event.data.pass === true)).toBe(true);
 
     const counted = await status(["--oneline"], failedRepo);
-    expect(counted).toBe("run-counted · 1/1 done · verify failed");
+    // CG1: the lead's facts follow the verdict — lineage first pass, the wall window, the current needs-you fold.
+    expect(counted).toBe("run-counted · 1/1 done · verify failed · end-to-end first pass 1/1 · 13s wall · needs you: outstanding 0 · 0 parked · 0 failed");
 
     // A field that is not one of the two recorded verdicts records no verdict — whatever it carries.
     const unusable = [
@@ -133,7 +134,7 @@ describe("compact one-line status form", () => {
 
       const line = await status(["--oneline"], repo);
 
-      expect(line).toBe(`run-unusable-${index} · 1/1 done · verify unrecorded`);
+      expect(line).toBe(`run-unusable-${index} · 1/1 done · verify unrecorded · end-to-end first pass 1/1 · 13s wall · needs you: outstanding 0 · 0 parked · 0 failed`);
       expect(line.split("\n")).toHaveLength(1);
       expect(CONTROL_BYTE.test(line), JSON.stringify(line)).toBe(false);
       expect(line).not.toContain("verify passed");

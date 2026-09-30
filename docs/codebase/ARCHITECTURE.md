@@ -226,8 +226,11 @@ remain separately labeled; a new attempt does not inherit an old pass silently. 
 or unparseable worker/judge/review results fail closed, even if their prose claims zero
 findings. In the three-task partial case, a passed tip with human T2 and blocked T3 is
 PARTIAL; approval alone is permission, resume resets current tip to PENDING, and completion
-needs the latest run-end plus matching recorded merges, known nonfailed tip and empty
-failed/human/blocked/pending buckets. See the canonical
+needs the latest run-end plus matching recorded merges, known nonfailed tip, empty
+failed/human/blocked/pending buckets, and owed checks outstanding empty AND known in the
+CURRENT fold (`foldOwedChecks`, re-read after a post-run `verify --record` discharge; the
+run-end row's copy is history). `run`/`resume` keep execution-based exit codes; their final
+line says `verified` only when that fold is known and empty. See the canonical
 [loop walkthrough](../../skills/tickmarkr-loop/SKILL.md#cockpit-parked-decisions-and-printed-twins).
 
 Command help is dispatched before handlers by `src/cli/index.ts` using

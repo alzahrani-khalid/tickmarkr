@@ -8,6 +8,8 @@ import { readTierLiveness, SUPERVISION_TIERS } from "../../run/supervision.js";
 import { OperatorStateFold, type OperatorRecord } from "../../run/operator-state.js";
 
 export const OBSERVATION_INTERVAL_MS = 1_000;
+/** Stat-to-fstat observations one poll spends on a journal a writer keeps appending to. */
+export const APPEND_RACE_OBSERVATIONS = 3;
 // Graph declarations have a separate 16 MiB bound; journal retention remains unchanged.
 export const STORE_LIMITS = { graphBytes: 16 * 1024 * 1024, history: 256, historyBytes: 2 * 1024 * 1024, recordBytes: 1024 * 1024, readBytes: 1024 * 1024, subscribers: 64, metrics: 12, errors: 32 } as const;
 export interface SourceError { source: string; error: string; line?: number; id?: string }
@@ -51,21 +53,40 @@ export class JournalTail {
   private bytesRead = 0;
   private lastSuccessfulReadAt?: number;
   private failure?: SourceError;
+  private stale = false;
   constructor(readonly source: string, private readonly hooks: { record?: (record: OperatorRecord) => void; reset?: () => void } = {}) {}
   private reset(): void {
     this.offset = 0; this.line = 0; this.carry = Buffer.alloc(0); this.carryBytes = 0; this.lineOffset = 0;
     this.history = []; this.historyBytes = 0; this.errors = []; this.malformedCount = 0; this.generation++;
     this.hooks.reset?.();
   }
+  /** A same-inode append between stat and fstat is retried; exhaustion keeps the last good snapshot, pending. */
   poll(now = Date.now()): TailSnapshot {
+    try {
+      for (let observation = 1; !this.observe(); observation++) {
+        if (observation === APPEND_RACE_OBSERVATIONS) { this.stale = true; this.failure = undefined; return this.snapshot(); }
+      }
+      this.stale = false; this.failure = undefined; this.lastSuccessfulReadAt = now;
+    } catch (e) { this.failure = { source: this.source, error: errorText(e) }; }
+    return this.snapshot();
+  }
+  /** One stat-to-fstat observation. False when an append raced it; nothing was consumed or reset. */
+  private observe(): boolean {
     let fd: number | undefined;
     try {
       const st = statSync(this.source, { bigint: true });
       if (!st.isFile()) throw new Error("journal source is not a regular file");
-      if (!this.st || fileIdentity(st) !== fileIdentity(this.st) || st.size < this.st.size || (st.size === this.st.size && stamp(st) !== stamp(this.st))) this.reset();
-      if (Number(st.size) > this.offset) {
+      const replaced = !this.st || fileIdentity(st) !== fileIdentity(this.st) || st.size < this.st.size || (st.size === this.st.size && stamp(st) !== stamp(this.st));
+      if (Number(st.size) > (replaced ? 0 : this.offset)) {
         fd = openSync(this.source, "r");
-        if (stamp(fstatSync(fd, { bigint: true })) !== stamp(st)) throw new Error("journal changed before read; retry observation");
+        const opened = fstatSync(fd, { bigint: true });
+        if (stamp(opened) !== stamp(st)) {
+          if (fileIdentity(opened) === fileIdentity(st) && opened.size > st.size) return false;
+          throw new Error("journal changed before read; retry observation");
+        }
+      }
+      if (replaced) this.reset();
+      if (fd !== undefined) {
         let remaining = STORE_LIMITS.readBytes as number;
         const buffer = Buffer.allocUnsafe(Math.min(64 * 1024, Number(st.size) - this.offset));
         while (this.offset < Number(st.size) && remaining > 0) {
@@ -91,10 +112,9 @@ export class JournalTail {
           this.offset += count;
         }
       }
-      this.st = st; this.failure = undefined; this.lastSuccessfulReadAt = now;
-    } catch (e) { this.failure = { source: this.source, error: errorText(e) }; }
-    finally { if (fd !== undefined) closeSync(fd); }
-    return this.snapshot();
+      this.st = st;
+      return true;
+    } finally { if (fd !== undefined) closeSync(fd); }
   }
   private appendCarry(bytes: Buffer): void {
     this.carryBytes += bytes.length;
@@ -107,7 +127,7 @@ export class JournalTail {
       history: this.history.slice(), errors: this.errors.slice(), malformedCount: this.malformedCount,
       pending: this.carryBytes ? { line: this.line + 1, bytes: this.carryBytes } : undefined,
       backlogBytes: Math.max(0, Number(this.st?.size ?? 0) - this.offset),
-      status: this.failure ? "unreadable" : this.malformedCount ? "corrupt" : this.carryBytes ? "pending" : "readable",
+      status: this.failure ? "unreadable" : this.malformedCount ? "corrupt" : this.carryBytes || this.stale ? "pending" : "readable",
       error: this.failure, lastSuccessfulReadAt: this.lastSuccessfulReadAt, bytesRead: this.bytesRead,
     };
   }

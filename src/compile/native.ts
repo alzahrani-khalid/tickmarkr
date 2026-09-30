@@ -59,6 +59,106 @@ export function classifyContextPath(entry: string, tracked: Set<string>, repoDir
   return hits.length === 1 ? { kind: "missing", suggestion: hits[0] } : { kind: "missing" };
 }
 
+// v2.6.4 T9 (E): picomatch (the files[] matcher, graph/files-glob.ts) expands a brace group only when
+// it holds a top-level comma or a `..` range, which compiles to a character class — faithful only
+// between single characters: `{A..z}` is `[A-z]`, but `{1..10}` is the class `[1-10]`. Any other
+// unescaped group stays LITERAL braces: `docs/{a}.md` scopes a file named `docs/{a}.md`, never
+// `docs/a.md` (2.6.3 T10: six scope reds). Like picomatch, a `[...]` class (opened only when a `]`
+// follows; a `]` right after `[` or `[^` is a member) swallows braces and commas: `docs/{[a,b]}.md`
+// stays literal, `docs/[{a}].md` holds no group. A POSIX `[:name:]` inside a class is replayed as
+// picomatch's parser does it (the `:]` is consumed, the class stays open), so `docs/{[[:alpha:],]}.md`
+// stays literal and `docs/[[:alpha:]{a}].md` holds no group. Outside a class, picomatch reads `"..."` as
+// quoted literal text (an escape still applies inside it), so a quoted `[`, `{` or `,` opens nothing:
+// `docs/"["/{a}].md` still holds the group `{a}`, `docs/"{a}".md` holds none. A class picomatch never
+// closes (its only `]` is a member: `docs/[]/{a}.md`) has its opener escaped at the end, and everything
+// after that opener stays literal text — no quotes, no classes, braces literal — so that tail is
+// rescanned for groups with only escapes honoured: `docs/[]/{a}.md` holds `{a}`. Returns each literal
+// group and the pattern with those braces dropped — the literal path its author almost certainly meant.
+// A range is read with picomatch's escapes: its lexer drops a backslash before `.`, `/` or `;` (the char
+// stays live, so `{1\..3}` IS the range `{1..3}`) and keeps any other `\X` as one literal character. Each
+// end must be one such character, and the matcher itself must then match both ends: `{\d..z}` compiles
+// to the class `[\d-z]`, which never matches "d".
+const RANGE_END = String.raw`(\\[\s\S]|[^\\])`;
+const RANGE = new RegExp(`^${RANGE_END}\\.\\.${RANGE_END}$`);
+function supportedRange(group: string): boolean {
+  const ends = RANGE.exec(group.replace(/\\([\s\S])/g, (pair, ch: string) => "./;".includes(ch) ? ch : pair));
+  if (!ends) return false;
+  const match = filesGlob(`{${group}}`);
+  return ends.slice(1).every((end) => match(end.slice(-1)));
+}
+const POSIX_CLASS: Record<string, string> = picomatch.constants.POSIX_REGEX_SOURCE;
+function singletonBraces(pattern: string): { groups: string[]; bare: string } {
+  const open: { at: number; comma: boolean }[] = [];
+  const groups: string[] = [];
+  const drop = new Set<number>();
+  let cls: string | undefined; // the open character class's text as picomatch accumulates it, undefined outside one
+  let clsAt = -1; // the open class's opener
+  let quoted = false; // inside a "..." run outside any class
+  let raw = false; // past an unterminated class's opener: literal text, only escapes and braces count
+  for (let i = 0; i < pattern.length; i++) {
+    const ch = pattern[i];
+    if (cls !== undefined) {
+      const at = cls.lastIndexOf("[");
+      if (ch === "\\") cls += pattern.slice(i, ++i + 1);
+      else if (ch === "]" && cls !== "[" && cls !== "[^") cls = undefined;
+      else if (ch === ":" && at > 0 && cls.includes(":", 1) && Object.hasOwn(POSIX_CLASS, cls.slice(at + 2))) {
+        cls = cls.slice(0, at) + POSIX_CLASS[cls.slice(at + 2)];
+        i++; // picomatch consumes the char after the closing `:` (the `]` of `[:name:]`) without closing the class
+      } else cls += ch;
+    } else if (ch === "\\") i++; // escaped: `\{a\}` is a literal filename
+    else if (ch === '"' && !raw) quoted = !quoted;
+    else if (quoted) continue;
+    else if (ch === "[" && !raw && pattern.includes("]", i + 1)) [cls, clsAt] = ["[", i];
+    else if (ch === "{") open.push({ at: i, comma: false });
+    else if (ch === "," && open.length) open[open.length - 1].comma = true;
+    else if (ch === "}" && open.length) {
+      const { at, comma } = open.pop()!;
+      if (comma || supportedRange(pattern.slice(at + 1, i))) continue;
+      groups.push(pattern.slice(at, i + 1));
+      drop.add(at).add(i);
+    }
+    if (cls !== undefined && i + 1 >= pattern.length) [i, cls, raw] = [clsAt, undefined, true]; // unterminated: rescan its tail raw
+  }
+  return { groups, bare: pattern.split("").filter((_, i) => !drop.has(i)).join("") };
+}
+
+// v2.6.4 T9 (E): a files[] path the SELECTED git tree (spec base, else HEAD — what a worker's worktree
+// is built from) stores as a symlink, mode 120000, scopes the link's own bytes: its stored target
+// text. An edit made THROUGH the link writes the file it points to, which the scope gate refuses. The
+// checkout is never the oracle — its links may be untracked or replaced. Advisory only; with no
+// repository (or no files[]) there is no tree to inspect and git is never spawned.
+function symlinkScopeWarnings(file: string, tasks: readonly Task[], base: string | undefined): string[] {
+  const scoped = tasks.filter((task) => task.files.length > 0)
+    .map((task) => ({ id: task.id, match: filesGlob(task.files.map((entry) => entry.replace(/^\.\//, ""))) }));
+  if (!scoped.length || !repositoryRoot(file)) return [];
+  const tree = base ?? "HEAD";
+  const git = (...args: string[]) => spawnSync("git", ["-C", dirname(file), ...args], { encoding: "utf8", maxBuffer: 1 << 28 });
+  const failed = (r: ReturnType<typeof git>) => r.error || r.signal || r.status !== 0 || typeof r.stdout !== "string";
+  const why = (r: ReturnType<typeof git>) => r.signal ? `signal ${r.signal}` : r.status === null ? "git did not run" : `git exit ${r.status}`;
+  const advisory = (what: string, r: ReturnType<typeof git>) =>
+    `tickmarkr: advisory: files[] symlink inspection could not read ${what} in the selected git tree ${JSON.stringify(tree)} (${why(r)}) — symlink scope is unverified for this compile.`;
+  const ls = git("ls-tree", "--full-tree", "-r", "-z", "--end-of-options", tree); // a base is never an option
+  if (failed(ls)) return [advisory("the tree", ls)];
+  const warnings: string[] = [];
+  for (const row of ls.stdout.split("\0")) {
+    const link = /^120000 blob ([0-9a-f]+)\t([\s\S]+)$/.exec(row);
+    if (!link) continue;
+    const owners = scoped.filter((task) => task.match(link[2]));
+    if (!owners.length) continue;
+    // ponytail: one cat-file per matched link; switch to `cat-file --batch` if a scope matches hundreds
+    const target = git("cat-file", "blob", link[1]);
+    if (failed(target)) {
+      warnings.push(advisory(`the stored target of ${JSON.stringify(link[2])}`, target));
+      continue;
+    }
+    for (const { id } of owners) {
+      warnings.push(`tickmarkr: task ${id} files[] path ${JSON.stringify(link[2])} is a symlink in the selected git tree ${JSON.stringify(tree)} storing target ${JSON.stringify(target.stdout)} — `
+        + `files[] owns only that stored target text; an edit made through the link changes the file it points to, which needs its own files[] entry.`);
+    }
+  }
+  return warnings;
+}
+
 // OBS-97: mirror of the vitest.config.ts suite include — the only path class vitest collects.
 export const COLLECTABLE_TESTS = "tests/**/*.test.ts";
 
@@ -660,6 +760,20 @@ export function compileNative(file: string, options: { strict?: boolean } = {}):
   // filename, and csv() would silently retarget the declared obligation to "fixtures/output".
   const pinPaths = (value: string) => splitTop(value).map((item) => item.trim()).filter(Boolean);
 
+  // v2.6.4 T9 (E): refused BEFORE the hosting probe below, which expands every brace group — so it
+  // would certify `tests/{native}.test.ts` as a test home while the scope gate never matches it.
+  for (const draft of drafts) {
+    for (const entry of csv(draft.fields.files)) {
+      const { groups, bare } = singletonBraces(entry);
+      if (groups.length) {
+        invalid(draft.id, "files", `entry ${JSON.stringify(entry)} holds single-item brace group${groups.length === 1 ? "" : "s"} ${groups.join(", ")}: `
+          + `the scope gate matches ${groups.length === 1 ? "it" : "them"} as literal braces while test hosting expands ${groups.length === 1 ? "it" : "them"}, `
+          + `so the declared scope disagrees with itself. Write the bare path ${JSON.stringify(bare)}, list two or more alternatives as {a,b}, `
+          + `or escape the braces (\\{ \\}) if they are part of the filename (a range expands only between single characters, e.g. {1..3} or {a..c}).`);
+      }
+    }
+  }
+
   // OBS-97: a typed test: oracle needs a collectable home. vitest only collects COLLECTABLE_TESTS
   // paths, so a task whose non-empty files[] cannot host one makes scope-green and acceptance-green
   // mutually exclusive by construction — run-20260719-210434 burned two dispatch attempts before a
@@ -796,6 +910,7 @@ export function compileNative(file: string, options: { strict?: boolean } = {}):
     },
     tasks,
   });
+  for (const warning of symlinkScopeWarnings(file, result.tasks, specBase)) console.warn(warning);
   const authoringFindings = authoringLintFindings(result.tasks, file);
   const blockingCodes = new Set<AuthoringLintCode>(["criterion-scope", "fence-symbol-absent"]);
   const blockingFindings = authoringFindings.filter((finding) => options.strict || blockingCodes.has(finding.code));

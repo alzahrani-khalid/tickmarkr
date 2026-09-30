@@ -45,16 +45,39 @@ function makeInkStreams() {
   return { input: input as unknown as NodeJS.ReadStream, output: output as unknown as NodeJS.WriteStream, writes };
 }
 
-const wait = (ms = 20) => new Promise((r) => setTimeout(r, ms));
+/** Upper bound on any wait for a production frame; a poll that reaches it rejects with the last frame drawn. */
+const FRAME_POLL_MS = 2000;
+const tick = () => new Promise((r) => setTimeout(r, 5));
+/** Poll the production frames until `settled` holds; never a fixed sleep. Rejects at the bound with the last frame. */
+async function untilFrame(frame: () => string, settled: (frame: string) => boolean, want: string, timeoutMs = FRAME_POLL_MS): Promise<string> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const current = frame();
+    if (settled(current)) return current;
+    if (Date.now() >= deadline) throw new Error(`frame never reached ${want} within ${timeoutMs} ms; last frame:\n${current}`);
+    await tick();
+  }
+}
+const shows = (text: string) => (frame: string) => frame.includes(text);
+/** Follow on AND the tail selected in the SAME frame: the toggle's first render still carries the old selection. */
+const followingTail = (tailId: string) => (frame: string) => frame.includes("Follow on") && frame.includes(`selected ${tailId}`);
 
 async function drawFrame(node: ReactElement) {
   const { input, output, writes } = makeInkStreams();
   const app = render(node, { stdin: input, stdout: output, exitOnCtrlC: false, patchConsole: false, debug: true });
-  await wait();
+  const frame = () => stripAnsi(writes.at(-1) ?? "");
+  const until = (settled: (frame: string) => boolean, want: string, timeoutMs?: number) => untilFrame(frame, settled, want, timeoutMs);
+  /** Write a key and wait for the frame it produces: the requested text when known, otherwise any new frame. */
+  const key = async (bytes: string, settled?: (frame: string) => boolean, want = "a new frame") => {
+    const drawn = writes.length;
+    input.write(bytes);
+    return until(settled ?? (() => writes.length > drawn), `${want} after ${JSON.stringify(bytes)}`);
+  };
+  await until((f) => f.length > 0, "a first frame");
   return {
-    frame: () => stripAnsi(writes.at(-1) ?? ""),
-    input,
-    rerender: async (next: ReactElement) => { app.rerender(next); await wait(); },
+    frame, input, key, until,
+    frames: () => writes.map(stripAnsi),
+    rerender: async (next: ReactElement, settled: (frame: string) => boolean, want: string) => { app.rerender(next); await until(settled, want); },
     unmount: () => app.unmount(),
   };
 }
@@ -118,36 +141,37 @@ describe("evidence-view", () => {
     const frame = await drawFrame(createElement(EvidenceView, { model }));
     expect(frame.frame()).toContain("JOURNAL");
     expect(frame.frame()).toContain("missing"); // the held-selection tail row (T2's review) has none
-    frame.input.write("\x1B[C"); await wait(); // right arrow -> Report
+    await frame.key("\x1B[C", shows("[REPORT]"), "the Report tab"); // right arrow -> Report
     expect(frame.frame()).toContain("usage floor; dollar total not measurable");
-    frame.input.write("\x1B[C"); await wait(); // -> Stats
+    await frame.key("\x1B[C", shows("[STATS]"), "the Stats tab"); // -> Stats
     expect(frame.frame()).toContain("codex:gpt-5 | dispatches 1 | deliveries 1");
-    frame.input.write("\x1B[C"); await wait(); // -> Channels
+    await frame.key("\x1B[C", shows("[CHANNELS]"), "the Channels tab"); // -> Channels
     expect(frame.frame()).toContain("worker: 1, review: 1, consult: 0");
-    frame.input.write("\x1B[C"); await wait(); // -> Learning preview
+    await frame.key("\x1B[C", shows("[LEARNING PREVIEW]"), "the Learning preview tab"); // -> Learning preview
     expect(frame.frame()).toContain("implement pi:sub cheap raw=3 n_eff=2 q=0.71");
-    frame.input.write("\x1B[D"); frame.input.write("\x1B[D"); frame.input.write("\x1B[D"); frame.input.write("\x1B[D");
-    await wait(); // back to Journal
+    frame.input.write("\x1B[D"); frame.input.write("\x1B[D"); frame.input.write("\x1B[D");
+    await frame.key("\x1B[D", shows("[JOURNAL]"), "the Journal tab"); // back to Journal
     frame.unmount();
 
     // Follow off holds a selected historical row while new events arrive; a newly appended row
     // never steals it. Follow on returns the selection to the tail.
     const growable = await drawFrame(createElement(EvidenceView, { model }));
     expect(growable.frame()).toContain("selected journal.jsonl#L6"); // default: Follow on, tail selected
-    growable.input.write("f"); await wait(); // Follow off
-    growable.input.write("\x1B[A"); await wait(); // up arrow: select T2's review's predecessor row (#L5)
-    growable.input.write("\x1B[A"); await wait(); // up arrow again: #L4 (T1 merge)
+    await growable.key("f", shows("Follow off"), "Follow off"); // Follow off
+    await growable.key("\x1B[A", shows("selected journal.jsonl#L5"), "#L5 selected"); // up arrow: select T2's review's predecessor row (#L5)
+    await growable.key("\x1B[A", shows("selected journal.jsonl#L4"), "#L4 selected"); // up arrow again: #L4 (T1 merge)
     expect(growable.frame()).toContain("selected journal.jsonl#L4");
     expect(growable.frame()).toContain("Follow off");
 
     const grownEvents = [...baseEvents, ev("task-done", "T3", {}), ev("run-end", undefined, { done: ["T1", "T2"], failed: [], human: [], blocked: [], pending: [] })];
     const grownModel = deriveEvidenceView({ events: grownEvents });
-    await growable.rerender(createElement(EvidenceView, { model: grownModel }));
+    await growable.rerender(createElement(EvidenceView, { model: grownModel }), shows("#L8"), "the grown journal");
     // the held selection survived the new rows arriving — never recomputed to the new tail
     expect(growable.frame()).toContain("selected journal.jsonl#L4");
     expect(growable.frame()).not.toContain("selected journal.jsonl#L8");
 
-    growable.input.write("f"); await wait(); // Follow on: snaps back to the (new) tail
+    // Follow on: snaps back to the (new) tail — observed as Follow on AND the tail selection in one frame.
+    await growable.key("f", followingTail("journal.jsonl#L8"), "Follow on at the new tail");
     expect(growable.frame()).toContain("selected journal.jsonl#L8");
     expect(growable.frame()).toContain("Follow on");
     growable.unmount();
@@ -390,11 +414,12 @@ test("test: the Evidence view shows each operator-page group with its first and 
     for (const page of [...pages].reverse()) {
       // Wait for the DRAWN selection, not for a fixed sleep: a 20 ms wait is host-speed-bound and
       // reddened both public CI jobs of v2.5.7 (run 35577514076).
-      for (let i = 0; i < 100 && !frame.frame().includes(`selected journal.jsonl#L${page.line}`); i++) await wait();
-      expect(frame.frame()).toContain(`selected journal.jsonl#L${page.line}`);
+      await frame.until(shows(`selected journal.jsonl#L${page.line}`), `#L${page.line} selected`);
       expect(frame.frame()).toContain(`"summary": "${page.event.data.summary}"`);
-      frame.input.write("\r"); await wait();
-      frame.input.write("\x1B[A"); await wait();
+      const opens = selected.length + 1;
+      frame.input.write("\r");
+      await frame.until(() => selected.length === opens, `open #${opens}`);
+      frame.input.write("\x1B[A");
     }
     expect(selected).toEqual([...pages].reverse().map(p => `journal.jsonl#L${p.line}`));
   } finally { frame.unmount(); }
@@ -413,9 +438,46 @@ test("Enter opens the row the operator navigated to even when no frame was drawn
   try {
     // Two arrows and an Enter in one tick: no render, and no re-subscribed handler, in between.
     frame.input.write("\x1B[A"); frame.input.write("\x1B[A"); frame.input.write("\r");
-    await wait(50);
+    await frame.until((f) => selected.length === 1 && f.includes("selected journal.jsonl#L6"), "the open callback and #L6 selected");
     expect(selected).toEqual(["journal.jsonl#L6"]);
     expect(frame.frame()).toContain("selected journal.jsonl#L6");
+  } finally { frame.unmount(); }
+});
+
+test("test: evidence Follow waits for Follow on and the final tail selection together while an intermediate Follow on old-selection frame cannot satisfy the poll", async () => {
+  const model = deriveEvidenceView({ events: baseEvents });
+  const frame = await drawFrame(createElement(EvidenceView, { model }));
+  try {
+    expect(frame.frame()).toContain("selected journal.jsonl#L6");
+    await frame.key("f", shows("Follow off"), "Follow off");
+    await frame.key("\x1B[A", shows("selected journal.jsonl#L5"), "#L5 selected");
+    await frame.key("\x1B[A", shows("selected journal.jsonl#L4"), "#L4 selected");
+    const grown = deriveEvidenceView({ events: [...baseEvents, ev("task-done", "T3", {}), ev("run-end", undefined, { done: ["T1", "T2"], failed: [], human: [], blocked: [], pending: [] })] });
+    await frame.rerender(createElement(EvidenceView, { model: grown }), shows("#L8"), "the grown journal");
+    expect(frame.frame()).toContain("Follow off");
+    expect(frame.frame()).toContain("selected journal.jsonl#L4");
+
+    // The production toggle renders Follow on first and snaps the selection to the tail in a following
+    // effect, so an intermediate frame reading "Follow on | selected #L4" exists. The poll requires both
+    // Follow on and the FINAL tail selection in one observation; that intermediate frame cannot satisfy it.
+    const settledAtTail = followingTail("journal.jsonl#L8");
+    const intermediate = frame.frame().replace("Follow off", "Follow on");
+    expect(intermediate).toContain("Follow on");
+    expect(intermediate).toContain("selected journal.jsonl#L4");
+    expect(settledAtTail(intermediate)).toBe(false);
+    expect(shows("Follow on")(intermediate)).toBe(true); // a Follow-only poll would have stopped here
+
+    const drawnBefore = frame.frames().length;
+    const settled = await frame.key("f", settledAtTail, "Follow on at the new tail");
+    expect(settled).toContain("Follow on");
+    expect(settled).toContain("selected journal.jsonl#L8");
+    expect(settled).not.toContain("selected journal.jsonl#L4");
+    // Every frame the toggle drew before the settled one was either still Follow off or Follow on at the old
+    // selection — none of them satisfied the poll, and none is what the test observed.
+    const toggled = frame.frames().slice(drawnBefore);
+    const firstSettled = toggled.findIndex(settledAtTail);
+    expect(firstSettled).toBeGreaterThanOrEqual(0);
+    for (const drawn of toggled.slice(0, firstSettled)) expect(settledAtTail(drawn)).toBe(false);
   } finally { frame.unmount(); }
 });
 

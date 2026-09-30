@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeEach, afterEach, describe, expect, test, vi } from "vitest";
 import { CLAUDE_ALIAS_IDENTITY_STAMPS } from "../../src/adapters/claude-code.js";
-import { hasCodexTrustedProject, seedCodexTrust } from "../../src/adapters/codex.js";
+import { codex, hasCodexTrustedProject, seedCodexTrust } from "../../src/adapters/codex.js";
 import { ARTIFICIAL_ANALYSIS_CATALOG_URL, CATALOG_REFRESH_TIMEOUT_MS, LIVEBENCH_CATEGORIES_URL, LIVEBENCH_TABLE_DATE, LIVEBENCH_TABLE_URL, MODELS_DEV_CATALOG_URL, readCachedCatalog } from "../../src/adapters/catalog-remote.js";
 import { FakeAdapter } from "../../src/adapters/fake.js";
 import * as registry from "../../src/adapters/registry.js";
@@ -1264,4 +1264,90 @@ routing:
       }
     }
   }, 60_000);
+});
+
+describe("B1a codex retirement notices (doctor)", () => {
+  // The notice as the installed codex 0.159.0 cache carries it (models_cache.json fetched 2026-09-29T16:09Z).
+  const NOTICE = {
+    model: "gpt-5.6-sol",
+    migration_markdown: "GPT-5.5 retires on October 14, 2026. Switch to GPT-5.6 Sol to continue working in Codex.",
+    retirement_at: "2026-10-14T19:00:00Z",
+  };
+  // The production codex adapter and its cache reader (via CODEX_HOME), minus every surface that would
+  // touch the machine: no version binary, no headless probe command (zero tokens), no trust store.
+  const cacheCodex = {
+    ...codex,
+    probe: async () => ({ installed: true, authed: true, version: "codex-cli fixture", models: [] }),
+    hardcodedFlags: undefined,
+    headlessCommand: undefined,
+    trust: undefined,
+  } as unknown as WorkerAdapter;
+  const repoWithGpt55 = () => {
+    const repo = makeRepo({ "keep.txt": "x" });
+    withOverlay(repo, "tiers:\n  codex:\n    models:\n      gpt-5.5: frontier\n");
+    return repo;
+  };
+  // every configured codex id is listed with upgrade:null unless `entry` says otherwise for gpt-5.5
+  const codexHome = (repo: string, cache: "missing" | "malformed" | ((slug: string) => Record<string, unknown>)) => {
+    const home = mkdtempSync(join(tmpdir(), "tickmarkr-b1a-codex-home-"));
+    if (cache === "malformed") writeFileSync(join(home, "models_cache.json"), "{ not valid json");
+    else if (cache !== "missing") {
+      const models = Object.keys(loadConfig(repo).tiers.codex?.models ?? {})
+        .map((slug) => ({ slug, visibility: "list", upgrade: null, ...cache(slug) }));
+      writeFileSync(join(home, "models_cache.json"), JSON.stringify({ fetched_at: "2026-09-29T16:09:00Z", models }));
+    }
+    return home;
+  };
+  const doctorAt = async (repo: string, home: string, iso: string) => {
+    vi.stubEnv("CODEX_HOME", home);
+    try {
+      return await doctor(["--"], repo, [cacheCodex], { banner: false, now: () => new Date(iso) });
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  };
+  const retiringCache = (slug: string) => (slug === "gpt-5.5" ? { upgrade: NOTICE } : {});
+
+  test("doctor distinguishes gpt-5.5 retiring before 2026-10-14T19:00:00Z from retired at or after that injected instant and names successor gpt-5.6-sol; listed-clean hidden malformed or missing caches retain their respective known or unknown diagnostics", async () => {
+    const repo = repoWithGpt55();
+    const home = codexHome(repo, retiringCache);
+
+    const before = await doctorAt(repo, home, "2026-10-14T18:59:59.999Z");
+    expect(before).toContain("codex: gpt-5.5 retires 2026-10-14T19:00:00Z per the CLI's notice; successor gpt-5.6-sol");
+    expect(before).not.toContain("gpt-5.5 retired");
+    // the other listed ids carry upgrade:null — known clean, so neither a notice nor an unknown line
+    expect(before).not.toMatch(/codex: gpt-5\.6-sol retir/);
+    expect(before).not.toContain("retirement unknown");
+
+    for (const iso of ["2026-10-14T19:00:00.000Z", "2026-10-20T00:00:00.000Z"]) {
+      const after = await doctorAt(repo, home, iso);
+      expect(after, iso).toContain("codex: gpt-5.5 retired 2026-10-14T19:00:00Z per the CLI's notice; successor gpt-5.6-sol");
+      expect(after, iso).not.toContain("gpt-5.5 retires");
+    }
+
+    // listed-clean: gpt-5.5 listed with upgrade:null is known clean — no notice, no unknown, no tombstone
+    const clean = await doctorAt(repo, codexHome(repo, () => ({})), "2026-10-20T00:00:00.000Z");
+    expect(clean).not.toMatch(/gpt-5\.5 retir/);
+    expect(clean).not.toContain("retirement unknown");
+    expect(clean).not.toContain("tiers lists gpt-5.5");
+
+    // hidden: the notice rides on a hidden entry, so the existing missing-listing advisory speaks instead
+    const hidden = await doctorAt(repo, codexHome(repo, (slug) => (slug === "gpt-5.5" ? { visibility: "hide", upgrade: NOTICE } : {})), "2026-10-01T00:00:00.000Z");
+    expect(hidden).toContain("codex: tiers lists gpt-5.5 — CLI no longer reports it; tombstone it (gpt-5.5: null overlay) or verify the id");
+    expect(hidden).not.toMatch(/gpt-5\.5 retir/);
+    expect(hidden).not.toContain("retirement unknown");
+
+    // a malformed notice on a listed id is unknown for that id — never clean, never a guessed date
+    const badNotice = await doctorAt(repo, codexHome(repo, (slug) => (slug === "gpt-5.5" ? { upgrade: { model: "gpt-5.6-sol", retirement_at: "mid-October" } } : {})), "2026-10-01T00:00:00.000Z");
+    expect(badNotice).toContain("codex: retirement unknown for gpt-5.5 — the CLI's notice is absent or unreadable");
+    expect(badNotice).not.toMatch(/gpt-5\.5 retir/);
+
+    // a malformed or missing cache file is unknown for the whole listing
+    for (const cache of ["malformed", "missing"] as const) {
+      const unknown = await doctorAt(repo, codexHome(repo, cache), "2026-10-20T00:00:00.000Z");
+      expect(unknown, cache).toContain("codex: no detection data — run tickmarkr doctor");
+      expect(unknown, cache).not.toMatch(/gpt-5\.5 retir/);
+      expect(unknown, cache).not.toContain("tiers lists gpt-5.5");
+    }
+  });
 });

@@ -1,3 +1,7 @@
+- finished 1/1 done · tip verify cached · end-to-end first pass 1/1
+- time 1m 30s wall, each instant once: residual 1m 30s
+- needs you: outstanding 0 · 0 parked · 0 failed
+
 # tickmarkr engagement
 
 - **runId:** run-brand-pin
@@ -12,7 +16,8 @@
 
 - **fake:fake-1** — attempts/windows: 1; tokens: not measurable; price: not measurable; basis: no telemetry row
 - **wall-clock:** 1m 30s
-- **first-attempt rate:** not measurable
+- **end-to-end first pass:** 1/1 — this journal's dispatch, park, approval and merge lineage
+- **first-attempt rate (engagement-local telemetry):** not measurable — attempts restart at every resume
 - **gate failures:** test: 1
 - **consults:** 1
 - **escalations:** 0

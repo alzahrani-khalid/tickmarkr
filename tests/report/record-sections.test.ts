@@ -55,7 +55,7 @@ describe("tickmarkr report --md against v1.17–v1.19 run fixtures", () => {
     expect(out).toMatch(/\*\*codex:gpt-5\.6-sol\*\*[^\n]*price: not measurable/);
     expect(out).toMatch(/\*\*claude-code:haiku\*\*[^\n]*price: not measurable/);
     expect(out).toContain("**done:** 5");
-    expect(out).toContain("**first-attempt rate:** 3/5 (60%)");
+    expect(out).toContain("**first-attempt rate (engagement-local telemetry):** 3/5 (60%)");
     expect(out).toContain("**gate failures:** build: 1");
     expect(out).toContain("**consults:** 0");
     expect(out).toContain("**escalations:** 2");

@@ -609,10 +609,27 @@ export const DEFAULT_CONFIG: TickmarkrConfig = {
     // retired id. Installed codex 0.144.1 lists it (models_cache.json client_version 0.144.0, fetched
     // 2026-07-10) AND a live runtime probe (`codex exec --model gpt-5.6-sol` → "OK", 2026-07-10) confirmed
     // it runs. Reseeding away would be a regression — the CLI upgrade closed the gate. Seed stays.
+    // v2.6.4 T3 (B1b, D-717): gpt-6-astra / gpt-6-sol / gpt-6-luna seeded AHEAD of the retained gpt-5.x
+    // ids from the installed CLI's models_cache.json snapshot (codex 0.159.0, fetched 2026-09-29T16:09Z).
+    // Tiers are ASSUMPTIONS, not measurements — no benchmark was run or cited for any of the three:
+    // astra=frontier and luna=cheap follow the provider's own descriptions in the local cache (read
+    // 2026-09-29: "Frontier intelligence for the most demanding work" / "Fast and affordable model for
+    // easier tasks"); sol=frontier keeps the shipped workhorse-family mapping (gpt-5.6-sol above) by
+    // continuity. Learned routing or an overlay may retier on evidence. gpt-5.5 stays seeded until its
+    // CLI-announced retirement (2026-10-14T19:00:00Z → gpt-5.6-sol); gpt-5.6-sol is not retiring.
+    // Windows: the same snapshot lists context_window=272000 for all seven — the budget the CLI launches
+    // with, and the authority for these seeds. The API's published 1,050,000 is a different surface and is
+    // not contradicted. A later cache listing more ids (gpt-6.1-sol) does not widen this sealed set.
     codex: {
       vendor: "openai", channel: "sub",
-      models: { "gpt-5.6-sol": "frontier", "gpt-5.5": "frontier", "gpt-5.6-terra": "mid", "gpt-5.6-luna": "cheap" },
-      windows: { "gpt-5.6-sol": 1_050_000, "gpt-5.5": 1_050_000, "gpt-5.6-terra": 1_050_000, "gpt-5.6-luna": 1_050_000 },
+      models: {
+        "gpt-6-astra": "frontier", "gpt-6-sol": "frontier", "gpt-6-luna": "cheap",
+        "gpt-5.6-sol": "frontier", "gpt-5.5": "frontier", "gpt-5.6-terra": "mid", "gpt-5.6-luna": "cheap",
+      },
+      windows: {
+        "gpt-6-astra": 272_000, "gpt-6-sol": 272_000, "gpt-6-luna": 272_000,
+        "gpt-5.6-sol": 272_000, "gpt-5.5": 272_000, "gpt-5.6-terra": 272_000, "gpt-5.6-luna": 272_000,
+      },
     },
     // grok-4.5 (xAI, released 2026-07-08) → mid: AA Intelligence 54 (#4), Terminal-Bench 2.1 83.3%
     // (≈ GPT-5.5 83.4, Fable 5 84.3), SWE-bench Pro 64.7%, ~4.2× more token-efficient than Opus 4.8
@@ -879,9 +896,13 @@ function resolveRoutingMode(cfg: TickmarkrConfig, layers: unknown[]): ModeResolu
  *  already applied to cfg.routing.floors — route() consumes floors only and never sees the mode. */
 export function loadConfigWithMode(
   repoRoot: string,
-  opts: { globalDir?: string; repoOverlayText?: string } = {},
+  opts: { globalDir?: string; repoOverlayText?: string; userOverlayText?: string } = {},
 ): { cfg: TickmarkrConfig; mode: ModeResolution } {
-  const globalCfg = readYaml(join(opts.globalDir ?? globalConfigDir(), "config.yaml"));
+  // B2: userOverlayText substitutes candidate bytes for the on-disk USER layer — the fleet's save
+  // destination — so a preview and the write guard load exactly the bytes a save would land.
+  const globalCfg = opts.userOverlayText === undefined
+    ? readYaml(join(opts.globalDir ?? globalConfigDir(), "config.yaml"))
+    : parse(opts.userOverlayText);
   // v1.52 T2: repoOverlayText substitutes candidate bytes for the on-disk repo layer — the fleet
   // write guard validates EXACTLY what it is about to write through this one loader path.
   const repoCfg = opts.repoOverlayText === undefined
@@ -896,22 +917,24 @@ export function loadConfigWithMode(
   return { cfg: r.data, mode: resolveRoutingMode(r.data, [globalCfg, repoCfg]) };
 }
 
-/** OBS-1182: tiers.<adapter>.modelOverrides as the layers under the repo overlay resolve them. */
+/** OBS-1182: tiers.<adapter>.modelOverrides as the layers under the written overlay resolve them. */
 export type LowerLayerModelOverrides = Record<string, Record<string, Record<string, unknown>>>;
 
-/** OBS-1182: tiers.<adapter>.modelOverrides as the layers under the repo overlay (defaults + global)
- *  merge them. Read raw, never schema-validated: a lower layer may only validate beside repo fields
- *  (global `vendor: null` completed by a repo vendor) and its override metadata is still inherited.
+/** OBS-1182: tiers.<adapter>.modelOverrides as the layers under the written overlay merge them —
+ *  defaults + global under the repo overlay; B2 `below: "user"`: the defaults alone under the USER
+ *  overlay, which is never read as its own lower layer. Read raw, never schema-validated: a lower
+ *  layer may only validate beside upper fields (global `vendor: null` completed by a repo vendor)
+ *  and its override metadata is still inherited.
  *  OBS-1188: an unparseable global file, or a non-map where this path expects a map, is an error —
  *  never an empty lower layer, which would silently drop the metadata a write must re-mask. */
 export function lowerLayerModelOverrides(
-  opts: { globalDir?: string } = {},
+  opts: { globalDir?: string; below?: "repo" | "user" } = {},
 ): { ok: true; overrides: LowerLayerModelOverrides } | { ok: false; error: string } {
   const isMap = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
   const path = join(opts.globalDir ?? globalConfigDir(), "config.yaml");
   let global: unknown;
   try {
-    global = readYaml(path);
+    global = opts.below === "user" ? undefined : readYaml(path);
   } catch (error) {
     return { ok: false, error: `lower config layer ${path} is malformed YAML: ${(error as Error).message.replace(/\s+/g, " ").trim()}` };
   }
@@ -938,12 +961,21 @@ export function loadConfig(repoRoot: string, opts: { globalDir?: string } = {}):
   return loadConfigWithMode(repoRoot, opts).cfg;
 }
 
-/** v1.52 T2 write-time reload guard: run candidate repo-overlay bytes through the SAME production
- *  loader path every later command uses (parse → merge → schema → mode resolution). Returns null
- *  when the bytes load, else the loader's failure message — the caller must refuse the write. */
-export function overlayBytesLoadError(repoRoot: string, bytes: string, opts: { globalDir?: string } = {}): string | null {
+/** v1.52 T2 write-time reload guard: run candidate overlay bytes (the repo layer, or B2's USER layer)
+ *  through the SAME production loader path every later command uses (parse → merge → schema → mode
+ *  resolution). Returns null when the bytes load, else the loader's failure message — the caller
+ *  must refuse the write. */
+export function overlayBytesLoadError(
+  repoRoot: string,
+  bytes: string,
+  opts: { globalDir?: string; layer?: "repo" | "user"; repoOverlayText?: string } = {},
+): string | null {
   try {
-    loadConfigWithMode(repoRoot, { ...opts, repoOverlayText: bytes });
+    loadConfigWithMode(repoRoot, {
+      globalDir: opts.globalDir,
+      // B2: a user-layer check may substitute the repo layer too ("" = none: the bytes on their own)
+      ...(opts.layer === "user" ? { userOverlayText: bytes, repoOverlayText: opts.repoOverlayText } : { repoOverlayText: bytes }),
+    });
     return null;
   } catch (e) {
     return (e as Error).message;
@@ -1206,6 +1238,61 @@ export function fleetKeyLayer(
   if (at(repoRaw) !== undefined) return "repo";
   if (at(globalRaw) !== undefined) return "global";
   return "defaults";
+}
+
+const isPlainMap = (v: unknown): v is Record<string, unknown> =>
+  typeof v === "object" && v !== null && !Array.isArray(v);
+
+/** B2: every leaf path an overlay write changes — a map on either side (the other absent) is
+ *  walked, anything else (scalar, list, null tombstone) is one leaf. */
+function changedLeafPaths(before: unknown, after: unknown, path: string[] = []): string[][] {
+  if (JSON.stringify(before) === JSON.stringify(after)) return [];
+  const walkable = (v: unknown) => v === undefined || isPlainMap(v);
+  if (!walkable(before) || !walkable(after)) return [path];
+  const b = (before ?? {}) as Record<string, unknown>;
+  const a = (after ?? {}) as Record<string, unknown>;
+  return [...new Set([...Object.keys(b), ...Object.keys(a)])].flatMap((key) => changedLeafPaths(b[key], a[key], [...path, key]));
+}
+
+/** B2: the user-overlay keys a write changes that the repo overlay (merged above it) decides in this
+ *  repository — it declares the path, or a non-map (value, list, null tombstone) at a prefix that
+ *  replaces or deletes the user's subtree, or its merge otherwise moves the value (a repo pin/pool/
+ *  prefer replaces the user's whole routing.map slot atomically) — each with the value that still
+ *  applies here. Bytes the loader refuses yield none: the write guard refuses them anyway. */
+export function repoShadowedUserKeys(
+  repoRoot: string,
+  beforeUser: string,
+  afterUser: string,
+  opts: { globalDir?: string } = {},
+): Array<{ path: string; value: unknown }> {
+  let effective: TickmarkrConfig;
+  let paths: string[][];
+  try {
+    effective = loadConfigWithMode(repoRoot, { globalDir: opts.globalDir, userOverlayText: afterUser }).cfg;
+    paths = changedLeafPaths(parse(beforeUser) ?? undefined, parse(afterUser) ?? undefined);
+  } catch {
+    return [];
+  }
+  // the same bytes without the repo layer: any changed path whose value differs here is the repo's merge
+  let alone: TickmarkrConfig | undefined;
+  try {
+    alone = loadConfigWithMode(repoRoot, { globalDir: opts.globalDir, userOverlayText: afterUser, repoOverlayText: "" }).cfg;
+  } catch {
+    alone = undefined;
+  }
+  const at = (cfg: unknown, path: string[]) => path.reduce<unknown>((cur, key) => (isPlainMap(cur) ? cur[key] : undefined), cfg);
+  const repo = readOverlayFile(repoOverlayPath(repoRoot));
+  const decides = (path: string[]) => {
+    if (alone !== undefined && JSON.stringify(at(alone, path)) !== JSON.stringify(at(effective, path))) return true;
+    let cur: unknown = repo;
+    for (const key of path) {
+      if (!isPlainMap(cur)) return cur !== repo;
+      if (!(key in cur)) return false;
+      cur = cur[key];
+    }
+    return true;
+  };
+  return paths.filter(decides).map((path) => ({ path: path.join("."), value: at(effective, path) }));
 }
 
 /** Non-interactive fleet state for CI drift checks (`tickmarkr fleet --print`). */

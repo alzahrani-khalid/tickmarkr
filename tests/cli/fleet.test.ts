@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { EventEmitter } from "node:events";
 import { emitKeypressEvents } from "node:readline";
 import { PassThrough } from "node:stream";
-import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, onTestFinished, test, vi } from "vitest";
 import { parse } from "yaml";
 
 import * as registry from "../../src/adapters/registry.js";
@@ -15,10 +15,10 @@ import { GLYPHS } from "../../src/brand.js";
 import { assembleFleetEditor, fleet, type FleetIO } from "../../src/cli/commands/fleet.js";
 import { doctor } from "../../src/cli/commands/doctor.js";
 import { Journal } from "../../src/run/journal.js";
-import { formatFleetPrint, loadConfig, overlayBytesLoadError } from "../../src/config/config.js";
+import { DEFAULT_CONFIG, formatFleetPrint, loadConfig, loadConfigWithMode, overlayBytesLoadError } from "../../src/config/config.js";
 import { pickRole } from "../../src/route/role-pick.js";
 import { route } from "../../src/route/router.js";
-import { TaskSchema } from "../../src/graph/schema.js";
+import { SHAPES, TaskSchema } from "../../src/graph/schema.js";
 import { tickmarkrDir } from "../../src/graph/graph.js";
 import { channelKey, channelsFromConfig, type WorkerAdapter } from "../../src/adapters/types.js";
 import { makeRepo } from "../helpers/tmprepo.js";
@@ -62,7 +62,20 @@ const REACH_IN = KEYS.space + KEYS.enter;
 const REACH_WORKERS = KEYS.space + KEYS.down + KEYS.enter;
 const REACH_ALL = KEYS.space + KEYS.down.repeat(2) + KEYS.enter;
 
+// B2: fleet saves the operator's machine choices to the USER overlay, so each fixture repo's fleet
+// policy lives in its own user layer — the --global-dir its session runs with. The repo overlay is
+// written only where a test is about the repository layer itself (withRepoOverlay).
+const userDirs = new Map<string, string>();
+const userDirOf = (repo: string): string => {
+  const dir = userDirs.get(repo) ?? mkdtempSync(join(tmpdir(), "tickmarkr-fleet-u-"));
+  userDirs.set(repo, dir);
+  return dir;
+};
+const overlayFile = (repo: string) => join(userDirOf(repo), "config.yaml");
 const withOverlay = (repo: string, yaml: string) => {
+  writeFileSync(overlayFile(repo), yaml);
+};
+const withRepoOverlay = (repo: string, yaml: string) => {
   mkdirSync(join(repo, ".tickmarkr"), { recursive: true });
   writeFileSync(join(repo, ".tickmarkr", "config.yaml"), yaml);
 };
@@ -177,7 +190,8 @@ const ioReadlineImports = () => readFileSync(
 ).match(/from "node:readline(?:\/promises)?"/g) ?? [];
 
 let queuedConfirm: string | undefined;
-const drive = (repo: string, adapter: FakeAdapter, io: FleetIO, bytes: string, argv: string[] = []) => {
+// B2: a session with no explicit layer runs over the fixture repo's own user layer (never the ambient one)
+const drive = (repo: string, adapter: FakeAdapter, io: FleetIO, bytes: string, argv: string[] = ["--global-dir", userDirOf(repo)]) => {
   const p = fleet(argv, repo, [adapter], io);
   const confirm = queuedConfirm;
   queuedConfirm = undefined;
@@ -251,13 +265,13 @@ describe("tickmarkr fleet", () => {
   const SCOPE_FAKE = RAIL + KEYS.down.repeat(3) + KEYS.enter;
   // shapes list order is SHAPES order: plan spec implement tests docs … — docs is row 4
   const TO_DOCS = OPEN_SHAPES + KEYS.down.repeat(4);
-  const overlayAt = (repo: string) => join(repo, ".tickmarkr", "config.yaml");
+  const overlayAt = overlayFile;
   const parsedOverlay = (repo: string) => parse(readFileSync(overlayAt(repo), "utf8")) as Record<string, any>;
 
   test("print mode output for an unchanged config is byte-identical to the pre-migration output", async () => {
     const repo = makeRepo({ "keep.txt": "x" });
     const gdir = isolatedGlobal();
-    withOverlay(repo, `${FAKE_TIERS}routing:
+    withRepoOverlay(repo, `${FAKE_TIERS}routing:
   deny:
     models: [fake:fake-2]
 `);
@@ -275,7 +289,7 @@ describe("tickmarkr fleet", () => {
     const repo = makeRepo({ "keep.txt": "x" });
     const fetcher = vi.fn(async () => { throw new Error("offline"); });
 
-    const out = await fleet(["--print", "--global-dir", isolatedGlobal()], repo, [], {
+    const out = await fleet(["--print", "--global-dir", userDirOf(repo)], repo, [], {
       catalogFetcher: fetcher,
       catalogNow: () => new Date("2026-09-20T00:00:00.000Z"),
     });
@@ -294,14 +308,14 @@ describe("tickmarkr fleet", () => {
   test("fleet print output names the mode and its source layer", async () => {
     const gdir = isolatedGlobal();
     const repo = makeRepo({ "keep.txt": "x" });
-    withOverlay(repo, `${FAKE_TIERS}routing:
+    withRepoOverlay(repo, `${FAKE_TIERS}routing:
   mode: staff-led
 `);
     const out = await fleet(["--print", "--global-dir", gdir], repo, [fakeAdapter(repo)]);
     expect(out).toContain("# mode: staff-led (repo config)");
     // no declaration anywhere → the default, named as such
     const repo2 = makeRepo({ "keep.txt": "x" });
-    withOverlay(repo2, FAKE_TIERS);
+    withRepoOverlay(repo2, FAKE_TIERS);
     const out2 = await fleet(["--print", "--global-dir", gdir], repo2, [fakeAdapter(repo2)]);
     expect(out2).toContain("# mode: risk-based (default)");
     // a global-layer declaration is attributed to the global layer
@@ -313,7 +327,7 @@ describe("tickmarkr fleet", () => {
   test("print output renders the review steering preferences when the loaded config declares them", async () => {
     const repo = makeRepo({ "keep.txt": "x" });
     const gdir = isolatedGlobal();
-    withOverlay(repo, `${FAKE_TIERS}review:
+    withRepoOverlay(repo, `${FAKE_TIERS}review:
   prefer: [fake:fake-1, fake]
 `);
 
@@ -327,7 +341,7 @@ describe("tickmarkr fleet", () => {
   test("print output renders the consult steering preferences when the loaded config declares them", async () => {
     const repo = makeRepo({ "keep.txt": "x" });
     const gdir = isolatedGlobal();
-    withOverlay(repo, `${FAKE_TIERS}consult:
+    withRepoOverlay(repo, `${FAKE_TIERS}consult:
   prefer: [fake:fake-1]
 `);
 
@@ -341,7 +355,7 @@ describe("tickmarkr fleet", () => {
   test("a config declaring no steering renders no empty steering block", async () => {
     const repo = makeRepo({ "keep.txt": "x" });
     const gdir = isolatedGlobal();
-    withOverlay(repo, FAKE_TIERS);
+    withRepoOverlay(repo, FAKE_TIERS);
 
     const out = await fleet(["--print", "--global-dir", gdir], repo, [fakeAdapter(repo)]);
 
@@ -385,7 +399,7 @@ describe("tickmarkr fleet", () => {
     });
     const { io } = makeIO();
 
-    const out = await drive(repo, adapter, io, KEYS.q, ["--global-dir", isolatedGlobal()],);
+    const out = await drive(repo, adapter, io, KEYS.q, ["--global-dir", userDirOf(repo)],);
 
     expect(out).toBe("fleet: quit without writing");
     expect(fetcher).not.toHaveBeenCalled();
@@ -394,7 +408,7 @@ describe("tickmarkr fleet", () => {
     const stale2 = new Date(Date.now() - 2 * 60 * 60 * 1000);
     utimesSync(join(tickmarkrDir(withCatalog.repo), "doctor.json"), stale2, stale2);
     const catalogIo = makeIO();
-    const done = fleet(["--global-dir", isolatedGlobal()], withCatalog.repo, [withCatalog.adapter], {
+    const done = fleet(["--global-dir", userDirOf(withCatalog.repo)], withCatalog.repo, [withCatalog.adapter], {
       ...catalogIo.io,
       catalogFetcher: fetcher,
       catalogNow: () => new Date("2026-09-20T00:00:00.000Z"),
@@ -409,7 +423,7 @@ describe("tickmarkr fleet", () => {
     const stale = new Date(Date.now() - 2 * 60 * 60 * 1000);
     utimesSync(join(tickmarkrDir(repo), "doctor.json"), stale, stale);
     const { io, writes } = makeIO();
-    const out = await drive(repo, adapter, io, KEYS.q, ["--global-dir", isolatedGlobal()]);
+    const out = await drive(repo, adapter, io, KEYS.q, ["--global-dir", userDirOf(repo)]);
     expect(out).toBe("fleet: quit without writing");
     const all = strip(writes.join(""));
     expect(all).toContain("tickmarkr fleet"); // the editor DID open
@@ -419,7 +433,7 @@ describe("tickmarkr fleet", () => {
   test("--fresh forces the probe even when the cache is fresh", async () => {
     const { repo, adapter } = setup(); // stampDoctor: 5m old — inside the reuse TTL
     const { io, writes } = makeIO();
-    const out = await drive(repo, adapter, io, KEYS.q, ["--fresh", "--global-dir", isolatedGlobal()]);
+    const out = await drive(repo, adapter, io, KEYS.q, ["--fresh", "--global-dir", userDirOf(repo)]);
     expect(out).toBe("fleet: quit without writing");
     expect(strip(writes.join(""))).toContain("probe 0m old"); // re-probed despite the fresh cache
   });
@@ -432,10 +446,10 @@ describe("tickmarkr fleet", () => {
       adapter,
       makeIO().io,
       RAIL + KEYS.down.repeat(3) + REACH_ALL + KEYS.w,
-      ["--global-dir", isolatedGlobal()],
+      ["--global-dir", userDirOf(repo)],
     );
     expect(out).toMatch(/^fleet: wrote /);
-    const routing = parse(readFileSync(join(repo, ".tickmarkr", "config.yaml"), "utf8")).routing;
+    const routing = parse(readFileSync(overlayFile(repo), "utf8")).routing;
     // whole fleet out: allow stays present but EMPTY (fail-closed, nothing admitted); OBS-1046:
     // an addition the allow form carries writes no deny tombstone — the absent scopes stay absent
     expect(routing.allow).toEqual({});
@@ -464,7 +478,7 @@ describe("tickmarkr fleet", () => {
     const io = makeIO();
     delete (io.input as Partial<TestInput>).ref;
     delete (io.input as Partial<TestInput>).unref;
-    const done = fleet(["--global-dir", isolatedGlobal()], repo, [adapter], io.io);
+    const done = fleet(["--global-dir", userDirOf(repo)], repo, [adapter], io.io);
     // Bypass makeIO's one-key-at-a-time terminal simulation: injected callers historically
     // wrote a whole key sequence at once, and that compatibility must survive the Ink beachhead.
     PassThrough.prototype.write.call(
@@ -547,7 +561,7 @@ describe("tickmarkr fleet", () => {
     const out = await drive(
       repo, adapter, io,
       OPEN_SHAPES + RAIL + KEYS.down + KEYS.enter + KEYS.q,
-      ["--global-dir", isolatedGlobal()],
+      ["--global-dir", userDirOf(repo)],
     );
     expect(out).toBe("fleet: quit without writing");
     const all = strip(writes.join(""));
@@ -561,22 +575,22 @@ describe("tickmarkr fleet", () => {
 
   test("escape aborts the editor without writing the overlay — a staged edit takes a second Esc and the first names the loss", async () => {
     const { repo, adapter } = setup();
-    const before = readFileSync(join(repo, ".tickmarkr", "config.yaml"), "utf8");
+    const before = readFileSync(overlayFile(repo), "utf8");
     const { io, writes } = makeIO();
     const out = await drive(repo, adapter, io, REACH_WORKERS + KEYS.escape + KEYS.escape);
     expect(out).toBe("fleet: quit without writing");
     // OBS-521: the first Esc warns instead of silently discarding the staged toggle
     expect(strip(writes.join(""))).toContain("staged edit(s) not written");
-    expect(readFileSync(join(repo, ".tickmarkr", "config.yaml"), "utf8")).toBe(before);
+    expect(readFileSync(overlayFile(repo), "utf8")).toBe(before);
   });
 
   test("the q key aborts the editor without writing the overlay — a staged edit takes a second q", async () => {
     const { repo, adapter } = setup();
-    const before = readFileSync(join(repo, ".tickmarkr", "config.yaml"), "utf8");
+    const before = readFileSync(overlayFile(repo), "utf8");
     const { io } = makeIO();
     const out = await drive(repo, adapter, io, REACH_WORKERS + KEYS.q + KEYS.q);
     expect(out).toBe("fleet: quit without writing");
-    expect(readFileSync(join(repo, ".tickmarkr", "config.yaml"), "utf8")).toBe(before);
+    expect(readFileSync(overlayFile(repo), "utf8")).toBe(before);
   });
 
   test("w on an untouched browser says nothing is staged and stays open instead of exiting", async () => {
@@ -584,32 +598,32 @@ describe("tickmarkr fleet", () => {
     const doctorPath = join(tickmarkrDir(repo), "doctor.json");
     const doctorBefore = readFileSync(doctorPath, "utf8");
     const mtimeBefore = statSync(doctorPath).mtimeMs;
-    const overlayBefore = readFileSync(join(repo, ".tickmarkr", "config.yaml"), "utf8");
+    const overlayBefore = readFileSync(overlayFile(repo), "utf8");
     const { io, writes } = makeIO();
     // OBS-522: the save key never doubles as quit — q (with nothing staged) exits immediately
-    const out = await drive(repo, adapter, io, KEYS.w + KEYS.q, ["--global-dir", isolatedGlobal()]);
+    const out = await drive(repo, adapter, io, KEYS.w + KEYS.q, ["--global-dir", userDirOf(repo)]);
     expect(out).toBe("fleet: quit without writing");
     expect(strip(writes.join(""))).toContain("no staged edits — nothing to write");
     expect(readFileSync(doctorPath, "utf8")).toBe(doctorBefore);
     expect(statSync(doctorPath).mtimeMs).toBe(mtimeBefore);
-    expect(readFileSync(join(repo, ".tickmarkr", "config.yaml"), "utf8")).toBe(overlayBefore);
+    expect(readFileSync(overlayFile(repo), "utf8")).toBe(overlayBefore);
     expect(ioReadlineImports()).toEqual([]);
   });
 
   test("a toggle is written to the overlay only after the diff is confirmed", async () => {
     const { repo, adapter } = setup();
-    const overlayPath = join(repo, ".tickmarkr", "config.yaml");
+    const overlayPath = overlayFile(repo);
     const before = readFileSync(overlayPath, "utf8");
     // OBS-994/FL-1: two presses reach out(all) — the allow-form write this test targets.
     const bytes = REACH_ALL + KEYS.w;
 
     queueAnswers("n");
-    const declined = await drive(repo, adapter, makeIO().io, bytes, ["--global-dir", isolatedGlobal()]);
+    const declined = await drive(repo, adapter, makeIO().io, bytes, ["--global-dir", userDirOf(repo)]);
     expect(declined).toBe("fleet: discarded overlay changes");
     expect(readFileSync(overlayPath, "utf8")).toBe(before);
 
     queueAnswers("y");
-    const accepted = await drive(repo, adapter, makeIO().io, bytes, ["--global-dir", isolatedGlobal()]);
+    const accepted = await drive(repo, adapter, makeIO().io, bytes, ["--global-dir", userDirOf(repo)]);
     expect(accepted).toMatch(/^fleet: wrote /);
     const after = readFileSync(overlayPath, "utf8");
     expect(after).not.toBe(before);
@@ -627,11 +641,11 @@ describe("tickmarkr fleet", () => {
       io.io,
       KEYS.down + KEYS.t + KEYS.down + KEYS.enter
         + KEYS.enter + "AA Index 54, SWE-bench Pro 62%" + KEYS.enter + KEYS.w,
-      ["--global-dir", isolatedGlobal()],
+      ["--global-dir", userDirOf(repo)],
     );
     expect(ok).toMatch(/^fleet: wrote /);
     expect(strip(io.writes.join(""))).toContain("benchmark-provenance note is required");
-    const overlay = readFileSync(join(repo, ".tickmarkr", "config.yaml"), "utf8");
+    const overlay = readFileSync(overlayFile(repo), "utf8");
     expect(overlay).toContain("fake-2: mid");
     expect(overlay).toContain("AA Index 54, SWE-bench Pro 62%");
   });
@@ -644,7 +658,7 @@ describe("tickmarkr fleet", () => {
       adapter,
       io,
       KEYS.down + KEYS.t + KEYS.escape + KEYS.q,
-      ["--global-dir", isolatedGlobal()],
+      ["--global-dir", userDirOf(repo)],
     );
     expect(out).toBe("fleet: quit without writing");
     const rendered = strip(writes.join(""));
@@ -654,7 +668,6 @@ describe("tickmarkr fleet", () => {
   });
 
   test("an empty provenance note is re-asked and a corrected note lands on the classified model exactly as before the migration", async () => {
-    const gdir = isolatedGlobal();
     const classify = (emptyFirst: boolean) =>
       KEYS.down + KEYS.t + KEYS.down + KEYS.enter
       + (emptyFirst ? KEYS.enter : "")
@@ -667,7 +680,7 @@ describe("tickmarkr fleet", () => {
       corrected.adapter,
       makeIO().io,
       classify(true),
-      ["--global-dir", gdir],
+      ["--global-dir", userDirOf(corrected.repo)],
     )).toMatch(/^fleet: wrote /);
 
     const firstTry = setup();
@@ -677,12 +690,12 @@ describe("tickmarkr fleet", () => {
       firstTry.adapter,
       makeIO().io,
       classify(false),
-      ["--global-dir", gdir],
+      ["--global-dir", userDirOf(firstTry.repo)],
     )).toMatch(/^fleet: wrote /);
 
-    const correctedBytes = readFileSync(join(corrected.repo, ".tickmarkr", "config.yaml"), "utf8");
+    const correctedBytes = readFileSync(overlayFile(corrected.repo), "utf8");
     expect(correctedBytes).toMatch(/fake-2: mid {2}# AA Index 54 — fleet \d{4}-\d{2}-\d{2}/);
-    expect(correctedBytes).toBe(readFileSync(join(firstTry.repo, ".tickmarkr", "config.yaml"), "utf8"));
+    expect(correctedBytes).toBe(readFileSync(overlayFile(firstTry.repo), "utf8"));
   });
 
   // v1.52 T5: routing.floors is the only band authority now — the Shapes view exposes no 't'
@@ -693,7 +706,7 @@ describe("tickmarkr fleet", () => {
     const out = await drive(
       repo, adapter, io,
       OPEN_SHAPES + KEYS.t + KEYS.w + KEYS.q,
-      ["--global-dir", isolatedGlobal()],
+      ["--global-dir", userDirOf(repo)],
     );
     // 't' on the Shapes view is unhandled — nothing changed, so w stays put and q quits clean
     expect(out).toBe("fleet: quit without writing");
@@ -781,7 +794,7 @@ describe("tickmarkr fleet", () => {
     // the extra trailing Esc pair: the first Esc dismisses the auto-raised presets overlay on the
     // Shapes entry (v1.92); the staged toggle arms the quit guard so TWO more Esc quit the browser
     // OBS-994/FL-1: two spaces cycle in → out(workers) → out(all), the state this test asserts.
-    const out = await drive(repo, adapter, io, " \x1b[B\x1b[B\r\x1b[D\x1b[B\r\x1b\x1b\x1b", ["--global-dir", isolatedGlobal()]);
+    const out = await drive(repo, adapter, io, " \x1b[B\x1b[B\r\x1b[D\x1b[B\r\x1b\x1b\x1b", ["--global-dir", userDirOf(repo)]);
     expect(out).toBe("fleet: quit without writing");
     const all = strip(writes.join(""));
     expect(all).toContain(`${GLYPHS.toggleInactive} fake/fake-1`);
@@ -813,7 +826,7 @@ describe("tickmarkr fleet", () => {
     const { repo, adapter } = setup();
     queueAnswers("y");
     const { io, input } = makeIO();
-    const out = await drive(repo, adapter, io, REACH_WORKERS + KEYS.w, ["--global-dir", isolatedGlobal()]);
+    const out = await drive(repo, adapter, io, REACH_WORKERS + KEYS.w, ["--global-dir", userDirOf(repo)]);
     expect(out).toMatch(/^fleet: wrote /);
     expect(input.isPaused()).toBe(true);
     expect(input.listenerCount("keypress")).toBe(0);
@@ -858,7 +871,7 @@ describe("tickmarkr fleet", () => {
       // the Esc after the first Enter dismisses the auto-raised presets overlay on the Shapes
       // entry (v1.92) so the walk still reaches the Steering view
       KEYS.down + RAIL + KEYS.down + KEYS.enter + KEYS.escape + RAIL + KEYS.down + KEYS.enter + KEYS.q,
-      ["--global-dir", isolatedGlobal()],
+      ["--global-dir", userDirOf(repo)],
     );
     expect(out).toBe("fleet: quit without writing");
     // the fzf invariant holds for EVERY complete frame the runtime renders — asserted per-frame
@@ -900,7 +913,7 @@ describe("tickmarkr fleet", () => {
     const before = readFileSync(doctorPath, "utf8");
     const mtimeBefore = statSync(doctorPath).mtimeMs;
     queueAnswers("y");
-    const out = await drive(repo, adapter, makeIO().io, REACH_WORKERS + KEYS.w, ["--global-dir", isolatedGlobal()]);
+    const out = await drive(repo, adapter, makeIO().io, REACH_WORKERS + KEYS.w, ["--global-dir", userDirOf(repo)]);
     expect(out).toMatch(/^fleet: wrote /);
     expect(readFileSync(doctorPath, "utf8")).toBe(before);
     expect(statSync(doctorPath).mtimeMs).toBe(mtimeBefore);
@@ -971,7 +984,7 @@ describe("tickmarkr fleet", () => {
   test("the fleet mode overlay lists three modes with the highlighted row carrying the pointer glyph", async () => {
     const { repo, adapter } = setup();
     const { io, writes } = makeIO();
-    const out = await drive(repo, adapter, io, KEYS.m + KEYS.q + KEYS.q, ["--global-dir", isolatedGlobal()]);
+    const out = await drive(repo, adapter, io, KEYS.m + KEYS.q + KEYS.q, ["--global-dir", userDirOf(repo)]);
     expect(out).toBe("fleet: quit without writing");
     const frame = writes.find((f) => strip(f).includes("routing mode"))!;
     expect(frame).toBeDefined();
@@ -994,7 +1007,7 @@ describe("tickmarkr fleet", () => {
     const out = await drive(
       repo, adapter, io,
       KEYS.m + KEYS.down + KEYS.enter + KEYS.w,
-      ["--global-dir", isolatedGlobal()],
+      ["--global-dir", userDirOf(repo)],
     );
     // the down keypress highlights staff-led; the SAME frame previews its floor deltas vs risk-based —
     // rendered before the diff and its confirm ever appear
@@ -1007,7 +1020,7 @@ describe("tickmarkr fleet", () => {
     expect(strip(writes.join(""))).toContain("+routing:");
     expect(strip(writes.join(""))).toContain("+  mode: staff-led");
     expect(out).toMatch(/^fleet: wrote /);
-    expect(readFileSync(join(repo, ".tickmarkr", "config.yaml"), "utf8")).toContain("mode: staff-led");
+    expect(readFileSync(overlayFile(repo), "utf8")).toContain("mode: staff-led");
   });
 
   test("the mode overlay previews the same routed mix the production router reports for the selected mode", async () => {
@@ -1018,7 +1031,7 @@ describe("tickmarkr fleet", () => {
       adapter,
       io,
       KEYS.m + KEYS.down + KEYS.escape + KEYS.q,
-      ["--global-dir", isolatedGlobal()],
+      ["--global-dir", userDirOf(repo)],
     );
     expect(out).toBe("fleet: quit without writing");
     const preview = strip(writes.join(""));
@@ -1029,18 +1042,18 @@ describe("tickmarkr fleet", () => {
 
   test("quitting on the mode overlay writes nothing even after a selection preview", async () => {
     const { repo, adapter } = setup();
-    const before = readFileSync(join(repo, ".tickmarkr", "config.yaml"), "utf8");
+    const before = readFileSync(overlayFile(repo), "utf8");
     const { io } = makeIO();
-    const out = await drive(repo, adapter, io, KEYS.m + KEYS.down + KEYS.escape + KEYS.q, ["--global-dir", isolatedGlobal()]);
+    const out = await drive(repo, adapter, io, KEYS.m + KEYS.down + KEYS.escape + KEYS.q, ["--global-dir", userDirOf(repo)]);
     expect(out).toBe("fleet: quit without writing");
-    expect(readFileSync(join(repo, ".tickmarkr", "config.yaml"), "utf8")).toBe(before);
+    expect(readFileSync(overlayFile(repo), "utf8")).toBe(before);
   });
 
   test("a non-injected input stream drives the mode overlay through the production keypress path", async () => {
     const { repo, adapter } = setup();
     const { io, writes } = makeIO();
     // plain PassThrough, raw ANSI/CR bytes only — node's own emitKeypressEvents is the decoder
-    const out = await drive(repo, adapter, io, "m" + "\x1b[B" + "\x1b" + "q", ["--global-dir", isolatedGlobal()]);
+    const out = await drive(repo, adapter, io, "m" + "\x1b[B" + "\x1b" + "q", ["--global-dir", userDirOf(repo)]);
     expect(out).toBe("fleet: quit without writing");
     const modeFrames = writes.filter((f) => strip(f).includes("routing mode"));
     expect(modeFrames.length).toBeGreaterThan(0);
@@ -1058,13 +1071,13 @@ describe("tickmarkr fleet", () => {
 
   test("the production reload guard still rejects malformed proposed overlay bytes", () => {
     const { repo } = setup();
-    const error = overlayBytesLoadError(repo, BAD_OVERLAY, { globalDir: isolatedGlobal() });
+    const error = overlayBytesLoadError(repo, BAD_OVERLAY, { globalDir: userDirOf(repo) });
     expect(error).toContain('expected one of "cheap"|"mid"|"frontier"');
   });
 
   test("valid component-runtime edits still write through the diff confirm", async () => {
     const { repo, adapter } = setup();
-    const gdir = isolatedGlobal();
+    const gdir = userDirOf(repo);
     queueAnswers("y");
     const out = await drive(repo, adapter, makeIO().io, REACH_WORKERS + KEYS.w, ["--global-dir", gdir]);
     expect(out).toMatch(/^fleet: wrote /);
@@ -1073,7 +1086,7 @@ describe("tickmarkr fleet", () => {
 
   test("a valid overlay still writes through the diff confirm", async () => {
     const { repo, adapter } = setup();
-    const gdir = isolatedGlobal();
+    const gdir = userDirOf(repo);
     queueAnswers("y");
     const out = await drive(repo, adapter, makeIO().io, REACH_WORKERS + KEYS.w, ["--global-dir", gdir]);
     expect(out).toMatch(/^fleet: wrote /);
@@ -1084,7 +1097,7 @@ describe("tickmarkr fleet", () => {
   // Shape preferences are an ordered component-runtime picker. Provenance is the only
   // free-text edit; diff confirmation remains inside that same runtime.
   const completeShapePreferPick = async (repo: string, adapter: FakeAdapter, io: ReturnType<typeof makeIO>) => {
-    const done = fleet(["--global-dir", isolatedGlobal()], repo, [adapter], io.io);
+    const done = fleet(["--global-dir", userDirOf(repo)], repo, [adapter], io.io);
     io.input.write(OPEN_SHAPES + KEYS.f);
     await settle(() => io.writes.join("").includes("edit · plan.prefer"));
     const mark = io.writes.length;
@@ -1132,7 +1145,7 @@ describe("tickmarkr fleet", () => {
   test("after the provenance free-text entry the component flow keeps accepting keys instead of exiting", async () => {
     const { repo, adapter } = setup();
     const { io, input, writes } = makeIO();
-    const p = fleet(["--global-dir", isolatedGlobal()], repo, [adapter], io);
+    const p = fleet(["--global-dir", userDirOf(repo)], repo, [adapter], io);
     input.write(KEYS.down + KEYS.t + KEYS.down + KEYS.enter);
     await settle(() => writes.join("").includes("benchmark provenance (required)"));
     const mark = writes.length;
@@ -1154,7 +1167,7 @@ describe("tickmarkr fleet", () => {
     const { repo, adapter } = setup();
     queueAnswers("y");
     const pick = KEYS.down + KEYS.space + KEYS.up + KEYS.space + KEYS.enter;
-    const out = await drive(repo, adapter, makeIO().io, OPEN_STEER + KEYS.f + pick + KEYS.w, ["--global-dir", isolatedGlobal()]);
+    const out = await drive(repo, adapter, makeIO().io, OPEN_STEER + KEYS.f + pick + KEYS.w, ["--global-dir", userDirOf(repo)]);
     expect(out).toMatch(/^fleet: wrote /);
     expect(parsedOverlay(repo).review.prefer).toEqual(["fake:fake-1", "fake"]);
   });
@@ -1162,7 +1175,7 @@ describe("tickmarkr fleet", () => {
   test("a picked consult prefer seat lands in the written overlay under consult prefer", async () => {
     const { repo, adapter } = setup();
     queueAnswers("y");
-    const out = await drive(repo, adapter, makeIO().io, OPEN_STEER + KEYS.down + KEYS.f + KEYS.space + KEYS.enter + KEYS.w, ["--global-dir", isolatedGlobal()]);
+    const out = await drive(repo, adapter, makeIO().io, OPEN_STEER + KEYS.down + KEYS.f + KEYS.space + KEYS.enter + KEYS.w, ["--global-dir", userDirOf(repo)]);
     expect(out).toMatch(/^fleet: wrote /);
     expect(parsedOverlay(repo).consult.prefer).toEqual(["fake:fake-1"]);
   });
@@ -1212,7 +1225,7 @@ describe("tickmarkr fleet", () => {
       adapter,
       makeIO().io,
       SCOPE_FAKE + KEYS.s + KEYS.w,
-      ["--global-dir", isolatedGlobal()],
+      ["--global-dir", userDirOf(repo)],
     );
     expect(out).toMatch(/^fleet: wrote /);
     const overlay = parsedOverlay(repo);
@@ -1233,14 +1246,14 @@ describe("tickmarkr fleet", () => {
     const bareRow = /· fake(?![:-])/;
     const a = setup();
     const aIO = makeIO();
-    await drive(a.repo, a.adapter, aIO.io, OPEN_STEER + KEYS.down + KEYS.f + "\x03", ["--global-dir", isolatedGlobal()]);
+    await drive(a.repo, a.adapter, aIO.io, OPEN_STEER + KEYS.down + KEYS.f + "\x03", ["--global-dir", userDirOf(a.repo)]);
     const consultFrame = strip(aIO.writes.join(""));
     expect(consultFrame).toContain("edit · consult.prefer");
     expect(consultFrame).toContain("· fake:fake-1");
     expect(consultFrame).not.toMatch(bareRow);
     const b = setup();
     const bIO = makeIO();
-    await drive(b.repo, b.adapter, bIO.io, OPEN_STEER + KEYS.f + "\x03", ["--global-dir", isolatedGlobal()]);
+    await drive(b.repo, b.adapter, bIO.io, OPEN_STEER + KEYS.f + "\x03", ["--global-dir", userDirOf(b.repo)]);
     const reviewFrame = strip(bIO.writes.join(""));
     expect(reviewFrame).toContain("edit · review.prefer");
     expect(reviewFrame).toMatch(bareRow);
@@ -1258,7 +1271,7 @@ describe("tickmarkr fleet", () => {
     // undiscovered chain entries append after the channel universe, so codex is the LAST row —
     // over-pressing down clamps there without pinning the test to the universe's size
     const pick = KEYS.down.repeat(9) + KEYS.space + KEYS.enter;
-    const out = await drive(repo, adapter, makeIO().io, OPEN_STEER + KEYS.f + pick + KEYS.w, ["--global-dir", isolatedGlobal()]);
+    const out = await drive(repo, adapter, makeIO().io, OPEN_STEER + KEYS.f + pick + KEYS.w, ["--global-dir", userDirOf(repo)]);
     expect(out).toMatch(/^fleet: wrote /);
     const written = readFileSync(overlayAt(repo), "utf8");
     expect(written).not.toContain("prefer");
@@ -1271,7 +1284,7 @@ describe("tickmarkr fleet", () => {
     const io = makeIO();
     const reloadGuard = vi.fn(() => "consult.prefer entries must be adapter:model");
     const done = fleet(
-      ["--global-dir", isolatedGlobal()],
+      ["--global-dir", userDirOf(repo)],
       repo,
       [adapter],
       { ...io.io, reloadGuard } as FleetIO,
@@ -1314,7 +1327,7 @@ describe("tickmarkr fleet", () => {
     for (const bytes of cases) {
       const { repo, adapter } = setup();
       const io = makeIO();
-      const out = await drive(repo, adapter, io.io, bytes, ["--global-dir", isolatedGlobal()]);
+      const out = await drive(repo, adapter, io.io, bytes, ["--global-dir", userDirOf(repo)]);
       expect(out).toBe("fleet: quit without writing");
       expect(io.input.isPaused()).toBe(true);
       expect(io.rawCalls.at(-1)).toBe(false);
@@ -1348,7 +1361,7 @@ review:
   complexityThreshold: 9
 `);
     queueAnswers("y");
-    const out = await drive(repo, adapter, makeIO().io, OPEN_STEER + KEYS.f + KEYS.space + KEYS.enter + KEYS.w, ["--global-dir", isolatedGlobal()]);
+    const out = await drive(repo, adapter, makeIO().io, OPEN_STEER + KEYS.f + KEYS.space + KEYS.enter + KEYS.w, ["--global-dir", userDirOf(repo)]);
     expect(out).toMatch(/^fleet: wrote /);
     const overlay = parsedOverlay(repo);
     expect(overlay.concurrency).toBe(5);
@@ -1360,7 +1373,7 @@ review:
   test("an aborted prefer edit leaves the overlay untouched", async () => {
     const { repo, adapter } = setup();
     const before = readFileSync(overlayAt(repo), "utf8");
-    const out = await drive(repo, adapter, makeIO().io, OPEN_STEER + KEYS.f + KEYS.escape + KEYS.q, ["--global-dir", isolatedGlobal()]);
+    const out = await drive(repo, adapter, makeIO().io, OPEN_STEER + KEYS.f + KEYS.escape + KEYS.q, ["--global-dir", userDirOf(repo)]);
     expect(out).toBe("fleet: quit without writing");
     expect(readFileSync(overlayAt(repo), "utf8")).toBe(before);
   });
@@ -1386,7 +1399,7 @@ review:
   // completes a steering picker apply and waits for the re-rendered steering frame — the picker
   // never leaves keypress mode (no readline hop), so the decoder loop must survive the nesting
   const completeSteerPick = async (repo: string, adapter: FakeAdapter, io: ReturnType<typeof makeIO>) => {
-    const done = fleet(["--global-dir", isolatedGlobal()], repo, [adapter], io.io);
+    const done = fleet(["--global-dir", userDirOf(repo)], repo, [adapter], io.io);
     io.input.write(OPEN_STEER + KEYS.f);
     await settle(() => io.writes.join("").includes("edit · review.prefer"));
     const mark = io.writes.length;
@@ -1419,7 +1432,7 @@ review:
   test("the editor process exits after quitting the mode overlay", async () => {
     const { repo, adapter } = setup();
     const { io, input, rawCalls } = makeIO();
-    const out = await drive(repo, adapter, io, KEYS.m + KEYS.escape + KEYS.q, ["--global-dir", isolatedGlobal()]);
+    const out = await drive(repo, adapter, io, KEYS.m + KEYS.escape + KEYS.q, ["--global-dir", userDirOf(repo)]);
     expect(out).toBe("fleet: quit without writing");
     // nothing keeps the event loop alive: stream paused, zero keypress listeners, raw mode off —
     // the OBS-70 exit contract that lets the real process terminate after q on the mode overlay
@@ -1440,7 +1453,7 @@ review:
   test("pressing p opens the candidate picker for the highlighted shape", async () => {
     const { repo, adapter } = setup();
     const { io, writes } = makeIO();
-    const out = await drive(repo, adapter, io, TO_DOCS + KEYS.p + "\x03", ["--global-dir", isolatedGlobal()]);
+    const out = await drive(repo, adapter, io, TO_DOCS + KEYS.p + "\x03", ["--global-dir", userDirOf(repo)]);
     expect(out).toBe("fleet: quit without writing");
     const picker = writes.find((f) => strip(f).includes("pin · docs"))!;
     expect(picker).toBeDefined();
@@ -1457,7 +1470,7 @@ review:
     const { repo, adapter } = setup();
     const { io, writes } = makeIO();
     // down moves the picker cursor to rank-2 so the footer detail names ITS full why line too
-    const out = await drive(repo, adapter, io, TO_DOCS + KEYS.p + KEYS.down + "\x03", ["--global-dir", isolatedGlobal()]);
+    const out = await drive(repo, adapter, io, TO_DOCS + KEYS.p + KEYS.down + "\x03", ["--global-dir", userDirOf(repo)]);
     expect(out).toBe("fleet: quit without writing");
     const picker = writes.map(strip).filter((f) => f.includes("pin · docs")).join("\n").replace(/\s+/g, " ");
     // cost signal is channel economics: flat-rate quota for sub (never $0), rough per-task $ for api
@@ -1516,7 +1529,7 @@ review:
     const out = await drive(
       repo, adapter, io,
       TO_DOCS + KEYS.p + KEYS.down + KEYS.enter + KEYS.w,
-      ["--global-dir", isolatedGlobal()],
+      ["--global-dir", userDirOf(repo)],
     );
     expect(out).toMatch(/^fleet: wrote /);
     // the pick reached disk regardless: the mechanism never depended on when a frame arrives
@@ -1549,7 +1562,7 @@ review:
       adapter,
       makeIO().io,
       TO_DOCS + KEYS.p + KEYS.down + KEYS.enter + KEYS.w,
-      ["--global-dir", isolatedGlobal()],
+      ["--global-dir", userDirOf(repo)],
     );
     expect(out).toMatch(/^fleet: wrote /);
     expect(parsedOverlay(repo).routing.map.docs).toEqual({
@@ -1573,11 +1586,11 @@ review:
     const before = readFileSync(overlayAt(repo), "utf8");
     const bytes = TO_DOCS + KEYS.p + KEYS.down + KEYS.enter + KEYS.w;
     queueAnswers("n");
-    const declined = await drive(repo, adapter, makeIO().io, bytes, ["--global-dir", isolatedGlobal()]);
+    const declined = await drive(repo, adapter, makeIO().io, bytes, ["--global-dir", userDirOf(repo)]);
     expect(declined).toBe("fleet: discarded overlay changes");
     expect(readFileSync(overlayAt(repo), "utf8")).toBe(before);
     queueAnswers("y");
-    const accepted = await drive(repo, adapter, makeIO().io, bytes, ["--global-dir", isolatedGlobal()]);
+    const accepted = await drive(repo, adapter, makeIO().io, bytes, ["--global-dir", userDirOf(repo)]);
     expect(accepted).toMatch(/^fleet: wrote /);
     expect(readFileSync(overlayAt(repo), "utf8")).toContain("pin:");
   });
@@ -1586,7 +1599,7 @@ review:
     const { repo, adapter } = setup();
     // first: pin fake:fake-2 on docs through the picker (row 2 = the api channel)
     queueAnswers("y");
-    const pinned = await drive(repo, adapter, makeIO().io, TO_DOCS + KEYS.p + KEYS.down + KEYS.enter + KEYS.w, ["--global-dir", isolatedGlobal()]);
+    const pinned = await drive(repo, adapter, makeIO().io, TO_DOCS + KEYS.p + KEYS.down + KEYS.enter + KEYS.w, ["--global-dir", userDirOf(repo)]);
     expect(pinned).toMatch(/^fleet: wrote /);
     expect(parsedOverlay(repo).routing.map.docs.pin).toEqual({ via: "fake", model: "fake-2" });
     // then: pool in REVERSE rank order (row 2 first, row 1 second) — channels are the pick
@@ -1598,7 +1611,7 @@ review:
       repo, adapter, makeIO().io,
       TO_DOCS + KEYS.p + KEYS.down + KEYS.space + KEYS.up + KEYS.space + KEYS.enter
         + KEYS.down + KEYS.enter + KEYS.w,
-      ["--global-dir", isolatedGlobal()],
+      ["--global-dir", userDirOf(repo)],
     );
     expect(pooled).toMatch(/^fleet: wrote /);
     expect(parsedOverlay(repo).routing.map.docs.pool).toEqual({ mode: "ordered", channels: ["fake:fake-2", "fake:fake-1"] });
@@ -1621,7 +1634,7 @@ review:
     const a = setup();
     withOverlay(a.repo, TWO_CLASSIFIED);
     const aIO = makeIO();
-    const aDone = fleet(["--global-dir", isolatedGlobal()], a.repo, [a.adapter], aIO.io);
+    const aDone = fleet(["--global-dir", userDirOf(a.repo)], a.repo, [a.adapter], aIO.io);
     // OBS-994/FL-1: Space now cycles in → out(workers) → out(all) → in — two presses reach the
     // all-seats exclusion this test's allow-form assertions target.
     aIO.input.write(REACH_ALL + TO_DOCS + KEYS.p);
@@ -1644,7 +1657,7 @@ review:
     models: [fake:fake-2]
 `);
     const bIO = makeIO();
-    const bDone = fleet(["--global-dir", isolatedGlobal()], b.repo, [b.adapter], bIO.io);
+    const bDone = fleet(["--global-dir", userDirOf(b.repo)], b.repo, [b.adapter], bIO.io);
     bIO.input.write(REACH_IN + TO_DOCS + KEYS.p);
     await settle(() => strip(bIO.writes.join("")).includes("pin · docs"));
     bIO.input.write(KEYS.escape + KEYS.w + KEYS.y);
@@ -1657,7 +1670,7 @@ review:
     const { repo, adapter } = setup();
     const { io, writes } = makeIO();
     // Space toggles fake-1 out of the fleet; Enter on the same row must coach, not assign
-    const out = await drive(repo, adapter, io, REACH_WORKERS + KEYS.enter + KEYS.q + KEYS.q, ["--global-dir", isolatedGlobal()]);
+    const out = await drive(repo, adapter, io, REACH_WORKERS + KEYS.enter + KEYS.q + KEYS.q, ["--global-dir", userDirOf(repo)]);
     expect(out).toBe("fleet: quit without writing");
     const all = strip(writes.join(""));
     expect(all).toContain("fake:fake-1 is out of the fleet — Space adds it before assigning");
@@ -1667,7 +1680,7 @@ review:
   test("Esc on the poolmode overlay returns to the candidate picker with the chain markers intact", async () => {
     const { repo, adapter } = setup();
     const io = makeIO();
-    const done = fleet(["--global-dir", isolatedGlobal()], repo, [adapter], io.io);
+    const done = fleet(["--global-dir", userDirOf(repo)], repo, [adapter], io.io);
     io.input.write(TO_DOCS + KEYS.p + KEYS.down + KEYS.space + KEYS.up + KEYS.space + KEYS.enter);
     await settle(() => strip(io.writes.join("")).includes("pool mode · docs"));
     const poolFrame = io.writes.map(strip).find((f) => f.includes("pool mode · docs"))!;
@@ -1687,7 +1700,7 @@ review:
   test("/ outside the models view names where search lives instead of eating the key", async () => {
     const { repo, adapter } = setup();
     const { io, writes, input } = makeIO();
-    const done = fleet(["--global-dir", isolatedGlobal()], repo, [adapter], io);
+    const done = fleet(["--global-dir", userDirOf(repo)], repo, [adapter], io);
     input.write(OPEN_SHAPES);
     await settle(() => writes.map(strip).some((f) => f.includes("Shapes  routed under")));
     input.write("/");
@@ -1700,7 +1713,7 @@ review:
   test("a leading / in a searchable overlay is swallowed so /query works everywhere", async () => {
     const { repo, adapter } = setup();
     const { io, writes, input } = makeIO();
-    const done = fleet(["--global-dir", isolatedGlobal()], repo, [adapter], io);
+    const done = fleet(["--global-dir", userDirOf(repo)], repo, [adapter], io);
     input.write(TO_DOCS + KEYS.p);
     await settle(() => strip(writes.join("")).includes("pin · docs"));
     input.write("/fake-2");
@@ -1727,7 +1740,7 @@ review:
     const when = new Date(Date.now() - 5 * 60_000);
     utimesSync(join(tickmarkrDir(repo), "doctor.json"), when, when);
     const { io, writes, input } = makeIO();
-    const done = fleet(["--global-dir", isolatedGlobal()], repo, [fakeAdapter(repo)], io);
+    const done = fleet(["--global-dir", userDirOf(repo)], repo, [fakeAdapter(repo)], io);
     input.write(RAIL + KEYS.down.repeat(3) + KEYS.space);
     await settle(() => strip(writes.join("")).includes("is not authed"));
     input.write(KEYS.escape + KEYS.q); // Esc leaves the picker with nothing staged — one q quits
@@ -1740,7 +1753,7 @@ review:
   test("the first Shapes entry per session raises the presets overlay and Esc lands in the shapes list", async () => {
     const { repo, adapter } = setup();
     const { io, writes, input } = makeIO();
-    const done = fleet(["--global-dir", isolatedGlobal()], repo, [adapter], io);
+    const done = fleet(["--global-dir", userDirOf(repo)], repo, [adapter], io);
     input.write(RAIL + KEYS.down + KEYS.enter);
     await settle(() => strip(writes.join("")).includes("routing mode"));
     expect(strip(writes[0])).not.toContain("routing mode"); // never at launch — the browser opens first
@@ -1759,7 +1772,7 @@ review:
   test("test: the escape path's settled row is observed through the same release gate its sibling case already uses, so the stream as it stands the instant the escape key is written does not carry that row while the post-release poll does; an assertion satisfied by that instant read fails", async () => {
     const { repo, adapter } = setup();
     const io = makeIO();
-    const done = fleet(["--global-dir", isolatedGlobal()], repo, [adapter], io.io);
+    const done = fleet(["--global-dir", userDirOf(repo)], repo, [adapter], io.io);
     io.input.write(TO_DOCS + KEYS.p);
     await settle(() => strip(io.writes.at(-1) ?? "").includes("pin · docs")); // picker open = TO_DOCS drained
     // capture the settled shape row the picker opened on — the LAST Shapes-view frame BEFORE the
@@ -1794,7 +1807,7 @@ review:
     const out = await drive(
       repo, adapter, io,
       TO_DOCS + KEYS.p + KEYS.down + KEYS.enter + KEYS.a + KEYS.q,
-      ["--global-dir", isolatedGlobal()],
+      ["--global-dir", userDirOf(repo)],
     );
     expect(out).toBe("fleet: quit without writing");
     const rows = docsRows(writes);
@@ -1807,7 +1820,7 @@ review:
   test("aborting from inside the picker releases keypress listeners and pauses the input stream", async () => {
     const { repo, adapter } = setup();
     const { io, input, rawCalls } = makeIO();
-    const out = await drive(repo, adapter, io, TO_DOCS + KEYS.p + "\x03", ["--global-dir", isolatedGlobal()]);
+    const out = await drive(repo, adapter, io, TO_DOCS + KEYS.p + "\x03", ["--global-dir", userDirOf(repo)]);
     expect(out).toBe("fleet: quit without writing");
     expect(input.isPaused()).toBe(true);
     expect(input.listenerCount("keypress")).toBe(0);
@@ -1841,7 +1854,7 @@ review:
     // painted before pressing the key that replaces it — the same contract the neighbouring
     // shapes-economics drives already state. Nothing about the comparison itself is relaxed.
     const { io, writes, input } = makeIO();
-    const done = fleet(["--global-dir", isolatedGlobal()], repo, [adapter], io);
+    const done = fleet(["--global-dir", userDirOf(repo)], repo, [adapter], io);
     input.write(TO_DOCS);
     await settle(() => docsRows(writes).some((l) => /fake:fake-\d/.test(l)));
     input.write(KEYS.p);
@@ -1884,7 +1897,7 @@ review:
   // painted, then quit — one-chunk drives coalesce into a single final render and can skip it
   const driveToShapes = async (repo: string, adapter: FakeAdapter) => {
     const { io, writes, input } = makeIO();
-    const done = fleet(["--global-dir", isolatedGlobal()], repo, [adapter], io);
+    const done = fleet(["--global-dir", userDirOf(repo)], repo, [adapter], io);
     input.write(OPEN_SHAPES);
     await settle(() => writes.map(strip).some((f) => f.includes("Shapes  routed under")));
     input.write(KEYS.q);
@@ -1909,7 +1922,7 @@ review:
   test("no sub channel row renders a zero dollar amount", async () => {
     const { repo, adapter } = setupAllRoutable();
     const { io, writes, input } = makeIO();
-    const done = fleet(["--global-dir", isolatedGlobal()], repo, [adapter], io);
+    const done = fleet(["--global-dir", userDirOf(repo)], repo, [adapter], io);
     // split writes: the shapes frame must PAINT before p replaces it with the picker (one-chunk
     // drives coalesce into a single final render and would skip it)
     input.write(OPEN_SHAPES);
@@ -1932,7 +1945,7 @@ review:
   test("an api routed shape shows a rough per task estimate from the pricing table", async () => {
     const { repo, adapter } = setup();
     const { io, writes, input } = makeIO();
-    const done = fleet(["--global-dir", isolatedGlobal()], repo, [adapter], io);
+    const done = fleet(["--global-dir", userDirOf(repo)], repo, [adapter], io);
     input.write(TO_DOCS + KEYS.p);
     await settle(() => strip(writes.join("")).includes("pin · docs"));
     const mark = writes.length;
@@ -1973,7 +1986,7 @@ review:
       repo, adapter, makeIO().io,
       KEYS.down + KEYS.t + KEYS.enter
         + "AA Index 54" + KEYS.enter + KEYS.w,
-      ["--global-dir", isolatedGlobal()],
+      ["--global-dir", userDirOf(repo)],
     );
     expect(out).toMatch(/^fleet: wrote /);
     const written = readFileSync(overlayAt(repo), "utf8");
@@ -1986,14 +1999,14 @@ review:
     // a mode-only write
     const a = setupNoted();
     queueAnswers("y");
-    expect(await drive(a.repo, a.adapter, makeIO().io, MODE_ONLY_WRITE, ["--global-dir", isolatedGlobal()])).toMatch(/^fleet: wrote /);
+    expect(await drive(a.repo, a.adapter, makeIO().io, MODE_ONLY_WRITE, ["--global-dir", userDirOf(a.repo)])).toMatch(/^fleet: wrote /);
     const afterMode = readFileSync(overlayAt(a.repo), "utf8");
     expect(afterMode).toContain("mode: staff-led");
     expect(afterMode).toContain(`fake-1: mid  # ${NOTE}`);
     // a steering-only write (picker: toggle the bare fake adapter, apply, review, confirm)
     const b = setupNoted();
     queueAnswers("y");
-    expect(await drive(b.repo, b.adapter, makeIO().io, OPEN_STEER + KEYS.f + KEYS.space + KEYS.enter + KEYS.w, ["--global-dir", isolatedGlobal()])).toMatch(/^fleet: wrote /);
+    expect(await drive(b.repo, b.adapter, makeIO().io, OPEN_STEER + KEYS.f + KEYS.space + KEYS.enter + KEYS.w, ["--global-dir", userDirOf(b.repo)])).toMatch(/^fleet: wrote /);
     const afterSteer = readFileSync(overlayAt(b.repo), "utf8");
     expect(parsedOverlay(b.repo).review.prefer).toEqual(["fake"]);
     expect(afterSteer).toContain(`fake-1: mid  # ${NOTE}`);
@@ -2002,7 +2015,7 @@ review:
   test("a repo overlay with no existing provenance comments loads a fleet session with no provenance data and writes no spurious notes", async () => {
     const { repo, adapter } = setup(); // FAKE_TIERS carries no comments
     queueAnswers("y");
-    const out = await drive(repo, adapter, makeIO().io, MODE_ONLY_WRITE, ["--global-dir", isolatedGlobal()]);
+    const out = await drive(repo, adapter, makeIO().io, MODE_ONLY_WRITE, ["--global-dir", userDirOf(repo)]);
     expect(out).toMatch(/^fleet: wrote /);
     const written = readFileSync(overlayAt(repo), "utf8");
     expect(written).toContain("mode: staff-led");
@@ -2017,7 +2030,7 @@ review:
       - fake:fake-2  # burned quota — re-enable in August
 `);
     queueAnswers("y");
-    const out = await drive(repo, adapter, makeIO().io, MODE_ONLY_WRITE, ["--global-dir", isolatedGlobal()]);
+    const out = await drive(repo, adapter, makeIO().io, MODE_ONLY_WRITE, ["--global-dir", userDirOf(repo)]);
     expect(out).toMatch(/^fleet: wrote /);
     const written = readFileSync(overlayAt(repo), "utf8");
     expect(written).toContain("- fake:fake-2  # burned quota — re-enable in August"); // hand-written deny reason
@@ -2035,7 +2048,7 @@ review:
     // OBS-994/FL-1: two presses reach out(all) — this test targets the all-seats allow form.
     const bytes = REACH_ALL + KEYS.down + KEYS.t + KEYS.down + KEYS.enter + KEYS.enter
       + "AA Index 54" + KEYS.enter + KEYS.w;
-    const out = await drive(repo, adapter, io.io, bytes, ["--global-dir", isolatedGlobal()]);
+    const out = await drive(repo, adapter, io.io, bytes, ["--global-dir", userDirOf(repo)]);
     expect(out).toMatch(/^fleet: wrote /);
     expect(strip(io.writes.join(""))).toContain("benchmark-provenance note is required");
     const overlay = parsedOverlay(repo);
@@ -2046,16 +2059,15 @@ review:
   });
 
   test("a corrected entry after a re-prompt applies the tier assignment exactly as if it had been entered correctly the first time", async () => {
-    const gdir = isolatedGlobal();
     const classify = (emptyFirst: boolean) =>
       KEYS.down + KEYS.t + KEYS.down + KEYS.enter
       + (emptyFirst ? KEYS.enter : "") + "AA Index 54" + KEYS.enter + KEYS.w;
     const a = setup();
     queueAnswers("y");
-    expect(await drive(a.repo, a.adapter, makeIO().io, classify(true), ["--global-dir", gdir])).toMatch(/^fleet: wrote /);
+    expect(await drive(a.repo, a.adapter, makeIO().io, classify(true), ["--global-dir", userDirOf(a.repo)])).toMatch(/^fleet: wrote /);
     const b = setup();
     queueAnswers("y");
-    expect(await drive(b.repo, b.adapter, makeIO().io, classify(false), ["--global-dir", gdir])).toMatch(/^fleet: wrote /);
+    expect(await drive(b.repo, b.adapter, makeIO().io, classify(false), ["--global-dir", userDirOf(b.repo)])).toMatch(/^fleet: wrote /);
     expect(readFileSync(overlayAt(a.repo), "utf8")).toBe(readFileSync(overlayAt(b.repo), "utf8"));
   });
 
@@ -2080,7 +2092,7 @@ review:
     const out = await drive(
       repo, fakeAdapter(repo), makeIO().io,
       KEYS.down + KEYS.t + KEYS.down + KEYS.enter + "AA Index 54" + KEYS.enter + KEYS.w,
-      ["--global-dir", isolatedGlobal()],
+      ["--global-dir", userDirOf(repo)],
     );
     expect(out).toMatch(/^fleet: wrote /);
     expect(out).toContain("1 newly classified model(s) have no probe verdict yet (fake:fake-2)");
@@ -2092,7 +2104,7 @@ review:
     const silent = await drive(
       probed.repo, probed.adapter, makeIO().io,
       KEYS.down + KEYS.t + KEYS.down + KEYS.enter + "AA Index 54" + KEYS.enter + KEYS.w,
-      ["--global-dir", isolatedGlobal()],
+      ["--global-dir", userDirOf(probed.repo)],
     );
     expect(silent).toMatch(/^fleet: wrote /);
     expect(silent).not.toContain("probe verdict");
@@ -2109,7 +2121,7 @@ review:
       REACH_ALL + KEYS.t + KEYS.down + KEYS.t
         + KEYS.down + KEYS.down + KEYS.enter + KEYS.enter
         + "AA Index 54" + KEYS.enter + KEYS.w,
-      ["--global-dir", isolatedGlobal()],
+      ["--global-dir", userDirOf(repo)],
     );
     expect(out).toBe("fleet: discarded overlay changes");
     const all = strip(io.writes.join(""));
@@ -2129,7 +2141,7 @@ review:
     // dynamic import mirrors init.ts and keeps Ink's color detection AFTER the TTY fixture above
     const { runFleetInkEditor } = await import("../../src/tui/ink/fleet-app.js");
     const assembled = await assembleFleetEditor(repo, [adapter], io.io, {
-      globalDir: isolatedGlobal(),
+      globalDir: userDirOf(repo),
       entry: "presets",
     });
     if ("unavailable" in assembled) throw new Error(assembled.unavailable);
@@ -2197,7 +2209,7 @@ review:
     const io = makeIO();
     // steering: down down lands on the judge row; f opens the picker; down skips (keep default)
     const bytes = OPEN_STEER + KEYS.down + KEYS.down + KEYS.f + KEYS.down + KEYS.enter + KEYS.w;
-    const out = await drive(repo, adapter, io.io, bytes, ["--global-dir", isolatedGlobal()]);
+    const out = await drive(repo, adapter, io.io, bytes, ["--global-dir", userDirOf(repo)]);
     expect(out).toMatch(/^fleet: wrote /);
     const all = strip(io.writes.join(""));
     expect(all).toContain("(keep default)  claude-code:fable"); // the picker names the resolved default
@@ -2245,7 +2257,7 @@ review:
     // classify flow (FAKE_TIERS declares the channel, so it opens at the tier pick — the same
     // flow `t` opens) — never a silent no-op.
     const bytes = KEYS.down + KEYS.down + KEYS.space;
-    const p = fleet(["--global-dir", isolatedGlobal()], repo, [adapter], io.io);
+    const p = fleet(["--global-dir", userDirOf(repo)], repo, [adapter], io.io);
     io.input.write(bytes + KEYS.escape + KEYS.q);
     await p;
     const all = strip(io.writes.join(""));
@@ -2271,7 +2283,7 @@ review:
     utimesSync(join(tickmarkrDir(repo), "doctor.json"), when, when);
     const adapter = fakeAdapter(repo);
     const io = makeIO();
-    const p = fleet(["--global-dir", isolatedGlobal()], repo, [adapter], io.io);
+    const p = fleet(["--global-dir", userDirOf(repo)], repo, [adapter], io.io);
     // models browser → toggle show-all → quit
     io.input.write(KEYS.a + KEYS.q);
     await p;
@@ -2298,7 +2310,7 @@ review:
     // search mode swallows t/n/a as search characters — "fake-new" narrowing keeps working
     const { repo, adapter } = setup();
     const io = makeIO();
-    const p = fleet(["--global-dir", isolatedGlobal()], repo, [adapter], io.io);
+    const p = fleet(["--global-dir", userDirOf(repo)], repo, [adapter], io.io);
     io.input.write("/fake-n" + KEYS.escape + KEYS.q);
     await p;
     const all = strip(io.writes.join(""));
@@ -2321,7 +2333,7 @@ review:
     const { repo, adapter } = setup();
     const before = readFileSync(overlayAt(repo), "utf8");
     const bytes = OPEN_STEER + KEYS.down + KEYS.down + KEYS.f + KEYS.enter + KEYS.w + KEYS.q;
-    const out = await drive(repo, adapter, makeIO().io, bytes, ["--global-dir", isolatedGlobal()]);
+    const out = await drive(repo, adapter, makeIO().io, bytes, ["--global-dir", userDirOf(repo)]);
     expect(out).toBe("fleet: quit without writing");
     expect(readFileSync(overlayAt(repo), "utf8")).toBe(before);
   });
@@ -2330,7 +2342,7 @@ review:
   test("type-to-search narrows a picker list and backspace restores the dropped rows", async () => {
     const { repo, adapter } = setup();
     const io = makeIO();
-    const done = fleet(["--global-dir", isolatedGlobal()], repo, [adapter], io.io);
+    const done = fleet(["--global-dir", userDirOf(repo)], repo, [adapter], io.io);
     io.input.write(OPEN_STEER + KEYS.f);
     await settle(() => io.writes.join("").includes("edit · review.prefer"));
     io.input.write("1");
@@ -2354,7 +2366,7 @@ review:
     withOverlay(repo, TWO_CLASSIFIED);
     const io = makeIO();
     io.output.rows = 18; // viewRows = max(8, 18-12) = 8 → review window 9 rows
-    const done = fleet(["--global-dir", isolatedGlobal()], repo, [adapter], io.io);
+    const done = fleet(["--global-dir", userDirOf(repo)], repo, [adapter], io.io);
     // OBS-994/FL-1: a workers-only press on one classified row plus two presses (out all) on the
     // next stage a workers deny block AND the allow form — a diff taller than the 9-row window
     // (OBS-1046: an addition writes no deny tombstones, so one scope alone no longer overflows it).
@@ -2373,7 +2385,7 @@ review:
   // ── OBS-525: pools round-trip through the editor ──
   // returns { done } — a bare promise return would be FLATTENED by the caller's await
   const stageDocsPool = async (io: ReturnType<typeof makeIO>, repo: string, adapter: FakeAdapter) => {
-    const done = fleet(["--global-dir", isolatedGlobal()], repo, [adapter], io.io);
+    const done = fleet(["--global-dir", userDirOf(repo)], repo, [adapter], io.io);
     io.input.write(TO_DOCS + KEYS.p + KEYS.down + KEYS.space + KEYS.up + KEYS.space + KEYS.enter);
     await settle(() => strip(io.writes.join("")).includes("pool mode · docs"));
     const mark = io.writes.length;
@@ -2426,7 +2438,7 @@ review:
   test("closing an overlay restores the committed model search instead of dumping the operator on the unfiltered list", async () => {
     const { repo, adapter } = setup();
     const io = makeIO();
-    const done = fleet(["--global-dir", isolatedGlobal()], repo, [adapter], io.io);
+    const done = fleet(["--global-dir", userDirOf(repo)], repo, [adapter], io.io);
     io.input.write("/e-2" + KEYS.enter); // commit the filter
     await settle(() => strip(io.writes.join("")).includes("> e-2"));
     io.input.write(KEYS.enter); // fake-2 is unclassified → the classify overlay opens
@@ -2443,7 +2455,7 @@ review:
   test("the header counts staged edits while they exist and drops the chip when the last one is untoggled", async () => {
     const { repo, adapter } = setup();
     const io = makeIO();
-    const done = fleet(["--global-dir", isolatedGlobal()], repo, [adapter], io.io);
+    const done = fleet(["--global-dir", userDirOf(repo)], repo, [adapter], io.io);
     io.input.write(REACH_WORKERS);
     await settle(() => io.writes.map(strip).some((f) => f.includes("· 1 staged")));
     expect(io.writes.map(strip).some((f) => f.includes("· 1 staged"))).toBe(true);
@@ -2475,7 +2487,7 @@ review:
       },
     });
     const io: FleetIO = { input: base.input as unknown as NodeJS.ReadStream, output: output as unknown as NodeJS.WriteStream, debug: true };
-    const done = fleet(["--global-dir", isolatedGlobal()], repo, [adapter], io);
+    const done = fleet(["--global-dir", userDirOf(repo)], repo, [adapter], io);
     base.input.write(REACH_WORKERS); // stage a toggle so state survival across the resize is observable
     await settle(() => writes.map(strip).some((f) => f.includes("· 1 staged")));
     const frameWidth = (frame: string) =>
@@ -2498,7 +2510,7 @@ review:
     const io = makeIO();
     delete (io.input as Partial<TestInput>).ref;
     delete (io.input as Partial<TestInput>).unref;
-    const done = fleet(["--global-dir", isolatedGlobal()], repo, [adapter], io.io);
+    const done = fleet(["--global-dir", userDirOf(repo)], repo, [adapter], io.io);
     await settle(() => io.writes.map(strip).some((f) => f.includes("All models")));
     // bypass makeIO's one-key pump: a real paste delivers the whole chunk in ONE data event
     PassThrough.prototype.write.call(io.input, "/e-2\r");
@@ -2514,7 +2526,7 @@ review:
   test("the candidate picker names every excluded bucket instead of omitting channels silently", async () => {
     const { repo, adapter } = setup();
     const io = makeIO();
-    const done = fleet(["--global-dir", isolatedGlobal()], repo, [adapter], io.io);
+    const done = fleet(["--global-dir", userDirOf(repo)], repo, [adapter], io.io);
     io.input.write(REACH_WORKERS); // stage fake-1 out — the picker must attribute its absence
     await settle(() => io.writes.map(strip).some((f) => f.includes("· 1 staged")));
     io.input.write(OPEN_SHAPES + KEYS.p);
@@ -2574,7 +2586,7 @@ describe("D-225: greyed ledger rows", () => {
     listModels: async () => [],
   };
   const pickImplement = async (repo: string, adapter: WorkerAdapter) => {
-    const assembled = await assembleFleetEditor(repo, [adapter], makeIO().io, { globalDir: isolatedGlobal() });
+    const assembled = await assembleFleetEditor(repo, [adapter], makeIO().io, { globalDir: userDirOf(repo) });
     if ("unavailable" in assembled) throw new Error(assembled.unavailable);
     const { candidatesForShape, initialMap, props } = { ...assembled, ...assembled.props };
     const deny = {
@@ -2636,9 +2648,9 @@ describe("D-225: greyed ledger rows", () => {
 describe("Fleet role selection", () => {
   test("test: fleet --pick returns the shared role choice as complete JSON identity after vendor exclusion without launching a seat or changing configuration, so printing a preference list instead of a resolved choice fails", async () => {
     const { repo, adapter } = setup();
-    const globalDir = isolatedGlobal();
+    const globalDir = userDirOf(repo);
     withOverlay(repo, `${FAKE_TIERS}consult:\n  prefer: [fake:fake-1, fake:fake-2]\n`);
-    const configPath = join(repo, ".tickmarkr", "config.yaml");
+    const configPath = overlayFile(repo);
     const before = readFileSync(configPath, "utf8");
     const doctorPath = join(repo, ".tickmarkr", "doctor.json");
     const doctorBefore = readFileSync(doctorPath, "utf8");
@@ -2676,7 +2688,7 @@ describe("Fleet role selection", () => {
 
   test("test: fleet --pick returns a named nonzero refusal for missing prefer versus a complete eligible selection for configured prefer, so unsupported roles or exhausted vendor filters silently defaulting fails", async () => {
     const { repo, adapter } = setup();
-    const globalDir = isolatedGlobal();
+    const globalDir = userDirOf(repo);
     const pick = (role: string, extra: string[] = []) => fleet(["--pick", role, "--global-dir", globalDir, ...extra], repo, [adapter]);
     for (const role of ["consult", "review", "worker", "judge"]) {
       expect(await pick(role)).toEqual({ code: 1, out: expect.stringContaining(`${role}.prefer: missing-prefer`) });
@@ -2715,13 +2727,13 @@ describe("OBS-1144 the write review names each dead carried pool entry", () => {
     const writeDeny = async (channels: string) => {
       const { repo, adapter } = setup();
       withOverlay(repo, `${FAKE_TIERS}routing:\n  map:\n    implement: { pool: { mode: ordered, channels: [${channels}] } }\n`);
-      const globalDir = isolatedGlobal();
+      const globalDir = userDirOf(repo);
       const io = makeIO();
       queueAnswers("y");
       // the cursor row is fake:fake-1 (B): out(workers) stages the deny the review must explain
       const out = await drive(repo, adapter, io.io, REACH_WORKERS + KEYS.w, ["--global-dir", globalDir]);
       expect(out).toMatch(/^fleet: wrote /);
-      expect(parse(readFileSync(join(repo, ".tickmarkr", "config.yaml"), "utf8")).routing.deny.workers.models).toEqual(["fake:fake-1"]);
+      expect(parse(readFileSync(overlayFile(repo), "utf8")).routing.deny.workers.models).toEqual(["fake:fake-1"]);
       const review = reviewText(io.writes.find((f) => strip(f).includes("review ·")) ?? "");
       const why = await fleet(["--why", "--global-dir", globalDir], repo, [adapter]);
       return { review, implement: why.split("\n").find((line) => /\bimplement\b/.test(line)) ?? "" };
@@ -2746,7 +2758,7 @@ describe("OBS-1144 the write review names each dead carried pool entry", () => {
     const io = makeIO();
     io.output.columns = 80;
     io.output.rows = 24; // viewRows 12 → a 13-row review window; five notes wrap to far more rows
-    const done = fleet(["--global-dir", isolatedGlobal()], repo, [adapter], io.io);
+    const done = fleet(["--global-dir", userDirOf(repo)], repo, [adapter], io.io);
     io.input.write(REACH_WORKERS + KEYS.w);
     await settle(() => strip(io.writes.join("")).includes("review · "));
     expect(strip(io.writes.at(-1)!)).toMatch(/… \d+ below — ↓ scrolls/);
@@ -2815,7 +2827,7 @@ ${models.map((m) => `      ${m}: frontier\n`).join("")}routing:
     utimesSync(join(tickmarkrDir(repo), "doctor.json"), when, when);
     return repo;
   };
-  const written = (repo: string) => parse(readFileSync(join(repo, ".tickmarkr", "config.yaml"), "utf8")) as Record<string, any>;
+  const written = (repo: string) => parse(readFileSync(overlayFile(repo), "utf8")) as Record<string, any>;
   // opens docs' picker, returns its first frame and the row index of each candidate/ledger line
   const openPicker = async (io: ReturnType<typeof makeIO>, keys: string) => {
     const mark = io.writes.length;
@@ -2838,7 +2850,7 @@ ${models.map((m) => `      ${m}: frontier\n`).join("")}routing:
     // Space on X: the ✗ row carries ordinal 2 and its deny reason; Space drops it, B renumbers
     const repo = setupAXB();
     const io = makeIO();
-    const done = fleet(["--global-dir", isolatedGlobal()], repo, [threeAdapter], io.io);
+    const done = fleet(["--global-dir", userDirOf(repo)], repo, [threeAdapter], io.io);
     const { frame, rowOf } = await openPicker(io, TO_DOCS + KEYS.p);
     expect(frame).toMatch(/1 fake:fake-1/);
     expect(frame).toMatch(/2 ✗ fake\/fake-2 — reach: out all — routing\.deny\.models \(fake:fake-2\)/);
@@ -2858,7 +2870,7 @@ ${models.map((m) => `      ${m}: frontier\n`).join("")}routing:
 
     // reopen: the remaining pool and order round-trip; Space on the now-unchained ✗ X adds nothing
     const again = makeIO();
-    const reopened = fleet(["--global-dir", isolatedGlobal()], repo, [threeAdapter], again.io);
+    const reopened = fleet(["--global-dir", userDirOf(repo)], repo, [threeAdapter], again.io);
     const second = await openPicker(again, TO_DOCS + KEYS.p);
     expect(second.frame).toMatch(/1 fake:fake-1/);
     expect(second.frame).toMatch(/2 fake:fake-3/);
@@ -2874,7 +2886,7 @@ ${models.map((m) => `      ${m}: frontier\n`).join("")}routing:
     // versus: Space on B instead leaves X untouched — it is retained at its ordinal and written
     const control = setupAXB();
     const cio = makeIO();
-    const cdone = fleet(["--global-dir", isolatedGlobal()], control, [threeAdapter], cio.io);
+    const cdone = fleet(["--global-dir", userDirOf(control)], control, [threeAdapter], cio.io);
     const picker = await openPicker(cio, TO_DOCS + KEYS.p);
     const b = picker.rowOf("fake:fake-3");
     expect(await commit(cio, KEYS.down.repeat(b) + KEYS.space + KEYS.up.repeat(b))).toContain("pool: fake:fake-1 → fake:fake-2");
@@ -2887,7 +2899,7 @@ ${models.map((m) => `      ${m}: frontier\n`).join("")}routing:
     // so Tab is the commit path — it writes [Y] and reopening shows Y alone at ordinal 1
     const repo = setupAXB("[fake:fake-1, fake:fake-2, fake:fake-3]", "[fake:fake-1, fake:fake-2]");
     const io = makeIO();
-    const done = fleet(["--global-dir", isolatedGlobal()], repo, [threeAdapter], io.io);
+    const done = fleet(["--global-dir", userDirOf(repo)], repo, [threeAdapter], io.io);
     const { frame } = await openPicker(io, TO_DOCS + KEYS.p);
     expect(frame).toMatch(/2 ✗ fake\/fake-2/);
     expect(frame).toMatch(/❯ 1 ✗ fake\/fake-1/); // the cursor opens on X
@@ -2897,7 +2909,7 @@ ${models.map((m) => `      ${m}: frontier\n`).join("")}routing:
     expect(written(repo).routing.deny.models).toEqual(["fake:fake-1", "fake:fake-2", "fake:fake-3"]);
 
     const again = makeIO();
-    const reopened = fleet(["--global-dir", isolatedGlobal()], repo, [threeAdapter], again.io);
+    const reopened = fleet(["--global-dir", userDirOf(repo)], repo, [threeAdapter], again.io);
     const second = await openPicker(again, TO_DOCS + KEYS.p);
     expect(second.frame).toMatch(/1 ✗ fake\/fake-2/);
     expect(second.frame).not.toMatch(/\d ✗ fake\/fake-1/);
@@ -2907,11 +2919,11 @@ ${models.map((m) => `      ${m}: frontier\n`).join("")}routing:
 
   test("carried entries lead the picker ledger in chain order and an undiscovered one still gets its own row", async () => {
     const repo = setupAXB();
-    withOverlay(repo, readFileSync(join(repo, ".tickmarkr", "config.yaml"), "utf8")
+    withOverlay(repo, readFileSync(overlayFile(repo), "utf8")
       .replace("fake-3: frontier", "fake-3: frontier\n      fake-4: frontier")
       .replace("models: [fake:fake-2]", "models: [fake:fake-2, fake:fake-4]")
       .replace("[fake:fake-1, fake:fake-2, fake:fake-3]", "[fake:fake-1, fake:fake-9, fake:fake-4, fake:fake-3]"));
-    const assembled = await assembleFleetEditor(repo, [threeAdapter], makeIO().io, { globalDir: isolatedGlobal() });
+    const assembled = await assembleFleetEditor(repo, [threeAdapter], makeIO().io, { globalDir: userDirOf(repo) });
     if ("unavailable" in assembled) throw new Error(assembled.unavailable);
     const { candidatesForShape, initialMap, initialDenyAdapters, initialDenyModels } = assembled.props;
     const picked = candidatesForShape("docs", "risk-based", initialMap, {
@@ -2943,12 +2955,12 @@ describe("OBS-1052(3) review no-verdict history", () => {
   const surfaces = async (runs: number[]) => {
     const { repo, adapter } = setup();
     for (const noVerdicts of runs) completedRun(repo, noVerdicts);
-    const assembled = await assembleFleetEditor(repo, [adapter], makeIO().io, { globalDir: isolatedGlobal() });
+    const assembled = await assembleFleetEditor(repo, [adapter], makeIO().io, { globalDir: userDirOf(repo) });
     if ("unavailable" in assembled) throw new Error(assembled.unavailable);
     const reviewPool = registry.discoverChannels(loadConfig(repo), [adapter], registry.readDoctor(repo)!, "review")
       .map((c) => `${c.adapter}:${c.model}`);
     const { io, writes } = makeIO();
-    expect(await drive(repo, adapter, io, OPEN_STEER + KEYS.q, ["--global-dir", isolatedGlobal()])).toBe("fleet: quit without writing");
+    expect(await drive(repo, adapter, io, OPEN_STEER + KEYS.q, ["--global-dir", userDirOf(repo)])).toBe("fleet: quit without writing");
     const frame = strip(writes.join(""));
     const report = strip(await doctor(["--"], repo, [doctorStub], { banner: false }));
     return { assembled, reviewPool, frame, report };
@@ -2985,10 +2997,20 @@ describe("OBS-1052(3) review no-verdict history", () => {
   });
 });
 
+// B2: the only layer under the user overlay Fleet writes is the defaults, so a lower-layer fixture is
+// a scoped DEFAULT_CONFIG injection (the loader clones the defaults per call), restored when the test ends.
+const withDefaultTiers = (tiers: Record<string, Record<string, unknown>>) => {
+  for (const [adapter, fields] of Object.entries(tiers)) {
+    const saved = DEFAULT_CONFIG.tiers[adapter];
+    DEFAULT_CONFIG.tiers[adapter] = { ...structuredClone(saved), ...fields } as (typeof DEFAULT_CONFIG.tiers)[string];
+    onTestFinished(() => { DEFAULT_CONFIG.tiers[adapter] = saved; });
+  }
+};
+
 describe("OBS-1182 Fleet persists launch effort as channel metadata", () => {
   test("Fleet round-trips configured Claude high or Codex medium effort into routed Assignment versus omitted effort preserving defaults, so a metadata bridge changing channel identity fails", async () => {
     const repo = makeRepo({ "keep.txt": "x" });
-    const gdir = isolatedGlobal();
+    const gdir = userDirOf(repo);
     // a pre-existing codex override: the effort write must land BESIDE its channel, never replace it
     withOverlay(repo, "tiers:\n  codex:\n    modelOverrides:\n      gpt-5.6-sol: { channel: api }\n");
     const authed = (models: string[]) => ({
@@ -3027,7 +3049,7 @@ describe("OBS-1182 Fleet persists launch effort as channel metadata", () => {
     // default → low → medium → high on fable; default → low → medium on sol
     expect(await session(`${search("claude-code/fable")}eee${KEYS.escape}${search("codex/gpt-5.6-sol")}ee${KEYS.escape}${KEYS.w}y`))
       .toMatch(/^fleet: wrote /);
-    const parsedOverlay = () => parse(readFileSync(join(repo, ".tickmarkr", "config.yaml"), "utf8")) as Record<string, any>;
+    const parsedOverlay = () => parse(readFileSync(overlayFile(repo), "utf8")) as Record<string, any>;
     const written = parsedOverlay();
     expect(written.tiers["claude-code"]).toEqual({ modelOverrides: { fable: { effort: "high" } } });
     expect(written.tiers.codex).toEqual({ modelOverrides: { "gpt-5.6-sol": { channel: "api", effort: "medium" } } });
@@ -3039,7 +3061,7 @@ describe("OBS-1182 Fleet persists launch effort as channel metadata", () => {
     const omitted = routed("claude-code", "opus");
     expect(omitted).toEqual({ adapter: "claude-code", model: "opus", channel: "sub", tier: "frontier" });
     expect("effort" in omitted).toBe(false);
-    expect(await fleet(["--print", "--global-dir", gdir], repo, seats)).toMatch(/fable:\s+effort: high # repo — fleet e edits/);
+    expect(await fleet(["--print", "--global-dir", gdir], repo, seats)).toMatch(/fable:\s+effort: high # global — fleet e edits/);
 
     // high → default clears fable's key alone; sol keeps its channel and medium effort
     expect(await session(`${search("claude-code/fable")}e${KEYS.escape}${KEYS.w}y`)).toMatch(/^fleet: wrote /);
@@ -3053,17 +3075,12 @@ describe("OBS-1182 Fleet persists launch effort as channel metadata", () => {
 
   test("clearing an effort a lower layer declares masks it in the merged config, keeping vendor/channel siblings and never an empty override", async () => {
     const repo = makeRepo({ "keep.txt": "x" });
-    const gdir = isolatedGlobal();
-    // global high under repo medium (fable); global effort-only (opus); global effort beside a channel (sol)
-    writeFileSync(join(gdir, "config.yaml"), `tiers:
-  claude-code:
-    modelOverrides:
-      fable: { effort: high }
-      opus: { effort: low }
-  codex:
-    modelOverrides:
-      gpt-5.6-sol: { channel: api, effort: high }
-`);
+    withDefaultTiers({
+      // defaults high under user medium (fable); default effort-only (opus); default effort beside a channel (sol)
+      "claude-code": { modelOverrides: { fable: { effort: "high" }, opus: { effort: "low" } } },
+      codex: { modelOverrides: { "gpt-5.6-sol": { channel: "api", effort: "high" } } },
+    });
+    const gdir = userDirOf(repo);
     withOverlay(repo, "tiers:\n  claude-code:\n    modelOverrides:\n      fable: { effort: medium }\n");
     const authed = (models: string[]) => ({
       installed: true, authed: true, version: "x", models, modelsDetectedAt: "2026-09-25T00:00:00.000Z",
@@ -3083,7 +3100,7 @@ describe("OBS-1182 Fleet persists launch effort as channel metadata", () => {
     io.input!.write(`${search("claude-code/fable")}ee${KEYS.escape}${search("claude-code/opus")}eee${KEYS.escape}${search("codex/gpt-5.6-sol")}e${KEYS.escape}${KEYS.w}y`);
     expect(await out).toMatch(/^fleet: wrote /);
 
-    const written = parse(readFileSync(join(repo, ".tickmarkr", "config.yaml"), "utf8")) as Record<string, any>;
+    const written = parse(readFileSync(overlayFile(repo), "utf8")) as Record<string, any>;
     expect(written.tiers["claude-code"].modelOverrides).toEqual({ fable: null, opus: null });
     expect(written.tiers.codex.modelOverrides).toEqual({ "gpt-5.6-sol": { effort: null } });
     const cfg = loadConfig(repo, { globalDir: gdir });
@@ -3093,11 +3110,13 @@ describe("OBS-1182 Fleet persists launch effort as channel metadata", () => {
     expect(all.find((c) => c.model === "gpt-5.6-sol")?.channel).toBe("api");
   });
 
-  test("clearing a repo effort masks a global one even when the global layer only validates beside repo fields", async () => {
+  test("clearing a user effort masks a default one even when the defaults only validate beside user fields", async () => {
     const repo = makeRepo({ "keep.txt": "x" });
-    const gdir = isolatedGlobal();
-    // D-503 repro: global vendor:null cannot load without the repo's vendor, yet its fable effort is inherited
-    writeFileSync(join(gdir, "config.yaml"), "tiers:\n  claude-code:\n    vendor: null\n    modelOverrides:\n      fable: { effort: high }\n");
+    withDefaultTiers({
+      // D-503 repro, one layer down: a default vendor:null cannot load without the user's vendor, yet its fable effort is inherited
+      "claude-code": { vendor: null, modelOverrides: { fable: { effort: "high" } } },
+    });
+    const gdir = userDirOf(repo);
     withOverlay(repo, "tiers:\n  claude-code:\n    vendor: anthropic\n    modelOverrides:\n      fable: { effort: medium }\n");
     registry.writeDoctor(repo, { "claude-code": {
       installed: true, authed: true, version: "x", models: ["fable"], modelsDetectedAt: "2026-09-25T00:00:00.000Z",
@@ -3116,7 +3135,7 @@ describe("OBS-1182 Fleet persists launch effort as channel metadata", () => {
     io.input!.write(`/claude-code/fable${KEYS.enter}ee${KEYS.escape}${KEYS.w}y`);
     expect(await out).toMatch(/^fleet: wrote /);
 
-    const written = parse(readFileSync(join(repo, ".tickmarkr", "config.yaml"), "utf8")) as Record<string, any>;
+    const written = parse(readFileSync(overlayFile(repo), "utf8")) as Record<string, any>;
     expect(written.tiers["claude-code"]).toEqual({ vendor: "anthropic", modelOverrides: { fable: null } });
     const fable = channelsFromConfig("claude-code", loadConfig(repo, { globalDir: gdir })).find((c) => c.model === "fable");
     expect(fable).toMatchObject({ vendor: "anthropic", channel: "sub" });
@@ -3127,17 +3146,12 @@ describe("OBS-1182 Fleet persists launch effort as channel metadata", () => {
 describe("OBS-1182 setting effort beneath a tombstone", () => {
   test("setting an effort beneath a tombstoned override or modelOverrides re-masks the inherited vendor/channel and sibling overrides it suppressed", async () => {
     const repo = makeRepo({ "keep.txt": "x" });
-    const gdir = isolatedGlobal();
-    writeFileSync(join(gdir, "config.yaml"), `tiers:
-  claude-code:
-    modelOverrides:
-      fable: { channel: api }
-  codex:
-    modelOverrides:
-      gpt-5.6-sol: { vendor: azure, channel: api }
-      gpt-5.6-terra: { channel: api }
-`);
-    // the repo suppresses fable's override and codex's whole modelOverrides block
+    withDefaultTiers({
+      "claude-code": { modelOverrides: { fable: { channel: "api" } } },
+      codex: { modelOverrides: { "gpt-5.6-sol": { vendor: "azure", channel: "api" }, "gpt-5.6-terra": { channel: "api" } } },
+    });
+    const gdir = userDirOf(repo);
+    // the user layer suppresses fable's default override and codex's whole modelOverrides block
     withOverlay(repo, "tiers:\n  claude-code:\n    modelOverrides:\n      fable: null\n  codex:\n    modelOverrides: null\n");
     const authed = (models: string[]) => ({
       installed: true, authed: true, version: "x", models, modelsDetectedAt: "2026-09-25T00:00:00.000Z",
@@ -3165,7 +3179,7 @@ describe("OBS-1182 setting effort beneath a tombstone", () => {
     io.input!.write(`${search("claude-code/fable")}e${KEYS.escape}${search("codex/gpt-5.6-sol")}ee${KEYS.escape}${KEYS.w}y`);
     expect(await out).toMatch(/^fleet: wrote /);
 
-    const written = parse(readFileSync(join(repo, ".tickmarkr", "config.yaml"), "utf8")) as Record<string, any>;
+    const written = parse(readFileSync(overlayFile(repo), "utf8")) as Record<string, any>;
     expect(written.tiers["claude-code"].modelOverrides).toEqual({ fable: { effort: "low", channel: null } });
     expect(written.tiers.codex.modelOverrides).toEqual({
       "gpt-5.6-sol": { effort: "medium", vendor: null, channel: null },
@@ -3175,5 +3189,294 @@ describe("OBS-1182 setting effort beneath a tombstone", () => {
     expect(seatOf("fable")).toEqual({ ...before.fable, effort: "low" });
     expect(seatOf("gpt-5.6-sol")).toEqual({ ...before.sol, effort: "medium" });
     expect(seatOf("gpt-5.6-terra")).toEqual(before.terra);
+  });
+});
+
+describe("B2 Fleet saves machine model choices to the user overlay", () => {
+  // the fixed FakeAdapter serves two hard-coded channels; a tiered one reads the loaded tiers like a real adapter
+  const tiered = (repo: string, id = "fake"): WorkerAdapter => Object.assign(Object.create(fakeAdapter(repo)) as WorkerAdapter, {
+    id, channels: (cfg: Parameters<WorkerAdapter["channels"]>[0]) => channelsFromConfig(id, cfg),
+  });
+  const fakeTiers = (models: string[], tier = "mid") =>
+    `tiers:\n  fake:\n    vendor: fake\n    channel: sub\n    models:\n${models.map((m) => `      ${m}: ${tier}\n`).join("")}`;
+  // a repo with the given user layer, optional repo overlay and a fresh doctor probing each adapter's models
+  const b2Repo = (user: string, repoOverlay: string | undefined, doctor: Record<string, string[]>) => {
+    const repo = makeRepo({ "keep.txt": "x" });
+    withOverlay(repo, user);
+    if (repoOverlay !== undefined) withRepoOverlay(repo, repoOverlay);
+    const authed = { authed: true, probedAt: "2026-09-29T00:00:00.000Z" };
+    registry.writeDoctor(repo, Object.fromEntries(Object.entries(doctor).map(([id, models]) => [id, {
+      installed: true, authed: true, version: "fake", models,
+      modelsDetectedAt: "2026-09-29T00:00:00.000Z", modelAuth: Object.fromEntries(models.map((m) => [m, authed])),
+    }])));
+    const when = new Date(Date.now() - 5 * 60_000);
+    utimesSync(join(tickmarkrDir(repo), "doctor.json"), when, when);
+    return { repo, globalDir: userDirOf(repo), repoPath: join(repo, ".tickmarkr", "config.yaml") };
+  };
+  const noDeny = { adapters: [], models: [], workersAdapters: [], workersModels: [] };
+  const b2Editor = async (repo: string, adapters: WorkerAdapter[], globalDir: string) => {
+    const assembled = await assembleFleetEditor(repo, adapters, makeIO().io, { globalDir });
+    if ("unavailable" in assembled) throw new Error(assembled.unavailable);
+    const { props } = assembled;
+    const base = {
+      denyAdapters: props.initialDenyAdapters, denyModels: props.initialDenyModels,
+      denyWorkersAdapters: props.initialDenyWorkersAdapters, denyWorkersModels: props.initialDenyWorkersModels,
+      classifications: [], selectedMode: props.initialMode, map: props.initialMap, steering: props.initialSteering,
+    };
+    const reviewOf = (state: Partial<Parameters<typeof props.reviewOverlay>[0]>) => {
+      const staged = props.reviewOverlay({ ...base, ...state });
+      if (staged.kind !== "diff") throw new Error("the staged choice must stage a diff");
+      return staged;
+    };
+    const rowOf = (shape: string, map = props.initialMap) => props.shapeRows(props.initialMode, map, noDeny).find((row) => row.id === shape)!.label;
+    return { ...assembled, reviewOf, rowOf };
+  };
+  const taskOf = (shape: string) => TaskSchema.parse({ id: "T1", title: "t", goal: "g", shape, complexity: 3, acceptance: ["a"] });
+  const routed = (repo: string, cfg: ReturnType<typeof loadConfig>, adapter: WorkerAdapter, shape: string) =>
+    route(taskOf(shape), cfg, registry.discoverChannels(cfg, [adapter], registry.readDoctor(repo)!)).assignment;
+
+  test("fleet preview equals the defaults/user/repo loader for model membership classification effort routing allow deny prefer mode reviewer consult and judge choices; malformed or stale reviewed bytes are refused whereas cancel preserves the original user bytes", async () => {
+    const userBytes = `# operator machine choices\n${FAKE_TIERS}`;
+    const { repo, globalDir, repoPath } = b2Repo(userBytes, "concurrency: 2  # a project execution preference\n",
+      { fake: ["fake-1", "fake-2", "fake-new"], codex: ["gpt-6-astra"] });
+    const userPath = overlayFile(repo);
+    const repoBytes = readFileSync(repoPath, "utf8");
+    const { props, commit, reviewOf } = await b2Editor(repo, [fakeAdapter(repo), tiered(repo, "codex")], globalDir);
+    // every machine choice the editor stages, at once
+    const review = () => reviewOf({
+      denyWorkersModels: ["fake:fake-1"],
+      allowOut: ["fake:fake-2"],
+      classifications: [{ adapter: "fake", model: "fake-new", tier: "cheap", note: "AA Index 40" }],
+      efforts: { codex: { "gpt-6-astra": "high" } },
+      selectedMode: "staff-led",
+      map: { ...props.initialMap, implement: { prefer: ["codex"] } },
+      steering: { review: ["fake:fake-1"], consult: ["fake:fake-1"] },
+      judgeSeat: { adapter: "fake", model: "fake-1" },
+    });
+
+    const first = review();
+    expect(first.path).toBe(userPath);
+    expect(first.before).toBe(userBytes);
+    expect(first.notes ?? []).toEqual([]); // the repo overlay decides none of these keys
+    expect(props.reloadGuard(first.after)).toBeNull();
+
+    // malformed reviewed bytes: refused on y and at save, nothing lands
+    const malformed = { ...first, after: "judge: [unclosed\n" };
+    expect(props.reloadGuard(malformed.after)).not.toBeNull();
+    expect(commit({ kind: "write", review: malformed })).toMatch(/^fleet: nothing written — /);
+    expect(readFileSync(userPath, "utf8")).toBe(userBytes);
+
+    // stale reviewed bytes: the user overlay moved after the preview
+    writeFileSync(userPath, `${userBytes}# edited after the preview\n`);
+    expect(commit({ kind: "write", review: first })).toMatch(/^fleet: nothing written — stale preview — the user overlay/);
+    writeFileSync(userPath, userBytes);
+
+    // cancel: the original user bytes stay exactly as they were
+    expect(commit({ kind: "discard" })).toBe("fleet: discarded overlay changes");
+    expect(commit({ kind: "quit" })).toBe("fleet: quit without writing");
+    expect(readFileSync(userPath, "utf8")).toBe(userBytes);
+
+    // confirmed: the defaults/user/repo loader over the files equals the preview's loader over the reviewed bytes
+    const confirmed = review();
+    const previewed = loadConfigWithMode(repo, { globalDir, userOverlayText: confirmed.after });
+    expect(commit({ kind: "write", review: confirmed })).toBe(`fleet: wrote ${userPath}`);
+    expect(readFileSync(userPath, "utf8")).toBe(confirmed.after);
+    expect(readFileSync(repoPath, "utf8")).toBe(repoBytes);
+    const loaded = loadConfigWithMode(repo, { globalDir });
+    expect(loaded).toEqual(previewed);
+    const { cfg } = loaded;
+    expect(cfg.routing.allow).toEqual({ adapters: ["codex"], models: ["fake:fake-1"] }); // membership
+    expect(cfg.routing.deny?.workers?.models).toEqual(["fake:fake-1"]); // deny
+    expect(cfg.tiers.fake.models["fake-new"]).toBe("cheap"); // classification
+    expect(cfg.tiers.codex.modelOverrides?.["gpt-6-astra"]?.effort).toBe("high"); // effort
+    expect(cfg.routing.map.implement?.prefer).toEqual(["codex"]); // routing prefer
+    expect(loaded.mode.mode).toBe("staff-led"); // mode
+    expect(cfg.review.prefer).toEqual(["fake:fake-1"]); // reviewer
+    expect(cfg.consult.prefer).toEqual(["fake:fake-1"]); // consult
+    expect(cfg.judge).toMatchObject({ adapter: "fake", model: "fake-1" }); // judge
+    // the staged membership preview the browser ranks against is the same routing the loader resolves
+    const staged = props.stagedRouting?.({ ...noDeny, workersModels: ["fake:fake-1"], allowOut: ["fake:fake-2"] });
+    expect(staged?.ok && { allow: staged.routing.allow, deny: staged.routing.deny }).toEqual({ allow: cfg.routing.allow, deny: cfg.routing.deny });
+    // and the choice is the machine's: a second repository with no overlay of its own inherits it
+    const second = makeRepo({ "keep.txt": "x" });
+    expect(loadConfig(second, { globalDir }).judge).toMatchObject({ adapter: "fake", model: "fake-1" });
+    expect(existsSync(join(second, ".tickmarkr", "config.yaml"))).toBe(false);
+
+    // a project whose overlay decides the mode, the implement slot and a private adapter's metadata
+    const project = b2Repo(userBytes, [
+      "routing:", "  mode: risk-based", "  map:", "    implement:", "      pin: { via: fake, model: fake-1 }",
+      "tiers:", "  nova:", "    vendor: nova", "    channel: sub", "    models:", "      nova-1: mid", "",
+    ].join("\n"), { fake: ["fake-1", "fake-2"], nova: ["nova-1"] });
+    const projectBytes = readFileSync(project.repoPath, "utf8");
+    const p2 = await b2Editor(project.repo, [fakeAdapter(project.repo), tiered(project.repo, "nova")], project.globalDir);
+    // the user picks staff-led and an implement prefer: the preview's floors come from the same candidate
+    // user bytes the loader resolves — the repo's risk-based still applies, so no floor moves here
+    const picked = { selectedMode: "staff-led" as const, map: { ...p2.props.initialMap, implement: { prefer: ["fake"] } } };
+    const choice = p2.reviewOf(picked);
+    const candidate = loadConfigWithMode(project.repo, { globalDir: project.globalDir, userOverlayText: choice.after });
+    const current = loadConfigWithMode(project.repo, { globalDir: project.globalDir });
+    expect(candidate.mode.mode).toBe("risk-based");
+    expect(SHAPES.filter((s) => current.cfg.routing.floors[s] !== candidate.cfg.routing.floors[s])).toEqual([]);
+    expect(p2.props.modePreview("staff-led", picked.map, noDeny).slice(1)).toEqual(["  floors vs risk-based:", "    (no floor changes)"]);
+    // the shape rows' floor provenance comes from the same candidate: never "operator-pinned" by a shadowed mode
+    const shadowedRows = p2.props.shapeRows("staff-led", p2.props.initialMap, noDeny);
+    expect(shadowedRows.some((row) => row.label.includes("operator-pinned"))).toBe(false);
+    expect(shadowedRows).toEqual(p2.props.shapeRows("risk-based", p2.props.initialMap, noDeny));
+    // control: staff-led does move floors where no repo mode shadows it
+    const unshadowed = loadConfigWithMode(project.repo, { globalDir: project.globalDir, repoOverlayText: "routing:\n  mode: staff-led\n" });
+    expect(SHAPES.some((s) => unshadowed.cfg.routing.floors[s] !== current.cfg.routing.floors[s])).toBe(true);
+    // the repo pin replaces the whole implement slot, so the saved prefer is named shadowed, never applied
+    expect(candidate.cfg.routing.map.implement).toEqual({ pin: { via: "fake", model: "fake-1" } });
+    for (const [key, value] of [["routing.map.implement.prefer", "absent"], ["routing.mode", "risk-based"]]) {
+      expect(choice.notes).toContain(`repo-shadowed: ${key} stays ${value} in this repository — ${project.repoPath} sets it above the user overlay`);
+    }
+
+    // reclassifying the private adapter's model: the user bytes load only beside this repo's nova
+    // vendor/channel, so every other repository would break — refused, user bytes untouched
+    const reclass = p2.reviewOf({ classifications: [{ adapter: "nova", model: "nova-1", tier: "frontier", note: "AA Index 60" }] });
+    expect(overlayBytesLoadError(project.repo, reclass.after, { globalDir: project.globalDir, layer: "user" })).toBeNull();
+    expect(p2.props.reloadGuard(reclass.after)).toMatch(/loads only beside .* every repository inherits it/);
+    expect(p2.commit({ kind: "write", review: reclass })).toMatch(/^fleet: nothing written — the user overlay .* loads only beside/);
+    expect(readFileSync(overlayFile(project.repo), "utf8")).toBe(userBytes);
+    expect(readFileSync(project.repoPath, "utf8")).toBe(projectBytes);
+    expect(() => loadConfig(makeRepo({ "keep.txt": "x" }), { globalDir: project.globalDir })).not.toThrow();
+  });
+
+  test("a changed routing slot replaces the user's own repo-hidden declaration, shape rows read the slot the loader applies, and a layer edited mid-session re-renders the staged routing preview", async () => {
+    // the user pins implement to fake:fake-1; this repository's prefer hides that whole slot
+    const { repo, globalDir, repoPath } = b2Repo(
+      `${fakeTiers(["fake-1", "fake-2", "fake-3"])}routing:\n  map:\n    implement:\n      pin: { via: fake, model: fake-1 }\n`,
+      "routing:\n  map:\n    implement:\n      prefer: [fake:fake-2]\n", { fake: ["fake-1", "fake-2", "fake-3"] });
+    const { props, commit, reviewOf, rowOf } = await b2Editor(repo, [fakeAdapter(repo)], globalDir);
+    expect(props.initialMap.implement).toEqual({ prefer: ["fake:fake-2"] });
+    const alone = (bytes: string) => loadConfigWithMode(makeRepo({ "keep.txt": "x" }), { globalDir, userOverlayText: bytes }).cfg;
+
+    // a pool replaces the hidden user pin — never pin+pool bytes the loader refuses
+    const pool = { mode: "ordered" as const, channels: ["fake:fake-2", "fake:fake-3"] };
+    const pooled = { ...props.initialMap, implement: { pool } };
+    const poolReview = reviewOf({ map: pooled });
+    expect(props.reloadGuard(poolReview.after)).toBeNull();
+    expect(parse(poolReview.after).routing.map.implement).toEqual({ pool });
+    expect(alone(poolReview.after).routing.map.implement).toEqual({ pool });
+    // the shape row shows the repo prefer the loader keeps, and names the staged pool shadowed
+    const note = "  · staged pool(ordered·2) shadowed — not applied in this repository";
+    expect(rowOf("implement", pooled)).toContain(note);
+    expect(rowOf("implement", pooled)).not.toContain("pool(ordered·2) →");
+    expect(rowOf("implement", pooled)).not.toContain("operator-pinned");
+    expect(rowOf("implement", pooled).replace(note, "")).toBe(rowOf("implement"));
+    // the picker's captions name the repo prefer the loader applies, never the shadowed staged pool
+    const picked = props.candidatesForShape("implement", props.initialMode, pooled, noDeny).excludedNote ?? "";
+    expect(picked).toContain("task hint: routing.map.implement.prefer ranks fake:fake-2");
+    expect(picked).not.toContain("outside routing.map.implement.pool");
+
+    // a layer edited after a preview was cached: the staged routing re-renders from the bytes now on disk
+    const cached = props.stagedRouting?.(noDeny);
+    expect(cached?.ok && cached.routing.deny?.workers?.models).toBeUndefined();
+    writeFileSync(repoPath, `${readFileSync(repoPath, "utf8")}  deny:\n    workers:\n      models: [fake:fake-1]\n`);
+    const judgeReview = reviewOf({ judgeSeat: { adapter: "fake", model: "fake-2" } });
+    const reviewed = loadConfigWithMode(repo, { globalDir, userOverlayText: judgeReview.after }).cfg.routing;
+    expect(reviewed.deny?.workers?.models).toEqual(["fake:fake-1"]);
+    const staged = props.stagedRouting?.(noDeny);
+    expect(staged?.ok && staged.routing.deny).toEqual(reviewed.deny);
+
+    // a prefer replaces the hidden pin too, so a second repository routes by the saved prefer
+    const preferReview = reviewOf({ map: { ...props.initialMap, implement: { prefer: ["fake:fake-3"] } } });
+    expect(parse(preferReview.after).routing.map.implement).toEqual({ prefer: ["fake:fake-3"] });
+    expect(commit({ kind: "write", review: preferReview })).toMatch(/^fleet: wrote /);
+    const cfg = loadConfig(makeRepo({ "keep.txt": "x" }), { globalDir });
+    expect(cfg.routing.map.implement).toEqual({ prefer: ["fake:fake-3"] });
+    expect(route(taskOf("implement"), cfg, channelsFromConfig("fake", cfg)).assignment).toMatchObject({ adapter: "fake", model: "fake-3" });
+  });
+
+  test("a touched membership replaces the user's own repo-hidden deny, so discovery here and in a second repository admits exactly the saved fleet", async () => {
+    // the user denies fake-1; this repository's deny list replaces that list with fake-2
+    const { repo, globalDir } = b2Repo(`${fakeTiers(["fake-1", "fake-2", "fake-3"])}routing:\n  deny:\n    models: [fake:fake-1]\n`,
+      "routing:\n  deny:\n    models: [fake:fake-2]\n", { fake: ["fake-1", "fake-2", "fake-3"] });
+    const adapter = tiered(repo);
+    const { props, commit, reviewOf } = await b2Editor(repo, [adapter], globalDir);
+    expect(props.initialDenyModels).toEqual(["fake:fake-2"]);
+    const admitted = (at: string) => registry.discoverChannels(loadConfig(at, { globalDir }), [adapter], registry.readDoctor(repo)!)
+      .map((c) => `${c.adapter}:${c.model}`);
+    expect(admitted(repo)).toEqual(["fake:fake-1", "fake:fake-3"]);
+
+    // stage fake-3 out beside the repo's fake-2: the saved fleet is fake-1 alone, in every repository
+    const staged = reviewOf({ denyModels: ["fake:fake-2", "fake:fake-3"] });
+    expect(props.reloadGuard(staged.after)).toBeNull();
+    expect(commit({ kind: "write", review: staged })).toMatch(/^fleet: wrote /);
+    expect(admitted(repo)).toEqual(["fake:fake-1"]);
+    expect(admitted(makeRepo({ "keep.txt": "x" }))).toEqual(["fake:fake-1"]);
+  });
+
+  test("shape rows rank the channel metadata a repository layer changed after assembly, equal to production routing over the reviewed bytes", async () => {
+    const { repo, globalDir, repoPath } = b2Repo(fakeTiers(["fake-1"], "frontier"), undefined, { fake: ["fake-1"] });
+    const adapter = tiered(repo);
+    const { props, reviewOf, rowOf } = await b2Editor(repo, [adapter], globalDir);
+    expect(rowOf("docs")).toContain("fake:fake-1 (sub, frontier)");
+
+    // the repository reclassifies fake-1 cheap on the api channel before a judge choice is reviewed
+    withRepoOverlay(repo, "tiers:\n  fake:\n    channel: api\n    models:\n      fake-1: cheap\n");
+    expect(readFileSync(repoPath, "utf8")).toContain("fake-1: cheap");
+    const review = reviewOf({ judgeSeat: { adapter: "fake", model: "fake-1" } });
+    const cfg = loadConfigWithMode(repo, { globalDir, userOverlayText: review.after }).cfg;
+    expect(routed(repo, cfg, adapter, "docs")).toMatchObject({ adapter: "fake", model: "fake-1", channel: "api", tier: "cheap" });
+    expect(rowOf("docs")).toContain("fake:fake-1 (api, cheap)");
+    expect(props.candidatesForShape("docs", props.initialMode, props.initialMap, noDeny).rows.map((row) => row.id)).toEqual(["fake:fake-1"]);
+  });
+
+  // B2 review: the three serialization classes a user-layer save must get right, each proven in a second repository
+  test("auto on a slot the defaults pin masks the default pin, so a second repository routes the shape automatically while this repository's own pin is named shadowed", async () => {
+    const { repo, globalDir } = b2Repo(
+      `${fakeTiers(["fake-1", "fake-2"], "frontier")}routing:\n  map:\n    plan:\n      pin: { via: fake, model: fake-1 }\n`,
+      "routing:\n  map:\n    plan:\n      pin: { via: fake, model: fake-2 }\n", { fake: ["fake-1", "fake-2"] });
+    const adapter = tiered(repo);
+    const { props, commit, reviewOf, rowOf } = await b2Editor(repo, [adapter], globalDir);
+    expect(props.initialMap.plan).toEqual({ pin: { via: "fake", model: "fake-2" } }); // the repo pin over the user's
+    expect(props.initialMap.spec).toEqual({ pin: { via: "claude-code", model: "fable" } }); // the defaults' pin
+    // auto on both: plan's user pin sits over the default pin, spec is the default alone
+    const auto = { ...props.initialMap, plan: {}, spec: {} };
+    expect(rowOf("plan", auto)).toContain("staged cleared slot shadowed — not applied in this repository");
+    const review = reviewOf({ map: auto });
+    expect(props.reloadGuard(review.after)).toBeNull();
+    expect(parse(review.after).routing.map).toEqual({ plan: { prefer: [] }, spec: { prefer: [] } });
+    expect(review.notes?.some((note) => note.startsWith("repo-shadowed: routing.map.plan.pin.model stays fake-2 in this repository"))).toBe(true);
+    expect(commit({ kind: "write", review })).toMatch(/^fleet: wrote /);
+    expect(loadConfig(repo, { globalDir }).routing.map.plan).toEqual({ pin: { via: "fake", model: "fake-2" } });
+    const second = makeRepo({ "keep.txt": "x" });
+    const cfg = loadConfig(second, { globalDir });
+    for (const shape of ["plan", "spec"]) {
+      expect(cfg.routing.map[shape]?.pin, shape).toBeUndefined();
+      expect(routed(repo, cfg, adapter, shape), shape).toMatchObject({ adapter: "fake" });
+    }
+  });
+
+  test("after a review the shape rows rank the staged reclassification, equal to production routing over the reviewed bytes", async () => {
+    const { repo, globalDir } = b2Repo(fakeTiers(["fake-1"], "frontier"), undefined, { fake: ["fake-1"] });
+    const adapter = tiered(repo);
+    const { props, reviewOf, rowOf } = await b2Editor(repo, [adapter], globalDir);
+    expect(rowOf("docs")).toContain("fake:fake-1 (sub, frontier)");
+    const review = reviewOf({ classifications: [{ adapter: "fake", model: "fake-1", tier: "cheap", note: "AA Index 30" }] });
+    const cfg = loadConfigWithMode(repo, { globalDir, userOverlayText: review.after }).cfg;
+    expect(routed(repo, cfg, adapter, "docs")).toMatchObject({ adapter: "fake", model: "fake-1", tier: "cheap" });
+    expect(rowOf("docs")).toContain("fake:fake-1 (sub, cheap)");
+    expect(props.candidatesForShape("docs", props.initialMode, props.initialMap, noDeny).rows[0].label).toContain("cheap");
+  });
+
+  test("a touched membership serializes against the universe the staged classifications serve, so a newly classified model stays in the saved fleet unless the current allow form already leaves it out", async () => {
+    const saved = async (user: string) => {
+      const { repo, globalDir } = b2Repo(user, undefined, { fake: ["fake-1", "fake-2", "fake-3"] });
+      const adapter = tiered(repo);
+      const { commit, reviewOf } = await b2Editor(repo, [adapter], globalDir);
+      const review = reviewOf({ denyModels: ["fake:fake-2"], classifications: [{ adapter: "fake", model: "fake-3", tier: "mid", note: "AA Index 40" }] });
+      expect(commit({ kind: "write", review })).toMatch(/^fleet: wrote /);
+      const admitted = (at: string) => registry.discoverChannels(loadConfig(at, { globalDir }), [adapter], registry.readDoctor(repo)!)
+        .map((c) => `${c.adapter}:${c.model}`);
+      expect(admitted(makeRepo({ "keep.txt": "x" }))).toEqual(admitted(repo));
+      return admitted(repo);
+    };
+    const tiers = fakeTiers(["fake-1", "fake-2"]);
+    // no allow form on disk: the staged exclusion names fake-2 alone, so fake-3 joins the saved fleet
+    expect(await saved(tiers)).toEqual(["fake:fake-1", "fake:fake-3"]);
+    // the user's allow form already leaves every unlisted model out: fake-3 keeps that verdict
+    expect(await saved(`${tiers}routing:\n  allow:\n    models: [fake:fake-1, fake:fake-2]\n`)).toEqual(["fake:fake-1"]);
   });
 });

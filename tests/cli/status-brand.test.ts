@@ -265,6 +265,10 @@ describe("T3 watch cockpit brand restyle", () => {
     await withStdout(false, async () => {
       const out = await status([], repo);
       expect(out).toBe(
+        // CG1: the three lead lines — finished, wall, needs you — open the plain print.
+        "finished 1/3 done · tip verify pending · end-to-end first pass unknown (1 without lineage)\n" +
+        "time 0s wall, each instant once\n" +
+        "needs you: outstanding 0 · 0 parked · 1 failed\n" +
         `tickmarkr status / run run-brand abandoned since ${lastRowTime} / last event 10m ago / daemon pid unknown / 1/3 done\n` +
         "  gates: B build / T test / L lint / E evidence / S scope / A acceptance / R review\n" +
         // no watcher has ever beaten in this fixture, and every tier says so rather than being omitted

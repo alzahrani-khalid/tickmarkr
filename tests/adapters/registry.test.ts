@@ -12,8 +12,10 @@ import { kimi } from "../../src/adapters/kimi.js";
 import { opencode } from "../../src/adapters/opencode.js";
 import { pi } from "../../src/adapters/pi.js";
 import { qwen } from "../../src/adapters/qwen.js";
+import * as registry from "../../src/adapters/registry.js";
 import { discoverChannels, flagDriftWarnings, missingDeclaredFlags, modelAuthExclusions, probeAll, probeModels, readDoctor, writeDoctor } from "../../src/adapters/registry.js";
-import { DEFAULT_CONFIG } from "../../src/config/config.js";
+import { modelLints } from "../../src/adapters/model-lints.js";
+import { DEFAULT_CONFIG, loadConfig } from "../../src/config/config.js";
 import { modelAuthed, type WorkerAdapter } from "../../src/adapters/types.js";
 import { doctor } from "../../src/cli/commands/doctor.js";
 import { makeRepo } from "../helpers/tmprepo.js";
@@ -52,6 +54,9 @@ model status:
     sonnet   mid      unauthed: headless probe unavailable (2026-07-15)  denied=—  prefer=—
     haiku    cheap    unauthed: headless probe unavailable (2026-07-15)  denied=—  prefer=—
   codex
+    gpt-6-astra   frontier unauthed: headless probe unavailable (2026-07-15)  denied=—  prefer=implement#1
+    gpt-6-sol     frontier unauthed: headless probe unavailable (2026-07-15)  denied=—  prefer=implement#1
+    gpt-6-luna    cheap    unauthed: headless probe unavailable (2026-07-15)  denied=—  prefer=implement#1
     gpt-5.6-sol   frontier unauthed: headless probe unavailable (2026-07-15)  denied=—  prefer=implement#1
     gpt-5.5       frontier unauthed: headless probe unavailable (2026-07-15)  denied=—  prefer=implement#1
     gpt-5.6-terra mid      unauthed: headless probe unavailable (2026-07-15)  denied=—  prefer=implement#1
@@ -967,5 +972,60 @@ describe("hardcoded flag drift (v1.65 T3)", () => {
       ].join("\n"));
       for (const f of a.hardcodedFlags!.flags) expect(t.has(f), `${a.id} declares ${f}`).toBe(true);
     }
+  });
+});
+
+describe("B1a retirement notices survive the doctor.json round trip", () => {
+  // production codex adapter + its cache reader (via CODEX_HOME); no version binary, headless probe or trust store
+  const cacheCodex = {
+    ...codex,
+    probe: async () => ({ installed: true, authed: true, version: "codex-cli fixture", models: [] }),
+    hardcodedFlags: undefined,
+    headlessCommand: undefined,
+    trust: undefined,
+  } as unknown as WorkerAdapter;
+  const NOW = new Date("2026-10-01T00:00:00.000Z");
+
+  test("doctor reloads retirement metadata through probeAll writeDoctor and readDoctor while an old doctor record renders retirement unknown and a listed model without an upgrade remains known clean", async () => {
+    const repo = makeRepo({ "keep.txt": "x" });
+    mkdirSync(join(repo, ".tickmarkr"), { recursive: true });
+    writeFileSync(join(repo, ".tickmarkr", "config.yaml"), "tiers:\n  codex:\n    models:\n      gpt-5.5: frontier\n      gpt-5.6-sol: frontier\n");
+    const cfg = loadConfig(repo);
+    const configured = Object.keys(cfg.tiers.codex!.models);
+    const home = mkdtempSync(join(tmpdir(), "tickmarkr-b1a-reload-"));
+    writeFileSync(join(home, "models_cache.json"), JSON.stringify({
+      fetched_at: "2026-09-29T16:09:00Z",
+      models: configured.map((slug) => ({
+        slug,
+        visibility: "list",
+        upgrade: slug === "gpt-5.5" ? { model: "gpt-5.6-sol", retirement_at: "2026-10-14T19:00:00Z" } : null,
+      })),
+    }));
+    const candidates = vi.spyOn(registry, "detectCandidateClis").mockReturnValue([]);
+    vi.stubEnv("CODEX_HOME", home);
+    try {
+      // doctor = probeAll → the listing (models + notices) → writeDoctor
+      await doctor(["--"], repo, [cacheCodex], { banner: false, now: () => NOW });
+    } finally {
+      vi.unstubAllEnvs();
+      candidates.mockRestore();
+    }
+
+    // a fresh reader: readDoctor reloads the notices the listing carried, null (known clean) kept distinct
+    const reloaded = readDoctor(repo)!;
+    expect(reloaded.codex.modelRetirements?.["gpt-5.5"]).toEqual({ retiresAt: "2026-10-14T19:00:00Z", successor: "gpt-5.6-sol" });
+    expect(reloaded.codex.modelRetirements?.["gpt-5.6-sol"]).toBeNull();
+    const fresh = modelLints(cfg, reloaded, [cacheCodex], { now: NOW });
+    expect(fresh).toContain("codex: gpt-5.5 retires 2026-10-14T19:00:00Z per the CLI's notice; successor gpt-5.6-sol (named by the CLI — not a tier claim; classify it per benchmark policy) — tombstone it (gpt-5.5: null overlay) before then (advisory — routing unchanged)");
+    expect(fresh.filter((l) => l.startsWith("codex: gpt-5.6-sol"))).toEqual([]);
+    expect(fresh.some((l) => l.includes("retirement unknown"))).toBe(false);
+
+    // an old doctor record (pre-2.6.4 bytes: same listing, no notice field) renders unknown — never clean
+    const { modelRetirements: _dropped, ...old } = reloaded.codex;
+    writeFileSync(join(repo, ".tickmarkr", "doctor.json"), JSON.stringify({ codex: old }, null, 2) + "\n");
+    const legacy = modelLints(cfg, readDoctor(repo)!, [cacheCodex], { now: NOW });
+    expect(legacy).toContain(`codex: retirement unknown for ${configured.join(", ")} — doctor record carries no CLI retirement notices; rerun tickmarkr doctor`);
+    expect(legacy.some((l) => /codex: gpt-5\.5 retir/.test(l))).toBe(false);
+    expect(configured).toContain("gpt-5.6-sol");
   });
 });

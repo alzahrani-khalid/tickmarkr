@@ -2616,6 +2616,49 @@ describe("RT-2 red replay", () => {
   }, 120_000);
 });
 
+// F (D-718): the daemon's failover reads the router's one exclusion meaning. fake-alias ranks ahead of
+// fake-2 (same tier and cost, earlier in discovery order), so only the probed identity it shares with the
+// tried fake-1 can move the retry to fake-2; unprobed, it is neutral and stays eligible by its raw key.
+describe("F (D-718) probed-identity failover (fake adapter, zero tokens)", () => {
+  const aliasRetry = async (runId: string, aliasIdentity: string | undefined) => {
+    const { repo, fake } = setupRepo([T("T1")], {
+      consult: { action: "retry", notes: "a no-trailer exit is not a channel verdict" },
+      tasks: { T1: [
+        { shell: "echo 'usage limit reached for this model'; exit 1" },
+        { shell: `echo ok > t1.txt && ${COMMIT} t1`, result: { ok: true, summary: "ok" } },
+      ] },
+    });
+    fake.channels = () => [
+      { adapter: "fake", vendor: "fake-a", model: "fake-1", channel: "sub", tier: "frontier" },
+      { adapter: "fake", vendor: "fake-a", model: "fake-alias", channel: "api", tier: "frontier" },
+      { adapter: "fake", vendor: "fake-b", model: "fake-2", channel: "api", tier: "frontier" },
+    ];
+    const identities: Record<string, string | undefined> = { "fake-1": "fake-served-1", "fake-alias": aliasIdentity, "fake-2": "fake-served-2" };
+    fake.probe = async () => ({
+      installed: true, authed: true, version: "fake", models: Object.keys(identities),
+      modelAuth: Object.fromEntries(Object.entries(identities).map(([model, identity]) =>
+        [model, { authed: true, probedAt: "2026-09-29T00:00:00.000Z", ...(identity ? { identity } : {}) }])),
+    });
+    const s = await runDaemon(repo, { adapters: [fake], runId });
+    expect(s.done).toEqual(["T1"]);
+    const evs = Journal.open(repo, runId).read();
+    const dispatches = evs.filter((e) => e.event === "task-dispatch" && e.taskId === "T1")
+      .map((e) => { const a = e.data.assignment as { adapter: string; model: string }; return `${a.adapter}:${a.model}`; });
+    const failover = evs.find((e) => e.event === "quota-failover" && e.taskId === "T1")?.data as { from: string; to: string | null } | undefined;
+    return { dispatches, failover };
+  };
+
+  test("runDaemon retry after tried fake-1 dispatches fake-2 rather than fake-alias carrying the same probed identity while an unprobed fake-alias stays eligible by raw key", async () => {
+    const probed = await aliasRetry("run-d718-probed-alias", "fake-served-1");
+    expect(probed.failover).toMatchObject({ from: "fake:fake-1", to: "fake:fake-2" });
+    expect(probed.dispatches).toEqual(["fake:fake-1", "fake:fake-2"]);
+
+    const unprobed = await aliasRetry("run-d718-unprobed-alias", undefined);
+    expect(unprobed.failover).toMatchObject({ from: "fake:fake-1", to: "fake:fake-alias" });
+    expect(unprobed.dispatches).toEqual(["fake:fake-1", "fake:fake-alias"]);
+  }, 240_000);
+});
+
 describe("ES-2 daemon tier climb", () => {
   const fixture = (options: { pin?: boolean; off?: boolean; unowned?: boolean; refusal?: boolean; quota?: boolean; infra?: boolean; changing?: boolean; collateral?: boolean } = {}) => {
     const made = setupRepo([T("T1", {

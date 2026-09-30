@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /** Fake terminal host; pane launch executes the exact driver-supplied production command. */
 import { spawn } from 'node:child_process';
-import { readFileSync, writeFileSync, appendFileSync } from 'node:fs';
+import { readFileSync, writeFileSync, appendFileSync, openSync, closeSync } from 'node:fs';
 const [family, verb, ...args] = process.argv.slice(2);
 const file = process.env.C6_HERDR_STATE;
 const state = JSON.parse(readFileSync(file, 'utf8'));
@@ -24,11 +24,15 @@ else if (family === 'pane' && verb === 'split') {
   else {
     const launch = state.noLaunch ? ':' : args[1];
     const frame = `${file}.${pane.pane_id.replaceAll(':', '-')}.frame`;
+    // The pane's own stdout/stderr outlive it, so a board that never acknowledges can say why.
+    const log = `${file}.${pane.pane_id.replaceAll(':', '-')}.log`;
+    const stdio = openSync(log, 'a');
     const child = spawn('bash', ['-c', `${pane.seed ?? ':'}\n${launch}`], {
-      cwd: pane.cwd, detached: true, stdio: 'ignore',
+      cwd: pane.cwd, detached: true, stdio: ['ignore', stdio, stdio],
       env: { ...process.env, C6_FRAME_PATH: frame, NODE_OPTIONS: `--import ${new URL('./tty-bootstrap.mjs', import.meta.url).pathname}` },
     });
-    child.unref(); pane.launcherPid = child.pid; pane.frame = frame;
+    closeSync(stdio);
+    child.unref(); pane.launcherPid = child.pid; pane.frame = frame; pane.log = log;
     state.children.push(child.pid);
   }
 } else if (family === 'pane' && verb === 'close') {

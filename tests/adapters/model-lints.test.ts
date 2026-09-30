@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { parse } from "yaml";
-import { allAdapters, readDoctor, writeDoctor } from "../../src/adapters/registry.js";
+import { allAdapters, discoverChannels, readDoctor, writeDoctor } from "../../src/adapters/registry.js";
 import { readCachedCatalog, type CatalogReadResult } from "../../src/adapters/catalog-remote.js";
 import { MODEL_STALE_DAYS, SEED_STAMPED, catalogModelAdvisory, catalogTierRanking, contextWindowLints, deadPoolLints, estimateTaskPayloadTokens, hasWindowsConfig, modelLints, preferEntryLints, seedPreferLints, suggestOverlay } from "../../src/adapters/model-lints.js";
 import { CITED_MODEL_WINDOWS } from "../../src/adapters/model-windows.js";
@@ -58,8 +58,13 @@ describe("modelLints — both-direction staleness lints", () => {
   });
 
   test("unconfigured direction: reports N models not in tiers, per-id diff (gpt-5.5 configured+detected → no lint)", () => {
+    // B1a: the listed configured ids carry the CLI's known-clean notice (upgrade: null) — a record without the
+    // field would rightly render "retirement unknown" naming gpt-5.5, which is not this diff's subject.
     const health = {
-      codex: installed(["gpt-5.6-sol", "gpt-5.5", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex-spark"]),
+      codex: {
+        ...installed(["gpt-5.6-sol", "gpt-5.5", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex-spark"]),
+        modelRetirements: { "gpt-5.6-sol": null, "gpt-5.5": null, "gpt-5.6-terra": null, "gpt-5.6-luna": null },
+      },
     };
     const lints = modelLints(cfg(), health, adapters);
     expect(lints).toContain(
@@ -253,7 +258,7 @@ describe("suggestOverlay — paste-ready drift fragment", () => {
   });
 
   test("quiet when clean: detected === configured → \"\"; no-list-surface & empty detection contribute nothing", () => {
-    const clean = { codex: installed(["gpt-5.6-sol", "gpt-5.5", "gpt-5.6-terra", "gpt-5.6-luna"], AT) };
+    const clean = { codex: installed(["gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.5", "gpt-5.6-terra", "gpt-5.6-luna"], AT) };
     expect(suggestOverlay(cfg(), clean, adapters)).toBe("");
     // claude-code has no listModels; opencode installed but empty detection → both skipped, mirroring modelLints guards
     expect(suggestOverlay(cfg(), { "claude-code": installed([]), opencode: installed([]) }, adapters)).toBe("");
@@ -780,7 +785,7 @@ describe("contextWindowLints — v1.47 T3", () => {
   test("every model carrying a tier in the seed config also carries a declared window, proven member by member over the installed fleet — a claude-code fixture, a codex fixture, a cursor-agent fixture, an opencode fixture, a pi fixture, a grok fixture and a kimi fixture", () => {
     const installedFleet = {
       "claude-code": ["fable", "opus", "sonnet", "haiku"],
-      codex: ["gpt-5.6-sol", "gpt-5.5", "gpt-5.6-terra", "gpt-5.6-luna"],
+      codex: ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.5", "gpt-5.6-terra", "gpt-5.6-luna"],
       "cursor-agent": ["composer-2.5", "composer-2.5-fast", "claude-fable-5-1", "gemini-3.8-flash"],
       opencode: ["zai-coding-plan/glm-5.2"],
       pi: ["zai/glm-5.2", "zai/glm-5.3", "zai/glm-5.3-flash"],
@@ -954,6 +959,38 @@ describe("contextWindowLints — v1.47 T3", () => {
     } finally {
       entry.windows = original;
     }
+  });
+
+  // v2.6.4 T3 (D-717): the installed codex CLI's models_cache.json snapshot budgets 272000 for all seven.
+  test("loadConfig discovery uses 272000 for each of the seven declared Codex seeds and accepts an explicit smaller operator window but refuses a 1050000 independent-table disagreement", () => {
+    const seeds = ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.5", "gpt-5.6-terra", "gpt-5.6-luna"];
+    const loaded = cfg();
+    const health = { codex: { ...installed([]), modelAuth: Object.fromEntries(seeds.map((m) => [m, { authed: true, probedAt: "2026-09-29T16:09:00.000Z" }])) } };
+    const discovered = discoverChannels(loaded, adapters, health).filter((c) => c.adapter === "codex").map((c) => c.model);
+    expect(discovered).toEqual(seeds);
+    for (const model of discovered) {
+      expect(loaded.tiers.codex.windows?.[model], model).toBe(272_000);
+      expect(CITED_MODEL_WINDOWS.find((claim) => claim.modelId === model)?.window, `${model} table`).toBe(272_000);
+    }
+
+    // an operator overlay may declare a deliberately smaller window; the table attests only the seed artifact
+    const { repo, globalDir } = emptyRepo();
+    mkdirSync(join(repo, ".tickmarkr"), { recursive: true });
+    writeFileSync(join(repo, ".tickmarkr", "config.yaml"), "tiers:\n  codex:\n    windows:\n      gpt-6-sol: 128000\n");
+    const smaller = loadConfig(repo, { globalDir });
+    expect(smaller.tiers.codex.windows?.["gpt-6-sol"]).toBe(128_000);
+    expect(smaller.tiers.codex.windows?.["gpt-6-astra"]).toBe(272_000);
+
+    // a seed carrying the superseded 1050000 API claim disagrees with the independent table and refuses to load
+    const entry = DEFAULT_CONFIG.tiers.codex;
+    const original = structuredClone(entry.windows!);
+    try {
+      entry.windows!["gpt-6-astra"] = 1_050_000;
+      expect(() => cfg()).toThrow(/tiers\.codex\.windows\.gpt-6-astra declares 1050000 but does not match cited window 272000/);
+    } finally {
+      entry.windows = original;
+    }
+    expect(cfg().tiers.codex.windows?.["gpt-6-astra"]).toBe(272_000);
   });
 });
 

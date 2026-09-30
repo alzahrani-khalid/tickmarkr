@@ -17,7 +17,8 @@ export type ModelWindowResolution =
 
 /**
  * Validate cited model-window claims before production code can consume them.
- * These values are vendor-published claims, not measurements made by tickmarkr.
+ * These values are vendor-published claims (a vendor page, or a vendor CLI's own model cache), not
+ * measurements made by tickmarkr.
  */
 export function loadModelWindowClaims(input: unknown): readonly ModelWindowClaim[] {
   const claims = z.array(ModelWindowClaimSchema).parse(input);
@@ -30,8 +31,15 @@ export function loadModelWindowClaims(input: unknown): readonly ModelWindowClaim
 }
 
 const ANTHROPIC_SOURCE = "https://platform.claude.com/docs/en/about-claude/models/overview";
-const OPENAI_SOURCE = "https://developers.openai.com/api/docs/models";
-const OPENAI_GPT_55_SOURCE = "https://developers.openai.com/api/docs/models/gpt-5.5";
+// v2.6.4 T3 (D-717): the Codex rows cite the installed CLI's own models_cache.json snapshot, not the API
+// docs. That file has no public URL, so the source names it in its own scheme, snapshot instant included.
+// Every listed entry there carried context_window=272000 — the budget the codex CLI launches with. The
+// API docs' 1,050,000 (formerly cited here) describes the API surface; it is superseded for these CLI
+// seeds, not called false. These windows are the CLI's self-report, not a tickmarkr measurement. Only the
+// window comes from this snapshot: the codex tiers seeded beside it (config.ts) rest on the provider's
+// descriptions and the retained workhorse tier policy, not on any measured benchmark.
+const CODEX_CLI_CACHE_SOURCE = "codex-cli:models_cache.json#fetched_at=2026-09-29T16:09Z";
+const CODEX_CLI_CACHE_READ_DATE = "2026-09-29";
 const CURSOR_SOURCE = "https://cursor.com/help/ai-features/max-mode";
 const ZAI_SOURCE = "https://z.ai/blog/glm-5.2";
 const XAI_SOURCE = "https://docs.x.ai/developers/models/grok-4.5";
@@ -46,10 +54,13 @@ const VENDORED_MODEL_WINDOW_CLAIMS = [
   { modelId: "opus", window: 1_000_000, source: ANTHROPIC_SOURCE, readDate: READ_DATE },
   { modelId: "sonnet", window: 1_000_000, source: ANTHROPIC_SOURCE, readDate: READ_DATE },
   { modelId: "haiku", window: 200_000, source: ANTHROPIC_SOURCE, readDate: READ_DATE },
-  { modelId: "gpt-5.6-sol", window: 1_050_000, source: OPENAI_SOURCE, readDate: READ_DATE },
-  { modelId: "gpt-5.5", window: 1_050_000, source: OPENAI_GPT_55_SOURCE, readDate: READ_DATE },
-  { modelId: "gpt-5.6-terra", window: 1_050_000, source: OPENAI_SOURCE, readDate: READ_DATE },
-  { modelId: "gpt-5.6-luna", window: 1_050_000, source: OPENAI_SOURCE, readDate: READ_DATE },
+  { modelId: "gpt-6-astra", window: 272_000, source: CODEX_CLI_CACHE_SOURCE, readDate: CODEX_CLI_CACHE_READ_DATE },
+  { modelId: "gpt-6-sol", window: 272_000, source: CODEX_CLI_CACHE_SOURCE, readDate: CODEX_CLI_CACHE_READ_DATE },
+  { modelId: "gpt-6-luna", window: 272_000, source: CODEX_CLI_CACHE_SOURCE, readDate: CODEX_CLI_CACHE_READ_DATE },
+  { modelId: "gpt-5.6-sol", window: 272_000, source: CODEX_CLI_CACHE_SOURCE, readDate: CODEX_CLI_CACHE_READ_DATE },
+  { modelId: "gpt-5.5", window: 272_000, source: CODEX_CLI_CACHE_SOURCE, readDate: CODEX_CLI_CACHE_READ_DATE },
+  { modelId: "gpt-5.6-terra", window: 272_000, source: CODEX_CLI_CACHE_SOURCE, readDate: CODEX_CLI_CACHE_READ_DATE },
+  { modelId: "gpt-5.6-luna", window: 272_000, source: CODEX_CLI_CACHE_SOURCE, readDate: CODEX_CLI_CACHE_READ_DATE },
   { modelId: "composer-2.5", window: 200_000, source: CURSOR_SOURCE, readDate: READ_DATE },
   { modelId: "composer-2.5-fast", window: 200_000, source: CURSOR_SOURCE, readDate: READ_DATE },
   { modelId: "claude-fable-5-1", window: 1_000_000, source: ANTHROPIC_SOURCE, readDate: OBS_871_READ_DATE },

@@ -259,6 +259,66 @@ test("test: a waiver of the test gate followed by a recheck of the same subject 
 }, 60_000);
 
 
+// W: a red evidence/scope screen ends its round before the tool battery runs, so a waive of that
+// screen can leave build and lint with no prior-round row. The resumed battery must run them as
+// declared gates; a prior green row is still reused (build is provisioned, never re-gated).
+async function waivedScreen(gate: "scope" | "evidence", priorTools: boolean) {
+  const commands = { build: "true", test: "true", lint: "true" };
+  const { repo, fake } = setupRepo([T("T1", {
+    files: ["work.ts"], gates: ["build", "test", "lint", "evidence", "scope"],
+  })], { tasks: {} }, stringify({ gates: commands }));
+  const runId = `run-waive-${gate}-${priorTools ? "prior" : "unobserved"}`;
+  const baseRef = await gitHead(repo);
+  const git = (cwd: string, ...args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8" });
+  const branch = `tickmarkr/${runId}`;
+  git(repo, "branch", branch, baseRef);
+  const wt = await createWorktree(repo, `${branch}--T1`, baseRef);
+  writeFileSync(join(wt, "work.ts"), "export const value = 1;\n");
+  git(wt, "add", "work.ts");
+  git(wt, "commit", "--no-gpg-sign", "-m", "work");
+  const subject = createHash("sha256").update(git(wt, "log", "--reverse",
+    "--format=%T%x00%an%x00%ae%x00%cn%x00%ce%x00%B%x1e", `${baseRef}..HEAD`)).digest("hex");
+  const journal = Journal.create(repo, runId);
+  journal.append("run-start", undefined, { baseRef, branch, commands, graphDefinitionHash: graphDefinitionHash(loadGraph(repo)) });
+  journal.append("task-dispatch", "T1", { assignment: { adapter: "fake", model: "fake-1", channel: "sub", tier: "frontier" }, attempt: 0 });
+  journal.append("worker-result", "T1", { ok: true, summary: "landed", deviations: [] });
+  journal.phaseStart("T1", "gates");
+  if (priorTools) {
+    for (const tool of ["build", "test", "lint"]) journal.append("gate-result", "T1", { gate: tool, pass: true, commit: subject, details: "green" });
+  }
+  if (gate === "scope") journal.append("gate-result", "T1", { gate: "evidence", pass: true, commit: subject, details: "green" });
+  journal.append("gate-result", "T1", { gate, pass: false, commit: subject, details: "operator disputes this verdict" });
+  journal.append("task-human", "T1", { kind: "gate-fail" });
+  await approve([runId, "T1", "--waive"], repo);
+  expect(journal.replaySatisfiedGates().get("T1")).toBe(gate);
+  writeFileSync(join(journal.dir, "baseline.json"), JSON.stringify({
+    commands: Object.fromEntries(Object.keys(commands).map((name) => [name, { exitCode: 0, fingerprints: [] }])),
+  }));
+  const before = journal.read().length;
+  const summary = await runDaemon(repo, { adapters: [fake], runId, resume: true });
+  expect(summary.done).toEqual(["T1"]);
+  const events = journal.read().slice(before).filter((e) => e.taskId === "T1");
+  expect(events.filter((e) => e.event === "task-dispatch" || e.event === "worker-launch")).toEqual([]);
+  const rows = (tool: string) => events.filter((e) => e.event === "gate-result" && e.data.gate === tool).map((e) => e.data.pass);
+  return { rows, events };
+}
+
+test("runDaemon after a scope or evidence waive emits passing build and lint gate rows when neither had a prior row while prior green build and lint verdicts are reused rather than rerun as task gates", async () => {
+  for (const gate of ["scope", "evidence"] as const) {
+    const unobserved = await waivedScreen(gate, false);
+    expect(unobserved.rows("build")).toEqual([true]);
+    expect(unobserved.rows("lint")).toEqual([true]);
+    expect(unobserved.rows(gate)).toEqual([]);
+    expect(unobserved.events.some((e) => e.event === "gate-provisioned")).toBe(false);
+
+    const prior = await waivedScreen(gate, true);
+    expect(prior.rows("build")).toEqual([]);
+    expect(prior.rows("lint")).toEqual([]);
+    expect(prior.rows(gate)).toEqual([]);
+    expect(prior.events.filter((e) => e.event === "gate-provisioned").map((e) => e.data.exitCode)).toEqual([0]);
+  }
+}, 240_000);
+
 test("review waiver carry fails closed without a subject and ends on superseding authority or worker dispatch", () => {
   for (const ending of ["review-upheld", "attempt-cap", "untyped", "dispatch", "changed", "missing"]) {
     const journal = Journal.create(makeTestTempDir("tickmarkr-waiver-boundary-"), `run-${ending}`);

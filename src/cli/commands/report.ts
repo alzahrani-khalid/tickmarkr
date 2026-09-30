@@ -19,13 +19,16 @@ import {
   totalTokens as total,
 } from "../../report/operator-record.js";
 import { cellsOf, cellSummary } from "../../route/profile.js";
-import { Journal, loadRoutingProfile, type JournalEvent, type TelemetryRow } from "../../run/journal.js";
+import {
+  effectiveEvents, foldOwedChecks, Journal, loadRoutingProfile, OWED_DISCHARGE_EVENT, type JournalEvent, type OwedFold, type TelemetryRow,
+} from "../../run/journal.js";
 import {
   baselineProvenanceOf, fingerprintsOf, forgivenFingerprints, forgivenGateRow, formatBaselineProvenance, formatFingerprints,
   formatForgiven, formatTipProof, runEndTipProof,
 } from "../../run/daemon.js";
-import { formatSpan, WALL_PRIORITY_TEXT, wallBudget, wallBudgetFacts } from "../../run/wall-budget.js";
+import { formatSpan, WALL_PRIORITY, WALL_PRIORITY_TEXT, wallBudget, wallBudgetFacts } from "../../run/wall-budget.js";
 import { deriveRunCockpitData } from "../../tui/cockpit/derive.js";
+import { cellWidth, wrapCells } from "../../tui/cockpit/width.js";
 
 const n = (x: number) => x.toLocaleString("en-US"); // explicit locale — CI/darwin flake guard
 const EM = "—";
@@ -145,6 +148,201 @@ const supersession = (events: JournalEvent[]): { supersededBy?: string; supersed
   return { ...(typeof by === "string" ? { supersededBy: by } : {}), ...(supersedes ? { supersedes } : {}) };
 };
 
+// ── CG1 (v2.6.4): the lead — what finished, where the wall went, what needs you NOW ──────────────
+// Status and report open with the same three lines, folded here once. Finished work and first pass
+// come from this journal's own lineage; time is the existing disjoint wall partition (never summed
+// task-time); outstanding is the CURRENT owed-check fold, re-read on every call, never the run-end copy.
+
+// Rows that prove a task's lineage was not one uninterrupted dispatch: a park, an approval, a failure,
+// a repair, or a restart restoring it.
+const INTERRUPTED = new Set(["task-human", "task-failed", "task-approved", "repair-dispatch", "resume-restore"]);
+
+export interface FirstPass { passed: number; known: number; unknown: number }
+
+/**
+ * End-to-end first pass over the finished tasks of the SELECTED journal (no cross-run scan). A task
+ * closed done, merged, or named done by the newest run-end passes only as one dispatch at attempt 0
+ * straight to its merge. A task whose predecessor or dispatch evidence is missing — no run-start, a run
+ * that supersedes another, no dispatch, a first dispatch not at attempt 0 or not recording lifetime
+ * worker dispatch ordinal 0 — is unknown whatever else it shows: attempts reset at every release, so
+ * only the lifetime ordinal proves no earlier dispatch is missing. Otherwise any park, approval, failure, repair, restore or second dispatch is a known miss — a
+ * run-end summary's park or a restart before its merge included — and a would-be pass with no merge is
+ * unknown, never counted as a pass.
+ */
+export function endToEndFirstPass(events: readonly JournalEvent[]): FirstPass {
+  const start = events.find((e) => e.event === "run-start");
+  const predecessorUnread = !start || typeof start.data.supersedes === "string";
+  const runEnd = [...events].reverse().find((e) => e.event === "run-end");
+  const finished = new Set([
+    ...events.flatMap((e) => e.taskId && (e.event === "task-done" || e.event === "merge") ? [e.taskId] : []),
+    ...(Array.isArray(runEnd?.data.done) ? runEnd.data.done.map(String) : []),
+  ]);
+  const fp: FirstPass = { passed: 0, known: 0, unknown: 0 };
+  const names = (e: JournalEvent, buckets: readonly string[], taskId: string): boolean => e.event === "run-end"
+    && buckets.some((b) => Array.isArray(e.data[b]) && (e.data[b] as unknown[]).map(String).includes(taskId));
+  for (const taskId of finished) {
+    const own = events.filter((e) => e.taskId === taskId);
+    const dispatches = own.filter((e) => e.event === "task-dispatch");
+    // Run-level rows name the task too: a run-end summary parking or failing it is a park wherever it
+    // sits, and between its first dispatch and its merge any not-done bucket or a restart means the
+    // lineage crossed an engagement boundary — never one uninterrupted dispatch.
+    const at = events.findIndex((e) => e.taskId === taskId && e.event === "task-dispatch");
+    const end = events.findIndex((e) => e.taskId === taskId && e.event === "merge");
+    const span = at < 0 ? [] : events.slice(at, end < 0 ? undefined : end);
+    const crossed = events.some((e) => names(e, ["human", "failed"], taskId))
+      || span.some((e) => e.event === "run-resume" || names(e, ["blocked", "pending"], taskId));
+    // Missing predecessor or dispatch evidence is unknown BEFORE any outcome is classified: a park read
+    // without its initial dispatch (none, a first one past attempt 0, or one whose lifetime ordinal is
+    // unrecorded or past 0), or in a run continuing an unread predecessor, is no known miss either.
+    const origin = dispatches[0]?.data;
+    if (predecessorUnread || origin?.attempt !== 0 || origin.workerDispatchOrdinal !== 0) fp.unknown++;
+    else if (dispatches.length > 1 || crossed || own.some((e) => INTERRUPTED.has(e.event))) fp.known++;
+    else if (!own.some((e) => e.event === "merge")) fp.unknown++;
+    else { fp.passed++; fp.known++; }
+  }
+  return fp;
+}
+
+export const firstPassText = ({ passed, known, unknown }: FirstPass): string =>
+  known === 0 && unknown > 0
+    ? `end-to-end first pass unknown (${unknown} without lineage)`
+    : `end-to-end first pass ${passed}/${known}${unknown ? ` + ${unknown} unknown` : ""}`;
+
+/** The CURRENT owed-check fold. `cwd` is any checkout of the run's repository. */
+export const currentOwed = (events: readonly JournalEvent[], cwd = process.cwd()): OwedFold => foldOwedChecks(events, cwd);
+
+export const outstandingText = (fold: OwedFold): string => fold.known
+  ? `outstanding ${fold.debt}${fold.outstanding.length ? ` (${fold.outstanding.map((o) => `${o.taskId} ${o.gate}`).join(", ")})` : ""}`
+  : "outstanding unknown";
+
+// A run-end summary's buckets read as the lifecycle row each names; later effective rows move them on.
+const SUMMARY_STATE: Record<string, string> = { done: "task-done", failed: "task-failed", human: "task-human", blocked: "task-blocked", pending: "task-pending" };
+
+/**
+ * Tasks the CURRENT lifecycle leaves waiting on the operator: every run-end summary sets the tasks its
+ * buckets name, and each effective lifecycle row after it moves its task on — so a summary naming a
+ * park or failure the task rows never wrote still counts, and a later approval or merge clears it.
+ */
+const waitingOnYou = (events: readonly JournalEvent[]): { parked: number; failed: number } => {
+  const last = new Map<string, string>();
+  for (const e of effectiveEvents(events)) {
+    if (e.event === "run-end") {
+      for (const [bucket, state] of Object.entries(SUMMARY_STATE)) {
+        if (Array.isArray(e.data[bucket])) for (const id of e.data[bucket] as unknown[]) last.set(String(id), state);
+      }
+    } else if (e.taskId && ["task-dispatch", "task-done", "task-failed", "task-human", "task-approved", "merge"].includes(e.event)) last.set(e.taskId, e.event);
+  }
+  const states = [...last.values()];
+  return { parked: states.filter((s) => s === "task-human").length, failed: states.filter((s) => s === "task-failed").length };
+};
+
+export const needsYouText = (events: readonly JournalEvent[], owed: OwedFold): string => {
+  const { parked, failed } = waitingOnYou(events);
+  const why = owed.known ? "" : ` · unknown: ${owed.unknown[0]?.reason ?? "owed checks unreadable"}`;
+  return `needs you: ${outstandingText(owed)} · ${parked} parked · ${failed} failed${why}`;
+};
+
+/** The wall window alone, for the one-line form: the same partition, never task-time. */
+export const wallText = (events: readonly JournalEvent[]): string => {
+  const budget = wallBudget(events);
+  return budget ? `${formatSpan(budget.wallMs)} wall` : "wall not measurable";
+};
+
+/** Time: the existing disjoint wall partition's window and its largest exposed buckets — never task-time. */
+const timeLead = (events: readonly JournalEvent[]): string => {
+  const budget = wallBudget(events);
+  if (!budget) return "time not measurable — the journal names no run-start with a readable timestamp";
+  const top = [...WALL_PRIORITY.map((bucket) => [bucket, budget.exposedMs[bucket]] as const), ["residual", budget.residualMs] as const]
+    .filter(([, ms]) => ms > 0).sort((a, b) => b[1] - a[1]).slice(0, 3);
+  return `time ${formatSpan(budget.wallMs)} wall, each instant once${top.length ? `: ${top.map(([bucket, ms]) => `${bucket} ${formatSpan(ms)}`).join(" · ")}` : ""}`;
+};
+
+/**
+ * The three lead lines. `finished` is the surface's own done tally and tip reading (plus any
+ * comparability or supersession note); the rest is folded here from the journal and the current fold.
+ */
+export function leadLines(events: readonly JournalEvent[], owed: OwedFold, finished: { tally: string; tip: string; notes?: string[] }): [string, string, string] {
+  return [
+    `finished ${[finished.tally, finished.tip, firstPassText(endToEndFirstPass(events)), ...(finished.notes ?? [])].join(" · ")}`,
+    timeLead(events),
+    needsYouText(events, owed),
+  ];
+}
+
+/**
+ * A lead line packed into `columns` at its ` · ` fact boundaries: a fact that does not fit beside the
+ * last moves whole to a `prefix`ed continuation row, so narrowing costs rows and never drops a fact.
+ */
+const wrapFacts = (line: string, columns: number, prefix: string): string[] => {
+  const rows: string[] = [];
+  // Read fact by fact without a hand-split (the learning-section source pin forbids one here).
+  for (const [, fact] of line.matchAll(/(?:^| · )(.+?)(?= · |$)/gu)) {
+    const last = rows.at(-1);
+    if (last !== undefined && cellWidth(`${last} · ${fact}`) <= columns) rows[rows.length - 1] = `${last} · ${fact}`;
+    else rows.push(...wrapCells(last === undefined ? fact : `${prefix}${fact}`, columns, { continuationPrefix: "  " }));
+  }
+  return rows;
+};
+
+const LEAD_LABELS = ["finished", "time", "needs you"] as const;
+
+/**
+ * The lead at `columns`: the first row of finished, time and needs you are the first three physical
+ * lines, and every continuation follows them, naming the lead it continues.
+ */
+export const leadRows = (lead: readonly string[], columns: number): string[] => {
+  const wrapped = lead.map((line, i) => wrapFacts(line, columns, `  ${LEAD_LABELS[i]}: `));
+  return [...wrapped.map((rows) => rows[0]!), ...wrapped.flatMap((rows) => rows.slice(1))];
+};
+
+/**
+ * The discharge rows the current fold validates ON THEIR OWN: each is folded alone, at its own journal
+ * position among every non-discharge row, so one valid proof never lends its validity to a refused
+ * sibling naming the same check, and a proof written before its obligation is never validated by it.
+ */
+const validatedDischarges = (events: readonly JournalEvent[], cwd?: string): Array<{ row: JournalEvent; gates: string[] }> => {
+  return events.filter((e) => e.event === OWED_DISCHARGE_EVENT).flatMap((row) => {
+    const ids = Array.isArray(row.data.ids) ? row.data.ids.map(String) : [];
+    // In journal order: a discharge that precedes its obligation stays where it was written, never moved after it.
+    const fold = currentOwed(events.filter((e) => e.event !== OWED_DISCHARGE_EVENT || e === row), cwd);
+    if (!ids.length || !ids.every((id) => fold.discharged.includes(id))) return [];
+    return [{ row, gates: ids.map((id) => fold.acceptedRisk.find((o) => o.id === id)?.gate ?? "unknown") }];
+  });
+};
+
+/** A leg2 row's own reviewer fact: top-level, or under the verify gate row's meta it spreads. */
+const leg2Seat = (data: Record<string, unknown>, key: "reviewer" | "vendor"): unknown =>
+  data[key] ?? (typeof data.meta === "object" && data.meta !== null ? (data.meta as Record<string, unknown>)[key] : undefined);
+
+/**
+ * A review-leg2 row supersedes the daemon review only through its OWN validated discharge of a review
+ * check: a passing row whose artifact was captured, bound to that discharge's artifact and range, and
+ * naming the very reviewer seat (key and vendor) the discharge validated. A failed or capture-failed
+ * row, or one naming another seat, never borrows a sibling's proof.
+ */
+const leg2Discharge = (leg2: JournalEvent, validated: ReturnType<typeof validatedDischarges>): JournalEvent | undefined => {
+  const d = leg2.data;
+  if (d.pass !== true || d.artifactAvailability !== "available" || typeof d.artifactSha256 !== "string") return undefined;
+  return validated.find(({ row, gates }) => {
+    const seat = row.data.reviewer as { key?: unknown; vendor?: unknown } | undefined;
+    return row.taskId === leg2.taskId && gates.includes("review")
+      && row.data.artifactSha256 === d.artifactSha256 && row.data.artifactPath === d.artifactPath
+      && row.data.head === d.head && row.data.mergeBase === d.mergeBase
+      && typeof seat?.key === "string" && leg2Seat(d, "reviewer") === seat.key && leg2Seat(d, "vendor") === seat.vendor;
+  })?.row;
+};
+
+const RUN_END_BUCKETS = ["done", "failed", "human", "blocked", "pending"] as const;
+
+/** The record's done tally: tasks closed done in the journal or its newest run-end, over every task it names. */
+const recordTally = (events: readonly JournalEvent[]): string => {
+  const runEnd = [...events].reverse().find((e) => e.event === "run-end");
+  const bucket = (key: string): string[] => Array.isArray(runEnd?.data[key]) ? (runEnd!.data[key] as unknown[]).map(String) : [];
+  const done = new Set([...bucket("done"), ...events.flatMap((e) => e.taskId && (e.event === "task-done" || e.event === "merge") ? [e.taskId] : [])]);
+  const all = new Set([...done, ...RUN_END_BUCKETS.flatMap(bucket), ...events.flatMap((e) => e.taskId && e.event.startsWith("task-") ? [e.taskId] : [])]);
+  return `${done.size}/${all.size} done`;
+};
+
 const taskIds = (events: JournalEvent[]): string[] => {
   const seen = new Set<string>();
   const out: string[] = [];
@@ -259,7 +457,7 @@ const fingerprintClauses = (data: Record<string, unknown>): string => {
 };
 
 // VIS-07 / REC-01: derived only from the run journal, telemetry, and local configuration.
-export function renderMarkdownRecord(runId: string, events: JournalEvent[], prices: ChannelCost[] = [], rows: TelemetryRow[] = [], suite?: BaselineCommand): string {
+export function renderMarkdownRecord(runId: string, events: JournalEvent[], prices: ChannelCost[] = [], rows: TelemetryRow[] = [], suite?: BaselineCommand, cwd?: string): string {
   const runStart = events.find((e) => e.event === "run-start");
   const runEnd = [...events].reverse().find((e) => e.event === "run-end");
   const baseRef = typeof runStart?.data.baseRef === "string" ? runStart.data.baseRef : EM;
@@ -282,7 +480,11 @@ export function renderMarkdownRecord(runId: string, events: JournalEvent[], pric
   if (!usageLines.length) usageLines.push("- **not recorded:** attempts/windows: not measurable; tokens: not measurable; price: not measurable");
 
   const sup = supersession(events);
+  const owed = currentOwed(events, cwd);
+  const validated = validatedDischarges(events, cwd);
   const lines = [
+    ...leadLines(events, owed, { tally: recordTally(events), tip: `tip verify ${verificationOf(runId, events)}` }).map((line) => `- ${line}`),
+    "",
     `# tickmarkr engagement`,
     "",
     `- **runId:** ${runId}`,
@@ -301,7 +503,8 @@ export function renderMarkdownRecord(runId: string, events: JournalEvent[], pric
     "",
     ...usageLines,
     `- **wall-clock:** ${wallClock(runStart, runEnd)}`,
-    `- **first-attempt rate:** ${firstAttemptRate}`,
+    `- **end-to-end first pass:** ${firstPassText(endToEndFirstPass(events)).replace("end-to-end first pass ", "")} — this journal's dispatch, park, approval and merge lineage`,
+    `- **first-attempt rate (engagement-local telemetry):** ${firstAttemptRate} — attempts restart at every resume`,
     `- **gate failures:** ${[...gateFailures.entries()].map(([gate, failures]) => `${gate}: ${failures}`).join(", ") || "none recorded"}`,
     `- **consults:** ${events.filter((e) => e.event === "consult-verdict").length}`,
     `- **escalations:** ${events.filter((e) => e.event === "escalation").length}`,
@@ -373,7 +576,12 @@ export function renderMarkdownRecord(runId: string, events: JournalEvent[], pric
         const identityText = identity
           ? `reviewer ${identity.reviewer}${identity.vendor ? ` (vendor: ${identity.vendor}; provider: ${identity.provider})` : ` (provider: ${identity.provider})`}`
           : firstLine(row.data.details);
-        lines.push(`  - review-leg2: ${pass} (supersedes daemon review) — ${identityText}`);
+        // CG1: only this row's own validated discharge of a review check lets it supersede the daemon review.
+        const discharge = leg2Discharge(row, validated);
+        const claim = discharge
+          ? `supersedes daemon review — validated discharge ${(discharge.data.ids as unknown[]).map(String).join(", ")}`
+          : "unvalidated — no validated owed-check discharge; the daemon review stands";
+        lines.push(`  - review-leg2: ${pass} (${claim}) — ${identityText}`);
       }
     } else lines.push(`  - ${EM}`);
     lines.push("- **National Office:**");
@@ -448,12 +656,19 @@ function textReport(runId: string, events: JournalEvent[], rows: TelemetryRow[],
   const failovers = events.filter((e) => e.event === "quota-failover").length;
 
   const sup = supersession(events);
+  // CG1: at a configured terminal width the lead wraps its continuations after the three lead lines;
+  // report() fits every other row of the complete output (fitColumns).
+  const lead = leadLines(events, currentOwed(events, cwd), { tally: recordTally(events), tip: `tip verify ${verificationOf(runId, events)}` });
+  const columns = process.stdout.columns;
   return [
+    ...(columns ? leadRows(lead, columns) : lead),
     `tickmarkr engagement — ${runId}`,
     ...(sup.supersededBy ? [`superseded by ${sup.supersededBy}`] : []),
     ...(sup.supersedes ? [`supersedes ${sup.supersedes}`] : []),
     "",
-    "engagement summary — audit trail:",
+    // CG1: the telemetry rows are engagement-local — attempts restart at every resume; the lead's
+    // end-to-end first pass is the lineage reading.
+    "engagement summary — audit trail: engagement-local telemetry, attempts restart at every resume",
     ...[...groups.entries()].map(([k, g]) =>
       `  ${k.padEnd(30)} tasks ${g.rows.length}, attempts ${g.rows.reduce((s, r) => s + r.attempts, 0)}, done ${g.rows.filter((r) => r.outcome === "done").length}`,
     ),
@@ -477,14 +692,23 @@ function textReport(runId: string, events: JournalEvent[], rows: TelemetryRow[],
   ].join("\n");
 }
 
+/**
+ * CG1: at a configured terminal width EVERY row of the complete text output fits it — the lead, the
+ * body, a --bundle receipt and --compare output alike: a row that overflows wraps beneath its own
+ * indent, no fact dropped; a row that already fits (the lead's own layout) is untouched.
+ */
+const fitColumns = (out: string, columns = process.stdout.columns): string => columns
+  ? out.replace(/^.*$/gmu, (line) => wrapCells(line, columns, { continuationPrefix: `${/^ */u.exec(line)![0]}  ` }).join("\n"))
+  : out;
+
 // T4 (v1.50): TTY-only brand pass over the text report — title frame + dim section chrome; row
 // text and alignment untouched (the doctor/status system). Gated on ttyVisual(): the non-TTY
 // surface returns untouched, and --md never styles (the record is a document surface).
 const stylizeReport = (out: string): string => {
   if (!ttyVisual()) return out;
   return out
-    .replace(/^.*$/m, (first) => `${title(first)}\n${rule()}`) // non-global /m ⇒ first line only
-    .replace(/^(engagement summary — audit trail:|wall budget — [^\n]*|spend — tokens[^\n]*|spend — money:|learning \([^\n]*)$/gm, (l) => dim(l));
+    .replace(/^tickmarkr engagement — .*$/m, (head) => `${title(head)}\n${rule()}`) // non-global /m ⇒ the title line only
+    .replace(/^(engagement summary — audit trail:[^\n]*|wall budget — [^\n]*|spend — tokens[^\n]*|spend — money:|learning \([^\n]*)$/gm, (l) => dim(l));
 };
 
 export async function report(argv: string[], cwd = process.cwd()): Promise<string> {
@@ -533,8 +757,13 @@ export async function report(argv: string[], cwd = process.cwd()): Promise<strin
     comparison = "\n" + outcome.text;
   }
 
+  // CG1: the bundle receipt follows the three lead lines and their wrapped continuations, never above
+  // them (in markdown, after the blank line that closes the lead list, so it never joins its last item).
+  const afterLead = (out: string, at = 3): string => bundleNote
+    ? out.replace(new RegExp(`^(?:[^\\n]*\\n){${at}}(?:  [^\\n]*\\n)*`, "u"), (lead) => `${lead}${bundleNote.trimEnd()}\n`)
+    : out;
   if (values.md) {
-    return bundleNote + renderMarkdownRecord(runId, events, estimateCosts(rows, cfg.cost), rows, suite) + comparison;
+    return afterLead(renderMarkdownRecord(runId, events, estimateCosts(rows, cfg.cost), rows, suite, cwd), 4) + comparison;
   }
-  return bundleNote + stylizeReport(textReport(runId, events, rows, cwd, suite)) + comparison;
+  return fitColumns(afterLead(stylizeReport(textReport(runId, events, rows, cwd, suite))) + comparison);
 }

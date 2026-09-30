@@ -43,7 +43,7 @@ import { applyScopeAmendments, activeRetryBan, interruptedAttempt, RESUME_HARVES
 import { gateReviewerFloor, isDiffCapPark, isGarbageReview, pickReviewer } from "../gates/review.js";
 import { acquireApprovalSerialization, acquireRunLock, isPidLive, releaseRunLock } from "./lock.js";
 import { ensureIntegration, integrationBranch, integrationHead, mergeTask, reusedTipEvidence, verifyIntegrationTip } from "./merge.js";
-import { climbChannel, inTaskPool, marginalCostRank, nextChannel, poolExhaustion, route, taskPool } from "../route/router.js";
+import { channelExclusion, climbChannel, inTaskPool, marginalCostRank, nextChannel, poolExhaustion, route, taskPool } from "../route/router.js";
 import { desiredPanes } from "./reconcile.js";
 import { readTierLiveness, readWatchBoard, supervisionPresencePath } from "./supervision.js";
 import {
@@ -3300,10 +3300,12 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     // and a lastAssignment at zero attempts is a first dispatch whose capacity requeue was taken back:
     // the seat is still in force, so restore it instead of failing over its own tried[] entry early.
     // OBS-1187: a restored seat must still be a member of the task's pool (the operator may have closed it).
+    // F/W (D-718): and not excluded under the router's one meaning — its raw key, or a probed identity
+    // it shares with an excluded channel; an unprobed seat is excluded by its raw key alone.
     if (!hintsChanged && rs?.lastAssignment
         && channels.some((c) => channelKey(c) === channelKey(rs.lastAssignment!))
         && inTaskPool(t, cfg, channelKey(rs.lastAssignment))
-        && !demotedChannels.has(channelKey(rs.lastAssignment!))) {
+        && !channelExclusion(channels, demotedChannels)(rs.lastAssignment)) {
       assignment = rs.lastAssignment; // restore the consult-chosen assignment (bypasses route()'s static re-pick)
     } else if (!hintsChanged && rs && rs.tried.length && !t.routingHints?.pin) {
       // trailing-reroute edge (kill between verdict and dispatch), a stale fleet, OR a fresh-budget
@@ -4079,7 +4081,10 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           const followsApproved = GATE_NAMES.indexOf(gate) > satisfiedIndex;
           const otherRed = prior?.pass === false;
           const needsFullSuite = gate === "test" && prior?.fullSuite !== true;
-          return followsApproved || otherRed || needsFullSuite;
+          // W: a red evidence/scope screen ends the round before the battery, so a gate that PRECEDES
+          // the waived one may never have run: no prior-round row is no verdict — run it as declared.
+          const unobserved = prior === undefined;
+          return followsApproved || otherRed || needsFullSuite || unobserved;
         });
       } else {
         // T15: reuse only a contiguous green prefix from the current attempt on the exact task tip.

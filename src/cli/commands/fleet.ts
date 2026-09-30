@@ -1,5 +1,5 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
+import { dirname, join } from "node:path";
 import { parseArgs } from "node:util";
 import { allAdapters, discoverChannels, doctorAgeMs, initDoctorReuse, modelAuthExclusions, PREFERENCE_ROLES } from "../../adapters/registry.js";
 import { catalogModelAdvisory, catalogTierRanking, declaredModelWindow, fleetUnclassifiedModels } from "../../adapters/model-lints.js";
@@ -8,6 +8,7 @@ import { CLAUDE_ALIAS_IDENTITY_STAMPS, type ClaudeAlias, readClaudeAliasIdentity
 import type { BillingChannel, WorkerAdapter } from "../../adapters/types.js";
 import {
   ConfigError,
+  DEFAULT_CONFIG,
   fleetEditableFromConfig,
   fleetEditableEquals,
   formatFleetPrint,
@@ -21,16 +22,20 @@ import {
   stagedDenyKeyOf,
   renderFleetOverlayWrite,
   repoOverlayPath,
+  repoShadowedUserKeys,
   ROUTING_MODES,
   TIER_RANK,
   type FleetOverlayWrite,
   type FleetEditable,
+  type FleetUniverseRow,
   type LowerLayerModelOverrides,
   type MapEntry,
+  type ModeResolution,
   type RoutingMode,
   type Tier,
   type TickmarkrConfig,
   unifiedYamlDiff,
+  universeEntryMatches,
 } from "../../config/config.js";
 import { exclusionReason, projectFleetWhy, renderFleetWhy, type FleetWhyValue } from "../../config/fleet-why.js";
 import { SHAPES, TIERS, type Shape, type Task } from "../../graph/schema.js";
@@ -77,6 +82,18 @@ export type FleetIO = {
 // (rankCandidates routes noExplore so repeated calls agree) — a due probe must never make a
 // step-4/5 row disagree with the picker's rank-1 for the same shape and channel set.
 const PREVIEW_EXPLORE = { noExplore: true } as const;
+
+// B2: a routing.map entry's declaration slot (pin/pool/prefer) — an empty prefer declares nothing
+const mapSlot = (entry: MapEntry | undefined) => ({
+  ...(entry?.pin ? { pin: entry.pin } : {}),
+  ...(entry?.pool ? { pool: entry.pool } : {}),
+  ...(entry?.prefer?.length ? { prefer: entry.prefer } : {}),
+});
+const slotLabel = (slot: ReturnType<typeof mapSlot>): string =>
+  slot.pin ? `pin ${slot.pin.via}:${slot.pin.model}`
+    : slot.pool ? `pool(${slot.pool.mode}·${slot.pool.channels.length})`
+      : slot.prefer ? `prefer [${slot.prefer.join(", ")}]`
+        : "cleared slot";
 
 function previewTask(shape: Shape): Task {
   return {
@@ -289,6 +306,10 @@ export async function assembleFleetEditor(
   | { unavailable: string }
 > {
   const globalDir = opts.globalDir;
+  // B2: the editor's choices are the operator's MACHINE choices — every save lands in the USER
+  // overlay, which every repository on this machine inherits. The repo overlay is read, never written.
+  const userPath = join(globalDir, "config.yaml");
+  const currentUserText = () => (existsSync(userPath) ? readFileSync(userPath, "utf8") : "");
   const { reuse, health: cached } = initDoctorReuse(cwd, false);
   if (!reuse || !cached) {
     return {
@@ -307,10 +328,12 @@ export async function assembleFleetEditor(
   // writer emits the minimal allow form from it. The same pool later ranks every preview.
   const { deny: _diskDeny, allow: _diskAllow, ...routingScopeBlind } = cfg.routing;
   const previewChannels = discoverChannels({ ...cfg, routing: routingScopeBlind }, adapters, health);
-  const universe = adapters
+  // B2: the universe any scope-blind discovery serves — the assembly's, or a candidate config's at a
+  // membership write (current layers plus staged classifications)
+  const universeOf = (discovered: BillingChannel[]): FleetUniverseRow[] => adapters
     .filter((adapter) => health[adapter.id]?.installed)
     .map((adapter) => {
-      const served = previewChannels.filter((c) => c.adapter === adapter.id);
+      const served = discovered.filter((c) => c.adapter === adapter.id);
       // LEG2-T3 round 2 finding 3: the recorded identity per channel, so the editable membership
       // matches allow/deny entries with the same authority the collector and the browser use
       const identities = Object.fromEntries(served.flatMap((c) => (c.identity ? [[c.model, c.identity]] : [])));
@@ -320,6 +343,7 @@ export async function assembleFleetEditor(
         ...(Object.keys(identities).length ? { identities } : {}),
       };
     });
+  const universe = universeOf(previewChannels);
   const initial = fleetEditableFromConfig(cfg, universe);
   const editable = structuredClone(initial) as FleetEditable;
   // OBS-508: the same catalog evidence doctor's drift overlay prints now rides each unclassified
@@ -444,36 +468,127 @@ export async function assembleFleetEditor(
   type StagedDeny = FleetStagedDeny;
   const stagedDenyOf = (editable: FleetEditable): StagedDeny =>
     Object.fromEntries(DENY_SCOPES.map((scope) => [stagedDenyKeyOf(scope), editable[scope.key] ?? []])) as StagedDeny;
-  // OBS-1188: previews stage no effort, so both sides drop efforts — the writer then needs no lower layers
-  const previewInitial = { ...structuredClone(initial), efforts: undefined };
-  const stagedEditable = (map: Record<string, MapEntry>, deny: StagedDeny) => ({
-    ...structuredClone(previewInitial),
+  // B2: the classifications and efforts of the last reviewed state — the preview callbacks carry mode,
+  // map and deny only (fleet-app's contract), so every preview after a review ranks the same fully
+  // staged candidate that review rendered, never the assembly-time tiers.
+  // ponytail: one staged after the last review reaches previews at the next w; thread classifications
+  // and efforts through fleet-app's preview callbacks if that lag ever matters.
+  let reviewedStage: Pick<FleetEditable, "tiers" | "efforts"> = { tiers: initial.tiers, efforts: initial.efforts };
+  // OBS-1182: the layers under the written overlay — B2: the defaults alone under the USER overlay —
+  // read raw, so clearing an effort masks an inherited one. OBS-1188: re-read at every review and
+  // save, never an assembly-time snapshot; an unreadable read keeps the last good one for the
+  // preview only — the save guard below refuses it.
+  let lowerOverrides: LowerLayerModelOverrides = {};
+  const stagedEditable = (map: Record<string, MapEntry>, deny: StagedDeny): FleetEditable => ({
+    ...structuredClone(initial),
+    ...structuredClone(reviewedStage),
     ...Object.fromEntries(DENY_SCOPES.map((scope) => [scope.key, deny[stagedDenyKeyOf(scope)]])),
     // OBS-1046: the allow complement is staged beside the deny lists, never folded into them
     allowOut: deny.allowOut ?? initial.allowOut,
     map,
   });
+  // B2: the writer diffs a CHANGED routing.map slot against what its destination declares there —
+  // the user layer (defaults + user, no repo) — never the effective slot a repo pin/pool/prefer
+  // shadows, which would leave the user's own hidden declaration beside the new one (a stale pin a
+  // second repository still routes to, or pin+pool bytes that refuse a valid edit).
+  // B2: a touched membership is the same — the writer rewrites the allow form from the whole staged
+  // fleet, so its flat deny lists and allow complement diff against the user layer's own; a user
+  // deny the repo's list hides is admitted or kept by the staged fleet, never left to re-exclude
+  // it in every other repository.
+  const membershipKeys = [...DENY_SCOPES.filter((scope) => scope.path.length === 3).map((scope) => scope.key), "allowOut"] as const;
+  const sameSet = (a: string[] = [], b: string[] = []) => [...new Set(a)].sort().join() === [...new Set(b)].sort().join();
+  const destinationInitial = <T extends FleetEditable>(base: T, edited: FleetEditable, userText: string, target: FleetUniverseRow[]): T => {
+    let userCfg: TickmarkrConfig;
+    try {
+      userCfg = loadConfigWithMode(cwd, { globalDir, userOverlayText: userText, repoOverlayText: "" }).cfg;
+    } catch {
+      return base; // ponytail: user bytes that load only beside this repo — the reload guard refuses the write
+    }
+    const userLayer = userCfg.routing.map;
+    const editedMap = edited.map;
+    const map = { ...base.map };
+    for (const shape of new Set([...Object.keys(base.map), ...Object.keys(editedMap)])) {
+      if (JSON.stringify(base.map[shape]) === JSON.stringify(editedMap[shape])) continue;
+      const { pin, pool, prefer } = userLayer[shape] ?? {};
+      // escalate is no slot key: it merges per key, so the effective value stays the baseline
+      const escalate = base.map[shape]?.escalate;
+      map[shape] = {
+        ...(pin ? { pin } : {}), ...(pool ? { pool } : {}), ...(prefer ? { prefer } : {}),
+        ...(escalate !== undefined ? { escalate } : {}),
+      };
+    }
+    const membershipTouched = membershipKeys.some((key) => !sameSet(base[key], edited[key]));
+    const destination = membershipTouched ? fleetEditableFromConfig(userCfg, target) : undefined;
+    return {
+      ...base,
+      map,
+      ...(destination ? Object.fromEntries(membershipKeys.map((key) => [key, destination[key] ?? []])) : {}),
+    };
+  };
+  // B2: a changed slot staged with no declaration (auto, no prefer) where the defaults under the user
+  // overlay declare one: deleting the user's pin/pool would restore that default, so the slot is
+  // masked with prefer: [] — a declaration that replaces the lower slot atomically and ranks nothing
+  const maskClearedSlots = (base: FleetEditable, staged: FleetEditable): FleetEditable => {
+    const map = { ...staged.map };
+    for (const shape of new Set([...Object.keys(base.map), ...Object.keys(staged.map)])) {
+      const entry = staged.map[shape];
+      if (JSON.stringify(base.map[shape]) === JSON.stringify(entry)) continue;
+      if (Object.keys(mapSlot(entry)).length || !Object.keys(mapSlot(DEFAULT_CONFIG.routing.map[shape])).length) continue;
+      map[shape] = { ...entry, prefer: [] };
+    }
+    return { ...staged, map };
+  };
+  // B2: the one user-layer write builder the previews and the review share, so a preview ranks the
+  // bytes y would land. A touched membership serializes against the universe the candidate itself
+  // serves (current layers plus staged classifications), rendered first with membership unchanged;
+  // a channel only that universe adds keeps the verdict the current layers' allow form gives it.
+  const userLayerWrite = (
+    staged: FleetEditable,
+    userText: string,
+    rest: Pick<FleetOverlayWrite, "mode" | "judge" | "steering"> & { lowerOverrides: LowerLayerModelOverrides },
+  ): FleetOverlayWrite => {
+    let edited = maskClearedSlots(initial, staged);
+    let target = universe;
+    if (membershipKeys.some((key) => !sameSet(initial[key], edited[key]))) {
+      const unchanged = { ...edited, ...Object.fromEntries(membershipKeys.map((key) => [key, initial[key]])) };
+      try {
+        const bytes = renderFleetOverlayWrite(userText, {
+          ...rest, initial: destinationInitial(initial, unchanged, userText, universe), edited: unchanged, universe,
+        });
+        const candidate = loadConfigWithMode(cwd, { globalDir, userOverlayText: bytes }).cfg;
+        target = universeOf(candidateChannels(candidate));
+        const known = (entry: string) => universe.some((row) =>
+          entry === row.adapter || row.models.some((model) => universeEntryMatches(row, model, entry)));
+        const grown = (fleetEditableFromConfig(candidate, target).allowOut ?? []).filter((entry) => !known(entry));
+        if (grown.length) edited = { ...edited, allowOut: [...new Set([...(edited.allowOut ?? []), ...grown])].sort() };
+      } catch {
+        // the full render below (or the reload guard) names the refusal
+      }
+    }
+    return { ...rest, initial: destinationInitial(initial, edited, userText, target), edited, universe: target };
+  };
   // LEG2-T3 finding 2: a preview is the config loader over the candidate bytes the writer would
   // produce — never a second in-memory merge of the staged sets over the resolved config, which
   // kept every on-disk scope the staged edit tombstones (a removed workers deny survived here).
   // Judge c2 (R107): candidate bytes the writer cannot render or the loader refuses are an
   // explicit invalid-preview state carrying the refusal — never another config shown in their place.
   // ponytail: bounded memo, previews re-render per key press; a tiny LRU if it ever churns.
-  type CandidatePreview = { ok: true; cfg: TickmarkrConfig } | { ok: false; error: string };
+  type CandidatePreview = { ok: true; cfg: TickmarkrConfig; mode: ModeResolution } | { ok: false; error: string };
   const candidateMemo = new Map<string, CandidatePreview>();
   const previewCfg = (mode: RoutingMode, map: Record<string, MapEntry>, deny: StagedDeny): CandidatePreview => {
-    const key = JSON.stringify([mode, map, deny]);
+    // B2: the user and repo overlay bytes are part of the key — a layer edited mid-session (a repo
+    // deny added before a review) re-renders the preview instead of serving the pre-edit one
+    const userText = currentUserText();
+    const key = JSON.stringify([mode, map, deny, userText, currentRepoOverlayText(cwd)]);
     const hit = candidateMemo.get(key);
     if (hit) return hit;
     let preview: CandidatePreview;
     try {
-      const bytes = renderFleetOverlayWrite(currentRepoOverlayText(cwd), {
-        initial: previewInitial,
-        edited: stagedEditable(map, deny),
-        universe,
+      const bytes = renderFleetOverlayWrite(userText, userLayerWrite(stagedEditable(map, deny), userText, {
+        lowerOverrides,
         ...(mode !== rm.mode.mode ? { mode } : {}),
-      });
-      preview = { ok: true, cfg: loadConfigWithMode(cwd, { globalDir, repoOverlayText: bytes }).cfg };
+      }));
+      preview = { ok: true, ...loadConfigWithMode(cwd, { globalDir, userOverlayText: bytes }) };
     } catch (error) {
       preview = { ok: false, error: (error as Error).message.replace(/\s+/g, " ").trim() };
     }
@@ -487,10 +602,22 @@ export async function assembleFleetEditor(
     const preview = previewCfg(rm.mode.mode, editable.map, deny);
     return preview.ok ? { ok: true, routing: preview.cfg.routing } : preview;
   };
+  // B2: the candidate config's own discovery, blind to both membership scopes — classifications and
+  // channel metadata (tier, channel) a reloaded layer changed reach routing, ranking and the ledger,
+  // never the assembly-time channels. Keyed on the memoized candidate config object.
+  const candidateChannelMemo = new WeakMap<TickmarkrConfig, BillingChannel[]>();
+  const candidateChannels = (cfgPreview: TickmarkrConfig): BillingChannel[] => {
+    const hit = candidateChannelMemo.get(cfgPreview);
+    if (hit) return hit;
+    const { deny: _deny, allow: _allow, ...blind } = cfgPreview.routing;
+    const discovered = discoverChannels({ ...cfgPreview, routing: blind }, adapters, health);
+    candidateChannelMemo.set(cfgPreview, discovered);
+    return discovered;
+  };
   // route() never deny-filters its pool — that contract lives in discoverChannels — so every
   // preview call rebuilds the pool the staged deny would discover
   const previewPool = (cfgPreview: TickmarkrConfig) =>
-    previewChannels.filter((c) => disallowedBy(c, cfgPreview.routing) === null);
+    candidateChannels(cfgPreview).filter((c) => disallowedBy(c, cfgPreview.routing) === null);
   const modeSpend = (mode: RoutingMode, map: Record<string, MapEntry>, deny: StagedDeny): string => {
     const tierCount: Partial<Record<Tier, number>> = {};
     let subs = 0;
@@ -515,7 +642,7 @@ export async function assembleFleetEditor(
         if (assignment.channel === "sub") subs += 1;
         else {
           apiN += 1;
-          apiUsd += cfg.pricing[assignment.tier] ?? 0;
+          apiUsd += cfgPreview.pricing[assignment.tier] ?? 0;
         }
       } catch {
         // Unroutable under this mode's floors; the aggregate names it below.
@@ -530,10 +657,14 @@ export async function assembleFleetEditor(
     if (unroutable) parts.push(`${unroutable} unroutable`);
     return `  mix: ${mix} — ${parts.join(" · ")}`;
   };
-  const floorPreview = (mode: RoutingMode): string[] => {
+  // B2: the floors the candidate user-layer bytes resolve to — the same config the routed mix ranks
+  // against, so a repo-declared mode that shadows the user's pick previews no floor change
+  const floorPreview = (mode: RoutingMode, map: Record<string, MapEntry>, deny: StagedDeny): string[] => {
     if (mode === rm.mode.mode) return [];
+    const preview = previewCfg(mode, map, deny);
+    if (!preview.ok) return []; // modeSpend names the refusal
     const current = cfg.routing.floors;
-    const next = modeCfgs[mode].cfg.routing.floors;
+    const next = preview.cfg.routing.floors;
     const changed = SHAPES.filter((shape) => current[shape] !== next[shape]);
     return [
       `  floors vs ${rm.mode.mode}:`,
@@ -542,23 +673,27 @@ export async function assembleFleetEditor(
         : ["    (no floor changes)"]),
     ];
   };
+  // B2: `resolution` is the candidate user-layer bytes' own mode resolution — a repo-declared mode that
+  // shadows the user's pick keeps its provenance, never an operator pin the loader would not apply
+  // B2: `entry` is the slot the candidate's loader applies — a staged slot a repo declaration shadows
+  // is no operator pin here; the repo's winning declaration keeps its provenance
   const whyDeclaration = (
     shape: Shape,
-    mode: RoutingMode,
-    map: Record<string, MapEntry>,
+    resolution: ModeResolution,
+    entry: MapEntry | undefined,
     mapProducedValue: boolean,
   ): Pick<FleetWhyValue, "declaredAt" | "operatorPinned"> => {
-    const mapChanged = JSON.stringify(map[shape] ?? {}) !== JSON.stringify(editable.map[shape] ?? {});
+    const mapChanged = JSON.stringify(mapSlot(entry)) !== JSON.stringify(mapSlot(editable.map[shape]));
     if (mapProducedValue) {
       return mapChanged
         ? { operatorPinned: true }
         : { declaredAt: `routing.map.${shape}` };
     }
 
-    const floorSource = modeCfgs[mode].mode.provenance[shape];
+    const floorSource = resolution.provenance[shape];
     if (floorSource === undefined) return {};
     if (floorSource === "config floors") return { declaredAt: `routing.floors.${shape}` };
-    if (mode !== rm.mode.mode) return { operatorPinned: true };
+    if (resolution.mode !== rm.mode.mode) return { operatorPinned: true };
     return rm.source === "default"
       ? { declaredAt: `routing.floors.${shape}` }
       : { declaredAt: "routing.mode" };
@@ -569,12 +704,19 @@ export async function assembleFleetEditor(
       return projectFleetWhy(SHAPES.map((shape) => ({
         id: shape,
         effective: previewUnavailable(preview.error),
-        ...whyDeclaration(shape, mode, map, false),
+        ...whyDeclaration(shape, modeCfgs[mode].mode, map[shape], false),
       })), { repoRoot: cwd, globalDir });
     }
     const cfgPreview = preview.cfg;
     const pool = previewPool(cfgPreview);
     const values: FleetWhyValue<Shape>[] = SHAPES.map((shape) => {
+      // B2: annotations and provenance read the slot the loader applies; a staged slot it does not
+      // apply (a repo pin/pool/prefer above the user overlay) is named shadowed, never shown as routing
+      const entry = cfgPreview.routing.map[shape];
+      const staged = mapSlot(map[shape]);
+      const shadowed = JSON.stringify(staged) !== JSON.stringify(mapSlot(editable.map[shape]))
+        && JSON.stringify(staged) !== JSON.stringify(mapSlot(entry));
+      const shadowNote = shadowed ? `  · staged ${slotLabel(staged)} shadowed — not applied in this repository` : "";
       try {
         const routed = route(
           previewTask(shape),
@@ -588,23 +730,23 @@ export async function assembleFleetEditor(
         const assignment = routed.assignment;
         // OBS-531: a pooled shape used to render only the routed WINNER — indistinguishable from
         // a pin. The declaration is the operator's decision; the winner is today's dice.
-        const declaredPool = map[shape]?.pool;
+        const declaredPool = entry?.pool;
         const poolPrefix = declaredPool ? `pool(${declaredPool.mode}·${declaredPool.channels.length}) → ` : "";
-        const effective = `${poolPrefix}${assignment.adapter}:${assignment.model} (${assignment.channel}, ${assignment.tier})  ${costSignal(assignment, cfg.pricing)}`;
-        const mapProducedValue = map[shape]?.pin !== undefined || map[shape]?.pool !== undefined
+        const effective = `${poolPrefix}${assignment.adapter}:${assignment.model} (${assignment.channel}, ${assignment.tier})  ${costSignal(assignment, cfgPreview.pricing)}${shadowNote}`;
+        const mapProducedValue = entry?.pin !== undefined || entry?.pool !== undefined
           || routed.provenance.includes("via prefer");
         return {
           id: shape,
           effective,
-          ...whyDeclaration(shape, mode, map, mapProducedValue),
+          ...whyDeclaration(shape, preview.mode, entry, mapProducedValue),
         };
       } catch (error) {
-        const mapProducedValue = map[shape]?.pin !== undefined || map[shape]?.pool !== undefined
-          || (map[shape]?.prefer?.length ?? 0) > 0;
+        const mapProducedValue = entry?.pin !== undefined || entry?.pool !== undefined
+          || (entry?.prefer?.length ?? 0) > 0;
         return {
           id: shape,
-          effective: (error as Error).message,
-          ...whyDeclaration(shape, mode, map, mapProducedValue),
+          effective: `${(error as Error).message}${shadowNote}`,
+          ...whyDeclaration(shape, preview.mode, entry, mapProducedValue),
           setupCommand: "tickmarkr fleet",
         };
       }
@@ -625,7 +767,7 @@ export async function assembleFleetEditor(
   const excludedNoteFor = (cfgPreview: TickmarkrConfig): string | undefined => {
     let stagedOut = 0;
     let denied = 0;
-    for (const channel of previewChannels) {
+    for (const channel of candidateChannels(cfgPreview)) {
       if (disallowedBy(channel, cfgPreview.routing) === null) continue;
       if (disallowedBy(channel, cfg.routing) === null) stagedOut += 1;
       else denied += 1;
@@ -643,9 +785,11 @@ export async function assembleFleetEditor(
   // silent omission is indistinguishable from a bug (OBS-530's lesson, extended past deny/allow).
   // allow and the unauthed probe already carry a reason through excludedNoteFor above; the rest
   // are shape-scoped (a pin/pool/floor/prefer excludes only for THIS shape) and belong here.
-  const shapeExclusionCaptions = (shape: Shape, map: Record<string, MapEntry>, cfgPreview: TickmarkrConfig): string[] => {
+  // B2: captions read the slot the candidate's loader applies — a staged slot a repo declaration
+  // shadows excludes nothing here, so it is never named as the reason
+  const shapeExclusionCaptions = (shape: Shape, cfgPreview: TickmarkrConfig): string[] => {
     const pool = previewPool(cfgPreview);
-    const entry = map[shape];
+    const entry = cfgPreview.routing.map[shape];
     const captions: string[] = [];
 
     // 2. pin or pool — a closed candidate set declared for this shape; a channel outside it is
@@ -714,10 +858,11 @@ export async function assembleFleetEditor(
     cfgPreview: TickmarkrConfig,
     offered: ReadonlySet<string>,
   ): string[] => {
-    const entry = map[shape];
+    // B2: reasons name the applied slot; the carried chain below stays the staged one Space edits
+    const entry = cfgPreview.routing.map[shape];
     const floor = cfgPreview.routing.floors[shape];
     const collisions = denyPreferCollisions(cfgPreview, [shape], health);
-    const discovered = new Set(previewChannels.map((c) => `${c.adapter}:${c.model}`));
+    const discovered = new Set(candidateChannels(cfgPreview).map((c) => `${c.adapter}:${c.model}`));
     // T2 review (D-225): discovery already dropped a channel whose model probe failed — it is
     // rebuilt as a structured channel from its adapter's own declaration and walks the SAME
     // reach + collector path as every other row, the auth reason appended LAST; never a bare string
@@ -726,17 +871,17 @@ export async function assembleFleetEditor(
       return identity ? { ...declared, identity } : declared;
     };
     const failedProbes = unauthedModels.filter(({ key }) => !discovered.has(key)).flatMap(({ key, adapter, reason }) => {
-      const declared = adapters.find((a) => a.id === adapter)?.channels(cfg).find((c) => `${c.adapter}:${c.model}` === key);
+      const declared = adapters.find((a) => a.id === adapter)?.channels(cfgPreview).find((c) => `${c.adapter}:${c.model}` === key);
       return declared ? [{ ...withIdentity(adapter, declared), authReason: `unauthed (${reason}) — re-probe with tickmarkr doctor` }] : [];
     });
     // T2 review round 6: an installed-but-unauthed CLI is dropped by discovery AND by the model
     // probe list, so its configured channels are rebuilt from the adapter's own declaration too —
     // each greys with its reach and covering entry, the CLI auth reason last; never one bare adapter line
-    const unauthedCliChannels = unauthedClis.flatMap((adapter) => (adapters.find((a) => a.id === adapter)?.channels(cfg) ?? [])
+    const unauthedCliChannels = unauthedClis.flatMap((adapter) => (adapters.find((a) => a.id === adapter)?.channels(cfgPreview) ?? [])
       .map((declared) => ({ ...withIdentity(adapter, declared), authReason: `${adapter} CLI unauthed — re-probe with tickmarkr doctor` })));
     // D-225: the ledger is the EXCLUDED half of a closed partition — a channel the picker offers
     // never greys beside itself; its pin/pool/floor/prefer captions stay in excludedNote
-    const ledgerChannels = [...previewChannels.map((c) => ({ ...c, authReason: undefined as string | undefined })), ...failedProbes, ...unauthedCliChannels]
+    const ledgerChannels = [...candidateChannels(cfgPreview).map((c) => ({ ...c, authReason: undefined as string | undefined })), ...failedProbes, ...unauthedCliChannels]
       .filter((c) => !offered.has(`${c.adapter}:${c.model}`));
     const lines = ledgerChannels.flatMap((c) => {
       const key = `${c.adapter}:${c.model}`;
@@ -769,7 +914,7 @@ export async function assembleFleetEditor(
     // OBS-1145 add.1: every carried pool member the picker does not offer leads the ledger in chain
     // order — one no reason above names still gets its own row — so the picker renders its ordinal
     // and Space can drop it; a chain member with no row is hidden AND irremovable
-    const carried = entry?.pool?.channels.filter((key) => !offered.has(key)) ?? [];
+    const carried = map[shape]?.pool?.channels.filter((key) => !offered.has(key)) ?? [];
     const named = new Set(lines.map((row) => row.key));
     const unnamed = carried.filter((key) => !named.has(key)).map((key) => ({
       key,
@@ -784,13 +929,13 @@ export async function assembleFleetEditor(
     const cfgPreview = preview.cfg;
     const rows = shapeCandidates(previewTask(shape), cfgPreview, previewPool(cfgPreview), profile).map((candidate) => ({
       id: `${candidate.assignment.adapter}:${candidate.assignment.model}`,
-      label: candidateRow(candidate, cfg.pricing),
+      label: candidateRow(candidate, cfgPreview.pricing),
       pin: { via: candidate.assignment.adapter, model: candidate.assignment.model },
       // OBS-1065: a picker lift reads eligibility from here, not the ledger strings
       belowFloor: candidate.belowFloor,
     }));
     const offered = new Set(rows.map((row) => row.id));
-    const notes = [excludedNoteFor(cfgPreview), ...shapeExclusionCaptions(shape, map, cfgPreview)].filter(
+    const notes = [excludedNoteFor(cfgPreview), ...shapeExclusionCaptions(shape, cfgPreview)].filter(
       (note): note is string => note !== undefined,
     );
     return { rows, excludedNote: notes.length ? notes.join("\n") : undefined, ledger: channelLedger(shape, map, cfgPreview, offered) };
@@ -819,25 +964,40 @@ export async function assembleFleetEditor(
   // The judge is one seat by schema (config.judge: { adapter, model }); the editor offers the same
   // discovered seats universe plus a keep-default row, and a write is staged only on a real change.
   const initialJudge = `${cfg.judge.adapter}:${cfg.judge.model}`;
-  let pendingWrite: FleetOverlayWrite | null = null;
-  // OBS-1182: the layers under the repo overlay, read raw, so clearing an effort masks an inherited
-  // one even when those layers only validate beside repo fields. OBS-1188: re-read at every review
-  // and save, never an assembly-time snapshot; an unreadable read keeps the last good one for the
-  // preview only — the save guard below refuses it.
-  let lowerOverrides: LowerLayerModelOverrides = {};
-  // OBS-1188: the reviewed bytes are the only bytes that may land. Re-rendered from the repo overlay
-  // and lower layers as they are NOW; any difference is a stale preview. Null = still current.
-  const stalePreview = (write: FleetOverlayWrite, reviewed: string, prior = currentRepoOverlayText(cwd)): string | null => {
-    const lower = lowerLayerModelOverrides({ globalDir });
+  // B2: the staged write plus the user and repo overlay bytes its review (and shadow notes) were rendered against
+  type PendingWrite = { write: FleetOverlayWrite; repo: string; user: string };
+  let pendingWrite: PendingWrite | null = null;
+  const lowerLayers = () => lowerLayerModelOverrides({ globalDir, below: "user" });
+  // OBS-1188: the reviewed bytes are the only bytes that may land. Any byte of the user or repo overlay
+  // that moved since the review is a stale preview — a re-render alone would overwrite a same-key edit
+  // with the staged value and still match — then the lower layers are re-rendered as they are NOW.
+  // Null = still current.
+  const stalePreview = (pending: PendingWrite, reviewed: string, prior = currentUserText()): string | null => {
+    if (currentRepoOverlayText(cwd) !== pending.repo) {
+      return `stale preview — the repository overlay ${repoOverlayPath(cwd)} changed after the review diff was rendered; press w to review what would be written now`;
+    }
+    if (prior !== pending.user) {
+      return `stale preview — the user overlay ${userPath} changed after the review diff was rendered; press w to review what would be written now`;
+    }
+    const lower = lowerLayers();
     if (!lower.ok) return lower.error;
     try {
-      if (renderFleetOverlayWrite(prior, { ...write, lowerOverrides: lower.overrides }) === reviewed) return null;
+      if (renderFleetOverlayWrite(prior, { ...pending.write, lowerOverrides: lower.overrides }) === reviewed) return null;
     } catch (error) {
       return (error as Error).message;
     }
-    return "stale preview — the repo overlay or a lower config layer changed after the review diff was rendered; press w to review what would be written now";
+    return `stale preview — the user overlay ${userPath} or a lower config layer changed after the review diff was rendered; press w to review what would be written now`;
   };
+  // B2: a saved user key the repository overlay also decides does not apply in THIS repository —
+  // each is named with the value that still applies here, never reported as applied.
+  const repoShadowNotes = (before: string, after: string): string[] =>
+    repoShadowedUserKeys(cwd, before, after, { globalDir }).map(({ path, value }) => {
+      const shown = value === undefined ? "absent" : typeof value === "string" ? value : JSON.stringify(value);
+      return `repo-shadowed: ${path} stays ${shown} in this repository — ${repoOverlayPath(cwd)} sets it above the user overlay`;
+    });
   const reviewOverlay = (state: FleetEditorState): FleetOverlayReview => {
+    // B2: a review re-reads every layer, so no preview rendered before it is served after it
+    candidateMemo.clear();
     const staged = structuredClone(initial) as FleetEditable;
     // OBS-994/FL-1, OBS-1099 add.1: every schema-enumerated deny scope rides the same review/write funnel
     for (const scope of DENY_SCOPES) staged[scope.key] = state[scope.key];
@@ -855,11 +1015,14 @@ export async function assembleFleetEditor(
         provenance: `${classification.note} — fleet ${today}`,
       };
     }
+    reviewedStage = { tiers: staged.tiers, efforts: staged.efforts };
 
     // This callback is the sole candidate-overlay builder. The Ink component renders
     // the diff and asks for confirmation, but owns neither filesystem access nor a writer.
-    const before = currentRepoOverlayText(cwd);
-    const path = repoOverlayPath(cwd);
+    // B2: defaults/user/repo are re-read here, at review — the destination is the user overlay.
+    const before = currentUserText();
+    const repo = currentRepoOverlayText(cwd);
+    const path = userPath;
     const modeChanged = state.selectedMode !== rm.mode.mode;
     const steeringChanged = (["review", "consult"] as const).some(
       (key) => JSON.stringify(state.steering[key]) !== JSON.stringify(initialSteering[key]),
@@ -871,33 +1034,30 @@ export async function assembleFleetEditor(
       pendingWrite = null;
       return { kind: "empty" };
     }
-    const lower = lowerLayerModelOverrides({ globalDir });
+    const lower = lowerLayers();
     if (lower.ok) lowerOverrides = lower.overrides;
-    const write: FleetOverlayWrite = {
-      initial,
-      edited: staged,
-      universe,
+    const write = userLayerWrite(staged, before, {
       lowerOverrides,
       ...(modeChanged ? { mode: state.selectedMode } : {}),
       ...(judgeChanged && judgeSeat ? { judge: judgeSeat } : {}),
       steering: { initial: initialSteering, edited: state.steering },
-    };
+    });
     const after = renderFleetOverlayWrite(before, write);
     if (before === after) {
       pendingWrite = null;
       return { kind: "empty" };
     }
-    pendingWrite = write;
+    pendingWrite = { write, repo, user: before };
     // OBS-1144: the review names every dead pool entry the written config carries, with its reason and
     // what still routes — before y. Unloadable bytes carry no notes: the reload guard refuses them anyway.
     let poolNotes: string[] = [];
     try {
-      const written = loadConfigWithMode(cwd, { globalDir, repoOverlayText: after }).cfg;
+      const written = loadConfigWithMode(cwd, { globalDir, userOverlayText: after }).cfg;
       poolNotes = deadPoolEntries(written, undefined, health).map(deadPoolEntryLine);
     } catch {
       poolNotes = [];
     }
-    const notes = [...(lower.ok ? [] : [`${lower.error} — y will be refused`]), ...poolNotes];
+    const notes = [...repoShadowNotes(before, after), ...(lower.ok ? [] : [`${lower.error} — y will be refused`]), ...poolNotes];
     return {
       kind: "diff",
       before,
@@ -907,8 +1067,16 @@ export async function assembleFleetEditor(
       ...(notes.length ? { notes } : {}),
     };
   };
+  // B2: every repository inherits the user overlay, so its bytes must load here AND on their own —
+  // a tiers entry whose vendor/channel only this repository declares would break every other one
   const loaderGuard = io.reloadGuard
-    ?? ((bytes: string) => overlayBytesLoadError(cwd, bytes, { globalDir }));
+    ?? ((bytes: string) => {
+      const here = overlayBytesLoadError(cwd, bytes, { globalDir, layer: "user" });
+      if (here !== null) return here;
+      const alone = overlayBytesLoadError(cwd, bytes, { globalDir, layer: "user", repoOverlayText: "" });
+      return alone === null ? null
+        : `the user overlay ${userPath} loads only beside ${repoOverlayPath(cwd)} — every repository inherits it, and without that overlay it fails: ${alone}`;
+    });
   // OBS-1188: a stale preview or an unreadable lower layer answers on the same error channel as the loader
   const reloadGuard = (bytes: string) => (pendingWrite && stalePreview(pendingWrite, bytes)) || loaderGuard(bytes);
 
@@ -923,7 +1091,7 @@ export async function assembleFleetEditor(
     initialMode: rm.mode.mode,
     modeOptions: ROUTING_MODES.map((mode) => ({ id: mode, gloss: MODE_GLOSS[mode] })),
     initialMap: editable.map,
-    modePreview: (mode, map, deny) => [modeSpend(mode, map, deny), ...floorPreview(mode)],
+    modePreview: (mode, map, deny) => [modeSpend(mode, map, deny), ...floorPreview(mode, map, deny)],
     shapeRows: routedShapeRows,
     candidatesForShape,
     preferOptionsForShape: (_shape, current) => [
@@ -955,13 +1123,17 @@ export async function assembleFleetEditor(
 
     // The command remains the single config actuator. Every interactive edit reaches this
     // one write only after the component-rendered diff confirm and the production reload guard.
-    const write = pendingWrite;
-    if (!write) throw new Error("fleet write reached confirmation without a staged overlay mutation");
-    // OBS-1188: re-checked against the bytes on disk at write time; a refusal throws before the temp file exists
+    const pending = pendingWrite;
+    if (!pending) throw new Error("fleet write reached confirmation without a staged overlay mutation");
+    const write = pending.write;
+    // OBS-1188: re-checked against the bytes on disk at write time; a refusal throws before the temp file exists.
+    // B2: the one destination is the user overlay, and bytes the loader refuses never land there either.
     try {
-      writeFleetOverlay(result.review.path, (prior) => {
-        const stale = stalePreview(write, result.review.after, prior);
-        if (stale !== null) throw new ConfigError(stale);
+      writeFleetOverlay(userPath, (prior) => {
+        const refusal = result.review.path === userPath
+          ? stalePreview(pending, result.review.after, prior) ?? loaderGuard(result.review.after)
+          : `the reviewed destination ${result.review.path} is not the user overlay ${userPath}`;
+        if (refusal !== null) throw new ConfigError(refusal);
         return result.review.after;
       });
     } catch (error) {
@@ -979,7 +1151,8 @@ export async function assembleFleetEditor(
         if (health[adapter]?.modelAuth?.[model] === undefined) unprobed.push(`${adapter}:${model}`);
       }
     }
-    const head = `fleet: wrote ${result.review.path}`;
+    // B2: a repo-shadowed save says what still applies here — never claimed applied
+    const head = [`fleet: wrote ${userPath}`, ...repoShadowNotes(result.review.before, result.review.after).map((note) => `fleet: ${note}`)].join("\n");
     if (!unprobed.length) return head;
     const named = unprobed.slice(0, 3).join(", ") + (unprobed.length > 3 ? `, +${unprobed.length - 3} more` : "");
     return `${head}\nfleet: ${unprobed.length} newly classified model(s) have no probe verdict yet (${named}) — run \`tickmarkr fleet --fresh\` to probe them; unverified models stay unroutable`;

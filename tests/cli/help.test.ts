@@ -290,7 +290,8 @@ test("Command help describes every flag accepted by each production parser and t
     const before = snapshot(repo);
     const markdown = await dispatch("report", ["run-example", "--md"]);
     expect(markdown.code, markdown.out).toBe(0);
-    expect(markdown.out).toMatch(/^# tickmarkr engagement\n/);
+    // CG1: the record leads with its three current facts, then its heading.
+    expect(markdown.out).toMatch(/^- finished [^\n]*\n- time [^\n]*\n- needs you: [^\n]*\n\n# tickmarkr engagement\n/);
     expect(markdown.out).toContain("**runId:** run-example");
     expect(snapshot(repo)).toEqual(before);
   } finally {

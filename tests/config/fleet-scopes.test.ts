@@ -1,4 +1,4 @@
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { PassThrough } from "node:stream";
 import { join } from "node:path";
 import { expect, test, vi } from "vitest";
@@ -88,7 +88,8 @@ test("test: the exported deny scope enumeration is derived from the routing sche
     mkdirSync(join(repo, ".tickmarkr"), { recursive: true });
     const overlay = "tiers:\n  fake:\n    vendor: fake\n    channel: sub\n    models:\n      fake-1: mid\n      fake-2: mid\n"
       + "routing:\n  deny:\n    judges: [fake:fake-2]  # the grown scope\n    models: [fake:fake-1]  # a sibling the write keeps\n";
-    writeFileSync(join(repo, ".tickmarkr", "config.yaml"), overlay);
+    // B2: fleet saves to the USER overlay, so the session's policy lives in the user layer it runs with
+    const user = makeRepo({ "config.yaml": overlay });
     registry.writeDoctor(repo, {
       fake: {
         installed: true,
@@ -112,7 +113,7 @@ test("test: the exported deny scope enumeration is derived from the routing sche
     const io = terminal();
     // cursor opens on fake-1; ↓ to fake-2 (the row the grown scope excludes), Space opens the reach
     // picker on `in`, Enter takes it, w stages the write, y confirms
-    const done = fleet(["--global-dir", grown], repo, [adapter], { input: io.input, output: io.output, debug: true } as unknown as Parameters<typeof fleet>[3]);
+    const done = fleet(["--global-dir", user], repo, [adapter], { input: io.input, output: io.output, debug: true } as unknown as Parameters<typeof fleet>[3]);
     io.input.write("\x1b[B" + " " + "\r" + "w" + "y");
     const out = await done;
     expect(out).toMatch(/^fleet: wrote /);
@@ -120,10 +121,11 @@ test("test: the exported deny scope enumeration is derived from the routing sche
     const lines = frames.flatMap((f) => f.split("\n")).map((line) => line.trim());
     expect(lines.find((line) => line.includes("reach: out") && line.includes("routing.deny.judges (fake:fake-2)")), "the grown scope renders on its row").toBeDefined();
     expect(lines.find((line) => line.includes("space: cleared fake:fake-2 from routing.deny.judges")), "the reach picker lifted it from the grown scope").toBeDefined();
-    const after = fresh.loadConfig(repo, { globalDir: grown }).routing as unknown as { deny?: Record<string, unknown> };
+    const after = fresh.loadConfig(repo, { globalDir: user }).routing as unknown as { deny?: Record<string, unknown> };
     expect(after.deny?.judges, "the writer removed exactly the grown scope").toBeUndefined();
     expect(after.deny?.models, "the sibling scope kept its entry").toEqual(["fake:fake-1"]);
-    expect(readFileSync(join(repo, ".tickmarkr", "config.yaml"), "utf8")).toContain("a sibling the write keeps");
+    expect(readFileSync(join(user, "config.yaml"), "utf8")).toContain("a sibling the write keeps");
+    expect(existsSync(join(repo, ".tickmarkr", "config.yaml")), "the repo overlay stays unwritten").toBe(false);
     // and the two writer seams alone, with no browser in front: the grown scope is written and tombstoned by key
     const { renderFleetOverlayWrite, fleetRepoOverlayFromDelta } = await import("../../src/config/fleet-overlay.js");
     const initial = { ...fresh.fleetEditableFromConfig(fresh.loadConfig(repo, { globalDir: grown, repoOverlayText: overlay })) } as Record<string, unknown>;

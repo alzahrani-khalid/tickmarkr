@@ -886,3 +886,76 @@ describe("D-1 documentation half: the AA key is advertised where the catalog is 
     expect(parse(after).routing.mode).toBe("staff-led");
   });
 });
+
+describe("B2 machine model choices land in the user overlay", () => {
+  test("fleet and init confirmation saves the previewed user-layer model choice inherited by a second repository; repo bytes stay identical and a repo-shadowed judge key is reported at its effective value rather than falsely claimed applied", async () => {
+    const { FakeAdapter } = await import("../../src/adapters/fake.js");
+    const { fleet } = await import("../../src/cli/commands/fleet.js");
+    const gdir = mkdtempSync(join(tmpdir(), "tickmarkr-init-b2-user-"));
+    const userPath = join(gdir, "config.yaml");
+    writeFileSync(userPath, "# machine choices\ntiers:\n  fake:\n    vendor: fake\n    channel: sub\n    models:\n      fake-1: mid\n      fake-2: mid\n");
+    const probed = (repo: string) => {
+      registry.writeDoctor(repo, { fake: {
+        installed: true, authed: true, version: "fake", models: ["fake-1", "fake-2"],
+        modelAuth: Object.fromEntries(["fake-1", "fake-2"].map((m) => [m, { authed: true, probedAt: "2026-09-29T00:00:00.000Z" }])),
+      } });
+      const when = new Date(Date.now() - 5 * 60_000);
+      utimesSync(join(tickmarkrDir(repo), "doctor.json"), when, when);
+      const script = join(repo, "fake.json");
+      writeFileSync(script, JSON.stringify({ tasks: {} }));
+      return new FakeAdapter(script);
+    };
+    // Steering → judge row → picker; the picker lists (keep default) then fake:fake-1, fake:fake-2
+    const pickJudge = (downs: number) => KEY.left + KEY.down.repeat(2) + KEY.enter + KEY.down.repeat(2) + "f" + KEY.down.repeat(downs) + KEY.enter + "w";
+    const second = makeRepo({ "keep.txt": "x" }); // no overlay of its own: inherits the machine choice
+    const judgeIn = (repo: string) => loadConfig(repo, { globalDir: gdir }).judge.model;
+
+    // fleet: this project's overlay sets judge fake-1, the machine choice is fake-2
+    const projectA = "concurrency: 2\njudge:\n  adapter: fake\n  model: fake-1  # this project's judge\n";
+    const repoA = makeRepo({ ".tickmarkr/config.yaml": projectA });
+    const adapterA = probed(repoA);
+    const fleetIO = makeIO();
+    const fleetDone = fleet(["--global-dir", gdir], repoA, [adapterA], {
+      input: fleetIO.input as unknown as NodeJS.ReadStream, output: fleetIO.output as unknown as NodeJS.WriteStream,
+    } as Parameters<typeof fleet>[3]);
+    await fleetIO.whenFrame("All models");
+    fleetIO.input.write(pickJudge(2));
+    await fleetIO.whenFrame("repo-shadowed: judge.model stays fake-1"); // named in the preview, before y
+    fleetIO.input.write("y");
+    const fleetOut = strip(String(await fleetDone));
+    expect(fleetOut.split("\n")).toEqual([
+      `fleet: wrote ${userPath}`,
+      `fleet: repo-shadowed: judge.adapter stays fake in this repository — ${join(repoA, ".tickmarkr", "config.yaml")} sets it above the user overlay`,
+      `fleet: repo-shadowed: judge.model stays fake-1 in this repository — ${join(repoA, ".tickmarkr", "config.yaml")} sets it above the user overlay`,
+    ]);
+    expect(parse(readFileSync(userPath, "utf8")).judge).toEqual({ adapter: "fake", model: "fake-2" });
+    expect(readFileSync(userPath, "utf8")).toContain("# machine choices");
+    expect(readFileSync(join(repoA, ".tickmarkr", "config.yaml"), "utf8")).toBe(projectA);
+    expect(judgeIn(repoA)).toBe("fake-1"); // the effective value the report named
+    expect(judgeIn(second)).toBe("fake-2");
+
+    // init act 3: this project's overlay sets judge fake-2; the operator picks fake-1 for the machine
+    const projectC = "concurrency: 3\njudge:\n  adapter: fake\n  model: fake-2\n";
+    const repoC = makeRepo({ ".tickmarkr/config.yaml": projectC });
+    const adapterC = probed(repoC);
+    vi.spyOn(registry, "allAdapters").mockReturnValue([adapterC]);
+    const initIO = makeIO();
+    const initDone = init(["--global-dir", gdir], repoC, {
+      input: initIO.input as unknown as NodeJS.ReadStream, output: initIO.output as unknown as NodeJS.WriteStream,
+    });
+    await initIO.whenFrame("All models");
+    initIO.input.write(pickJudge(1));
+    await initIO.whenFrame("repo-shadowed: judge.model stays fake-2");
+    initIO.input.write("y");
+    const initOut = strip(await initDone);
+    expect(initOut).toContain(`kept existing ${userPath}`);
+    expect(initOut).toContain(`fleet: wrote ${userPath}`);
+    expect(initOut).toContain(`fleet: repo-shadowed: judge.model stays fake-2 in this repository — ${join(repoC, ".tickmarkr", "config.yaml")} sets it above the user overlay`);
+    expect(initOut).not.toContain("judge.adapter stays"); // the adapter did not change this time
+    expect(parse(readFileSync(userPath, "utf8")).judge).toEqual({ adapter: "fake", model: "fake-1" });
+    expect(readFileSync(join(repoC, ".tickmarkr", "config.yaml"), "utf8")).toBe(projectC);
+    expect(judgeIn(repoC)).toBe("fake-2");
+    expect(judgeIn(second)).toBe("fake-1");
+    expect(existsSync(join(second, ".tickmarkr", "config.yaml"))).toBe(false);
+  });
+});

@@ -1,12 +1,13 @@
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { execSync } from "node:child_process";
+import { execFileSync, execSync } from "node:child_process";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { quietGitInit } from "../helpers/tmprepo.js";
 import { CompileError } from "../../src/compile/common.js";
 import { compileSource } from "../../src/compile/index.js";
 import { classifyContextPath, compileNative, TICKMARKR_NATIVE_MARKER, specTemplate } from "../../src/compile/native.js";
+import { filesGlob } from "../../src/graph/files-glob.js";
 import { GraphValidationError, validateGraph } from "../../src/graph/schema.js";
 
 function compileNativeText(body: string, marker = "tickmarkr") {
@@ -130,6 +131,26 @@ describe("native spec marker (v1.38)", () => {
   });
 });
 
+// v2.6.4 T9: the committed corpus compiles ONCE, read by both corpus tests. SLOWEST-RUNNER: ~8 s on a
+// dev laptop for ~130 specs (each compile spawns git); 120 s is a kill ceiling for a loaded 3-core
+// coverage runner, never a speed claim.
+const CORPUS_CEILING_MS = 120_000;
+// Archives the singleton-brace rule refuses. History is never rewritten to clear a newer bar.
+const SINGLETON_REFUSED = ["v2.6.3-the-run-spends-its-time-on-the-work.spec.md"];
+// The public export carries no spec history: scripts/export-public.sh ships only this stub, which the
+// private repository never holds. The attribution test needs the archive, so it runs only where the archive lives.
+const PUBLIC_EXPORT = existsSync(join("specs", "export-selftest.spec.md"));
+let corpus: { file: string; source?: string; error?: unknown }[] | undefined;
+const committedCorpus = () => corpus ??= readdirSync("specs")
+  .filter((file) => file.endsWith(".spec.md") && TICKMARKR_NATIVE_MARKER.test(readFileSync(join("specs", file), "utf8")))
+  .map((file) => {
+    try {
+      return { file, source: compileSource(join("specs", file)).spec.source };
+    } catch (error) {
+      return { file, error };
+    }
+  });
+
 describe("native spec compiler", () => {
   test("compiles every Task field and validates as a native RunGraph", () => {
     const graph = compileSource("fixtures/sample.native.md", "native");
@@ -245,10 +266,9 @@ describe("native spec compiler", () => {
   });
 
   test("compiles every committed tickmarkr-marked native spec", () => {
-    const specs = readdirSync("specs").filter((file) => file.endsWith(".spec.md"));
-    const marked = specs.filter((file) => TICKMARKR_NATIVE_MARKER.test(readFileSync(join("specs", file), "utf8")));
+    const marked = committedCorpus();
     expect(marked.length).toBeGreaterThan(0);
-    for (const file of marked) {
+    for (const { file, source, error } of marked) {
       // OBS-97: pre-lint archives (read-only history, never amended) may trip the collectable-home
       // lint; that exact rejection is tolerated here — any other failure still fails this test.
       // OBS-212/214: the task unit contract is a NEWER bar than most of these archives, which were
@@ -264,14 +284,41 @@ describe("native spec compiler", () => {
       // OBS-488: the unconsumed-line invariant is the fourth bar. Measured over the corpus:
       // 3 column-zero prose lines across v1.86 (2) and v1.90 (1) were silently DROPPED by every
       // prior compiler — the error now names them instead.
+      // v2.6.4 T9: a single-item brace group in files[] is the fifth bar, each refusal attributed below.
+      if (error === undefined) {
+        expect(source, file).toBe("native");
+        continue;
+      }
+      expect(error, file).toBeInstanceOf(CompileError);
+      expect((error as Error).message, file).toMatch(/OBS-97|OBS-604|task unit contract|context: paths that do not exist|criterion-scope authoring lint|no parse rule consumes|single-item brace group/);
+    }
+  }, CORPUS_CEILING_MS);
+
+  test.skipIf(PUBLIC_EXPORT)("the committed native-spec corpus accepts its unchanged valid members and explicitly attributes historical singleton-brace refusals to the new compile rule instead of rewriting the historical specs", () => {
+    const results = committedCorpus();
+    const refused = results.filter(({ error }) => error instanceof CompileError && /single-item brace group/.test(error.message));
+    // closed list: an over-broad rule refuses a valid member, a rewritten archive drops out of it
+    expect(refused.map(({ file }) => file)).toEqual(SINGLETON_REFUSED);
+    for (const { file, error } of refused) {
+      const text = readFileSync(join("specs", file), "utf8");
+      const [, entry, group] = (error as Error).message.match(/entry ("(?:[^"\\]|\\.)*") holds single-item brace groups? (\{[^}]*\})/)!;
+      // the refusal names bytes the committed archive still holds — attributed, never rewritten
+      expect(text, file).toContain(JSON.parse(entry));
+      expect(JSON.parse(entry), file).toContain(group);
+      // and the new rule is the cause: a scratch copy with only those braces dropped is not refused by it
+      const copy = join(mkdtempSync(join(tmpdir(), "tickmarkr-corpus-attribution-")), file);
+      writeFileSync(copy, text.replace(/^- files:.*$/gm, (line) => line.replace(/(?<!\\)\{([^{},]*)\}/g, "$1")));
       try {
-        expect(compileSource(join("specs", file)).spec.source).toBe("native");
-      } catch (error) {
-        expect(error).toBeInstanceOf(CompileError);
-        expect((error as Error).message).toMatch(/OBS-97|OBS-604|task unit contract|context: paths that do not exist|criterion-scope authoring lint|no parse rule consumes/);
+        compileSource(copy);
+      } catch (other) {
+        expect((other as Error).message, file).not.toMatch(/single-item brace group/);
       }
     }
-  });
+    const accepted = results.filter(({ error }) => error === undefined).map(({ file }) => file);
+    expect(accepted.length).toBeGreaterThan(0);
+    // valid members already use real {a,b} alternatives, and the rule accepts them unchanged
+    expect(accepted.some((file) => /^- files:.*\{[^{}]*,[^{}]*\}/m.test(readFileSync(join("specs", file), "utf8")))).toBe(true);
+  }, CORPUS_CEILING_MS);
 
   test("a compiled task keeps every line of a multiline goal", () => {
     const g = compileNativeText(
@@ -410,6 +457,134 @@ describe("native spec test-oracle collectable-home lint (OBS-97)", () => {
   test("a task whose acceptance carries only command and judge oracles compiles regardless of file scope shape", () => {
     const g = compileNativeText("## T1: NoTestOracle\n- files: scripts/rig.mjs\n- acceptance:\n  - command: npm test\n  - judge: behaves under load\n  - plain criterion\n");
     expect(g.tasks[0].acceptance).toHaveLength(3);
+  });
+});
+
+// v2.6.4 T9 (E): picomatch keeps a comma-less brace group literal while the hosting probe expands it,
+// and a git symlink in files[] scopes its stored target text, never the file it points to.
+describe("files[] brace and symlink scope (v2.6.4 T9)", () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  const scoped = (files: string, oracle = "judge: the fixture page explains itself") =>
+    `## T1: Scoped\n- files: ${files}\n- acceptance:\n  - ${oracle}\n`;
+  const refusal = (body: string): string => {
+    try {
+      compileNativeText(body);
+    } catch (error) {
+      expect(error).toBeInstanceOf(CompileError);
+      return (error as Error).message;
+    }
+    return expect.unreachable(`should have refused: ${body}`);
+  };
+
+  test("compile refuses docs brace-singleton or tests segment-singleton scopes before hosting and suggests the bare path whereas bare paths two-item alternatives escaped braces or supported numeric ranges compile", () => {
+    // the disagreement being refused: the scope gate's matcher never matches the path hosting assumes
+    expect(filesGlob("tests/{compile}/native.test.ts")("tests/compile/native.test.ts")).toBe(false);
+
+    // a [...] class swallows the comma, so filesGlob keeps these outer braces literal too
+    expect(filesGlob("docs/{[a,b]}.md")("docs/a.md")).toBe(false);
+    // a POSIX [:alpha:] keeps its class open past its `:]`, so the comma is still a member
+    expect(filesGlob("docs/{[[:alpha:],]}.md")("docs/a.md")).toBe(false);
+    expect(filesGlob("docs/{[[:alpha:],]}.md")("docs/{a}.md")).toBe(true);
+    // a quoted `[` is literal text, never a class opener, so it cannot conceal the singleton after it
+    expect(filesGlob('docs/"["/{a}].md')("docs/[/{a}].md")).toBe(true);
+    expect(filesGlob('docs/"["/{a}].md')("docs/[/a].md")).toBe(false);
+    // an unterminated class (its only `]` is a member) turns literal with everything after it, braces included
+    expect(filesGlob("docs/[]/{a}.md")("docs/[]/{a}.md")).toBe(true);
+    expect(filesGlob("docs/[]/{a}.md")("docs/[]/a.md")).toBe(false);
+    expect(filesGlob("docs/[]/a.md")("docs/[]/a.md")).toBe(true);
+    // docs/{a}.md cannot host a test, so a refusal placed AFTER the hosting probe would surface as OBS-97
+    for (const [files, bare] of [["docs/{a}.md", "docs/a.md"], ["{docs/a.md}", "docs/a.md"], ["docs/{[a,b]}.md", "docs/[a,b].md"], ["docs/{[[:alpha:],]}.md", "docs/[[:alpha:],].md"], ['docs/"["/{a}].md', 'docs/"["/a].md'], ["docs/[]/{a}.md", "docs/[]/a.md"]]) {
+      const message = refusal(scoped(files, "test: covered"));
+      expect(message, files).toMatch(/Task T1 field "files"/);
+      expect(message, files).toContain(`single-item brace group ${files.match(/\{[^}]*\}/)![0]}`);
+      expect(message, files).toContain(`bare path ${JSON.stringify(bare)}`);
+      expect(message, files).not.toMatch(/OBS-97/);
+    }
+    // the hosting probe alone ACCEPTS a segment singleton (it expands the group), so only the refusal stops it
+    for (const files of ["tests/{compile}/native.test.ts", "{tests}/compile/native.test.ts"]) {
+      const message = refusal(scoped(files, "test: covered"));
+      expect(message, files).toContain('bare path "tests/compile/native.test.ts"');
+    }
+    // a range picomatch cannot expand faithfully is not a supported range ({1..10} compiles to [1-10])
+    expect(refusal(scoped("docs/{1..10}.md"))).toMatch(/single-item brace group \{1\.\.10\}/);
+    // an escaped end the matcher's class never matches is not a supported range either ({\d..z} is [\d-z])
+    expect(filesGlob("docs/{\\d..z}.md")("docs/d.md")).toBe(false);
+    expect(refusal(scoped("docs/{\\d..z}.md"))).toMatch(/single-item brace group \{\\d\.\.z\}/);
+
+    // filesGlob expands these, so they compile: a class's braces are members, a cross-case range is [A-z]
+    expect(filesGlob("docs/[{a}].md")("docs/a.md")).toBe(true);
+    expect(filesGlob("docs/[[:alpha:]{a}].md")("docs/a.md")).toBe(true);
+    expect(filesGlob("docs/{A..z}.md")("docs/Z.md")).toBe(true);
+    // picomatch drops the backslash of an escaped dot, so {1\..3} is the range {1..3}, never a singleton
+    for (const path of ["docs/1.md", "docs/2.md", "docs/3.md"]) expect(filesGlob("docs/{1\\..3}.md")(path), path).toBe(true);
+    // quoted braces are literal text, like escaped ones
+    expect(filesGlob('docs/"{a}".md')("docs/{a}.md")).toBe(true);
+    for (const files of ["docs/a.md", "docs/{a,b}.md", "docs/\\{a\\}.md", "docs/{1..3}.md", "docs/{1\\..3}.md", "docs/{\\a..c}.md", "docs/{A..z}.md", "docs/[{a}].md", "docs/[[:alpha:]{a}].md", 'docs/"{a}".md', "tests/{compile,gates}/native.test.ts"]) {
+      expect(compileNativeText(scoped(files)).tasks[0].files, files).toEqual([files]);
+    }
+  });
+
+  const git = (repo: string, ...args: string[]) => execFileSync("git", ["-C", repo, ...args], { encoding: "utf8", stdio: "pipe" }).trim();
+  const symlinkWarnings = (repo: string, files: string, base?: string): string[] => {
+    const spec = join(repo, "specs", "fixture.spec.md");
+    writeFileSync(spec, `<!-- tickmarkr:spec -->\n${base === undefined ? "" : `base: ${base}\n`}${scoped(files)}`);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    compileSource(spec, "native");
+    const lines = warn.mock.calls.map((call) => String(call[0])).filter((line) => /symlink/.test(line));
+    warn.mockRestore();
+    return lines;
+  };
+
+  test("compile reports the stored target of literal or glob-matched symlinks from the selected git base tree; regular missing untracked or checkout-only replacement paths get no symlink claim and unreadable tree inspection produces an advisory", () => {
+    const repo = mkdtempSync(join(tmpdir(), "tickmarkr-symlink-scope-"));
+    quietGitInit(repo);
+    git(repo, "config", "user.email", "t@t.t");
+    git(repo, "config", "user.name", "t");
+    mkdirSync(join(repo, "docs"));
+    mkdirSync(join(repo, "specs"));
+    writeFileSync(join(repo, "docs", "a.md"), "a");
+    writeFileSync(join(repo, "docs", "b.md"), "b");
+    symlinkSync("a.md", join(repo, "docs", "link.md"));
+    symlinkSync("../docs/a.md", join(repo, "docs", "retired.md"));
+    git(repo, "add", "docs");
+    git(repo, "commit", "--no-gpg-sign", "-qm", "base");
+    const base = git(repo, "rev-parse", "HEAD");
+    // HEAD replaces the retired link with a regular file: only the selected base tree still stores a link
+    rmSync(join(repo, "docs", "retired.md"));
+    writeFileSync(join(repo, "docs", "retired.md"), "regular now");
+    git(repo, "add", "docs");
+    git(repo, "commit", "--no-gpg-sign", "-qm", "retire link");
+    // checkout-only: an untracked link, and a tracked regular file the checkout replaced with a link
+    symlinkSync("a.md", join(repo, "docs", "untracked.md"));
+    rmSync(join(repo, "docs", "b.md"));
+    symlinkSync("a.md", join(repo, "docs", "b.md"));
+
+    const literal = symlinkWarnings(repo, "docs/link.md");
+    expect(literal).toHaveLength(1);
+    expect(literal[0]).toContain('task T1 files[] path "docs/link.md" is a symlink in the selected git tree "HEAD" storing target "a.md"');
+
+    // the glob reaches the one committed link and nothing the checkout alone calls a link
+    const globbed = symlinkWarnings(repo, "docs/*.md");
+    expect(globbed).toHaveLength(1);
+    expect(globbed[0]).toContain('"docs/link.md"');
+
+    for (const files of ["docs/a.md", "docs/missing.md", "docs/untracked.md", "docs/b.md", "docs/retired.md"]) {
+      expect(symlinkWarnings(repo, files), files).toEqual([]);
+    }
+
+    // the declared base selects the tree: the link HEAD retired is still a link there, with its target
+    const atBase = symlinkWarnings(repo, "docs/retired.md", base);
+    expect(atBase).toHaveLength(1);
+    expect(atBase[0]).toContain(`"docs/retired.md" is a symlink in the selected git tree "${base}" storing target "../docs/a.md"`);
+
+    for (const unreadable of ["refs/heads/no-such-base", "--bogus"]) {
+      const advisory = symlinkWarnings(repo, "docs/link.md", unreadable);
+      expect(advisory, unreadable).toHaveLength(1);
+      expect(advisory[0], unreadable).toContain(`advisory: files[] symlink inspection could not read the tree in the selected git tree ${JSON.stringify(unreadable)}`);
+      expect(advisory[0], unreadable).toContain("symlink scope is unverified");
+      expect(advisory[0], unreadable).not.toContain("storing target");
+    }
   });
 });
 

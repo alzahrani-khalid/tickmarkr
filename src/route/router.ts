@@ -1,7 +1,7 @@
 import { type Assignment, type BillingChannel, channelKey, channelsFromConfig } from "../adapters/types.js";
 import { type TickmarkrConfig, TIER_RANK, type Tier } from "../config/config.js";
 import type { Task } from "../graph/schema.js";
-import { channelRouteIdentity, disallowedBy, modelRouteIdentity, routingModelProvider } from "./preference.js";
+import { disallowedBy, routingModelProvider } from "./preference.js";
 import { cellOf, EXPLORE_CAP, explorationBonus, learnedScore, MIN_SAMPLES, type RoutingProfile } from "./profile.js";
 
 export type LadderStep = "retry" | "escalate" | "consult" | "human";
@@ -161,10 +161,33 @@ function spreadFrontierTies(
   return out;
 }
 
+/**
+ * F (D-718): the one exclusion meaning route(), nextChannel() and climbChannel() share — explicit
+ * exclusions, demotions, tried and escalation history, and climb skips — exported so resume can test a
+ * restored assignment the same way. An excluded raw channel key always excludes itself (the fallback).
+ * The exclusion extends to another offered channel only when BOTH offered channels carry a probed
+ * identity and the two are equal. A missing identity is neutral: it never matches and never blocks.
+ * Residual, by ruling: an unprobed alias of an excluded model stays eligible by its raw key — this is
+ * not complete alias exclusion; reopen on an executed re-dispatch of a tried model through an alias
+ * with no probed identity. The daemon's nextChannel-null exhaustion fallback is not this policy's.
+ */
+export function channelExclusion(offered: readonly BillingChannel[], excluded: Iterable<string>): (seat: ChannelSeat) => boolean {
+  const keys = new Set(excluded);
+  const identityOf = new Map(offered.flatMap((c) => (c.identity ? [[channelKey(c), c.identity] as const] : [])));
+  const identities = new Set([...keys].flatMap((k) => identityOf.get(k) ?? []));
+  return (seat) => {
+    const key = channelKey(seat);
+    const identity = identityOf.get(key);
+    return keys.has(key) || (identity !== undefined && identities.has(identity));
+  };
+}
+
 function withoutExcluded(channels: BillingChannel[], exclude?: ReadonlySet<string>): BillingChannel[] {
   if (!exclude?.size) return channels;
   // OBS-57: in-run demotion after consecutive no-trailer windows — route around poisoned channels for the rest of the run.
-  return channels.filter((c) => !exclude.has(channelKey(c)));
+  // D-718: a demoted channel's probed-identical alias is routed around too; an unprobed one is not.
+  const excluded = channelExclusion(channels, exclude);
+  return channels.filter((c) => !excluded(c));
 }
 
 // Pools spread providers before tier, independently within each marginal-cost run. Stable
@@ -453,19 +476,18 @@ function candidatePool(
   tierPredicate: (tier: Tier) => boolean,
   exclude?: ReadonlySet<string>,
 ): BillingChannel[] {
-  channels = withoutExcluded(channels, exclude).filter((c) => inTaskPool(task, cfg, channelKey(c)));
+  // D-718: tried/escalated/demoted keys share channelExclusion's meaning, resolved against every offered
+  // channel; the provider-outage rule below still reads the raw-key remainder exactly as before.
+  const excluded = channelExclusion(channels, [...(exclude ?? []), ...tried]);
+  channels = channels.filter((c) => !exclude?.has(channelKey(c)) && inTaskPool(task, cfg, channelKey(c)));
   const triedKeys = new Set(tried);
-  const triedIdentities = new Set(tried.map((key) => {
-    const channel = channels.find((c) => channelKey(c) === key);
-    return channel ? modelRouteIdentity(channel.model, channel.vendor) : channelRouteIdentity(key);
-  }));
   // excludeAdapter is expanded by the daemon into every channel key of the failed adapter. Once that
   // complete set is present, the outage follows the current served provider across gateway aliases.
   const currentAdapterExcluded = channels.some((c) => c.adapter === current.adapter)
     && channels.filter((c) => c.adapter === current.adapter).every((c) => triedKeys.has(channelKey(c)));
   const currentChannel = channels.find((c) => c.adapter === current.adapter && c.model === current.model);
   const excludedProvider = currentAdapterExcluded ? routingModelProvider(current.model, currentChannel?.vendor) : undefined;
-  return channels.filter((c) => !triedIdentities.has(modelRouteIdentity(c.model, c.vendor))
+  return channels.filter((c) => !excluded(c)
     && (!excludedProvider || routingModelProvider(c.model, c.vendor) !== excludedProvider)
     && tierPredicate(c.tier));
 }

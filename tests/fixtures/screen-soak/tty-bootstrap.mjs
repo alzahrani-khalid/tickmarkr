@@ -1,6 +1,6 @@
 /** Terminal transport only: the real built CLI owns rendering, input and shutdown. */
 import { PassThrough, Writable } from 'node:stream';
-import { writeFileSync } from 'node:fs';
+import { renameSync, writeFileSync } from 'node:fs';
 const destination = process.env.C6_FRAME_PATH;
 if (destination) {
   const input = new PassThrough();
@@ -12,7 +12,10 @@ if (destination) {
     isTTY = true; columns = 120; rows = 40;
     _write(chunk, _encoding, callback) {
       last = (last + chunk.toString()).slice(-20000);
-      writeFileSync(destination, JSON.stringify({ pid: process.pid, raw: input.isRaw, frame: last }));
+      // Readers poll this frame by path: write aside, then rename, so no reader ever parses a half-written frame.
+      const staged = `${destination}.${process.pid}.tmp`;
+      writeFileSync(staged, JSON.stringify({ pid: process.pid, raw: input.isRaw, frame: last }));
+      renameSync(staged, destination);
       callback();
     }
   }

@@ -26,21 +26,66 @@ function makeInkStreams() {
   const output = new PassThrough() as PassThrough & { isTTY: boolean; columns: number; rows: number };
   output.isTTY = true; output.columns = 100; output.rows = 40;
   const writes: string[] = [];
+  // Frame delivery control: once a production frame satisfies `holdFrom`, it and every later frame are held
+  // back from `writes` until `release()` delivers them in order. Rendering itself is never touched.
+  const held: string[] = [];
+  let holdFrom: ((frame: string) => boolean) | undefined;
   const write = output.write.bind(output);
   output.write = ((chunk: string | Uint8Array, ...args: unknown[]) => {
-    writes.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+    const frame = typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8");
+    if (holdFrom && (held.length > 0 || holdFrom(stripAnsi(frame)))) held.push(frame); else writes.push(frame);
     return Reflect.apply(write, output, [chunk, ...args]) as boolean;
   }) as typeof output.write;
-  return { input: input as unknown as NodeJS.ReadStream, output: output as unknown as NodeJS.WriteStream, writes };
+  const hold = (from: (frame: string) => boolean) => { holdFrom = from; };
+  const release = () => { holdFrom = undefined; const delivered = held.splice(0); writes.push(...delivered); return delivered.map(stripAnsi); };
+  const holding = () => held.length;
+  return { input: input as unknown as NodeJS.ReadStream, output: output as unknown as NodeJS.WriteStream, writes, hold, release, holding };
 }
 
-const wait = (ms = 20) => new Promise((r) => setTimeout(r, ms));
+/** Upper bound on any wait for a production frame; a poll that reaches it rejects with the last frame drawn. */
+const FRAME_POLL_MS = 2000;
+const tick = () => new Promise((r) => setTimeout(r, 5));
+/** Poll the production frames until `settled` holds; never a fixed sleep. Rejects at the bound with the last frame. */
+async function untilFrame(frame: () => string, settled: (frame: string) => boolean, want: string, timeoutMs = FRAME_POLL_MS): Promise<string> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const current = frame();
+    if (settled(current)) return current;
+    if (Date.now() >= deadline) throw new Error(`frame never reached ${want} within ${timeoutMs} ms; last frame:\n${current}`);
+    await tick();
+  }
+}
+const shows = (text: string) => (frame: string) => frame.includes(text);
 
-async function drawFrame(node: ReactElement): Promise<{ frame: string; input: NodeJS.ReadStream; unmount: () => void }> {
-  const { input, output, writes } = makeInkStreams();
+/** Mount `node` and wait for its first frame; keys and rerenders then wait for the frame they produce. */
+async function mountFrame(node: ReactElement) {
+  const { input, output, writes, hold, release, holding } = makeInkStreams();
   const app = render(node, { stdin: input, stdout: output, exitOnCtrlC: false, patchConsole: false, debug: true });
-  await wait();
-  return { frame: stripAnsi(writes.at(-1) ?? ""), input, unmount: () => app.unmount() };
+  const frame = () => stripAnsi(writes.at(-1) ?? "");
+  const until = (settled: (frame: string) => boolean, want: string, timeoutMs?: number) => untilFrame(frame, settled, want, timeoutMs);
+  /** Write a key and wait for the frame it produces: the requested text when known, otherwise any new frame. */
+  const key = async (bytes: string, settled?: (frame: string) => boolean, want = "a new frame") => {
+    const drawn = writes.length;
+    input.write(bytes);
+    return until(settled ?? (() => writes.length > drawn), `${want} after ${JSON.stringify(bytes)}`);
+  };
+  /** Wait for a callback or other non-frame observation; the failure still carries the last frame. */
+  const untilCall = (done: () => boolean, want: string, timeoutMs?: number) => until(() => done(), want, timeoutMs);
+  await until((f) => f.length > 0, "a first frame");
+  return {
+    frame, input, key, until, untilCall, hold, release, holding,
+    frames: () => writes.map(stripAnsi),
+    rerender: async (next: ReactElement, settled: (frame: string) => boolean, want: string) => {
+      app.rerender(next);
+      await until(settled, want);
+    },
+    unmount: () => app.unmount(),
+  };
+}
+
+async function drawFrame(node: ReactElement) {
+  const mounted = await mountFrame(node);
+  return { ...mounted, frame: mounted.frame() };
 }
 async function mountHome(initialModel: HomeViewModel, handlers?: {
   onOpenPark?: (id: string) => void;
@@ -48,31 +93,18 @@ async function mountHome(initialModel: HomeViewModel, handlers?: {
   onOpenEvidence?: (ev: EvidenceIdentity) => void;
   onSelectNeedsYou?: (target: HomeNeedsYouTarget | undefined, index: number) => void;
 }) {
-  const { input, output, writes } = makeInkStreams();
-  const app = render(createElement(HomeView, {
-    model: initialModel,
+  const home = (model: HomeViewModel) => createElement(HomeView, {
+    model,
     focused: true,
     onOpenPark: handlers?.onOpenPark ?? (() => {}),
     onOpenDiagnostic: handlers?.onOpenDiagnostic ?? (() => {}),
     onOpenEvidence: handlers?.onOpenEvidence ?? (() => {}),
     onSelectNeedsYou: handlers?.onSelectNeedsYou,
-  }), { stdin: input, stdout: output, exitOnCtrlC: false, patchConsole: false, debug: true });
-  await wait();
+  });
+  const mounted = await mountFrame(home(initialModel));
   return {
-    frame: () => stripAnsi(writes.at(-1) ?? ""),
-    input,
-    rerender: async (nextModel: HomeViewModel) => {
-      app.rerender(createElement(HomeView, {
-        model: nextModel,
-        focused: true,
-        onOpenPark: handlers?.onOpenPark ?? (() => {}),
-        onOpenDiagnostic: handlers?.onOpenDiagnostic ?? (() => {}),
-        onOpenEvidence: handlers?.onOpenEvidence ?? (() => {}),
-        onSelectNeedsYou: handlers?.onSelectNeedsYou,
-      }));
-      await wait();
-    },
-    unmount: () => app.unmount(),
+    ...mounted,
+    rerender: (nextModel: HomeViewModel, settled: (frame: string) => boolean, want: string) => mounted.rerender(home(nextModel), settled, want),
   };
 }
 
@@ -225,18 +257,17 @@ test("Home Needs-you opens the selected park or available diagnostic context and
   // Live wiring: PageUp scrolls the window until the early row is on top, then Enter opens it —
   // through the callback C1 supplies, never fabricated.
   const openedEvidence: unknown[] = [];
-  const { input, unmount } = await drawFrame(createElement(HomeView, {
+  const paged = await drawFrame(createElement(HomeView, {
     model: activityModel, focused: true,
     onOpenPark: () => {}, onOpenDiagnostic: () => {},
     onOpenEvidence: (evidence) => openedEvidence.push(evidence),
   }));
-  input.write("\x1B[C"); // right arrow: focus the activity section
-  await wait();
+  await paged.key("\x1B[C"); // right arrow: focus the activity section
   const pages = Math.ceil(earlyIndex / HOME_ACTIVITY_VISIBLE_ROWS);
-  for (let i = 0; i < pages; i++) { input.write("\x1B[5~"); await wait(); } // Page Up
-  input.write("\r"); // Enter
-  await wait();
-  unmount();
+  for (let i = 0; i < pages; i++) await paged.key("\x1B[5~"); // Page Up
+  paged.input.write("\r"); // Enter
+  await paged.untilCall(() => openedEvidence.length === 1, "the opened evidence callback");
+  paged.unmount();
   expect(openedEvidence).toHaveLength(1);
   expect(openedEvidence[0]).toEqual(longActivity[earlyIndex]!.evidence);
 
@@ -247,8 +278,9 @@ test("Home Needs-you opens the selected park or available diagnostic context and
     onOpenPark: (id) => openedParks.push(id), onOpenDiagnostic: (id) => openedParks.push(id),
     onOpenEvidence: () => {},
   }));
+  // A no-op Enter draws nothing new: give the callback the same bounded window a real one gets, expecting silence.
   idleFrame.input.write("\r");
-  await wait();
+  await expect(idleFrame.untilCall(() => openedParks.length > 0, "a park callback", 100)).rejects.toThrow(/never reached a park callback/);
   idleFrame.unmount();
   expect(openedParks).toEqual([]);
 
@@ -298,55 +330,53 @@ test("test: arrow keys move a Home Activity selection kept apart from the page w
   }));
   const model = deriveHomeView({ operator: resumedSnapshot, seats, activity: sevenRowActivity });
 
+  // A down arrow waits for the frame it produces: the drawn pointer while the row is inside the 3-row window,
+  // otherwise the next frame — the selection is kept apart from the page window, so it is not drawn there.
+  const downTo = (h: { key: (bytes: string, settled?: (frame: string) => boolean, want?: string) => Promise<string> }, index: number) =>
+    index < HOME_ACTIVITY_VISIBLE_ROWS
+      ? h.key("\x1B[B", shows(`${GLYPHS.pointer} event ${index}`), `the pointer on event ${index}`)
+      : h.key("\x1B[B");
   // Verify in isolated mounts that each required row opens through Enter:
   // second newest (index 1), third newest (index 2), fifth newest (index 4), sixth newest (index 5)
   for (const targetIndex of [1, 2, 4, 5]) {
     const opened: unknown[] = [];
-    const { input, unmount } = await drawFrame(createElement(HomeView, {
+    const h = await drawFrame(createElement(HomeView, {
       model, focused: true,
       onOpenPark: () => {}, onOpenDiagnostic: () => {},
       onOpenEvidence: (ev) => opened.push(ev),
     }));
-    input.write("\x1B[C"); // focus activity
-    await wait();
-    for (let step = 0; step < targetIndex; step++) {
-      input.write("\x1B[B"); // move down to target row
-      await wait();
-    }
-    input.write("\r"); // Enter opens selected row
-    await wait();
-    unmount();
+    await h.key("\x1B[C"); // focus activity
+    for (let step = 1; step <= targetIndex; step++) await downTo(h, step); // move down to target row
+    h.input.write("\r"); // Enter opens selected row
+    await h.untilCall(() => opened.length === 1, "the opened evidence callback");
+    h.unmount();
     expect(opened).toHaveLength(1);
     expect(opened[0]).toEqual(sevenRowActivity[targetIndex]!.evidence);
   }
 
   // Continuous traversal across rows, including rows scrolled outside the 3-row visible window (indices 4 and 5):
   const continuousOpened: unknown[] = [];
-  const { input, unmount } = await drawFrame(createElement(HomeView, {
+  const h = await drawFrame(createElement(HomeView, {
     model, focused: true,
     onOpenPark: () => {}, onOpenDiagnostic: () => {},
     onOpenEvidence: (ev) => continuousOpened.push(ev),
   }));
-  input.write("\x1B[C");
-  await wait();
+  await h.key("\x1B[C");
+  const down = (index: number) => downTo(h, index);
+  const enter = (opens: number) => { h.input.write("\r"); return h.untilCall(() => continuousOpened.length === opens, `open #${opens}`); };
   // 2nd newest row (index 1):
-  input.write("\x1B[B"); await wait();
-  input.write("\r"); await wait();
+  await down(1); await enter(1);
   expect(continuousOpened[0]).toEqual(sevenRowActivity[1]!.evidence);
   // 3rd newest row (index 2):
-  input.write("\x1B[B"); await wait();
-  input.write("\r"); await wait();
+  await down(2); await enter(2);
   expect(continuousOpened[1]).toEqual(sevenRowActivity[2]!.evidence);
   // 5th newest row (index 4, outside visible window 0..2):
-  input.write("\x1B[B"); await wait();
-  input.write("\x1B[B"); await wait();
-  input.write("\r"); await wait();
+  await down(3); await down(4); await enter(3);
   expect(continuousOpened[2]).toEqual(sevenRowActivity[4]!.evidence);
   // 6th newest row (index 5, outside visible window 0..2):
-  input.write("\x1B[B"); await wait();
-  input.write("\r"); await wait();
+  await down(5); await enter(4);
   expect(continuousOpened[3]).toEqual(sevenRowActivity[5]!.evidence);
-  unmount();
+  h.unmount();
 });
 
 test("test: Needs-you moves its selection across every listed park and diagnostic and Enter opens the selected one through its own callback, so with three targets the second and third open by their own ids and not the first", async () => {
@@ -362,39 +392,34 @@ test("test: Needs-you moves its selection across every listed park and diagnosti
 
   const openedParks: string[] = [];
   const openedDiagnostics: string[] = [];
-  const { input, unmount } = await drawFrame(createElement(HomeView, {
+  const h = await drawFrame(createElement(HomeView, {
     model: threeTargetModel,
     focused: true,
     onOpenPark: (id) => openedParks.push(id),
     onOpenDiagnostic: (id) => openedDiagnostics.push(id),
     onOpenEvidence: () => {},
   }));
+  const enter = (opens: number) => { h.input.write("\r"); return h.untilCall(() => openedParks.length + openedDiagnostics.length === opens, `open #${opens}`); };
 
   // Initial selection is target 0 ("T2"). Move down to second target ("T3", a park):
-  input.write("\x1B[B");
-  await wait();
-  input.write("\r");
-  await wait();
+  await h.key("\x1B[B", shows("T3 blocked"), "the pointer on T3");
+  await enter(1);
   expect(openedParks).toEqual(["T3"]);
   expect(openedDiagnostics).toEqual([]);
 
   // Move down to third target ("lock-dead-holder", a diagnostic):
-  input.write("\x1B[B");
-  await wait();
-  input.write("\r");
-  await wait();
+  await h.key("\x1B[B", shows("lock: dead holder"), "the pointer on the diagnostic");
+  await enter(2);
   expect(openedParks).toEqual(["T3"]);
   expect(openedDiagnostics).toEqual(["lock-dead-holder"]);
 
   // Cycle to next target (cycles back to first target "T2"):
-  input.write("\x1B[B");
-  await wait();
-  input.write("\r");
-  await wait();
+  await h.key("\x1B[B", shows("T2 human"), "the pointer on T2");
+  await enter(3);
   expect(openedParks).toEqual(["T3", "T2"]);
   expect(openedDiagnostics).toEqual(["lock-dead-holder"]);
 
-  unmount();
+  h.unmount();
 });
 
 describe("home-view model", () => {
@@ -423,10 +448,8 @@ test("Needs-you selection reconciles against model updates: when Needs-you shrin
   expect(h.frame()).toContain("T2 human");
 
   // Move down twice to select target index 2 ("lock: dead holder")
-  h.input.write("\x1B[B");
-  await wait();
-  h.input.write("\x1B[B");
-  await wait();
+  await h.key("\x1B[B", shows("T3 blocked"), "the pointer on T3");
+  await h.key("\x1B[B", shows("lock: dead holder"), "the pointer on the diagnostic");
   expect(h.frame()).toContain("lock: dead holder");
 
   // Model shrinks to 2 targets: diagnostic is resolved/cleared, only T2 and T3 remain
@@ -434,12 +457,12 @@ test("Needs-you selection reconciles against model updates: when Needs-you shrin
     operator: partialSnapshot,
     seats,
   });
-  await h.rerender(shrunkModel);
+  await h.rerender(shrunkModel, (f) => !f.includes("lock: dead holder"), "the frame without the cleared diagnostic");
 
   // The label must NOT disappear, and Enter must NOT be a no-op; it clamps/reconciles to T3 blocked
   expect(h.frame()).toContain("T3 blocked");
   h.input.write("\r");
-  await wait();
+  await h.untilCall(() => openedParks.length === 1, "the first park callback");
   expect(openedParks).toEqual(["T3"]);
   expect(openedDiagnostics).toEqual([]);
 
@@ -454,10 +477,10 @@ test("Needs-you selection reconciles against model updates: when Needs-you shrin
     },
     seats,
   });
-  await h.rerender(singleTargetModel);
+  await h.rerender(singleTargetModel, (f) => !f.includes("T3 blocked"), "the frame without the merged T3");
   expect(h.frame()).toContain("T2 human");
   h.input.write("\r");
-  await wait();
+  await h.untilCall(() => openedParks.length === 2, "the second park callback");
   expect(openedParks).toEqual(["T3", "T2"]);
 
   h.unmount();
@@ -474,10 +497,8 @@ test("Activity selection reconciles by stable evidence identity when new activit
     onOpenEvidence: (ev) => opened.push(ev),
   });
 
-  h.input.write("\x1B[C"); // focus activity
-  await wait();
-  h.input.write("\x1B[B"); // select row1 (event 99)
-  await wait();
+  await h.key("\x1B[C"); // focus activity
+  await h.key("\x1B[B", shows(`${GLYPHS.pointer} event 99`), "the pointer on event 99"); // select row1 (event 99)
 
   // Verify row1 is selected
   expect(h.frame()).toContain(`${GLYPHS.pointer} event 99`);
@@ -485,14 +506,14 @@ test("Activity selection reconciles by stable evidence identity when new activit
   // New row is prepended at index 0 (as journal writes new chronological events)
   const rowNew: HomeActivityRow = { evidence: { source: "journal.jsonl", line: 101, id: "journal.jsonl#L101" }, time: "08:03:00", state: "neutral", text: "event 101" };
   const updatedModel = deriveHomeView({ operator: resumedSnapshot, seats, activity: [rowNew, row0, row1, row2] });
-  await h.rerender(updatedModel);
+  await h.rerender(updatedModel, shows("event 101"), "the prepended row");
 
   // Selection must still be on event 99 (now at index 2), NOT silently retargeted to event 100
   expect(h.frame()).toContain(`${GLYPHS.pointer} event 99`);
   expect(h.frame()).not.toContain(`${GLYPHS.pointer} event 100`);
 
   h.input.write("\r");
-  await wait();
+  await h.untilCall(() => opened.length === 1, "the opened evidence callback");
   expect(opened).toEqual([row1.evidence]);
 
   h.unmount();
@@ -507,7 +528,7 @@ test("test: a down arrow followed at once by Enter on the needs you section open
     expect(h.frame()).toContain("T2 human");
     // No wait or render between the navigation and activation.
     h.input.write("\x1B[B"); h.input.write("\r");
-    await wait(50);
+    await h.until((f) => opened.length === 1 && f.includes("T3 blocked"), "the park callback and the pointer on T3");
     expect(opened).toEqual(["T3"]);
     expect(h.frame()).toContain("T3 blocked");
     expect(h.frame()).not.toContain("T2 human");
@@ -529,7 +550,7 @@ test("test: a right arrow then a down arrow then Enter written in one tick opens
   try {
     expect(h.frame()).toContain("T2 human");
     h.input.write("\x1B[C"); h.input.write("\x1B[B"); h.input.write("\r");
-    await wait(50);
+    await h.until((f) => opened.length === 1 && f.includes(`${GLYPHS.pointer} event 97`), "the evidence callback and the pointer on event 97");
     expect(opened).toEqual([activity[1]!.evidence]);
     expect(parks).toEqual([]);
     expect(h.frame()).toContain(`${GLYPHS.pointer} event 97`);
@@ -552,9 +573,70 @@ test("test: two down arrows written in one tick across three parks select the th
   try {
     expect(h.frame()).toContain(model.needsYou[0]!.label);
     h.input.write("\x1B[B"); h.input.write("\x1B[B"); h.input.write("\r");
-    await wait(50);
+    await h.until((f) => opened.length === 1 && f.includes(model.needsYou[2]!.label), "the park callback and the pointer on the third park");
     expect(opened).toEqual(["T3"]);
     expect(h.frame()).toContain(model.needsYou[2]!.label);
     expect(h.frame()).not.toContain(model.needsYou[1]!.label);
+  } finally { h.unmount(); }
+});
+
+test("test: home-view key cases reach their expected final frames when each key's second render is delayed past the former fixed sleep while a view that never renders rejects at the bounded poll", async () => {
+  const FORMER_FIXED_SLEEP_MS = 20;
+  const activity: HomeActivityRow[] = [100, 99, 98].map(line => ({
+    evidence: { source: "journal.jsonl", line, id: `journal.jsonl#L${line}` },
+    time: "08:00:00", state: "neutral", text: `event ${line}`,
+  }));
+  // Only the seat count differs between these models, so a seats update is a production frame that never
+  // shows a key's requested view.
+  const withSeats = (active: number) => deriveHomeView({
+    operator: partialSnapshot, seats: { active, eligible: 3 }, activity,
+    diagnostics: [{ kind: "diagnostic", id: "lock-dead-holder", label: "lock: dead holder" }],
+  });
+  const opened: string[] = [];
+  const evidence: EvidenceIdentity[] = [];
+  const h = await mountHome(withSeats(1), { onOpenPark: id => opened.push(id), onOpenDiagnostic: id => opened.push(id), onOpenEvidence: e => evidence.push(e) });
+  /** Resolves "pending" or "settled" after `ms`, without ever settling `wait` itself. */
+  const stateAfter = (wait: Promise<unknown>, ms: number) =>
+    Promise.race([wait.then(() => "settled" as const), new Promise<"pending">(r => setTimeout(() => r("pending"), ms))]);
+  const cases: Array<{ key: string; expected: string }> = [
+    { key: "\x1B[B", expected: "T3 blocked" },
+    { key: "\x1B[B", expected: "lock: dead holder" },
+    { key: "\x1B[B", expected: "T2 human" },
+    { key: "\x1B[C", expected: `${GLYPHS.pointer} event 100` },
+    { key: "\x1B[B", expected: `${GLYPHS.pointer} event 99` },
+    { key: "\x1B[B", expected: `${GLYPHS.pointer} event 98` },
+  ];
+  try {
+    for (const [i, { key, expected }] of cases.entries()) {
+      expect(h.frame()).not.toContain(expected);
+      const drawn = h.frames().length;
+      // The key is delivered at once through the navigation helper. Before it is handled, a seats update
+      // draws a nonmatching production frame AFTER the key; the key's second render, the one showing the
+      // requested view, is then held back past the former fixed sleep.
+      h.hold(shows(expected));
+      const wait = h.key(key, shows(expected), expected);
+      const seatsText = `${i + 2} active`;
+      await h.rerender(withSeats(i + 2), shows(seatsText), seatsText);
+      const intermediate = h.frame();
+      expect(h.frames().length).toBeGreaterThan(drawn); // a helper returning on any new frame would stop here
+      expect(intermediate).toContain(seatsText);
+      expect(intermediate).not.toContain(expected);
+      await h.untilCall(() => h.holding() > 0, `the held render showing ${expected}`);
+      // The final frame exists but is held: key() stays pending on the intermediate frame past the former sleep.
+      expect(await stateAfter(wait, FORMER_FIXED_SLEEP_MS * 2)).toBe("pending");
+      expect(h.frame()).toBe(intermediate);
+      const released = h.release();
+      expect(released.at(-1)).toContain(expected);
+      expect(released.at(-1)).toContain(seatsText); // drawn after the intermediate frame, not before it
+      const settled = await wait;
+      expect(settled).toContain(expected);
+      expect(settled).toBe(h.frame());
+    }
+    h.input.write("\r");
+    await h.untilCall(() => evidence.length === 1, "the opened evidence callback");
+    expect(evidence).toEqual([activity[2]!.evidence]);
+    expect(opened).toEqual([]);
+    // A view that never renders: no key produces a fourth activity row, so the poll rejects at its bound.
+    await expect(h.until(shows(`${GLYPHS.pointer} event 97`), "a fourth row", 80)).rejects.toThrow(/never reached a fourth row within 80 ms; last frame:/);
   } finally { h.unmount(); }
 });

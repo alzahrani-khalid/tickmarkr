@@ -1,10 +1,16 @@
+import { writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import { type BillingChannel, channelKey } from "../../src/adapters/types.js";
 import { DEFAULT_CONFIG, type TickmarkrConfig, type Tier } from "../../src/config/config.js";
+import { graphDefinitionHash, loadGraph } from "../../src/graph/graph.js";
 import { validateGraph } from "../../src/graph/schema.js";
 import type { ProfileCell, RoutingProfile } from "../../src/route/profile.js";
-import { marginalCostRank, nextChannel } from "../../src/route/router.js";
-import { activeRetryBan, type JournalEvent } from "../../src/run/journal.js";
+import { climbChannel, marginalCostRank, nextChannel, route } from "../../src/route/router.js";
+import { runDaemon } from "../../src/run/daemon.js";
+import { gitHead } from "../../src/run/git.js";
+import { activeRetryBan, Journal, type JournalEvent } from "../../src/run/journal.js";
+import { COMMIT, setupRepo, T } from "../helpers/tmprepo.js";
 
 // ROUTE-13 behavioral oracles for the FAILURE path. These are the successors of the retired ROUTE-10
 // learning-blind grep-pin (learned.test.ts): learnedScore is the STRICTLY-LAST nextChannel sort key —
@@ -157,12 +163,14 @@ test("test: a gate-fingerprint-cap recorded on pi:openai-codex/gpt-5.5 bans code
   }];
   expect(activeRetryBan(events, "T1", "codex:gpt-5.5")).toBe("test");
 
+  // D-718: a tried alias is skipped through the probed identity both offered channels carry — an
+  // unprobed alias is neutral (see the D-718 leaves below), so the alias fleet here is probed.
   const aliasFleet: BillingChannel[] = [
-    { adapter: "pi", vendor: "mixed", model: "openai-codex/gpt-5.5", channel: "sub", tier: "mid" },
-    { adapter: "pi", vendor: "zhipu", model: "zai/glm-5.3", channel: "sub", tier: "mid" },
-    { adapter: "codex", vendor: "openai", model: "gpt-5.5", channel: "sub", tier: "mid" },
-    { adapter: "omp", vendor: "mixed", model: "openai-codex/gpt-5.5", channel: "sub", tier: "mid" },
-    { adapter: "codex", vendor: "openai", model: "gpt-5.6-terra", channel: "sub", tier: "mid" },
+    { adapter: "pi", vendor: "mixed", model: "openai-codex/gpt-5.5", channel: "sub", tier: "mid", identity: "gpt-5.5" },
+    { adapter: "pi", vendor: "zhipu", model: "zai/glm-5.3", channel: "sub", tier: "mid", identity: "glm-5.3" },
+    { adapter: "codex", vendor: "openai", model: "gpt-5.5", channel: "sub", tier: "mid", identity: "gpt-5.5" },
+    { adapter: "omp", vendor: "mixed", model: "openai-codex/gpt-5.5", channel: "sub", tier: "mid", identity: "gpt-5.5" },
+    { adapter: "codex", vendor: "openai", model: "gpt-5.6-terra", channel: "sub", tier: "mid", identity: "gpt-5.6-terra" },
   ];
   const current = { adapter: "pi", model: "openai-codex/gpt-5.5", channel: "sub" as const, tier: "mid" as const };
   for (const tried of ["pi:openai-codex/gpt-5.5", "codex:gpt-5.5"]) {
@@ -188,4 +196,111 @@ describe("ROUTE-13 oracle 4 — no exploration bonus on the failure path (score-
   test("nextChannel picks the warm B, never the under-cap A a route() probe would prefer", () => {
     expect(channelKey(nextChannel(cur("mid"), mkTask(shape), cfg, PAIR, [], profile)!)).toBe("fake:bb");
   });
+});
+
+// ── F (D-718): one exclusion meaning across route, nextChannel and climbChannel ──
+// A raw channel key always excludes itself; the exclusion extends to another offered channel only when
+// BOTH carry a probed identity and the two are equal; a missing identity is neutral. canonical and alias
+// serve one probed identity; independent serves another and ranks BEHIND both (api vs sub), so a
+// raw-key-only exclusion lands on the surviving alias and only the identity moves the pick to independent.
+// The cheap same-adapter siblings sit below every mid pick; they keep each alias's adapter partly untried,
+// so the provider-outage rule (a whole excluded adapter) stays out of play and never decides these rows.
+const d718Cfg: TickmarkrConfig = structuredClone(DEFAULT_CONFIG);
+d718Cfg.routing.map = {}; // no prefer band: marginal cost and tier alone order the fleet
+const canonical: BillingChannel = { adapter: "codex", vendor: "openai", model: "gpt-5.5", channel: "sub", tier: "mid", identity: "gpt-5.5" };
+const alias: BillingChannel = { adapter: "pi", vendor: "mixed", model: "openai-codex/gpt-5.5", channel: "sub", tier: "mid", identity: "gpt-5.5" };
+const independent: BillingChannel = { adapter: "claude-code", vendor: "anthropic", model: "claude-sonnet-5-5", channel: "api", tier: "mid", identity: "claude-sonnet-5-5" };
+const codexSibling: BillingChannel = { adapter: "codex", vendor: "openai", model: "gpt-5.4-mini", channel: "sub", tier: "cheap", identity: "gpt-5.4-mini" };
+const piSibling: BillingChannel = { adapter: "pi", vendor: "zhipu", model: "zai/glm-5.3", channel: "sub", tier: "cheap", identity: "glm-5.3" };
+const withIdentity = (c: BillingChannel, identity: string | undefined): BillingChannel => {
+  const { identity: _, ...rest } = c;
+  return identity ? { ...rest, identity } : rest;
+};
+const d718Fleet = (canonicalIdentity: string | undefined, aliasIdentity: string | undefined): BillingChannel[] =>
+  [withIdentity(canonical, canonicalIdentity), withIdentity(alias, aliasIdentity), independent, codexSibling, piSibling];
+
+// Every site the policy covers, for an exclusion that starts on `from`. `toSibling` is the cheap channel on
+// the adapter of the channel sharing from's identity — the escalation history's earlier seat and the climb origin.
+const d718Picks = (fleet: BillingChannel[], from: BillingChannel, toSibling: BillingChannel, extraTried: string[] = []) => {
+  const task = mkTask("implement");
+  const f = channelKey(from);
+  const s = channelKey(toSibling);
+  const key = (p: { adapter: string; model: string } | null) => p && channelKey(p);
+  return {
+    "route excludes": key(route(task, d718Cfg, fleet, undefined, undefined, new Set([f, ...extraTried])).assignment),
+    "nextChannel demotions": key(nextChannel(from, task, d718Cfg, fleet, extraTried, undefined, new Set([f]))),
+    "climbChannel demotions": key(climbChannel(toSibling, task, d718Cfg, fleet, [s, ...extraTried], undefined, new Set([f]))),
+    "nextChannel tried": key(nextChannel(from, task, d718Cfg, fleet, [f, ...extraTried])),
+    "climbChannel escalation history": key(climbChannel(from, task, d718Cfg, fleet, [s, f, ...extraTried])),
+    "climbChannel climb skips": key(climbChannel(toSibling, task, d718Cfg, fleet, [s, f, ...extraTried])),
+  };
+};
+const every = (picks: Record<string, string | null>, expected: string) =>
+  Object.fromEntries(Object.keys(picks).map((site) => [site, expected]));
+const DIRECTIONS = [
+  { name: "canonical-to-alias", from: canonical, to: alias, toSibling: piSibling },
+  { name: "alias-to-canonical", from: alias, to: canonical, toSibling: codexSibling },
+] as const;
+
+describe("F (D-718) probed-identity exclusion across aliases", () => {
+  test("route nextChannel and climbChannel select the independent served identity for canonical-to-alias and alias-to-canonical exclusions across excludes demotions tried escalation history and climb skips", () => {
+    for (const d of DIRECTIONS) {
+      const picks = d718Picks(d718Fleet("gpt-5.5", "gpt-5.5"), d.from, d.toSibling);
+      expect({ direction: d.name, picks }).toEqual({ direction: d.name, picks: every(picks, channelKey(independent)) });
+      // the climb rows really took their named paths: skips climb a tier, history falls back within it
+      const task = mkTask("implement");
+      const tried = [channelKey(d.toSibling), channelKey(d.from)];
+      expect(climbChannel(d.toSibling, task, d718Cfg, d718Fleet("gpt-5.5", "gpt-5.5"), tried)?.climbed).toBe(true);
+      expect(climbChannel(d.from, task, d718Cfg, d718Fleet("gpt-5.5", "gpt-5.5"), tried)?.climbed).toBe(false);
+      // raw-key control: without the shared identity every site lands on the surviving alias, so the rows
+      // above are decided by the probed identity and not by rank
+      const control = d718Picks(d718Fleet("gpt-5.5", "gpt-5.5-other"), d.from, d.toSibling);
+      expect({ direction: d.name, control }).toEqual({ direction: d.name, control: every(control, channelKey(d.to)) });
+    }
+  });
+
+  test("route nextChannel and climbChannel keep an unprobed untried raw key eligible but reject its directly tried key or two equal probed identities; the unchanged trailing-reroute daemon regression selects fake-2 rather than fake-1", async () => {
+    for (const d of DIRECTIONS) {
+      // missing identity is neutral on either side: the untried raw key stays eligible everywhere
+      for (const [label, fromId, toId] of [
+        ["unprobed target", "gpt-5.5", undefined],
+        ["unprobed excluded", undefined, "gpt-5.5"],
+        ["both unprobed", undefined, undefined],
+      ] as const) {
+        const fleet = d.from === canonical ? d718Fleet(fromId, toId) : d718Fleet(toId, fromId);
+        const picks = d718Picks(fleet, d.from, d.toSibling);
+        expect({ direction: d.name, label, picks }).toEqual({ direction: d.name, label, picks: every(picks, channelKey(d.to)) });
+        // …but its own raw key, tried directly, is still rejected
+        const direct = d718Picks(fleet, d.from, d.toSibling, [channelKey(d.to)]);
+        expect({ direction: d.name, label, direct }).toEqual({ direction: d.name, label, direct: every(direct, channelKey(independent)) });
+      }
+      // two equal probed identities reject the untried alias
+      const equal = d718Picks(d718Fleet("gpt-5.5", "gpt-5.5"), d.from, d.toSibling);
+      expect({ direction: d.name, equal }).toEqual({ direction: d.name, equal: every(equal, channelKey(independent)) });
+    }
+
+    // D-718 control: the unprobed fake fleet of the unchanged trailing-reroute leaf in
+    // tests/run/resume-replay.test.ts, replayed through the real runDaemon — four burned fake-1
+    // dispatches, then a reroute verdict killed before its dispatch. The raw-key exclusion alone must
+    // still move the resumed dispatch to fake-2, never back onto fake-1.
+    const { repo, fake } = setupRepo([T("T1")], {
+      consult: { action: "retry", notes: "retry" },
+      tasks: { T1: [{ shell: `echo done > t1.txt && ${COMMIT} t1`, result: { ok: true, summary: "t1 done" } }] },
+    });
+    const runId = "run-d718-trailing-reroute";
+    const j = Journal.create(repo, runId);
+    j.append("run-start", undefined, { baseRef: await gitHead(repo), commands: {}, graphDefinitionHash: graphDefinitionHash(loadGraph(repo)) });
+    const fake1 = { adapter: "fake", model: "fake-1", channel: "sub" as const, tier: "frontier" as const };
+    for (let attempt = 0; attempt < 4; attempt++) j.append("task-dispatch", "T1", { assignment: fake1, attempt });
+    j.append("consult-verdict", "T1", { action: "reroute", notes: "banned last channel" });
+    writeFileSync(join(j.dir, "baseline.json"), JSON.stringify({ commands: {} }));
+    const s = await runDaemon(repo, { adapters: [fake], runId, resume: true });
+    expect(s.done).toEqual(["T1"]);
+    const all = Journal.open(repo, runId).read();
+    const dispatches = all.slice(all.findIndex((e) => e.event === "run-resume") + 1)
+      .filter((e) => e.event === "task-dispatch" && e.taskId === "T1")
+      .map((e) => channelKey((e.data as { assignment: { adapter: string; model: string } }).assignment));
+    expect(dispatches[0]).toBe("fake:fake-2");
+    expect(dispatches).not.toContain("fake:fake-1");
+  }, 240_000);
 });

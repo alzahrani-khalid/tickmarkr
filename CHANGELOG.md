@@ -2,6 +2,28 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v2.6.4 — honest state, and a faster run
+
+**v2.6.4** makes what tickmarkr reports match what is still owed, and trims repeated work. A waive now records the check it leaves owed, and a matching verify discharges it; status, report and the run's green rails read that current debt. Standalone verify finishes its semantic gates before it leases the test suite. Codex retirement and window knowledge, user-layer model choices, alias-aware exclusions and live board reads are corrected. Run `run-20260929-184142-0000000000000204`: 13/13 merged over six laps, green at run-end (done 13; failed, human, blocked and pending empty; tip build/test/lint fresh on 61068fde, 385 test files).
+
+- **T1 — the keys ledger repeats less runner work.** Setup, child runs and assertion bodies are profiled separately; the ledger stays an independent mutation oracle.
+- **T2 — doctor carries Codex retirement knowledge.** A listed model's retirement date and successor persist in health and render in lints; known-empty retirement metadata is distinguished from an absent legacy record.
+- **T3 — the seven ruled Codex models are seeded together.** gpt-6-astra, gpt-6-sol and gpt-6-luna join the retained models, and all seven windows are 272 000 tokens in both the seeds and the window table.
+- **T4 — Fleet and init save machine model choices to the user layer.** Membership, classifications, effort, routing maps, mode and reviewer/consult/judge choices are previewed and committed to the user overlay; repo-shadowed keys are reported and repo bytes preserved.
+- **T5 — standalone verify runs its semantic gates before it leases the suite.** Cheap gates, then judge and review concurrently, then the repository lease for the baseline and candidate suites; one accumulated verdict.
+- **T6 — a waive records an immutable owed check.** The obligation rides the waive row, survives restart and merge, and is discharged only by validated matching proof.
+- **T7 — status and report lead with current facts.** Finished work, wall accounting and what is outstanding come first; first pass is derived from the journal's dispatch, park, approval and merge lineage, and missing lineage is shown as unknown.
+- **T8 — run rails and the generated green rule are debt-aware.** Green or verified is claimed only when current outstanding debt is empty and known; exit codes stay execution-based.
+- **T9 — compile refuses a single-item brace group** in `files[]`, naming the pattern and the literal-path repair, and explains symlinked scope paths.
+- **T10 — tried identities are excluded across aliases** when both channels carry the same probed identity; a missing identity is neutral.
+- **T11 — a waived task's unobserved gates still run.** After a scope or evidence waive, build and lint without a prior-round row run as declared gates; assignment restoration honours the alias-aware exclusions.
+- **T12 — the live board stays readable while the journal grows.** A same-inode append between stat and fstat is retried; exhaustion keeps the last good snapshot as pending.
+- **T13 — cockpit tests wait for final frames** instead of fixed sleeps, and the short-HOME receipt case is restored.
+
+**Known limitations (two review waivers; each task's tip build ✓ and lint ✓).**
+- Compile's single-item brace refusal does not see exotic backslash runs before a comma or brace inside a group; such a group compiles as it did in 2.6.3. Queued for 2.6.5.
+- Fleet's routing previews (Shapes, mode, candidate picker) reflect the last reviewed classifications and efforts; an edit shows in the previews only after `w` (review). The review screen and the saved configuration are correct. Queued for 2.6.5.
+
 ## v2.6.3 — the run spends its time on the work
 
 **v2.6.3** cuts repeated verification and repair laps without weakening a gate. Trusted repair selection and pooled suites reduce duplicate test screens. Infrastructure-shaped reds are adjudicated before a worker is charged. Semantic disagreement is resolved without an unfounded charge. Recovery finds finished work, and test capacity is accounted through leases and active time. Run `run-20260927-122129-0000000000000171`: 15/15 merged over two laps, green at run-end (done 15; failed, human, blocked and pending empty; tip build/test/lint fresh on e9f444a5, 385 test files).

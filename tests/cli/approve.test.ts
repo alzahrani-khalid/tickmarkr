@@ -8,7 +8,7 @@ import { graphDefinitionHash, loadGraph, taskDefinitionFingerprint, tickmarkrDir
 import { outstandingApprovals, pendingDaemonApprovalActions, runDaemon } from "../../src/run/daemon.js";
 import { gitHead } from "../../src/run/git.js";
 import {
-  activeRetryBan, APPROVAL_REFUSED, applyScopeAmendments, bindingToken, effectiveDecisions, foldDecisions, identicalGateFailures, journaledFailureBrief, Journal, normalizeGateFailure, PARK_KINDS,
+  activeRetryBan, APPROVAL_REFUSED, foldOwedChecks, owedCriteria, owedSubject, type OwedCheck, applyScopeAmendments, bindingToken, effectiveDecisions, foldDecisions, identicalGateFailures, journaledFailureBrief, Journal, normalizeGateFailure, PARK_KINDS,
   pendingApprovalActions, pendingRechecks, recordedGraphDefinitionHash, repairReachSinceApproval, repairsSinceApproval, reviewRoundsSinceApproval,
   staleApprovals, type DecisionBinding,
 } from "../../src/run/journal.js";
@@ -18,6 +18,7 @@ import { createLiveStore } from "../../src/tui/cockpit/live-store.js";
 import { decidedLiveStore } from "../../src/tui/cockpit/live-runtime.js";
 import { acquireApprovalSerialization } from "../../src/run/lock.js";
 import { COMMIT, setupRepo, T } from "../helpers/tmprepo.js";
+import { execSync } from "node:child_process";
 
 const countApproved = (dir: string, runId: string): number =>
   Journal.open(dir, runId).read().filter((e) => e.event === "task-approved").length;
@@ -60,6 +61,54 @@ describe("tickmarkr approve — fail-closed human gate approval (GATE-08, zero-t
     )).toHaveLength(1);
     expect(afterResume.slice(beforeResume.length).some((e) => e.event === "merge" && e.taskId === "T1")).toBe(true);
   }, 120_000);
+
+  test("approve waive writes exactly one same-row obligation with run task gate immutable subject criteria cause and run-derived authors and a real park waive restart merge leaves one accepted-risk check in the run-end reduction", async () => {
+    const { repo, fake } = setupRepo(
+      [T("T1", { complexity: 8, acceptance: ["done", "the approved file exists"] })],
+      {
+        judge: { pass: false, criteria: [{ criterion: "c1", met: false, reason: "operator override required" }] },
+        review: { approve: true, issues: [] },
+        consult: { action: "human", notes: "operator must decide" },
+        tasks: { T1: [{ shell: `echo approved > approved.txt && ${COMMIT} approved`, result: { ok: true, summary: "implemented" } }] },
+      },
+    );
+    const runId = "run-owed-waive";
+    expect((await runDaemon(repo, { adapters: [fake], runId })).human).toEqual(["T1"]);
+    const parked = Journal.open(repo, runId).read();
+
+    const out = await approve([runId, "T1", "--waive", "--by", "operator", "--reason", "D-1 accepts the judge red"], repo);
+    const rows = Journal.open(repo, runId).read().slice(parked.length);
+    expect(rows.map((e) => e.event)).toEqual(["task-approved"]); // one append: the waiver and its obligation together
+    const obligation = rows[0]!.data.obligation as OwedCheck;
+    const taskHead = execSync(`git rev-parse tickmarkr/${runId}--T1`, { cwd: repo, encoding: "utf8" }).trim();
+    const measured = parked.filter((e) => e.event === "gate-result" && e.taskId === "T1" && e.data.gate === "acceptance").at(-1)!;
+    const dispatched = [...new Set(parked.filter((e) => e.event === "task-dispatch" && e.taskId === "T1")
+      .map((e) => e.data.assignment as { adapter: string; model: string }).map((a) => `${a.adapter}:${a.model}`))].sort();
+    expect(rows[0]).toMatchObject({ taskId: "T1", data: { release: "gate-satisfied", gate: "acceptance" } });
+    expect(obligation).toMatchObject({
+      version: 1, runId, taskId: "T1", gate: "acceptance", head: taskHead, subject: measured.data.commit,
+      criteria: owedCriteria(["done", "the approved file exists"]), cause: "D-1 accepts the judge red",
+      disposition: "accepted-risk", known: true,
+    });
+    expect(obligation.subject).toBe(owedSubject(repo, obligation.base, obligation.head));
+    // Authors are the run's patch owners: a dispatched seat that landed no patch is not one.
+    expect(obligation.authors.length).toBeGreaterThan(0);
+    expect(obligation.authors.every((a) => dispatched.includes(a))).toBe(true);
+    expect(out).toContain(`owes acceptance check ${obligation.id}`);
+
+    const resumed = await runDaemon(repo, { adapters: [fake], runId, resume: true });
+    expect(resumed.done).toEqual(["T1"]);
+    const events = Journal.open(repo, runId).read();
+    expect(events.some((e) => e.event === "merge" && e.taskId === "T1")).toBe(true);
+    // ...and they are the daemon's own lifetime-author fold for the merged subject.
+    expect(obligation.authors).toEqual(events.find((e) => e.event === "task-done" && e.taskId === "T1")!.data.authors);
+    const runEnd = events.filter((e) => e.event === "run-end").at(-1)!;
+    expect(runEnd.data.owedChecks).toMatchObject({ known: true, debt: 1, discharged: [], unknown: [] });
+    const reduced = runEnd.data.owedChecks as { acceptedRisk: OwedCheck[]; outstanding: OwedCheck[] };
+    expect(reduced.acceptedRisk).toEqual([obligation]);
+    expect(reduced.outstanding).toEqual([obligation]);
+    expect(foldOwedChecks(events, repo)).toMatchObject({ debt: 1, acceptedRisk: [{ id: obligation.id }] });
+  }, 240_000);
 
   test("test: the recorded approval marker is scoped to the approved task and gate and releases nothing else", async () => {
     const { repo } = setupRepo([T("T1"), T("T2")], { tasks: {} });

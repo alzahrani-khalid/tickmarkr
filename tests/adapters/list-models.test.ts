@@ -133,6 +133,37 @@ describe("readCodexModelsCache (codex-cli 0.143.0 cache, verified 2026-07-10)", 
     expect(readCodexModelsCache(p).models).toEqual(["gpt-5.5"]);
   });
 
+  test("B1a: listed upgrade notices keep date and successor; null is known clean; absent, malformed or hidden records nothing", () => {
+    const retirement_at = "2026-10-14T19:00:00Z";
+    const r = readCodexModelsCache(writeCache({
+      models: [
+        { slug: "gpt-5.5", visibility: "list", upgrade: { model: "gpt-5.6-sol", migration_markdown: "GPT-5.5 retires", retirement_at } },
+        { slug: "gpt-5.6-sol", visibility: "list", upgrade: null },
+        { slug: "gpt-5.6-terra", visibility: "list" },
+        { slug: "gpt-5.6-luna", visibility: "list", upgrade: { model: "gpt-5.6-sol", retirement_at: "soon" } },
+        { slug: "gpt-5.4", visibility: "list", upgrade: { model: "poison;rm -rf", retirement_at } },
+        { slug: "gpt-5.3", visibility: "list", upgrade: { retirement_at } },
+        { slug: "gpt-reserve", visibility: "hide", upgrade: { model: "gpt-5.6-sol", retirement_at } },
+      ],
+    }));
+    expect(r.models).toEqual(["gpt-5.5", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.4", "gpt-5.3"]);
+    expect(r.retirements).toEqual({
+      "gpt-5.5": { retiresAt: retirement_at, successor: "gpt-5.6-sol" },
+      "gpt-5.6-sol": null,
+      "gpt-5.3": { retiresAt: retirement_at },
+    });
+    const dir = mkdtempSync(join(tmpdir(), "tickmarkr-codexhome-"));
+    writeFileSync(join(dir, "models_cache.json"), JSON.stringify({ models: [{ slug: "gpt-5.6-sol", visibility: "list", upgrade: null }] }));
+    const prev = process.env.CODEX_HOME;
+    process.env.CODEX_HOME = dir;
+    try {
+      expect(codex.listModelsRetirements?.()).toEqual({ "gpt-5.6-sol": null });
+    } finally {
+      if (prev === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = prev;
+    }
+  });
+
   test("WR-01/MODEL-05: adapter surfaces the cache's own fetched_at (via CODEX_HOME) for honest staleness", () => {
     const dir = mkdtempSync(join(tmpdir(), "tickmarkr-codexhome-"));
     writeFileSync(join(dir, "models_cache.json"), JSON.stringify(cache));

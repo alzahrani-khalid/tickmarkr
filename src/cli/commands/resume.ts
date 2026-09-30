@@ -3,14 +3,10 @@ import { readDoctor } from "../../adapters/registry.js";
 import { loadConfig } from "../../config/config.js";
 import { classifyHost, parseDriverOverride, pickDriver, preflightHostDriver } from "../../drivers/index.js";
 import { loadGraph } from "../../graph/graph.js";
-import { type RunSummary, formatSummary, runDaemon } from "../../run/daemon.js";
+import { formatSummary, runDaemon } from "../../run/daemon.js";
 import { denyPreferCollisionLine, denyPreferCollisions } from "../../route/preference.js";
-import { narrationSink, bindNarration } from "./run.js";
+import { finalRail, narrationSink, bindNarration, summaryGreen } from "./run.js";
 import { assertRefsWritable } from "../../run/git.js";
-
-const summaryGreen = (s: RunSummary) =>
-  s.failed.length === 0 && s.human.length === 0 && s.blocked.length === 0 && s.pending.length === 0
-  && s.tipVerify !== "failed";
 
 export async function resume(argv: string[], cwd = process.cwd()): Promise<{ out: string; code: number }> {
   const { values, positionals } = parseArgs({
@@ -58,6 +54,6 @@ export async function resume(argv: string[], cwd = process.cwd()): Promise<{ out
     // the operator named, so a resumed run's lifecycle rows name THIS run and not a generic word.
     narrate,
   });
-  const out = `resumed ${s.runId} — ${formatSummary(s)}`;
+  const out = `resumed ${s.runId} — ${formatSummary(s)}${finalRail(s, cwd)}`;
   return { out, code: summaryGreen(s) ? 0 : 2 };
 }

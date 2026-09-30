@@ -431,6 +431,50 @@ describe("OBS-119 dead-channel exclusion resume (v1.71 T4, zero tokens)", () => 
   });
 });
 
+// W (D-718): resume restores lastAssignment under the router's one exclusion meaning. fake-alias ranks
+// ahead of fake-2 in failover order and shares fake-1's probed identity, so only that identity can move a
+// restore of fake-alias onto fake-2; with an unrelated exclusion the restore still wins over route()'s
+// static pick (fake-1, the flat-rate seat).
+describe("W (D-718) identity-aware resume restore (fake adapter, zero tokens)", () => {
+  const aliasRestore = async (runId: string, last: "fake-1" | "fake-alias", excluded: string) => {
+    const { repo, fake } = setupResumeRepo();
+    fake.channels = () => [
+      { adapter: "fake", vendor: "fake-a", model: "fake-1", channel: "sub", tier: "frontier" },
+      { adapter: "fake", vendor: "fake-a", model: "fake-alias", channel: "api", tier: "frontier" },
+      { adapter: "fake", vendor: "fake-b", model: "fake-2", channel: "api", tier: "frontier" },
+    ];
+    const identities: Record<string, string> = { "fake-1": "fake-served-1", "fake-alias": "fake-served-1", "fake-2": "fake-served-2" };
+    fake.probe = async () => ({
+      installed: true, authed: true, version: "fake", models: Object.keys(identities),
+      modelAuth: Object.fromEntries(Object.entries(identities).map(([model, identity]) =>
+        [model, { authed: true, probedAt: "2026-09-29T00:00:00.000Z", identity }])),
+    });
+    await seedJournal(repo, runId, [
+      { event: "task-dispatch", taskId: "T1", data: { assignment: { ...(last === "fake-1" ? fake1 : fake2), model: last }, attempt: 0 } },
+      { event: "channel-exclusion", taskId: "T1", data: { channel: excluded, reason: "auth-required", kind: "dead-channel" } },
+    ]);
+    const s = await runDaemon(repo, { adapters: [fake], runId, resume: true });
+    expect(s.done).toEqual(["T1"]);
+    const post = postResume(Journal.open(repo, runId).read());
+    const restored = post.find((e) => e.event === "resume-restore" && e.taskId === "T1")!;
+    return {
+      restored: channelKey(dispatchAssignment(restored)),
+      dispatched: post.filter((e) => e.event === "task-dispatch" && e.taskId === "T1").map((e) => channelKey(dispatchAssignment(e))),
+    };
+  };
+
+  test("resumed runDaemon dispatches fake-2 when lastAssignment is either excluded fake-1 or its probed fake-alias identity while a nonexcluded restored assignment remains eligible", async () => {
+    const direct = await aliasRestore("run-w-restore-direct", "fake-1", "fake:fake-1");
+    expect(direct).toEqual({ restored: "fake:fake-2", dispatched: ["fake:fake-2"] });
+
+    const alias = await aliasRestore("run-w-restore-alias", "fake-alias", "fake:fake-1");
+    expect(alias).toEqual({ restored: "fake:fake-2", dispatched: ["fake:fake-2"] });
+
+    const eligible = await aliasRestore("run-w-restore-eligible", "fake-alias", "fake:fake-2");
+    expect(eligible).toEqual({ restored: "fake:fake-alias", dispatched: ["fake:fake-alias"] });
+  }, 240_000);
+});
+
 test("test: every task-dispatch row after a ladder move names the dispatched channel in its provenance with the abandoned pin marked not re-tried and the channels the ladder skipped listed on the row, and a resume whose loaded graph pins a channel the recorded graph did not dispatches that pin journaling restore-rerouted, so a row claiming a pin it did not run on fails", async () => {
   for (const change of ["ladder", "pin", "floor"] as const) {
     const { repo, fake } = setupResumeRepo();

@@ -449,7 +449,7 @@ describe("tickmarkr doctor — model drift suggestion fragment (MODEL-05/06/07)"
     expect(out).toContain("gpt-5.6-sol: null");
 
     const cleanRepo = makeRepo({ "a.txt": "x" });
-    const clean = await doctor(["--"], cleanRepo, [stub("codex", async () => ["gpt-5.6-sol", "gpt-5.5", "gpt-5.6-terra", "gpt-5.6-luna"])]);
+    const clean = await doctor(["--"], cleanRepo, [stub("codex", async () => ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.5", "gpt-5.6-terra", "gpt-5.6-luna"])]);
     expect(clean).not.toContain("paste-ready overlay");
     expect(clean).not.toContain("tiers:");
   });

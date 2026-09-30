@@ -1,11 +1,13 @@
 import { graphDefinitionHash, loadGraph, saveGraph, taskDefinitionFingerprint } from "../../graph/graph.js";
 import { execFileSync } from "node:child_process";
 import { userInfo } from "node:os";
+import { allAdapters } from "../../adapters/registry.js";
+import { channelKey } from "../../adapters/types.js";
 import { loadConfig } from "../../config/config.js";
 import { integrationBranch } from "../../run/merge.js";
 import { separabilityErrors, surfaceErrors, taskBudgetErrors } from "../../compile/collateral.js";
-import { GATE_NAMES } from "../../graph/schema.js";
-import { applyScopeAmendments, bindingToken, engagementComparable, engagementReleased, failedGateBeforePark, parseBindingToken, physicalLine, ATTEMPT_CAP_RELEASE, GATE_SATISFIED_RELEASE, Journal, RECHECK_RELEASE, REVIEW_UPHELD_RELEASE, type DecisionBinding, type JournalEvent } from "../../run/journal.js";
+import { GATE_NAMES, type GateName } from "../../graph/schema.js";
+import { applyScopeAmendments, bindingToken, captureOwedCheck, engagementComparable, engagementReleased, failedGateBeforePark, parseBindingToken, physicalLine, ATTEMPT_CAP_RELEASE, GATE_SATISFIED_RELEASE, Journal, RECHECK_RELEASE, REVIEW_UPHELD_RELEASE, type DecisionBinding, type JournalEvent } from "../../run/journal.js";
 
 export const APPROVAL_DISPOSITIONS = ["dispatch", "waive-gate", "re-dispatch", "fund-fixed-attempt", "fresh-budget"] as const;
 export type ApprovalDisposition = (typeof APPROVAL_DISPOSITIONS)[number];
@@ -365,6 +367,24 @@ export async function approve(argv: string[], cwd = process.cwd()): Promise<stri
     if (!gateFailPark || !failedGate) {
       throw new Error(`--waive applies to a gate-fail park; ${taskId}'s newest park is ${String(lastHuman?.data.kind ?? "none")} with failed gate ${failedGate ?? "none"} — refusing`);
     }
+    // C1: the waiver's owed check rides the SAME row — one append, captured synchronously so a live
+    // daemon's boundary never observes the decision without its obligation (or a second write).
+    // The seats a review discharge may resolve to are this repository's declared channels, recorded on
+    // the row so every later fold reads the same table whatever process or checkout it runs in.
+    let integrationRef = "unknown";
+    let declared: Array<{ key: string; vendor: string }> | undefined;
+    let owedTask: { acceptance?: unknown; files?: unknown } | undefined;
+    try {
+      const cfg = loadConfig(cwd);
+      integrationRef = integrationBranch(cfg, runId);
+      declared = allAdapters().flatMap((a) => a.channels(cfg)).map((c) => ({ key: channelKey(c), vendor: c.vendor }));
+    } catch { /* an unreadable config binds no range and declares no seat: unknown */ }
+    try { owedTask = loadGraph(cwd).tasks.find((t) => t.id === taskId); } catch { /* recorded as unknown criteria and scope */ }
+    const obligation = captureOwedCheck({
+      cwd, runId, taskId, gate: failedGate as GateName, events, acceptance: owedTask?.acceptance, files: owedTask?.files, declared,
+      cause: reason ?? `operator waived failed ${failedGate} gate`, // the row's own park field binds the park
+      taskRef: `${integrationRef}--${taskId}`, integrationRef,
+    });
     journal.append("task-approved", taskId, {
       by,
       ...(reason ? { reason } : {}),
@@ -373,8 +393,9 @@ export async function approve(argv: string[], cwd = process.cwd()): Promise<stri
       gate: failedGate,
       park: parkBinding,
       ...(reviewRoundCeiling === undefined ? {} : { reviewRoundCeiling }),
+      obligation,
     });
-    return disposition(cwd, runId, "waive-gate", `waived failed gate ${failedGate} for ${taskId} in ${runId} — by ${by}`, serialization.contended);
+    return disposition(cwd, runId, "waive-gate", `waived failed gate ${failedGate} for ${taskId} in ${runId} — by ${by}; owes ${failedGate} check ${obligation.id}${obligation.known ? "" : " (debt unknown)"}`, serialization.contended);
   }
   if (gateFailPark) {
     const choices = [`--waive (disposition waive-gate)`, `--recheck (disposition re-dispatch)`];

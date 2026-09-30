@@ -8,7 +8,7 @@
 ! run-20260821-070000-0000000000001734 board lost — pid 2428, pane wZ:p1EB
 ✓ run-20260821-070000-0000000000001734 board reopened — pane wZ:p1F1
 ✗ run-20260821-070000-0000000000001734 board reopen failed — no caller pane, pane wZ:p1EB
-✓ run-rail finished — done 1, failed 0
+✓ run-rail finished — done 1, failed 0, outstanding 0
 ✓ run-20260821-070000-0000000000001734 tip verify — test passed
 ✗ run-20260821-070000-0000000000001734 tip verify — test failed after T1
 ❯ run-20260821-070000-0000000000001734 tip verify — gates build, test

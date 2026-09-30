@@ -8,10 +8,11 @@ import { type TaskStatus } from "../../graph/schema.js";
 import { type RunSummary, formatSummary, resolveRunMode, runDaemon } from "../../run/daemon.js";
 import { isRunLockLive } from "../../run/lock.js";
 import { route, type ExploreContext, NO_EXPLORE_ENV } from "../../route/router.js";
-import { formatJournalNarration, loadRoutingProfile, newRunId, type JournalEvent } from "../../run/journal.js";
+import { formatJournalNarration, Journal, loadRoutingProfile, newRunId, type JournalEvent, type OwedFold } from "../../run/journal.js";
 import { normalizeGateOutcome, type GateOutcomeKind } from "../../run/outcome.js";
 import { GLYPHS, LIVE } from "../../brand.js";
 import { cellWidth, fitCells } from "../../tui/cockpit/width.js";
+import { currentOwed, outstandingText } from "./report.js";
 
 import { assertRefsWritable } from "../../run/git.js";
 // ── the operator event rail (v1.99 T2) ──────────────────────────────────────────────────────────
@@ -179,15 +180,24 @@ const bucket = (value: unknown): number => (Array.isArray(value) ? value.length 
  *
  *   a fatal crash, a failed task or a failed integration tip is a FAILURE;
  *   an incomplete run — parked, blocked or still-pending work — wants ATTENTION;
+ *   so does a complete execution that owes a check, or whose owed-check fold is unknown (CG2);
  *   only a run with none of those is a pass.
  *
  * A rail that paints the terminal record by the same predicate the exit code uses can never show a
- * green tickmark over a run whose exit code is 2.
+ * green tickmark over a run whose exit code is 2 — and, since the exit code is execution-based, the
+ * debt clause is the one place the tone is stricter than it: exit 0 with an owed check is not green.
+ * The fold is the one this row carries, reduced at its own append: live, that IS the current fold.
  */
 const runEndTone = (data: Record<string, unknown>): RailTone => {
   if (data.fatal === true || bucket(data.failed) > 0 || data.tipVerify === "failed") return "fail";
   if (bucket(data.human) + bucket(data.blocked) + bucket(data.pending) > 0) return "attention";
-  return "pass";
+  return recordedDebt(data) === 0 ? "pass" : "attention";
+};
+
+/** The outstanding count a run-end record's own fold carries; undefined when it carries none or an unknown one. */
+const recordedDebt = (data: Record<string, unknown>): number | undefined => {
+  const owed = data.owedChecks as Partial<OwedFold> | undefined;
+  return owed?.known === true && Array.isArray(owed.outstanding) ? owed.outstanding.length : undefined;
 };
 
 /** A gate row's non-failure is spelled across `pass`, `skipped`, `verdict` and `infra`, and a row may
@@ -347,6 +357,8 @@ const RAIL_PROJECTION: Record<string, (data: Record<string, unknown>) => string 
     typeof d.gatedCommit === "string" && typeof d.branchTip === "string"
       ? `gated ${d.gatedCommit.slice(0, 12)}, tip ${d.branchTip.slice(0, 12)}`
       : undefined,
+  // CG2: the terminal row names its debt — a legacy record without a fold is unknown, never zero
+  "run-end": (d) => `outstanding ${recordedDebt(d) ?? "unknown"}`,
   "trust-auto-answer": (d) =>
     typeof d.adapter === "string" ? `${d.adapter}${typeof d.phase === "string" ? ` ${d.phase}` : ""}` : undefined,
   // SB-1: the census the ceiling released beside, and the budget the round ran under versus the one it
@@ -447,9 +459,25 @@ export function bindNarration<D extends ExecutorDriver>(driver: D, narrate: (eve
   return driver;
 }
 
-const summaryGreen = (s: RunSummary) =>
+/** Execution green: the exit-code predicate run and resume share. Users' scripts read it; debt never moves it. */
+export const summaryGreen = (s: RunSummary) =>
   s.failed.length === 0 && s.human.length === 0 && s.blocked.length === 0 && s.pending.length === 0
   && s.tipVerify !== "failed";
+
+/**
+ * CG2 (v2.6.4): the last line of a run or resume, read from the CURRENT owed-check fold after the
+ * daemon returns — never the run-end row's copy, which a later `verify --record` discharge leaves
+ * historical. "verified" requires execution green AND outstanding empty AND known; an execution-green
+ * run that owes a check, or whose debt is unknown, says so and is not green. A partial or failed run
+ * adds nothing: its summary keeps its own wording and is never called complete.
+ */
+export function finalRail(s: RunSummary, cwd: string): string {
+  if (!summaryGreen(s)) return "";
+  const owed = currentOwed(Journal.open(cwd, s.runId).read(), cwd);
+  if (owed.known && owed.outstanding.length === 0) return `\nverified — execution complete, ${outstandingText(owed)}`;
+  const why = owed.known ? "" : ` (${owed.unknown[0]?.reason ?? "owed checks unreadable"})`;
+  return `\nexecution complete; ${outstandingText(owed)}${why} — not green until outstanding is empty and known`;
+}
 
 // v1.51 T2: --quality is a pure compatibility alias for `--mode partner-led` (this run only). It
 // carries no one-band floor raise of its own — and since the OBS-89 rip (v1.60) route() no longer
@@ -559,7 +587,7 @@ export async function run(argv: string[], cwd = process.cwd()): Promise<{ out: s
       supersedes: values.supersedes,
       narrate,
     });
-    const out = `run ${s.runId} finished — ${formatSummary(s)} (merge to main is a human decision)`;
+    const out = `run ${s.runId} finished — ${formatSummary(s)} (merge to main is a human decision)${finalRail(s, cwd)}`;
     return { out, code: summaryGreen(s) ? 0 : 2 };
   } finally {
     if (noExplore) delete process.env[NO_EXPLORE_ENV];

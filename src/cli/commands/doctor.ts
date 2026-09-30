@@ -85,6 +85,8 @@ export type DoctorOpts = {
   resolveOrcaBinary?: (cwd: string) => string | undefined;
   /** Test seam for the runner-owned JSON listing used by the acceptance-oracle report row. */
   listTests?: (cwd: string) => Promise<VitestListResult>;
+  /** Clock for model-knowledge lints (retirement notices, knowledge age); absent = the wall clock. */
+  now?: () => Date;
 };
 
 type OrcaCapability = { verdict: "pass" | "fail" | "warn"; detail: string };
@@ -661,6 +663,10 @@ export async function doctor(
       // measures real knowledge age, not run time. opencode reads its own offline cache too but exposes
       // no fetch timestamp, so it still stamps now — its staleness lint is best-effort until it surfaces one.
       if (health[a.id].models.length) health[a.id].modelsDetectedAt = a.listModelsFetchedAt?.() ?? new Date().toISOString();
+      // v2.6.4 T2 (B1a): the CLI's retirement notices ride into doctor.json beside the list they describe;
+      // an unreadable source leaves the field absent, which every reader treats as unknown.
+      const retirements = a.listModelsRetirements?.();
+      if (retirements) health[a.id].modelRetirements = retirements;
     } catch { /* fail open: leave models as-is, doctor stays healthy */ }
   }
   // A free Kimi auth failure or failed earned-green turn must not spend more probes. Every other
@@ -846,7 +852,7 @@ export async function doctor(
   const lintRows: string[] = [];
   const liveBenchStale = liveBenchStalenessFinding(opts.catalogNow?.() ?? new Date());
   if (liveBenchStale) lintRows.push(attentionRow(liveBenchStale));
-  lintRows.push(...modelLints(cfg, health, adapters, { tty: ttyVisual(), stateDir: stateDirName(cwd), overlayPreferShapes: overlayPreferShapes(cwd) }).map(attentionRow));
+  lintRows.push(...modelLints(cfg, health, adapters, { tty: ttyVisual(), stateDir: stateDirName(cwd), overlayPreferShapes: overlayPreferShapes(cwd), now: opts.now?.() }).map(attentionRow));
   const excluded = excludedChannels(cfg, adapters, health);
   if (excluded.length) lintRows.push(attentionRow(exclusionLine(excluded)));
   lintRows.push(...denyPreferCollisions(cfg, undefined, health).map((c) => attentionRow(denyPreferCollisionLine(c))));

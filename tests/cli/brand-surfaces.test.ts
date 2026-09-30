@@ -110,7 +110,7 @@ function mkReportRepo(): string {
   const j = Journal.create(repo, "run-brand-pin");
   writeFileSync(join(j.dir, "journal.jsonl"), [
     { ts: "2026-07-18T10:00:00.000Z", event: "run-start", data: { baseRef: "abc123def456" } },
-    { ts: "2026-07-18T10:00:01.000Z", event: "task-dispatch", taskId: "T1", data: { assignment: { adapter: "fake", model: "fake-1", channel: "sub", tier: "cheap" }, attempt: 0, provenance: "floor cheap" } },
+    { ts: "2026-07-18T10:00:01.000Z", event: "task-dispatch", taskId: "T1", data: { assignment: { adapter: "fake", model: "fake-1", channel: "sub", tier: "cheap" }, attempt: 0, workerDispatchOrdinal: 0, provenance: "floor cheap" } },
     { ts: "2026-07-18T10:00:02.000Z", event: "gate-result", taskId: "T1", data: { gate: "build", pass: true, details: "exit 0" } },
     { ts: "2026-07-18T10:00:03.000Z", event: "gate-result", taskId: "T1", data: { gate: "test", pass: false, details: "1 failed" } },
     { ts: "2026-07-18T10:00:04.000Z", event: "consult-verdict", taskId: "T1", data: { action: "retry", notes: "fix the test" } },
@@ -212,7 +212,7 @@ const RAIL_SPEC: RailSpec[] = [
   { event: "watch-board-reopened", label: "board reopened", tone: "pass", salient: "pane wZ:p1F1", run: true, data: { pane: "wZ:p1F1", attempt: 1 } },
   // Leg-2 T7 M2: a reopen that failed is its own row — the loss above is journaled once, not once per poll
   { event: "watch-board-reopen-failed", label: "board reopen failed", tone: "fail", salient: "pane wZ:p1EB", run: true, data: { pane: "wZ:p1EB", attempt: 2, error: "no caller pane" } },
-  { event: "run-end", label: "finished", tone: "neutral", renders: "pass", run: true, data: { runId: "run-rail", done: ["T1"], failed: [], human: [], blocked: [], pending: [], tipVerify: "passed" } },
+  { event: "run-end", label: "finished", tone: "neutral", renders: "pass", run: true, data: { runId: "run-rail", done: ["T1"], failed: [], human: [], blocked: [], pending: [], tipVerify: "passed", owedChecks: { known: true, debt: 0, outstanding: [], acceptedRisk: [], discharged: [], unknown: [] } } },
   { event: "tip-verify", label: "tip verify", tone: "pass", run: true, data: { gate: "test" } },
   { event: "tip-verify-failed", label: "tip verify", tone: "fail", run: true, data: { gate: "test", lastMergedTask: "T1" } },
   { event: "tip-verify-start", label: "tip verify", tone: "active", run: true, data: { tip: "deadbeefcafe", cmdHash: "c0ffee", gates: ["build", "test"], cached: false } },
@@ -756,8 +756,24 @@ describe("T4 v1.50 brand pass — plan, run narration, report", () => {
     // operator acts on — rendered the same neutral dash over a green, a crash and a park alike.
     const glyphOf = (data: Record<string, unknown>) =>
       stripAnsi(narrationRow({ ts: "t", event: "run-end", data: { runId: "run-rail", ...data } }, 120)!).slice(0, 1);
-    const clean = { done: ["T1"], failed: [], human: [], blocked: [], pending: [], tipVerify: "passed" };
+    const known = { known: true, debt: 0, outstanding: [], acceptedRisk: [], discharged: [], unknown: [] };
+    const clean = { done: ["T1"], failed: [], human: [], blocked: [], pending: [], tipVerify: "passed", owedChecks: known };
     expect(glyphOf(clean)).toBe(TONE_SIGNAL.pass.glyph);
+    // CG2: execution green is not green while the record's own fold owes a check or is unknown —
+    // and a legacy record carrying no fold at all is unknown debt, never zero.
+    const owed = { taskId: "T1", gate: "review" };
+    const rowOf = (data: Record<string, unknown>) =>
+      stripAnsi(narrationRow({ ts: "t", event: "run-end", data: { runId: "run-rail", ...data } }, 120)!);
+    expect(rowOf(clean)).toContain("outstanding 0");
+    for (const [label, data] of [
+      ["one owed check", { ...clean, owedChecks: { ...known, debt: 1, outstanding: [owed], acceptedRisk: [owed] } }],
+      ["unknown fold", { ...clean, owedChecks: { ...known, known: false, debt: "unknown", unknown: [{ reason: "legacy waiver without an owed-check obligation" }] } }],
+      ["legacy record", { ...clean, owedChecks: undefined }],
+    ] as const) {
+      expect(glyphOf(data), label).toBe(TONE_SIGNAL.attention.glyph);
+    }
+    expect(rowOf({ ...clean, owedChecks: { ...known, debt: 1, outstanding: [owed] } })).toContain("outstanding 1");
+    expect(rowOf({ ...clean, owedChecks: undefined })).toContain("outstanding unknown");
 
     // control 1 — a FAILED task, everything else identical to the green above.
     expect(glyphOf({ ...clean, done: [], failed: ["T1"] })).toBe(TONE_SIGNAL.fail.glyph);
@@ -796,6 +812,7 @@ describe("T4 v1.50 brand pass — plan, run narration, report", () => {
     }
   });
 
+  // CG1 regenerated the golden: it now leads with finished/time/needs-you and labels telemetry engagement-local.
   test("report markdown output is byte-identical to before this change", async () => {
     setTTY(false);
     expect(await report(["run-brand-pin", "--md"], mkReportRepo())).toBe(golden("report-md.md"));
@@ -809,7 +826,9 @@ describe("T4 v1.50 brand pass — plan, run narration, report", () => {
     const plain = await report(["run-brand-pin"], repo);
     onTTY();
     const tty = await report(["run-brand-pin"], repo);
-    expect(tty.startsWith("\x1b[1mtickmarkr engagement — run-brand-pin\x1b[0m\n\x1b[2m─")).toBe(true);
+    // CG1: three unstyled lead lines, then the title frame on the engagement title line.
+    expect(tty.split("\n").slice(0, 3)).toEqual(plain.split("\n").slice(0, 3));
+    expect(tty.split("\n").slice(3).join("\n").startsWith("\x1b[1mtickmarkr engagement — run-brand-pin\x1b[0m\n\x1b[2m─")).toBe(true);
     expect(tty.replace(/\x1b\[[0-9;]*m/g, "").split("\n").filter((l) => !/^─+$/.test(l)).join("\n")).toBe(plain);
   });
 });

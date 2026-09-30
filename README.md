@@ -183,8 +183,16 @@ can enact the release at its next task boundary; a different live run must end b
 one resumes. Keep any resume refusal and its remediation visible, including a deny/prefer
 config conflict; repair the source/config as directed, never edit the compiled graph to
 force success. After resume, CURRENT TIP is PENDING until fresh evidence arrives. Completion
-requires the latest run-end, a nonfailed known tip result, and empty `failed`, `human`,
-`blocked` and `pending` buckets; the completed case has 3/3 recorded merges. An unrelated
+requires the latest run-end, a nonfailed known tip result, empty `failed`, `human`,
+`blocked` and `pending` buckets, and owed checks outstanding empty AND known in CURRENT
+`tickmarkr status <runId>` (`outstanding 0`); the completed case has 3/3 recorded merges.
+Empty buckets alone are not completion (D-660): 3/3 merged with every bucket empty and the
+tip passed, after the operator waived T2's review, leaves one accepted-risk review check owed.
+`run`/`resume` exit 0 on execution alone, their final line says
+`execution complete; outstanding 1 (T2 review)` rather than `verified`, and status reads
+`outstanding 1`. That run completes only when `tickmarkr verify --record <runId>` discharges
+the check and CURRENT status reads `outstanding 0` — a discharge after run-end counts, while the
+run-end record keeps its old count; `outstanding unknown` never completes. An unrelated
 graph says “not comparable” and supplies no borrowed denominator. Historical GATES RAN
 does not establish current completion.
 

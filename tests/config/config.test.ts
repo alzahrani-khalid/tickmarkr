@@ -93,44 +93,40 @@ describe("config", () => {
     expect(grok["grok-composer-2.5-fast"]).toBe("cheap");
   });
 
-  // MODEL-10 overlay-dedup: re-adding a DEFAULT grok seed to .tickmarkr/config.yaml reddens this.
-  // It asserts DUPLICATION, which is what the name says — not the absence of every `grok-` line.
-  // The old form was `/^\s*grok-/m`, and it was over-broad in the one direction that matters: a grok
-  // model the catalog newly carries, written into the overlay by `tickmarkr fleet` itself, is not a
-  // duplicate of anything. Measured 2026-08-28 — `grok-4.6` (absent from DEFAULT_CONFIG, added by a
-  // fleet write) reddened this repo's own suite, so a shipped command and this guard disagreed about
-  // a lawful overlay. A guard must forbid the thing it is named for and nothing wider.
-  test("MODEL-10: repo overlay must not duplicate grok seeds", () => {
-    const overlay = join(process.cwd(), ".tickmarkr", "config.yaml");
-    if (!existsSync(overlay)) return; // absent on fresh clones, and excluded from the public export
-    const yaml = readFileSync(overlay, "utf8");
-    const seeded = Object.keys(DEFAULT_CONFIG.tiers.grok.models);
-    const duplicated = seeded.filter((m) =>
+  // MODEL-10 overlay-dedup + HYG-06: the hygiene checks run over EXPLICIT fixture overlays in a fresh
+  // sandbox. They used to read the live checkout's .tickmarkr/config.yaml and return early when it was
+  // absent — on a fresh clone and in the public export every assertion silently skipped. The dedup check
+  // forbids DUPLICATING a seed and nothing wider: a grok model the catalog newly carries, written into
+  // an overlay by `tickmarkr fleet`, duplicates nothing (measured 2026-08-28: grok-4.6 reddened the old
+  // over-broad /^\s*grok-/m form). The load check asserts what the SOURCE guarantees — seed resolution
+  // surviving the overlay, keys resolving to the right TYPES — never an operator-chosen literal
+  // (HYG-06: pinning taskTimeoutMinutes === 15 failed a run's test gate when the operator raised it).
+  test("configuration hygiene checks exercise explicit clean duplicated and legacy fixture overlays in a fresh sandbox so an absent operator config still executes each assertion", () => {
+    const duplicatedGrokSeeds = (yaml: string) => Object.keys(DEFAULT_CONFIG.tiers.grok.models).filter((m) =>
       new RegExp(`^\\s*${m.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*:`, "m").test(yaml));
-    expect(duplicated).toEqual([]);
-  });
-
-  // HYG-06 (v1.12): this test MUST NOT pin operator-local overlay VALUES. It previously asserted
-  // `taskTimeoutMinutes === 15` and an exact `setup` string read from the live `.tickmarkr/config.yaml` —
-  // so an operator raising their own timeout reddened tickmarkr's suite, and it did: the v1.12
-  // 15→35 raise failed the P42 run's test gate for a reason unrelated to the worker's code, burning
-  // three attempts (the gate's fingerprint details never named this test, so the worker and the consult
-  // both chased benign stdout instead). A test may assert what the SOURCE guarantees (DEFAULT_CONFIG
-  // resolution surviving the overlay); it may never assert what the OPERATOR happens to have configured.
-  test("MODEL-10: loadConfig keeps cursor xhigh retired + native grok seeds after overlay dedup", () => {
-    const overlay = join(process.cwd(), ".tickmarkr", "config.yaml");
-    if (!existsSync(overlay)) return;
-    const cfg = loadConfig(process.cwd());
-    const cursor = cfg.tiers["cursor-agent"].models;
-    expect("grok-4.5-xhigh" in cursor).toBe(false);
-    expect("grok-4.5-fast-xhigh" in cursor).toBe(false);
-    expect(cursor["composer-2.5"]).toBe("mid");
-    expect(cfg.tiers.grok.models["grok-4.5"]).toBe("mid");
-    expect(cfg.tiers.grok.models["grok-composer-2.5-fast"]).toBe("cheap");
-    // the overlay must still LOAD (a malformed one throws) and its keys must resolve to the right TYPES —
-    // never to operator-chosen literals.
-    expect(typeof cfg.taskTimeoutMinutes).toBe("number");
-    expect(cfg.taskTimeoutMinutes).toBeGreaterThan(0);
+    const fixtures = {
+      clean: "taskTimeoutMinutes: 35\ntiers:\n  grok:\n    models:\n      grok-4.6: mid  # a fleet write, not a seed\n",
+      duplicated: "tiers:\n  grok:\n    models:\n      grok-4.5: mid\n",
+      legacy: "tiers:\n  cursor-agent:\n    models:\n      grok-4.5-xhigh: null\n      grok-4.5-fast-xhigh: null\nrouting:\n  map:\n    tests: { tier: null }\n",
+    };
+    const duplicates: Record<keyof typeof fixtures, string[]> = { clean: [], duplicated: ["grok-4.5"], legacy: [] };
+    // every assertion below runs for every fixture — none may be skipped for want of an operator file
+    expect.assertions(Object.keys(fixtures).length * 9);
+    for (const [name, yaml] of Object.entries(fixtures) as Array<[keyof typeof fixtures, string]>) {
+      const { repo, globalDir } = repoWithOverlay(yaml);
+      expect(existsSync(join(globalDir, "config.yaml")), name).toBe(false); // a fresh, empty user layer
+      const overlay = readFileSync(join(repo, ".tickmarkr", "config.yaml"), "utf8");
+      expect(overlay, name).toBe(yaml);
+      expect(duplicatedGrokSeeds(overlay), name).toEqual(duplicates[name]);
+      const cfg = loadConfig(repo, { globalDir });
+      const cursor = cfg.tiers["cursor-agent"].models;
+      expect("grok-4.5-xhigh" in cursor, name).toBe(false);
+      expect("grok-4.5-fast-xhigh" in cursor, name).toBe(false);
+      expect(cursor["composer-2.5"], name).toBe("mid");
+      expect(cfg.tiers.grok.models["grok-4.5"], name).toBe("mid");
+      expect(cfg.tiers.grok.models["grok-composer-2.5-fast"], name).toBe("cheap");
+      expect(cfg.taskTimeoutMinutes, name).toBeGreaterThan(0);
+    }
   });
 
   test("repo overlay wins over global, global over defaults; deep merge", () => {
