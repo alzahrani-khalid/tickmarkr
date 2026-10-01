@@ -479,7 +479,9 @@ function daemonRepoRoot(worktree: string, artifactDir?: string): string | undefi
 export function renderPriorMaterials(priorMaterials: readonly StructuredFinding[]): string {
   const fingerprints = priorMaterials.map((finding, i) => {
     const observed = observedReviewFingerprints(finding);
-    const heading = observed.length > 1 ? `Finding ${i + 1} (choose one observed spelling):\n` : "";
+    // E2 (T4 D-766): every finding is headed. A one-spelling finding left unheaded read as one more
+    // spelling of the multi-spelling finding above it, so a faithful seat closed F1 alone.
+    const heading = observed.length > 1 ? `Finding ${i + 1} (choose one observed spelling):\n` : `Finding ${i + 1}:\n`;
     return heading + observed.map((id) => `Fingerprint: ${id}`).join("\n");
   }).join("\n");
   return `## Prior materials this attempt must close
@@ -789,11 +791,14 @@ ${responseRequirement}
     if (!(error instanceof SeatLaunchError)) throw error;
     // OBS-1168(b): the seat never launched, so there is no verdict and nothing about the WORK. A typed
     // no-verdict re-routes to another seat in run-gates; an exhausted pool is an infra park.
+    // E1: the cause stays seat-launch-failed; a typed launchCause rides beside it, never replaces it.
+    const launch = error.launchCause ? `; launchCause: ${error.launchCause}` : "";
     return { gate: "review", pass: false,
-      details: `review dispatch failed — ${error.message} (reviewer ${reviewer.adapter}:${reviewer.model}; vendor: ${reviewer.vendor}; provider: ${provider}; cause: seat-launch-failed) — failing closed`,
+      details: `review dispatch failed — ${error.message} (reviewer ${reviewer.adapter}:${reviewer.model}; vendor: ${reviewer.vendor}; provider: ${provider}; cause: seat-launch-failed${launch}) — failing closed`,
       meta: { ...policyMeta, ...rotationMeta, ...floorMeta, reviewer: channelKey(reviewer), reviewerTier: reviewer.tier,
         vendor: reviewer.vendor, provider, noVerdict: true, classification: "infra", infra: true,
-        cause: "seat-launch-failed" satisfies ReviewUnparseableCause, ...(savedBrief ? { briefPath: savedBrief } : {}) } };
+        cause: "seat-launch-failed" satisfies ReviewUnparseableCause, ...(error.launchCause ? { launchCause: error.launchCause } : {}),
+        ...(savedBrief ? { briefPath: savedBrief } : {}) } };
   }
   const raw = llm.output;
   let saved: string | undefined;

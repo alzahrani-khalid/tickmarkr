@@ -27,6 +27,7 @@ import { type TipVerifyResult, verifyIntegrationTip } from "../../src/run/merge.
 import { Journal } from "../../src/run/journal.js";
 import { resolveReceiptArtifacts } from "../../src/run/receipt-resolver.js";
 import { makeRepo, makeTestTempDir, setupRepo, T } from "../helpers/tmprepo.js";
+import { NATIVE_PROCESS_TITLE_ENV, resetTitleEnvironmentForTests, setTitleEnvironmentForTests } from "../../src/run/title-environment.js";
 
 function commitAll(repo: string, msg: string): void {
   execSync(`git add -A && git commit --no-gpg-sign -m "${msg}"`, { cwd: repo, encoding: "utf8" });
@@ -1213,3 +1214,75 @@ test("test: standalone verify plus the integration tip verifier retain a fresh f
   expect(tipRed?.evidenceReceipt?.termination).toMatchObject({ kind: "exit", exitCode: 1 });
   expect(tipRed?.evidenceReceipt?.invocationId).not.toBe(tipGreen?.evidenceReceipt?.invocationId);
 }, 60_000);
+
+// A2: every production daemon run captures its own baseline and judges its candidate through the same
+// shell, and looks the candidate's verdict up in the repository store. Nothing here builds a baseline by
+// hand: each step is one whole run, so a mode change must recapture the candidate exactly once on its own
+// and an unchanged mode must answer from the stored proof without executing the command.
+test("test: baseline/candidate cache lookups match production shell effective preload content/mode/NODE_OPTIONS identity; content replacement or opt-out or refusal recaptures once versus unchanged-mode proof reuse", async () => {
+  const prior = { options: process.env.NODE_OPTIONS, optOut: process.env[NATIVE_PROCESS_TITLE_ENV] };
+  const restore = (key: string, value: string | undefined) => { if (value === undefined) delete process.env[key]; else process.env[key] = value; };
+  const preload = join(makeTestTempDir("tickmarkr title cache "), "title-preload.cjs");
+  const own = "--max-old-space-size=4096";
+  const preloaded = `${own} --require "${preload}"`;
+  const refusing = (() => ({ status: 7, signal: null })) as unknown as typeof import("node:child_process").spawnSync;
+  interface Step { change?: () => void; nodeOptions: string; reused: boolean }
+  const chains: Step[][] = [[
+    { nodeOptions: preloaded, reused: false },
+    { nodeOptions: preloaded, reused: true }, // unchanged mode: the stored proof answers
+    { change: () => writeFileSync(preload, "// preload content B\n"), nodeOptions: preloaded, reused: false },
+    { nodeOptions: preloaded, reused: true },
+    { change: () => setTitleEnvironmentForTests({ probe: refusing }), nodeOptions: own, reused: false },
+    { nodeOptions: own, reused: true },
+  ], [
+    { nodeOptions: preloaded, reused: false },
+    { change: () => { process.env[NATIVE_PROCESS_TITLE_ENV] = "1"; }, nodeOptions: own, reused: false },
+    { nodeOptions: own, reused: true },
+    // A nested daemon inherits its parent's preload, then opts out: its children get the operator's options
+    // alone, so the preload's (replaced) content is no longer part of what runs — nor of the identity.
+    { change: () => { process.env.NODE_OPTIONS = preloaded; writeFileSync(preload, "// preload content C\n"); }, nodeOptions: own, reused: true },
+  ]];
+  try {
+    for (const steps of chains) {
+      process.env.NODE_OPTIONS = own;
+      delete process.env[NATIVE_PROCESS_TITLE_ENV];
+      writeFileSync(preload, "// preload content A\n");
+      resetTitleEnvironmentForTests();
+      setTitleEnvironmentForTests({ platform: "darwin", preloadPath: preload });
+      const calls = join(makeTestTempDir("tickmarkr-title-calls-"), "calls.log");
+      const { repo, scriptPath } = setupRepo([T("T1")], {
+        tasks: { T1: [{ shell: "echo one > t1.txt && git add t1.txt && git commit --no-gpg-sign -m one", result: { ok: true, summary: "one" } }] },
+      }, 'gates: { test: "sh check.sh" }\n');
+      writeFileSync(join(repo, "check.sh"), `printf '%s|%s\\n' "$PWD" "\${NODE_OPTIONS:-}" >> ${JSON.stringify(calls)}\n`);
+      commitAll(repo, "check");
+      const graphPath = join(repo, ".tickmarkr", "graph.json");
+      const graph = readFileSync(graphPath);
+      let seen = 0;
+      for (const [i, step] of steps.entries()) {
+        step.change?.();
+        writeFileSync(graphPath, graph);
+        const runId = `run-title-${i}`;
+        await runDaemon(repo, { adapters: [new FakeAdapter(scriptPath)], runId, approvalWindowMs: 0 });
+        const rows = Journal.open(repo, runId).read().filter(e => e.event === "gate-result" && e.taskId === "T1" && e.data.gate === "test");
+        const lines = existsSync(calls) ? readFileSync(calls, "utf8").trim().split("\n") : [];
+        const ran = lines.slice(seen).map(line => ({ cwd: line.slice(0, line.lastIndexOf("|")), nodeOptions: line.slice(line.lastIndexOf("|") + 1) }));
+        seen = lines.length;
+        const at = JSON.stringify({ i, ...step, ran });
+        expect(rows.length, at).toBe(1);
+        expect(rows[0]!.data.pass, at).toBe(true);
+        expect(rows[0]!.data.reused === true, at).toBe(step.reused);
+        // The run's own baseline child and its candidate child received the one effective NODE_OPTIONS. (The
+        // integration tip verifier is a separate node process that derives its own title environment and
+        // hashes it there; this file's seams do not reach it, so its child is not part of this ledger.)
+        const baselineRan = ran.filter(r => r.cwd === realpathSync(repo));
+        const candidateRan = ran.filter(r => r.cwd.includes(`tickmarkr-${runId}--T1`));
+        expect(baselineRan.map(r => r.nodeOptions), at).toEqual([step.nodeOptions]);
+        expect(candidateRan.map(r => r.nodeOptions), at).toEqual(step.reused ? [] : [step.nodeOptions]);
+      }
+    }
+  } finally {
+    restore("NODE_OPTIONS", prior.options);
+    restore(NATIVE_PROCESS_TITLE_ENV, prior.optOut);
+    resetTitleEnvironmentForTests();
+  }
+}, 300_000);

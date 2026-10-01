@@ -100,7 +100,7 @@ type RankedBasis = typeof RANKED_BASES[number];
 export type CatalogSuggestionBasis = RankedBasis | "price";
 
 export interface CatalogModelAdvisory {
-  coverage: "covered" | "uncovered";
+  coverage: "covered" | "uncovered" | "unknown";
   evidence?: CatalogModelEvidence;
   suggestion?: { tier: Tier; kind: "inference"; basis: CatalogSuggestionBasis; provenanceNote: string };
   display: string;
@@ -232,6 +232,10 @@ export function catalogModelAdvisory(
   const row: CatalogAdvisoryRow = { adapter, model, resolvedModel };
   const evidence = catalogEvidenceFor(cfg, catalog, row);
   if (!evidence) {
+    // v2.6.5 T9: a failed post-discovery refresh proves nothing about coverage — unknown, never "uncovered".
+    if ([model, resolvedModel].some((m) => m !== undefined && catalog.coverageUnknown?.includes(`${adapter}:${m}`))) {
+      return { coverage: "unknown", display: `${model} — catalog coverage unknown (post-discovery refresh failed); no tier suggestion` };
+    }
     return {
       coverage: "uncovered",
       display: `${model} — uncovered by ${catalog.source === "cache" ? "cached catalogs" : "vendored catalog"}; no tier suggestion`,

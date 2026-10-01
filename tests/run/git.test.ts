@@ -1,15 +1,18 @@
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { compareToBaseline, fingerprint } from "../../src/gates/baseline.js";
-import { DEFAULT_FORK_CAP, DEFAULT_SHELL_TIMEOUT_MS, FORK_CAP_ENV, ROUTING_ENV_SEAMS as SCRUBBED_AT_SPAWN, SPAWN_ATTEMPT_LIMIT, assertRefsWritable, classifyIdentityProbe, createWorktree, gitHead, linkNodeModules, preserveWorktree, probeRefsWritable, removeWorktree, resetSpawnForTests, setSpawnForTests, sh, shOk, shGit, shGitOk, WORKTREES_DIR, worktreePath } from "../../src/run/git.js";
+import { DEFAULT_FORK_CAP, DEFAULT_SHELL_TIMEOUT_MS, FORK_CAP_ENV, ROUTING_ENV_SEAMS as SCRUBBED_AT_SPAWN, SPAWN_ATTEMPT_LIMIT, assertRefsWritable, classifyIdentityProbe, createWorktree, gitHead, linkNodeModules, preserveWorktree, probeRefsWritable, removeWorktree, resetSpawnForTests, setSpawnForTests, sh, shell, shOk, shGit, shGitOk, WORKTREES_DIR, worktreePath } from "../../src/run/git.js";
 import { GATE_FINGERPRINT_CAP, identicalGateFailures, normalizeGateFailure, type JournalEvent } from "../../src/run/journal.js";
 import { NO_EXPLORE_ENV, QUALITY_ENV, ROUTING_ENV_SEAMS } from "../../src/route/router.js";
 import { makeRepo } from "../helpers/tmprepo.js";
+import ts from "typescript";
+import { shq } from "../../src/adapters/types.js";
+import { NATIVE_PROCESS_TITLE_ENV, resetTitleEnvironmentForTests, setTitleEnvironmentForTests, TITLE_PREFLIGHT_TIMEOUT_MS } from "../../src/run/title-environment.js";
 
 const processGroupExists = (groupId: number): boolean => {
   try {
@@ -896,4 +899,263 @@ test("processIdentity classifies only ps's clean no-such-process exit as gone; a
   expect(classifyIdentityProbe({ code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" }, "Fri")).toBeNull();
   expect(classifyIdentityProbe({ code: 2 }, "")).toBeNull();
   expect(classifyIdentityProbe(null, "")).toBeNull();
+});
+
+// A2 (D-787): the Darwin title preload at the one shell seam. Each child reports through a ready file
+// AFTER its title writes and then holds until released, so `ps` reads the live process — never a sleep.
+describe("Darwin title preload at the shell seam (A2)", () => {
+  const REPO_ROOT = join(import.meta.dirname, "../..");
+  /** The shipped preload source compiled to CommonJS into a test-owned directory (root dist is shared). */
+  const compiledPreload = (dir: string): string => {
+    mkdirSync(dir, { recursive: true });
+    const out = join(dir, "title-preload.cjs");
+    writeFileSync(out, ts.transpileModule(readFileSync(join(REPO_ROOT, "src/run/title-preload.cts"), "utf8"),
+      { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText);
+    return out;
+  };
+  const writeBarrier = (dir: string): string => {
+    const barrier = join(dir, "barrier.cjs");
+    writeFileSync(barrier, `const fs = require("fs");
+module.exports = (ready, release) => {
+  fs.writeFileSync(ready + ".tmp", JSON.stringify({ pid: process.pid, title: process.title, nodeOptions: process.env.NODE_OPTIONS ?? null, userHook: globalThis.tkrUserHook === true }));
+  fs.renameSync(ready + ".tmp", ready);
+  const hold = setInterval(() => { if (fs.existsSync(release)) clearInterval(hold); }, 10);
+};
+`);
+    return barrier;
+  };
+  const psCommand = (pid: number): string => execFileSync("ps", ["-o", "command=", "-p", String(pid)], { encoding: "utf8" }).trim();
+  let held = 0;
+  /** Run `script args…` under production shell; read the child's report and its OS-visible command, then release it. */
+  const holdChild = async (dir: string, script: string, args: string[], env: NodeJS.ProcessEnv) => {
+    const ready = join(dir, `ready-${++held}.json`), release = join(dir, `release-${held}`);
+    let settled: Awaited<ReturnType<typeof shell>> | undefined;
+    const result = shell([process.execPath, script, ready, release, ...args].map(shq).join(" "), dir, 120_000, false, { env })
+      .then((r) => (settled = r));
+    try {
+      await expect.poll(() => existsSync(ready) || settled !== undefined, { timeout: 60_000, interval: 20 }).toBe(true);
+      expect(existsSync(ready), settled?.stderr).toBe(true);
+      const report = JSON.parse(readFileSync(ready, "utf8")) as { pid: number; title: string; nodeOptions: string | null; userHook: boolean };
+      return { report, ps: psCommand(report.pid) };
+    } finally {
+      writeFileSync(release, "");
+      expect((await result).code).toBe(0);
+    }
+  };
+  afterEach(() => { resetTitleEnvironmentForTests(); resetSpawnForTests(); });
+
+  test("test: production shell Darwin mode appends one quoted inherited preload at a space-bearing absolute path versus unchanged Linux or native opt-out environments; JS title updates retain the native ps command", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "tkr title "));
+    try {
+      const preload = compiledPreload(join(dir, "pre load"));
+      const option = `--require "${preload}"`;
+      const child = join(dir, "title child.cjs");
+      writeFileSync(child, `process.title = "tkr-js-title";\nrequire(${JSON.stringify(writeBarrier(dir))})(process.argv[2], process.argv[3]);\n`);
+      const own = "--max-old-space-size=4096";
+      // Another tickmarkr install's shipped preload (a nested shell under it) is managed too; a user's own hook
+      // that happens to share the file name is not, and keeps running in every mode.
+      const otherInstall = join(dir, "other install");
+      const other = `--require "${compiledPreload(join(otherInstall, "dist/run"))}"`;
+      writeFileSync(join(otherInstall, "package.json"), JSON.stringify({ name: "tickmarkr" }));
+      const userHook = join(dir, "project", "title-preload.cjs");
+      mkdirSync(join(dir, "project"));
+      writeFileSync(userHook, "globalThis.tkrUserHook = true;\n");
+      const user = `--require "${userHook}"`;
+      for (const row of [
+        { platform: "darwin" as const, inherited: own, optOut: false, expected: `${own} ${option}` },
+        // a nested shell inherits the option already: still exactly one
+        { platform: "darwin" as const, inherited: `${own} ${option}`, optOut: false, expected: `${own} ${option}` },
+        { platform: "linux" as const, inherited: own, optOut: false, expected: own },
+        { platform: "darwin" as const, inherited: own, optOut: true, expected: own },
+        // a nested shell's inherited preload never outlives native mode: opt-out and Linux both drop it
+        { platform: "darwin" as const, inherited: `${option} ${own}`, optOut: true, expected: own },
+        { platform: "linux" as const, inherited: `${own} ${option}`, optOut: false, expected: own },
+        // when the inherited preload was all there was, the native child's NODE_OPTIONS is unset, not empty
+        { platform: "darwin" as const, inherited: option, optOut: true, expected: null },
+        { platform: "darwin" as const, inherited: `${own} ${other}`, optOut: false, expected: `${own} ${option}` },
+        { platform: "darwin" as const, inherited: `${other} ${own}`, optOut: true, expected: own },
+        // the user's hook is kept byte-identical and runs; in Darwin its --require is an option the probe cannot vouch for
+        { platform: "linux" as const, inherited: `${own} ${user}`, optOut: false, expected: `${own} ${user}` },
+        { platform: "darwin" as const, inherited: `${own} ${user}`, optOut: true, expected: `${own} ${user}` },
+        { platform: "darwin" as const, inherited: `${own} ${user}`, optOut: false, expected: `${own} ${user}` },
+      ]) {
+        setTitleEnvironmentForTests({ platform: row.platform, preloadPath: preload });
+        const env: NodeJS.ProcessEnv = { ...process.env, NODE_OPTIONS: row.inherited };
+        if (row.optOut) env[NATIVE_PROCESS_TITLE_ENV] = "1"; else delete env[NATIVE_PROCESS_TITLE_ENV];
+        const { report, ps } = await holdChild(dir, child, [], env);
+        const preloaded = row.expected?.includes(option) ?? false;
+        expect(report.nodeOptions, JSON.stringify(row)).toBe(row.expected);
+        expect((report.nodeOptions ?? "").split(option).length - 1).toBe(preloaded ? 1 : 0);
+        expect(report.userHook).toBe(row.inherited.includes(user));
+        expect(report.title).toBe("tkr-js-title"); // the child reads back its own write in every mode
+        if (preloaded) {
+          expect(ps).toContain(child);
+          expect(ps).not.toContain("tkr-js-title");
+        } else expect(ps).toBe("tkr-js-title");
+      }
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }, 300_000);
+
+  test("test: production shell preserves native npm secret hiding for npm-cli entry paths of majors 9 10 and 11 while ordinary vitest forks and threads use the JS setter", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "tkr-title-npm-"));
+    try {
+      setTitleEnvironmentForTests({ platform: "darwin", preloadPath: compiledPreload(join(dir, "preload")) });
+      const env: NodeJS.ProcessEnv = { ...process.env, NODE_OPTIONS: "" };
+      delete env[NATIVE_PROCESS_TITLE_ENV];
+      const barrier = writeBarrier(dir);
+      // Each major's installed layout; the entry replaces its argv with the native title first thing, as
+      // npm's lib/cli/entry.js does. Two run through the `npm` link on PATH, as a shell invokes npm.
+      for (const { major, pkg, run } of [
+        { major: 9, pkg: "nvm/versions/node/v18.20.4/lib/node_modules/npm", run: "nvm/versions/node/v18.20.4/lib/node_modules/npm/bin/npm-cli.js" },
+        { major: 10, pkg: "project/node_modules/npm", run: "project/node_modules/.bin/npm" },
+        { major: 11, pkg: "homebrew/lib/node_modules/npm", run: "homebrew/bin/npm" },
+      ]) {
+        mkdirSync(join(dir, pkg, "bin"), { recursive: true });
+        writeFileSync(join(dir, pkg, "package.json"), JSON.stringify({ name: "npm", version: `${major}.9.0`, bin: { npm: "bin/npm-cli.js" } }));
+        const entry = join(dir, pkg, "bin/npm-cli.js");
+        writeFileSync(entry, `#!/usr/bin/env node\nprocess.title = "npm";\nprocess.title = "npm --version";\nrequire(${JSON.stringify(barrier)})(process.argv[2], process.argv[3]);\n`);
+        if (!run.endsWith("npm-cli.js")) {
+          mkdirSync(join(dir, run, ".."), { recursive: true });
+          symlinkSync(entry, join(dir, run));
+        }
+        const secret = `--//registry.example/:_authToken=SECRET-${major}`;
+        const { report, ps } = await holdChild(dir, join(dir, run), [secret], env);
+        expect(report.nodeOptions).toContain("title-preload.cjs");
+        expect(ps, `npm ${major}`).toBe("npm --version");
+        expect(ps).not.toContain("SECRET");
+      }
+      // Vitest's main process writes `node (vitest)` and its workers `node (vitest N)`; the fixture worker writes
+      // one too. Under the preload every one of those writes stays in JS in both pool kinds: the worker's
+      // process (a fork, or the main process itself for threads) and a fork's parent main show no vitest title.
+      const project = join(dir, "pools");
+      mkdirSync(project);
+      writeFileSync(join(project, "title.test.mjs"), `import { execFileSync } from "node:child_process";
+import { writeFileSync } from "node:fs";
+import { isMainThread } from "node:worker_threads";
+test("title", () => {
+  process.title = "node (vitest fixture)";
+  const ps = (pid) => execFileSync("ps", ["-o", "command=", "-p", String(pid)], { encoding: "utf8" }).trim();
+  const jsSetter = typeof Object.getOwnPropertyDescriptor(process, "title").get === "function";
+  writeFileSync(process.env.TKR_TITLE_REPORT, JSON.stringify({ jsSetter, title: process.title, ps: ps(process.pid), parentPs: ps(process.ppid), isMainThread }));
+});
+`);
+      const vitest = join(REPO_ROOT, "node_modules/vitest/vitest.mjs");
+      for (const pool of ["forks", "threads"]) {
+        const report = join(dir, `${pool}.json`);
+        const r = await shell([process.execPath, vitest, "run", "--globals", "--configLoader", "runner", "--root", project, "--pool", pool].map(shq).join(" "),
+          project, 120_000, false, { env: { ...env, TKR_TITLE_REPORT: report } });
+        expect(r.code, `${r.stdout}\n${r.stderr}`).toBe(0);
+        const seen = JSON.parse(readFileSync(report, "utf8")) as { jsSetter: boolean; title: string; ps: string; parentPs: string; isMainThread: boolean };
+        expect(seen, pool).toMatchObject({ jsSetter: true, title: "node (vitest fixture)", isMainThread: pool === "forks" });
+        expect(seen.ps).toContain("node");
+        expect(seen.ps).not.toContain("(vitest");
+        if (pool === "forks") expect(seen.parentPs).not.toContain("(vitest");
+      }
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }, 300_000);
+
+  test("test: production shell preflights a refused preload then starts one native payload and never repeats an already-started payload that exits with the same refusal text", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "tkr-title-refused-"));
+    try {
+      const refused = join(dir, "refused-preload.cjs");
+      writeFileSync(refused, 'process.stderr.write("TKR_PRELOAD_REFUSED\\n");\nprocess.exit(7);\n');
+      const probes: Array<{ command: string; args: readonly string[]; nodeOptions?: string; cwd?: unknown; timeout?: number; killSignal?: unknown }> = [];
+      const spawned: string[] = [];
+      const probeWith = (answer: (...a: Parameters<typeof spawnSync>) => ReturnType<typeof spawnSync>) => ((...a: Parameters<typeof spawnSync>) => {
+        const options = a[2] as { env?: NodeJS.ProcessEnv; cwd?: unknown; timeout?: number; killSignal?: unknown };
+        probes.push({ command: a[0], args: a[1] as string[], nodeOptions: options.env?.NODE_OPTIONS, cwd: options.cwd, timeout: options.timeout, killSignal: options.killSignal });
+        return answer(...a);
+      }) as typeof spawnSync;
+      setSpawnForTests(((command: string, args: readonly string[], options: object) => {
+        spawned.push(args.at(-1)!);
+        return spawn(command, args, options);
+      }) as unknown as typeof spawn);
+      const marker = join(dir, "payload.log");
+      const own = "--max-old-space-size=4096";
+      const payload = `echo started >> ${shq(marker)}; printf '%s' "$NODE_OPTIONS"; echo TKR_PRELOAD_REFUSED >&2; exit 7`;
+      const env = { ...process.env, NODE_OPTIONS: own };
+      // The real runner node refuses this preload: native payloads, one start each, one probe in all — run under
+      // the preload alone in its own directory, so neither the operator's options nor a payload cwd key it.
+      setTitleEnvironmentForTests({ platform: "darwin", preloadPath: refused, probe: probeWith((...a) => spawnSync(...a)) });
+      for (let round = 1; round <= 2; round++) {
+        const r = await shell(payload, dir, 60_000, false, { env });
+        expect(r).toMatchObject({ code: 7, stdout: own });
+        expect(r.stderr).toContain("TKR_PRELOAD_REFUSED");
+        expect(readFileSync(marker, "utf8").trim().split("\n")).toHaveLength(round);
+      }
+      // A nested shell inherits the refused preload from its parent: the native fallback removes it, so the
+      // one node payload starts and exits on its own terms rather than the preload's 7, and nothing re-probes.
+      const nodePayload = [process.execPath, "-e", `require("fs").appendFileSync(${JSON.stringify(marker)}, "started\\n"); process.stdout.write(process.env.NODE_OPTIONS)`].map(shq).join(" ");
+      const nested = await shell(nodePayload, dir, 60_000, false, { env: { ...env, NODE_OPTIONS: `${own} --require "${refused}"` } });
+      expect(nested, nested.stderr).toMatchObject({ code: 0, stdout: own });
+      expect(nested.stderr).not.toContain("TKR_PRELOAD_REFUSED");
+      expect(readFileSync(marker, "utf8").trim().split("\n")).toHaveLength(3);
+      // D-827: the refused (execPath, content, mode) triple stays refused under a changed heap size from another cwd.
+      const sub = join(dir, "payload cwd");
+      mkdirSync(sub);
+      const resized = await shell(nodePayload, sub, 60_000, false, { env: { ...env, NODE_OPTIONS: "--max-old-space-size=8192" } });
+      expect(resized, resized.stderr).toMatchObject({ code: 0, stdout: "--max-old-space-size=8192" });
+      expect(readFileSync(marker, "utf8").trim().split("\n")).toHaveLength(4);
+      expect(probes).toEqual([{ command: process.execPath, args: ["-e", ""], nodeOptions: `--require "${refused}"`, cwd: dir, timeout: TITLE_PREFLIGHT_TIMEOUT_MS, killSignal: "SIGKILL" }]);
+      expect(spawned).toEqual([payload, payload, nodePayload, nodePayload]);
+      // The closed preflight table: an accepted probe preloads; one killed at its ceiling, a nonzero exit
+      // and a thrown spawn each fail open. Every member is probed once and never through the payload seam.
+      const tableMarker = join(dir, "table.log");
+      for (const member of [
+        { name: "accepted", preloaded: true, answer: () => ({ status: 0, signal: null }) },
+        { name: "never returns", preloaded: false, answer: () => ({ status: null, signal: "SIGKILL", error: Object.assign(new Error("spawnSync ETIMEDOUT"), { code: "ETIMEDOUT" }) }) },
+        { name: "nonzero", preloaded: false, answer: () => ({ status: 1, signal: null }) },
+        { name: "spawn throws", preloaded: false, answer: () => { throw Object.assign(new Error("spawnSync EAGAIN"), { code: "EAGAIN" }); } },
+      ]) {
+        probes.length = 0;
+        spawned.length = 0;
+        setTitleEnvironmentForTests({ probe: probeWith(member.answer as unknown as (...a: Parameters<typeof spawnSync>) => ReturnType<typeof spawnSync>) });
+        const command = `echo started >> ${shq(tableMarker)}; printf '%s' "$NODE_OPTIONS"`;
+        for (let round = 0; round < 2; round++) {
+          const r = await shell(command, dir, 60_000, false, { env });
+          expect(r.stdout, member.name).toBe(member.preloaded ? `${own} --require "${refused}"` : own);
+        }
+        expect(probes, member.name).toHaveLength(1);
+        expect(spawned).toEqual([command, command]);
+      }
+      expect(readFileSync(tableMarker, "utf8").trim().split("\n")).toHaveLength(8);
+      // D-827: the operator's own options can refuse a sound preload the probe accepted — a cwd-relative permission
+      // grant denies reading it from a payload cwd other than the probe's — so options the one probe cannot vouch
+      // for (the permission model, another loader, any cwd-relative path) select native payloads in every cwd with
+      // no probe, while a changed heap size from another cwd reuses the single accepted probe.
+      const permission = process.allowedNodeEnvironmentFlags.has("--permission") ? "--permission" : "--experimental-permission";
+      const preload = compiledPreload(join(dir, "pre load"));
+      const relativeGrant = `${permission} --allow-fs-read=./*`;
+      const denied = spawnSync(process.execPath, ["-e", ""], { cwd: sub, encoding: "utf8", env: { ...env, NODE_OPTIONS: `${relativeGrant} --require "${preload}"` } });
+      expect(denied.stderr).toContain("ERR_ACCESS_DENIED"); // the payload's failure this rule prevents
+      const hook = join(dir, "hook.cjs");
+      writeFileSync(hook, "");
+      setTitleEnvironmentForTests({ preloadPath: preload, probe: probeWith((...a) => spawnSync(...a)) });
+      probes.length = 0;
+      spawned.length = 0;
+      const guarded = [process.execPath, "-e", `process.stdout.write(JSON.stringify({ options: process.env.NODE_OPTIONS, fsRead: process.permission?.has("fs.read") ?? null }))`].map(shq).join(" ");
+      const report = async (cwd: string, options: string): Promise<unknown> => {
+        const r = await shell(guarded, cwd, 60_000, false, { env: { ...env, NODE_OPTIONS: options } });
+        expect(r.code, `${options}\n${r.stderr}`).toBe(0);
+        return JSON.parse(r.stdout);
+      };
+      expect(await report(dir, own)).toEqual({ options: `${own} --require "${preload}"`, fsRead: null });
+      expect(await report(sub, "--max-old-space-size=8192")).toEqual({ options: `--max-old-space-size=8192 --require "${preload}"`, fsRead: null });
+      const uncertified = [relativeGrant, permission, `--require ${hook}`, "--redirect-warnings=./warnings.log"];
+      for (const options of uncertified) {
+        expect(await report(sub, options), options).toEqual({ options, fsRead: options.startsWith(permission) ? false : null });
+      }
+      // Node takes `_` for `-` in an option name: Node 20.3.1's `--experimental_permission` refuses the preload's
+      // read exactly as the hyphen spelling does, so each underscore spelling is classified and stays native too.
+      // A shell payload reports what the child received, since today's runner node rejects Node 20's flag itself.
+      const received = `printf '%s' "$NODE_OPTIONS"`;
+      const underscored = ["--experimental_permission", "--allow_fs_read=*", "--experimental_loader=/abs/hook.mjs", "--experimental_policy=/abs/policy.json"];
+      for (const options of underscored) {
+        const r = await shell(received, sub, 60_000, false, { env: { ...env, NODE_OPTIONS: options } });
+        expect(r, options).toMatchObject({ code: 0, stdout: options });
+      }
+      expect(probes.map((p) => [p.nodeOptions, p.cwd])).toEqual([[`--require "${preload}"`, join(dir, "pre load")]]);
+      expect(spawned).toEqual([...Array(2 + uncertified.length).fill(guarded), ...Array(underscored.length).fill(received)]);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }, 180_000);
 });

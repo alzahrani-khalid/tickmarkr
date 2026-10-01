@@ -284,9 +284,16 @@ export async function approve(argv: string[], cwd = process.cwd()): Promise<stri
   if (namedGate !== undefined && namedGate !== park?.failedGate) {
     throw new Error(`refusing mismatched gate for ${taskId}: --gate ${namedGate} but park ${bindingToken(parkBinding)} failed ${park?.failedGate ?? "no gate"} — nothing appended`);
   }
-  if ((park?.kind === "scope-request" && !decisions) || files !== undefined) {
+  // A scope-request park is released one of two ways: --files widens files[], or a nonempty --reason
+  // refuses the expansion and funds a plain worker within the current files[] — the reason rides into
+  // the next brief as a standing ruling (journaledFailureBrief). No reason, no release: the refusal is
+  // a ruling only when it says why. The cockpit menu still offers neither (it has no reason entry).
+  const scopeRefusal = park?.kind === "scope-request" && !decisions && files === undefined && Boolean(reason?.trim());
+  if ((park?.kind === "scope-request" && !decisions && !scopeRefusal) || files !== undefined) {
     if (park?.kind !== "scope-request") throw new Error("--files requires a scope-request park");
-    if (!files?.length) throw new Error(`scope-request for ${taskId} requires --files <glob,…>`);
+    if (!files?.length) {
+      throw new Error(`scope-request for ${taskId} requires --files <glob,…> to widen files[], or \`tickmarkr approve ${runId} ${taskId} --reason <text>\` to refuse the expansion and continue within the current files[]`);
+    }
     if (decisions) throw new Error("--files cannot be combined with --waive, --uphold or --recheck");
     const graph = applyScopeAmendments(loadGraph(cwd), journal, false, engagementReleased(events));
     const from = graphDefinitionHash(graph);
@@ -424,7 +431,7 @@ export async function approve(argv: string[], cwd = process.cwd()): Promise<stri
     park: parkBinding,
   });
   const token = capPark ? "fresh-budget" : "dispatch";
-  return disposition(cwd, runId, token, `approved ${taskId} in ${runId} — by ${by}`, serialization.contended);
+  return disposition(cwd, runId, token, `approved ${taskId} in ${runId} — by ${by}${scopeRefusal ? "; scope expansion refused, files[] unchanged" : ""}`, serialization.contended);
   } finally {
     serialization.release();
   }

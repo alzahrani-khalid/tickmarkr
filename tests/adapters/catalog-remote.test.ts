@@ -16,6 +16,7 @@ import {
   type CatalogCache,
 } from "../../src/adapters/catalog-remote.js";
 import { CLAUDE_ALIAS_IDENTITY_STAMPS } from "../../src/adapters/claude-code.js";
+import { writeDoctor } from "../../src/adapters/registry.js";
 import { catalogModelAdvisory, catalogTierRanking, suggestOverlay } from "../../src/adapters/model-lints.js";
 import type { AuthHealth, WorkerAdapter } from "../../src/adapters/types.js";
 import { channelsFromConfig } from "../../src/adapters/types.js";
@@ -246,7 +247,7 @@ describe("cache-only model capability catalog", () => {
     expect(readFileSync(join(repo, ".tickmarkr", "config.yaml"), "utf8")).toBe(before);
   });
 
-  test("test: an ordinary doctor run makes ZERO CATALOG-network calls and resolves every model from the cached catalog, while the named refresh command is the only path that fetches a catalog and the ordinary adapter, auth and model probes are untouched, and catalog failure never fails doctor nor changes a routing verdict, proven over the closed set of failure shapes — an offline fixture, a 401 fixture, a 500 fixture, a timeout fixture, a malformed-JSON fixture, and a stale-cache fixture", async () => {
+  test("test: an ordinary doctor run makes ZERO CATALOG-network calls and resolves every model from the cached catalog, while — once a prior doctor has seen every model it discovers, so no post-discovery coverage refresh is owed — the named refresh command is the only path that fetches a catalog and the ordinary adapter, auth and model probes are untouched, and catalog failure never fails doctor nor changes a routing verdict, proven over the closed set of failure shapes — an offline fixture, a 401 fixture, a 500 fixture, a timeout fixture, a malformed-JSON fixture, and a stale-cache fixture", async () => {
     const repo = makeRepo({ "keep.txt": "x" });
     mkdirSync(join(repo, ".tickmarkr"), { recursive: true });
     writeFileSync(join(repo, ".tickmarkr", "config.yaml"), fakeOverlay);
@@ -267,6 +268,8 @@ describe("cache-only model capability catalog", () => {
     const cfgBefore = loadConfig(repo);
     const task = { id: "T17", title: "catalog", goal: "catalog", shape: "implement", complexity: 4, acceptance: ["catalog"] } as const;
     const routeBefore = route(task, cfgBefore, adapter.channels!(cfgBefore));
+    // v2.6.5 T9: ordinary = a repeat discovery; a first discovery of the uncovered fake-1 earns the one refresh (doctor.test.ts)
+    writeDoctor(repo, { fake: installed(["fake-1", "fake-2"]) });
 
     const ordinary = await doctor(["--"], repo, [adapter], { banner: false, catalogNow: () => new Date("2026-08-05T00:00:00.000Z") });
     expect(network).not.toHaveBeenCalled();

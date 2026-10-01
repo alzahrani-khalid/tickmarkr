@@ -1,6 +1,6 @@
 import { graphDefinitionHash } from "../graph/graph.js";
 import { GATE_NAMES, type RunGraph } from "../graph/schema.js";
-import { engagementComparable, type JournalEvent } from "./journal.js";
+import { engagementComparable, type JournalEvent, type OwedFold } from "./journal.js";
 
 /** An evidence identity is a physical journal line, never a filtered row ordinal. */
 export interface EvidenceIdentity { source: string; line: number; id: string; generation?: number }
@@ -36,11 +36,20 @@ export interface OperatorSnapshot {
   buckets: Record<"failed" | "human" | "blocked" | "pending", readonly string[] | undefined>;
   gatesRan: { passed: number; total: number }; latestRunEnd?: EvidenceIdentity;
   approvedResumeRequired: boolean;
+  /** I2: CURRENT owed-check debt from the authority this observation supplied; "unknown" when absent or stale. */
+  debt: number | "unknown"; outstanding: readonly string[];
 }
+/** I2: foldOwedChecks over the complete effective journal, tagged with the journal basis it read. A result
+ * whose basis is not the observation's own is stale and counts as unknown debt, never as zero. */
+export interface OwedAuthority { basis: string; fold: OwedFold }
 const bucketNames = ["failed", "human", "blocked", "pending"] as const;
 const strings = (value: unknown): string[] | undefined => Array.isArray(value) && value.every(v => typeof v === "string") ? [...value] : undefined;
 const identity = ({ source, line, id, generation }: EvidenceIdentity): EvidenceIdentity => ({ source, line, id, generation });
 const emptyGates = (): Record<string, OperatorGate> => Object.fromEntries(GATE_NAMES.map(g => [g, { state: "not-run" }]));
+/** I1: at a terminal boundary nothing will finish a queued or running cell, so it reads unknown (keeping the
+ * row that started it); a measured passed/failed cell is never touched. Returns copies. */
+const settled = (gates: Record<string, OperatorGate>, settle = true): Record<string, OperatorGate> =>
+  Object.fromEntries(Object.entries(gates).map(([g, cell]) => [g, settle && (cell.state === "queued" || cell.state === "running") ? { ...cell, state: "unknown" } : { ...cell }]));
 /** Author channels recorded on a task-done row. A row written before authors were recorded carries none and
  * projects nothing (never the dispatch); unattributed preserved work arrives as an explicit "unknown" entry. */
 export const doneAuthors = (data: Record<string, unknown>): string[] | undefined => strings(data.authors);
@@ -95,6 +104,7 @@ export class OperatorStateFold {
       };
       this.active = false;
       this.approved = false;
+      for (const t of this.tasks.values()) { t.gates = settled(t.gates); t.gateActivity = undefined; }
       for (const key of bucketNames) for (const id of this.end.buckets[key] ?? []) {
         const task = this.task(id);
         task.state = key;
@@ -137,6 +147,7 @@ export class OperatorStateFold {
     }
     if (e.event === "suite-admitted") t.gateActivity = undefined;
     if (["task-done", "merge", "task-failed", "task-human", "task-blocked"].includes(e.event)) t.gateActivity = undefined;
+    if (["task-failed", "task-human", "task-blocked"].includes(e.event)) t.gates = settled(t.gates);
     const phaseGate = e.event === "phase-start" && typeof e.data.phase === "string"
       ? e.data.phase.startsWith("gate:") ? e.data.phase.slice(5) : e.data.phase === "judge" ? "acceptance" : e.data.phase === "review" ? "review" : undefined
       : undefined;
@@ -161,15 +172,21 @@ export class OperatorStateFold {
     if (!t) { t = { id, state: "unknown", merged: false, dispatches: 0, reviewRounds: 0, parks: 0, gates: emptyGates() }; this.tasks.set(id, t); }
     return t;
   }
-  snapshot({ graph, sequence = 0, observedAt = Date.now(), readable = true, graphAvailability }: {
-    graph?: RunGraph; sequence?: number; observedAt?: number; readable?: boolean; graphAvailability?: OperatorSnapshot["graphAvailability"];
+  /** A run-end is the latest lifecycle boundary: the only state whose headline consults owed-check debt. */
+  get ended(): boolean { return !!this.end && !this.active; }
+  /** `daemonDead`: this run's lock holder was observed provably dead (lock.ts liveness). It is an observation,
+   * not a journal row, so it settles the projection only and the fold keeps no trace of it.
+   * `owed`/`basis` (I2): COMPLETE needs a known-empty debt computed over this very journal basis. */
+  snapshot({ graph, sequence = 0, observedAt = Date.now(), readable = true, graphAvailability, daemonDead = false, owed, basis }: {
+    graph?: RunGraph; sequence?: number; observedAt?: number; readable?: boolean; graphAvailability?: OperatorSnapshot["graphAvailability"]; daemonDead?: boolean;
+    owed?: OwedAuthority; basis?: string;
   } = {}): OperatorSnapshot {
     const hash = graph && graphDefinitionHash(graph);
     const comparable = this.comparableTo(hash);
     const ids = comparable ? [...graph!.tasks.map(t => t.id), ...[...this.tasks.keys()].filter(id => !graph!.tasks.some(t => t.id === id))] : [...this.tasks.keys()];
     const tasks = ids.map(id => {
       const t = this.tasks.get(id) ?? { id, state: "unknown" as const, merged: false, dispatches: 0, reviewRounds: 0, parks: 0, gates: emptyGates() };
-      return { ...t, title: comparable ? graph!.tasks.find(g => g.id === id)?.title : undefined, gates: Object.fromEntries(Object.entries(t.gates).map(([g, cell]) => [g, { ...cell }])) };
+      return { ...t, title: comparable ? graph!.tasks.find(g => g.id === id)?.title : undefined, gates: settled(t.gates, daemonDead), ...(daemonDead ? { gateActivity: undefined } : {}) };
     });
     const buckets = Object.fromEntries(bucketNames.map(k => [k, this.end?.buckets[k] === undefined ? undefined : [...this.end.buckets[k]!]])) as OperatorSnapshot["buckets"];
     // A matching graph contributes planned tasks even when the journal has never named them.
@@ -180,9 +197,11 @@ export class OperatorStateFold {
     const unresolved = tasks.some(t => ["unknown", "failed", "human", "blocked", "pending", "running"].includes(t.state));
     const allPlannedMerged = comparable && merged === planned;
     const currentTip = this.active ? "pending" : this.tipFailed ? "failed" : this.end?.tip ?? "unknown";
+    const current = owed !== undefined && basis !== undefined && owed.basis === basis && owed.fold.known && typeof owed.fold.debt === "number";
+    const debt = current ? owed!.fold.debt : "unknown";
     const green = readable && comparable && allPlannedMerged && !!this.start && !!this.end && !this.approved && !unresolved
       && (currentTip === "passed" || currentTip === "not required")
-      && bucketNames.every(k => buckets[k]?.length === 0);
+      && bucketNames.every(k => buckets[k]?.length === 0) && debt === 0;
     const lifecycle: OperatorSnapshot["lifecycle"] = !readable || !this.start ? "UNKNOWN" : this.active ? "RUNNING" : this.approved ? "APPROVED" : green ? "COMPLETE" : this.end ? "PARTIAL" : "PENDING";
     return {
       sequence, observedAt, lastEventAt: this.lastEventAt, firstEventAt: this.firstEventAt, resumes: this.resumes, escalations: this.escalations, lifecycle,
@@ -192,6 +211,7 @@ export class OperatorStateFold {
       planned, tasks, buckets,
       gatesRan: { passed: this.passed, total: this.total }, latestRunEnd: this.end?.evidence,
       approvedResumeRequired: this.approved,
+      debt, outstanding: current ? owed!.fold.outstanding.map(o => `${o.taskId} ${o.gate}`) : [],
     };
   }
   private comparableTo(hash: string | undefined): boolean {
@@ -205,7 +225,8 @@ export class OperatorStateFold {
 /** C1/C6 share this pure reader; callers supply the same observation and journal snapshot. */
 export function readOperatorState({ events, source = "journal.jsonl", ...options }: {
   events: readonly (JournalEvent | OperatorRecord)[]; source?: string; graph?: RunGraph;
-  sequence?: number; observedAt?: number; readable?: boolean;
+  sequence?: number; observedAt?: number; readable?: boolean; daemonDead?: boolean;
+  owed?: OwedAuthority; basis?: string;
 }): OperatorSnapshot {
   const fold = new OperatorStateFold();
   events.forEach((event, i) => fold.apply(typeof event.event === "object" ? event as OperatorRecord : {

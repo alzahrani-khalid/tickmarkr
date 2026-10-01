@@ -1,8 +1,8 @@
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import ts from "typescript";
-import { expect, onTestFinished, test } from "vitest";
+import { expect, onTestFinished, test, vi } from "vitest";
 import { parse, stringify } from "yaml";
 
 import * as registry from "../../src/adapters/registry.js";
@@ -11,6 +11,8 @@ import { assembleFleetEditor, fleet, writeFleetOverlay } from "../../src/cli/com
 import {
   DEFAULT_CONFIG,
   fleetEditableFromConfig,
+  fleetKeyLayer,
+  globalConfigDir,
   fleetRepoOverlayFromDelta,
   loadConfig,
   loadConfigWithMode,
@@ -20,6 +22,9 @@ import {
   type FleetOverlayWrite,
 } from "../../src/config/config.js";
 import { disallowedBy } from "../../src/route/preference.js";
+import { route } from "../../src/route/router.js";
+import { TaskSchema } from "../../src/graph/schema.js";
+import { autoMapEntry, type FleetStagedMetadata } from "../../src/tui/ink/fleet-app.js";
 import { makeRepo } from "../helpers/tmprepo.js";
 
 const editable = (over: Partial<FleetEditable> = {}): FleetEditable => ({
@@ -1052,4 +1057,230 @@ test("test: Fleet persists an effort write only with complete lower-layer input 
   const unchangedEffort = editable({ efforts: { codex: { m1: "high" } } });
   expect(renderFleetOverlayWrite(prior, { initial: unchangedEffort, edited: { ...unchangedEffort, floors: { spec: "frontier" } } } as FleetOverlayWrite))
     .toBe(renderFleetOverlayWrite(prior, floorsOnly));
+});
+
+// T8: a fleet session over an isolated HOME and an isolated user-overlay directory. The real user's
+// files (resolved before HOME is stubbed) are snapshotted so a test can prove nothing touched them.
+const t8Seat = (id: string): WorkerAdapter => ({
+  id,
+  vendor: id,
+  probe: async () => ({ installed: true, authed: true, models: [] }),
+  channels: (c) => channelsFromConfig(id, c),
+  headlessCommand: () => id,
+  interactiveCommand: () => null,
+  invoke: () => ({ command: id }),
+  parse: () => ({ ok: false, summary: "unused", deviations: [], raw: "" }),
+  listModels: async () => [],
+});
+const T8_SEATS = [t8Seat("fake"), t8Seat("codex")];
+const t8Doctor = (repo: string) => registry.writeDoctor(repo, Object.fromEntries(
+  [["fake", "fake-1"], ["codex", "gpt-5.6-terra"]].map(([id, model]) => [id, {
+    installed: true, authed: true, version: "fake", models: [model],
+    modelAuth: { [model]: { authed: true, probedAt: "2026-09-30T00:00:00.000Z" } },
+  }]),
+));
+const t8Session = async (fake1: "cheap" | "frontier", overlayTail = "") => {
+  const realUserFiles = [join(homedir(), ".config", "tickmarkr", "config.yaml"), join(globalConfigDir(), "config.yaml")];
+  const snapshot = () => realUserFiles.map((path) => (existsSync(path) ? readFileSync(path, "utf8") : null));
+  const real = snapshot();
+  const home = mkdtempSync(join(tmpdir(), "tickmarkr-fleet-home-"));
+  vi.stubEnv("HOME", home);
+  onTestFinished(() => {
+    vi.unstubAllEnvs();
+  });
+  const globalDir = mkdtempSync(join(tmpdir(), "tickmarkr-fleet-user-"));
+  const userPath = join(globalDir, "config.yaml");
+  const userBytes = `# operator machine choices\ntiers:\n  fake:\n    vendor: fake\n    channel: sub\n    models:\n      fake-1: ${fake1}\n${overlayTail}`;
+  writeFileSync(userPath, userBytes);
+  const editorIn = async (repo: string) => {
+    t8Doctor(repo);
+    const assembled = await assembleFleetEditor(repo, T8_SEATS, {}, { globalDir });
+    if ("unavailable" in assembled) throw new Error(assembled.unavailable);
+    return assembled;
+  };
+  const repo = makeRepo({ "keep.txt": "x" });
+  const realUntouched = () => {
+    expect(snapshot()).toEqual(real);
+    expect(readdirSync(home)).toEqual([]);
+  };
+  return { repo, globalDir, userPath, userBytes, editor: await editorIn(repo), editorIn, realUntouched };
+};
+const t8Deny = { adapters: [], models: [], workersAdapters: [], workersModels: [] };
+type T8Props = Extract<Awaited<ReturnType<typeof assembleFleetEditor>>, { props: unknown }>["props"];
+const t8State = (props: T8Props) => ({
+  denyAdapters: props.initialDenyAdapters ?? [],
+  denyModels: props.initialDenyModels ?? [],
+  denyWorkersAdapters: props.initialDenyWorkersAdapters ?? [],
+  denyWorkersModels: props.initialDenyWorkersModels ?? [],
+  classifications: [],
+  selectedMode: props.initialMode,
+  map: props.initialMap,
+  steering: props.initialSteering,
+});
+const whyRowOf = (why: string, shape: string) => why.split("\n").find((line) => line.startsWith(`${shape}  →`));
+const DEFAULT_PIN = { pin: { via: "claude-code", model: "fable" } };
+const labelsOf = (rows: Array<{ label: string }>) => rows.map((row) => row.label).join("\n");
+
+test("FleetEditor Auto over the inherited spec fable pin saves a null tombstone and reloads unpinned in a second isolated repository while an untouched pin keeps its original provenance", async () => {
+  const { globalDir, userPath, userBytes, editor, editorIn, realUntouched } = await t8Session("frontier");
+  const { props, commit, renderWhy } = editor;
+  // spec and plan both inherit the defaults' fable pin — the user overlay declares neither
+  expect(props.initialMap.spec).toEqual(DEFAULT_PIN);
+  expect(props.initialMap.plan).toEqual(DEFAULT_PIN);
+  const planRow = whyRowOf(renderWhy(), "plan");
+  expect(planRow).toContain("source: seed-default");
+
+  // the editor's a on spec: Auto clears the inherited pin
+  const map = { ...props.initialMap, spec: autoMapEntry(props.initialMap.spec) };
+  const review = props.reviewOverlay({ ...t8State(props), map });
+  if (review.kind !== "diff") throw new Error("Auto over an inherited pin must stage a diff");
+  expect(review.after).toBe(`${userBytes}routing:\n  map:\n    spec:\n      pin: null\n`);
+  expect(parse(review.after).routing.map).toEqual({ spec: { pin: null } }); // a raw tombstone, never a prefer
+  expect(commit({ kind: "write", review })).toBe(`fleet: wrote ${userPath}`);
+  expect(readFileSync(userPath, "utf8")).toBe(review.after);
+
+  // a second isolated repository inherits only the user overlay: spec is unpinned and routes automatically
+  const second = makeRepo({ "keep.txt": "x" });
+  const cfg = loadConfig(second, { globalDir });
+  expect(cfg.routing.map.spec).toEqual({});
+  const task = TaskSchema.parse({ id: "T1", title: "t", goal: "g", shape: "spec", complexity: 3, acceptance: ["a"] });
+  expect(route(task, cfg, channelsFromConfig("fake", cfg)).assignment).toMatchObject({ adapter: "fake", model: "fake-1" });
+  expect(fleetKeyLayer(second, "routing.map.spec.pin", { globalDir })).toBe("global");
+  // the untouched plan pin is still the defaults' own, with the same provenance on a fresh editor
+  expect(cfg.routing.map.plan).toEqual(DEFAULT_PIN);
+  expect(fleetKeyLayer(second, "routing.map.plan.pin", { globalDir })).toBe("defaults");
+  expect(whyRowOf((await editorIn(second)).renderWhy(), "plan")).toBe(planRow);
+  realUntouched();
+});
+
+test("FleetEditor saving reviewed staged classification effort and Auto produces previews equal to a fresh isolated load while a rejected review preserves the lower layer and real user files untouched", async () => {
+  const { repo, globalDir, userPath, userBytes, editor, editorIn, realUntouched } = await t8Session("cheap");
+  const { props, commit, previewConfig } = editor;
+  const lowerBefore = lowerLayerModelOverrides({ globalDir, below: "user" });
+  // the staged session: fake-1 reclassified frontier, codex terra at high effort, Auto on spec
+  const stage: FleetStagedMetadata = {
+    classifications: [{ adapter: "fake", model: "fake-1", tier: "frontier", note: "AA Index 60" }],
+    efforts: { codex: { "gpt-5.6-terra": "high" } },
+  };
+  const map = { ...props.initialMap, spec: autoMapEntry(props.initialMap.spec) };
+  const state = { ...t8State(props), ...stage, map };
+  const previewsOf = (p: T8Props, m: T8Props["initialMap"], s?: FleetStagedMetadata) => ({
+    mode: p.modePreview(p.initialMode, m, t8Deny, s),
+    shapes: p.shapeRows(p.initialMode, m, t8Deny, s),
+    pickers: (["spec", "migration", "implement"] as const).map((shape) => p.candidatesForShape(shape, p.initialMode, m, t8Deny, s)),
+  });
+  const staged = previewsOf(props, map, stage);
+  const candidate = previewConfig(props.initialMode, map, t8Deny, stage);
+
+  // rejected review: nothing lands — the user bytes, the defaults under them and the inherited pin all hold
+  const rejected = props.reviewOverlay(state);
+  if (rejected.kind !== "diff") throw new Error("the staged session must stage a diff");
+  expect(commit({ kind: "discard" })).toBe("fleet: discarded overlay changes");
+  expect(readFileSync(userPath, "utf8")).toBe(userBytes);
+  expect(lowerLayerModelOverrides({ globalDir, below: "user" })).toEqual(lowerBefore);
+  const kept = loadConfig(repo, { globalDir });
+  expect(kept.routing.map.spec).toEqual(DEFAULT_PIN);
+  expect(kept.tiers.fake.models["fake-1"]).toBe("cheap");
+  expect(kept.tiers.codex.modelOverrides?.["gpt-5.6-terra"]?.effort).toBeUndefined();
+  realUntouched();
+
+  // reviewed and saved: a fresh editor in a second isolated repository previews exactly what the stage previewed
+  const review = props.reviewOverlay(state);
+  if (review.kind !== "diff") throw new Error("the staged session must stage a diff");
+  expect(rejected.after).toBe(review.after);
+  expect(commit({ kind: "write", review })).toBe(`fleet: wrote ${userPath}`);
+  const second = makeRepo({ "keep.txt": "x" });
+  const fresh = await editorIn(second);
+  expect(fresh.props.initialMap.spec).toEqual({});
+  expect(previewsOf(fresh.props, fresh.props.initialMap)).toEqual(staged);
+  expect(labelsOf(staged.shapes)).toContain("migration  →  fake:fake-1 (sub, frontier)");
+  expect(labelsOf(staged.shapes)).toContain("implement  →  codex:gpt-5.6-terra (sub, mid, effort high)");
+  if (!candidate.ok) throw new Error(candidate.error);
+  expect(candidate.cfg).toEqual(loadConfigWithMode(second, { globalDir }).cfg);
+  realUntouched();
+});
+
+test("FleetEditor Auto over an aliased empty spec entry writes the pin null tombstone and reloads unpinned", async () => {
+  // `spec: *empty` is an alias to a mapping, not a scalar tombstone: spec still inherits the defaults' pin
+  const tail = "shared: &empty {}\nrouting:\n  map:\n    spec: *empty\n";
+  const { globalDir, userPath, editor, realUntouched } = await t8Session("frontier", tail);
+  const { props, commit } = editor;
+  expect(props.initialMap.spec).toEqual(DEFAULT_PIN);
+  const map = { ...props.initialMap, spec: autoMapEntry(props.initialMap.spec) };
+  const review = props.reviewOverlay({ ...t8State(props), map });
+  if (review.kind !== "diff") throw new Error("Auto over an aliased inherited pin must stage a diff");
+  const after = parse(review.after);
+  expect(after.routing.map.spec).toEqual({ pin: null });
+  expect(after.shared).toEqual({}); // the anchored node every other alias shares is never edited
+  expect(commit({ kind: "write", review })).toBe(`fleet: wrote ${userPath}`);
+  const second = makeRepo({ "keep.txt": "x" });
+  expect(loadConfig(second, { globalDir }).routing.map.spec).toEqual({});
+  realUntouched();
+});
+
+test("Auto over an aliased user pin deletes the pin from an un-anchored copy while the anchored node and its other alias keep the pin", () => {
+  const prior = "shared: &pinned\n  pin:\n    via: codex\n    model: gpt-5.6-terra\nrouting:\n  map:\n    docs: *pinned\n    chore: *pinned\n";
+  const pinned = { pin: { via: "codex", model: "gpt-5.6-terra" } };
+  const written = parse(renderFleetOverlayWrite(prior, {
+    initial: editable({ map: { docs: pinned, chore: pinned } }),
+    edited: editable({ map: { docs: autoMapEntry(pinned), chore: pinned } }),
+    lowerMap: DEFAULT_CONFIG.routing.map,
+  }));
+  expect(written.routing.map.docs).toEqual({});
+  expect(written.routing.map.chore).toEqual(pinned);
+  expect(written.shared).toEqual(pinned);
+});
+
+test("FleetEditor Auto on spec under a nested-anchor alias map clears only spec while the sibling plan alias keeps its inherited pin and provenance", async () => {
+  // D-821: the copy of *entries must not carry &empty, or plan: *empty rebinds to the edited spec
+  const tail = "shared: &entries\n  spec: &empty {}\n  plan: *empty\nrouting:\n  map: *entries\n";
+  const { globalDir, userPath, userBytes, editor, editorIn, realUntouched } = await t8Session("frontier", tail);
+  const { props, commit } = editor;
+  expect(props.initialMap.spec).toEqual(DEFAULT_PIN);
+  expect(props.initialMap.plan).toEqual(DEFAULT_PIN);
+  const planRow = whyRowOf(editor.renderWhy(), "plan");
+  expect(planRow).toBeDefined();
+  const map = { ...props.initialMap, spec: autoMapEntry(props.initialMap.spec) };
+  const review = props.reviewOverlay({ ...t8State(props), map });
+  if (review.kind !== "diff") throw new Error("Auto over a nested-anchor aliased pin must stage a diff");
+  const after = parse(review.after);
+  expect(after.routing.map).toEqual({ spec: { pin: null }, plan: {} });
+  expect(review.after.startsWith(userBytes.replace(/routing:\n {2}map: \*entries\n$/, ""))).toBe(true); // shared bytes untouched
+  expect(after.shared).toEqual({ spec: {}, plan: {} });
+  expect(props.reloadGuard(review.after)).toBeNull();
+  expect(commit({ kind: "write", review })).toBe(`fleet: wrote ${userPath}`);
+  const second = makeRepo({ "keep.txt": "x" });
+  const cfg = loadConfig(second, { globalDir });
+  expect(cfg.routing.map.spec).toEqual({});
+  expect(cfg.routing.map.plan).toEqual(DEFAULT_PIN);
+  expect(fleetKeyLayer(second, "routing.map.plan.pin", { globalDir })).toBe("defaults");
+  expect(whyRowOf((await editorIn(second)).renderWhy(), "plan")).toBe(planRow);
+  realUntouched();
+});
+
+test("setting and deleting through nested aliases edit only the reached entry: sibling and later aliases keep resolving to the original anchors", () => {
+  const pinned = { pin: { via: "codex", model: "gpt-5.6-terra" } };
+  const write = (prior: string, initialMap: FleetEditable["map"], editedMap: FleetEditable["map"]) =>
+    parse(renderFleetOverlayWrite(prior, { initial: editable({ map: initialMap }), edited: editable({ map: editedMap }), lowerMap: DEFAULT_CONFIG.routing.map }));
+
+  // set: the pin:null tombstone lands on spec only; a later *empty still names the shared {}
+  const setPrior = "shared: &entries\n  spec: &empty {}\n  plan: *empty\nrouting:\n  map: *entries\nlater: *empty\n";
+  const inherited = { spec: DEFAULT_PIN, plan: DEFAULT_PIN };
+  const set = write(setPrior, inherited, { spec: autoMapEntry(DEFAULT_PIN), plan: DEFAULT_PIN });
+  expect(set.routing.map).toEqual({ spec: { pin: null }, plan: {} });
+  expect(set.shared).toEqual({ spec: {}, plan: {} });
+  expect(set.later).toEqual({});
+
+  // delete: Auto on docs deletes its own pin; the sibling chore and a later alias keep it
+  const delPrior = "shared: &entries\n  docs: &pinned\n    pin: {via: codex, model: gpt-5.6-terra}\n  chore: *pinned\nrouting:\n  map: *entries\nlater: *pinned\n";
+  const del = write(delPrior, { docs: pinned, chore: pinned }, { docs: autoMapEntry(pinned), chore: pinned });
+  expect(del.routing.map).toEqual({ docs: {}, chore: pinned });
+  expect(del.shared).toEqual({ docs: pinned, chore: pinned });
+  expect(del.later).toEqual(pinned);
+
+  // a sibling whose anchor is redefined before the copy is expanded, never rebound to the redefinition
+  const shadowPrior = "shared: &entries\n  spec: &empty {}\n  plan: *empty\nredefined: &empty\n  pin: {via: codex, model: gpt-5.6-terra}\nrouting:\n  map: *entries\n";
+  const shadow = write(shadowPrior, inherited, { spec: autoMapEntry(DEFAULT_PIN), plan: DEFAULT_PIN });
+  expect(shadow.routing.map).toEqual({ spec: { pin: null }, plan: {} });
+  expect(shadow.redefined).toEqual(pinned);
 });

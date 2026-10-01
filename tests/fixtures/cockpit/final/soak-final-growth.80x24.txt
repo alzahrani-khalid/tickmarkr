@@ -1,5 +1,5 @@
 tickmarkr capture | RUN | run-screen-soak
-1 Home  4 Run  5 Evidence | content | 1–17/42 | 25 hidden
+1 Home  4 Run  5 Evidence  7 Log | content | 1–17/42 | 25 hidden
 ────────────────────────────────────────────────────────────────────────────────
 │RUN / RUNNING · 0/? merged | current-cycle tip PENDING | RUNNING | not compara│
 │ tickmarkr  run-screen-soak  │  0/? done  │  0 esc  │  1h34m                  │

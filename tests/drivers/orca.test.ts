@@ -34,7 +34,7 @@ import { readWatchBoard } from "../../src/run/supervision.js";
 import { COMMIT, setupRepo, T } from "../helpers/tmprepo.js";
 import {
   FakeOrca, fakeBoardObserver, killBoardObservers, ORCA_FIXTURE_NONCE, ORCA_LITERAL_MARKER, orcaBoardDriver, pagedMarkerLines,
-  pollBoardObservers, steppedTime, type FakeBoardObserver, type FakeOrcaOpts,
+  pacedReadExec, pollBoardObservers, steppedTime, withheldProofExec, type FakeBoardObserver, type FakeOrcaOpts,
 } from "../helpers/fake-orca.js";
 
 const WT = "/tmp/orca-wt/T1";
@@ -1137,6 +1137,316 @@ describe("OrcaDriver", () => {
     expect(fake.workspaceStatuses.get(WT)).toBe("in-review");
   });
 
+});
+
+// E1: on a loaded host a seat's wrapper shell can print its startup proof long after create. The
+// window is INJECTED time: a matching proof first arriving at 10000 ms launches, while no proof, a
+// foreign checkout's frame, a cut frame, a mark whose header the frame grammar cannot parse and a proof
+// overrunning the ceiling all close the terminal at 20000 ms and latch the slot. ONE absolute deadline:
+// no read starts at or past it, each is handed exactly the budget left, and a proof a slow read only
+// returns past the ceiling launches nothing. The typed timeout only when EVERY poll read its whole
+// scrollback inside the ceiling with no trace of the mark: a page limit, a stalled next cursor, a throw,
+// a late read or a read the ceiling cut off is unread — unknown, never absence — and no later poll
+// downgrades it to absent.
+test("production Orca launch accepts matching checkout proof first arriving at injected 10000 ms while absent foreign and malformed proof close fail-closed at the injected 20000 ms ceiling", async () => {
+  // readMs/honor: pacedReadExec; pageSize: the fake's page, so a seeded banner spans several pages.
+  const launch = async (opts: {
+    seed?: (proof: string) => string[]; atMs?: number; arrive?: (proof: string) => string[];
+    readMs?: number; honor?: boolean; failCursor?: number; failUntil?: number; pageSize?: number;
+    stall?: "missing" | "repeat"; cursorless?: boolean; blind?: boolean;
+    malform?: { shape: "missing" | "non-array" | "non-string"; pagesOnly?: boolean };
+  }) => {
+    const clock = steppedTime();
+    const fake = new FakeOrca({ trackedWorktrees: [WT, OTHER_WT], pageSize: opts.pageSize });
+    let closedAt: number | undefined;
+    const reads: { at: number; timeoutMs?: number; cut: boolean }[] = [];
+    const paced = pacedReadExec(withheldProofExec(fake, clock, opts), clock, {
+      readMs: opts.readMs ?? 0, honor: opts.honor, failCursor: opts.failCursor, failUntil: opts.failUntil,
+      stall: opts.stall, cursorless: opts.cursorless, malform: opts.malform, onRead: (r) => reads.push(r),
+    });
+    const exec: OrcaExec = async (args, cwd, timeoutMs) => {
+      if (args[1] === "close") closedAt ??= clock.now();
+      return paced(args, cwd, timeoutMs);
+    };
+    const driver = new OrcaDriver({ exec, time: clock, launchingHandle: "term_launch" });
+    const slot = await driver.slot(WT, TITLE);
+    const error = await driver.run(slot, "review").then(() => undefined, (e: unknown) => e);
+    // Every proof read starts inside the ceiling and is handed exactly what is left of it.
+    for (const r of reads) {
+      expect(r.at).toBeLessThan(20_000);
+      expect(r.timeoutMs).toBe(20_000 - r.at);
+    }
+    return { fake, driver, slot, error, elapsed: clock.now(), closedAt, reads };
+  };
+
+  // Released: the matching proof first appears at 10000 ms — past the old 2000 ms window — and launches.
+  const late = await launch({ atMs: 10_000 });
+  expect(late.error).toBeUndefined();
+  expect(late.elapsed).toBeGreaterThanOrEqual(10_000);
+  expect(late.elapsed).toBeLessThan(20_000);
+  expect(late.closedAt).toBeUndefined();
+  expect(late.fake.countOf("close")).toBe(0);
+  expect(late.fake.terminals).toHaveLength(1);
+  await late.driver.run(late.slot, "next"); // bound: a later delivery is a send, never a second create
+  expect(late.fake.countOf("create")).toBe(1);
+  expect(late.fake.sent.get(late.fake.last()!.handle)).toEqual(["next"]);
+
+  const foreignCheckout = checkoutProofLine(canonicalWorktreePath(OTHER_WT));
+  const cases = [
+    { name: "absent", opts: {}, reason: /names no checkout\)/, launchCause: "checkout-proof-timeout" },
+    { name: "overrun", opts: { atMs: 20_001 }, reason: /names no checkout\)/, launchCause: "checkout-proof-timeout" },
+    { name: "foreign", opts: { seed: () => [foreignCheckout] }, reason: /names \S*orca-wt\/T2\)/, launchCause: undefined },
+    { name: "malformed", opts: { seed: (proof: string) => [proof.slice(0, -3)] }, reason: /incomplete proof frame/, launchCause: undefined },
+    { name: "cut before colon", opts: { seed: (proof: string) => [proof.slice(0, proof.indexOf(":"))] }, reason: /names no checkout and carries a malformed proof marker\)/, launchCause: undefined },
+    { name: "invalid length", opts: { seed: (proof: string) => [proof.replace(/ \d+:/, " x:")] }, reason: /names no checkout and carries a malformed proof marker\)/, launchCause: undefined },
+  ];
+  for (const c of cases) {
+    const r = await launch(c.opts);
+    expect(r.error, c.name).toBeInstanceOf(OrcaUnavailableError);
+    const error = r.error as OrcaUnavailableError;
+    expect(error.message, c.name).toMatch(/does not prove checkout \S+ within 20000 ms/);
+    expect(error.message, c.name).toMatch(c.reason); // the partial diagnostic names what the scrollback held
+    expect(error.launchCause, c.name).toBe(c.launchCause);
+    // Fail-closed at the ceiling, not before it: the close lands at exactly 20000 ms of injected time.
+    expect(r.closedAt, c.name).toBe(20_000);
+    expect(r.fake.countOf("close"), c.name).toBe(1);
+    expect(r.fake.terminals, c.name).toEqual([]); // cleanup: the unproven terminal is gone
+    // Latched: the slot never opens a second terminal beside the one it refused.
+    await expect(r.driver.run(r.slot, "again"), c.name).rejects.toBeInstanceOf(OrcaUnavailableError);
+    expect(r.fake.countOf("create"), c.name).toBe(1);
+  }
+
+  // Slow reads (12000 ms each) and a matching proof first arriving at 24000 ms: the read that returns it
+  // ends past the ceiling, so it proves nothing — refused, closed, latched. A late read is unread output:
+  // the earlier whole-scrollback absent poll never makes the window a timeout (late exit path).
+  const slow = await launch({ atMs: 24_000, readMs: 12_000 });
+  expect(slow.error).toBeInstanceOf(OrcaUnavailableError);
+  expect((slow.error as OrcaUnavailableError).message).toMatch(/within 20000 ms \(read past the ceiling, its scrollback names \S*orca-wt\/T1\)/);
+  expect((slow.error as OrcaUnavailableError).launchCause).toBeUndefined();
+  expect(slow.reads.at(-1)!.timeoutMs).toBeLessThan(20_000); // the late read was handed only the remaining budget
+  expect(slow.closedAt).toBeGreaterThan(20_000);
+  expect(slow.fake.countOf("close")).toBe(1);
+  expect(slow.fake.terminals).toEqual([]);
+  await expect(slow.driver.run(slow.slot, "again")).rejects.toBeInstanceOf(OrcaUnavailableError);
+  expect(slow.fake.countOf("create")).toBe(1);
+
+  // Production-shaped reads: 150 ms each, honoring the budget they are handed, paged from oldestCursor.
+  // Over the fake's 6-row pages a poll is an anchor plus two pages (650 ms with the 200 ms sleep) and the
+  // ceiling falls in the 31st poll's sleep: every poll read its whole scrollback, so absent is the typed
+  // timeout (complete exit path). Over 2-row pages a poll is an anchor plus four pages (950 ms), so the
+  // 22nd poll's anchor is CUT at 20000 ms — unread output, which neither keeps the earlier absence a
+  // timeout (cut exit path) nor erases the foreign or cut mark every earlier poll read.
+  const banner = ["banner 1", "banner 2", "banner 3", "banner 4", "banner 5", "banner 6", "banner 7"];
+  const paced = [
+    { name: "absent", seed: () => banner, launchCause: { 6: "checkout-proof-timeout", 2: undefined } },
+    { name: "foreign", seed: () => [...banner, foreignCheckout], launchCause: { 6: undefined, 2: undefined } },
+    { name: "cut before colon", seed: (proof: string) => [...banner, proof.slice(0, proof.indexOf(":"))], launchCause: { 6: undefined, 2: undefined } },
+  ];
+  for (const pageSize of [6, 2] as const) {
+    const on = await launch({ atMs: 10_000, readMs: 150, honor: true, pageSize, seed: () => banner });
+    expect(on.error, `on time, pageSize ${pageSize}`).toBeUndefined();
+    expect(on.elapsed).toBeGreaterThanOrEqual(10_000);
+    expect(on.fake.countOf("close")).toBe(0);
+    for (const c of paced) {
+      const name = `${c.name}, 150 ms reads, pageSize ${pageSize}`;
+      const r = await launch({ seed: c.seed, readMs: 150, honor: true, pageSize });
+      expect(r.error, name).toBeInstanceOf(OrcaUnavailableError);
+      expect((r.error as OrcaUnavailableError).launchCause, name).toBe(c.launchCause[pageSize]);
+      expect(r.closedAt, name).toBe(20_000); // never past the ceiling
+      expect(r.fake.countOf("close"), name).toBe(1);
+      if (pageSize === 2) {
+        expect(r.reads.at(-1), name).toMatchObject({ at: 19_950, timeoutMs: 50, cut: true }); // the cut final anchor
+        expect(r.reads.filter((x) => x.cut), name).toHaveLength(1);
+      } else expect(r.reads.filter((x) => x.cut), name).toHaveLength(0);
+    }
+  }
+
+  // Reads that do NOT honor their budget: the final anchor lands at 20100 ms, past the ceiling, with
+  // an oldestCursor whose pages are never read. Its own tail still shows the foreign or cut mark — that
+  // is placement evidence, never the exemption — and the late anchor proves nothing; with no mark at
+  // all the late anchor is unread output, so the earlier absent polls are no timeout either.
+  for (const c of paced) {
+    const r = await launch({ seed: c.seed, readMs: 150, pageSize: 2 });
+    const name = `${c.name}, late anchor`;
+    expect(r.reads.at(-1), name).toMatchObject({ at: 19_950, timeoutMs: 50, cut: false });
+    expect((r.error as OrcaUnavailableError).launchCause, name).toBeUndefined();
+    expect(r.closedAt, name).toBe(20_100);
+  }
+
+  // Cut at the ceiling with the mark between banner rows: 14 banner rows over 2-row pages make a poll
+  // 1250 ms+, so the 15th poll starts at 19600 ms — when the frame (or a mark cut before its colon)
+  // lands with two more banner rows after it. That poll's anchor is read, but its tail shows only the
+  // trailing banner, and the ceiling cuts paging off at 20000 ms before the page holding the mark: known
+  // unread scrollback after fourteen whole-scrollback absent polls, so never the typed timeout. The
+  // reason names no foreign checkout — the mark was never read, only left unread.
+  const fourteen = Array.from({ length: 14 }, (_, i) => `banner ${i + 1}`);
+  for (const c of [
+    { name: "foreign", arrive: () => [foreignCheckout, "banner 15", "banner 16"] },
+    { name: "cut before colon", arrive: (proof: string) => [proof.slice(0, proof.indexOf(":")), "banner 15", "banner 16"] },
+    { name: "absent", arrive: () => ["banner 15", "banner 16"] },
+  ]) {
+    const name = `${c.name} between banner rows at 19600 ms, cut at the ceiling`;
+    const r = await launch({ seed: () => fourteen, atMs: 19_600, arrive: c.arrive, readMs: 150, honor: true, pageSize: 2 });
+    expect(r.error, name).toBeInstanceOf(OrcaUnavailableError);
+    const error = r.error as OrcaUnavailableError;
+    expect(error.launchCause, name).toBeUndefined();
+    expect(error.message, name).toMatch(/within 20000 ms \(the ceiling cut off paging, its scrollback names no checkout\); raw response:/);
+    expect(r.reads.slice(-3).map(({ at, cut }) => ({ at, cut })), name)
+      .toEqual([{ at: 19_600, cut: false }, { at: 19_750, cut: false }, { at: 19_900, cut: true }]);
+    expect(r.closedAt, name).toBe(20_000);
+    expect(r.fake.countOf("close"), name).toBe(1);
+  }
+  // The same 14-row banner with no arrival: the 15th poll is cut the same way, so the window is unread.
+  const plain = await launch({ seed: () => fourteen, readMs: 150, honor: true, pageSize: 2 });
+  expect((plain.error as OrcaUnavailableError).launchCause).toBeUndefined();
+
+  // A limited page whose next cursor is missing or repeats the one asked for says more scrollback exists
+  // that no read can reach — unread, never absent. Seven banner rows, the mark, two more: each poll's
+  // anchor shows only the trailing banner and its first page (the first two rows) stalls, so the mark is
+  // never read (150 ms reads, 500 ms a poll, none cut). Every poll is unread, so no exemption is typed —
+  // nor with no mark at all. An empty scrollback has no limited page to stall: still the typed timeout.
+  const seven = Array.from({ length: 7 }, (_, i) => `banner ${i + 1}`);
+  for (const stall of ["missing", "repeat"] as const) {
+    for (const c of [
+      { name: "foreign", seed: () => [...seven, foreignCheckout, "banner 8", "banner 9"] },
+      { name: "cut before colon", seed: (proof: string) => [...seven, proof.slice(0, proof.indexOf(":")), "banner 8", "banner 9"] },
+      { name: "absent", seed: () => [...seven, "banner 8", "banner 9"] },
+    ]) {
+      const name = `${c.name} between banner rows, ${stall} next cursor`;
+      const r = await launch({ seed: c.seed, readMs: 150, honor: true, pageSize: 2, stall });
+      expect(r.error, name).toBeInstanceOf(OrcaUnavailableError);
+      const error = r.error as OrcaUnavailableError;
+      expect(error.launchCause, name).toBeUndefined();
+      expect(error.message, name).toMatch(/within 20000 ms \(a limited read gave no next cursor with scrollback unread, its scrollback names no checkout\); raw response:/);
+      expect(r.reads.filter((x) => x.cut), name).toHaveLength(0);
+      expect(r.closedAt, name).toBe(20_000);
+      expect(r.fake.countOf("close"), name).toBe(1);
+    }
+    const empty = await launch({ readMs: 150, honor: true, pageSize: 2, stall });
+    expect((empty.error as OrcaUnavailableError).launchCause, `empty, ${stall} next cursor`).toBe("checkout-proof-timeout");
+  }
+  // An anchor with no oldestCursor that is truncated is the same unreachable scrollback (100 ms reads,
+  // 300 ms a poll, none cut); one that is the whole scrollback is complete, so absence is the timeout.
+  for (const c of [
+    { name: "foreign", seed: () => [...seven, foreignCheckout, "banner 8", "banner 9"], launchCause: undefined },
+    { name: "absent", seed: () => [...seven, "banner 8", "banner 9"], launchCause: undefined },
+    { name: "whole", seed: () => ["banner 1", "banner 2"], launchCause: "checkout-proof-timeout" },
+  ]) {
+    const name = `${c.name}, cursorless anchor`;
+    const r = await launch({ seed: c.seed, readMs: 100, honor: true, pageSize: 2, cursorless: true });
+    expect((r.error as OrcaUnavailableError).launchCause, name).toBe(c.launchCause);
+    expect(r.reads.filter((x) => x.cut), name).toHaveLength(0);
+    expect(r.closedAt, name).toBe(20_000);
+  }
+
+  // Complete at production pacing, and an unread poll never downgraded: an empty scrollback over 150 ms
+  // reads is an anchor plus one page (500 ms a poll) and the ceiling falls in the last sleep, so every
+  // poll read the whole scrollback — the typed timeout. Failing the cursor reads for the first second
+  // only leaves those polls unread; the whole-scrollback absent polls after them never make it a timeout.
+  const complete = await launch({ readMs: 150, honor: true });
+  expect((complete.error as OrcaUnavailableError).launchCause).toBe("checkout-proof-timeout");
+  expect(complete.reads.filter((x) => x.cut)).toHaveLength(0);
+  expect(complete.closedAt).toBe(20_000);
+  const recovered = await launch({ readMs: 150, honor: true, failCursor: 0, failUntil: 1_000 });
+  expect(recovered.error).toBeInstanceOf(OrcaUnavailableError);
+  expect((recovered.error as OrcaUnavailableError).launchCause).toBeUndefined();
+  expect((recovered.error as OrcaUnavailableError).message).toMatch(/within 20000 ms \(orca read failed — orca CLI exited 1/);
+  expect(recovered.closedAt).toBe(20_000);
+
+  // PROOF_PAGES is a bound, not a proof of absence: 136 ms budget-honoring reads over 2-row pages and
+  // 40 banner rows before the mark leave scrollback unread after 16 pages in all eight polls, while
+  // every anchor's own tail shows the foreign or cut mark — placement evidence, never the exemption.
+  // A banner that long with no mark at all is unread every poll, so it is never typed absent either;
+  // nor does an earlier empty poll survive the later polls that could not read a hidden foreign frame.
+  const long = Array.from({ length: 40 }, (_, i) => `banner ${i + 1}`);
+  const exhausted = [
+    { name: "foreign", seed: () => [...long, foreignCheckout] },
+    { name: "cut before colon", seed: (proof: string) => [...long, proof.slice(0, proof.indexOf(":"))] },
+    { name: "absent", seed: () => long },
+    { name: "foreign hidden after an empty poll", atMs: 1_000, arrive: () => [...long, foreignCheckout, ...long.slice(0, 5)] },
+  ];
+  for (const c of exhausted) {
+    const name = `${c.name}, past 16 pages`;
+    const r = await launch({ ...c, readMs: 136, honor: true, pageSize: 2 });
+    expect(r.error, name).toBeInstanceOf(OrcaUnavailableError);
+    expect((r.error as OrcaUnavailableError).launchCause, name).toBeUndefined();
+    expect(r.closedAt, name).toBe(20_000);
+    expect(r.fake.countOf("close"), name).toBe(1);
+    // Eight polls, each an anchor plus all 16 pages (2312 ms), none cut: the ceiling falls in the last sleep.
+    if (c.seed) expect(r.reads.filter((x) => !x.cut), name).toHaveLength(8 * 17);
+  }
+
+  // A malformed page is unread, never an empty page: a tail that is missing, a string instead of an
+  // array, or rows that are not strings once filtered to nothing and made a hidden foreign frame — or
+  // no mark at all — read as absent, the timeout exemption. On every read (anchor included) each poll
+  // is unread from its first read (100 ms reads, none cut, so no poll at the ceiling is what denies
+  // the exemption); on cursor pages only, the well-formed anchor is read first, so a
+  // foreign frame in its own tail stays placement evidence beside the malformed page that stopped paging.
+  for (const shape of ["missing", "non-array", "non-string"] as const) {
+    for (const c of [
+      { name: "foreign hidden", seed: () => [...seven, foreignCheckout, "banner 8", "banner 9"], reason: /orca read failed — terminal (?:record carries no tail array|tail carries a non-string line)/ },
+      { name: "absent", seed: () => ["banner 1", "banner 2"], reason: /orca read failed — terminal (?:record carries no tail array|tail carries a non-string line)/ },
+      { name: "foreign in the anchor", seed: () => [...seven, foreignCheckout], pagesOnly: true, reason: /its scrollback names \S*orca-wt\/T2; then a read failed — orca read failed — terminal/ },
+      { name: "absent behind the anchor", seed: () => [...seven, "banner 8", "banner 9"], pagesOnly: true, reason: /its scrollback names no checkout; then a read failed — orca read failed — terminal/ },
+    ]) {
+      const name = `${c.name}, ${shape} tail${c.pagesOnly ? " on cursor pages" : ""}`;
+      const r = await launch({ seed: c.seed, readMs: 100, honor: true, pageSize: 2, malform: { shape, pagesOnly: c.pagesOnly } });
+      expect(r.error, name).toBeInstanceOf(OrcaUnavailableError);
+      const error = r.error as OrcaUnavailableError;
+      expect(error.launchCause, name).toBeUndefined();
+      expect(error.message, name).toMatch(c.reason);
+      expect(r.reads.filter((x) => x.cut), name).toHaveLength(0);
+      expect(r.closedAt, name).toBe(20_000);
+      expect(r.fake.countOf("close"), name).toBe(1);
+    }
+  }
+  // The same scrollback well-formed is the typed timeout: the malformed shape alone denied it.
+  const wellFormed = await launch({ seed: () => ["banner 1", "banner 2"], readMs: 100, honor: true, pageSize: 2 });
+  expect((wellFormed.error as OrcaUnavailableError).launchCause).toBe("checkout-proof-timeout");
+
+  // A blind stream page (OBS-1011 add.1: status exited, an empty tail, zero lines returned) is unread,
+  // never an empty page: a connected terminal whose running screen shows a foreign frame — or nothing —
+  // answers every proof read blind (100 ms budget-honoring reads, none cut), so no exemption is typed.
+  // A running terminal's genuinely empty scrollback read the same way is complete: the typed timeout.
+  for (const c of [
+    { name: "foreign on the screen", seed: () => [foreignCheckout] },
+    { name: "nothing on the screen", seed: () => [] },
+  ]) {
+    const name = `${c.name}, blind stream`;
+    const r = await launch({ seed: c.seed, blind: true, readMs: 100, honor: true });
+    expect(r.error, name).toBeInstanceOf(OrcaUnavailableError);
+    const error = r.error as OrcaUnavailableError;
+    expect(error.launchCause, name).toBeUndefined();
+    expect(error.message, name).toMatch(/within 20000 ms \(orca read failed — proof page is a blind stream page/);
+    expect(r.reads.filter((x) => x.cut), name).toHaveLength(0);
+    expect(r.closedAt, name).toBe(20_000);
+    expect(r.fake.countOf("close"), name).toBe(1);
+  }
+  const runningEmpty = await launch({ readMs: 100, honor: true });
+  expect((runningEmpty.error as OrcaUnavailableError).launchCause).toBe("checkout-proof-timeout");
+  expect(runningEmpty.reads.filter((x) => x.cut)).toHaveLength(0);
+
+  // A cursor read that FAILS keeps what the poll already read: after an empty first poll (absent), the
+  // foreign or cut mark arrives at 1000 ms and every later anchor shows it while its page read fails —
+  // the failure is unread output, the anchor's tail is placement evidence, and no exemption is typed.
+  // With no mark at all, failing reads still never extend the earlier absence into a timeout.
+  for (const c of [
+    { name: "foreign", arrive: () => [foreignCheckout], misplaced: true },
+    { name: "cut before colon", arrive: (proof: string) => [proof.slice(0, proof.indexOf(":"))], misplaced: true },
+    { name: "absent", arrive: () => [], misplaced: false },
+  ]) {
+    const name = `${c.name}, failing cursor reads`;
+    const r = await launch({ atMs: 1_000, arrive: c.arrive, readMs: 150, honor: true, failCursor: 1_000 });
+    expect(r.error, name).toBeInstanceOf(OrcaUnavailableError);
+    const error = r.error as OrcaUnavailableError;
+    expect(error.launchCause, name).toBeUndefined();
+    // The anchor's evidence is reported beside the failure that stopped its pages.
+    expect(error.message, name).toMatch(c.misplaced
+      ? /its scrollback names (?:\S*orca-wt\/T2|no checkout and carries a malformed proof marker); then a read failed — orca read failed — orca CLI exited 1/
+      : /within 20000 ms \(orca read failed — orca CLI exited 1/); // an empty anchor: only the failure to report
+    expect(r.closedAt, name).toBe(20_000);
+    expect(r.fake.countOf("close"), name).toBe(1);
+  }
 });
 
 // OBS-1168 add.3: the shell echoes the typed launch line into the scrollback, repainted and

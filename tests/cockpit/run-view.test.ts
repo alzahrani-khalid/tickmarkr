@@ -36,6 +36,7 @@ import {
 } from "../../src/tui/cockpit/decision-actions.js";
 import { deriveRunCockpitData } from "../../src/tui/cockpit/derive.js";
 import { runLiveCockpit } from "../../src/tui/cockpit/live.js";
+import { createLiveStore } from "../../src/tui/cockpit/live-store.js";
 import { deriveRunViewRows, taskProjectionText } from "../../src/tui/cockpit/run-cockpit.js";
 import type { ShellDelivery } from "../../src/tui/cockpit/live-runtime.js";
 import {
@@ -225,9 +226,9 @@ describe("C4 — Run and validated decisions", () => {
     j.append("gate-result", "T7", { gate: "build", pass: true, details: "ok" });
     j.append("task-failed", "T7", { reason: "worker died" });
     j.append("task-dispatch", "T7", { assignment: ASSIGNMENT, attempt: 1 });
-    j.append("gate-start", "T7", { gate: "build" });
     j.append("run-end", undefined, { done: ["T1"], failed: [], human: ["T2"], blocked: ["T3"], pending: ["T4", "T5", "T6", "T7"], tipVerify: "passed" });
     j.append("run-resume", undefined, {});
+    j.append("gate-start", "T7", { gate: "build" });
     for (const gate of ["build", "test", "lint"]) j.append("gate-reused", "T5", { gate, commit: "abc" });
     j.append("gate-start", "T5", { gate: "evidence" });
 
@@ -1183,5 +1184,69 @@ describe("T9 — projection per agent with source references and honest locators
     expect(receiptFrame).toContain("RECEIPT · appended");
     expect(receiptFrame).toContain(`#L${receipt.appended.line} task-approved T2 · release ${receipt.release ?? "none"}`);
     expect(focusDriver).not.toHaveBeenCalled();
+  });
+});
+
+describe("I1 — unfinished gate cells settle at terminal boundaries", () => {
+  /** T1 has build passed, acceptance running and review failed; the board row and the cell list both draw it. */
+  function writeRun(terminal: ((j: Journal) => void) | undefined, daemon: "alive" | "dead") {
+    const root = repo();
+    const runId = "run-i1-settle";
+    const graph = graphOf(["T1", "T2"]);
+    writeFileSync(join(tickmarkrDir(root), "graph.json"), JSON.stringify(graph));
+    const j = Journal.create(root, runId);
+    j.append("run-start", undefined, { graphDefinitionHash: graphDefinitionHash(graph), branch: "fixture" });
+    j.append("task-dispatch", "T1", { assignment: ASSIGNMENT, attempt: 0 });
+    j.append("gate-result", "T1", { gate: "build", pass: true, details: "ok" });
+    j.append("gate-result", "T1", { gate: "review", pass: false, details: "requested changes" });
+    j.append("gate-start", "T1", { gate: "acceptance" });
+    terminal?.(j);
+    writeFileSync(join(tickmarkrDir(root), "graph.lock"), JSON.stringify({ pid: 434343, runId, startedAt: Date.now() }));
+    return { root, runId, graph, daemon };
+  }
+  async function drawLive({ root, runId, graph, daemon }: ReturnType<typeof writeRun>) {
+    const kill = vi.spyOn(process, "kill").mockImplementation(() => {
+      if (daemon === "alive") return true;
+      throw Object.assign(new Error("gone"), { code: "ESRCH" });
+    });
+    const store = createLiveStore({ cwd: root, runId });
+    try {
+      const snap = store.snapshot();
+      const frame = await renderComponent(createElement(RunView, {
+        snapshot: snap.operator, rows: snap.journal.history, page: store.page, graph, decisions: [],
+        session: initialRunViewSession(), columns: 150, run: approvalRunOwner(root, runId), now: () => 0,
+      }), 150);
+      const row = frame.split("\n").find((line) => /^ {2}❯ T1 /u.test(line)) ?? "";
+      const acceptance = frame.split("\n").map((line) => line.replace(/│/gu, "").trim()).find((line) => /^[A-Z?-] acceptance /u.test(line)) ?? "";
+      return { lock: snap.lock.state, frame, row, acceptance };
+    } finally { store.dispose(); kill.mockRestore(); }
+  }
+
+  test("test: production run-view and board render unknown after task-human/task-failed/task-blocked/run-end even with a live daemon; for the same nonterminal journal a dead matching daemon settles the cell while an alive matching daemon retains running", async () => {
+    const terminals: Record<string, (j: Journal) => void> = {
+      "task-human": (j) => j.append("task-human", "T1", { kind: "gate-fail", reason: "review red" }),
+      "task-failed": (j) => j.append("task-failed", "T1", { reason: "worker died" }),
+      "task-blocked": (j) => j.append("task-blocked", "T1", { reason: "dependency" }),
+      "run-end": (j) => j.append("run-end", undefined, { done: [], failed: [], human: [], blocked: [], pending: ["T1", "T2"], tipVerify: "not required" }),
+    };
+    for (const [name, terminal] of Object.entries(terminals)) {
+      const drawn = await drawLive(writeRun(terminal, "alive"));
+      expect(drawn.lock, name).toBe("alive");
+      expect(drawn.frame, name).toContain("● LIVE");
+      // Board strip: build ✔ · acceptance ? · review ✖ — the measured verdicts survive, the start does not read running.
+      expect(drawn.row, name).toMatch(/✔ {2}· {2}· {2}· {2}· {2}\? {2}✖ /u);
+      expect(drawn.acceptance, name).toMatch(/^\? acceptance +unknown — gate-start never finished · #L5$/u);
+      expect(drawn.frame, name).not.toContain("running · acceptance");
+    }
+    const dead = await drawLive(writeRun(undefined, "dead"));
+    expect(dead.lock).toBe("dead");
+    expect(dead.row).toMatch(/✔ {2}· {2}· {2}· {2}· {2}\? {2}✖ /u);
+    expect(dead.acceptance).toMatch(/^\? acceptance +unknown — gate-start never finished · #L5$/u);
+    expect(dead.frame).not.toContain("running · acceptance");
+    const alive = await drawLive(writeRun(undefined, "alive"));
+    expect(alive.lock).toBe("alive");
+    expect(alive.row).toMatch(/✔ {2}· {2}· {2}· {2}· {2}R {2}✖ /u);
+    expect(alive.frame).toContain("running · acceptance");
+    expect(alive.acceptance).toMatch(/^R acceptance +running · #L5$/u);
   });
 });

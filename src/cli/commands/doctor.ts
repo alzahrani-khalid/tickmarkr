@@ -15,11 +15,14 @@ import { HerdrDriver } from "../../drivers/herdr.js";
 import { ORCA_FIXTURE_VERSION, parseEnvelope, resolveOrcaCliBinary } from "../../drivers/orca.js";
 import type { WorkerAdapter } from "../../adapters/types.js";
 import { kimi, type KimiDoctorTurnResult, probeKimiDoctorTurn } from "../../adapters/kimi.js";
+import { type CodexSandbox, recordCodexCommit } from "../../adapters/codex-commit-check.js";
 import { denyPreferCollisionLine, denyPreferCollisions, disallowedBy, excludedChannels, exclusionLine, observedSeat, preferRanks } from "../../route/preference.js";
 import { CATALOG_REFRESH_TIMEOUT_MS, LIVEBENCH_TABLE_DATE, formatCatalogRefreshLegs, readCachedCatalog, refreshCatalogCommand, type CatalogFetcher, type CatalogReadResult } from "../../adapters/catalog-remote.js";
 import { sh, type ShResult } from "../../run/git.js";
 import { auditNamedTestOracles, listVitestTests, type VitestListResult } from "../../gates/acceptance.js";
 import { readReviewNoVerdictHistory, reviewNoVerdictRows } from "../../run/journal.js";
+import { checkModelDiscovery } from "../../adapters/model-discovery-check.js";
+import { recordLaunchServices } from "../../run/launchservices-check.js";
 
 /** Where a newer `table_<date>.csv` is discovered — the deployed site builds filenames by
  *  concatenation and publishes no index, so the release listing is the only enumerable surface. */
@@ -68,6 +71,7 @@ export function recentReviewDemotions(cwd: string, lastRuns = 50): ReviewDemotio
 export type DoctorOpts = {
   banner?: boolean;
   kimiTurnProbe?: (cwd: string) => Promise<KimiDoctorTurnResult>;
+  codexSandbox?: CodexSandbox;
   resolveClaudeAliasIdentity?: (cwd: string, alias: ClaudeAlias) => string | undefined;
   catalog?: CatalogReadResult;
   catalogNow?: () => Date;
@@ -653,6 +657,7 @@ export async function doctor(
       };
     }
   }
+  await recordCodexCommit(adapters, health, cwd, opts.codexSandbox);
   // MODEL-02: detect models where the adapter exposes a list surface, BEFORE writing doctor.json (write once, below).
   // Fail OPEN — the inverse of gates' fail-closed: detection is advisory, so a broken list surface NEVER fails doctor.
   for (const a of adapters) {
@@ -728,7 +733,11 @@ export async function doctor(
       }
     }
   }
-  writeDoctor(cwd, health);
+  const discovery = await checkModelDiscovery({ cwd, cfg, adapters, health, catalog, resolved: resolvedIdentitySnapshot, mayRefresh: !opts.catalog && !catalogRefreshLine && catalogRefreshAllowed, fetcher: opts.catalogFetcher, now: opts.catalogNow });
+  catalog = discovery.catalog;
+  aliasDriftFindings.push(...discovery.findings);
+  const launchServices = await recordLaunchServices(readDoctor(cwd), health);
+  writeDoctor(cwd, launchServices.health);
   const rows = adapters.map((a) => {
     const h = health[a.id];
     // OBS-503: a crash-on-version verdict carries its reason in note — print it instead of the lie.
@@ -867,6 +876,7 @@ export async function doctor(
   lintRows.push(...flagDriftWarnings(adapters, health).map(attentionRow));
   // OBS-145: resolved-identity drift is advisory display warning.
   lintRows.push(...aliasDriftFindings.map(attentionRow));
+  if (launchServices.line) lintRows.push(attentionRow(launchServices.line));
   const resolvedCatalogModel = (adapter: string, model: string): string | undefined => {
     if (adapter !== "claude-code" || !(model in CLAUDE_ALIAS_IDENTITY_STAMPS)) return undefined;
     return resolvedIdentitySnapshot[model as ClaudeAlias];
@@ -951,9 +961,11 @@ export async function doctor(
       for (const advisory of shown) rows.push(`    ${dim(`catalog · ${advisory.display}`)}`);
       if (!listAllModels && bulk.length) {
         const uncovered = bulk.filter((adv) => adv.coverage === "uncovered").length;
-        const evidenceOnly = bulk.length - uncovered;
+        const unknown = bulk.filter((adv) => adv.coverage === "unknown").length;
+        const evidenceOnly = bulk.length - uncovered - unknown;
         const parts = [
           ...(uncovered ? [`${uncovered} uncovered by ${catalog.source === "cache" ? "cached catalogs" : "vendored catalog"}`] : []),
+          ...(unknown ? [`${unknown} coverage unknown after a failed refresh`] : []),
           ...(evidenceOnly ? [`${evidenceOnly} covered without a tier suggestion`] : []),
         ];
         rows.push(`    ${dim(`catalog · ${parts.join(" · ")} — tickmarkr doctor --models lists each`)}`);

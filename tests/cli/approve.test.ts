@@ -2,14 +2,14 @@ import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs
 import { userInfo } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
-import { type ApprovalDisposition, approve } from "../../src/cli/commands/approve.js";
+import { type ApprovalDisposition, approve, newestPark, parkToken, permittedDecisionVerbs, readJournalEvents } from "../../src/cli/commands/approve.js";
 import { status } from "../../src/cli/commands/status.js";
 import { graphDefinitionHash, loadGraph, taskDefinitionFingerprint, tickmarkrDir } from "../../src/graph/graph.js";
 import { outstandingApprovals, pendingDaemonApprovalActions, runDaemon } from "../../src/run/daemon.js";
 import { gitHead } from "../../src/run/git.js";
 import {
   activeRetryBan, APPROVAL_REFUSED, foldOwedChecks, owedCriteria, owedSubject, type OwedCheck, applyScopeAmendments, bindingToken, effectiveDecisions, foldDecisions, identicalGateFailures, journaledFailureBrief, Journal, normalizeGateFailure, PARK_KINDS,
-  pendingApprovalActions, pendingRechecks, recordedGraphDefinitionHash, repairReachSinceApproval, repairsSinceApproval, reviewRoundsSinceApproval,
+  parseBindingToken, pendingApprovalActions, pendingRechecks, recordedGraphDefinitionHash, repairReachSinceApproval, repairsSinceApproval, reviewRoundsSinceApproval,
   staleApprovals, type DecisionBinding,
 } from "../../src/run/journal.js";
 import { previewDecision } from "../../src/tui/cockpit/decision-actions.js";
@@ -727,5 +727,51 @@ describe("tickmarkr approve — park-bound decisions (OBS-1178, zero-token)", ()
     expect(open).toEqual([expect.objectContaining({ taskId: "T1", line: late, stale: expect.stringContaining("newest park is none") })]);
     expect(staleApprovals(j.read()).get("T1")?.lines).toEqual([late]);
     expect(j.replayStatuses().get("T1")).toBe("done");
+  });
+});
+
+describe("tickmarkr approve — reason-only scope refusal beside the command table (T13, zero-token)", () => {
+  test("test: production approve accepts a bound reason-only scope refusal while infrastructure approve/recheck and review gate-fail waive/uphold/recheck retain their existing command table and plain gate-fail approval still refuses", async () => {
+    const { repo } = setupRepo([T("T1", { files: ["src/a.ts"] })], { tasks: {} });
+    const hash = graphDefinitionHash(loadGraph(repo));
+    let n = 0;
+    const seed = (kind: "scope-request" | "infra" | "review") => {
+      const j = Journal.create(repo, `run-t13-table-${n++}`);
+      j.append("run-start", undefined, { graphDefinitionHash: hash });
+      j.append("task-dispatch", "T1", { attempt: 0 });
+      if (kind === "review") j.append("gate-result", "T1", { gate: "review", pass: false, details: "changes requested", commit: "c1" });
+      j.append("task-human", "T1", kind === "scope-request"
+        ? { kind, paths: ["src/b.ts"], graphDefinitionHash: hash }
+        : { kind: kind === "infra" ? "infra" : "gate-fail", reason: "parked" });
+      const { events, sourceIndexes } = readJournalEvents(j);
+      const park = newestPark(events, "T1", sourceIndexes)!;
+      return { j, park, token: parkToken(park)! };
+    };
+    const decide = async (kind: "scope-request" | "infra" | "review", flags: string[]) => {
+      const { j, park, token } = seed(kind);
+      const out = await approve([j.runId, "T1", "--park", token, "--by", "op", "--reason", "D-13 ruling", ...flags], repo);
+      const rows = j.read().filter((e) => e.event === "task-approved");
+      expect(rows).toHaveLength(1);
+      expect(rows[0]!.data).toMatchObject({ reason: "D-13 ruling", park: parseBindingToken(token) });
+      return { verbs: permittedDecisionVerbs(park), release: rows[0]!.data.release, gate: rows[0]!.data.gate, out };
+    };
+
+    // The reason-only scope refusal: a plain worker release, no amendment; the menu still offers no verb.
+    const scope = await decide("scope-request", []);
+    expect(scope).toMatchObject({ verbs: [], release: undefined });
+    expect(scope.out).toContain("approval disposition dispatch");
+    // Infrastructure: approve or recheck, exactly as before.
+    expect(await decide("infra", [])).toMatchObject({ verbs: ["approve", "recheck"], release: undefined });
+    expect(await decide("infra", ["--recheck"])).toMatchObject({ verbs: ["approve", "recheck"], release: "recheck" });
+    // Review gate-fail: waive, uphold or recheck, exactly as before.
+    expect(await decide("review", ["--waive"])).toMatchObject({ verbs: ["waive", "uphold", "recheck"], release: "gate-satisfied", gate: "review" });
+    expect(await decide("review", ["--uphold"])).toMatchObject({ verbs: ["waive", "uphold", "recheck"], release: "review-upheld", gate: "review" });
+    expect(await decide("review", ["--recheck"])).toMatchObject({ verbs: ["waive", "uphold", "recheck"], release: "recheck" });
+
+    // Plain approve on a review gate-fail park still refuses — a reason buys no gate a disposition.
+    const { j, token } = seed("review");
+    await expect(approve([j.runId, "T1", "--park", token, "--reason", "D-13 ruling"], repo))
+      .rejects.toThrow(/parked on failed gate review; plain approve has disposition only for non-gate parks — pass --waive .* or --recheck .* or --uphold/);
+    expect(j.read().filter((e) => e.event === "task-approved")).toEqual([]);
   });
 });

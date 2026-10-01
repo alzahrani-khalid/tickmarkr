@@ -1,11 +1,12 @@
+import { createHash } from "node:crypto";
 import { closeSync, fstatSync, openSync, readSync, statSync, type BigIntStats } from "node:fs";
 import { join } from "node:path";
 import { graphPath, stateDirName } from "../../graph/graph.js";
 import { validateGraph, type RunGraph } from "../../graph/schema.js";
-import { parseRunId, type JournalEvent } from "../../run/journal.js";
+import { foldOwedChecks, parseJournalText, parseRunId, type JournalEvent, type OwedFold, type OwedProofMemo } from "../../run/journal.js";
 import { isPidLive, STALE_MS } from "../../run/lock.js";
 import { readTierLiveness, SUPERVISION_TIERS } from "../../run/supervision.js";
-import { OperatorStateFold, type OperatorRecord } from "../../run/operator-state.js";
+import { OperatorStateFold, type OperatorRecord, type OwedAuthority } from "../../run/operator-state.js";
 
 export const OBSERVATION_INTERVAL_MS = 1_000;
 /** Stat-to-fstat observations one poll spends on a journal a writer keeps appending to. */
@@ -15,7 +16,8 @@ export const STORE_LIMITS = { graphBytes: 16 * 1024 * 1024, history: 256, histor
 export interface SourceError { source: string; error: string; line?: number; id?: string }
 export interface JournalLine extends Omit<OperatorRecord, "event"> { event?: JournalEvent; raw: string; error?: string; offset: number; endOffset: number }
 export interface TailSnapshot {
-  source: string; generation: number; identity?: string; offset: number; lines: number;
+  /** `digest` (I2): sha256 of every byte the tail consumed, [0, offset) — the bytes its fold was built from. */
+  source: string; generation: number; identity?: string; version?: string; digest: string; offset: number; lines: number;
   history: readonly JournalLine[]; errors: readonly SourceError[]; malformedCount: number;
   pending: { line: number; bytes: number } | undefined; backlogBytes: number;
   status: "readable" | "pending" | "corrupt" | "unreadable"; error?: SourceError;
@@ -24,6 +26,12 @@ export interface TailSnapshot {
 const errorText = (e: unknown): string => e instanceof Error ? e.message : String(e);
 const fileIdentity = (st: BigIntStats): string => `${st.dev}:${st.ino}`;
 const stamp = (st: BigIntStats): string => `${fileIdentity(st)}:${st.size}:${st.mtimeNs}:${st.ctimeNs}`;
+/** The one record shape the tail accepts; the complete-journal (owed) read validates against it too. */
+const isJournalRecord = (e: unknown): e is JournalEvent => {
+  const r = e as { ts?: unknown; event?: unknown; data?: unknown; taskId?: unknown } | null;
+  return !!r && typeof r === "object" && typeof r.ts === "string" && Number.isFinite(Date.parse(r.ts)) && typeof r.event === "string"
+    && !!r.data && typeof r.data === "object" && !Array.isArray(r.data) && (r.taskId === undefined || typeof r.taskId === "string");
+};
 function decodeLine(bytes: Buffer, source: string, line: number, offset: number, endOffset: number, generation: number, oversized = false): JournalLine {
   const base = { source, line, id: `${source}#L${line}`, offset, endOffset, generation };
   let raw = "";
@@ -31,9 +39,9 @@ function decodeLine(bytes: Buffer, source: string, line: number, offset: number,
     if (oversized) throw new Error(`record exceeds ${STORE_LIMITS.recordBytes} bytes; page raw evidence from disk`);
     raw = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
     if (!raw.trim()) return { ...base, raw };
-    const e = JSON.parse(raw);
-    if (!e || typeof e !== "object" || typeof e.ts !== "string" || !Number.isFinite(Date.parse(e.ts)) || typeof e.event !== "string" || !e.data || typeof e.data !== "object" || Array.isArray(e.data) || (e.taskId !== undefined && typeof e.taskId !== "string")) throw new Error("invalid journal record");
-    return { ...base, raw, event: e as JournalEvent };
+    const e: unknown = JSON.parse(raw);
+    if (!isJournalRecord(e)) throw new Error("invalid journal record");
+    return { ...base, raw, event: e };
   } catch (e) { return { ...base, raw: raw || bytes.toString("utf8"), error: errorText(e) }; }
 }
 
@@ -54,12 +62,19 @@ export class JournalTail {
   private lastSuccessfulReadAt?: number;
   private failure?: SourceError;
   private stale = false;
+  private hash = createHash("sha256");
+  private invalid = false;
   constructor(readonly source: string, private readonly hooks: { record?: (record: OperatorRecord) => void; reset?: () => void } = {}) {}
   private reset(): void {
     this.offset = 0; this.line = 0; this.carry = Buffer.alloc(0); this.carryBytes = 0; this.lineOffset = 0;
     this.history = []; this.historyBytes = 0; this.errors = []; this.malformedCount = 0; this.generation++;
+    this.hash = createHash("sha256"); this.invalid = false;
     this.hooks.reset?.();
   }
+  /** I2: the consumed prefix was found rewritten (an in-place rewrite then growth reads as an append), so the
+   * next poll treats the file as replaced and refolds it from its first byte. */
+  invalidate(): void { this.invalid = true; }
+  get invalidated(): boolean { return this.invalid; }
   /** A same-inode append between stat and fstat is retried; exhaustion keeps the last good snapshot, pending. */
   poll(now = Date.now()): TailSnapshot {
     try {
@@ -76,7 +91,7 @@ export class JournalTail {
     try {
       const st = statSync(this.source, { bigint: true });
       if (!st.isFile()) throw new Error("journal source is not a regular file");
-      const replaced = !this.st || fileIdentity(st) !== fileIdentity(this.st) || st.size < this.st.size || (st.size === this.st.size && stamp(st) !== stamp(this.st));
+      const replaced = this.invalid || !this.st || fileIdentity(st) !== fileIdentity(this.st) || st.size < this.st.size || (st.size === this.st.size && stamp(st) !== stamp(this.st));
       if (Number(st.size) > (replaced ? 0 : this.offset)) {
         fd = openSync(this.source, "r");
         const opened = fstatSync(fd, { bigint: true });
@@ -93,6 +108,7 @@ export class JournalTail {
           const count = readSync(fd, buffer, 0, Math.min(buffer.length, Number(st.size) - this.offset, remaining), this.offset);
           if (!count) throw new Error("journal truncated during read");
           this.bytesRead += count; remaining -= count;
+          this.hash.update(buffer.subarray(0, count));
           let begin = 0;
           for (let index = 0; index < count; index++) if (buffer[index] === 10) {
             this.appendCarry(buffer.subarray(begin, index));
@@ -123,7 +139,7 @@ export class JournalTail {
   }
   snapshot(): TailSnapshot {
     return {
-      source: this.source, generation: this.generation, identity: this.st && fileIdentity(this.st), offset: this.offset, lines: this.line,
+      source: this.source, generation: this.generation, identity: this.st && fileIdentity(this.st), version: this.st && stamp(this.st), digest: this.hash.copy().digest("hex"), offset: this.offset, lines: this.line,
       history: this.history.slice(), errors: this.errors.slice(), malformedCount: this.malformedCount,
       pending: this.carryBytes ? { line: this.line + 1, bytes: this.carryBytes } : undefined,
       backlogBytes: Math.max(0, Number(this.st?.size ?? 0) - this.offset),
@@ -197,6 +213,39 @@ class JsonSource<T> {
     }
   }
 }
+/** I2: the journal basis an owed-check fold read — the observed file version, its generation and the bytes consumed. */
+export const journalBasis = (journal: TailSnapshot): string => `${journal.source}:${journal.generation}:${journal.version}:${journal.offset}`;
+const unknownOwed = (reason: string): OwedFold => ({ known: false, debt: "unknown", outstanding: [], acceptedRisk: [], discharged: [], unknown: [{ reason }] });
+/** I2: the bytes the tail consumed are no longer the file's prefix — rewritten in place, then grown. */
+export class JournalRewritten extends Error { constructor() { super("journal prefix rewritten since the tail consumed it"); } }
+/** I2 (D-857): the ONE way any reader beside the tail gets `journal`'s bytes — every consumed byte of the very
+ * file version the tail observed (an in-place rewrite, even an equal-length one, changes it), stamped before
+ * and after the read, and proved by digest to be the very bytes the tail's fold consumed (a rewrite followed by
+ * growth keeps the tail appending). Any change throws, so no second read is ever combined with this
+ * observation's lifecycle, owed or basis. */
+export function readObservedJournal(journal: TailSnapshot): Buffer {
+  const fd = openSync(journal.source, "r");
+  try {
+    const observed = () => { if (stamp(fstatSync(fd, { bigint: true })) !== journal.version) throw new Error("journal changed since its observation"); };
+    observed();
+    const bytes = Buffer.alloc(journal.offset);
+    for (let length = 0; length < bytes.length;) {
+      const n = readSync(fd, bytes, length, bytes.length - length, length);
+      if (!n) throw new Error("journal truncated since its observation");
+      length += n;
+    }
+    observed();
+    if (createHash("sha256").update(bytes).digest("hex") !== journal.digest) throw new JournalRewritten();
+    return bytes;
+  } finally { closeSync(fd); }
+}
+/** The complete journal behind `journal`'s basis: its observed bytes, every non-blank line a valid record. */
+function readLedger(journal: TailSnapshot): JournalEvent[] {
+  const text = new TextDecoder("utf-8", { fatal: true }).decode(readObservedJournal(journal));
+  const events = parseJournalText(text);
+  if (events.length !== text.split("\n").filter(line => line.trim()).length || !events.every(isJournalRecord)) throw new Error("complete journal holds an invalid line");
+  return events;
+}
 export interface LiveStoreOptions {
   cwd: string; runId: string; now?: () => number; configPath?: string; cachePath?: string;
   isDaemonAlive?: (pid: number) => boolean;
@@ -224,10 +273,34 @@ export function createLiveStore(options: LiveStoreOptions) {
   let disposed = false;
   let queued: Promise<void> | undefined;
   const metrics: { observedAt: number; bytesRead: number }[] = [];
+  // I2: the complete journal is re-read only when its basis moves; its owed fold re-reads every discharge
+  // artifact on every observation, and only the immutable git re-proof is reused through this store's memo.
+  // ponytail: an ended run's whole parsed journal stays resident; fold a debt-only projection if that measures large.
+  const owedMemo: OwedProofMemo = new Set();
+  let ledger: { basis: string; events: JournalEvent[] } | undefined;
+  const owedAuthority = (journal: TailSnapshot): OwedAuthority => {
+    const basis = journalBasis(journal);
+    if (ledger?.basis !== basis) {
+      // Never cache a failure: only a successful read is reused; a failed one is unknown debt now and re-read next observation.
+      try { ledger = { basis, events: readLedger(journal) }; } catch (e) {
+        ledger = undefined;
+        if (e instanceof JournalRewritten) tail.invalidate();
+        return { basis, fold: unknownOwed(`complete journal unreadable: ${errorText(e)}`) };
+      }
+    }
+    return { basis, fold: foldOwedChecks(ledger.events, options.cwd, owedMemo) };
+  };
   function observe() {
     const observedAt = now();
     const delayed = lastObservation !== undefined && observedAt - lastObservation > 2 * OBSERVATION_INTERVAL_MS;
-    const journal = tail.poll(observedAt);
+    const isReadable = (j: TailSnapshot) => j.status === "readable" && j.backlogBytes === 0;
+    // Debt decides only an ended run's headline; a running or unreadable journal never pays for the fold.
+    const owedOf = (j: TailSnapshot) => isReadable(j) && fold.ended ? owedAuthority(j) : undefined;
+    let journal = tail.poll(observedAt);
+    let owed = owedOf(journal);
+    // I2: the owed read found the tail's consumed prefix rewritten, so its fold (lifecycle) is stale. Refold the
+    // whole file now: lifecycle and debt then come from the same bytes. A repeat rewrite is unknown debt.
+    if (tail.invalidated) { journal = tail.poll(observedAt); owed = owedOf(journal); }
     const graphReading = graph.read(observedAt);
     const configReading = config.read(observedAt);
     const cacheReading = cache.read(observedAt);
@@ -239,11 +312,13 @@ export function createLiveStore(options: LiveStoreOptions) {
     metrics.push({ observedAt, bytesRead: journal.bytesRead });
     if (metrics.length > STORE_LIMITS.metrics) metrics.shift();
     lastObservation = observedAt;
-    const readable = journal.status === "readable" && journal.backlogBytes === 0;
+    const readable = isReadable(journal);
     return {
       sequence: ++sequence, observedAt, delayed, freshness: errors.length ? "failed" : delayed ? "delayed" : "fresh",
-      operator: fold.snapshot({ graph: graphReading.status === "readable" ? graphReading.value : undefined, sequence, observedAt, readable, graphAvailability: { status: graphReading.status, error: graphReading.error } }),
-      journal, graph: graphReading, config: configReading, cache: cacheReading,
+      // I1: only this run's own lock naming a provably-dead (ESRCH) holder settles unfinished cells; an alive,
+      // EPERM, foreign, unreadable or absent lock is not proof the work stopped.
+      operator: fold.snapshot({ graph: graphReading.status === "readable" ? graphReading.value : undefined, sequence, observedAt, readable, graphAvailability: { status: graphReading.status, error: graphReading.error }, daemonDead: lockState === "dead", owed, basis: journalBasis(journal) }),
+      owed, journal, graph: graphReading, config: configReading, cache: cacheReading,
       lock: { ...owner, state: lockState, alive, expired: owner.identity ? observedAt - Number(owner.identity.split(":")[3]) / 1e6 > STALE_MS : undefined },
       supervision, errors, actionsEnabled: readable && !errors.length && !delayed,
       viewport, inputSequence, metrics: metrics.slice(),

@@ -12,7 +12,7 @@ Use the canonical loop skill's [cockpit, parked decisions and printed twins](../
 for each target: delivered views are **1 Home, 4 Run, 5 Evidence**; Fleet/Bootstrap and
 Plan/Health remain follow-ons with CLI entries. The recorded 1/3 merged, human T2, blocked
 T3 case stays PARTIAL despite tip pass. Review the Run confirmation, read back the appended
-`task-approved` receipt, and explicitly `tickmarkr resume <runId>` when no live owner exists;
+`task-approved` receipt, and explicitly launch `tickmarkr resume <runId>` with the host-owned split form below when no live owner exists;
 approval records permission and never dispatches work itself. Non-TTY readers keep `status`,
 `report` and default-watch line output, with `--watch --plain` as the TTY fallback.
 Keep `name: tickmarkr-auto` and the installed links to canonical `skills/` intact.
@@ -92,7 +92,37 @@ After sending, **confirm delivery** by reading the target pane and verifying the
 1. **Prepare** — confirm the target list. Run the [binary preflight](#binary-preflight-before-compile-or-run). Check `git status`, confirm no tickmarkr run is active, and work from a non-main branch.
 2. **Compile** — run `tickmarkr compile <spec-or-directory>`. Fix source-spec defects instead of editing the generated graph.
 3. **Plan** — run `tickmarkr plan`. Review routes, capability-floor warnings, and human gates before execution.
-4. **Run** — run `tickmarkr run`. A watch ending the seat's turn is no watch: keep a **blocking journal consumer** alive for the run's terminal events — the shipped watcher below, or a foreground `until grep` on the run's terminal events — and ensure it is re-armed at most every twenty minutes. Never rely on a `Monitor`-only wake. Watch the run journal rather than polling agents, using the shipped watcher — `.claude/skills/tickmarkr-overseer/scripts/watch-journal.sh <state-dir>/runs 20 28800` — which takes a line baseline at arm time, then wakes ONCE on `run-end`, `task-human`, `task-failed` or `consult-verdict` and grades the run-end summary against every execution clause for you; the debt clause is yours — read CURRENT `tickmarkr status <runId>` (step 5). Re-arm after every wake. ⛔ Never `tail -F | grep -m1` (run-end is the journal's last line, so tail never notices the broken pipe and the watcher hangs forever) and never a pane-level done wait (it fires on every agent turn end, not mission end). ⚠ A bare whole-file `grep -q '"event":"run-end"'` is the trap the watcher exists to avoid: on a resume it matches the PREVIOUS run's run-end and returns instantly, so a re-armed watcher reads as coverage that does not exist. Resolve blocked interactions in the relevant agent session.
+4. **Run** — launch `tickmarkr run` using the [host-owned split form](#host-owned-daemon-and-detached-beats), and start detached beats with their run-end stop items. A watch ending the seat's turn is no watch: keep a **blocking journal consumer** alive for the run's terminal events — the shipped watcher below, or a foreground `until grep` on the run's terminal events — and ensure it is re-armed at most every twenty minutes. Never rely on a `Monitor`-only wake. Watch the run journal rather than polling agents, using the shipped watcher — `.claude/skills/tickmarkr-overseer/scripts/watch-journal.sh <state-dir>/runs 20 28800` — which takes a line baseline at arm time, then wakes ONCE on `run-end`, `task-human`, `task-failed` or `consult-verdict` and grades the run-end summary against every execution clause for you; the debt clause is yours — read CURRENT `tickmarkr status <runId>` (step 5). Re-arm after every wake. ⛔ Never `tail -F | grep -m1` (run-end is the journal's last line, so tail never notices the broken pipe and the watcher hangs forever) and never a pane-level done wait (it fires on every agent turn end, not mission end). ⚠ A bare whole-file `grep -q '"event":"run-end"'` is the trap the watcher exists to avoid: on a resume it matches the PREVIOUS run's run-end and returns instantly, so a re-armed watcher reads as coverage that does not exist. Resolve blocked interactions in the relevant agent session.
 5. **Verify and consolidate** — continue only after a green run. A run is green when the run-end event exists in the journal, the tip verify is not "failed", the summary's `failed`, `human`, `blocked` and `pending` buckets are all empty, and CURRENT `tickmarkr status <runId>` reads its owed checks outstanding empty AND known (`outstanding 0`) — a run with a parked task is partial, not green. Empty execution buckets alone are not green either (D-660): every bucket empty and the tip passed, but an operator waived one review, leaves one accepted-risk review check owed — status reads `outstanding 1 (T7 review)` and `run`/`resume` still exit 0 on execution alone, so the run is execution complete, not green. It turns green only when a `tickmarkr verify --record <runId>` discharge moves CURRENT status to `outstanding 0`, including a discharge landing after run-end — the historical run-end record keeps the old count, so never read debt from it; `outstanding unknown` is never green. Tickmarkr consolidates accepted work on `tickmarkr/<runId>` and never signs off to the main branch. A human controls any later release merge.
 6. **Record** — `tickmarkr report <runId> --md` prints Markdown to stdout; redirect explicitly beside the spec (for example `tickmarkr report <runId> --md > feature.record.md`) and commit the execution record when the repository tracks those records.
 7. **Continue** — move to the next requested target. If a target fails or is parked, stop with the journal evidence rather than silently skipping it.
+
+## Host-owned daemon and detached beats
+
+Launch the daemon as a SPLIT of the orchestrator's own pane in the ORCH tab, owned by the
+host PTY. Never launch it as an agent harness background task or in a separate tab. The daemon
+self-places its board from that split, keeping both daemon and board in the ORCH tab.
+
+- **On Orca (`TERM_PROGRAM=Orca` and non-empty `ORCA_TERMINAL_HANDLE`)**:
+  `orca terminal split --terminal "$ORCA_TERMINAL_HANDLE" --direction vertical --command "tickmarkr run"`.
+- **On herdr (`HERDR_ENV=1`)**: use `herdr pane split` on the orchestrator's own pane, then
+  `herdr pane run <new> "tickmarkr run"` in the returned split.
+
+For `resume`, use the same host-owned split form with `tickmarkr resume <runId>` in place of
+`tickmarkr run`. After either launch, read this repository's lock pid and walk its ppid chain
+in the process table to the host PTY; verify no agent session is an ancestor. If an agent is
+an ancestor, stop that launch and relaunch through the host split before continuing.
+
+Start `tickmarkr beat <tier> --seat <seat> --loop` as a DETACHED background process, one per
+(tier, seat), from the repository root. Use setsid plus nohup (or the host's equivalent detached
+session facility), redirect output to a file, and record a pidfile under the repository's state
+dir. Verify ppid 1 and no agent-session ancestor. Never put beats in a harness background task
+or a visible tab. The lifecycle must be idempotent: start checks the pidfile against the live
+process payload and returns an "already running" no-op for the same (repo, tier, seat); status
+checks that payload and beat freshness; stop sends `--stand-down` for the same tier and seat,
+verifies the loop exits within one interval, then removes its pidfile. A stale or reused pid
+must never be killed without matching its live payload. Include a run-end stop item for every
+beat started, also on failure, park or handoff; verify DISARMED and remove retired beat files.
+
+Keep only watchers that must WAKE the seat in the harness. Re-arm them on each wake and at
+their harness cap; daemon and beat lifetimes must not depend on that cap.

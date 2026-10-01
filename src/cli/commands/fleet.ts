@@ -53,6 +53,7 @@ import type {
   FleetModelEvidence,
   FleetOverlayReview,
   FleetStagedDeny,
+  FleetStagedMetadata,
   FleetSteeringKey,
 } from "../../tui/ink/fleet-app.js";
 
@@ -302,6 +303,8 @@ export async function assembleFleetEditor(
     props: FleetEditorProps;
     commit: (result: FleetEditorResult) => string;
     renderWhy: () => string;
+    previewConfig: (mode: RoutingMode, map: Record<string, MapEntry>, deny: FleetStagedDeny, stage?: FleetStagedMetadata) =>
+      { ok: true; cfg: TickmarkrConfig; mode: ModeResolution } | { ok: false; error: string };
   }
   | { unavailable: string }
 > {
@@ -468,20 +471,34 @@ export async function assembleFleetEditor(
   type StagedDeny = FleetStagedDeny;
   const stagedDenyOf = (editable: FleetEditable): StagedDeny =>
     Object.fromEntries(DENY_SCOPES.map((scope) => [stagedDenyKeyOf(scope), editable[scope.key] ?? []])) as StagedDeny;
-  // B2: the classifications and efforts of the last reviewed state — the preview callbacks carry mode,
-  // map and deny only (fleet-app's contract), so every preview after a review ranks the same fully
-  // staged candidate that review rendered, never the assembly-time tiers.
-  // ponytail: one staged after the last review reaches previews at the next w; thread classifications
-  // and efforts through fleet-app's preview callbacks if that lag ever matters.
+  // T8: staged classifications and efforts as the editable tiers/efforts a review writes — one fold for
+  // the review and every preview, so the mode/shape/picker callbacks rank exactly what w would write.
+  const stagedMetadataOf = (stage: FleetStagedMetadata): Pick<FleetEditable, "tiers" | "efforts"> => {
+    const tiers = structuredClone(initial.tiers);
+    const today = new Date().toISOString().slice(0, 10);
+    for (const classification of stage.classifications) {
+      tiers[classification.adapter] ??= {};
+      tiers[classification.adapter][classification.model] = {
+        tier: classification.tier,
+        provenance: `${classification.note} — fleet ${today}`,
+      };
+    }
+    // OBS-1182: staged efforts replace the loaded ones; none staged anywhere ⇒ no key, as loaded
+    const efforts = Object.fromEntries(Object.entries(stage.efforts ?? {}).filter(([, models]) => Object.keys(models).length));
+    return { tiers, ...(Object.keys(efforts).length ? { efforts } : {}) };
+  };
+  // B2: the classifications and efforts of the last reviewed state — what a preview called without a
+  // stage (the browser's staged routing, --why) ranks; the editor passes its current stage (T8).
   let reviewedStage: Pick<FleetEditable, "tiers" | "efforts"> = { tiers: initial.tiers, efforts: initial.efforts };
   // OBS-1182: the layers under the written overlay — B2: the defaults alone under the USER overlay —
   // read raw, so clearing an effort masks an inherited one. OBS-1188: re-read at every review and
   // save, never an assembly-time snapshot; an unreadable read keeps the last good one for the
   // preview only — the save guard below refuses it.
   let lowerOverrides: LowerLayerModelOverrides = {};
-  const stagedEditable = (map: Record<string, MapEntry>, deny: StagedDeny): FleetEditable => ({
+  const stagedEditable = (map: Record<string, MapEntry>, deny: StagedDeny, metadata: Pick<FleetEditable, "tiers" | "efforts">): FleetEditable => ({
     ...structuredClone(initial),
-    ...structuredClone(reviewedStage),
+    efforts: undefined, // metadata carries efforts only when some are staged — as a review writes them
+    ...structuredClone(metadata),
     ...Object.fromEntries(DENY_SCOPES.map((scope) => [scope.key, deny[stagedDenyKeyOf(scope)]])),
     // OBS-1046: the allow complement is staged beside the deny lists, never folded into them
     allowOut: deny.allowOut ?? initial.allowOut,
@@ -527,13 +544,16 @@ export async function assembleFleetEditor(
   };
   // B2: a changed slot staged with no declaration (auto, no prefer) where the defaults under the user
   // overlay declare one: deleting the user's pin/pool would restore that default, so the slot is
-  // masked with prefer: [] — a declaration that replaces the lower slot atomically and ranks nothing
+  // masked with prefer: [] — a declaration that replaces the lower slot atomically and ranks nothing.
+  // T8: a default PIN is masked by the writer's raw pin: null tombstone instead (lowerMap below), so
+  // Auto saves no prefer declaration the operator never made.
   const maskClearedSlots = (base: FleetEditable, staged: FleetEditable): FleetEditable => {
     const map = { ...staged.map };
     for (const shape of new Set([...Object.keys(base.map), ...Object.keys(staged.map)])) {
       const entry = staged.map[shape];
+      const lower = mapSlot(DEFAULT_CONFIG.routing.map[shape]);
       if (JSON.stringify(base.map[shape]) === JSON.stringify(entry)) continue;
-      if (Object.keys(mapSlot(entry)).length || !Object.keys(mapSlot(DEFAULT_CONFIG.routing.map[shape])).length) continue;
+      if (Object.keys(mapSlot(entry)).length || !Object.keys(lower).length || lower.pin) continue;
       map[shape] = { ...entry, prefer: [] };
     }
     return { ...staged, map };
@@ -554,6 +574,7 @@ export async function assembleFleetEditor(
       try {
         const bytes = renderFleetOverlayWrite(userText, {
           ...rest, initial: destinationInitial(initial, unchanged, userText, universe), edited: unchanged, universe,
+          lowerMap: DEFAULT_CONFIG.routing.map,
         });
         const candidate = loadConfigWithMode(cwd, { globalDir, userOverlayText: bytes }).cfg;
         target = universeOf(candidateChannels(candidate));
@@ -565,7 +586,8 @@ export async function assembleFleetEditor(
         // the full render below (or the reload guard) names the refusal
       }
     }
-    return { ...rest, initial: destinationInitial(initial, edited, userText, target), edited, universe: target };
+    // T8: the user overlay's lower layer is the defaults alone (B2) — a pin cleared over one is tombstoned
+    return { ...rest, initial: destinationInitial(initial, edited, userText, target), edited, universe: target, lowerMap: DEFAULT_CONFIG.routing.map };
   };
   // LEG2-T3 finding 2: a preview is the config loader over the candidate bytes the writer would
   // produce — never a second in-memory merge of the staged sets over the resolved config, which
@@ -575,16 +597,18 @@ export async function assembleFleetEditor(
   // ponytail: bounded memo, previews re-render per key press; a tiny LRU if it ever churns.
   type CandidatePreview = { ok: true; cfg: TickmarkrConfig; mode: ModeResolution } | { ok: false; error: string };
   const candidateMemo = new Map<string, CandidatePreview>();
-  const previewCfg = (mode: RoutingMode, map: Record<string, MapEntry>, deny: StagedDeny): CandidatePreview => {
+  const previewCfg = (mode: RoutingMode, map: Record<string, MapEntry>, deny: StagedDeny, stage?: FleetStagedMetadata): CandidatePreview => {
     // B2: the user and repo overlay bytes are part of the key — a layer edited mid-session (a repo
-    // deny added before a review) re-renders the preview instead of serving the pre-edit one
+    // deny added before a review) re-renders the preview instead of serving the pre-edit one.
+    // T8: so are the staged tiers/efforts — a metadata edit never serves the preview cached before it
+    const metadata = stage ? stagedMetadataOf(stage) : reviewedStage;
     const userText = currentUserText();
-    const key = JSON.stringify([mode, map, deny, userText, currentRepoOverlayText(cwd)]);
+    const key = JSON.stringify([mode, map, deny, metadata, userText, currentRepoOverlayText(cwd)]);
     const hit = candidateMemo.get(key);
     if (hit) return hit;
     let preview: CandidatePreview;
     try {
-      const bytes = renderFleetOverlayWrite(userText, userLayerWrite(stagedEditable(map, deny), userText, {
+      const bytes = renderFleetOverlayWrite(userText, userLayerWrite(stagedEditable(map, deny, metadata), userText, {
         lowerOverrides,
         ...(mode !== rm.mode.mode ? { mode } : {}),
       }));
@@ -618,12 +642,12 @@ export async function assembleFleetEditor(
   // preview call rebuilds the pool the staged deny would discover
   const previewPool = (cfgPreview: TickmarkrConfig) =>
     candidateChannels(cfgPreview).filter((c) => disallowedBy(c, cfgPreview.routing) === null);
-  const modeSpend = (mode: RoutingMode, map: Record<string, MapEntry>, deny: StagedDeny): string => {
+  const modeSpend = (mode: RoutingMode, map: Record<string, MapEntry>, deny: StagedDeny, stage?: FleetStagedMetadata): string => {
     const tierCount: Partial<Record<Tier, number>> = {};
     let subs = 0;
     let apiN = 0;
     let apiUsd = 0;
-    const preview = previewCfg(mode, map, deny);
+    const preview = previewCfg(mode, map, deny, stage);
     if (!preview.ok) return `  mix: ${previewUnavailable(preview.error)}`;
     const cfgPreview = preview.cfg;
     const pool = previewPool(cfgPreview);
@@ -659,9 +683,9 @@ export async function assembleFleetEditor(
   };
   // B2: the floors the candidate user-layer bytes resolve to — the same config the routed mix ranks
   // against, so a repo-declared mode that shadows the user's pick previews no floor change
-  const floorPreview = (mode: RoutingMode, map: Record<string, MapEntry>, deny: StagedDeny): string[] => {
+  const floorPreview = (mode: RoutingMode, map: Record<string, MapEntry>, deny: StagedDeny, stage?: FleetStagedMetadata): string[] => {
     if (mode === rm.mode.mode) return [];
-    const preview = previewCfg(mode, map, deny);
+    const preview = previewCfg(mode, map, deny, stage);
     if (!preview.ok) return []; // modeSpend names the refusal
     const current = cfg.routing.floors;
     const next = preview.cfg.routing.floors;
@@ -698,8 +722,8 @@ export async function assembleFleetEditor(
       ? { declaredAt: `routing.floors.${shape}` }
       : { declaredAt: "routing.mode" };
   };
-  const projectedShapeRows = (mode: RoutingMode, map: Record<string, MapEntry>, deny: StagedDeny) => {
-    const preview = previewCfg(mode, map, deny);
+  const projectedShapeRows = (mode: RoutingMode, map: Record<string, MapEntry>, deny: StagedDeny, stage?: FleetStagedMetadata) => {
+    const preview = previewCfg(mode, map, deny, stage);
     if (!preview.ok) {
       return projectFleetWhy(SHAPES.map((shape) => ({
         id: shape,
@@ -732,7 +756,9 @@ export async function assembleFleetEditor(
         // a pin. The declaration is the operator's decision; the winner is today's dice.
         const declaredPool = entry?.pool;
         const poolPrefix = declaredPool ? `pool(${declaredPool.mode}·${declaredPool.channels.length}) → ` : "";
-        const effective = `${poolPrefix}${assignment.adapter}:${assignment.model} (${assignment.channel}, ${assignment.tier})  ${costSignal(assignment, cfgPreview.pricing)}${shadowNote}`;
+        // T8: the launch effort the routed channel carries — a staged effort shows here before w
+        const effort = assignment.effort ? `, effort ${assignment.effort}` : "";
+        const effective = `${poolPrefix}${assignment.adapter}:${assignment.model} (${assignment.channel}, ${assignment.tier}${effort})  ${costSignal(assignment, cfgPreview.pricing)}${shadowNote}`;
         const mapProducedValue = entry?.pin !== undefined || entry?.pool !== undefined
           || routed.provenance.includes("via prefer");
         return {
@@ -753,8 +779,8 @@ export async function assembleFleetEditor(
     });
     return projectFleetWhy(values, { repoRoot: cwd, globalDir });
   };
-  const routedShapeRows = (mode: RoutingMode, map: Record<string, MapEntry>, deny: StagedDeny) =>
-    projectedShapeRows(mode, map, deny).map(({ id, label }) => ({ id, label }));
+  const routedShapeRows = (mode: RoutingMode, map: Record<string, MapEntry>, deny: StagedDeny, stage?: FleetStagedMetadata) =>
+    projectedShapeRows(mode, map, deny, stage).map(({ id, label }) => ({ id, label }));
   // OBS-530: the picker silently omitted every excluded channel — the operator asked "why is X
   // missing" three times in one session and the answer lived only in config archaeology. One dim
   // line now names each bucket. Static buckets (unauthed, unclassified) computed once; the
@@ -923,8 +949,8 @@ export async function assembleFleetEditor(
     const order = (key: string) => (carried.includes(key) ? carried.indexOf(key) : carried.length);
     return [...lines, ...unnamed].sort((a, b) => order(a.key) - order(b.key)).map((row) => row.line);
   };
-  const candidatesForShape = (shape: Shape, mode: RoutingMode, map: Record<string, MapEntry>, deny: StagedDeny) => {
-    const preview = previewCfg(mode, map, deny);
+  const candidatesForShape = (shape: Shape, mode: RoutingMode, map: Record<string, MapEntry>, deny: StagedDeny, stage?: FleetStagedMetadata) => {
+    const preview = previewCfg(mode, map, deny, stage);
     if (!preview.ok) return { rows: [], excludedNote: previewUnavailable(preview.error) };
     const cfgPreview = preview.cfg;
     const rows = shapeCandidates(previewTask(shape), cfgPreview, previewPool(cfgPreview), profile).map((candidate) => ({
@@ -1003,19 +1029,11 @@ export async function assembleFleetEditor(
     for (const scope of DENY_SCOPES) staged[scope.key] = state[scope.key];
     staged.allowOut = state.allowOut ?? initial.allowOut;
     staged.map = state.map;
-    // OBS-1182: staged efforts replace the loaded ones; none staged anywhere ⇒ no key, as loaded
-    const efforts = Object.fromEntries(Object.entries(state.efforts ?? {}).filter(([, models]) => Object.keys(models).length));
-    if (Object.keys(efforts).length) staged.efforts = efforts;
+    const metadata = stagedMetadataOf(state);
+    staged.tiers = metadata.tiers;
+    if (metadata.efforts) staged.efforts = metadata.efforts;
     else delete staged.efforts;
-    const today = new Date().toISOString().slice(0, 10);
-    for (const classification of state.classifications) {
-      staged.tiers[classification.adapter] ??= {};
-      staged.tiers[classification.adapter][classification.model] = {
-        tier: classification.tier,
-        provenance: `${classification.note} — fleet ${today}`,
-      };
-    }
-    reviewedStage = { tiers: staged.tiers, efforts: staged.efforts };
+    reviewedStage = metadata;
 
     // This callback is the sole candidate-overlay builder. The Ink component renders
     // the diff and asks for confirmation, but owns neither filesystem access nor a writer.
@@ -1091,7 +1109,7 @@ export async function assembleFleetEditor(
     initialMode: rm.mode.mode,
     modeOptions: ROUTING_MODES.map((mode) => ({ id: mode, gloss: MODE_GLOSS[mode] })),
     initialMap: editable.map,
-    modePreview: (mode, map, deny) => [modeSpend(mode, map, deny), ...floorPreview(mode, map, deny)],
+    modePreview: (mode, map, deny, stage) => [modeSpend(mode, map, deny, stage), ...floorPreview(mode, map, deny, stage)],
     shapeRows: routedShapeRows,
     candidatesForShape,
     preferOptionsForShape: (_shape, current) => [
@@ -1162,5 +1180,7 @@ export async function assembleFleetEditor(
     props,
     commit,
     renderWhy: () => renderFleetWhy(projectedShapeRows(rm.mode.mode, editable.map, stagedDenyOf(editable))),
+    // T8: the memoized candidate every preview callback ranks — read-only, so its identity is checkable
+    previewConfig: previewCfg,
   };
 }

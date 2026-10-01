@@ -269,6 +269,29 @@ describe("classifyDeadChannel (v1.65 T1)", () => {
   test("a no-trailer failure without a dead-channel signature stays untyped", () => {
     expect(dead("still working on the diff...")).toBeUndefined();
   });
+
+  // E1: the recorded refresh failure names neither login nor credentials, so it read as an ordinary
+  // failure; its sentence also asks to "log out and sign in again", which no older signature matches.
+  test("the production worker failure classifier maps access token could not be refreshed to auth-required while a quoted review finding with unrelated token wording remains an ordinary failure", () => {
+    const recorded = "■ Your access token could not be refreshed because your refresh token was already used. Please log out and sign in again.";
+    const refused = parseWorkerResult(`codex\n${recorded}\n`, N);
+    expect(refused).toMatchObject({ ok: false, cause: "no-verdict" });
+    expect(classifyDeadChannel(refused)).toBe("auth-required");
+    expect(dead(recorded.toUpperCase())).toBe("auth-required");
+
+    // A worker quoting a review finding about token handling is doing work, not reporting its own auth.
+    const finding = [
+      "Addressing the carried review material:",
+      "> F2 (material): src/auth/refresh.ts:14 — the access token refresh path could not be exercised, and the refresh token is never rotated",
+      "still editing src/auth/refresh.ts...",
+    ].join("\n");
+    const ordinary = parseWorkerResult(finding, N);
+    expect(ordinary).toMatchObject({ ok: false, cause: "no-verdict" });
+    expect(classifyDeadChannel(ordinary)).toBeUndefined();
+    // The phrase inside a parsed trailer is the worker speaking — never a dead channel.
+    const spoken = parseWorkerResult(`${recorded}\nTICKMARKR_RESULT_${N} {"ok":false,"summary":"tests failing"}`, N);
+    expect(classifyDeadChannel(spoken)).toBeUndefined();
+  });
 });
 
 // OBS-1161: transient capacity shares the parse boundary AND a row boundary — the phrase is a banner

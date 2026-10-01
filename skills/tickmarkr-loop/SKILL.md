@@ -88,9 +88,39 @@ When spawning consultants (agents gathering synthesis input for decisions like S
 1. **Prepare** — start from the requested spec. Run the [binary preflight](#binary-preflight-before-compile-or-run). Check `git status`, confirm no tickmarkr run is active, and work from a non-main branch.
 2. **Compile** — run `tickmarkr compile <spec>`. Correct compilation errors in the spec, never in the generated graph.
 3. **Plan** — run `tickmarkr plan`. Review the routing table, capability-floor warnings, and every human gate, including work that each gate blocks.
-4. **Run** — run `tickmarkr run`. A watch ending the seat's turn is no watch: keep a **blocking journal consumer** alive for the run's terminal events — the shipped watcher below, or a foreground `until grep` on the run's terminal events — and ensure it is re-armed at most every twenty minutes. Never rely on a `Monitor`-only wake. Watch the run journal rather than polling agents, using the shipped watcher — `.claude/skills/tickmarkr-overseer/scripts/watch-journal.sh <state-dir>/runs 20 28800` — which takes a line baseline at arm time, then wakes ONCE on `run-end`, `task-human`, `task-failed` or `consult-verdict` and grades the run-end summary against every execution clause for you; the debt clause is yours — read CURRENT `tickmarkr status <runId>` (step 5). Re-arm after every wake. ⛔ Never `tail -F | grep -m1` (run-end is the journal's last line, so tail never notices the broken pipe and the watcher hangs forever) and never a pane-level done wait (it fires on every agent turn end, not mission end). ⚠ A bare whole-file `grep -q '"event":"run-end"'` is the trap the watcher exists to avoid: on a resume it matches the PREVIOUS run's run-end and returns instantly, so a re-armed watcher reads as coverage that does not exist. Resolve blocked interactions in the agent session; do not turn them into proxy questions.
+4. **Run** — launch `tickmarkr run` using the [host-owned split form](#host-owned-daemon-and-detached-beats), and start detached beats with their run-end stop items. A watch ending the seat's turn is no watch: keep a **blocking journal consumer** alive for the run's terminal events — the shipped watcher below, or a foreground `until grep` on the run's terminal events — and ensure it is re-armed at most every twenty minutes. Never rely on a `Monitor`-only wake. Watch the run journal rather than polling agents, using the shipped watcher — `.claude/skills/tickmarkr-overseer/scripts/watch-journal.sh <state-dir>/runs 20 28800` — which takes a line baseline at arm time, then wakes ONCE on `run-end`, `task-human`, `task-failed` or `consult-verdict` and grades the run-end summary against every execution clause for you; the debt clause is yours — read CURRENT `tickmarkr status <runId>` (step 5). Re-arm after every wake. ⛔ Never `tail -F | grep -m1` (run-end is the journal's last line, so tail never notices the broken pipe and the watcher hangs forever) and never a pane-level done wait (it fires on every agent turn end, not mission end). ⚠ A bare whole-file `grep -q '"event":"run-end"'` is the trap the watcher exists to avoid: on a resume it matches the PREVIOUS run's run-end and returns instantly, so a re-armed watcher reads as coverage that does not exist. Resolve blocked interactions in the agent session; do not turn them into proxy questions.
 5. **Verify and consolidate** — accept only a green run. A run is green when the run-end event exists in the journal, the tip verify is not "failed", the summary's `failed`, `human`, `blocked` and `pending` buckets are all empty, and CURRENT `tickmarkr status <runId>` reads its owed checks outstanding empty AND known (`outstanding 0`) — a run with a parked task is partial, not green. Empty execution buckets alone are not green either (D-660): every bucket empty and the tip passed, but an operator waived one review, leaves one accepted-risk review check owed — status reads `outstanding 1 (T7 review)` and `run`/`resume` still exit 0 on execution alone, so the run is execution complete, not green. It turns green only when a `tickmarkr verify --record <runId>` discharge moves CURRENT status to `outstanding 0`, including a discharge landing after run-end — the historical run-end record keeps the old count, so never read debt from it; `outstanding unknown` is never green. Tickmarkr consolidates accepted task work on `tickmarkr/<runId>`; it never signs off to the main branch. A human may later merge that integration branch through the repository's normal release process.
 6. **Record** — `tickmarkr report <runId> --md` prints Markdown to stdout. Redirect it explicitly beside the source spec (for example `tickmarkr report <runId> --md > feature.record.md`) and commit the execution record when the repository tracks those records. Then [stand down](#stand-down-mission-end-and-retirement).
+
+## Host-owned daemon and detached beats
+
+Launch the daemon as a SPLIT of the orchestrator's own pane in the ORCH tab, owned by the
+host PTY. Never launch it as an agent harness background task or in a separate tab. The daemon
+self-places its board from that split, keeping both daemon and board in the ORCH tab.
+
+- **On Orca (`TERM_PROGRAM=Orca` and non-empty `ORCA_TERMINAL_HANDLE`)**:
+  `orca terminal split --terminal "$ORCA_TERMINAL_HANDLE" --direction vertical --command "tickmarkr run"`.
+- **On herdr (`HERDR_ENV=1`)**: use `herdr pane split` on the orchestrator's own pane, then
+  `herdr pane run <new> "tickmarkr run"` in the returned split.
+
+For `resume`, use the same host-owned split form with `tickmarkr resume <runId>` in place of
+`tickmarkr run`. After either launch, read this repository's lock pid and walk its ppid chain
+in the process table to the host PTY; verify no agent session is an ancestor. If an agent is
+an ancestor, stop that launch and relaunch through the host split before continuing.
+
+Start `tickmarkr beat <tier> --seat <seat> --loop` as a DETACHED background process, one per
+(tier, seat), from the repository root. Use setsid plus nohup (or the host's equivalent detached
+session facility), redirect output to a file, and record a pidfile under the repository's state
+dir. Verify ppid 1 and no agent-session ancestor. Never put beats in a harness background task
+or a visible tab. The lifecycle must be idempotent: start checks the pidfile against the live
+process payload and returns an "already running" no-op for the same (repo, tier, seat); status
+checks that payload and beat freshness; stop sends `--stand-down` for the same tier and seat,
+verifies the loop exits within one interval, then removes its pidfile. A stale or reused pid
+must never be killed without matching its live payload. Include a run-end stop item for every
+beat started, also on failure, park or handoff; verify DISARMED and remove retired beat files.
+
+Keep only watchers that must WAKE the seat in the harness. Re-arm them on each wake and at
+their harness cap; daemon and beat lifetimes must not depend on that cap.
 
 ## Cockpit, parked decisions and printed twins
 
@@ -107,7 +137,7 @@ run/task, original park `#L`, actor/reason, exact argv, consequence and enactor.
 confirms; `n`/Esc cancel; Enter never confirms. Read the receipt's appended `task-approved`
 line and actor/reason back from the journal. Approval records permission, never dispatch,
 a passed gate or task completion. With no live owner it says **approved; resume required**:
-exit the observer and run `tickmarkr resume <runId>` explicitly. A matching live daemon
+exit the observer and launch `tickmarkr resume <runId>` explicitly with the same host-owned split form above. A matching live daemon
 enacts at its next task boundary; if a different live run owns the repository lock, wait
 for that run to end before resuming this one.
 
@@ -176,6 +206,20 @@ inaccessible or changed holders refuse. `doctor --cached`, `--probe-preflight`,
 repair and catalog refresh; default doctor and `--fix` still probe. `scope <intent-file>
 --preview` performs no probes, model calls or writes; authoring requires confirmation or
 `--yes`. These actions remain CLI entries until their follow-on views ship.
+
+**macOS host failure: a launchservicesd restart (D-787/D-789).** If GUI apps suddenly read "The
+application … is not open anymore" during a local suite, launchservicesd crashed and respawned with an
+empty app registry. That was measured on 2026-09-30: `0x1000600b` Mach port exhaustion under node
+`process.title` check-ins, crash at 17:15:00Z and respawn at 17:15:09Z. `tickmarkr doctor` and standalone
+`tickmarkr verify` record the daemon's pid/start through the separate `src/run/launchservices-check.ts`
+module: one bounded `/bin/ps` read with a 5000 ms kill ceiling. doctor's wiring is five lines in
+`src/cli/commands/doctor.ts`. The identity lives on the first `doctor.json` record, and one advisory
+prints and persists when it changed. Unknown evidence keeps the prior identity, and verdicts and retries
+never change. Confirm the identity with `/bin/ps -o pid=,lstart= -p "$(pgrep -x launchservicesd)"`: it
+is young beside Dock and Finder. Confirm the log with `/usr/bin/log show --start '<that lstart minus two
+minutes>'`, looking for `0x1000600b` then `Successfully spawned launchservicesd`. Type the full path: a bare
+`log` is a zsh builtin that prints nothing. Then quit and relaunch the affected apps, or log out /
+restart once the run is stood down; a restart ends agent sessions and wipes `/private/tmp`.
 
 Keep this skill's canonical identity `tickmarkr-loop`; sibling skills link to this
 walkthrough. In this repository `skills/` is canonical and installed `.claude/skills/`

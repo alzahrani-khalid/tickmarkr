@@ -36,7 +36,10 @@ export const CLAUDE_ALIAS_IDENTITY_STAMPS = {
   // OBS-871, 2026-09-03: Fable's floating alias now resolves to the 5.1 benchmark identity.
   fable: "claude-fable-5-1",
   opus: "claude-opus-4-8",
-  sonnet: "claude-sonnet-5",
+  // v2.6.5 T9 (H, PREMISES-v265 P31): the author's live probeClaudeAliasIdentity call on 2026-09-30
+  // resolved sonnet to claude-sonnet-5-5. Its sourced price/window and continuity tier basis live in
+  // SOURCED_IDENTITY_RECORDS (catalog-remote.ts); this re-stamp re-dates no tier and adopts nothing.
+  sonnet: "claude-sonnet-5-5",
   haiku: "claude-haiku-4-5-20251001",
 } as const;
 export type ClaudeAlias = keyof typeof CLAUDE_ALIAS_IDENTITY_STAMPS;

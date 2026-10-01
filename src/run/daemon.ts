@@ -40,7 +40,7 @@ import { changeRepresented, cleanupRunWorktrees, deriveForkCap, FORK_CAP_ENV, gi
 import { runInteractiveSeed, type InteractiveSeedResult } from "./interactive-seed.js";
 import { classifyRepairDisposition, resolveScopeHints } from "./repair-disposition.js";
 import { applyScopeAmendments, activeRetryBan, interruptedAttempt, RESUME_HARVEST_SOURCE, resumeHarvestAuthor, approvalAction, APPROVAL_REFUSED, bindingToken, effectiveEvents, foldDecisions, physicalLine, staleApprovals, classifyTaskFailure, classifyWorkerResultCause, deferredReviewFindings, engagementComparable, formatPriorFindingEvidence, GATE_FINGERPRINT_CAP, GATE_SATISFIED_RELEASE, identicalGateFailures, isDeferredFinding, journaledFailureBrief, Journal, loadRoutingProfile, newRunId, normalizeGateFailure, outstandingConsultGuidance, readableExcerpt, receiptOrigin, outstandingReviewFindings, pendingApprovalActions, pendingRechecks, pendingRepairFindings, phaseForGate, priorJudgments, readPriorRunEvidence, recordedTaskFailureKind, reraisedReviewChains, RECHECK_RELEASE, renderStructuredReviewFinding, repairReachSinceApproval, repairsSinceApproval, reviewRoundsSinceApproval, runHasEnded, standingRulings, structuredFindings, upheldFeedbackByTask, type CurrentAttemptGateReplay, type JournalEvent, type ParkKind, type ResumeState, type RetryMode, type StructuredFinding } from "./journal.js";
-import { gateReviewerFloor, isDiffCapPark, isGarbageReview, pickReviewer } from "../gates/review.js";
+import { carriedAuthorVendors, gateReviewerFloor, isDiffCapPark, isGarbageReview, pickReviewer } from "../gates/review.js";
 import { acquireApprovalSerialization, acquireRunLock, isPidLive, releaseRunLock } from "./lock.js";
 import { ensureIntegration, integrationBranch, integrationHead, mergeTask, reusedTipEvidence, verifyIntegrationTip } from "./merge.js";
 import { channelExclusion, climbChannel, inTaskPool, marginalCostRank, nextChannel, poolExhaustion, route, taskPool } from "../route/router.js";
@@ -492,6 +492,46 @@ function classifyInfraResult(g: GateResult): void {
 const TIMEOUT_SHAPED_RE = /\b(?:Test|Hook) timed out in (?:\d+|#)\s*ms\b|\bexpected (?:\d+|#)(?:\.(?:\d+|#))? to be (?:less than|below)(?: or equal to)? (?:\d+|#)/i;
 const RUNNER_INFRA_DIAGNOSTIC_RE = /\bnever-started (?:[1-9]\d*|#)(?![\d#])|\[vitest-worker\]: Timeout calling\b/;
 const timeoutShaped = (details: string) => TIMEOUT_SHAPED_RE.test(readableExcerpt(details));
+/** C (E1): the one no-verdict that is the host's slowness, not the seat's — the same predicate run-gates
+ * applies to its run-scoped tally, read here for the live task strike and the resume reconstruction. */
+const proofTimeoutNote = (data: Record<string, unknown>): boolean =>
+  data.cause === "seat-launch-failed" && data.launchCause === "checkout-proof-timeout";
+/** C: the gate-fresh-forced reason that bounds the out-of-scope re-execution, one per journaled subject. */
+const OUTSIDE_SCOPE_RED = "no-commit-out-of-scope-red";
+const NAMED_FAILURE_FILE_RE = /^\s*(\S+\.(?:test|spec)\.[cm]?[jt]sx?)\s+>/gm;
+/** D-854: the runner certificate the vitest manifest path appends to a red (test-manifest.ts). */
+const RUNNER_CERTIFICATE_RE = /runner-level diagnostic: never-started ([^;\s]+); reporter errors ([^;\s]+)/g;
+/** C: a journaled test red whose failing-file attribution is nonempty, trustworthy and complete (repair
+ * selection's own rule: a behavioral red on a real subject from a full suite or a screen that names
+ * every failure), POSITIVELY certified complete by its runner, uncontradicted by the files its own text
+ * names, and wholly outside a declared files[]. Empty files[] is unrestricted and never qualifies;
+ * every other shape keeps its replay. */
+function outsideScopeRed(t: Task, taskId: string, data: Record<string, unknown>, commit: string): boolean {
+  if (!t.files.length || data.gate !== "test" || data.pass !== false || data.skipped === true || data.commit !== commit
+    // a failed producer — an infra row, a dirty-tree refusal, a recovery the runner could not finish —
+    // never attributes anything, whatever files it lists
+    || data.infra === true || data.dirtyWorktree === true || data.recoveryBlocked !== undefined) return false;
+  const attribution = repairSelectionDecision([{ event: "gate-result", taskId, data }], taskId, true);
+  if (attribution.reason !== "known-failing-files" || attribution.requiredFiles.length === 0) return false;
+  const text = readableExcerpt(String(data.details ?? ""));
+  // D-854: validate, never filter. A collection failure has no module record, so failingFiles omits it
+  // and it lives only in the certificate's counts; any never-started file or reporter error, an unknown
+  // count, or no certificate at all leaves the attribution unproven.
+  // ponytail: a nonzero count never qualifies, even when each diagnostic names an outside file — the
+  // details interleave diagnostics with the stdout tail; map them only if outside-scope collection reds need it.
+  const certificates = [...text.matchAll(RUNNER_CERTIFICATE_RE)];
+  if (!certificates.length || certificates.some((m) => m[1] !== "0" || m[2] !== "0")) return false;
+  const named = [...text.matchAll(ATTRIBUTED_FILE_RE), ...text.matchAll(NAMED_FAILURE_FILE_RE)].map((m) => m[1]!.replace(/^\.\//, ""));
+  if (named.some((file) => !attribution.requiredFiles.includes(file))) return false; // contradictory
+  const inScope = filesGlob(t.files);
+  return attribution.requiredFiles.every((file) => !inScope(file));
+}
+/** C: every test red a round journaled on `commit` is an out-of-scope red (none means none). */
+const allOutsideScopeReds = (t: Task, rows: readonly JournalEvent[], commit: string): boolean => {
+  const reds = rows.filter((e) => e.event === "gate-result" && e.data.gate === "test" && e.data.pass === false
+    && e.data.skipped !== true && e.data.commit === commit);
+  return reds.length > 0 && reds.every((e) => outsideScopeRed(t, e.taskId ?? t.id, e.data, commit));
+};
 const ATTRIBUTED_FILE_RE = /^\s*(?:FAIL|×|✗)\s+(?:\|[^|\n]*\|\s+)?(\S+\.(?:test|spec)\.[cm]?[jt]sx?)\b/gm;
 /** The failing files a red attributes to itself: the runner's own list, else its FAIL headlines. */
 const attributedFailingFiles = (g: GateResult): string[] => [...new Set(
@@ -2341,9 +2381,11 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
   // is what bounds a seat that flakes once per task (or once per session) across the run. Seeded from the
   // journal's review-no-verdict rows — the same notes noteReviewEvent appends — so a resumed daemon keeps
   // the count; run-gates appends to it in place, exactly as it does demotedReviewers.
+  // C (E1): a checkout-proof timeout never struck the live tally (run-gates), so a resume never seeds one.
   const reviewNoVerdicts = new Map<string, string[]>();
   for (const event of journal.read()) {
     if (event.event !== "review-no-verdict" || event.data.noVerdict !== true || typeof event.data.reviewer !== "string") continue;
+    if (proofTimeoutNote(event.data)) continue;
     reviewNoVerdicts.set(event.data.reviewer, [...(reviewNoVerdicts.get(event.data.reviewer) ?? []), String(event.data.cause)]);
   }
   const reviewHistory = journal.read()
@@ -3021,6 +3063,20 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     return red !== undefined
       && identicalGateFailures(journal.read(), t.id, "test", normalizeGateFailure(String(red.data.details))) < GATE_FINGERPRINT_CAP;
   };
+  // C: an unchanged cached test red attributed wholly outside files[] is re-executed ONCE per journaled
+  // subject — the worker cannot repair those files, so a copy of the red would only buy another round.
+  const owesOutsideScopeRefresh = (t: Task, priorRows: JournalEvent[], commit: string): boolean =>
+    allOutsideScopeReds(t, priorRows, commit)
+    && !journal.read().some((e) => e.taskId === t.id && e.event === "gate-fresh-forced"
+      && e.data.reason === OUTSIDE_SCOPE_RED && e.data.commit === commit);
+  // C: the forced re-execution's own round failed again only outside files[]: independent evidence the
+  // worker cannot act on. It keeps its red row and parks gate-fail before any cap, consult or repair move.
+  const freshOutsideScopeRed = (t: Task, commit: string): boolean => {
+    const own = journal.read().filter((e) => e.taskId === t.id);
+    return allOutsideScopeReds(t, own.slice(own.map((e) => e.event === "phase-start" && e.data.phase === "gates").lastIndexOf(true) + 1), commit);
+  };
+  const outsideScopePark = (t: Task) => gateFailApprovalReason(t.id,
+    "test: a fresh re-execution of the unchanged subject failed again only in files outside files[] — no repair can reach them");
 
   // OBS-1106 residual: before a timeout or wall-budget red accompanied by runner infra diagnostics is
   // charged, its attributed failing files are re-run ONCE, on the same checkout, under the suite
@@ -3375,10 +3431,14 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     }
     // Keep one live list: recovery retries must see exclusions added by onGate during the round.
     const badReviewers: string[] = [...replayedReviewerExclusions];
+    // C (E1): a checkout-proof timeout is the host being slow, not the seat failing — it is excluded for
+    // the CURRENT round only (so an always-timeout pool still ends the round), never struck task-wide.
+    let roundTimeouts: string[] = [];
     const noteReviewEvent = (e: Extract<GateEvent, { phase: "note" }>) => {
       journal.append(e.name, t.id, e.payload);
       if (e.name === "review-no-verdict" && typeof e.payload.reviewer === "string") {
-        if (!badReviewers.includes(e.payload.reviewer)) badReviewers.push(e.payload.reviewer);
+        const strikes = proofTimeoutNote(e.payload) ? roundTimeouts : badReviewers;
+        if (!strikes.includes(e.payload.reviewer)) strikes.push(e.payload.reviewer);
       }
       // OBS-1196: a seat whose same-subject re-emission delivered a valid verdict was a delivery flake,
       // not a bad reviewer — it stays seatable for this task's later rounds.
@@ -3412,18 +3472,31 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         gateRound: journal.read().filter((row) => row.taskId === task.id
           && row.event === "phase-start" && row.data.phase === "gates").length,
       };
-      const round = await runGates(task, ctx);
+      roundTimeouts = [];
+      // C: every gate-round boundary — a returned or a THROWN round — publishes the one row held behind
+      // a still-pending sibling and forgets the pending set, before any park or task-failed row lands.
+      const gateRound = async (subject: Task) => {
+        try {
+          return await runGates(subject, { ...ctx, excludeReviewers: [...badReviewers, ...roundTimeouts] });
+        } finally {
+          settleParallelRound();
+        }
+      };
+      const round = await gateRound(task);
       let review = round.results.find((g) => g.gate === "review");
+      // The recovery pick carries every preserved author, exactly as reviewGate's own pick does.
+      const authors = ctx.carriedAuthors?.length ? [...ctx.carriedAuthors] : [channelKey(ctx.author)];
       while (review?.meta?.noVerdict === true) {
         // Recovery must honor the gate's floor, including the seats that just failed to
-        // return a verdict; a below-floor alternative cannot replace the infra result.
+        // return a verdict; a below-floor alternative cannot replace the infra result. This round's
+        // proof timeouts count too — runGates folds every excluded seat into its own floor.
         const { floor } = gateReviewerFloor(task, ctx.cfg, ctx.author, ctx.channels,
-          [...(ctx.priorReviewers ?? []), ...badReviewers]);
-        const next = pickReviewer(ctx.author, ctx.channels, badReviewers, cfg.review.prefer ?? [],
-          floor, reviewHistory, undefined, demotedReviewers);
+          [...(ctx.priorReviewers ?? []), ...badReviewers, ...roundTimeouts]);
+        const next = pickReviewer(ctx.author, ctx.channels, [...badReviewers, ...roundTimeouts], cfg.review.prefer ?? [],
+          floor, reviewHistory, undefined, demotedReviewers, carriedAuthorVendors(ctx.channels, authors), authors);
         if (!next) break;
         journal.append("review-infra-retry", t.id, { reviewer: channelKey(next), cause: review.meta.cause });
-        const retried = await runGates({ ...task, gates: ["review"] }, ctx);
+        const retried = await gateRound({ ...task, gates: ["review"] });
         const replacement = retried.results.find((g) => g.gate === "review");
         // A dirty tree or another pre-dispatch refusal must still fail closed.
         if (!replacement) {
@@ -3450,14 +3523,16 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           gate: "review", flaked: rr.flaked, retried: rr.retried,
           ...(g.meta?.unparseable === true ? { secondUnparseable: true } : {}),
         });
-        badReviewers.push(rr.flaked);
+        // C (E1): a seat re-routed after a checkout-proof timeout is excluded for this round only.
+        if (!roundTimeouts.includes(rr.flaked)) badReviewers.push(rr.flaked);
       }
     };
     // v1.85 T3 (ruling R4): every BLOCKING review/judge result lands its findings in the journal
     // structured — class + canonical path + stable symbol — so a retry, a consult or an auto-uphold
     // decision reads identity instead of re-parsing prose, and line-number churn is not a new finding.
     // One helper, both onGate sites (satisfied-gate resume + main attempt loop).
-    let gateSubject: { commit: string; attempt: number; replayMeasurement?: true; replayedFromAttempt?: number } | undefined;
+    // `journaledGates` narrows replayMeasurement to the gates an interrupted round already journaled (C).
+    let gateSubject: { commit: string; attempt: number; replayMeasurement?: true; journaledGates?: readonly string[]; replayedFromAttempt?: number } | undefined;
     const journalGateResult = (g: GateResult) => {
       const blocking = g.meta?.infra !== true && gateFailed(g) && (g.gate === "review" || g.gate === "acceptance");
       // T2: a review that PASSED while DEFERRING a concern still recorded a defect — the prompt
@@ -3492,7 +3567,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         // for the worktree it ran in; absent only for a row that never went through the battery.
         ...(g.meta?.verification !== undefined ? { verification: g.meta.verification } : {}),
         ...(gateSubject ? { commit: gateSubject.commit, attempt: gateSubject.attempt } : {}),
-        ...(gateSubject?.replayMeasurement ? { replayMeasurement: true } : {}),
+        ...(gateSubject?.replayMeasurement && (gateSubject.journaledGates?.includes(g.gate) ?? true) ? { replayMeasurement: true } : {}),
         ...(gateSubject?.replayedFromAttempt !== undefined ? { replayedFromAttempt: gateSubject.replayedFromAttempt } : {}),
         ...(g.meta?.skipped === true || noVerdictReview ? { skipped: true } : {}),
         // T9: an infra-only exit is journaled AS one. The operator reading a red `test` row has to
@@ -3606,10 +3681,16 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     // ever held, and only while an earlier sibling is still in flight — a review that finishes first
     // waits for acceptance, never the reverse. That keeps T4's durability where it pays (the first
     // verdict to land is still published immediately) and bounds the exposure to one row for the
-    // remainder of one already-running gate. A gate that THROWS kills the round before merge, so a
-    // row held behind it is lost with the round it belonged to — not a verdict that could have merged.
+    // remainder of one already-running gate. A gate that THROWS still ends its round: C publishes the
+    // row held behind it at that boundary (settleParallelRound), so it is never lost or carried over.
     const parallelPending = new Set<GateName>();
     let heldParallel: (() => void) | undefined;
+    const settleParallelRound = () => {
+      parallelPending.clear();
+      const held = heldParallel;
+      heldParallel = undefined;
+      if (liveEngagement()) held?.();
+    };
     const notePhaseStart = (e: Extract<GateEvent, { phase: "start" }>) => {
       const active = activeGatePhases.get(t.id) ?? new Set<GateName>();
       active.add(e.gate);
@@ -4155,6 +4236,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       if (provisionedRow !== undefined) journal.append("gate-provisioned", t.id, provisionedRow);
       const resumedTask = { ...t, gates: remainingGates };
       const operatorContext = approvalReviewContext(journal.read(), t.id);
+      let outsideScopeForced = false;
 
       gateLoop: while (true) {
         fatalStop.signal.throwIfAborted();
@@ -4184,13 +4266,43 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           const own = journal.read().filter((e) => e.taskId === t.id);
           return own.slice(own.map((e) => e.event === "phase-start" && e.data.phase === "gates").lastIndexOf(true) + 1);
         })();
-        const freshTimeout = !recheck && !satisfiedGate && (
-          (harvestAuthor !== undefined && owesTimeoutRefresh(t, lastRound, gateSubject.commit))
-          || (lastRound.some((e) => e.event === "gate-fresh-forced" && e.data.commit === gateSubject!.commit)
-            && !lastRound.some((e) => e.event === "gate-result" && e.data.gate === "test")));
+        // C: a passing selected-test screen is never a forced round's conclusive test result (the
+        // journal's own replay rule): its full suite is still owed, fresh, under the round's bypass.
+        const measured = lastRound.filter((e) => e.event === "gate-result" && !(e.data.gate === "test"
+          && Array.isArray(e.data.selectedTests) && e.data.fullSuite !== true && e.data.pass !== false));
+        const forcedUnmeasured = (outside: boolean) => lastRound.some((e) => e.event === "gate-fresh-forced"
+          && e.data.commit === gateSubject!.commit && (e.data.reason === OUTSIDE_SCOPE_RED) === outside)
+          && !measured.some((e) => e.data.gate === "test");
+        // C: a crash after the forced re-execution journaled its red but before its park still owes that
+        // park — restored from the journaled subject and result, never re-measured, replayed or repaired.
+        // Infra adjudication stays authoritative, exactly as it is ahead of the live park.
+        if (!recheck && !satisfiedGate && lastRound.some((e) => e.event === "gate-fresh-forced"
+          && e.data.reason === OUTSIDE_SCOPE_RED && e.data.commit === gateSubject!.commit)
+          && allOutsideScopeReds(t, lastRound, gateSubject.commit)) {
+          const restored = lastRound.filter((e) => e.event === "gate-result" && e.data.gate === "test" && e.data.pass === false)
+            .map((e): GateResult => ({ gate: "test", pass: false, details: String(e.data.details ?? ""), meta: e.data }));
+          if (await adjudicateInfraShapedRed(t, restored, wt, gateSubject.commit, rs?.attempts ?? 0, true, (reason) =>
+            park(t, reason, "infra", gateAuthor, rs?.attempts ?? 0, startMs, gateFails, consults, tokens, metered, retryMode))) return;
+          await park(t, outsideScopePark(t), "gate-fail", gateAuthor, rs?.attempts ?? 0, startMs, gateFails, consults, tokens, metered, retryMode);
+          return;
+        }
+        // C: the same out-of-scope re-execution the live loop owes, and a crash inside it still owes it. It
+        // takes precedence over a timeout refresh: a qualifying red keeps its own bypass and park.
+        outsideScopeForced = !recheck && !satisfiedGate && (
+          (harvestAuthor !== undefined && owesOutsideScopeRefresh(t, lastRound, gateSubject.commit)) || forcedUnmeasured(true));
+        const freshTimeout = !recheck && !satisfiedGate && !outsideScopeForced && (
+          (harvestAuthor !== undefined && owesTimeoutRefresh(t, lastRound, gateSubject.commit)) || forcedUnmeasured(false));
+        // C: a measurement this forced round EXECUTES fresh — its forced test above all — is independent
+        // evidence, never a replay measurement; only a gate the interrupted round already journaled is.
+        if (outsideScopeForced) {
+          gateSubject = { ...gateSubject, journaledGates: measured.map((e) => String(e.data.gate)) };
+        }
         journal.phaseStart(t.id, "gates");
         if (freshTimeout) {
           journal.append("gate-fresh-forced", t.id, { gate: "test", attempt: gateSubject.attempt, commit: gateSubject.commit, reason: "no-commit-timeout-red", resumed: true });
+        }
+        if (outsideScopeForced) {
+          journal.append("gate-fresh-forced", t.id, { gate: "test", attempt: gateSubject.attempt, commit: gateSubject.commit, reason: OUTSIDE_SCOPE_RED, resumed: true });
         }
         const { results } = await withCommandContext(t.id,
           async () => runReviewRecovery(resumedTask, {
@@ -4217,7 +4329,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           // flaking seat is re-asked on every task.
           reviewNoVerdicts,
           recheck, // OBS-1055: a recheck discards cached reds — the battery re-measures what the operator questioned
-          cachedRedBypass: freshTimeout ? "timeout-fresh" : undefined,
+          cachedRedBypass: freshTimeout ? "timeout-fresh" : outsideScopeForced ? "out-of-scope-fresh" : undefined,
           onGate: async (e) => {
             if (!liveEngagement()) return;
             if (e.phase === "start") {
@@ -4283,6 +4395,11 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           // assignment back with it.
           if (await adjudicateInfraShapedRed(t, results, wt, gateSubject.commit, rs?.attempts ?? 0, false, (reason) =>
             park(t, reason, "infra", gateAuthor, rs?.attempts ?? 0, startMs, gateFails, consults, tokens, metered, retryMode))) return;
+          if (outsideScopeForced && freshOutsideScopeRed(t, gateSubject.commit)) {
+            await park(t, outsideScopePark(t), "gate-fail", gateAuthor, rs?.attempts ?? 0,
+              startMs, gateFails, consults, tokens, metered, retryMode);
+            return;
+          }
           const classified = journal.classifiedDispatch(t.id);
           if (await dispositionScopeRed(t, results, classified?.assignment ?? gateAuthor,
             classified ? (rs?.attempts ?? 0) : Math.max(0, (rs?.attempts ?? 0) - 1),
@@ -6263,6 +6380,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       };
       let results: GateResult[] = [];
       let commits: string[] = [];
+      let outsideScopeForced = false;
       gateLoop: while (true) {
         fatalStop.signal.throwIfAborted();
         executionSignal()?.throwIfAborted();
@@ -6278,12 +6396,18 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           && e.data.attempt === attempt - 1);
         const previousRows = retryMode === "repair" ? lastRoundRows : [];
         // OBS-1106 residual: see owesTimeoutRefresh — the replay below and the verdict cache are both refused.
-        const freshTimeout = !explicitlyFundedAttempt && owesTimeoutRefresh(t, lastRoundRows, gateSubject.commit);
+        // C: an unchanged red wholly outside files[] is re-executed once instead of copied (journal or cache);
+        // it outranks the timeout refresh, so a timeout-shaped qualifying red keeps its own bypass and park.
+        outsideScopeForced = !explicitlyFundedAttempt && owesOutsideScopeRefresh(t, lastRoundRows, gateSubject.commit);
+        const freshTimeout = !explicitlyFundedAttempt && !outsideScopeForced && owesTimeoutRefresh(t, lastRoundRows, gateSubject.commit);
         journal.phaseStart(t.id, "gates");
         if (freshTimeout) {
           journal.append("gate-fresh-forced", t.id, { gate: "test", attempt, priorAttempt: attempt - 1, commit: gateSubject.commit, reason: "no-commit-timeout-red" });
         }
-        const replay = !explicitlyFundedAttempt && !freshTimeout && previousRows.length > 0
+        if (outsideScopeForced) {
+          journal.append("gate-fresh-forced", t.id, { gate: "test", attempt, priorAttempt: attempt - 1, commit: gateSubject.commit, reason: OUTSIDE_SCOPE_RED });
+        }
+        const replay = !explicitlyFundedAttempt && !freshTimeout && !outsideScopeForced && previousRows.length > 0
           && previousRows.every((e) => e.data.commit === gateSubject!.commit)
           && previousRows.some((e) => e.data.pass === false && e.data.skipped !== true);
         if (replay) {
@@ -6317,7 +6441,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
             commands, baseline, channels: pools.review, judgeChannels: pools.judge, health, adapters, cfg, artifactDir: journal.dir,
             collateral: collateral.get(t.id) ?? [],
             selectTests: !testGateFailed,
-            cachedRedBypass: explicitlyFundedAttempt ? "operator-rerun" : freshTimeout ? "timeout-fresh" : undefined,
+            cachedRedBypass: explicitlyFundedAttempt ? "operator-rerun" : freshTimeout ? "timeout-fresh" : outsideScopeForced ? "out-of-scope-fresh" : undefined,
             via: cfg.visibility.llm === "pane"
               ? {
                   driver: trackedDriver,
@@ -6439,6 +6563,10 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       }
       if (await adjudicateInfraShapedRed(t, results, wt, gateSubject!.commit, attempt, gateSubject!.replayedFromAttempt !== undefined, (reason) =>
         park(t, reason, "infra", assignment, attempt + 1, startMs, gateFails, consults, tokens, metered, retryMode))) return;
+      if (outsideScopeForced && freshOutsideScopeRed(t, gateSubject!.commit)) {
+        await park(t, outsideScopePark(t), "gate-fail", assignment, attempt + 1, startMs, gateFails, consults, tokens, metered, retryMode);
+        return;
+      }
       // OBS-547: who pays for this red is decided by the run's collateral prediction (see
       // dispositionScopeRed) — an authoring defect parks unchargeable before any accounting below.
       if (await dispositionScopeRed(t, results, assignment, attempt, startMs, gateFails, consults, tokens, metered, retryMode, await treeOrDiffPaths(taskBase, wt))) return;

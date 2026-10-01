@@ -1,18 +1,18 @@
 tickmarkr capture | RUN | run-screen-soak
-1 Home  4 Run  5 Evidence | content | 1–33/42 | 9 hidden
+1 Home  4 Run  5 Evidence  7 Log | content | 1–33/42 | 9 hidden
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 │1 Home         │RUN / RUNNING · 0/? merged | current-cycle tip PENDING | RUNNING | not comparab│1 Home                │
 │4 Run          │ tickmarkr  run-screen-soak  │  0/? done  │  0 esc  │  0h00m                   │4 Run                 │
 │5 Evidence     │                                                                               │5 Evidence            │
-│               │  ▌ TASKS   0 journal tasks merged · graph absent                              │Tab Focus             │
-│CLI:           │                                                                               │Enter Open            │
-│fleet          │         area            deps          task                                    │a Actions             │
-│plan           │         bu te li ev sc ac re   channel     att  note                          │PageUp/PageDown Page  │
-│doctor         │    ───────────────────────────────────────────────────────────────────────────│? Keys                │
-│               │  ❯ T1   —               —                                                     │q Quit                │
-│               │         ·  ·  ·  ·  ·  ·  ·    fake:fixtu  1                                  │+ Widen shortcuts     │
-│               │         in flight                                                             │- Narrow shortcuts    │
-│               │                                                                               │                      │
+│7 Log          │  ▌ TASKS   0 journal tasks merged · graph absent                              │7 Log                 │
+│               │                                                                               │Tab Focus             │
+│CLI:           │         area            deps          task                                    │Enter Open            │
+│fleet          │         bu te li ev sc ac re   channel     att  note                          │a Actions             │
+│plan           │    ───────────────────────────────────────────────────────────────────────────│PageUp/PageDown Page  │
+│doctor         │  ❯ T1   —               —                                                     │? Keys                │
+│               │         ·  ·  ·  ·  ·  ·  ·    fake:fixtu  1                                  │q Quit                │
+│               │         in flight                                                             │+ Widen shortcuts     │
+│               │                                                                               │- Narrow shortcuts    │
 │               │    area    SPEC · FLEET · RUN · GATE · UI · DOCS · REPO                       │                      │
 │               │    gates   bu build  te test  li lint  ev evidence  sc scope  ac acceptance  r│                      │
 │               │            ✔ passed   ✖ failed   · pending   ─ not declared (acceptance and re│                      │

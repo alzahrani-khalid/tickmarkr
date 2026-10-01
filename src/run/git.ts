@@ -10,6 +10,7 @@ import { StringDecoder } from "node:string_decoder";
 import { shq } from "../adapters/types.js";
 import { tickmarkrDir } from "../graph/graph.js";
 import { ROUTING_ENV_SEAMS } from "../route/router.js";
+import { titleEnvironment } from "./title-environment.js";
 
 export { ROUTING_ENV_SEAMS };
 
@@ -398,6 +399,11 @@ function executeShell(cmd: string, cwd: string, timeoutMs: number, login: boolea
   // OBS-854: descendants can leave the checkout (nested fixture suites do), so cwd alone cannot
   // attribute them. Every daemon shell exports the daemon pid as their durable parentage marker.
   env[SUITE_PARENT_ENV] = String(process.pid);
+  // A2: on Darwin a Node child's title writes stay in JavaScript (title-environment.ts); runnerInputsHash
+  // hashes this same effective NODE_OPTIONS, so a verdict is only reused under the identical mode. Native
+  // mode is applied too: it drops a preload a nested shell inherited from its parent (unset when that was all).
+  const { nodeOptions } = titleEnvironment(env);
+  if (nodeOptions === undefined) delete env.NODE_OPTIONS; else env.NODE_OPTIONS = nodeOptions;
   // T7: the capacity every result of this shell carries, read HERE — off the environment the child
   // is about to receive, after the precedence above has settled. An operator export is already in
   // `env`, so what gets recorded is the operator's number, which is the case a release was re-taken

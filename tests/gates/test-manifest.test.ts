@@ -3,7 +3,7 @@ import { randomBytes } from "node:crypto";
 import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { expect, test } from "vitest";
+import { expect, test, vi } from "vitest";
 import { DEFAULT_CONFIG } from "../../src/config/config.js";
 import { captureBaseline, compareToBaseline, type Baseline, type BaselineCommand } from "../../src/gates/baseline.js";
 import { runGates, testCommandForFiles } from "../../src/gates/run-gates.js";
@@ -13,6 +13,7 @@ import { preserveWorktree, shGitOk, VERIFICATION_PROTOCOL } from "../../src/run/
 import { SubprocessDriver } from "../../src/drivers/subprocess.js";
 import { validateGraph } from "../../src/graph/schema.js";
 import { verifyIntegrationTip } from "../../src/run/merge.js";
+import { ExecutionBudgetExceeded, executionSignal, withExecutionBudget, type ExecutionBudgetEvent } from "../../src/run/execution-budget.js";
 import { alive, ownedFailures, runOwned } from "../helpers/owned-process.js";
 import { makeRepo, makeTestTempDir } from "../helpers/tmprepo.js";
 
@@ -96,6 +97,47 @@ if (mode === 'hang') setInterval(() => {}, 1000);
 else process.exit(mode === 'contradiction' || mode === 'runner-red' || mode === 'failed' ? 1 : 0);
 `, { mode: 0o755 });
 }
+/** The recorded 2.6.4 listing died at a 3000 ms fixture ceiling on a slow runner, not at a leaf hang.
+ * The ceiling is one production parameter shared by listing and run, so fixtures hand it this allowance
+ * and let the per-file timings alone discriminate a hang. */
+const LISTING_ALLOWANCE_MS = 60_000;
+/** Longer than the fixture ceiling the recorded listing died at. */
+const SLOW_LISTING_MS = 3_200;
+/** A stand-in runner whose listing is slow: held on a barrier file, delayed by a fixed time, or never
+ * completing after flushing a partial diagnostic. Its run branch starts tests/a.test.ts and either
+ * completes the suite ("released") or never completes that file ("hang"). */
+function slowListing(f: Fixture, listing: { barrier: string } | { delayMs: number } | "never", run: "released" | "hang" = "released") {
+  const listed = join(f.repo, `listing-${randomBytes(4).toString("hex")}.receipt`);
+  mkdirSync(join(f.repo, "node_modules/.bin"), { recursive: true });
+  writeFileSync(join(f.repo, "node_modules/.bin/vitest"), `#!/usr/bin/env node
+const fs = require('fs'), path = require('path');
+const args = process.argv.slice(2), files = ['tests/a.test.ts', 'tests/b.test.ts'];
+const listing = ${JSON.stringify(listing)};
+if (args[0] === 'list') {
+  const print = () => { console.log(JSON.stringify(files.map(file => ({ file: path.resolve(file), name: file })))); process.exit(0); };
+  process.stderr.write('partial listing diagnostic\\n', () => {
+    fs.writeFileSync(${JSON.stringify(listed)}, String(process.pid));
+    if (listing === 'never') setInterval(() => {}, 1000);
+    else if (listing.barrier) setInterval(() => { if (fs.existsSync(listing.barrier)) print(); }, 20);
+    else setTimeout(print, listing.delayMs);
+  });
+} else {
+  const now = Date.now(), hang = ${JSON.stringify(run)} === 'hang';
+  const report = { nonce: process.env.TICKMARKR_TEST_NONCE, requested: files,
+    started: hang ? { [files[0]]: now } : Object.fromEntries(files.map(f => [f, now])),
+    completed: hang ? {} : Object.fromEntries(files.map(f => [f, { at: now, status: 'passed' }])),
+    ...(hang ? {} : { certificate: { at: now, exitCode: 0 } }) };
+  fs.writeFileSync(process.env.TICKMARKR_TEST_REPORT, JSON.stringify(report));
+  if (hang) setInterval(() => {}, 1000); else process.exit(0);
+}
+`, { mode: 0o755 });
+  return listed;
+}
+const appeared = async (path: string) => {
+  for (const until = Date.now() + LISTING_ALLOWANCE_MS; !existsSync(path) && Date.now() < until;) await new Promise((r) => setTimeout(r, 20));
+  expect(existsSync(path), `${path} never appeared`).toBe(true);
+};
+
 function executed(f: Fixture, name: string, row: Awaited<ReturnType<typeof round>>, cmd: string) {
   expect(existsSync(receipt(f, name)), `${name}: ${row.details}`).toBe(true);
   const got = JSON.parse(readFileSync(receipt(f, name), "utf8"));
@@ -211,10 +253,10 @@ test("through runGates a fixture baseline with known per-file durations yields f
   expect(fileHangBudgetMs("nan",timings,1000)).toBe(300);
   expect(fileHangBudgetMs("inf",timings,1000)).toBe(300);
   const cases: Array<[string, Partial<BaselineCommand>, number]> = [
-    ["timed",{fileDurations:timings,ceilingMs:3000},120],
-    ["longest-wins",{fileDurations:[{file:"tests/a.test.ts",durationMs:10},{file:"b",durationMs:180}],ceilingMs:3000},180],
-    ["untimed",{fileDurations:[{file:"b",durationMs:60}],ceilingMs:3000},180],
-    ["legacy",{longestFile:{file:"tests/a.test.ts",durationMs:60},ceilingMs:3000},180],
+    ["timed",{fileDurations:timings,ceilingMs:LISTING_ALLOWANCE_MS},120],
+    ["longest-wins",{fileDurations:[{file:"tests/a.test.ts",durationMs:10},{file:"b",durationMs:180}],ceilingMs:LISTING_ALLOWANCE_MS},180],
+    ["untimed",{fileDurations:[{file:"b",durationMs:60}],ceilingMs:LISTING_ALLOWANCE_MS},180],
+    ["legacy",{longestFile:{file:"tests/a.test.ts",durationMs:60},ceilingMs:LISTING_ALLOWANCE_MS},180],
     ["none",{ceilingMs:5000},5000],
     ["zero",{fileDurations:[{file:"tests/a.test.ts",durationMs:0}],ceilingMs:5000},5000],
     ["legacy-zero",{longestFile:{file:"a",durationMs:0},ceilingMs:5000},5000],
@@ -231,7 +273,7 @@ test("through runGates a fixture baseline with known per-file durations yields f
   }
   for (const mode of ["failed","failed-zero"]) {
     const f = fixture(false); fault(f,mode,mode);
-    const row = await round(f,"vitest run --globals",{fileDurations:timings,ceilingMs:3000});
+    const row = await round(f,"vitest run --globals",{fileDurations:timings,ceilingMs:LISTING_ALLOWANCE_MS});
     executed(f,mode,row,"vitest run --globals");
     expect(row.meta?.classification).toBe("regression"); expect(row.details).toContain("injected assertion");
   }
@@ -1125,3 +1167,97 @@ test("test: production task/tip gates classify a 156-second wall-only jump as in
     }
   } finally { resetHangClocksForTests(); }
 }, 90_000);
+
+test("production manifest discovery completes a barrier-delayed listing within the 60000 ms fixture allowance while an injected never-completing listing released by execution-signal cancellation rejects with partial diagnostics and evidence receipts after cleanup inside an enclosing test timeout of at least 180000 ms", async () => {
+  const { performance } = await import("node:perf_hooks");
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  for (const key of ["VITEST", "TEST", "VITEST_WORKER_ID", "VITEST_POOL_ID"]) delete env[key];
+  const cmd = "vitest run --globals";
+  const discover = (f: Fixture) => discoverTestManifest(cmd, f.repo, {
+    dir: f.artifacts, nonce: randomBytes(8).toString("hex"), env, overallCeilingMs: LISTING_ALLOWANCE_MS, evidence: { artifactDir: f.artifacts },
+  });
+
+  // Held past the ceiling the recorded listing died at, then released: discovery waits and completes.
+  const delayed = fixture(false);
+  const barrier = join(delayed.artifacts, "release");
+  const delayedListing = slowListing(delayed, { barrier });
+  const startedAt = Date.now();
+  const listing = discover(delayed);
+  await appeared(delayedListing);
+  await new Promise((r) => setTimeout(r, SLOW_LISTING_MS));
+  writeFileSync(barrier, "");
+  const manifest = await listing;
+  const waitedMs = Date.now() - startedAt;
+  expect(manifest.files).toEqual(["tests/a.test.ts", "tests/b.test.ts"]);
+  expect(manifest.listingExit).toBe(0);
+  expect(waitedMs).toBeGreaterThanOrEqual(SLOW_LISTING_MS);
+  expect(waitedMs).toBeLessThan(LISTING_ALLOWANCE_MS);
+  expect(manifest.evidenceReceipt.termination).toMatchObject({ kind: "exit", exitCode: 0, timedOut: false });
+
+  // Never completing: only the execution budget's signal releases it. The budget's clock is advanced
+  // once the listing has flushed its diagnostic, so the cancellation never races the spawn.
+  const never = fixture(false);
+  const neverListing = slowListing(never, "never");
+  const events: ExecutionBudgetEvent[] = [];
+  const limitMs = 10 * LISTING_ALLOWANCE_MS;
+  const now = performance.now.bind(performance);
+  let skewMs = 0;
+  let failure: unknown;
+  const clock = vi.spyOn(performance, "now").mockImplementation(() => now() + skewMs);
+  try {
+    await expect(withExecutionBudget({
+      limitMs, taskId: "T1", readEvents: () => events,
+      append: (event, taskId, data) => { events.push({ event, taskId, data }); },
+    }, async () => {
+      const rejected = discover(never).then(() => undefined, (error: unknown) => error);
+      await appeared(neverListing);
+      expect(executionSignal()?.aborted).toBe(false);
+      skewMs = limitMs;
+      expect(executionSignal()?.aborted).toBe(true);
+      failure = await rejected;
+    })).rejects.toBeInstanceOf(ExecutionBudgetExceeded);
+  } finally { clock.mockRestore(); }
+
+  expect(failure).toBeInstanceOf(Error);
+  const error = failure as Error & { evidenceReceipt: Awaited<ReturnType<typeof discover>>["evidenceReceipt"]; evidenceReceipts: unknown[] };
+  expect(error.message).toMatch(/vitest cannot list files \(exit signal\)/);
+  expect(error.message).toContain("partial listing diagnostic");
+  expect(error.evidenceReceipt.termination).toMatchObject({ kind: "signal", exitCode: null, signal: "SIGKILL", timedOut: false });
+  expect(error.evidenceReceipt.availability).toBe("available");
+  expect(error.evidenceReceipts.at(-1)).toEqual(error.evidenceReceipt);
+  expect(readFileSync(join(never.artifacts, error.evidenceReceipt.stderr.path), "utf8")).toContain("partial listing diagnostic");
+  // cleanup preceded the rejection: the cancelled runner is gone, long before the 60000 ms allowance
+  expect(alive(Number(readFileSync(neverListing, "utf8")))).toBe(false);
+}, 180_000);
+
+test("production manifest evaluation still distinguishes injected 120 ms and 180 ms hangs from released work when listing setup receives the separate 60000 ms allowance", async () => {
+  const cmd = "vitest run --globals";
+  const budgets: Array<[Partial<BaselineCommand>, number]> = [
+    [{ fileDurations: [{ file: "tests/a.test.ts", durationMs: 40 }, { file: "tests/b.test.ts", durationMs: 100 }] }, 120],
+    [{ fileDurations: [{ file: "tests/a.test.ts", durationMs: 10 }, { file: "b", durationMs: 180 }] }, 180],
+  ];
+  for (const [timing, budget] of budgets) {
+    const over = { ...timing, ceilingMs: LISTING_ALLOWANCE_MS };
+    expect(fileHangBudgetMs("tests/a.test.ts", over.fileDurations, over.ceilingMs)).toBe(budget);
+
+    // The listing alone takes longer than the whole hang budget many times over, and is not a hang.
+    const hung = fixture(false);
+    const hungListing = slowListing(hung, { delayMs: SLOW_LISTING_MS }, "hang");
+    const startedAt = Date.now();
+    const row = await round(hung, cmd, over);
+    expect(existsSync(hungListing)).toBe(true);
+    expect(Date.now() - startedAt).toBeGreaterThanOrEqual(SLOW_LISTING_MS);
+    expect(row.pass, row.details).toBe(false);
+    expect(row.meta, row.details).toMatchObject({ classification: "infra", kind: "hang", file: "tests/a.test.ts", hangBudgetMs: budget });
+    expect(row.details).toContain(`within its ${budget}ms budget`);
+    expect(() => process.kill(-(row.meta!.pid as number), 0)).toThrow(/ESRCH/);
+
+    // The same slow listing followed by work that completes is green under the same timings.
+    const released = fixture(false);
+    slowListing(released, { delayMs: SLOW_LISTING_MS }, "released");
+    const green = await round(released, cmd, over);
+    expect(green.pass, green.details).toBe(true);
+    expect(green.meta?.kind).not.toBe("hang");
+    expect(green.meta?.manifest).toEqual(["tests/a.test.ts", "tests/b.test.ts"]);
+  }
+}, 180_000);

@@ -469,21 +469,28 @@ describe("OrcaDriver placement, laziness and owned-title reconcile", () => {
     const printed = fake.last()!.lines.filter((l) => !l.startsWith("TICKMARKR_CHECKOUT "));
     expect(printed).toEqual([A, A, "/", A]); // every list member ran in A; the subshell's cd did not leak
 
+    // E1: the refused launch now waits out the 20000 ms proof ceiling, so it runs on INJECTED time; the
+    // close waits on the wrapper's exit (a barrier, not a timing oracle) before its scrollback is judged.
+    // SLOWEST-RUNNER: that barrier allows 60000 ms, a kill ceiling for a 3-core coverage runner.
     const missing = join(parent, "missing");
     const gone = new FakeOrca({ trackedWorktrees: [parent], executeCommands: true });
+    const goneClock = steppedTime();
     let goneLines: string[] = [];
-    const goneDriver = new OrcaDriver({ exec: async (args, cwd, timeout) => {
-      if (args[1] === "close") goneLines = [...gone.last()!.lines];
+    const goneDriver = new OrcaDriver({ time: goneClock, exec: async (args, cwd, timeout) => {
+      if (args[1] === "close") {
+        await expect.poll(() => gone.executed[0]?.exitCode, { timeout: 60_000 }).not.toBeUndefined();
+        goneLines = [...gone.last()!.lines];
+      }
       return gone.exec(args, cwd, timeout);
     } });
     const goneSlot = await goneDriver.slot(missing, owned("TX", 0, RUN));
     await expect(goneDriver.run(goneSlot, "printf 'first\\n'; pwd")).rejects.toBeInstanceOf(OrcaUnavailableError);
-    await expect.poll(() => gone.executed[0]?.exitCode, { timeout: 5_000 }).not.toBeUndefined();
-    expect(gone.executed[0]!.exitCode).not.toBe(0);
+    expect(goneClock.now()).toBeGreaterThanOrEqual(20_000); // refused at the injected ceiling, never before it
+    expect(gone.executed[0]!.exitCode).toBeGreaterThan(0);
     expect(gone.countOf("close")).toBe(1);
     expect(goneLines.some((l) => l === "first" || l === parent)).toBe(false); // nothing of the payload ran
     expect(goneLines.some((l) => l.startsWith("TICKMARKR_CHECKOUT "))).toBe(false); // and no proof line was minted
-  });
+  }, 120_000);
 
   test("test: a create receipt whose surface is not visible raises one attention notify naming the surface whereas a receipt whose surface is visible or absent raises none so a driver that accepts a background surface silently fails", async () => {
     const notifications: { message: string; tier?: string }[] = [];

@@ -9,7 +9,7 @@ import { report } from "../src/cli/commands/report.js";
 import { resume } from "../src/cli/commands/resume.js";
 import { ui } from "../src/cli/commands/ui.js";
 import { saveGraph } from "../src/graph/graph.js";
-import { Journal } from "../src/run/journal.js";
+import { foldOwedChecks, Journal } from "../src/run/journal.js";
 import { readOperatorState } from "../src/run/operator-state.js";
 import { applyDecisionKey, decisionConfirmLines, decisionReceiptLines, deriveRunDecisions, executeDecision, initialDecisionSession, previewDecision, withDecisionPreview } from "../src/tui/cockpit/decision-actions.js";
 import { complete, graph, partial, resumed } from "./fixtures/operator-state/fixture.js";
@@ -108,7 +108,10 @@ test("Changed README and canonical skill prose walk the recorded partial-human-p
       ...(event.event === "task-dispatch" ? { assignment: { adapter: "fake", model: "fake-1", channel: "sub", tier: "frontier" } } : {}),
     });
     for (const event of partial) appendRecorded(event);
-    const read = () => readOperatorState({ events: journal.read(), graph });
+    const read = () => {
+      const events = journal.read();
+      return readOperatorState({ events, graph, owed: { basis: "journal", fold: foldOwedChecks(events, root) }, basis: "journal" });
+    };
     expect(read()).toMatchObject({ lifecycle: "PARTIAL", green: false, merged: 1, planned: 3,
       currentTip: "passed", buckets: { human: ["T2"], blocked: ["T3"] } });
     const selected = deriveRunDecisions(journal, graph).find(d => d.taskId === "T2")!;

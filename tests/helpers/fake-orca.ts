@@ -815,6 +815,91 @@ export class FakeOrca {
   }
 }
 
+/**
+ * E1: serve `fake` with each create's replayed startup proof withheld. `seed` is what the terminal shows
+ * instead at create (default: nothing — the absent proof); with `atMs`, `arrive` (default: the real
+ * proof) lands on the first read at or after `atMs` of INJECTED time since that create. Omit `atMs`
+ * for a proof that never arrives. With `blind`, the terminal answers the OBS-1011 add.1 incident shape:
+ * its stream reads `exited` with an empty tail while it stays connected and its screen runs and paints
+ * what was seeded and what arrives.
+ */
+export function withheldProofExec(
+  fake: FakeOrca,
+  clock: { now: () => number },
+  opts: { seed?: (proof: string) => string[]; atMs?: number; arrive?: (proof: string) => string[]; blind?: boolean } = {},
+): OrcaExec {
+  const held = new Map<string, { lines: string[]; at: number }>();
+  return async (args, cwd, timeoutMs) => {
+    const handle = args[1] === "read" ? args[args.indexOf("--terminal") + 1] : undefined;
+    const pending = handle === undefined ? undefined : held.get(handle);
+    if (handle !== undefined && pending && clock.now() >= pending.at) {
+      const t = fake.of(handle);
+      (opts.blind ? t?.screenLines : t?.lines)?.push(...pending.lines);
+      held.delete(handle);
+    }
+    const r = await fake.exec(args, cwd, timeoutMs);
+    if (args[1] === "create" && r.code === 0) {
+      const t = fake.last()!;
+      const proof = t.lines.splice(0);
+      const seeded = opts.seed?.(proof[0] ?? "") ?? [];
+      if (opts.blind) Object.assign(t, { status: "exited", connected: true, orphaned: false, screenStatus: "running", screenLines: seeded });
+      else t.lines.push(...seeded);
+      if (opts.atMs !== undefined) held.set(t.handle, { lines: opts.arrive?.(proof[0] ?? "") ?? proof, at: clock.now() + opts.atMs });
+    }
+    return r;
+  };
+}
+
+/**
+ * E1: production-shaped proof reads over `exec`. Each `terminal read` takes `readMs` of INJECTED time
+ * and, with `honor`, obeys the budget it is handed the way sh's SIGKILL timeout does: given less, it is
+ * cut AT the budget (nonzero, timedOut, no stdout) and nothing was read. Without `honor` it overruns
+ * and answers late with what the terminal shows at its END. With `failCursor`, a cursor page read that
+ * starts at or after `failCursor` ms — and before `failUntil`, when given — fails outright (exit 1,
+ * inside its budget); an anchor still answers. With `stall`, a cursor page that is `limited` answers
+ * with its next cursor missing or repeating the one asked for; with `cursorless`, the anchor answers
+ * without its oldestCursor (and its `truncated` flag says whether it is the whole scrollback). With
+ * `malform`, every read (cursor pages only, with `pagesOnly`) answers a malformed tail: missing, a
+ * string instead of an array, or rows that are objects instead of strings.
+ * `onRead` sees every read as issued.
+ */
+export function pacedReadExec(
+  exec: OrcaExec,
+  clock: { now: () => number; advance: (ms: number) => void },
+  opts: {
+    readMs: number; honor?: boolean; failCursor?: number; failUntil?: number; stall?: "missing" | "repeat"; cursorless?: boolean;
+    malform?: { shape: "missing" | "non-array" | "non-string"; pagesOnly?: boolean };
+    onRead?: (read: { at: number; timeoutMs?: number; cut: boolean }) => void;
+  },
+): OrcaExec {
+  return async (args, cwd, timeoutMs) => {
+    if (args[1] !== "read") return exec(args, cwd, timeoutMs);
+    const cut = opts.honor === true && timeoutMs !== undefined && timeoutMs < opts.readMs;
+    const cursor = args.includes("--cursor") ? args[args.indexOf("--cursor") + 1] : undefined;
+    const fail = !cut && opts.failCursor !== undefined && cursor !== undefined && clock.now() >= opts.failCursor
+      && clock.now() < (opts.failUntil ?? Infinity);
+    opts.onRead?.({ at: clock.now(), timeoutMs, cut });
+    clock.advance(cut ? timeoutMs! : opts.readMs);
+    if (fail) return { code: 1, stdout: "", stderr: "orca: terminal read failed", timedOut: false };
+    if (cut) return { code: 137, signalExit: true, stdout: "", stderr: "", timedOut: true };
+    const r = await exec(args, cwd, timeoutMs);
+    const malform = opts.malform !== undefined && (cursor !== undefined || !opts.malform.pagesOnly) ? opts.malform.shape : undefined;
+    const rewrite = malform !== undefined || (cursor === undefined ? opts.cursorless : opts.stall !== undefined);
+    if (!rewrite || r.code !== 0) return r;
+    const env = JSON.parse(r.stdout) as { result: { terminal: Record<string, unknown> } };
+    const term = { ...env.result.terminal };
+    const rows = term.tail as string[];
+    if (malform === "missing") delete term.tail;
+    else if (malform === "non-array") term.tail = rows.join("\n");
+    else if (malform === "non-string") term.tail = rows.map((text) => ({ text }));
+    if (cursor === undefined) { if (opts.cursorless) delete term.oldestCursor; }
+    else if (opts.stall === undefined || term.limited !== true) { /* the last page answers as is */ }
+    else if (opts.stall === "repeat") term.nextCursor = cursor;
+    else delete term.nextCursor;
+    return { ...r, stdout: JSON.stringify({ ...env, result: { ...env.result, terminal: term } }) };
+  };
+}
+
 /** Stepped clock: sleeping or an explicit test advance moves it without real waiting. */
 export function steppedTime(): { now: () => number; sleep: (ms: number) => Promise<void>; advance: (ms: number) => void } {
   let ms = 0;

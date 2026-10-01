@@ -3,10 +3,11 @@ import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import { FakeAdapter } from "../../src/adapters/fake.js";
 import { allAdapters, writeDoctor } from "../../src/adapters/registry.js";
-import type { WorkerAdapter } from "../../src/adapters/types.js";
+import { channelsFromConfig, type WorkerAdapter } from "../../src/adapters/types.js";
 import { DEFAULT_CONFIG } from "../../src/config/config.js";
 import { doctor } from "../../src/cli/commands/doctor.js";
 import { plan } from "../../src/cli/commands/plan.js";
+import { codexCommitHeadline } from "../../src/adapters/codex-commit-check.js";
 import { harnessLine, resolveHarness } from "../../src/cli/harness.js";
 import { run } from "../../src/cli/commands/run.js";
 import { graphDefinitionHash, loadGraph, saveGraph, tickmarkrDir } from "../../src/graph/graph.js";
@@ -1255,5 +1256,234 @@ describe("OBS-1185 plan floor follows routing", () => {
     expect(tier("T3")).toBe("mid");
     expect(block("T3")[0]).toContain("floor mid (config floors)");
     expect(block("T3")).toContain("    floor mid ← config floors");
+  });
+});
+
+describe("v2.6.5 T3 — Codex linked-worktree commit restriction", () => {
+  test("plan headlines the persisted protected-metadata worker restriction on its own headline line for the Codex worker assignment while an eligible non-Codex worker and an unknown probe remain differently labelled", async () => {
+    const graph = (repo: string) => saveGraph(repo, validateGraph({
+      version: 1, spec: { source: "prd", paths: ["p"], hash: "h" },
+      tasks: [{ id: "T1", title: "t", goal: "g", shape: "chore", complexity: 2, acceptance: ["a"] }],
+    }));
+    const planWith = async (codexCommit: string | undefined, overlay: string) => {
+      const repo = makeRepo({ "keep.txt": "x\n" });
+      graph(repo);
+      writeDoctor(repo, { ...DOCTOR5, codex: { ...DOCTOR5.codex, ...(codexCommit ? { codexCommit } : {}) } } as typeof DOCTOR5);
+      withOverlay(repo, overlay);
+      const out = (await plan([], repo)).split("\n");
+      const row = out.findIndex((l) => l.startsWith("  T1 "));
+      return { row: out[row]!, below: out[row + 1]! };
+    };
+    const toCodex = "routing: { learned: off, map: { chore: { prefer: [codex] } } }\n";
+    const clean = await planWith("allowed", toCodex);
+    const restricted = await planWith("protected", toCodex);
+    const unknown = await planWith("unknown", toCodex);
+    const absent = await planWith(undefined, toCodex);
+    const other = await planWith("protected", "routing: { learned: off }\n");
+
+    expect(clean.row).toContain("→ codex:");
+    expect(clean.below).toMatch(/^    judge: /);
+    // the restriction is its own line; the worker row keeps its bytes
+    expect(restricted.row).toBe(clean.row);
+    expect(restricted.below).toBe("    worker restriction: codex linked-worktree git metadata is protected (doctor probe) — this worker cannot commit its own work; routing consequence: steer this task to an eligible non-Codex worker");
+    expect(restricted.below).not.toMatch(/--add-dir|writable_roots/);
+    for (const u of [unknown, absent]) {
+      expect(u.row).toBe(clean.row);
+      expect(u.below).toBe("    worker restriction: unknown — the codex linked-worktree commit probe has no verdict; run tickmarkr doctor");
+    }
+    // the eligible non-Codex worker carries no restriction label even beside a protected Codex record
+    expect(other.row).toContain("→ claude-code:");
+    expect(other.below).toMatch(/^    judge: /);
+    // a codex-id stub earns no headline, whatever a cached record says
+    const stubbed = [{ id: "codex" } as WorkerAdapter];
+    for (const codexCommit of ["protected", "unknown"] as const) {
+      expect(codexCommitHeadline("codex", stubbed, { codex: { ...DOCTOR5.codex, codexCommit } }), codexCommit).toBeNull();
+    }
+  });
+});
+
+describe("v2.6.5 T9 (H) plan alias identity and review-seat headlines", () => {
+  const claudeInstalled = (identities: Record<string, string | undefined>) => ({
+    "claude-code": {
+      installed: true, authed: true, models: [],
+      modelAuth: Object.fromEntries(Object.entries(authedModels(Object.keys(DEFAULT_CONFIG.tiers["claude-code"]!.models)))
+        .map(([alias, auth]) => [alias, identities[alias] ? { ...auth, identity: identities[alias] } : auth])),
+    },
+  });
+  const claudeAdapter = allAdapters().filter((a) => a.id === "claude-code");
+
+  test("test: plan headlines drift using the persisted resolved alias identity while an alias with matching persisted identity stays clean and an unprobed legacy identity stays unknown", async () => {
+    const drifted = mkRepo();
+    // doctor persisted sonnet on the stale five-date identity and opus on its own stamp; fable/haiku were never probed
+    writeDoctor(drifted, claudeInstalled({ sonnet: "claude-sonnet-5", opus: "claude-opus-4-8" }));
+    const out = await plan([], drifted, claudeAdapter);
+    const lines = out.split("\n");
+    const drift = lines.findIndex((l) => l.startsWith("alias drift: claude-code:sonnet serves claude-sonnet-5 (persisted by doctor), stamped identity claude-sonnet-5-5"));
+    expect(drift).toBeGreaterThan(0);
+    expect(drift).toBeLessThan(lines.findIndex((l) => l.startsWith("  T1 ")));
+    expect(out).not.toContain("alias drift: claude-code:opus");
+    expect(out).toContain("alias identity unknown: claude-code:fable, haiku — doctor persisted no resolved identity");
+
+    const clean = mkRepo();
+    writeDoctor(clean, claudeInstalled({ fable: "claude-fable-5-1", opus: "claude-opus-4-8", sonnet: "claude-sonnet-5-5", haiku: "claude-haiku-4-5-20251001" }));
+    const cleanOut = await plan([], clean, claudeAdapter);
+    expect(cleanOut).not.toContain("alias drift:");
+    expect(cleanOut).not.toContain("alias identity unknown:");
+
+    const legacy = mkRepo();
+    writeDoctor(legacy, claudeInstalled({}));
+    const legacyOut = await plan([], legacy, claudeAdapter);
+    expect(legacyOut).not.toContain("alias drift:");
+    expect(legacyOut).toContain("alias identity unknown: claude-code:fable, opus, sonnet, haiku");
+  });
+
+  test("test: plan warns when exactly one eligible cross-vendor review seat remains after the production eligibility filters while two distinct eligible seats and two aliases of one identity remain distinguishable", async () => {
+    const adapter = (id: string, vendor: string) => ({
+      id, vendor, probe: async () => ({ installed: true, authed: true, models: [] }),
+      channels: (cfg: Parameters<typeof channelsFromConfig>[1]) => channelsFromConfig(id, cfg),
+      headlessCommand: () => "true",
+    }) as unknown as WorkerAdapter;
+    const fleet = [adapter("aw", "va"), adapter("rv", "vb"), adapter("rc", "vc")];
+    // rows default to T1; a third element names another task of the same run.
+    type Row = Record<string, unknown> | ((prior: ReturnType<Journal["read"]>) => Record<string, unknown>);
+    const scenario = async (reviewers: Record<string, string>, identities: Record<string, string> = {}, rows: [string, Row, string?][] = [], third: Record<string, string> = {},
+      opts: { prefer?: string[]; authorPeers?: Record<string, string>; deniedWorkers?: string[] } = {}) => {
+      const authorModels = { "author-1": "mid", ...opts.authorPeers };
+      const repo = mkRepo();
+      // rv is worker-denied so the author is always aw:author-1 (mid); rv-low (cheap) sits under the
+      // RF-1 author-tier floor, so the production filter removes it from review eligibility.
+      withOverlay(repo, `tiers:
+  aw: { vendor: va, channel: sub, models: { ${Object.entries(authorModels).map(([m, t]) => `${m}: ${t}`).join(", ")} } }
+  rv: { vendor: vb, channel: sub, models: { ${Object.entries(reviewers).map(([m, t]) => `${m}: ${t}`).join(", ")} } }
+  rc: { vendor: vc, channel: sub, models: { ${Object.entries(third).map(([m, t]) => `${m}: ${t}`).join(", ")} } }
+review: { required: true${opts.prefer ? `, prefer: [${opts.prefer.join(", ")}]` : ""} }
+routing: { deny: { workers: { adapters: [${(opts.deniedWorkers ?? ["rv", "rc"]).join(", ")}] } } }
+`);
+      writeDoctor(repo, {
+        aw: { installed: true, authed: true, models: [], modelAuth: authedModels(Object.keys(authorModels)) },
+        rv: {
+          installed: true, authed: true, models: [],
+          modelAuth: Object.fromEntries(Object.entries(authedModels(Object.keys(reviewers)))
+            .map(([m, auth]) => [m, identities[m] ? { ...auth, identity: identities[m] } : auth])),
+        },
+        rc: { installed: true, authed: true, models: [], modelAuth: authedModels(Object.keys(third)) },
+      });
+      if (rows.length) {
+        const j = Journal.create(repo, "run-20260930-120000-0000000000000009");
+        j.append("run-start", undefined, { graphDefinitionHash: graphDefinitionHash(loadGraph(repo)) });
+        for (const [event, data, taskId] of rows) j.append(event, taskId ?? "T1", typeof data === "function" ? data(j.read()) : data);
+      }
+      return plan([], repo, fleet);
+    };
+
+    const single = await scenario({ "rev-a": "frontier", "rev-low": "cheap" });
+    expect(single).toContain("→ aw:author-1");
+    expect(single).toContain("  ! T1: exactly one eligible cross-vendor review seat remains — identity rev-a via rv:rev-a; one flake or demotion leaves no reviewer");
+
+    const two = await scenario({ "rev-a": "frontier", "rev-b": "frontier", "rev-low": "cheap" });
+    expect(two).toContain("→ aw:author-1");
+    expect(two).not.toContain("exactly one eligible cross-vendor review seat");
+
+    const aliases = await scenario({ "rev-a": "frontier", "rev-a2": "frontier" }, { "rev-a": "rev-x", "rev-a2": "rev-x" });
+    expect(aliases).toContain("  ! T1: exactly one eligible cross-vendor review seat remains — identity rev-x via rv:rev-a, rv:rev-a2; one flake or demotion leaves no reviewer");
+    expect(aliases).not.toBe(single);
+
+    // D-858 (1): T1's own journaled reviewers lift the gate floor (RF-1 prior-reviewer) over the mid author
+    // (rows with no T1 dispatch, so the count stays exact), so of one frontier and one mid seat exactly one
+    // stays eligible — gate-result or no-verdict alike
+    const fresh = await scenario({ "rev-a": "frontier", "rev-mid": "mid" });
+    expect(fresh).not.toContain("exactly one eligible cross-vendor review seat");
+    for (const event of ["gate-result", "review-no-verdict"]) {
+      const resumed = await scenario({ "rev-a": "frontier", "rev-mid": "mid" }, {}, [[event, { gate: "review", reviewer: "rv:rev-a", reviewerTier: "frontier" }]]);
+      expect(resumed).toContain("  ! T1: exactly one eligible cross-vendor review seat remains — identity rev-a via rv:rev-a; one flake or demotion leaves no reviewer");
+    }
+    // a review-pool-demotion journaled by T0's review leaves the rotation for the run (daemon
+    // replayedReviewerExclusions), so for never-dispatched T1 of two frontier identities exactly one stays
+    // eligible and the plan's reviewer is never the demoted seat
+    const dispatchedT0: [string, Record<string, unknown>, string] = ["task-dispatch", { attempt: 0, assignment: { adapter: "aw", model: "author-1" } }, "T0"];
+    const demoted = await scenario({ "rev-a": "frontier", "rev-b": "frontier" }, {}, [dispatchedT0, ["review-pool-demotion", { gate: "review", reviewer: "rv:rev-b", reviewerTier: "frontier" }, "T0"]]);
+    expect(demoted).toContain("  ! T1: exactly one eligible cross-vendor review seat remains — identity rev-a via rv:rev-a; one flake or demotion leaves no reviewer");
+    expect(demoted).toContain("    review: rv:rev-a");
+    expect(demoted).not.toContain("review: rv:rev-b");
+    // D-858 parity, one regression per production input (run-gates.ts:1299-1305, daemon.ts excludeReviewers):
+    // (1) floor = this task's reviewers ∪ excludeReviewers — a replayed demoted frontier seat lifts the mid
+    // author's floor, so for never-dispatched T1 of a mid and a frontier seat only the frontier one stays eligible
+    const mixed = await scenario({ "rev-a": "frontier", "rev-b": "frontier", "rev-mid": "mid" }, {}, [dispatchedT0, ["review-pool-demotion", { gate: "review", reviewer: "rv:rev-b" }, "T0"]]);
+    expect(mixed).toContain("  ! T1: exactly one eligible cross-vendor review seat remains — identity rev-a via rv:rev-a; one flake or demotion leaves no reviewer");
+    expect(mixed).toContain("    review: rv:rev-a");
+    // (2) retired: a seat with two no-verdicts anywhere in this run leaves every pick; a checkout-proof timeout never strikes
+    const strike = (cause: Record<string, unknown>): [string, Record<string, unknown>, string] => ["review-no-verdict", { reviewer: "rv:rev-b", noVerdict: true, ...cause }, "T0"];
+    const retired = await scenario({ "rev-a": "frontier", "rev-b": "frontier" }, {}, [strike({ cause: "silent" }), strike({ cause: "truncated" })]);
+    expect(retired).toContain("  ! T1: exactly one eligible cross-vendor review seat remains — identity rev-a via rv:rev-a; one flake or demotion leaves no reviewer");
+    expect(retired).not.toContain("review: rv:rev-b");
+    const timedOut = await scenario({ "rev-a": "frontier", "rev-b": "frontier" }, {}, [strike({ cause: "silent" }), strike({ cause: "seat-launch-failed", launchCause: "checkout-proof-timeout" })]);
+    expect(timedOut).not.toContain("exactly one eligible cross-vendor review seat");
+    // (5) prefer only reorders: it moves the previewed seat, never the count
+    const preferred = await scenario({ "rev-a": "frontier", "rev-b": "frontier" }, {}, [], {}, { prefer: ["rv:rev-b"] });
+    expect(preferred).toContain("    review: rv:rev-b");
+    expect(preferred).not.toContain("exactly one eligible cross-vendor review seat");
+    const preferredOut = await scenario({ "rev-a": "frontier", "rev-low": "cheap" }, {}, [], {}, { prefer: ["rv:rev-low"] });
+    expect(preferredOut).toContain("  ! T1: exactly one eligible cross-vendor review seat remains — identity rev-a via rv:rev-a; one flake or demotion leaves no reviewer");
+    // (6) the author's own vendor: a frontier sibling of the author's adapter is never a review seat
+    const sibling = await scenario({ "rev-a": "frontier" }, {}, [], {}, { authorPeers: { "author-peer": "frontier" } });
+    expect(sibling).toContain("→ aw:author-1");
+    expect(sibling).toContain("  ! T1: exactly one eligible cross-vendor review seat remains — identity rev-a via rv:rev-a; one flake or demotion leaves no reviewer");
+    // D-862: once T1 is dispatched its author is resume state only the daemon decides (a restored or
+    // failed-over seat, a climb, carried commits, a parked recheck), so the count is unknown — no single-seat
+    // claim and no previewed reviewer, never a guess. Every case below has one frontier seat on each of vb and
+    // vc; the never-dispatched control counts both exactly.
+    const crossVendor = await scenario({ "rev-a": "frontier" }, {}, [], { "rev-c": "frontier" });
+    expect(crossVendor).toContain("    review: r");
+    expect(crossVendor).not.toContain("exactly one eligible cross-vendor review seat");
+    expect(crossVendor).not.toContain("count unknown");
+    const unknown = (out: string) => {
+      expect(out).toContain("  ! T1: eligible cross-vendor review seat count unknown — resume state decides the author");
+      expect(out).toContain("    review: unknown — resume state decides the author");
+      expect(out).not.toContain("exactly one eligible cross-vendor review seat");
+      expect(out).not.toMatch(/review: r[vc]:/);
+    };
+    const workers = { deniedWorkers: ["rc"] };
+    const dispatched = (adapter: string, model: string, tier: string): [string, Record<string, unknown>] =>
+      ["task-dispatch", { attempt: 0, assignment: { adapter, model, channel: "sub", tier } }];
+    // (b) astra's case: the journaled author rv:rev-b (frontier, vb) differs from the fresh route aw:author-1
+    const restored = await scenario({ "rev-b": "frontier" }, {}, [dispatched("rv", "rev-b", "frontier")], { "rev-c": "frontier" }, workers);
+    expect(restored).toContain("→ aw:author-1");
+    unknown(restored);
+    // (c) dispatched under the fresh route's own author, no carry
+    unknown(await scenario({ "rev-a": "frontier" }, {}, [dispatched("aw", "author-1", "mid")], { "rev-c": "frontier" }));
+    // the two-attempt carry: vb authors, aw carries
+    unknown(await scenario({ "rev-a": "frontier" }, {}, [
+      ["task-dispatch", { attempt: 0, assignment: { adapter: "rv", model: "rev-a" } }],
+      ["worker-result", { ok: false }],
+      ["task-dispatch", { attempt: 1, assignment: { adapter: "aw", model: "author-1" } }],
+      ["worktree-recreation", { attempted: ["c0ffee"], carried: ["c0ffee"] }],
+    ], { "rev-c": "frontier" }));
+    // the three-attempt chain: vb authors; vc carries and commits nothing; aw carries and adds
+    unknown(await scenario({ "rev-a": "frontier" }, {}, [
+      ["task-dispatch", { attempt: 0, assignment: { adapter: "rv", model: "rev-a" } }],
+      ["worker-result", { ok: false }],
+      ["task-dispatch", { attempt: 1, assignment: { adapter: "rc", model: "rev-c" } }],
+      ["worktree-recreation", { attempted: ["c0ffee"], carried: ["c0ffee"] }],
+      ["worker-result", { ok: false }],
+      ["task-dispatch", { attempt: 2, assignment: { adapter: "aw", model: "author-1" } }],
+      ["worktree-recreation", { attempted: ["c0ffee"], carried: ["c0ffee"] }],
+    ], { "rev-c": "frontier" }));
+    // a recreation that carried nothing, a replayed worker exclusion of the journaled author, a tier climb and a
+    // pending recheck are resume state too
+    unknown(await scenario({ "rev-a": "frontier" }, {}, [
+      ["task-dispatch", { attempt: 0, assignment: { adapter: "rv", model: "rev-a" } }],
+      ["task-dispatch", { attempt: 1, assignment: { adapter: "aw", model: "author-1" } }],
+      ["worktree-recreation", { attempted: [], carried: [] }],
+    ], { "rev-c": "frontier" }));
+    unknown(await scenario({ "rev-b": "frontier" }, {}, [dispatched("rv", "rev-b", "frontier"),
+      ["channel-exclusion", { channel: "rv:rev-b", reason: "no output twice", kind: "dead-channel" }]], { "rev-c": "frontier" }, workers));
+    unknown(await scenario({ "rev-b": "frontier" }, {}, [dispatched("aw", "author-1", "mid"), ["tier-escalated", { from: "aw:author-1", to: "rv:rev-b" }]],
+      { "rev-c": "frontier" }, workers));
+    const recheck = (prior: ReturnType<Journal["read"]>) => ({ release: "recheck", park: { line: prior.length, ts: prior.at(-1)!.ts } });
+    unknown(await scenario({ "rev-b": "frontier" }, {}, [dispatched("rv", "rev-b", "frontier"), ["task-human", { reason: "review" }], ["task-approved", recheck]],
+      { "rev-c": "frontier" }, workers));
+    // a dispatch of ANOTHER task leaves never-dispatched T1 exact
+    expect(await scenario({ "rev-b": "frontier" }, {}, [[...dispatched("rv", "rev-b", "frontier"), "T0"]], { "rev-c": "frontier" }, workers))
+      .not.toContain("count unknown");
   });
 });

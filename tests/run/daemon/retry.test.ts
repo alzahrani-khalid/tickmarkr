@@ -1317,17 +1317,21 @@ describe("T3 retry economics (fake adapter, zero tokens)", () => {
 
   test("test: a funded repair whose battery died at the test gate before reaching the review gate it was funded for is not charged so a third repair is still funded and the repair-exhausted row names per repair the funded gates the gate reached and the gate it died at whereas the shipped counter that charges every repair-attempt row and names only the last round's failing gates fails", async () => {
     const runId = "run-repair-reached";
-    const testCmd = "test ! -f broken.txt";
+    // The two test reds name different defects, so the second is a new failure rather than a repeat.
+    const testCmd = "test ! -f broken.txt || { cat broken.txt; exit 1; }";
     const { repo, fake, scriptPath } = setupRepo(
       [T("T1", { status: "human", humanGate: true, complexity: 8, acceptance: [{ oracle: "command", command: "true" }] })],
       {
         review: { approve: false, findings: [{ note: "`fixReview` in src/review.ts is incomplete", severity: "material" }] },
         consult: { action: "human", notes: "repair ladder exhausted" },
+        // v2.6.5 T6: a repair reviews first unless its task has a test red on record, so the opening
+        // attempt reds the test gate — every later repair is then battery-first, and the review-funded
+        // repair 2 dies at the test gate before reaching its review.
         tasks: { T1: [
-          { shell: `echo one > marker.txt && ${COMMIT} one`, result: { ok: true, summary: "one" } },
-          { shell: `echo broken > broken.txt && ${COMMIT} two`, result: { ok: true, summary: "two" } },
-          { shell: `git rm -q broken.txt && echo three > marker.txt && ${COMMIT} three`, result: { ok: true, summary: "three" } },
-          { shell: `echo four > marker.txt && ${COMMIT} four`, result: { ok: true, summary: "four" } },
+          { shell: `echo 'AssertionError: first defect' > broken.txt && echo one > marker.txt && ${COMMIT} one`, result: { ok: true, summary: "one" } },
+          { shell: `git rm -q broken.txt && echo two > marker.txt && ${COMMIT} two`, result: { ok: true, summary: "two" } },
+          { shell: `echo 'AssertionError: second defect' > broken.txt && echo three > marker.txt && ${COMMIT} three`, result: { ok: true, summary: "three" } },
+          { shell: `git rm -q broken.txt && echo four > marker.txt && ${COMMIT} four`, result: { ok: true, summary: "four" } },
           { shell: `echo five > marker.txt && ${COMMIT} five`, result: { ok: true, summary: "five" } },
           { shell: `echo six > marker.txt && ${COMMIT} six`, result: { ok: true, summary: "six" } },
         ] },
@@ -1352,9 +1356,9 @@ describe("T3 retry economics (fake adapter, zero tokens)", () => {
     const exhausted = events.find((e) => e.event === "repair-exhausted" && e.taskId === "T1")!;
     expect(exhausted.data.repairs).toBe(2);
     expect(exhausted.data.reached).toEqual([
-      expect.objectContaining({ repair: 1, funded: ["review"], reached: expect.arrayContaining(["test"]), diedAt: "test", charged: false }),
-      expect.objectContaining({ repair: 2, funded: ["test"], reached: expect.arrayContaining(["test", "review"]), diedAt: "review", charged: true }),
-      expect.objectContaining({ repair: 3, funded: ["review"], reached: expect.arrayContaining(["review"]), diedAt: "review", charged: true }),
+      expect.objectContaining({ repair: 1, funded: ["test"], reached: expect.arrayContaining(["test", "review"]), diedAt: "review", charged: true }),
+      expect.objectContaining({ repair: 2, funded: ["review"], reached: expect.arrayContaining(["test"]), diedAt: "test", charged: false }),
+      expect.objectContaining({ repair: 3, funded: ["test"], reached: expect.arrayContaining(["test", "review"]), diedAt: "review", charged: true }),
     ]);
   }, 180_000);
 
@@ -2042,7 +2046,9 @@ describe("T6 outstanding review findings (fake adapter, zero tokens)", () => {
 
   // ONE run, the shape the goal describes end to end:
   //   a0 commits            → the reviewer anchors a material finding (repair 1 of 2 is funded)
-  //   a1 repairs, breaks the test gate → the round fails for a reason that never mentions the finding
+  //   a1 repairs, breaks the lint gate → the round fails for a reason that never mentions the finding
+  //                           (v2.6.5 T6: lint, because a review-driven repair reviews before its test
+  //                           screen; the cheap battery still runs before review in every order)
   //   a2 dies at dispatch   → no worker-result, no gate result: no verdict at all
   //   resume --retry-failed → the dispatch after the death, rebuilt by a FRESH process from the
   //                           journal alone, so no loop-local brief can answer for it
@@ -2064,7 +2070,7 @@ describe("T6 outstanding review findings (fake adapter, zero tokens)", () => {
           { shell: `git rm -q broken.txt && ${COMMIT} b2`, result: { ok: true, summary: "a2" } },
         ] },
       },
-      "gates: { test: 'test ! -f broken.txt' }\n",
+      "gates: { lint: 'test ! -f broken.txt' }\n",
     );
     repo = s.repo;
     await runDaemon(repo, { adapters: [s.fake], runId, driver: deathOnWorkerDispatch(3) });
@@ -2084,22 +2090,22 @@ describe("T6 outstanding review findings (fake adapter, zero tokens)", () => {
     const reviewFail = evs.find((e) => e.event === "gate-result" && e.taskId === "T1"
       && e.data.gate === "review" && e.data.pass === false)!;
     expect(String(reviewFail.data.details)).toContain(FINDING);
-    // attempt 1 then failed the TEST gate — a reason that never mentions the finding, and one that
+    // attempt 1 then failed the LINT gate — a reason that never mentions the finding, and one that
     // returns the battery before review is even launched, so the finding drew no second row.
     const attempt1 = evs.slice(evs.indexOf(dispatches[1]!), evs.indexOf(dispatches[2]!));
     const failed1 = attempt1.filter((e) => e.event === "gate-result" && e.data.pass === false);
-    expect(failed1.map((e) => e.data.gate)).toEqual(["test"]);
+    expect(failed1.map((e) => e.data.gate)).toEqual(["lint"]);
     expect(JSON.stringify(failed1)).not.toContain("applyMarker");
 
     // the CONTROL: the previous attempt's failure bytes are all the journaled brief carries, and it
     // omits the finding entirely — a dispatch built from them alone is an amnesia dispatch.
     const beforeDispatch = evs.slice(0, evs.indexOf(dispatches[2]!));
     const lastAttemptBytes = journaledFailureBrief(beforeDispatch, "T1").join("\n\n");
-    expect(lastAttemptBytes).toContain("test: ");
+    expect(lastAttemptBytes).toContain("lint: ");
     expect(lastAttemptBytes).not.toContain("applyMarker");
-    // and the funded repair — the ONE dispatch that carries findings today — carries the test
+    // and the funded repair — the ONE dispatch that carries findings today — carries the lint
     // findings for this round, not the reviewer's: its budget was spent on the unrelated failure.
-    expect(pendingRepairFindings(beforeDispatch, "T1")).toContain("test: ");
+    expect(pendingRepairFindings(beforeDispatch, "T1")).toContain("lint: ");
     expect(pendingRepairFindings(beforeDispatch, "T1")).not.toContain("applyMarker");
 
     // yet the dispatch AFTER that one is handed the finding's own text, verbatim
@@ -2292,7 +2298,7 @@ describe("T6 a settled review finding stops travelling (fake adapter, zero token
 // ~2.3s of this file's ~65s, and the full suite ran green (264 files / 3584 tests, zero RPC timeouts)
 // under `VITEST_MAX_FORKS=6` at load average 20-32 on 18 cores. The discriminator is the headline: an
 // assertion red at load is real, an assertion-free red at load is infra. Do not shrink this block to
-// chase it — every attempt below is load-bearing (a1 breaks the TEST gate on purpose so the round's own
+// chase it — every attempt below is load-bearing (a1 breaks the LINT gate on purpose so the round's own
 // feedback quotes neither finding, which is what makes the brief assertion read off the journal alone).
 // Both fields deliberately span physical lines. review.ts renders their JSON strings into prose, so
 // this pins the journal projection to logical finding boundaries instead of the first newline.
@@ -2316,7 +2322,7 @@ describe("T2 a passing review does not drop what it deferred (fake adapter, zero
 
   // ONE task, two runs, the whole life of a deferral beside a blocking finding it must not be fused with:
   //   run A  a0 the reviewer BLOCKS on a material finding and DEFERS a second one with a rationale
-  //          a1 breaks the test gate — the battery stops before review, so the round's own feedback
+  //          a1 breaks the lint gate — the battery stops before review, so the round's own feedback
   //             quotes neither finding and the next brief must carry both on the journal's evidence
   //          a2 draws the same review again → two failing review rounds → the engagement's cap parks it
   //   approve --uphold → funds one fixed attempt; an uphold settles nothing
@@ -2341,16 +2347,16 @@ describe("T2 a passing review does not drop what it deferred (fake adapter, zero
           { shell: `git rm -q broken.txt && ${COMMIT} b2`, result: { ok: true, summary: "a2" } },
         ] },
       },
-      "gates: { test: 'test ! -f broken.txt' }\n",
+      "gates: { lint: 'test ! -f broken.txt' }\n",
     );
     repo = s.repo;
     await runDaemon(repo, { adapters: [closingReview(s.fake, s.scriptPath, "reraised"), reviewOnlySeat(s.repo, s.scriptPath)], runId });
-    // the dispatch AFTER the test-gate round: its own feedback quotes neither finding, so whatever it
+    // the dispatch AFTER the lint-gate round: its own feedback quotes neither finding, so whatever it
     // says about them it says on the journal's evidence alone. Read here, before run B can reuse a
     // prompt path for the same attempt number.
     const runA = evsOf(repo, runId);
     const afterTestFail = runA.slice(
-      runA.findIndex((e) => e.event === "gate-result" && e.data.gate === "test" && e.data.pass === false),
+      runA.findIndex((e) => e.event === "gate-result" && e.data.gate === "lint" && e.data.pass === false),
     ).find((e) => e.event === "task-dispatch" && e.taskId === "T1")!;
     briefAfterUnrelatedFailure = readFileSync(promptPath(repo, runId, afterTestFail.data.attempt as number), "utf8");
     // and the ORDINARY path: the dispatch immediately after the failing review, whose own raw bytes
@@ -2441,10 +2447,10 @@ describe("T2 a passing review does not drop what it deferred (fake adapter, zero
   });
 
   test("test: the dispatch brief presents a deferred finding as accepted-with-rationale and a blocking one as awaiting a passing review, each under a heading true of it; one heading covering both restates about the deferral the falsehood this task removes and: it fails", () => {
-    // the CONTROL: the round before this dispatch failed on `test` alone — the battery returns before
+    // the CONTROL: the round before this dispatch failed on `lint` alone — the battery returns before
     // review even launches — so this brief's own feedback quotes neither finding and both headings
     // below are written off the journal's evidence.
-    expect(briefAfterUnrelatedFailure).toContain("test: ");
+    expect(briefAfterUnrelatedFailure).toContain("lint: ");
     const open = sectionUnder(briefAfterUnrelatedFailure, OPEN_HEADING);
     const deferred = sectionUnder(briefAfterUnrelatedFailure, DEFER_HEADING);
     expect(open).not.toBe("");

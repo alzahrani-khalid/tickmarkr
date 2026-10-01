@@ -2,6 +2,7 @@ import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { parseArgs } from "node:util";
 import { allAdapters, doctorAgeMs, modelAuthExclusions, probeAll, readDoctor, rolePools, servableExclusions, servabilityLine } from "../../adapters/registry.js";
+import { aliasIdentityHeadlines } from "../../adapters/model-discovery-check.js";
 import { formatModelAuthLine, contextWindowLints, modelLints, preferEntryLints, ttyVisual, type RoutedAssignment } from "../../adapters/model-lints.js";
 import { GLYPHS, dim, rule, title, warn } from "../../brand.js";
 import { collateralLints, sourceScopeLints } from "../../compile/collateral.js";
@@ -15,9 +16,10 @@ import { disallowedBy, excludedChannels, exclusionLine, observedSeat, routingEnt
 import { decayWeight, HALF_LIFE_RUNS, staffLedEvidence } from "../../route/profile.js";
 import { resolvedFloor, route, RoutingError } from "../../route/router.js";
 import { auditNamedTestOracles, listVitestTests, type VitestListResult } from "../../gates/acceptance.js";
-import { modelId, modelProvider, pickReviewer } from "../../gates/review.js";
+import { carriedAuthorVendors, gateReviewerFloor, modelId, modelProvider, pickReviewer } from "../../gates/review.js";
 import { Journal, loadRoutingProfile, readProfileCursor, recordedGraphDefinitionHash, RUNS_WINDOW, type JournalEvent } from "../../run/journal.js";
 import { harnessLine, resolveHarness } from "../harness.js";
+import { codexCommitHeadline } from "../../adapters/codex-commit-check.js";
 import { channelKey, shq, type Assignment, type BillingChannel, type WorkerAdapter } from "../../adapters/types.js";
 import { shGit } from "../../run/git.js";
 import { runLockRunId, runStatusLine } from "../../run/lock.js";
@@ -148,6 +150,15 @@ async function taskInputFindings(tasks: readonly Task[], cwd: string): Promise<T
   return findings;
 }
 
+/**
+ * v2.6.5 T9 (D-862): a task the run never dispatched gates under the fresh route's author, so plan can
+ * mirror its review eligibility exactly. Once dispatched, resume state only the daemon decides (a restored
+ * or failed-over author, a tier climb, carried commits, a parked recheck) picks the author — fail closed.
+ * ponytail: unknown, not exact; call production's own resume functions once daemon.ts can export them (POOL).
+ */
+const resumeDecidesAuthor = (events: readonly JournalEvent[], taskId: string): boolean =>
+  events.some((row) => row.taskId === taskId && row.event === "task-dispatch");
+
 // v1.89 T4: harnessFrom is the resolver's INPUT — a caller (the byte-pinned goldens) fixes the location
 // and keeps this machine's absolute paths out of a fixture. The default is the INVOKED entrypoint,
 // `process.argv[1]`: the bin symlink a global install puts on PATH, which resolves to dist/cli/index.js.
@@ -201,6 +212,24 @@ export async function plan(
         .filter((event) => event.event === "gate-result" && event.data.gate === "review" && typeof event.data.reviewer === "string")
         .map((event) => event.data.reviewer as string)
     : [];
+  // daemon.ts replayedReviewerExclusions: a journaled review-pool-demotion is excluded from every review
+  // pick of the resumed run this plan previews (reviewer role only).
+  const replayedReviewerExclusions = [...new Set((matchingEvents ?? [])
+    .filter((event) => event.event === "review-pool-demotion" && typeof event.data.reviewer === "string")
+    .map((event) => event.data.reviewer as string))];
+  const demotedReviewers = new Set(replayedReviewerExclusions);
+  // daemon.ts demotedChannels: the resumed run's worker exclusions (journal replayExcludedChannels).
+  const runJournal = matchingRunId ? Journal.open(cwd, matchingRunId) : undefined;
+  const demotedWorkers = runJournal?.replayExcludedChannels() ?? new Set<string>();
+  // run-gates.ts retired (OBS-1025 add.2): seats with two no-verdicts this run are out of every pick, tallied
+  // as daemon.ts seeds reviewNoVerdicts — noVerdict rows only, and a checkout-proof timeout never strikes.
+  const noVerdicts = new Map<string, number>();
+  for (const event of matchingEvents ?? []) {
+    if (event.event !== "review-no-verdict" || event.data.noVerdict !== true || typeof event.data.reviewer !== "string") continue;
+    if (event.data.cause === "seat-launch-failed" && event.data.launchCause === "checkout-proof-timeout") continue;
+    noVerdicts.set(event.data.reviewer, (noVerdicts.get(event.data.reviewer) ?? 0) + 1);
+  }
+  const retiredReviewers = [...noVerdicts].filter(([, n]) => n >= 2).map(([seat]) => seat);
   // OBS-947 repair: a resumed run re-dispatches only tasks whose replayed status is pending (or that the
   // journal never mentions). done, failed and human are all skipped alike, so rendering their preview
   // picks must not advance the shared reviewHistory — a phantom draw wraps the LRU and makes a later
@@ -261,6 +290,9 @@ export async function plan(
       "",
     );
   }
+  // v2.6.5 T9 (H): alias drift is read from the identity doctor persisted, never re-probed here.
+  const aliasHeadlines = aliasIdentityHeadlines(cfg, health);
+  if (aliasHeadlines.length) lines.push(...aliasHeadlines, "");
   const entrySeats = routingEntrySeatLines(cfg);
   if (entrySeats.length) lines.push(...entrySeats, "");
   // OBS-1185: the floor route() resolved for THIS task — a task hint over the configured/mode floor.
@@ -365,11 +397,37 @@ export async function plan(
     if (policy === "judge-only") return { line: "none — reviewPolicy judge-only: declared leaf paths", cost: 0 };
     let rotationSeat = 1;
     let rotationCount = 0;
+    // Dispatched before: no count, no single-seat claim, no previewed reviewer (and so no rotation draw this
+    // plan could name). Never a guess.
+    if (resumeDecidesAuthor(matchingEvents ?? [], task.id)) {
+      lints.push(`${task.id}: eligible cross-vendor review seat count unknown — resume state decides the author`);
+      return { line: "unknown — resume state decides the author", cost: 0 };
+    }
+    // Never dispatched, daemon.ts subjectAuthors is just the fresh author; its vendor stays off the review.
+    const authors = [channelKey(author)];
+    const authorVendors = carriedAuthorVendors(pools.review, authors);
+    // Production's inputs as the task's first review round sees them: excludeReviewers = daemon badReviewers =
+    // replayedReviewerExclusions. run-gates.ts:1303 floors on THIS task's journaled reviewers at their dispatched
+    // tiers (daemon taskReviewers) ∪ excludeReviewers, so a replayed exclusion RAISES the floor; :1305 picks
+    // with excludeReviewers ∪ retired. prefer only reorders (the seat count below passes none).
+    const priorReviewers = [...(matchingEvents ?? []).filter((e) => e.taskId === task.id && typeof e.data.reviewer === "string"
+      && ((e.event === "gate-result" && e.data.gate === "review") || e.event === "review-no-verdict"))
+      .map((e) => ({ reviewer: e.data.reviewer as string, tier: e.data.reviewerTier })), ...replayedReviewerExclusions];
+    const reviewFloor = gateReviewerFloor(task, cfg, author, pools.review, priorReviewers).floor;
+    const exclusions = [...replayedReviewerExclusions, ...retiredReviewers];
     const reviewer = pickReviewer(
-      author, pools.review, [], cfg.review.prefer ?? [], task.routingHints?.floor,
-      reviewHistory, (seat, count) => { rotationSeat = seat; rotationCount = count; },
+      author, pools.review, exclusions, cfg.review.prefer ?? [], reviewFloor,
+      reviewHistory, (seat, count) => { rotationSeat = seat; rotationCount = count; }, demotedReviewers, authorVendors, authors,
     );
     if (!reviewer) return { line: "none — no cross-vendor reviewer available", cost: 0 };
+    // v2.6.5 T9 (H): one flaked or demoted seat away from no reviewer. Enumerate the production filter
+    // (pickReviewer at the gate's floor) and count served identities, so two aliases of one model count once.
+    const seats: BillingChannel[] = [];
+    for (let s; (s = pickReviewer(author, pools.review, [...exclusions, ...seats.map(channelKey)], [], reviewFloor, [], undefined, demotedReviewers, authorVendors, authors));) seats.push(s);
+    const identities = new Set(seats.map((c) => c.identity ?? modelId(c.model)));
+    if (identities.size === 1) {
+      lints.push(`${task.id}: exactly one eligible cross-vendor review seat remains — identity ${[...identities][0]} via ${seats.map(channelKey).join(", ")}; one flake or demotion leaves no reviewer`);
+    }
     // Advance the simulated rotation only for tasks the run would actually dispatch next — the same
     // rule as readyTasks (src/graph/graph.ts): pending, with every dependency already done. A pending
     // task behind a parked/failed/pending dependency cannot run, so it consumes no draw (RULING-229-14).
@@ -409,7 +467,8 @@ export async function plan(
       continue;
     }
     try {
-      const r = route(t, cfg, channels, dispatchProfile);
+      // daemon.ts:3322: the resumed run routes around its replayed worker exclusions.
+      const r = route(t, cfg, channels, dispatchProfile, undefined, demotedWorkers);
       routed.push({ taskId: t.id, adapter: r.assignment.adapter, model: r.assignment.model });
       for (const l of r.lints) {
         const suf = exclusionReason(l);
@@ -421,6 +480,7 @@ export async function plan(
       cost += est + judge.cost + review.cost;
       lines.push(
         `  ${t.id.padEnd(6)} ${t.shape.padEnd(10)} c${String(t.complexity).padEnd(3)}→ ${r.assignment.adapter}:${r.assignment.model} [${r.assignment.channel}/${r.assignment.tier}]${t.timeoutMinutes !== undefined ? ` (timeout ${t.timeoutMinutes}m)` : ""}${t.humanGate ? " (human gate)" : ""}${est ? ` ~$${est.toFixed(2)}` : ""} — ${r.provenance}`,
+        ...[codexCommitHeadline(r.assignment.adapter, adapters, health)].filter((l): l is string => l !== null),
         `    judge: ${judge.line}${judge.cost ? ` ~$${judge.cost.toFixed(2)}` : ""}`,
         `    review: ${review.line}${review.cost ? ` ~$${review.cost.toFixed(2)}` : ""}`,
         chainLine(t),

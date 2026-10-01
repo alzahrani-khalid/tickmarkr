@@ -2,6 +2,29 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v2.6.5 — no dead ends, and no wasted rounds
+
+**v2.6.5** gives every stuck state a lawful exit and stops paying twice for the same round. A failed review round always ends in a recorded exit with a bounded recovery path; a refused scope expansion can be released with its standing reason; a semantic repair is reviewed before its test battery is paid for; and finished cells settle instead of spinning forever. Seat launches get a fair proof window, the run's completion headline requires a known-empty current debt, and doctor reports what actually blocks a Codex commit, a drifted alias or a LaunchServices restart. Run `run-20260930-225704-0000000000000223`: 13/13 merged in one lap, green at run-end (done 13; failed, human, blocked and pending empty; owed checks known and 0; tip build/test/lint fresh on cff74234, 389 test files; no task waived).
+
+- **T1 — listing fixtures survive a slow runner.** Test discovery separates its listing and setup allowance from hang detection, and the repository scanner catches excluded archive children joined to `specs`.
+- **T2 — native process-title churn is prevented at the shell boundary (Darwin).** Every child shell gets one quoted preload in its effective `NODE_OPTIONS` (opt out with `TICKMARKR_NATIVE_PROCESS_TITLE=1`); npm's secret hiding is kept. **Upgrade note: on macOS, cached gate verdicts and verify baselines recapture once after upgrading**, because the effective preload identity is part of the runner identity.
+- **T3 — doctor reports the real Codex linked-worktree commit restriction.** A zero-token linked-worktree `index.lock` probe with an ordinary-file positive control replaces the guess.
+- **T4 — review seats get a fair checkout-proof window** (10 s injected, 20 s ceiling), and the typed launch cause is retained through the gate.
+- **T5 — every failed review round has a lawful exit and a bounded recovery path.** Held rows are published and pending parallel work is cleared at both round boundaries and before a thrown round fails the task.
+- **T6 — a semantic repair is reviewed before its test battery.** Carried material findings run the cheap gates, then acceptance with review, then the test screen, then the unchanged merge-candidate battery; a full suite's green stands only for the identity it measured.
+- **T7 — each prior finding gets its own heading,** so closure maps to the right material.
+- **T8 — Fleet saves Auto as a lower-layer pin mask** and previews the staged metadata it will write.
+- **T9 — discovery coverage and alias drift resolve from sourced identities.** Doctor refreshes coverage at most once after discovery; plan's single-seat advisory counts exactly only for never-dispatched tasks and says unknown otherwise.
+- **T10 — doctor and standalone verify detect a LaunchServices restart** (Darwin) as a best-effort advisory that never changes verify's verdict, JSON or exit code, and never refreshes doctor's auth freshness.
+- **T11 — unfinished gate cells settle at terminal boundaries** to unknown when their task parks, fails or blocks, or when execution ends.
+- **T12 — every completion headline requires a known-empty current debt.**
+- **T13 — a refused scope expansion can be released with its standing reason** (`approve --reason` on the open scope-request park).
+
+**Fixes landed beside the run (each with its own `tickmarkr verify --base` verdict).**
+- **The skills keep the daemon and its board in the orchestrator's tab.** `tickmarkr run` and `resume` launch as a host-owned split of the orchestrator's own pane (Orca and herdr forms; an overseer fallback targets the recorded orchestrator handle, never its own terminal), and seat beats run detached and invisible, one per seat, with an idempotent start/stop and a run-end stop.
+- **The daemon's board keeps its rails, gives stacked titles room, and gains a Log view.** The board a run places beside its terminal now shows the same side rails as the manual cockpit; in the stacked (narrow) band the task title uses the rest of the line; and a fourth view, **7 Log**, shows the run journal through the daemon's own narration formatter, following the tail by default, with paging that survives a journal append between refreshes.
+- **`tickmarkr verify` re-captures its baseline when the runner changes.** The cached standalone baseline is keyed on the effective runner inputs (the same identity the daemon uses), so a changed preload, `NODE_OPTIONS` or native-title mode recaptures once instead of reusing a baseline measured under another runner.
+
 ## v2.6.4 — honest state, and a faster run
 
 **v2.6.4** makes what tickmarkr reports match what is still owed, and trims repeated work. A waive now records the check it leaves owed, and a matching verify discharges it; status, report and the run's green rails read that current debt. Standalone verify finishes its semantic gates before it leases the test suite. Codex retirement and window knowledge, user-layer model choices, alias-aware exclusions and live board reads are corrected. Run `run-20260929-184142-0000000000000204`: 13/13 merged over six laps, green at run-end (done 13; failed, human, blocked and pending empty; tip build/test/lint fresh on 61068fde, 385 test files).

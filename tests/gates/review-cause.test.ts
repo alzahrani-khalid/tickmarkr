@@ -1,5 +1,5 @@
 import { execSync } from "node:child_process";
-import { mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test, vi } from "vitest";
@@ -8,13 +8,15 @@ import { qwen } from "../../src/adapters/qwen.js";
 import type { Assignment, BillingChannel } from "../../src/adapters/types.js";
 import { PLAIN_BANNER } from "../../src/brand.js";
 import { DEFAULT_CONFIG } from "../../src/config/config.js";
+import { OrcaDriver } from "../../src/drivers/orca.js";
 import type { ExecutorDriver, Slot } from "../../src/drivers/types.js";
-import { type GateVia, runLlmDetailed, REVIEW_FIRST_LIVENESS_MS, REVIEW_SILENT_BYTE_FLOOR, PROMPT_GLYPHS, reviewSeatOutput, setGateCpuAccountantFactoryForTests, resetGateCpuAccountantFactoryForTests, verdictNonceLine } from "../../src/gates/llm.js";
+import { type GateVia, runLlmDetailed, SeatLaunchError, REVIEW_FIRST_LIVENESS_MS, REVIEW_SILENT_BYTE_FLOOR, PROMPT_GLYPHS, reviewSeatOutput, setGateCpuAccountantFactoryForTests, resetGateCpuAccountantFactoryForTests, verdictNonceLine } from "../../src/gates/llm.js";
 import { captureBaseline } from "../../src/gates/baseline.js";
 import { runGates, type GateEvent } from "../../src/gates/run-gates.js";
 import { reviewGate } from "../../src/gates/review.js";
 import { classifyVerdictCause } from "../../src/gates/verdict-cause.js";
 import { validateGraph } from "../../src/graph/schema.js";
+import { FakeOrca, steppedTime, withheldProofExec } from "../helpers/fake-orca.js";
 import { makeRepo } from "../helpers/tmprepo.js";
 
 class VerdictPane implements ExecutorDriver {
@@ -640,4 +642,56 @@ test("test: a judge pane that times out under keep stays open while a review sea
   }
   expect(reviewPane.elapsed).toBeGreaterThanOrEqual(100);
   expect(reviewPane.closed).toBe(1);
+});
+
+// E1: a review seat whose Orca terminal never proved its checkout is a seat-launch failure like any
+// other — cause seat-launch-failed, no verdict, infra — but it carries the typed launchCause from the
+// driver through SeatLaunchError onto the row, where a different launch error (the Orca runtime not
+// reachable) carries none. The cause is never replaced; the type rides beside it.
+test("runGates preserves seat-launch-failed with checkout-proof-timeout through Orca and SeatLaunchError versus a different launch error and both remain no-verdict infra outcomes", async () => {
+  const cfg = { ...DEFAULT_CONFIG, review: { ...DEFAULT_CONFIG.review, timeoutMs: 5_000 } };
+  const orcaLaunch = async (fakeOpts: { reachable?: boolean }) => {
+    const { repo: raw, base } = repoWithCommit();
+    const repo = realpathSync(raw); // Orca compares canonical checkouts
+    const clock = steppedTime();
+    const fake = new FakeOrca({ trackedWorktrees: [repo], ...fakeOpts });
+    const driver = new OrcaDriver({ exec: withheldProofExec(fake, clock), time: clock, launchingHandle: "term_launch" });
+    // The raw error the gate row is built from: runLlm wraps the driver's failure, typed cause intact.
+    const launchError = await runLlmDetailed(reviewer(), "fake-2", `TICKMARKR-REVIEW\n${verdictNonceLine("12345678")}`, repo,
+      { driver, name: "review-cause", label: "REVIEW T1" }).then(() => undefined, (e: unknown) => e);
+    const events: GateEvent[] = [];
+    const { results } = await runGates({ ...task, gates: ["review"] }, {
+      worktree: repo, baseRef: base, author, channels,
+      adapters: [reviewer()], cfg, commands: {},
+      baseline: await captureBaseline(repo, {}),
+      result: { ok: true, summary: "work", raw: "", deviations: [] },
+      via: via(driver),
+      onGate: (e) => { events.push(e); },
+    });
+    const note = events.find((e) => e.phase === "note" && e.name === "review-no-verdict");
+    return { launchError, review: results.find((r) => r.gate === "review")!, note, fake };
+  };
+
+  const timeout = await orcaLaunch({});
+  expect(timeout.launchError).toBeInstanceOf(SeatLaunchError);
+  expect((timeout.launchError as SeatLaunchError).launchCause).toBe("checkout-proof-timeout");
+  expect((timeout.launchError as SeatLaunchError).message).toMatch(/does not prove checkout \S+ within 20000 ms \(its scrollback names no checkout\)/);
+  expect(timeout.fake.countOf("close")).toBeGreaterThan(0); // the unproven seat terminal is closed
+
+  const other = await orcaLaunch({ reachable: false });
+  expect(other.launchError).toBeInstanceOf(SeatLaunchError);
+  expect((other.launchError as SeatLaunchError).launchCause).toBeUndefined();
+  expect(other.fake.countOf("create")).toBe(0); // it failed before any terminal existed
+
+  for (const [name, r, launchCause] of [["timeout", timeout, "checkout-proof-timeout"], ["other", other, undefined]] as const) {
+    // Fail-closed, no verdict, infra — never a rejection of the work, never a pass.
+    expect(r.review.pass, name).toBe(false);
+    expect(r.review.meta, name).toMatchObject({ cause: "seat-launch-failed", noVerdict: true, infra: true, classification: "infra", reviewer: "fake:fake-2" });
+    expect(r.review.meta?.launchCause, name).toBe(launchCause);
+    expect(r.review.meta?.findings, name).toBeUndefined();
+    expect(r.review.details, name).toContain(launchCause ? "cause: seat-launch-failed; launchCause: checkout-proof-timeout)" : "cause: seat-launch-failed)");
+    // The journaled no-verdict note carries the same typed cause for the daemon's strike accounting.
+    expect(r.note?.phase === "note" && r.note.payload, name).toMatchObject({ cause: "seat-launch-failed", reviewer: "fake:fake-2" });
+    expect(r.note?.phase === "note" ? r.note.payload.launchCause : "missing", name).toBe(launchCause);
+  }
 });

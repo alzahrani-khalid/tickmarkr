@@ -193,13 +193,16 @@ export function boardFrame(input: BoardInput, width: number): BoardFrame {
     const unknown = buckets.filter(([, v]) => v === undefined).map(([k]) => k);
     const parked = buckets.filter(([, v]) => v !== undefined && v.length > 0).map(([k, v]) => `${k} ${v!.join(",")}`);
     const tally = `${doneIds.size} merged · ${(s.buckets.human ?? []).length} parked · ${(s.buckets.blocked ?? []).length} dep-blocked`;
-    const green = !unknown.length && !parked.length && (s.currentTip === "passed" || s.currentTip === "not required");
+    // I2: the same CURRENT owed-check authority as the lifecycle — debt must be known and empty.
+    const owed = s.debt === 0 ? undefined : s.debt === "unknown" ? "outstanding unknown" : `outstanding ${s.debt} (${s.outstanding.join(", ")})`;
+    const tipOk = s.currentTip === "passed" || s.currentTip === "not required";
+    const green = !unknown.length && !parked.length && tipOk && !owed;
     const now = green
       ? `${pass("RUN ENDED — GREEN")}  ${mute(`tip ${s.currentTip} · ${tally}`)}`
       : s.currentTip === "failed"
       ? `${fail("RUN ENDED — TIP VERIFY FAILED")}  ${mute(tally)}`
-      : parked.length || unknown.length
-      ? `${fail("RUN ENDED — NOT GREEN")}  ${mute(`${[...parked, ...unknown.map((k) => `${k} bucket unknown`)].join(" · ")} · ${tally}`)}`
+      : parked.length || unknown.length || tipOk
+      ? `${fail("RUN ENDED — NOT GREEN")}  ${mute(`${[...parked, ...unknown.map((k) => `${k} bucket unknown`), ...(owed ? [owed] : [])].join(" · ")} · ${tally}`)}`
       : `${warn("RUN ENDED — TIP NOT VERIFIED")}  ${mute(`tip ${s.currentTip} · ${tally}`)}`;
     top.push(`  ${accent("▌")} ${bold("NOW")}        ${now}`);
     top.push("");
@@ -210,8 +213,11 @@ export function boardFrame(input: BoardInput, width: number): BoardFrame {
 
   // ── aligned gate header: each label truncated to the cell it owns (prototype :382-394) ──
   const elastic = Math.max(30, W - BOARD_FIXED - BOARD_NOTE_RESERVE);
-  const LBL = Math.min(46, Math.max(18, Math.round(elastic * 0.62)));
-  const CHAN = Math.min(26, Math.max(12, elastic - LBL));
+  const compactLabel = Math.min(46, Math.max(18, Math.round(elastic * 0.62)));
+  const stacked = boardBand(W) === "stacked";
+  const LBL = stacked ? Math.max(0, W - 4 - 5 - BOARD_AREA_W - BOARD_DEPS_W)
+    : compactLabel;
+  const CHAN = Math.min(26, Math.max(12, elastic - compactLabel));
   const gateHead = BOARD_GATES.map((g) => faint(pad(g.slice(0, BOARD_CELL - 1), BOARD_CELL))).join("");
   const gateHeader = {
     head: `    ${pad("", 5)}${pad(faint("area"), BOARD_AREA_W)}${pad(faint("deps"), BOARD_DEPS_W)}${pad(faint("task"), LBL)}`,
@@ -255,7 +261,7 @@ export function boardFrame(input: BoardInput, width: number): BoardFrame {
       ? depText
       : depIds.length > 1 ? `${depIds[0]}+${depIds.length - 1}` : `${depIds[0]!.slice(0, BOARD_DEPS_W - 3)}…`;
     const deps = pad(faint(depLabel), BOARD_DEPS_W);
-    const titleText = sliceCells(g.title ?? "", LBL - 2).head;
+    const titleText = sliceCells(g.title ?? "", stacked ? LBL : LBL - 2).head;
     const title = hot ? body(pad(titleText, LBL)) : faint(pad(titleText, LBL));
     const note = [
       parks >= 3 ? park(`◍ parked ×${parks}`) : "",

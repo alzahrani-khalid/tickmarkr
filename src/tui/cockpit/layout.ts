@@ -624,8 +624,8 @@ export function resolveCockpitLayout(columns: number, rows: number): CockpitLayo
 
 /**
  * FINAL §3.1: one geometry for paint, focus and pointer hit testing. A ZERO shortcut budget is the
- * rail-less mount (BD-1, RULING-231-19 §2): the daemon-placed board is a one-view observer, so it
- * plans no rail and no shortcuts at any width — the budget is honoured, never floored back to 20.
+ * explicit compact mount: it plans no rail and no shortcuts at any width. Daemon-owned and manual
+ * boards both use the default budget; an explicit zero is honoured, never floored back to 20.
  */
 export function planShell(columns: number, rows: number, shortcutColumns = 22) {
   columns = Math.max(0, Math.floor(columns));

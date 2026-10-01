@@ -21,6 +21,7 @@ import { route } from "../../src/route/router.js";
 import { SHAPES, TaskSchema } from "../../src/graph/schema.js";
 import { tickmarkrDir } from "../../src/graph/graph.js";
 import { channelKey, channelsFromConfig, type WorkerAdapter } from "../../src/adapters/types.js";
+import type { FleetStagedMetadata } from "../../src/tui/ink/fleet-app.js";
 import { makeRepo } from "../helpers/tmprepo.js";
 
 const FAKE_TIERS = `tiers:
@@ -1205,7 +1206,8 @@ describe("tickmarkr fleet", () => {
           id: "anthropic",
           models: {
             "claude-opus-4-8": { id: "claude-opus-4-8", cost: { input: 5, output: 25 }, limit: { context: 200000 } },
-            "claude-sonnet-5": { id: "claude-sonnet-5", cost: { input: 2, output: 10 }, limit: { context: 200000 } },
+            // v2.6.5 T9: sonnet re-stamped to its sourced 5-5 identity; four identities still rank.
+            "claude-sonnet-5-5": { id: "claude-sonnet-5-5", cost: { input: 2, output: 10 }, limit: { context: 200000 } },
           },
         },
       },
@@ -1213,7 +1215,7 @@ describe("tickmarkr fleet", () => {
         intelligence_index_version: "4.1.1",
         data: [
           { id: "claude-opus-4-8", intelligence_index: 63 },
-          { id: "claude-sonnet-5", intelligence_index: 55 },
+          { id: "claude-sonnet-5-5", intelligence_index: 55 },
           { id: "fake-2", intelligence_index: 50 },
           { id: "fake-1", intelligence_index: 45 },
         ],
@@ -3437,8 +3439,9 @@ describe("B2 Fleet saves machine model choices to the user overlay", () => {
     expect(rowOf("plan", auto)).toContain("staged cleared slot shadowed — not applied in this repository");
     const review = reviewOf({ map: auto });
     expect(props.reloadGuard(review.after)).toBeNull();
-    expect(parse(review.after).routing.map).toEqual({ plan: { prefer: [] }, spec: { prefer: [] } });
-    expect(review.notes?.some((note) => note.startsWith("repo-shadowed: routing.map.plan.pin.model stays fake-2 in this repository"))).toBe(true);
+    // T8: a raw pin: null tombstone masks the default pin — never a prefer declaration the operator never made
+    expect(parse(review.after).routing.map).toEqual({ plan: { pin: null }, spec: { pin: null } });
+    expect(review.notes?.some((note) => note.startsWith('repo-shadowed: routing.map.plan.pin stays {"via":"fake","model":"fake-2"} in this repository'))).toBe(true);
     expect(commit({ kind: "write", review })).toMatch(/^fleet: wrote /);
     expect(loadConfig(repo, { globalDir }).routing.map.plan).toEqual({ pin: { via: "fake", model: "fake-2" } });
     const second = makeRepo({ "keep.txt": "x" });
@@ -3478,5 +3481,109 @@ describe("B2 Fleet saves machine model choices to the user overlay", () => {
     expect(await saved(tiers)).toEqual(["fake:fake-1", "fake:fake-3"]);
     // the user's allow form already leaves every unlisted model out: fake-3 keeps that verdict
     expect(await saved(`${tiers}routing:\n  allow:\n    models: [fake:fake-1, fake:fake-2]\n`)).toEqual(["fake:fake-1"]);
+  });
+
+  // T8: the editor's current staged metadata — what fleet-app hands every preview callback (stagedMetadata)
+  describe("T8 previews fold the current staged metadata", () => {
+    // HOME and the user overlay's directory are both fresh temp dirs: nothing here reads or writes real user state
+    const t8Repo = () => {
+      vi.stubEnv("HOME", mkdtempSync(join(tmpdir(), "tickmarkr-fleet-home-")));
+      onTestFinished(() => {
+    vi.unstubAllEnvs();
+  });
+      return b2Repo(fakeTiers(["fake-1"], "cheap"), undefined, { fake: ["fake-1"], codex: ["gpt-5.6-terra"] });
+    };
+    const reclassify = (tier: "cheap" | "mid" | "frontier") => ({ adapter: "fake", model: "fake-1", tier, note: `AA Index ${tier}` });
+    const staged = (tier: "mid" | "frontier", effort: "low" | "high"): FleetStagedMetadata => ({
+      classifications: tier === "frontier" ? [reclassify("frontier")] : [reclassify("frontier"), reclassify("mid")],
+      efforts: { codex: { "gpt-5.6-terra": effort } },
+    });
+    type Props = Awaited<ReturnType<typeof b2Editor>>["props"];
+    // the three production preview callbacks over the editor's own map and deny — only the metadata varies
+    const previewsOf = (props: Props, stage?: FleetStagedMetadata) => ({
+      mode: props.modePreview(props.initialMode, props.initialMap, noDeny, stage),
+      shapes: props.shapeRows(props.initialMode, props.initialMap, noDeny, stage),
+      picker: props.candidatesForShape("migration", props.initialMode, props.initialMap, noDeny, stage),
+    });
+    const labelOf = (rows: Array<{ id: string; label: string }>, id: string) => rows.find((row) => row.id === id)!.label;
+    const fake1BelowFloor = (previews: ReturnType<typeof previewsOf>) =>
+      previews.picker.rows.find((row) => row.id === "fake:fake-1")!.belowFloor;
+
+    test("FleetEditor current staged tier/effort reaches production mode/shape/picker previews before the first w; cheap-to-frontier eligibility changes despite unchanged saved metadata", async () => {
+      const { repo, globalDir } = t8Repo();
+      const userPath = overlayFile(repo);
+      const userBytes = readFileSync(userPath, "utf8");
+      const { props, previewConfig } = await b2Editor(repo, [tiered(repo), tiered(repo, "codex")], globalDir);
+      const saved = previewsOf(props);
+      // the saved metadata: fake-1 cheap, so migration's frontier floor offers it only as a below-floor override
+      expect(fake1BelowFloor(saved)).toBe(true);
+      expect(labelOf(saved.shapes, "migration")).toContain("no channel at tier>=frontier");
+      expect(labelOf(saved.shapes, "implement")).toContain("codex:gpt-5.6-terra (sub, mid)  ");
+      expect(saved.mode[0]).not.toContain("frontier");
+
+      // staged — no review, no w: fake-1 reclassified frontier, codex terra at high effort
+      const stage = staged("frontier", "high");
+      const now = previewsOf(props, stage);
+      expect(fake1BelowFloor(now)).toBe(false); // cheap → frontier: migration may now pick it
+      expect(labelOf(now.shapes, "migration")).toContain("fake:fake-1 (sub, frontier)");
+      expect(labelOf(now.shapes, "implement")).toContain("codex:gpt-5.6-terra (sub, mid, effort high)");
+      expect(now.mode[0]).toContain("1 frontier");
+      // every preview ranks one memoized candidate carrying the staged tier and effort, routed by production route()
+      const candidate = previewConfig(props.initialMode, props.initialMap, noDeny, stage);
+      if (!candidate.ok) throw new Error(candidate.error);
+      expect(previewConfig(props.initialMode, props.initialMap, noDeny, stage)).toBe(candidate);
+      expect(previewConfig(props.initialMode, props.initialMap, noDeny)).not.toBe(candidate);
+      expect(candidate.cfg.tiers.fake.models["fake-1"]).toBe("frontier");
+      expect(candidate.cfg.tiers.codex.modelOverrides?.["gpt-5.6-terra"]?.effort).toBe("high");
+      expect(routed(repo, candidate.cfg, tiered(repo), "migration")).toMatchObject({ adapter: "fake", model: "fake-1", tier: "frontier" });
+
+      // the saved metadata never moved: same user bytes, the loader still says cheap and no effort
+      expect(readFileSync(userPath, "utf8")).toBe(userBytes);
+      const onDisk = loadConfig(repo, { globalDir });
+      expect(onDisk.tiers.fake.models["fake-1"]).toBe("cheap");
+      expect(onDisk.tiers.codex.modelOverrides?.["gpt-5.6-terra"]?.effort).toBeUndefined();
+      expect(previewsOf(props)).toEqual(saved); // a stage-less call still ranks the saved metadata
+    });
+
+    test("FleetEditor after escaping review and making a second metadata edit refreshes all three production previews and their memo identity while cancellation keeps the persisted config unchanged", async () => {
+      const { repo, globalDir } = t8Repo();
+      const userPath = overlayFile(repo);
+      const userBytes = readFileSync(userPath, "utf8");
+      const { props, commit, previewConfig, reviewOf } = await b2Editor(repo, [tiered(repo), tiered(repo, "codex")], globalDir);
+      const stageA = staged("frontier", "high");
+      const memoOf = (stage: FleetStagedMetadata) => previewConfig(props.initialMode, props.initialMap, noDeny, stage);
+
+      // w: the first review renders stage A; Esc leaves it unconfirmed and the session keeps editing
+      reviewOf({ ...stageA });
+      const first = previewsOf(props, stageA);
+      const memoA = memoOf(stageA);
+      expect(labelOf(first.shapes, "migration")).toContain("fake:fake-1 (sub, frontier)");
+
+      // the second metadata edit after the escaped review: fake-1 back down to mid, terra to low effort
+      const stageB = staged("mid", "low");
+      const second = previewsOf(props, stageB);
+      for (const preview of ["mode", "shapes", "picker"] as const) expect(second[preview], preview).not.toEqual(first[preview]);
+      expect(fake1BelowFloor(second)).toBe(true);
+      expect(labelOf(second.shapes, "migration")).toContain("no channel at tier>=frontier");
+      expect(labelOf(second.shapes, "implement")).toContain("codex:gpt-5.6-terra (sub, mid, effort low)");
+      expect(second.mode[0]).not.toContain("frontier");
+      const memoB = memoOf(stageB);
+      expect(memoB).not.toBe(memoA);
+      expect(memoOf(stageB)).toBe(memoB);
+      if (!memoB.ok) throw new Error(memoB.error);
+      expect(memoB.cfg.tiers.fake.models["fake-1"]).toBe("mid");
+      expect(memoB.cfg.tiers.codex.modelOverrides?.["gpt-5.6-terra"]?.effort).toBe("low");
+      // the refreshed candidate is exactly the loader over the bytes a review of stage B would write
+      const reviewB = reviewOf({ ...stageB });
+      expect(memoB.cfg).toEqual(loadConfigWithMode(repo, { globalDir, userOverlayText: reviewB.after }).cfg);
+
+      // cancellation: nothing persisted — the user bytes and the loaded config are what they were
+      expect(commit({ kind: "discard" })).toBe("fleet: discarded overlay changes");
+      expect(commit({ kind: "quit" })).toBe("fleet: quit without writing");
+      expect(readFileSync(userPath, "utf8")).toBe(userBytes);
+      const onDisk = loadConfig(repo, { globalDir });
+      expect(onDisk.tiers.fake.models["fake-1"]).toBe("cheap");
+      expect(onDisk.tiers.codex.modelOverrides?.["gpt-5.6-terra"]?.effort).toBeUndefined();
+    });
   });
 });

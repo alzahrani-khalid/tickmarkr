@@ -297,3 +297,51 @@ test("The changed canonical overseer spawn/respawn contract requires every mappe
   expect(skill).toContain("promptSuggestionEnabled");
   expect(skill).toContain("turn_started");
 });
+
+test("D-837/D-838: loop, auto and overseer keep run and resume in host-owned ORCH splits, detach idempotent seat beats, and stop them at run end", () => {
+  for (const name of ["loop", "auto", "overseer"]) {
+    const skill = readFileSync(new URL(`../skills/tickmarkr-${name}/SKILL.md`, import.meta.url), "utf8");
+    const recipe = skill.slice(skill.indexOf("## Host-owned daemon and detached beats"));
+    expect(recipe).toContain('orca terminal split --terminal "$ORCA_TERMINAL_HANDLE" --direction vertical --command "tickmarkr run"');
+    expect(recipe).toContain('`herdr pane split` on the orchestrator\'s own pane');
+    expect(recipe).toContain('herdr pane run <new> "tickmarkr run"');
+    expect(recipe).toContain("For `resume`, use the same host-owned split form with `tickmarkr resume <runId>`");
+    expect(recipe).toContain("lock pid and walk its ppid chain");
+    expect(recipe).toContain("verify no agent session is an ancestor");
+    expect(recipe).toContain("setsid plus nohup");
+    expect(recipe).toContain("Verify ppid 1");
+    expect(recipe).toContain('(tier, seat)');
+    expect(recipe).toContain('"already running" no-op');
+    expect(recipe).toContain("status\nchecks that payload and beat freshness");
+    expect(recipe).toContain("stop sends `--stand-down`");
+    expect(recipe).toContain("run-end stop item for every\nbeat started, also on failure, park or handoff");
+    expect(recipe).toContain("Keep only watchers that must WAKE the seat in the harness");
+    expect(recipe).toContain("their harness cap");
+    expect(skill).not.toContain('the repo root as its own `run_in_background` Bash call');
+    if (name !== "overseer") expect(skill).toMatch(/4\. \*\*Run\*\* — launch .*host-owned split form/);
+    else expect(hostViolations(skill)).toEqual([]);
+  }
+});
+
+
+test("LEG A REPAIR: overseer fallback launches use the recorded ORCH handle or pane id, own-terminal launches are ORCH-only, and loop resume points above", () => {
+  const skill = readShippedSkill();
+  const start = skill.indexOf("**Sandbox-denial daemon launch (OVERSEER):**");
+  expect(start).toBeGreaterThan(skill.indexOf("2. **Orchestrator**"));
+  const fallback = skill.slice(start, skill.indexOf("**, after every `agent start`", start));
+  expect(fallback).toContain("`result.terminal.handle` from its seat-create receipt");
+  expect(fallback).toContain('orca terminal split --terminal <ORCH handle> --direction vertical --command "tickmarkr run"');
+  expect(fallback).toContain("`result.root_pane.pane_id` from its tab-create");
+  expect(fallback).toContain("`herdr pane split` targeting that recorded ORCH pane id");
+  expect(fallback).toContain("never target the OVERSEER's pane");
+  expect(fallback).toContain("use it only when the ORCH\n  launches its own daemon, never when the OVERSEER launches on the ORCH's behalf");
+  expect(fallback).not.toContain('orca terminal split --terminal "$ORCA_TERMINAL_HANDLE"');
+  expect(fallback).toContain("same recorded ORCH address is required for a fallback `tickmarkr resume <runId>`");
+  const recipe = skill.slice(skill.indexOf("## Host-owned daemon and detached beats"));
+  expect(recipe).toContain("only when the ORCH\n  launches its own daemon");
+  expect(recipe).toContain("substitute the ORCH handle recorded\n  at seat creation");
+  expect(hostViolations(skill)).toEqual([]);
+  const loop = readFileSync(new URL("../skills/tickmarkr-loop/SKILL.md", import.meta.url), "utf8");
+  expect(loop).toContain("with the same host-owned split form above");
+  expect(loop).not.toContain("with the same host-owned split form below");
+});

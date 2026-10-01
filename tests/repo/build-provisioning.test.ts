@@ -1,11 +1,14 @@
 import { isolatedBuild } from "../fixtures/screen-soak/isolated-build.js";
 import { archiveRecord, readArtifact } from "../fixtures/screen-soak/archive.mjs";
-import { execSync, spawnSync } from "node:child_process";
-import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync, execSync, spawn, spawnSync } from "node:child_process";
+import { cpSync, existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
+import { shq } from "../../src/adapters/types.js";
+import { resetSpawnForTests, setSpawnForTests, shell } from "../../src/run/git.js";
+import { NATIVE_PROCESS_TITLE_ENV, resetTitleEnvironmentForTests, setTitleEnvironmentForTests } from "../../src/run/title-environment.js";
 
 const artifactText = (path: string): string => readArtifact(path).toString("utf8");
 
@@ -243,3 +246,40 @@ test("Before default narrator cutover, changed docs/validation/screen-soak.md an
     expect(readFileSync(join(destination, "samples.jsonl"), "utf8")).toBe(preserved);
   } finally { rmSync(destination, { recursive: true, force: true }); }
 }, 30000);
+
+// A2: the artifact the package ships, compiled by the real tsconfig into a test-owned tree (root dist may be
+// rebuilt by the serialized CLI tests) and loaded by the runner's own node through production shell.
+test("test: the shipped NodeNext preload loads as CommonJS through production shell under the runner's own node and the dist artifact is inside the package files set while a missing artifact selects one native payload", async () => {
+  const build = isolatedBuild();
+  const artifact = join(build, "dist/run/title-preload.cjs");
+  const packed = JSON.parse(execFileSync("npm", ["pack", "--dry-run", "--json", "--ignore-scripts"], { cwd: build, encoding: "utf8" })) as Array<{ files: Array<{ path: string }> }>;
+  expect(packed[0]!.files.map((f) => f.path)).toContain("dist/run/title-preload.cjs");
+  const report = `${shq(process.execPath)} -e ${shq(`process.stdout.write(JSON.stringify({ node: process.execPath,
+    cjs: Object.keys(require.cache).filter((k) => k.endsWith(".cjs")), options: process.env.NODE_OPTIONS ?? null,
+    jsTitle: typeof Object.getOwnPropertyDescriptor(process, "title").get === "function" }))`)}`;
+  const own = "--max-old-space-size=4096";
+  const env: NodeJS.ProcessEnv = { ...process.env, NODE_OPTIONS: own };
+  delete env[NATIVE_PROCESS_TITLE_ENV];
+  const spawned: string[] = [];
+  let probes = 0;
+  setSpawnForTests(((command: string, args: readonly string[], options: object) => {
+    spawned.push(args.at(-1)!);
+    return spawn(command, args, options);
+  }) as unknown as typeof spawn);
+  try {
+    setTitleEnvironmentForTests({ platform: "darwin", preloadPath: artifact,
+      probe: ((...a: Parameters<typeof spawnSync>) => { probes++; return spawnSync(...a); }) as typeof spawnSync });
+    const loaded = await shell(report, build, 60_000, false, { env });
+    expect(loaded.code, loaded.stderr).toBe(0);
+    expect(JSON.parse(loaded.stdout)).toEqual({ node: process.execPath, cjs: [realpathSync(artifact)],
+      options: `${own} --require "${artifact}"`, jsTitle: true });
+    expect(probes).toBe(1);
+    setTitleEnvironmentForTests({ preloadPath: join(build, "dist/run/absent-title-preload.cjs") });
+    spawned.length = 0;
+    const native = await shell(report, build, 60_000, false, { env });
+    expect(native.code, native.stderr).toBe(0);
+    expect(JSON.parse(native.stdout)).toEqual({ node: process.execPath, cjs: [], options: own, jsTitle: false });
+    expect(spawned).toEqual([report]);
+    expect(probes).toBe(1); // a missing artifact is never probed
+  } finally { resetTitleEnvironmentForTests(); resetSpawnForTests(); }
+}, 300_000);

@@ -134,7 +134,11 @@ you were handed the whole picture — list the repository root, open every guida
 - **The gates are the product.** Seven, defined in \`src/graph/schema.ts\`:
   \`build test lint evidence scope acceptance review\`. **That is DECLARATION order, not execution order** —
   the first five run as a battery that stops at its first red, then \`acceptance\` and \`review\` run
-  CONCURRENTLY (\`run-gates.ts:39\`, *"judge ‖ review"*). The first five are MANDATORY; only \`acceptance\` and
+  CONCURRENTLY (\`run-gates.ts:39\`, *"judge ‖ review"*). One repair reorders them: a repair the REVIEW sent
+  back (carried \`review:material\`, test selection on, no required repair test) runs build, lint, evidence and
+  scope, then \`acceptance\` ‖ \`review\`, then its test screen, so a review that re-reds an unchanged subject
+  starts no test at all; a test-red repair keeps the battery first. Either way nothing merges until the FULL
+  suite has passed on the merge-candidate commit. The first five are MANDATORY; only \`acceptance\` and
   \`review\` may be omitted per task. Implementations are in \`src/gates/\` — \`baseline.ts\` (build/test/lint,
   diffed against a recorded baseline so pre-existing failures are forgiven), \`evidence.ts\`, \`scope.ts\`,
   \`acceptance.ts\` (its judge reads the DIFF and every criterion must cite a changed hunk), \`review.ts\`

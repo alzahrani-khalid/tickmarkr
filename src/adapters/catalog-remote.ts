@@ -30,6 +30,8 @@ export interface CatalogReadResult {
   source: "cache" | "vendored";
   stale: boolean;
   warning?: string;
+  /** v2.6.5 T9: `adapter:model` keys a failed post-discovery refresh left at UNKNOWN coverage, never "uncovered". */
+  coverageUnknown?: readonly string[];
 }
 
 export interface CatalogModelEvidence {
@@ -78,6 +80,63 @@ export interface RefreshCatalogResult {
   legs: CatalogLegResult[];
 }
 
+/**
+ * v2.6.5 T9 (H): records persisted from cited sources, never inferred from a model name or an API
+ * price. Prices are normal API USD per million tokens — a subscription seat is never billed from them.
+ * The tier is CONTINUITY of the shipped alias seeds (config.ts DEFAULT_CONFIG: sonnet=mid,
+ * opus=frontier), not a benchmark ruling: doctor prints it as an inference for operator confirmation
+ * and the configured (Fleet-confirmed) tier stays the routing authority.
+ */
+export interface SourcedIdentityRecord {
+  identity: string;
+  alias: "sonnet" | "opus";
+  inputCostPerMtok: number;
+  outputCostPerMtok: number;
+  contextWindow: number;
+  outputWindow: number;
+  tier: "mid" | "frontier";
+  tierBasis: string;
+  sources: readonly string[];
+  fetchedAt: string;
+}
+
+export const SOURCED_IDENTITY_RECORDS: readonly SourcedIdentityRecord[] = [
+  {
+    identity: "claude-sonnet-5-5",
+    alias: "sonnet",
+    inputCostPerMtok: 2,
+    outputCostPerMtok: 10,
+    contextWindow: 1_000_000,
+    outputWindow: 128_000,
+    tier: "mid",
+    tierBasis: "continuity of the existing sonnet=mid configuration, not derived from the name or price",
+    sources: [
+      "https://raw.githubusercontent.com/anomalyco/models.dev/dev/providers/anthropic/models/claude-sonnet-5-5.toml",
+      "https://raw.githubusercontent.com/anomalyco/models.dev/dev/models/anthropic/claude-sonnet-5-5.toml",
+      "https://platform.claude.com/docs/en/models/sonnet-5-5/overview",
+    ],
+    fetchedAt: "2026-09-30",
+  },
+  {
+    identity: "claude-opus-5-5",
+    alias: "opus",
+    inputCostPerMtok: 4,
+    outputCostPerMtok: 20,
+    contextWindow: 1_000_000,
+    outputWindow: 128_000,
+    tier: "frontier",
+    tierBasis: "continuity of the existing opus=frontier configuration, not derived from the name or price",
+    sources: [
+      "https://raw.githubusercontent.com/anomalyco/models.dev/dev/providers/anthropic/models/claude-opus-5-5.toml",
+      "https://raw.githubusercontent.com/anomalyco/models.dev/dev/models/anthropic/claude-opus-5-5.toml",
+    ],
+    fetchedAt: "2026-09-30",
+  },
+];
+
+export const sourcedIdentityRecord = (identity: string | undefined): SourcedIdentityRecord | undefined =>
+  SOURCED_IDENTITY_RECORDS.find((r) => r.identity === identity);
+
 const VENDORED_CATALOG: CatalogCache = {
   schemaVersion: 1,
   // Package fallback copied from https://models.dev/api.json on 2026-08-05. It is deliberately
@@ -91,6 +150,10 @@ const VENDORED_CATALOG: CatalogCache = {
         "claude-fable-5-1": { id: "claude-fable-5-1", cost: { input: 10, output: 50 }, limit: { context: 1_000_000, output: 128_000 }, reasoning: true, tool_call: true, structured_output: true, attachment: true },
         "claude-opus-4-8": { id: "claude-opus-4-8", cost: { input: 5, output: 25 }, limit: { context: 1_000_000, output: 128_000 }, reasoning: true, tool_call: true, structured_output: true, attachment: true },
         "claude-sonnet-5": { id: "claude-sonnet-5", cost: { input: 2, output: 10 }, limit: { context: 1_000_000, output: 128_000 }, reasoning: true, tool_call: true, structured_output: true, attachment: true },
+        // v2.6.5 T9: the sourced 5-5 records above, so a refresh-less resolution still covers them.
+        ...Object.fromEntries(SOURCED_IDENTITY_RECORDS.map((r) => [r.identity, {
+          id: r.identity, cost: { input: r.inputCostPerMtok, output: r.outputCostPerMtok }, limit: { context: r.contextWindow, output: r.outputWindow }, reasoning: true, tool_call: true, structured_output: true, attachment: true,
+        }])),
         "claude-haiku-4-5-20251001": { id: "claude-haiku-4-5-20251001", cost: { input: 1, output: 5 }, limit: { context: 200_000, output: 64_000 }, reasoning: true, tool_call: true, structured_output: true, attachment: true },
       },
     },

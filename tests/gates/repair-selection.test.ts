@@ -1,12 +1,15 @@
 import { execFileSync } from "node:child_process";
-import { readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
+import { FakeAdapter } from "../../src/adapters/fake.js";
 import { DEFAULT_CONFIG } from "../../src/config/config.js";
 import { captureBaseline, type Baseline } from "../../src/gates/baseline.js";
 import { computeVerificationIdentity, getVerdictStore, resolveStateDir } from "../../src/gates/cache.js";
 import { runGates, testCommandForFiles, type GateContext, type GateEvent } from "../../src/gates/run-gates.js";
 import { validateGraph } from "../../src/graph/schema.js";
+import type { StructuredFinding } from "../../src/run/journal.js";
 import { makeRepo } from "../helpers/tmprepo.js";
 
 const git = (repo: string, ...args: string[]) => execFileSync("git", args, { cwd: repo, encoding: "utf8" }).trim();
@@ -201,4 +204,77 @@ test("runGates uses one full invocation at a trusted cost ratio of 0.75 versus s
         ? { generated, pass: true, reused: undefined, manifest: ["tests/a.test.ts", "tests/generated.test.ts"], reason: "screen-cost-promoted" }
         : { generated, pass: true, reused: true, manifest: ["tests/a.test.ts"], reason: "full-green-cache" });
   }
+}, 120_000);
+
+// v2.6.5 T6 (D): the closed repair-mode table. Which repair asks its semantic question before
+// buying a test screen is decided by what the round carries, never by timing: the stream below is
+// the order gates actually started and ended, and executions.log is the actual test launch trace.
+const MATERIAL: StructuredFinding = { class: "review:material", path: "src/changed.ts", symbol: "changed",
+  note: "src/changed.ts `changed` drops the last row", fingerprint: "review:material|src/changed.ts|changed" };
+
+async function semanticOrder(over: Partial<GateContext>) {
+  const repo = makeRepo({
+    "src/changed.ts": "export const changed = 1;\n",
+    "src/separate.ts": "export const separate = 1;\n",
+    "tests/changed.test.ts": 'import { changed } from "../src/changed.js";\nchanged;\n',
+    "tests/repair.test.ts": 'import { separate } from "../src/separate.js";\nseparate;\n',
+    ".gitignore": "executions.log\n",
+    "run.sh": 'echo "$*" >> executions.log\nexit 0\n',
+  });
+  const baseRef = git(repo, "rev-parse", "HEAD");
+  const commands = { test: "sh run.sh" };
+  const baseline = await captureBaseline(repo, commands);
+  writeFileSync(join(repo, "src/changed.ts"), "export const changed = 2;\n");
+  commit(repo);
+  rmSync(join(repo, "executions.log"), { force: true });
+  const carried = over.carriedFindings ?? [MATERIAL];
+  const scriptPath = join(mkdtempSync(join(tmpdir(), "tickmarkr-semantic-order-")), "s.json");
+  writeFileSync(scriptPath, JSON.stringify({ tasks: {},
+    judge: { pass: true, criteria: [{ criterion: "c1", met: true, reason: "ok" }] },
+    review: { approve: true, findings: [], ...(carried.length ? { resolved: carried.map((f) => f.fingerprint), reraised: [] } : {}) } }));
+  const cfg = structuredClone(DEFAULT_CONFIG);
+  cfg.judge.adapter = "fake";
+  const task = validateGraph({
+    version: 1, spec: { source: "native", paths: ["spec.md"], hash: "semantic-order" },
+    tasks: [{ id: "T1", title: "repair", goal: "repair what the review found", shape: "implement", complexity: 8,
+      files: ["**"], acceptance: ["the defect is fixed"] }],
+  }).tasks[0];
+  const stream: string[] = [];
+  const { results } = await runGates(task, {
+    worktree: repo, baseRef, commands, baseline, cfg,
+    author: { adapter: "fake", model: "fake-1", channel: "sub", tier: "frontier" },
+    channels: [
+      { adapter: "fake", vendor: "fake-a", model: "fake-1", channel: "sub", tier: "frontier" },
+      { adapter: "fake", vendor: "fake-b", model: "fake-2", channel: "api", tier: "frontier" },
+    ],
+    adapters: [new FakeAdapter(scriptPath)],
+    result: { ok: true, summary: "repaired", deviations: [], raw: "" },
+    selectTests: true, carriedFindings: [MATERIAL],
+    onGate: (e) => {
+      // judge ‖ review complete in either order: both ends read as one semantic end
+      if (e.phase !== "note" && ["test", "acceptance", "review"].includes(e.gate)) stream.push(e.phase === "end" && e.gate !== "test" ? "semantic:end" : `${e.gate}:${e.phase}`);
+    },
+    ...over,
+  });
+  const executions = readFileSync(join(repo, "executions.log"), "utf8").split("\n").slice(0, -1);
+  return { stream, executions, green: results.every((r) => r.pass) };
+}
+
+const SEMANTICS = ["acceptance:start", "review:start", "semantic:end", "semantic:end"];
+
+test("runGates with selectTests false or a required repair test keeps test screening before semantics while review-only repair retains semantic-first ordering", async () => {
+  // selectTests false: a test-red repair whose full suite runs in the battery, before semantics.
+  expect(await semanticOrder({ selectTests: false })).toEqual({
+    stream: ["test:start", "test:end", ...SEMANTICS], executions: [""], green: true });
+  // A nonempty requiredRepairTests: the required screen (published) before semantics, then the full suite.
+  expect(await semanticOrder({ requiredRepairTests: ["tests/repair.test.ts"], selectionReason: "known-failing-tests" })).toEqual({
+    stream: ["test:start", "test:end", ...SEMANTICS, "test:start", "test:end"], executions: [repairSelection, ""], green: true });
+  // Review-only repair: semantics first, then the held screen and the merge-candidate full suite in one row.
+  expect(await semanticOrder({})).toEqual({
+    stream: [...SEMANTICS, "test:start", "test:start", "test:end"], executions: ["tests/changed.test.ts", ""], green: true });
+  expect(await semanticOrder({ requiredRepairTests: [] })).toEqual({
+    stream: [...SEMANTICS, "test:start", "test:start", "test:end"], executions: ["tests/changed.test.ts", ""], green: true });
+  // Nothing carried (a first attempt) is no repair at all: battery-first, as before.
+  expect(await semanticOrder({ carriedFindings: [] })).toEqual({
+    stream: ["test:start", "test:end", ...SEMANTICS, "test:start", "test:end"], executions: ["tests/changed.test.ts", ""], green: true });
 }, 120_000);

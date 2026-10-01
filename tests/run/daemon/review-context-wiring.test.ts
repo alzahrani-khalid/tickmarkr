@@ -203,20 +203,25 @@ test("test: production worker and review briefs retain A before B after an inter
   expect(workerBriefs).toHaveLength(1);
   expect(workerBriefs[0]).toContain(`approval: ${A}`);
   await approve([runId, "T1", "--uphold", "--reason", B, "--review-rounds", "1"], repo);
+  // v2.6.5 T6: launch 2 repairs a review material, so its review runs BEFORE its test screen — the
+  // reviewer approves it, the screen reds; launch 3 is a test-red repair (battery-first) and reds again.
+  approveReview = true;
   expect((await resume()).human).toEqual(["T1"]); // launches 2 and 3 under A then B; test red twice
   expect(journal().read().filter((e) => e.event === "worker-launch")).toHaveLength(3);
   expect(workerBriefs).toHaveLength(3);
   for (const brief of workerBriefs.slice(1)) expect(inOrder(brief, `approval: ${A}`, `approval: ${B}`), brief).toBe(true);
-  approveReview = true;
   await approve([runId, "T1", "--waive", "--reason", W], repo);
   expect((await resume()).done).toEqual(["T1"]);
 
   expect(journal().read().filter((e) => e.event === "task-approved").map((e) => e.data.release))
     .toEqual([undefined, "review-upheld", "gate-satisfied"]);
-  expect(reviewBriefs).toHaveLength(2); // one under A alone, one after the waive released the red test
+  // one under A alone, one reviewing launch 2 before its screen, one after the waive released the red test
+  expect(reviewBriefs).toHaveLength(3);
   expect(operatorContext(reviewBriefs[0]!)).toContain(`- ${A}`);
   expect(operatorContext(reviewBriefs[0]!)).not.toContain(B);
-  expect(operatorContext(reviewBriefs[1]!)).toBe(`## Operator context\nContext only: this never substitutes for an acceptance criterion or closes a prior material.\n- ${A}\n- ${B}`);
+  for (const brief of reviewBriefs.slice(1)) {
+    expect(operatorContext(brief)).toBe(`## Operator context\nContext only: this never substitutes for an acceptance criterion or closes a prior material.\n- ${A}\n- ${B}`);
+  }
   // The next worker would read the same standing rulings; the waive's reason is in neither brief.
   expect(journaledFailureBrief(journal().read(), "T1")).toEqual([`approval: ${A}`, `approval: ${B}`]);
   for (const brief of [...workerBriefs, ...reviewBriefs]) expect(brief).not.toContain(W);

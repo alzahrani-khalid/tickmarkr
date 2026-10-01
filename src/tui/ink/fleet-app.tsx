@@ -49,6 +49,17 @@ export type FleetEditorState = Record<DenyScopeKey, string[]> & {
   steering: Record<FleetSteeringKey, string[] | undefined>;
 };
 
+/** T8: the staged classifications and efforts every preview folds — the same metadata a review stages,
+ * so a preview ranks what w would write before the first review and after an escaped one. */
+export type FleetStagedMetadata = Pick<FleetEditorState, "classifications" | "efforts">;
+
+/** OBS-525: auto reverts the shape's WHOLE routing declaration — pool included, not just the pin.
+ * prefer survives: it biases auto routing and is valid without pin/pool. */
+export function autoMapEntry(entry: MapEntry | undefined): MapEntry {
+  const { pin: _pin, pool: _pool, ...rest } = entry ?? {};
+  return rest;
+}
+
 export type FleetOverlayReview =
   | { kind: "empty" }
   | {
@@ -346,13 +357,14 @@ export function FleetApp({
   initialMode: RoutingMode;
   modeOptions: FleetModeOption[];
   initialMap: Record<string, MapEntry>;
-  modePreview: (mode: RoutingMode, map: Record<string, MapEntry>, deny: FleetStagedDeny) => string[];
-  shapeRows: (mode: RoutingMode, map: Record<string, MapEntry>, deny: FleetStagedDeny) => FleetShapeRow[];
+  modePreview: (mode: RoutingMode, map: Record<string, MapEntry>, deny: FleetStagedDeny, stage?: FleetStagedMetadata) => string[];
+  shapeRows: (mode: RoutingMode, map: Record<string, MapEntry>, deny: FleetStagedDeny, stage?: FleetStagedMetadata) => FleetShapeRow[];
   candidatesForShape: (
     shape: Shape,
     mode: RoutingMode,
     map: Record<string, MapEntry>,
     deny: FleetStagedDeny,
+    stage?: FleetStagedMetadata,
   ) => { rows: FleetCandidateOption[]; excludedNote?: string; ledger?: string[] };
   preferOptionsForShape: (shape: Shape, current: string[]) => string[];
   initialSteering: Record<FleetSteeringKey, string[] | undefined>;
@@ -685,7 +697,7 @@ export function FleetApp({
     ...(Object.fromEntries(DENY_SCOPES.map((scope) => [stagedDenyKeyOf(scope), [...ui[scope.key]].sort()])) as Record<StagedDenyKey, string[]>),
     allowOut: [...ui.allowOut].sort(),
   });
-  const shapeList = () => shapeRows(ui.selectedMode, ui.map, stagedDeny());
+  const shapeList = () => shapeRows(ui.selectedMode, ui.map, stagedDeny(), stagedMetadata());
   const steeringList = () => [
     ...STEERING_KEYS.map((key) => ({
       id: key as string,
@@ -710,6 +722,12 @@ export function FleetApp({
   ];
 
   // ── state transitions ──────────────────────────────────────────────────────
+
+  // T8: the previews fold the CURRENT staged metadata — never only what the last review saw
+  const stagedMetadata = (): FleetStagedMetadata => {
+    const { classifications, efforts } = editorState();
+    return { classifications, efforts };
+  };
 
   const editorState = (): FleetEditorState => ({
     ...denyLists(),
@@ -1072,7 +1090,7 @@ export function FleetApp({
     // channel must be OFFERED at or above the floor once every policy scope is open — a failed
     // model probe (dropped by discovery), a pin or a pool keep it out of that list and a floor
     // marks it belowFloor, so nothing here lifts it.
-    const eligible = candidatesForShape(overlay.shape, ui.selectedMode, ui.map, openStagedDeny()).rows
+    const eligible = candidatesForShape(overlay.shape, ui.selectedMode, ui.map, openStagedDeny(), stagedMetadata()).rows
       .some((row) => row.id === id && !row.belowFloor);
     if (!eligible) {
       // the ledger line spells its reasons; drop the row label and the reach segment for the notice
@@ -1095,7 +1113,7 @@ export function FleetApp({
     const text = `lift: cleared ${found.entry} from ${found.scope}${after.reach === "in" ? "" : ` — still out: ${after.reasons.join("; ")}`}`;
     ui.lastEdit = { id, text };
     ui.notice = text;
-    const picked = candidatesForShape(overlay.shape, ui.selectedMode, ui.map, stagedDeny());
+    const picked = candidatesForShape(overlay.shape, ui.selectedMode, ui.map, stagedDeny(), stagedMetadata());
     ui.overlay = { ...overlay, rows: picked.rows, excludedNote: picked.excludedNote, ledger: picked.ledger ?? [], at: 0 };
     bump();
   };
@@ -1940,17 +1958,12 @@ export function FleetApp({
       const shape = rows[ui.listAt]?.id;
       if (!shape) return;
       if (hotkey === "a") {
-        // OBS-525: auto reverts the shape's WHOLE routing declaration — pool included, not just
-        // the pin. prefer survives: it biases auto routing and is valid without pin/pool.
-        const nextEntry = { ...ui.map[shape] };
-        delete nextEntry.pin;
-        delete nextEntry.pool;
-        ui.map = { ...ui.map, [shape]: nextEntry };
+        ui.map = { ...ui.map, [shape]: autoMapEntry(ui.map[shape]) };
         bump();
         return;
       }
       if (key.return || hotkey === "p") {
-        const picked = candidatesForShape(shape, ui.selectedMode, ui.map, stagedDeny());
+        const picked = candidatesForShape(shape, ui.selectedMode, ui.map, stagedDeny(), stagedMetadata());
         setOverlay({
           kind: "candidates",
           shape,
@@ -2186,7 +2199,7 @@ export function FleetApp({
     if (!overlay) return null;
 
     if (overlay.kind === "presets") {
-      const details = modeOptions[overlay.at] ? modePreview(modeOptions[overlay.at].id, ui.map, stagedDeny()) : [];
+      const details = modeOptions[overlay.at] ? modePreview(modeOptions[overlay.at].id, ui.map, stagedDeny(), stagedMetadata()) : [];
       return (
         <OverlayPanel title={overlay.home ? "routing preset" : "routing mode"} width={bodyW}>
           <Text dimColor>{overlay.home ? "a preset routes every shape — custom opens the browser" : "floors move with the mode; the browser edits the rest"}</Text>
@@ -2745,13 +2758,14 @@ export async function runFleetInkEditor({
   initialMode: RoutingMode;
   modeOptions: FleetModeOption[];
   initialMap: Record<string, MapEntry>;
-  modePreview: (mode: RoutingMode, map: Record<string, MapEntry>, deny: FleetStagedDeny) => string[];
-  shapeRows: (mode: RoutingMode, map: Record<string, MapEntry>, deny: FleetStagedDeny) => FleetShapeRow[];
+  modePreview: (mode: RoutingMode, map: Record<string, MapEntry>, deny: FleetStagedDeny, stage?: FleetStagedMetadata) => string[];
+  shapeRows: (mode: RoutingMode, map: Record<string, MapEntry>, deny: FleetStagedDeny, stage?: FleetStagedMetadata) => FleetShapeRow[];
   candidatesForShape: (
     shape: Shape,
     mode: RoutingMode,
     map: Record<string, MapEntry>,
     deny: FleetStagedDeny,
+    stage?: FleetStagedMetadata,
   ) => { rows: FleetCandidateOption[]; excludedNote?: string; ledger?: string[] };
   preferOptionsForShape: (shape: Shape, current: string[]) => string[];
   initialSteering: Record<FleetSteeringKey, string[] | undefined>;

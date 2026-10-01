@@ -1963,6 +1963,7 @@ test("test: a round given no operator context over identical task diff plus carr
     Use only these observed spellings. For every findings entry that restates a reraised prior, whether at the same path or a new path, set its "reraised" field to the copied id; unrelated defects need separate entries.
     The fingerprints appear once, in this block:
     \`\`\`text
+    Finding 1:
     Fingerprint: review:material|src/model.ts|src/model.ts loses selection on prepend.
     \`\`\`
     1. src/model.ts loses selection on prepend.
@@ -2052,6 +2053,7 @@ test("test: a round given no operator context over identical task diff plus carr
     Use only these observed spellings. For every findings entry that restates a reraised prior, whether at the same path or a new path, set its "reraised" field to the copied id; unrelated defects need separate entries.
     The fingerprints appear once, in this block:
     \`\`\`text
+    Finding 1:
     Fingerprint: review:material|src/model.ts|src/model.ts loses selection on prepend.
     \`\`\`
     1. src/model.ts loses selection on prepend.
@@ -2116,4 +2118,135 @@ test("test: a verdict that resolves no prior material still fails the gate when 
   expect(delivered).toContain("I approve this approach; keep the design.");
   expect(result.pass).toBe(false);
   expect(result.meta).toMatchObject({ cause: "malformed-verdict", unparseable: true });
+});
+
+// E2 (T4 D-766): F1 carried three spellings, F2 and F3 one each, and only F1 was headed — so F2's and F3's
+// lines read as two more spellings of F1 and a faithful seat closed F1 alone. Each verdict below is
+// authored from the brief the production gate delivered, read the way a seat reads the copy block.
+async function reviewFromBrief(carried: StructuredFinding[], answer: (brief: string) => Record<string, unknown>) {
+  const { repo, base } = repoWithCommit();
+  const out = join(mkdtempSync(join(tmpdir(), "tickmarkr-e2-")), "verdict.json");
+  const fake = fakeWith({});
+  let brief = "";
+  fake.headlessCommand = (file) => {
+    brief = readFileSync(file, "utf8");
+    writeFileSync(out, JSON.stringify({ nonce: extractPromptNonce(brief), approve: true, findings: [], ...answer(brief) }));
+    return `cat ${shq(out)}`;
+  };
+  const result = await reviewGate(mkTask(), repo, base, author, CH, [fake], DEFAULT_CONFIG,
+    undefined, undefined, undefined, undefined, undefined, carried);
+  return { brief, result };
+}
+
+const copyBlock = (brief: string) => /```text\n([\s\S]*?)```/.exec(brief)![1]!;
+const HEADING = /^Finding \d+(?: \(choose one observed spelling\))?:$/;
+
+/** A seat's reading of the copy block: a heading opens a finding; each Fingerprint line is one of its spellings. */
+function headedSpellings(brief: string): string[][] {
+  const groups: string[][] = [];
+  for (const line of copyBlock(brief).split("\n")) {
+    if (HEADING.test(line)) groups.push([]);
+    else if (line.startsWith("Fingerprint: ")) {
+      if (!groups.length) groups.push([]);
+      groups.at(-1)!.push(line.slice("Fingerprint: ".length));
+    }
+  }
+  return groups;
+}
+
+describe("E2: every prior finding is headed in the production brief", () => {
+  test("test: production reviewGate renders separate F1 F2 F3 headings for three one one spellings and accepts closure of all three through its parser while closure of F1 alone is invalid", async () => {
+    const f1 = {
+      ...lineageFinding("src/f1.ts"),
+      observedFingerprints: [lineageFinding("src/f1-old.ts").fingerprint, lineageFinding("src/f1-older.ts").fingerprint],
+    };
+    const f2 = lineageFinding("src/f2.ts", "allows unsafe HTML");
+    const f3 = lineageFinding("src/f3.ts", "leaks the handle");
+    const carried = [f1, f2, f3];
+    const spellings = carried.map(observedReviewFingerprints);
+    expect(spellings.map((s) => s.length)).toEqual([3, 1, 1]);
+
+    for (const pick of [0, 1, 2]) {
+      const { brief, result } = await reviewFromBrief(carried, (b) => ({
+        resolved: headedSpellings(b).map((group) => group[Math.min(pick, group.length - 1)]), reraised: [],
+      }));
+      expect(brief).toContain("\n## Prior materials this attempt must close\nFor each finding below, copy exactly ONE");
+      const lines = copyBlock(brief).split("\n").filter(Boolean);
+      expect(lines.filter((line) => HEADING.test(line)))
+        .toEqual(["Finding 1 (choose one observed spelling):", "Finding 2:", "Finding 3:"]);
+      expect(lines.filter((line) => line.includes("Fingerprint: ")).every((line) => line.startsWith("Fingerprint: "))).toBe(true);
+      expect(headedSpellings(brief)).toEqual(spellings);
+      expect(result.meta?.cause).toBeUndefined();
+      expect(result.pass).toBe(true);
+      expect(result.meta?.resolvedMatches).toEqual([f1.fingerprint, f2.fingerprint, f3.fingerprint]);
+    }
+
+    const split = await reviewFromBrief(carried, (b) => {
+      const [first, ...rest] = headedSpellings(b);
+      return { resolved: [first![0]], reraised: rest.map((group) => group[0]) };
+    });
+    expect(split.result.meta?.cause).toBeUndefined();
+    expect(split.result.pass).toBe(false);
+    expect(split.result.meta?.resolvedMatches).toEqual([f1.fingerprint]);
+    expect(split.result.meta?.reraisedMatches).toEqual([f2.fingerprint, f3.fingerprint]);
+
+    const f1Only = await reviewFromBrief(carried, (b) => ({ resolved: [headedSpellings(b)[0]![0]], reraised: [] }));
+    expect(f1Only.result.pass).toBe(false);
+    expect(f1Only.result.meta).toMatchObject({ cause: "malformed-verdict", closureInvalid: true });
+  });
+
+  test("test: production reviewGate preserves bytes of quoted spellings containing heading-like text while a swapped F2 consequence cannot discharge F3", async () => {
+    const material = (path: string, symbol: string, note: string, observed: string[] = []): StructuredFinding => ({
+      class: "review:material", path, symbol, note, fingerprint: `review:material|${path}|${symbol}`,
+      ...(observed.length ? { observedFingerprints: observed } : {}),
+    });
+    // F2 and F3 share a path and a heading-like prefix; only the consequence tells them apart.
+    const f1 = material("src/f1.ts", "Finding 2:", "Finding 2: src/f1.ts drops the cursor.", [
+      "review:material|src/f1-old.ts|Finding 1 (choose one observed spelling):",
+      "review:material|src/f1.ts|1. drops the cursor",
+    ]);
+    const f2 = material("src/gate.ts", "Finding 3: returns stale rows", "Finding 3: src/gate.ts returns stale rows.");
+    const f3 = material("src/gate.ts", "Finding 3: leaks the handle", "Finding 3: src/gate.ts leaks the handle.");
+    const carried = [f1, f2, f3];
+
+    const { brief, result } = await reviewFromBrief(carried, (b) => ({
+      resolved: headedSpellings(b).map((group) => group.at(-1)), reraised: [],
+    }));
+    expect(promptSection(brief, "Prior materials this attempt must close")).toBe(`For each finding below, copy exactly ONE of its observed fingerprints into resolved or reraised.
+Use only these observed spellings. For every findings entry that restates a reraised prior, whether at the same path or a new path, set its "reraised" field to the copied id; unrelated defects need separate entries.
+The fingerprints appear once, in this block:
+\`\`\`text
+Finding 1 (choose one observed spelling):
+Fingerprint: review:material|src/f1.ts|Finding 2:
+Fingerprint: review:material|src/f1-old.ts|Finding 1 (choose one observed spelling):
+Fingerprint: review:material|src/f1.ts|1. drops the cursor
+Finding 2:
+Fingerprint: review:material|src/gate.ts|Finding 3: returns stale rows
+Finding 3:
+Fingerprint: review:material|src/gate.ts|Finding 3: leaks the handle
+\`\`\`
+1. Finding 2: src/f1.ts drops the cursor.
+
+2. Finding 3: src/gate.ts returns stale rows.
+
+3. Finding 3: src/gate.ts leaks the handle.`);
+    expect(headedSpellings(brief)).toEqual(carried.map(observedReviewFingerprints));
+    expect(result.meta?.cause).toBeUndefined();
+    expect(result.pass).toBe(true);
+    expect(result.meta?.resolvedMatches).toEqual([f1.fingerprint, f2.fingerprint, f3.fingerprint]);
+
+    // F3's slot spelled with F2's consequence IS F2's id: it names F2, never F3.
+    const swapped = f3.fingerprint.replace("leaks the handle", "returns stale rows");
+    expect(matchClosureId(swapped, carried)).toBe(f2.fingerprint);
+    for (const lists of [
+      { resolved: [f1.fingerprint, f2.fingerprint, swapped], reraised: [] },
+      { resolved: [f1.fingerprint, f2.fingerprint], reraised: [swapped] },
+      { resolved: [f1.fingerprint, swapped], reraised: [] },
+    ]) {
+      const swap = await reviewFromBrief(carried, () => lists);
+      expect(swap.result.pass).toBe(false);
+      expect(swap.result.meta).toMatchObject({ cause: "malformed-verdict", closureInvalid: true });
+      expect(swap.result.meta?.resolvedMatches).toBeUndefined();
+    }
+  });
 });

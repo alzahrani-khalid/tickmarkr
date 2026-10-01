@@ -197,8 +197,9 @@ export interface GateContext {
   // and the gate re-runs (a cached green is not what the recheck questions and may replay).
   recheck?: boolean;
   /** Explicit worker funding requires fresh red measurements, never a gate waiver. OBS-1106: so does
-   * a retry that landed nothing on a timeout-class red — its one fresh re-observation. */
-  cachedRedBypass?: "operator-rerun" | "timeout-fresh";
+   * a retry that landed nothing on a timeout-class red — its one fresh re-observation. C: and one whose
+   * unchanged red is attributed wholly outside the task's files[] — its one fresh re-execution. */
+  cachedRedBypass?: "operator-rerun" | "timeout-fresh" | "out-of-scope-fresh";
   // OBS-1033: channel keys of the seats that authored the carried commits (the task's tried list) —
   // a reviewer of that vendor is excluded for the round, never handed its own work to approve.
   carriedAuthors?: readonly string[];
@@ -606,16 +607,28 @@ export async function runGates(
   const shapeGates = ctx.cfg.gates.byShape?.[task.shape];
   const enabled = (g: GateName) =>
     task.gates.includes(g) && (g !== "acceptance" && g !== "review" || shapeGates?.[g] !== false);
-  const failed = () => results.some((r) => !r.pass);
   // T4 (OBS-265): a GREEN selected-test run is a screen, not the round's verdict — the merge-candidate
   // round re-runs the full suite on the same commit and THAT is what the round reports. With no
   // semantic gate to act on it, the screen is held so its full suite speaks for it in one row.
   // (A RED screen IS the verdict: the round ends there, so it is recorded immediately.)
   let heldTest: GateResult | undefined;
+  const semantic = enabled("acceptance") || enabled("review");
+  // v2.6.5 T6 (D): the closed repair-mode table. A repair the REVIEW sent back (carried review:material)
+  // whose test history is clean — selection allowed, no required repair test — asks the question it
+  // was sent back for first: cheap gates → acceptance ‖ review → screen → merge-candidate full suite,
+  // so a semantic red costs zero test starts. selectTests false or a nonempty requiredRepairTests is a
+  // test-red repair and keeps battery-first order; so does every first attempt (nothing carried).
+  const semanticFirst = semantic && ctx.selectTests === true && !ctx.requiredRepairTests?.length
+    && (ctx.carriedFindings ?? []).some((f) => f.class === "review:material");
+  // Semantic-first, a review that returned NO verdict is not a red that ends the round before its
+  // test proof: the daemon re-asks only the review (runReviewRecovery) and merges on the rows beside
+  // it, so the round still buys its screen and full suite. The row stays red; the round is unsatisfied.
+  const failed = () => results.some((r) => !r.pass && !(semanticFirst && r.gate === "review" && r.meta?.noVerdict === true));
   // OBS-1176: when acceptance/review WILL act on a green screen, the screen is published before they
   // start, as its own selected row. The full suite afterwards is a second invocation on its own row —
   // it carries only its own receipts and interval, so it neither erases nor re-counts the screen.
-  const publishScreen = enabled("acceptance") || enabled("review");
+  // Semantic-first, nothing acts on the screen but its full suite: it is held like a gate-less round's.
+  const publishScreen = semantic && !semanticFirst;
   // v2.0 T2 (OBS-554): this round's per-gate measurement. Every interval a gate actually spends
   // executing is added HERE, at the call site that runs it, so a gate that runs twice (the test
   // gate's screen and its full suite) sums to its own cost and never to the span between them.
@@ -1275,8 +1288,12 @@ export async function runGates(
         if (typeof rv.meta.reviewer === "string") {
           const reviewer = rv.meta.reviewer;
           const cause = String(rv.meta.cause);
+          // E1: a checkout-proof timeout is the host being slow to print the seat's proof, not the seat
+          // failing. It is still a no-verdict re-routed away from for THIS round, but it never strikes the
+          // run-scoped tally; every other launch failure (foreign or malformed proof included) does.
+          const proofTimeout = cause === "seat-launch-failed" && rv.meta.launchCause === "checkout-proof-timeout";
           // OBS-1025 add.2: the run-scoped tally; two no-verdicts retire the seat for the rest of the run.
-          const causes = rv.meta.noVerdict === true && ctx.reviewNoVerdicts
+          const causes = rv.meta.noVerdict === true && ctx.reviewNoVerdicts && !proofTimeout
             ? [...(ctx.reviewNoVerdicts.get(reviewer) ?? []), cause] : undefined;
           if (causes) ctx.reviewNoVerdicts!.set(reviewer, causes);
           // OBS-1039: a seat below the byte floor at the beat is silent — demoted like a zero-byte seat.
@@ -1426,46 +1443,9 @@ export async function runGates(
     await runGate("scope", scopeResult);
     if (failed()) return done();
   }
-  // A non-final round may run only the tests covering its own diff; the merge-candidate round below
-  // pays the full suite anyway, so a selection that misses costs a round and can never merge.
-  let selected = ctx.selectTests && enabled("test") && ctx.commands.test
-    ? await coveringTests(ctx.worktree, ctx.baseRef)
-    : undefined;
-  let selectionReason = ctx.selectionReason ?? (selected ? "affected-tests" : "full-suite-fallback");
-  if (selected && ctx.requiredRepairTests?.length) {
-    const required = ctx.requiredRepairTests;
-    const safe = required.every((path) => posix.normalize(path) === path && !path.startsWith("../")
-      && !path.startsWith("/") && TEST_FILE_RE.test(path) && existsSync(join(ctx.worktree, path)));
-    const listed = safe ? await shGit(`git ls-files -z -- ${required.map(shq).join(" ")}`, ctx.worktree) : undefined;
-    const tracked = new Set(listed?.stdout.split("\0").filter(Boolean));
-    if (!listed || listed.code !== 0 || required.some((path) => !tracked.has(path))) {
-      selected = undefined;
-      selectionReason = "required-repair-test-unavailable";
-    } else selected = [...new Set([...selected, ...required])].sort();
-  }
-  // OBS-635: a screen buys nothing when the full suite that must follow it already has a qualified
-  // green on this exact identity (read BEFORE any screen), or when the harness-measured screen costs
-  // at least 75 % of it — then the full suite runs in the battery instead. Unknown timing keeps the
-  // screen. A selected-only green never answers here: its identity names its selection.
-  let promotion: { reason: string; costRatio?: number } | undefined;
-  if (selected) {
-    const hit = verdictStore.get(await fullTestIdentity());
-    const costRatio = screenCostRatio(ctx.baseline, selected);
-    if (hit?.pass === true && !isInfraResult(hit) && await certifiesFullManifest(hit)) promotion = { reason: "full-green-cache" };
-    else if (costRatio !== undefined && costRatio >= SCREEN_PROMOTION_RATIO) promotion = { reason: "screen-cost-promoted", costRatio };
-    if (promotion) selected = undefined;
-  }
-  if (ctx.selectionReason || promotion) selectionDecision = {
-    scope: selected ? "selected" : "full", reason: promotion?.reason ?? (selected ? selectionReason
-      : selectionReason === "known-failing-files" ? "unsupported-selection-full-suite" : selectionReason),
-    requiredFiles: [...(ctx.requiredRepairTests ?? [])],
-    ...(promotion?.costRatio !== undefined ? { costRatio: promotion.costRatio } : {}),
-  };
-  await runBattery(selected ? { ...ctx.commands, test: testCommandForFiles(ctx.commands.test!, selected) } : ctx.commands,
-    selected, enabled("test") ? ["test"] : []);
-  if (failed()) return done();
-
-  if (enabled("acceptance") || enabled("review")) {
+  // The judge and the reviewer, together. Returns true when the round ends here: a red, or a
+  // cancelled sibling — a cancelled seat's round never goes on to borrow a test row.
+  const runSemantics = async (): Promise<boolean> => {
     // Judge and review are launched TOGETHER (96m of serialization over 5 runs). Enforcement is
     // unchanged — it is still the AND of both, both still fail closed, and neither reads the other's
     // verdict: each gets the same commit and the same brief it always got, and neither promise is
@@ -1506,16 +1486,80 @@ export async function runGates(
     await Promise.all(closing);
     if (failure) throw failure.reason;
     executionSignal()?.throwIfAborted();
-    if (failed()) return done();
+    return cancelled || failed();
+  };
+
+  if (semanticFirst) {
+    if (await runSemantics()) {
+      // A cancelled round starts no test, yet its no-verdict review can still be re-asked alone. Its test
+      // proof is recorded OWED — unsatisfied, never a verdict — so that re-ask cannot merge an unrun subject.
+      if (!failed() && enabled("test") && ctx.commands.test !== undefined) {
+        await record({ gate: "test", pass: false, details: "test not run — the semantic round was cancelled before its "
+          + "test screen; the merge-candidate full suite is still owed on this subject",
+        meta: { skipped: true, infra: true, classification: "infra", retryable: false, testOwed: true } });
+      }
+      return done();
+    }
+    // Subject freshness: the semantic gates ran oracles and vendor CLIs in this worktree. Their dirt is
+    // not the committed subject, so no screen measures it and no cached green row answers for it.
+    const dirt = enabled("test") && ctx.commands.test !== undefined ? await dirtyWorktree() : undefined;
+    if (dirt) {
+      await emitStart("test");
+      await record(await dirtyRefusal("test", dirt));
+      return done();
+    }
   }
+
+  // A non-final round may run only the tests covering its own diff; the merge-candidate round below
+  // pays the full suite anyway, so a selection that misses costs a round and can never merge.
+  let selected = ctx.selectTests && enabled("test") && ctx.commands.test
+    ? await coveringTests(ctx.worktree, ctx.baseRef)
+    : undefined;
+  let selectionReason = ctx.selectionReason ?? (selected ? "affected-tests" : "full-suite-fallback");
+  if (selected && ctx.requiredRepairTests?.length) {
+    const required = ctx.requiredRepairTests;
+    const safe = required.every((path) => posix.normalize(path) === path && !path.startsWith("../")
+      && !path.startsWith("/") && TEST_FILE_RE.test(path) && existsSync(join(ctx.worktree, path)));
+    const listed = safe ? await shGit(`git ls-files -z -- ${required.map(shq).join(" ")}`, ctx.worktree) : undefined;
+    const tracked = new Set(listed?.stdout.split("\0").filter(Boolean));
+    if (!listed || listed.code !== 0 || required.some((path) => !tracked.has(path))) {
+      selected = undefined;
+      selectionReason = "required-repair-test-unavailable";
+    } else selected = [...new Set([...selected, ...required])].sort();
+  }
+  // OBS-635: a screen buys nothing when the full suite that must follow it already has a qualified
+  // green on this exact identity (read BEFORE any screen), or when the harness-measured screen costs
+  // at least 75 % of it — then the full suite runs in the battery instead. Unknown timing keeps the
+  // screen. A selected-only green never answers here: its identity names its selection.
+  let promotion: { reason: string; costRatio?: number } | undefined;
+  if (selected) {
+    const hit = verdictStore.get(await fullTestIdentity());
+    const costRatio = screenCostRatio(ctx.baseline, selected);
+    if (hit?.pass === true && !isInfraResult(hit) && await certifiesFullManifest(hit)) promotion = { reason: "full-green-cache" };
+    else if (costRatio !== undefined && costRatio >= SCREEN_PROMOTION_RATIO) promotion = { reason: "screen-cost-promoted", costRatio };
+    if (promotion) selected = undefined;
+  }
+  if (ctx.selectionReason || promotion) selectionDecision = {
+    scope: selected ? "selected" : "full", reason: promotion?.reason ?? (selected ? selectionReason
+      : selectionReason === "known-failing-files" ? "unsupported-selection-full-suite" : selectionReason),
+    requiredFiles: [...(ctx.requiredRepairTests ?? [])],
+    ...(promotion?.costRatio !== undefined ? { costRatio: promotion.costRatio } : {}),
+  };
+  await runBattery(selected ? { ...ctx.commands, test: testCommandForFiles(ctx.commands.test!, selected) } : ctx.commands,
+    selected, enabled("test") ? ["test"] : []);
+  if (failed()) return done();
+
+  if (semantic && !semanticFirst && await runSemantics()) return done();
 
   // OBS-635: the semantic gates ran oracles and vendor CLIs in this worktree after an in-battery full
   // suite spoke, and its green stands only for the identity it measured. Oracle dirt withdraws it; a
   // changed or unmeasurable identity — tree, command, baseline, environment, dependency resolution,
   // capacity, protocol, lifecycle, full manifest — buys a fresh merge-candidate suite below.
+  // Semantic-first too: an in-battery full suite that ran AFTER the semantic gates is clear of their
+  // dirt, never of its own test command's effects (an ignored lockfile, a newly collected test).
   let rerunFull = false;
   listing = undefined;
-  if (fullInBattery && ctx.commands.test !== undefined && (enabled("acceptance") || enabled("review"))) {
+  if (fullInBattery && ctx.commands.test !== undefined && semantic) {
     const dirt = await dirtyWorktree();
     if (dirt) {
       const refusal = withTelemetry(await dirtyRoundRefusal("test", dirt));

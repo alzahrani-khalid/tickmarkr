@@ -427,3 +427,45 @@ test("test: production scope extraction delivers the real test path in readable 
   }
 }, 120_000);
 
+
+test("test: production approve releases a bound scope-request carrying its nonempty refusal reason into the next worker brief versus missing-reason refusal; declared files/surface remain equal", async () => {
+  const inScope = { shell: `echo fixed > owned.txt && ${COMMIT} fixed`, result: { ok: true, summary: "fixed within files[]" } };
+  const { repo, fake } = setupRepo([T("T1", { files: ["owned.txt"] })], { tasks: { T1: [refusal, inScope] } });
+  seedNeeded(repo);
+  const briefs: string[] = [];
+  const invoke = fake.invoke.bind(fake);
+  fake.invoke = (task, cwd, a, ctx) => {
+    briefs.push(readFileSync(ctx.promptFile, "utf8"));
+    return invoke(task, cwd, a, ctx);
+  };
+  const id = "run-scope-refusal-reason";
+  expect((await runDaemon(repo, { adapters: [fake], runId: id, approvalWindowMs: 0 })).human).toEqual(["T1"]);
+  const journal = Journal.open(repo, id);
+  expect(journal.read().findLast((e) => e.event === "task-human")!.data.kind).toBe("scope-request");
+  const declared = loadGraph(repo).tasks.find((t) => t.id === "T1")!;
+  const identity = recordedGraphDefinitionHash(journal.read());
+  const before = journal.read();
+
+  // Missing reason: refused naming both releases, nothing appended.
+  await expect(approve([id, "T1"], repo)).rejects.toThrow(/requires --files.*approve .*--reason/);
+  expect(journal.read()).toEqual(before);
+
+  const reason = "D-T13: needed.txt belongs to another task; fix it within owned.txt";
+  expect(await approve([id, "T1", "--reason", reason, "--by", "operator"], repo)).toContain("files[] unchanged");
+  const approval = journal.read().findLast((e) => e.event === "task-approved")!;
+  expect(approval.data).toMatchObject({ by: "operator", reason, park: expect.any(Object) });
+  expect(approval.data.release).toBeUndefined();
+  expect(approval.data.amendment).toBeUndefined();
+
+  await runDaemon(repo, { adapters: [fake], runId: id, resume: true, approvalWindowMs: 0 });
+  expect(briefs).toHaveLength(2);
+  expect(briefs[0]).not.toContain(reason);
+  expect(briefs[1]).toContain(`approval: ${reason}`);
+  const rows = Journal.open(repo, id).read();
+  expect(rows.filter((e) => e.event === "graph-rehash")).toEqual([]);
+  expect(rows.filter((e) => e.event === "task-dispatch" && e.taskId === "T1").at(-1)!.data.files).toBeUndefined();
+  const after = loadGraph(repo).tasks.find((t) => t.id === "T1")!;
+  expect(after.files).toEqual(declared.files);
+  expect(after.acceptance).toEqual(declared.acceptance);
+  expect(recordedGraphDefinitionHash(rows)).toBe(identity);
+}, 120_000);

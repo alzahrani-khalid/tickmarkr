@@ -1,13 +1,16 @@
-import { execSync, spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { execSync, spawnSync, type spawn } from "node:child_process";
+import { EventEmitter } from "node:events";
+import { PassThrough } from "node:stream";
+import { existsSync, mkdirSync, readFileSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import type { BillingChannel } from "../../src/adapters/types.js";
 import { pickReviewer } from "../../src/gates/review.js";
 import { HUMAN_AUTHOR, HUMAN_CHANNEL, parseCriteria, verify, verifyStateDir } from "../../src/cli/commands/verify.js";
-import { writeDoctor } from "../../src/adapters/registry.js";
+import { doctorAgeMs, initDoctorReuse, readDoctor, writeDoctor } from "../../src/adapters/registry.js";
 import { withRepositoryLease } from "../../src/run/lease.js";
+import { LAUNCHSERVICES_PROBE_CEILING_MS, resetLaunchServicesProbeForTests, setLaunchServicesProbeForTests, type ProbeTimer } from "../../src/run/launchservices-check.js";
 import { approve } from "../../src/cli/commands/approve.js";
 import { saveGraph } from "../../src/graph/graph.js";
 import { validateGraph } from "../../src/graph/schema.js";
@@ -445,4 +448,110 @@ describe("tickmarkr verify --record — owed-check discharge (C1)", () => {
     expect(debt("run-owed-b")).toMatchObject({ known: true, debt: 0, discharged: [b.id] });
     expect(Journal.open(repo, "run-owed-b").read().filter((e) => e.event === "owed-check-discharged")).toHaveLength(1);
   }, 240_000);
+});
+
+describe("tickmarkr verify — launchservicesd identity probe (A1)", () => {
+  afterEach(() => { resetLaunchServicesProbeForTests(); vi.restoreAllMocks(); });
+
+  test("standalone verify bounds an injected never-returning /bin/ps identity probe at the production 5000 ms kill ceiling and retains unknown evidence after cancellation while a released matching identity completes normally without consuming a retry", async () => {
+    const PRIOR = { pid: 377, start: "Wed Sep 30 21:54:33 2026" };
+    const repo = repoWithBranch();
+    const doctorBytes = () => readFileSync(join(repo, ".tickmarkr", "doctor.json"), "utf8");
+    writeDoctor(repo, { fake: { installed: false, authed: false, models: [], launchServices: PRIOR } });
+    const held = doctorBytes();
+    const stderr: string[] = [];
+    vi.spyOn(console, "error").mockImplementation((line: unknown) => { stderr.push(String(line)); });
+
+    // A /bin/ps stand-in: `release` = its stdout on the next turn; null = it never returns until killed.
+    const kills: Array<NodeJS.Signals | number | undefined> = [];
+    let spawns = 0;
+    const ps = (release: string | null, onSpawn?: () => void) => ((() => {
+      spawns += 1;
+      const child = Object.assign(new EventEmitter(), {
+        stdout: new PassThrough(),
+        kill: (signal?: NodeJS.Signals | number) => { kills.push(signal); setImmediate(() => child.emit("close", null, signal)); return true; },
+      });
+      if (release !== null) {
+        child.stdout.on("end", () => child.emit("close", 0, null));
+        setImmediate(() => child.stdout.end(release));
+      }
+      onSpawn?.();
+      return child;
+    }) as unknown as typeof spawn);
+    // Injected time: the ceiling is requested, never waited on — `fire` jumps the clock to it.
+    const armed: number[] = [];
+    let cleared = 0;
+    const clock = (fire: boolean): ProbeTimer => (cb, ms) => { armed.push(ms); if (fire) setImmediate(cb); return () => { cleared += 1; }; };
+    const verdict = (r: { out: string; code: number }) => ({ code: r.code, rows: r.out.split("\n").filter((l) => /^(PASS|FAIL) /.test(l)) });
+
+    const reference = verdict(await verify(["--no-review"], repo)); // seam off: no probe at all
+    expect(reference.code).toBe(0);
+    expect(spawns).toBe(0);
+
+    // 1. never returns: killed at exactly the production ceiling, evidence unknown, prior identity kept.
+    expect(LAUNCHSERVICES_PROBE_CEILING_MS).toBe(5000);
+    setLaunchServicesProbeForTests({ platform: "darwin", spawn: ps(null), setTimer: clock(true) });
+    expect(verdict(await verify(["--no-review"], repo))).toEqual(reference);
+    expect(armed).toEqual([5000]);
+    expect(kills).toEqual(["SIGKILL"]);
+    expect(spawns).toBe(1);
+    expect(stderr.join("\n")).toContain("launchservicesd identity unknown — /bin/ps exceeded the 5000 ms kill ceiling");
+    expect(doctorBytes()).toBe(held);
+
+    // 2. never returns, the ceiling never reached, the caller cancels: reaped, unknown, prior identity kept.
+    stderr.length = 0;
+    const cancel = new AbortController();
+    setLaunchServicesProbeForTests({ platform: "darwin", spawn: ps(null, () => setImmediate(() => cancel.abort())), setTimer: clock(false), signal: cancel.signal });
+    expect(verdict(await verify(["--no-review"], repo))).toEqual(reference);
+    expect(armed).toEqual([5000, 5000]);
+    expect(kills).toEqual(["SIGKILL", "SIGKILL"]);
+    expect(cleared).toBe(2);
+    expect(stderr.join("\n")).toContain("launchservicesd identity unknown — probe cancelled; prior identity (pid 377 started Wed Sep 30 21:54:33 2026) retained");
+    expect(doctorBytes()).toBe(held);
+
+    // 3. released with the held identity: completes normally on its one spawn — no kill, no retry, no write.
+    stderr.length = 0;
+    setLaunchServicesProbeForTests({ platform: "darwin", spawn: ps(`  377 Wed Sep 30 21:54:33 2026     /System/Library/CoreServices/launchservicesd\n`), setTimer: clock(false) });
+    expect(verdict(await verify(["--no-review"], repo))).toEqual(reference);
+    expect(spawns).toBe(3);
+    expect(kills).toHaveLength(2);
+    expect(cleared).toBe(3);
+    expect(stderr.join("\n")).not.toContain("launchservicesd");
+    expect(doctorBytes()).toBe(held);
+  }, 120_000);
+
+  test("a changed identity persists without refreshing doctor.json's auth freshness, and a failed persist still returns the verdict", async () => {
+    const repo = repoWithBranch();
+    const doctorFile = join(repo, ".tickmarkr", "doctor.json");
+    const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000);
+    writeDoctor(repo, { fake: { installed: false, authed: false, models: [], launchServices: { pid: 377, start: "Wed Sep 30 21:54:33 2026" } } });
+    utimesSync(doctorFile, twoHoursAgo, twoHoursAgo);
+    const stderr: string[] = [];
+    vi.spyOn(console, "error").mockImplementation((line: unknown) => { stderr.push(String(line)); });
+    const ps = (() => {
+      const child = Object.assign(new EventEmitter(), { stdout: new PassThrough(), kill: () => true });
+      child.stdout.on("end", () => child.emit("close", 0, null));
+      setImmediate(() => child.stdout.end("  412 Thu Oct  1 09:12:05 2026     /System/Library/CoreServices/launchservicesd\n"));
+      return child;
+    }) as unknown as typeof spawn;
+    const verdict = (r: { out: string; code: number }) => ({ code: r.code, rows: r.out.split("\n").filter((l) => /^(PASS|FAIL) /.test(l)) });
+    const reference = verdict(await verify(["--no-review"], repo));
+
+    setLaunchServicesProbeForTests({ platform: "darwin", spawn: ps });
+    expect(verdict(await verify(["--no-review"], repo))).toEqual(reference);
+    expect(readDoctor(repo)!.fake!.launchServices).toMatchObject({ pid: 412, advisory: expect.stringContaining("launchservicesd restarted") });
+    expect(doctorAgeMs(repo)!).toBeGreaterThanOrEqual(2 * 60 * 60 * 1000);
+    expect(initDoctorReuse(repo, false).reuse).toBe(false);
+
+    // an obstructed temp file: the write throws inside verify, the verdict and JSON still come back
+    writeDoctor(repo, { fake: { installed: false, authed: false, models: [], launchServices: { pid: 377, start: "Wed Sep 30 21:54:33 2026" } } });
+    const held = readFileSync(doctorFile, "utf8");
+    mkdirSync(`${doctorFile}.tmp`);
+    expect(verdict(await verify(["--no-review"], repo))).toEqual(reference);
+    const json = await verify(["--no-review", "--json"], repo);
+    expect(json.code).toBe(reference.code);
+    expect(JSON.parse(json.out).green).toBe(true);
+    expect(stderr.join("\n")).toContain("launchservicesd evidence not persisted");
+    expect(readFileSync(doctorFile, "utf8")).toBe(held);
+  }, 120_000);
 });

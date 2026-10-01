@@ -7,6 +7,7 @@ import type { Baseline } from "./baseline.js";
 import type { GateResult } from "./types.js";
 import { checkoutIncarnation, describeCapacity, inventoryDependencyLinks, type RunCapacity, resolvedCapacity, shGit, type VerificationProtocol, verificationProtocol } from "../run/git.js";
 import { shq } from "../adapters/types.js";
+import { titleEnvironment } from "../run/title-environment.js";
 
 export const DEFAULT_VERDICT_CACHE_BOUND = 128;
 let testCacheBound: number | undefined;
@@ -89,9 +90,16 @@ export async function getWorktreeTree(worktree: string): Promise<string> {
  * it when another variable is shown to change what a runner executes. */
 export const RUNNER_ENV_KEYS = ["PATH", "NODE_OPTIONS", "NODE_PATH", "NODE_ENV", "TZ"] as const;
 
+/** A2: NODE_OPTIONS is hashed as the child RECEIVES it (shell appends the Darwin title preload), plus the
+ * preload's content identity, so a replaced preload, the opt-out or a refused preflight never reuses a
+ * verdict or baseline measured under another mode. Native mode hashes the pre-A2 inputs less any inherited
+ * managed preload, which shell removes from that child too. */
 export function runnerInputsHash(env: NodeJS.ProcessEnv = process.env): string {
-  return createHash("sha256").update(canonicalJson(Object.fromEntries(RUNNER_ENV_KEYS.map((k) => [k, env[k] ?? null]))))
-    .digest("hex").slice(0, 16);
+  const title = titleEnvironment(env);
+  const inputs: Record<string, string | null> = Object.fromEntries(RUNNER_ENV_KEYS.map((k) =>
+    [k, (k === "NODE_OPTIONS" ? title.nodeOptions : env[k]) ?? null]));
+  if (title.mode === "preload") inputs.titlePreload = title.identity;
+  return createHash("sha256").update(canonicalJson(inputs)).digest("hex").slice(0, 16);
 }
 
 export interface GateEnvironmentInput {

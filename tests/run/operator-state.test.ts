@@ -3,10 +3,13 @@ import { graphDefinitionHash } from "../../src/graph/graph.js";
 import { boardFrame } from "../../src/tui/cockpit/board.js";
 import { evidenceLookup, runGateCells } from "../../src/tui/cockpit/run-view.js";
 import { readOperatorState } from "../../src/run/operator-state.js";
+import { foldOwedChecks, type JournalEvent } from "../../src/run/journal.js";
+/** I2: the authoritative owed fold over the same events, tagged with the basis the read names. */
+const owedOf = (events: readonly JournalEvent[]) => ({ owed: { basis: "fixture", fold: foldOwedChecks(events, process.cwd()) }, basis: "fixture" });
 import { graph, partial, approved, resumed, complete, ev } from "../fixtures/operator-state/fixture.js";
 
 test("The exported operator-state reader required by C1 and C6 replays the three-task partial→approved→resumed→complete fixture with a matching graph with merged numerator 1 then 3 and planned denominator 3. Green requires the latest run-end, tip not failed and empty failed/human/blocked/pending buckets. One human or blocked member remains PARTIAL despite historical tip pass, resume makes current tip PENDING, and a mismatched graph says not comparable. Borrowing denominator 2 from observed tasks, using an old run-end or treating unknown evidence as green fails.", () => {
-  const read = (events = partial) => readOperatorState({ events, graph, sequence: 34, observedAt: 1000 });
+  const read = (events = partial) => readOperatorState({ events, graph, sequence: 34, observedAt: 1000, ...owedOf(events) });
   expect(read()).toMatchObject({ lifecycle: "PARTIAL", green: false, currentTip: "passed", merged: 1, planned: 3, sequence: 34, observedAt: 1000 });
   expect(read(approved)).toMatchObject({ lifecycle: "APPROVED", green: false, approvedResumeRequired: true, label: "approved; resume required" });
   expect(read(resumed)).toMatchObject({ lifecycle: "RUNNING", currentTip: "pending", merged: 1, planned: 3, latestRunEnd: undefined });
@@ -16,7 +19,7 @@ test("The exported operator-state reader required by C1 and C6 replays the three
   expect(readOperatorState({ events: partial, graph: foreign })).toMatchObject({ comparable: false, comparison: "not comparable", planned: undefined, merged: 1 });
   const foreignHash = graphDefinitionHash(foreign);
   expect(readOperatorState({ events: [partial[0]!, ev("graph-rehash", { from: partial[0]!.data.graphDefinitionHash, to: foreignHash }), ...partial.slice(1)], graph: foreign })).toMatchObject({ comparable: true, planned: 3 });
-  expect(readOperatorState({ events: [ev("run-start", {}), ev("graph-rehash", { from: null, to: graphDefinitionHash(graph) }), ...complete.slice(1)], graph })).toMatchObject({ comparable: true, lifecycle: "COMPLETE", green: true, planned: 3 });
+  expect(readOperatorState({ events: [ev("run-start", {}), ev("graph-rehash", { from: null, to: graphDefinitionHash(graph) }), ...complete.slice(1)], graph, ...owedOf(complete) })).toMatchObject({ comparable: true, lifecycle: "COMPLETE", green: true, planned: 3 });
   expect(readOperatorState({ events: [partial[0]!, ev("graph-rehash", { from: "unrelated", to: graphDefinitionHash(graph) }), ...partial.slice(1)], graph })).toMatchObject({ comparable: false, comparison: "not comparable" });
   expect(readOperatorState({ events: partial })).toMatchObject({ comparable: false, planned: undefined });
   for (const key of ["human", "blocked", "failed", "pending"]) {

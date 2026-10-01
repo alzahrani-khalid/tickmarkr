@@ -145,8 +145,9 @@ export type DeadChannelReason = "auth-required" | "setup-required" | "provider-o
 
 // Signatures anchor distinctive CLI-error phrasing — never bare fragments or bare status-code
 // numbers (the QUOTA_RE Pitfall-3 lesson): these run only over no-trailer output, but a stalled
-// worker's harvested pane can still contain ordinary work text.
-const AUTH_RE = /not logged in|please (?:log ?in|sign in)|please run [^\n]{0,30}log ?in|authentication[ _](?:required|failed|error)|invalid (?:api key|credentials)|api key (?:is )?(?:not set|missing|invalid|required)|credentials? (?:have )?expired|401 unauthorized/i;
+// worker's harvested pane can still contain ordinary work text. E1: the recorded refresh failure
+// ("access token could not be refreshed") is auth-required — classified, never re-probed or relaunched.
+const AUTH_RE = /not logged in|please (?:log ?in|sign in)|please run [^\n]{0,30}log ?in|authentication[ _](?:required|failed|error)|invalid (?:api key|credentials)|api key (?:is )?(?:not set|missing|invalid|required)|credentials? (?:have )?expired|401 unauthorized|access token could not be refreshed/i;
 const SETUP_RE = /command not found|not recognized as an internal or external command|spawn \S+ ENOENT|missing required config|workspace trust (?:required|not granted)/i;
 const OUTAGE_RE = /unable to reach the model provider|cannot reach the model provider|model provider.{0,40}(?:unavailable|unreachable)|service (?:is )?temporarily unavailable|upstream connect error|overloaded_error/i;
 const TIMEOUT_RE = /\bETIMEDOUT\b|request timed out|connection timed out|deadline exceeded|timed out waiting for/i;

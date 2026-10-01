@@ -1,21 +1,21 @@
 tickmarkr capture | EVIDENCE | run-20260905-000000
-1 Home  4 Run  5 Evidence | content | 1–25/25 | 0 hidden
+1 Home  4 Run  5 Evidence  7 Log | content | 1–25/25 | 0 hidden
 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 │1 Home         │EVIDENCE [JOURNAL]  REPORT  STATS  CHANNELS  LEARNING PREVIEW  | Follow on  | …│1 Home                │
 │4 Run          │RAW JOURNAL                                                                    │4 Run                 │
 │5 Evidence     │00:00:00 ● running #L1 run-start — fixture                                     │5 Evidence            │
-│               │00:00:00 ● running #L2 task-dispatch — T1                                      │Tab Focus             │
-│CLI:           │00:00:00 ✓ passed #L3 gate-result — T1 — review passed                         │Enter Open            │
-│fleet          │00:00:00 ✗ terminal failure #L4 gate-result — T1 — review failed               │a Actions             │
-│plan           │00:00:00 - disabled #L5 build — gate-result — Txxxxxxxxxxxxxxxxxxxxx…          │/ Filter              │
-│doctor         │00:00:00 ✓ passed #L6 merge — T1                                               │e Export              │
-│               │00:00:00 ! human park #L7 task-human — T2                                      │f Follow              │
-│               │00:00:00 ? unknown #L8 tip-verify                                              │PageUp/PageDown Page  │
-│               │00:00:00 ✓ passed #L9 run-end — done 1, failed 0                               │? Keys                │
-│               │00:00:00 ? unknown #L10 task-approved — T2                                     │q Quit                │
-│               │00:00:00 ● running #L11 run-resume                                             │+ Widen shortcuts     │
-│               │00:00:00 ● running ❯ #L12 task-dispatch — T2                                   │- Narrow shortcuts    │
-│               │OPERATOR PAGE GROUPS                                                           │                      │
+│7 Log          │00:00:00 ● running #L2 task-dispatch — T1                                      │7 Log                 │
+│               │00:00:00 ✓ passed #L3 gate-result — T1 — review passed                         │Tab Focus             │
+│CLI:           │00:00:00 ✗ terminal failure #L4 gate-result — T1 — review failed               │Enter Open            │
+│fleet          │00:00:00 - disabled #L5 build — gate-result — Txxxxxxxxxxxxxxxxxxxxx…          │a Actions             │
+│plan           │00:00:00 ✓ passed #L6 merge — T1                                               │/ Filter              │
+│doctor         │00:00:00 ! human park #L7 task-human — T2                                      │e Export              │
+│               │00:00:00 ? unknown #L8 tip-verify                                              │f Follow              │
+│               │00:00:00 ✓ passed #L9 run-end — done 1, failed 0                               │PageUp/PageDown Page  │
+│               │00:00:00 ? unknown #L10 task-approved — T2                                     │? Keys                │
+│               │00:00:00 ● running #L11 run-resume                                             │q Quit                │
+│               │00:00:00 ● running ❯ #L12 task-dispatch — T2                                   │+ Widen shortcuts     │
+│               │OPERATOR PAGE GROUPS                                                           │- Narrow shortcuts    │
 │               │no operator pages                                                              │                      │
 │               │SELECTED EVIDENCE                                                              │                      │
 │               │Original journal <engagement>/journal.jsonl                                    │                      │

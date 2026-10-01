@@ -7,6 +7,7 @@ import { join } from "node:path";
 import { matchesTrustDialog, type WorkerAdapter } from "../adapters/types.js";
 import type { Effort } from "../graph/schema.js";
 import { formatOwnedName, parseOwnedName, type ExecutorDriver, type Slot } from "../drivers/types.js";
+import type { SeatLaunchCause } from "../drivers/orca.js";
 import { bannerShell, paneDispatchCommand, PLAIN_BANNER } from "../brand.js";
 import { sh } from "../run/git.js";
 import {
@@ -344,11 +345,15 @@ export function reviewSeatOutput(raw: string, nonce: string, adapterBannerRows: 
 }
 
 /** OBS-1168(b): a judge/review seat whose pane could not be created or launched. Typed so the gates can
- * contain it as seat recovery (another seat) or an infra park — never as a worker failure. */
+ * contain it as seat recovery (another seat) or an infra park — never as a worker failure. E1: the
+ * driver's typed launch cause survives the wrap as a field; the message alone is prose. */
 export class SeatLaunchError extends Error {
+  readonly launchCause?: SeatLaunchCause;
   constructor(public readonly seat: string, cause: unknown) {
     super(`seat ${seat} failed to launch: ${cause instanceof Error ? cause.message : String(cause)}`);
     this.name = "SeatLaunchError";
+    const launchCause = (cause as { launchCause?: unknown } | null | undefined)?.launchCause;
+    if (launchCause === "checkout-proof-timeout") this.launchCause = launchCause;
   }
 }
 

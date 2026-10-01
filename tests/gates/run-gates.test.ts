@@ -11,17 +11,17 @@ import { HerdrDriver } from "../../src/drivers/herdr.js";
 import { SubprocessDriver } from "../../src/drivers/subprocess.js";
 import type { ExecutorDriver } from "../../src/drivers/types.js";
 import { captureBaseline, compareToBaseline, type Baseline } from "../../src/gates/baseline.js";
-import { extractPromptNonce } from "../../src/gates/llm.js";
-import { type GateEvent, runGates } from "../../src/gates/run-gates.js";
+import { extractPromptNonce, type GateVia } from "../../src/gates/llm.js";
+import { type GateContext, type GateEvent, runGates } from "../../src/gates/run-gates.js";
 import type { GateResult } from "../../src/gates/types.js";
 import { graphDefinitionHash, loadGraph } from "../../src/graph/graph.js";
-import { GATE_NAMES, validateGraph } from "../../src/graph/schema.js";
+import { GATE_NAMES, type GateName, validateGraph } from "../../src/graph/schema.js";
 import {
-  NUDGEABLE_ADAPTERS, resetHarvestSilentMsForTests, resetNudgeTimingForTests, runDaemon,
+  gateSatisfied, NUDGEABLE_ADAPTERS, resetHarvestSilentMsForTests, resetNudgeTimingForTests, runDaemon,
   setHarvestSilentMsForTests, setNudgeTimingForTests, verifyIntegrationTipCached, WORKER_NUDGE_MESSAGE,
 } from "../../src/run/daemon.js";
 import { gitHead } from "../../src/run/git.js";
-import { Journal } from "../../src/run/journal.js";
+import { Journal, type StructuredFinding } from "../../src/run/journal.js";
 import { COMMIT, makeRepo, makeTestTempDir, setupRepo, T } from "../helpers/tmprepo.js";
 
 const author: Assignment = { adapter: "fake", model: "fake-1", channel: "sub", tier: "frontier" };
@@ -1659,5 +1659,241 @@ describe("OBS-635 — an in-battery full green is revalidated after the semantic
           ? { generated, pass: true, full: true, reused: undefined, manifest: ["tests/a.test.ts", "tests/generated.test.ts"] }
           : { generated, pass: true, full: undefined, reused: undefined, manifest: ["tests/a.test.ts"] });
     }
+  }, 120_000);
+});
+
+// ---------------------------------------------------------------------------------------------
+// v2.6.5 T6 (D): a repair the REVIEW sent back — carried review:material, selection allowed, no
+// required repair test. witness.sh's log is the actual launch trace and the stream is the actual gate
+// order; nothing here infers order from time.
+// ---------------------------------------------------------------------------------------------
+
+const MATERIAL: StructuredFinding = { class: "review:material", path: "src/a.ts", symbol: "a",
+  note: "src/a.ts `a` drops the last row", fingerprint: "review:material|src/a.ts|a" };
+const APPROVE = { approve: true, resolved: [MATERIAL.fingerprint], reraised: [], findings: [] };
+const REJECT = { approve: false, resolved: [], reraised: [MATERIAL.fingerprint],
+  findings: [{ note: "src/a.ts:1 `a` still drops the last row", severity: "material" }] };
+
+// A reviewer whose vendor CLI also writes into the checkout it reviews.
+class LitteringReviewFake extends FakeAdapter {
+  constructor(scriptPath: string, private readonly repo: string) {
+    super(scriptPath);
+  }
+
+  override headlessCommand(promptFile: string, model: string): string {
+    const inner = super.headlessCommand(promptFile, model);
+    if (!/TICKMARKR-REVIEW/.test(readFileSync(promptFile, "utf8"))) return inner;
+    return `${inner}; echo litter > ${shq(join(this.repo, "litter.txt"))}`;
+  }
+}
+
+async function reviewRepair(review: object) {
+  const repo = makeRepo({
+    "src/a.ts": "export const a = 1;\n",
+    "tests/a.test.ts": 'import { a } from "../src/a.js";\na;\n',
+    "tests/hidden.test.ts": "// outside the import-based selection\n",
+    // The full suite (no file arguments) reds while full-red.flag exists; a screen never does.
+    "witness.sh": [
+      'echo "$*" >> battery.log',
+      'if [ -f full-red.flag ] && [ "$1" = test ] && [ "$#" -eq 1 ]; then echo "FAIL tests/hidden.test.ts > omitted regression"; exit 1; fi',
+      "exit 0",
+    ].join("\n"),
+    ".gitignore": "battery.log\nfull-red.flag\n",
+  });
+  const baseRef = await gitHead(repo);
+  writeFileSync(join(repo, "src/a.ts"), "export const a = 2;\n");
+  commitAll(repo, "repair");
+  const commands = { build: "sh witness.sh build", test: "sh witness.sh test", lint: "sh witness.sh lint" };
+  const cfg = structuredClone(DEFAULT_CONFIG);
+  cfg.judge.adapter = "fake";
+  const baseline = await captureBaseline(repo, commands);
+  const { adapter, scriptPath } = fakeWith({ judge: { pass: true, criteria: [{ criterion: "c1", met: true, reason: "ok" }] }, review });
+  const round = async (over: Partial<GateContext> = {}, taskOver: { gates?: GateName[] } = {}) => {
+    rmSync(join(repo, "battery.log"), { force: true });
+    const stream: string[] = [];
+    // spread AFTER validation, as the daemon's recovery builds `{ ...task, gates: ["review"] }`
+    const { results } = await runGates({ ...mkTask({ files: ["**"] }), ...taskOver }, {
+      worktree: repo, baseRef, author, result: { ok: true, summary: "repaired", deviations: [], raw: "" },
+      commands, baseline, channels, adapters: [adapter], cfg, selectTests: true, carriedFindings: [MATERIAL],
+      onGate: (e) => { if (e.phase !== "note") stream.push(`${e.gate}:${e.phase}`); },
+      ...over,
+    });
+    const log = existsSync(join(repo, "battery.log")) ? readFileSync(join(repo, "battery.log"), "utf8").trim().split("\n") : [];
+    return { results, stream, log, row: (gate: string) => results.find((r) => r.gate === gate) };
+  };
+  return { repo, scriptPath, round };
+}
+
+// A reviewer whose CLI prints nothing: every seat returns no verdict.
+class SilentReviewFake extends FakeAdapter {
+  override headlessCommand(promptFile: string, model: string): string {
+    return /TICKMARKR-REVIEW/.test(readFileSync(promptFile, "utf8")) ? "true" : super.headlessCommand(promptFile, model);
+  }
+}
+
+// The daemon's review-only recovery (runReviewRecovery): re-ask ONLY the review, swap its row, merge on all.
+const recoverReview = async (fixture: Awaited<ReturnType<typeof reviewRepair>>, first: GateResult[], over: Partial<GateContext> = {}) => {
+  const retried = await fixture.round(over, { gates: ["review"] });
+  const replacement = retried.row("review")!;
+  return { retried, replacement, merges: first.map((g) => g.gate === "review" ? replacement : g).every(gateSatisfied) };
+};
+
+const CHEAP = ["build", "lint", "evidence", "scope"].flatMap((g) => [`${g}:start`, `${g}:end`]);
+
+describe("v2.6.5 T6 — a semantic repair is reviewed before its test battery is bought (D)", () => {
+  test("runGates review-material repair follows cheap→acceptance‖review→screen→full versus zero test starts on a semantic red", async () => {
+    const green = await (await reviewRepair(APPROVE)).round();
+    expect(green.stream.slice(0, 10)).toEqual([...CHEAP, "acceptance:start", "review:start"]);
+    expect(green.stream.slice(10, 12).sort()).toEqual(["acceptance:end", "review:end"]); // judge ‖ review
+    // the screen, then the merge-candidate full suite, which speaks for the held screen in one row
+    expect(green.stream.slice(12)).toEqual(["test:start", "test:start", "test:end"]);
+    expect(green.log).toEqual(["build", "lint", "test tests/a.test.ts", "test"]);
+    expect(green.row("test")?.meta).toMatchObject({ fullSuite: true, selectedTests: ["tests/a.test.ts"] });
+    expect(green.results.every((r) => r.pass)).toBe(true);
+
+    const red = await (await reviewRepair(REJECT)).round();
+    expect(red.stream.slice(0, 10)).toEqual([...CHEAP, "acceptance:start", "review:start"]);
+    expect(red.stream.filter((e) => e.startsWith("test:"))).toEqual([]); // zero test starts
+    expect(red.log).toEqual(["build", "lint"]);
+    expect(red.row("review")?.pass).toBe(false);
+    expect(red.row("test")).toBeUndefined();
+  }, 120_000);
+
+  test("runGates semantic success still requires real merge-candidate full proof for the unchanged subject while a dirty changed subject or cancelled seat cannot borrow a green row", async () => {
+    // Semantics green and the screen green: a regression only the full suite sees still reds the round.
+    const unproven = await reviewRepair(APPROVE);
+    writeFileSync(join(unproven.repo, "full-red.flag"), "");
+    const regressed = await unproven.round();
+    expect(regressed.log).toEqual(["build", "lint", "test tests/a.test.ts", "test"]);
+    expect(regressed.row("acceptance")?.pass).toBe(true);
+    expect(regressed.row("review")?.pass).toBe(true);
+    expect(regressed.row("test")).toMatchObject({ pass: false, meta: { fullSuite: true } });
+    expect(regressed.row("test")?.details).toContain("tests/hidden.test.ts");
+
+    // A green round measures the clean subject; its rows are then in the verdict store.
+    const fixture = await reviewRepair(APPROVE);
+    const proven = await fixture.round();
+    expect(proven.log).toEqual(["build", "lint", "test tests/a.test.ts", "test"]);
+    expect(proven.row("test")).toMatchObject({ pass: true, meta: { fullSuite: true } });
+    const head = await gitHead(fixture.repo);
+
+    // The reviewer's CLI writes into the checkout: the changed subject borrows neither cached green,
+    // and no screen or full suite is started against it.
+    const dirty = await fixture.round({ adapters: [new LitteringReviewFake(fixture.scriptPath, fixture.repo)] });
+    expect(dirty.row("review")?.pass).toBe(true);
+    expect(dirty.log.filter((line) => line.startsWith("test"))).toEqual([]);
+    expect(dirty.stream.filter((e) => e.startsWith("test:"))).toEqual(["test:start", "test:end"]);
+    expect(dirty.row("test")).toMatchObject({ pass: false, meta: { dirtyWorktree: true, paths: ["litter.txt"] } });
+    expect(dirty.row("test")?.meta?.reused).toBeUndefined();
+    expect(dirty.row("test")?.meta?.culprit).toBeUndefined(); // no test command left it behind
+    expect(await gitHead(fixture.repo)).toBe(head);
+    rmSync(join(fixture.repo, "litter.txt"));
+
+    // No seat can launch: the seatless sibling cancels the other and the round ends before any test.
+    const driver = { slot: async () => { throw new Error("no pane could be created"); }, close: async () => {} } as unknown as ExecutorDriver;
+    const via: GateVia = { driver, nameFor: (role, adapter) => `${role}-${adapter}`, labelFor: (role) => role.toUpperCase() };
+    const seatless = await fixture.round({ via });
+    expect(seatless.stream.filter((e) => e === "test:start")).toEqual([]);
+    expect(seatless.log.filter((line) => line.startsWith("test"))).toEqual([]);
+    // absent, or (when a no-verdict review recorded before the cancel) recorded as owed — never a green
+    const owed = seatless.row("test");
+    expect(owed === undefined || (owed.meta?.testOwed === true && !gateSatisfied(owed))).toBe(true);
+    expect(seatless.results.some((r) => r.meta?.cause === "seat-launch-failed" && r.meta?.infra === true && !r.pass)).toBe(true);
+    expect(seatless.results.every((r) => r.pass)).toBe(false);
+  }, 120_000);
+
+  test("runGates semantic-first no-verdict review still buys its full suite so a review-only recovery that approves cannot merge a full-suite red", async () => {
+    // Every seat of the first round returns no verdict; the full suite reds on the repaired subject.
+    const fixture = await reviewRepair(APPROVE);
+    writeFileSync(join(fixture.repo, "full-red.flag"), "");
+    const first = await fixture.round({ adapters: [new SilentReviewFake(fixture.scriptPath)] });
+    expect(first.row("review")?.meta).toMatchObject({ noVerdict: true, infra: true });
+    expect(first.row("acceptance")?.pass).toBe(true);
+    // the no-verdict is not a semantic red: the round goes on to the screen and the merge-candidate suite
+    expect(first.stream.slice(12)).toEqual(["test:start", "test:start", "test:end"]);
+    expect(first.log).toEqual(["build", "lint", "test tests/a.test.ts", "test"]);
+    expect(first.row("test")).toMatchObject({ pass: false, meta: { fullSuite: true } });
+    // recovery re-asks only the review, starts no test, approves — and the task still does not merge
+    const recovered = await recoverReview(fixture, first.results);
+    expect(recovered.retried.log).toEqual([]);
+    expect(recovered.replacement.pass).toBe(true);
+    expect(recovered.merges).toBe(false);
+
+    // CONTROL: the same recovery over a full-suite GREEN merges, so the red test row is what refuses it.
+    // (a fresh subject: the red full suite above is a cached verdict for this one's identity)
+    const clean = await reviewRepair(APPROVE);
+    const green = await clean.round({ adapters: [new SilentReviewFake(clean.scriptPath)] });
+    expect(green.row("test")).toMatchObject({ pass: true, meta: { fullSuite: true } });
+    expect((await recoverReview(clean, green.results)).merges).toBe(true);
+
+    // A cancelled round (the only reviewer could not launch) starts no test: its test proof is OWED.
+    const driver = { slot: async () => { throw new Error("no pane could be created"); }, close: async () => {} } as unknown as ExecutorDriver;
+    const via: GateVia = { driver, nameFor: (role, adapter) => `${role}-${adapter}`, labelFor: (role) => role.toUpperCase() };
+    const reviewOnly = { gates: GATE_NAMES.filter((g) => g !== "acceptance") };
+    const cancelled = await fixture.round({ via }, reviewOnly);
+    expect(cancelled.row("review")?.meta).toMatchObject({ noVerdict: true, cause: "seat-launch-failed" });
+    expect(cancelled.stream.filter((e) => e === "test:start")).toEqual([]);
+    expect(cancelled.log.filter((line) => line.startsWith("test"))).toEqual([]);
+    expect(cancelled.row("test")).toMatchObject({ pass: false, meta: { skipped: true, infra: true, testOwed: true } });
+    expect((await recoverReview(fixture, cancelled.results)).merges).toBe(false);
+  }, 120_000);
+
+  test("runGates semantic-first full-suite fallback revalidates identity and the full manifest after its own test command, so a rewritten ignored lockfile or a newly collected ignored test reruns while an unchanged identity runs once", async () => {
+    // D-865: the full suite here ran AFTER the semantic gates, so no oracle dirt can reach it — but its
+    // own test command can still move the verification inputs it was measured against.
+    const fallback = async (files: Record<string, string>, test: string, scratch: string[]) => {
+      const repo = makeRepo({ ...files, "src/a.ts": "export const a = 1;\n", "src/gone.ts": "export const gone = 0;\n" });
+      if (test.startsWith("vitest")) symlinkSync(join(import.meta.dirname, "../../node_modules"), join(repo, "node_modules"), "dir");
+      const baseRef = await gitHead(repo);
+      writeFileSync(join(repo, "src/a.ts"), "export const a = 2;\n");
+      rmSync(join(repo, "src/gone.ts")); // a deletion attributes no selection: the full suite runs in the battery
+      commitAll(repo, "repair");
+      const cfg = structuredClone(DEFAULT_CONFIG);
+      cfg.judge.adapter = "fake";
+      const baseline = await captureBaseline(repo, { test });
+      for (const path of ["argv.log", ...scratch]) rmSync(join(repo, path), { force: true });
+      const stream: string[] = [];
+      const { results } = await runGates(mkTask({ files: ["**"] }), {
+        worktree: repo, baseRef, author, result: { ok: true, summary: "repaired", deviations: [], raw: "" },
+        commands: { test }, baseline, channels, cfg, selectTests: true, carriedFindings: [MATERIAL],
+        adapters: [fakeWith({ judge: { pass: true, criteria: [{ criterion: "c1", met: true, reason: "ok" }] }, review: APPROVE }).adapter],
+        onGate: (e) => { if (e.phase !== "note") stream.push(`${e.gate}:${e.phase}`); },
+      });
+      const verdict = results.find((r) => r.gate === "test")!;
+      // semantic-first: the judge and the reviewer spoke before any test started
+      expect(stream.indexOf("review:end")).toBeLessThan(stream.indexOf("test:start"));
+      return { repo, results, verdict, starts: stream.filter((e) => e === "test:start").length };
+    };
+    const witness = (body: string) => ({ "run.sh": `echo "$*" >> argv.log\n${body}exit 0\n`, ".gitignore": "argv.log\npackage-lock.json\n" });
+
+    // (a) the test command rewrites an ignored lockfile: the environment it measured is gone, so a fresh suite runs
+    const lockfile = await fallback(witness("echo '{}' > package-lock.json\n"), "sh run.sh", ["package-lock.json"]);
+    expect(argvLines(lockfile.repo)).toEqual(["", ""]);
+    expect(lockfile.starts).toBe(2);
+    expect(lockfile.verdict).toMatchObject({ pass: true, meta: { fullSuite: true } });
+    expect(lockfile.verdict.meta?.reused).toBeUndefined();
+    expect(lockfile.results.every((r) => r.pass)).toBe(true);
+
+    // (c) an unchanged identity: one suite, no wasted round
+    const unchanged = await fallback(witness(""), "sh run.sh", []);
+    expect(argvLines(unchanged.repo)).toEqual([""]);
+    expect(unchanged.starts).toBe(1);
+    expect(unchanged.verdict.pass).toBe(true);
+    expect(unchanged.results.every((r) => r.pass)).toBe(true);
+
+    // (b) the test command creates an ignored test its runner collects: only the rediscovered manifest moves
+    const collected = await fallback({
+      ".gitignore": "node_modules/\ntests/generated.test.ts\n",
+      "tests/a.test.ts": [
+        'import { writeFileSync } from "node:fs";',
+        'import { a } from "../src/a";',
+        'writeFileSync(new URL("./generated.test.ts", import.meta.url), \'test("generated", () => expect(1).toBe(1));\\n\');',
+        'test("alpha", () => expect(a).toBeGreaterThan(0));',
+      ].join("\n") + "\n",
+      "package.json": JSON.stringify({ type: "module", scripts: { test: "vitest run --globals" } }),
+    }, "vitest run --globals", ["tests/generated.test.ts"]);
+    expect(collected.starts).toBe(2);
+    expect(collected.verdict).toMatchObject({ pass: true, meta: { fullSuite: true, manifest: ["tests/a.test.ts", "tests/generated.test.ts"] } });
+    expect(collected.results.every((r) => r.pass)).toBe(true);
   }, 120_000);
 });

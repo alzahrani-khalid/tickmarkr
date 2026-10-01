@@ -135,6 +135,9 @@ export function runGateCells(task: OperatorTask, evidence: EvidenceLookup, rows:
       labels.push(line === undefined ? { "not-run": "not run", disabled: "disabled by policy", queued: "queued", running: "running", unknown: "unknown", passed: "passed", failed: "failed" }[cell.state] : `evidence #L${line} unavailable`);
     } else if (cell.state === "queued") {
       labels.push(`queued — ${row?.event?.event ?? "wait"}${typeof data.count === "number" ? ` (${data.count} suites)` : ""}`);
+    } else if (cell.state === "unknown" && row?.event?.event !== "gate-result") {
+      // I1: a start or wait row settled at a terminal boundary — no verdict ever measured it.
+      labels.push(`unknown — ${row?.event?.event ?? "start"} never finished`);
     } else if (data.disabled === true) {
       labels.push("disabled by policy");
     } else if (["gate-start", "gate-phase-start", "phase-start"].includes(row?.event?.event ?? "")) {

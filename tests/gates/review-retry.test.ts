@@ -3,7 +3,7 @@
 // an unparseable result names its cause (empty-output / no-verdict / malformed-verdict) and persists
 // the raw reviewer output beside the journal, so a ruled-on "unparseable" can be audited and a
 // reviewer cutoff is never indistinguishable from a parse defect.
-import { mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execSync } from "node:child_process";
@@ -12,12 +12,14 @@ import { FakeAdapter } from "../../src/adapters/fake.js";
 import { shq, type Assignment, type BillingChannel } from "../../src/adapters/types.js";
 import { approve } from "../../src/cli/commands/approve.js";
 import { DEFAULT_CONFIG } from "../../src/config/config.js";
+import { checkoutProofLine, OrcaDriver } from "../../src/drivers/orca.js";
 import { captureBaseline } from "../../src/gates/baseline.js";
 import { gateReviewerFloor, pickReviewer, reviewGate } from "../../src/gates/review.js";
 import { type GateEvent, runGates } from "../../src/gates/run-gates.js";
 import { validateGraph } from "../../src/graph/schema.js";
 import { runDaemon } from "../../src/run/daemon.js";
 import { Journal, observedReviewFingerprints, outstandingReviewFindings } from "../../src/run/journal.js";
+import { FakeOrca, pacedReadExec, steppedTime, withheldProofExec } from "../helpers/fake-orca.js";
 import { authedModels, COMMIT, makeRepo, setupRepo, T } from "../helpers/tmprepo.js";
 
 // command-typed acceptance keeps the judge deterministic (no fake-judge subprocess per round —
@@ -475,6 +477,134 @@ describe("reviewer floor — max(author tier, task floor, review.floor, prior re
       reviewerFloor: "mid", reviewerFloorCause: "prior-reviewer",
     });
   });
+});
+
+// E1: the run-scoped tally retires a seat at two no-verdicts (OBS-1025 add.2). A checkout-proof timeout is
+// the host being slow, not the seat failing: two of them leave the seat in the rotation, where two ordinary
+// launch failures — a proof mark cut before its colon, a header the frame grammar cannot even parse and
+// never a timeout exemption — retire it. Every round
+// of both pairs still fails closed as a no-verdict infra row; keeping a seat never passes a review.
+test("runGates keeps a reviewer after two checkout-proof timeouts but retires it after two ordinary launch failures while both pairs remain fail-closed", async () => {
+  const worker = new FakeAdapter(scriptWith({}));
+  const seat = new GarbageReviewer(scriptWith({ review: { approve: true } }));
+  const seatKey = "fake-b:fake-b-1";
+  // paced: 150 ms proof reads honoring their budgets over 2-row pages — the production shape, where a
+  // poll the ceiling cuts off, a page limit or a failed read is unread output, never the exemption.
+  // atMs/arrive: lines landing that long after create; failCursor: cursor page reads fail from then on;
+  // stall: a limited cursor page answers with its next cursor missing or repeated.
+  const pair = async (seed?: (proof: string) => string[], paced?: {
+    atMs?: number; arrive?: (proof: string) => string[]; failCursor?: number; stall?: "missing" | "repeat";
+    readMs?: number; malform?: "missing" | "non-array" | "non-string"; blind?: boolean;
+  }) => {
+    const { repo: raw, base } = repoWithCommit();
+    const repo = realpathSync(raw); // Orca compares canonical checkouts
+    const clock = steppedTime();
+    const fake = new FakeOrca({ trackedWorktrees: [repo], ...(paced ? { pageSize: 2 } : {}) });
+    const withheld = withheldProofExec(fake, clock, { seed, atMs: paced?.atMs, arrive: paced?.arrive, blind: paced?.blind });
+    const exec = paced ? pacedReadExec(withheld, clock, {
+      readMs: paced.readMs ?? 150, honor: true, failCursor: paced.failCursor, stall: paced.stall,
+      ...(paced.malform ? { malform: { shape: paced.malform } } : {}),
+    }) : withheld;
+    const driver = new OrcaDriver({ exec, time: clock, launchingHandle: "term_launch" });
+    const reviewNoVerdicts = new Map<string, string[]>();
+    const demotedReviewers = new Set<string>();
+    const events: GateEvent[] = [];
+    const round = async () => {
+      const { results } = await runGates(mkTask(), {
+        ...(await gateCtx(repo, base, [worker, seat], [chAuthor, chGarbage], events)),
+        via: { driver, nameFor: (role: string, adapter: string) => `T1-${role}-${adapter}`, labelFor: (role: string) => role.toUpperCase() },
+        reviewNoVerdicts,
+        demotedReviewers,
+      });
+      return results.find((r) => r.gate === "review")!;
+    };
+    const rounds = [await round(), await round()];
+    const creates = fake.countOf("create");
+    const third = await round();
+    return { rounds, creates, thirdCreates: fake.countOf("create") - creates, third, reviewNoVerdicts, demotedReviewers, events };
+  };
+
+  const timeouts = await pair();
+  const ordinary = await pair((proof) => [proof.slice(0, proof.indexOf(":"))]);
+  // An empty scrollback under paced reads: every poll (anchor plus one page) reads it whole inside the
+  // ceiling, so it is still the typed timeout.
+  const pacedTimeouts = await pair(undefined, {});
+  // 40 banner rows before the foreign frame: paging stops at PROOF_PAGES with scrollback unread, and only
+  // each anchor's tail shows the frame. And a foreign frame arriving after an empty first poll, shown
+  // by every later anchor while its cursor pages fail: what was read stays evidence.
+  const foreign = checkoutProofLine("/tmp/another-checkout");
+  const pacedForeign = await pair(() => [...Array.from({ length: 40 }, (_, i) => `banner ${i + 1}`), foreign], {});
+  const pacedFailing = await pair(undefined, { atMs: 1_000, arrive: () => [foreign], failCursor: 1_000 });
+  // 14 banner rows, then the foreign frame between banner rows at 19600 ms: the last poll reads its anchor
+  // (only trailing banner) and the ceiling cuts its paging off before the frame — after fourteen
+  // whole-scrollback absent polls, that unread scrollback still denies the exemption.
+  const fourteen = Array.from({ length: 14 }, (_, i) => `banner ${i + 1}`);
+  const pacedCut = await pair(() => fourteen, { atMs: 19_600, arrive: () => [foreign, "banner 15", "banner 16"] });
+  // The foreign frame between banner rows behind a limited page whose next cursor is missing, and no
+  // mark at all behind one that repeats its cursor: the scrollback past it is unread, never absent.
+  const seven = Array.from({ length: 7 }, (_, i) => `banner ${i + 1}`);
+  const pacedStalled = await pair(() => [...seven, foreign, "banner 8", "banner 9"], { stall: "missing" });
+  const pacedRepeat = await pair(() => [...seven, "banner 8", "banner 9"], { stall: "repeat" });
+  // The foreign frame between banner rows behind reads whose tail is missing, a string or non-string
+  // rows (100 ms reads, so no poll is cut at the ceiling): a malformed page is unread, never filtered
+  // to an empty page that hides the frame and reads as absent.
+  const malformed: (readonly [string, Awaited<ReturnType<typeof pair>>])[] = [];
+  for (const shape of ["missing", "non-array", "non-string"] as const) {
+    malformed.push([`paced malformed ${shape}`, await pair(() => [...seven, foreign, "banner 8", "banner 9"], { readMs: 100, malform: shape })]);
+  }
+  // The foreign frame on the running screen of a connected terminal whose stream answers blind
+  // (OBS-1011 add.1: exited, an empty tail): the blind page is unread output, never an empty page.
+  const pacedBlind = await pair(() => [foreign], { readMs: 100, blind: true });
+  for (const [name, p, launchCause] of [
+    ["timeouts", timeouts, "checkout-proof-timeout"], ["ordinary", ordinary, undefined],
+    ["paced blind", pacedBlind, undefined],
+    ["paced timeouts", pacedTimeouts, "checkout-proof-timeout"], ["paced foreign", pacedForeign, undefined],
+    ["paced failing", pacedFailing, undefined], ["paced cut", pacedCut, undefined],
+    ["paced stalled", pacedStalled, undefined], ["paced repeat", pacedRepeat, undefined],
+    ...malformed.map(([name, p]) => [name, p, undefined] as const),
+  ] as const) {
+    expect(p.creates, name).toBe(2); // one launch attempt per round: the seat was seated both times
+    for (const review of p.rounds) {
+      expect(review.pass, name).toBe(false);
+      expect(review.meta, name).toMatchObject({ cause: "seat-launch-failed", noVerdict: true, infra: true, classification: "infra", reviewer: seatKey });
+      expect(review.meta?.launchCause, name).toBe(launchCause);
+    }
+  }
+
+  // Kept: no strike, no demotion — the third round seats the same reviewer again, and still fails closed.
+  expect(timeouts.reviewNoVerdicts.get(seatKey)).toBeUndefined();
+  expect(timeouts.demotedReviewers.has(seatKey)).toBe(false);
+  expect(timeouts.events.some((e) => e.phase === "note" && e.name === "review-pool-demotion")).toBe(false);
+  expect(timeouts.thirdCreates).toBe(1);
+  expect(timeouts.third.pass).toBe(false);
+  expect(timeouts.third.meta).toMatchObject({ cause: "seat-launch-failed", launchCause: "checkout-proof-timeout", noVerdict: true, infra: true });
+
+  // Retired: two strikes, demoted at the second, and the third round never launches it — no eligible seat.
+  expect(ordinary.reviewNoVerdicts.get(seatKey)).toEqual(["seat-launch-failed", "seat-launch-failed"]);
+  expect(ordinary.demotedReviewers.has(seatKey)).toBe(true);
+  expect(ordinary.events.filter((e) => e.phase === "note" && e.name === "review-pool-demotion").map((e) => e.phase === "note" && e.payload))
+    .toEqual([{ reviewer: seatKey, cause: "seat-launch-failed", seatAuthoredBytes: 0, causes: ["seat-launch-failed", "seat-launch-failed"] }]);
+  expect(ordinary.thirdCreates).toBe(0);
+  expect(ordinary.third.pass).toBe(false);
+  expect(ordinary.third.meta?.noEligibleReviewer).toBe(true);
+
+  // The same split under production-shaped reads: slow-but-absent proof keeps the seat, a foreign
+  // frame retires it although its pages ran past PROOF_PAGES, its cursor reads failed, or the ceiling
+  // cut each launch's last paging off before the frame was ever read — or a stalled next cursor left the
+  // frame, or the whole scrollback, unreachable, or every read answered a malformed tail or a blind stream.
+  expect(pacedTimeouts.reviewNoVerdicts.get(seatKey)).toBeUndefined();
+  expect(pacedTimeouts.thirdCreates).toBe(1);
+  expect(pacedTimeouts.third.meta).toMatchObject({ cause: "seat-launch-failed", launchCause: "checkout-proof-timeout", noVerdict: true, infra: true });
+  for (const [name, p] of [
+    ["paced foreign", pacedForeign], ["paced failing", pacedFailing], ["paced cut", pacedCut],
+    ["paced stalled", pacedStalled], ["paced repeat", pacedRepeat], ["paced blind", pacedBlind], ...malformed,
+  ] as const) {
+    expect(p.reviewNoVerdicts.get(seatKey), name).toEqual(["seat-launch-failed", "seat-launch-failed"]);
+    expect(p.demotedReviewers.has(seatKey), name).toBe(true);
+    expect(p.thirdCreates, name).toBe(0);
+    expect(p.third.pass, name).toBe(false);
+    expect(p.third.meta?.noEligibleReviewer, name).toBe(true);
+  }
 });
 
 describe("unparseable cause + raw persistence (OBS-196)", () => {

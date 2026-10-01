@@ -70,7 +70,8 @@ const EXPECTED_EXCLUDED_PATHS = [
 
 function publicPath(path: string): boolean {
   return BOUNDARY.publicPaths.exact.includes(path)
-    || BOUNDARY.publicPaths.prefixes.some((prefix) => path.startsWith(prefix));
+    // A joined directory carries no trailing slash: `docs/codebase` IS the exported `docs/codebase/`.
+    || BOUNDARY.publicPaths.prefixes.some((prefix) => path.startsWith(prefix) || `${path}/` === prefix);
 }
 
 // Root exclusions are the archive pathspecs with no slash or glob. Exact dev-tool exclusions are
@@ -96,6 +97,26 @@ function excludedLiteral(literal: string): string | undefined {
 
 const literalValues = (source: string): string[] =>
   [...source.matchAll(/["'`]([^"'`\n]+)["'`]/g)].map((match) => match[1]);
+
+const STRING_LITERAL_RE = /^\s*["'`]([^"'`\n]+)["'`]\s*$/;
+
+// A path assembled by join()/resolve() never appears as one literal: `join(ROOT, "specs", "x.spec.md")`
+// reads an excluded child through two segments that are each harmless alone. Rebuild every run of
+// adjacent known segments (literals, or names bound to one string literal) as the path it denotes.
+// ponytail: flat argument lists only; a nested call inside join() is scanned on its own.
+function joinedPaths(expression: string, constants: ReadonlyMap<string, string>): string[] {
+  const paths: string[] = [];
+  for (const call of expression.matchAll(/\b(?:join|resolve)\s*\(([^()]*)\)/g)) {
+    let run: string[] = [];
+    const flush = () => { if (run.length > 1) paths.push(run.join("/")); run = []; };
+    for (const arg of call[1].split(",")) {
+      const segment = STRING_LITERAL_RE.exec(arg)?.[1] ?? constants.get(arg.trim());
+      if (segment === undefined) flush(); else run.push(segment);
+    }
+    flush();
+  }
+  return paths;
+}
 
 function namedGuard(source: string, variables: string[]): boolean {
   for (const variable of variables) {
@@ -139,12 +160,18 @@ function scanTestSource(file: string, source: string, allowlist: ReasonedAllowli
   const tainted = new Map<string, string>();
   const assignments = [...source.matchAll(/\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*([^;\n]+)(?:;|$)/gm)]
     .map((match) => ({ variable: match[1], expression: match[2] }));
+  const constants = new Map<string, string>();
+  for (const { variable, expression } of assignments) {
+    const literal = STRING_LITERAL_RE.exec(expression)?.[1];
+    if (literal !== undefined) constants.set(variable, literal);
+  }
+  const pathValues = (expression: string): string[] => [...literalValues(expression), ...joinedPaths(expression, constants)];
 
   for (const { variable, expression } of assignments) {
     const anchored = /\b(?:ROOT|REPO|repoRoot)\b|import\.meta\.dirname/.test(expression)
       || /^\s*resolve\(\s*["'`]/.test(expression);
     if (!anchored) continue;
-    const excludedPath = literalValues(expression).map(excludedLiteral).find(Boolean);
+    const excludedPath = pathValues(expression).map(excludedLiteral).find(Boolean);
     if (excludedPath) tainted.set(variable, excludedPath);
   }
 
@@ -172,7 +199,7 @@ function scanTestSource(file: string, source: string, allowlist: ReasonedAllowli
     const anchored = /\b(?:ROOT|REPO|repoRoot)\b|import\.meta\.dirname|\bresolve\s*\(/.test(call[1])
       || /^\s*["'`]/.test(call[1]);
     if (anchored) {
-      for (const excludedPath of literalValues(call[1]).map(excludedLiteral).filter((path): path is string => Boolean(path))) {
+      for (const excludedPath of pathValues(call[1]).map(excludedLiteral).filter((path): path is string => Boolean(path))) {
         if (!namedLiteralGuard(source, excludedPath)) {
           directReads.push({ file, excludedPath, variable: "<literal>" });
         }
@@ -276,4 +303,30 @@ test.skipIf(!existsSync(resolve(".planning")))("skipped on the exported tree: .p
     scanTestSource(file, readFileSync(join(ROOT, file), "utf8"), REPO_ALLOWLIST),
   );
   expect(findings).toEqual([]);
+});
+
+test("the repository export-read scanner rejects both literal-segment and variable-bound joined private specs paths from the goal's closed table while accepting the public stub and an explicit export guard", () => {
+  const scan = (source: string) => scanTestSource("tests/joined.test.ts", source);
+  const privateSpec = { file: "tests/joined.test.ts", excludedPath: "specs/private.spec.md", variable: "<literal>" };
+
+  expect(scan('readFileSync(join(ROOT,"specs","private.spec.md"), "utf8");')).toEqual([privateSpec]);
+  expect(scan('const name="private.spec.md";\nreadFileSync(join(ROOT,"specs",name), "utf8");')).toEqual([privateSpec]);
+  // The same two shapes bound to a variable before the read are tainted by the joined path too.
+  expect(scan('const name="private.spec.md";\nconst spec = join(ROOT,"specs",name);\nreadFileSync(spec, "utf8");'))
+    .toEqual([{ ...privateSpec, variable: "spec" }]);
+
+  expect(scan('readFileSync(join(ROOT,"specs","export-selftest.spec.md"), "utf8");')).toEqual([]);
+  expect(scan(`
+const spec = join(ROOT,"specs","private.spec.md");
+test.skipIf(!existsSync(spec))("private spec (skipped on the exported tree: specs/private.spec.md is absent)", () => {
+  readFileSync(spec, "utf8");
+});`)).toEqual([]);
+
+  // docs/codebase joined without a trailing slash is the exported directory; its children stay public
+  // while a sibling under the excluded docs root does not.
+  expect(scan('readdirSync(join(ROOT,"docs","codebase"));')).toEqual([]);
+  expect(scan('const dir = join(ROOT,"docs","codebase");\nreaddirSync(dir);')).toEqual([]);
+  expect(scan('readFileSync(join(ROOT,"docs","codebase","ARCHITECTURE.md"), "utf8");')).toEqual([]);
+  expect(scan('readFileSync(join(ROOT,"docs","operator-progress.md"), "utf8");'))
+    .toEqual([{ file: "tests/joined.test.ts", excludedPath: "docs/operator-progress.md", variable: "<literal>" }]);
 });

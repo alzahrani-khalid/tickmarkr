@@ -7,6 +7,7 @@ import { GLYPHS } from "../../src/brand.js";
 import { graphDefinitionHash } from "../../src/graph/graph.js";
 import { GATE_NAMES, type RunGraph } from "../../src/graph/schema.js";
 import { readOperatorState, type EvidenceIdentity } from "../../src/run/operator-state.js";
+import { foldOwedChecks } from "../../src/run/journal.js";
 import { graph, ev } from "../fixtures/operator-state/fixture.js";
 import {
   deriveHomeView,
@@ -137,7 +138,7 @@ const completeEvents = [
 
 const partialSnapshot = readOperatorState({ events: base, graph, sequence: 3, observedAt: 3000 });
 const resumedSnapshot = readOperatorState({ events: resumedEvents, graph, sequence: 1, observedAt: 1000 });
-const completeSnapshot = readOperatorState({ events: completeEvents, graph, sequence: 2, observedAt: 2000 });
+const completeSnapshot = readOperatorState({ events: completeEvents, graph, sequence: 2, observedAt: 2000, owed: { basis: "complete", fold: foldOwedChecks(completeEvents, process.cwd()) }, basis: "complete" });
 const emptySnapshot = readOperatorState({ events: [] });
 
 const zeroTaskGraph = {

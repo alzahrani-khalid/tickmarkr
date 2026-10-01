@@ -1,5 +1,5 @@
 // Fleet-overlay mutation, serialization, and diff rendering for the `tickmarkr fleet` write path.
-import { isMap, isScalar, isSeq, parseDocument, stringify, visit } from "yaml";
+import { type Alias, type Node as YamlNode, isAlias, isMap, isNode, isScalar, isSeq, parseDocument, stringify, visit } from "yaml";
 import { DENY_SCOPES, type DenyScope, type FleetEditable, type FleetUniverseRow, type LowerLayerModelOverrides, type MapEntry, type RoutingMode, type Tier, universeCovers, universeEntryMatches } from "./config.js";
 
 // OBS-1099 add.1: the writer ranges over the schema-derived scopes. The flat (all-seats) scopes
@@ -41,6 +41,11 @@ type FleetOverlayWriteFields = {
   // exclusion sets write the minimal routing.allow membership form and tombstone the deny
   // adapters/models scopes; absent ⇒ the legacy deny-array write, byte-identical to before.
   universe?: FleetUniverseRow[];
+  // T8: routing.map as the layers BELOW the written overlay resolve it. A changed slot left with no
+  // declaration over a lower pin writes a raw `pin: null` tombstone (the pool:null precedent) —
+  // deepMerge prunes it before schema validation, so Auto masks the inherited pin instead of
+  // revealing it, and MapEntry itself never carries null. Absent ⇒ a cleared pin is deleted.
+  lowerMap?: Record<string, MapEntry>;
 };
 
 // OBS-1188: only a write whose editables provably carry no efforts keeps the pre-effort contract.
@@ -220,7 +225,66 @@ function setStringSequencePreservingComments(
 // Total forms: a delete treats the masked subtree as absent (the operator's tombstone already
 // denies it, and survives untouched); a set clears the scalar and rebuilds what fleet owns —
 // the routing.allow precedent below.
+// T8 repair: an alias is no tombstone — `spec: *empty` resolves to a mapping. Each alias on the path
+// is replaced by an un-anchored copy of its target, so what it resolves to decides, and a write under
+// it never edits the anchored node its other aliases share.
+function materializeAliases(doc: OverlayDocument, path: OverlayPath): void {
+  for (let depth = 1; depth < path.length; depth++) {
+    const node = doc.getIn(path.slice(0, depth), true);
+    if (!isAlias(node)) continue;
+    const target = node.resolve(doc);
+    if (target === undefined) return;
+    doc.setIn(path.slice(0, depth), detachedCopy(doc, node, target, new Set()));
+  }
+}
+
+const nodesOf = (root: YamlNode): YamlNode[] => {
+  const out: YamlNode[] = [];
+  visit(root, (_key, node) => {
+    if (isNode(node)) out.push(node);
+  });
+  return out;
+};
+
+// D-821: a copy carries NO anchor (a nested `&empty` would rebind `plan: *empty` and every later
+// alias to the edited copy), and each inner alias must still name what it named in the original —
+// one whose anchor is redefined before `at` is replaced by a detached copy of its original target.
+function detachedCopy(doc: OverlayDocument, at: Alias, target: YamlNode, expanding: Set<YamlNode>): YamlNode {
+  if (expanding.has(target)) throw new Error(`fleet cannot detach the recursive YAML alias *${at.source}`);
+  const visible = new Map<string, YamlNode>();
+  visit(doc, (_key, node) => {
+    if (node === at) return visit.BREAK;
+    if (isNode(node) && !isAlias(node) && node.anchor) visible.set(node.anchor, node);
+  });
+  const copy = target.clone() as YamlNode;
+  const originals = nodesOf(target);
+  const replace = new Map<YamlNode, YamlNode>();
+  nodesOf(copy).forEach((node, index) => {
+    if (!isAlias(node)) {
+      node.anchor = undefined;
+      return;
+    }
+    const resolved = (originals[index] as Alias).resolve(doc) as YamlNode | undefined;
+    if (resolved !== undefined && visible.get(node.source) !== resolved) {
+      replace.set(node, detachedCopy(doc, at, resolved, new Set([...expanding, target])));
+    }
+  });
+  if (!replace.size) return copy;
+  visit(copy, (_key, node) => (isNode(node) ? replace.get(node) : undefined));
+  return copy;
+}
+
+function underScalar(doc: OverlayDocument, path: OverlayPath): boolean {
+  for (let depth = 1; depth < path.length; depth++) {
+    const node = doc.getIn(path.slice(0, depth), true);
+    if (node === undefined) return false;
+    if (!isMap(node)) return true;
+  }
+  return false;
+}
+
 function deleteAt(doc: OverlayDocument, path: OverlayPath): void {
+  materializeAliases(doc, path); // an aliased mapping is no tombstone: Auto under `spec: *pinned` deletes the pin
   for (let depth = 1; depth < path.length; depth++) {
     if (!isMap(doc.getIn(path.slice(0, depth), true))) return;
   }
@@ -229,6 +293,7 @@ function deleteAt(doc: OverlayDocument, path: OverlayPath): void {
 }
 
 function setAt(doc: OverlayDocument, path: OverlayPath, value: unknown): void {
+  materializeAliases(doc, path); // edit a copy of an aliased mapping, never drop what it resolved to
   for (let depth = 1; depth < path.length; depth++) {
     const node = doc.getIn(path.slice(0, depth), true);
     if (node === undefined) break;
@@ -332,9 +397,15 @@ export function renderFleetOverlayWrite(priorBytes: string, write: FleetOverlayW
   for (const shape of new Set([...Object.keys(initial.map), ...Object.keys(edited.map)])) {
     const before = initial.map[shape];
     const after = edited.map[shape];
-    if (JSON.stringify(before?.pin) !== JSON.stringify(after?.pin)) {
-      if (after?.pin === undefined) deleteAt(doc, ["routing", "map", shape, "pin"]);
-      else setAt(doc, ["routing", "map", shape, "pin"], doc.createNode(after.pin));
+    const pinPath = ["routing", "map", shape, "pin"];
+    const declares = after?.pin !== undefined || after?.pool !== undefined || after?.prefer !== undefined;
+    if (!declares && write.lowerMap?.[shape]?.pin !== undefined && JSON.stringify(before) !== JSON.stringify(after)) {
+      // pin: null tombstone — masks the lower-layer pin; a scalar tombstone above it already masks the entry
+      materializeAliases(doc, pinPath);
+      if (!underScalar(doc, pinPath)) setScalarPreservingComment(doc, pinPath, null);
+    } else if (JSON.stringify(before?.pin) !== JSON.stringify(after?.pin)) {
+      if (after?.pin === undefined) deleteAt(doc, pinPath);
+      else setAt(doc, pinPath, doc.createNode(after.pin));
     }
     if (JSON.stringify(before?.pool) !== JSON.stringify(after?.pool)) {
       const path = ["routing", "map", shape, "pool"];

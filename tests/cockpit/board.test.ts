@@ -1,12 +1,13 @@
 import { existsSync, readFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
-import type { JournalEvent } from "../../src/run/journal.js";
+import { foldOwedChecks, type JournalEvent } from "../../src/run/journal.js";
 import { readOperatorState } from "../../src/run/operator-state.js";
 import { validateGraph } from "../../src/graph/schema.js";
 import { graphDefinitionHash } from "../../src/graph/graph.js";
 import { BOARD_EFFORT_BAR_MAX, BOARD_PALETTE, clipBoard, renderBoard, renderBoardLines, stripBoardAnsi, wrapNote } from "../../src/tui/cockpit/board.js";
-import { cellWidth } from "../../src/tui/cockpit/width.js";
+import { cellWidth, sliceCells } from "../../src/tui/cockpit/width.js";
 import { planShell } from "../../src/tui/cockpit/layout.js";
 import { BOARD_ASSIGNMENT, boardEndedEvents, boardEvents, boardFixture, boardGraph, BOARD_NOW, BOARD_RUN_ID } from "../fixtures/cockpit/board/board-fixture.js";
 import { mountBoard, stripAnsi } from "../fixtures/cockpit/board/mount.js";
@@ -41,7 +42,10 @@ describe("BD-1 — the approved task board", () => {
     expect(plain).toMatch(/T6 .*✔ {2}✔ {2}✔ {2}· {2}· {2}· {2}─ /u);
 
     // Green needs the FOUR buckets empty; a passed tip alone is not green.
-    const header = (events: readonly (typeof boardEvents)[number][]) => renderBoard({ ...input, snapshot: readOperatorState({ events, graph: boardGraph }) }, 150).find((line) => stripBoardAnsi(line).includes("RUN ENDED"))!;
+    // I2: and the same CURRENT owed-check authority as the lifecycle — known and empty; absent debt is never green.
+    const header = (events: readonly (typeof boardEvents)[number][], owed = true) => renderBoard({ ...input, snapshot: readOperatorState({ events, graph: boardGraph,
+      ...(owed ? { owed: { basis: "board", fold: foldOwedChecks(events, tmpdir()) } } : {}), basis: "board" }) }, 150).find((line) => stripBoardAnsi(line).includes("RUN ENDED"))!;
+    expect(stripBoardAnsi(header(boardEndedEvents(), false))).toContain("RUN ENDED — NOT GREEN  outstanding unknown");
     const green = header(boardEndedEvents());
     expect(stripBoardAnsi(green)).toContain("RUN ENDED — GREEN");
     expect(green).toContain(`${sgr(BOARD_PALETTE.pass)}RUN ENDED — GREEN`);
@@ -82,53 +86,59 @@ describe("BD-1 — the approved task board", () => {
     expect(stacked.every((l) => [...l].length <= 80)).toBe(true);
   });
 
-  test("the cockpit mounted with the watch owner token at 150 columns plans zero rail columns and draws the board at the body width, the same mount at 113 columns equals the pinned rail-less frame whose note wraps onto a second row, the mount at 80 by 24 equals the pinned compact frame whose gate cells stack under the row, and the mount without the token at 150 columns keeps its rail, so a rail forced by width or a band that truncates instead of wrapping fails", async () => {
-    // 150 with the token: no rail, no shortcuts, the board's rule spans the body.
-    let f = boardFixture();
-    let m = await mountBoard(f.cwd, f.runId, { columns: 150, rows: 40, owner: true });
-    try {
-      const geometry = m.delivery.geometry()!;
-      expect(geometry).toMatchObject({ rail: 0, shortcuts: 0, bodyColumns: 148, focus: ["content"] });
-      expect(planShell(150, 40, 0)).toMatchObject({ rail: 0, shortcuts: 0, bodyColumns: 148 });
-      expect(planShell(220, 50, 0)).toMatchObject({ rail: 0, shortcuts: 0 });
-      const lines = stripAnsi(m.frame()).split("\n");
-      expect(lines[3]).toMatch(/^│RUN \/ RUNNING/u);
-      expect(lines.find((l) => /^│─+│$/u.test(l))).toBe(`│${"─".repeat(148)}│`);
-      expect(lines.some((l) => l.includes("│1 Home") || l.includes("Tab Focus   "))).toBe(false);
-      expect(lines.some((l) => l.includes("❯ T1   SPEC+GATE"))).toBe(true);
-    } finally { await m.close(); f.close(); }
-    // 113 with the token: the pinned rail-less frame, note wrapped onto its own row.
-    f = boardFixture();
-    m = await mountBoard(f.cwd, f.runId, { columns: 113, rows: 40, owner: true });
-    try {
-      const lines = stripAnsi(m.frame()).split("\n");
-      expect(lines).toEqual(pinned("railless.113x40.txt"));
-      const t1 = lines.findIndex((l) => l.includes("❯ T1   SPEC+GATE"));
-      expect(lines[t1]).not.toContain("parked");
-      expect(lines[t1 + 1]).toBe(`│         ◍ parked ×3 · 3/7 gates run${" ".repeat(111 - 36)}│`);
-      expect(lines.some((l) => l.includes("waiting on T3│"))).toBe(true);
-    } finally { await m.close(); f.close(); }
-    // 80×24 with the token: the pinned compact frame, gate cells stacked under the row.
-    f = boardFixture();
-    m = await mountBoard(f.cwd, f.runId, { columns: 80, rows: 24, owner: true });
-    try {
-      const lines = stripAnsi(m.frame()).split("\n");
-      expect(lines).toEqual(pinned("compact.80x24.txt"));
-      const t1 = lines.findIndex((l) => l.includes("❯ T1   SPEC+GATE"));
-      expect(lines[t1]).not.toContain("✔");
-      expect(lines[t1 + 1]).toMatch(/^│ {9}✔ {2}✔ {2}✔ {2}· {2}· {2}· {2}· {4}claude-cod +3 +│$/u);
-      expect(lines[t1 + 2]).toContain("◍ parked ×3 · 3/7 gates run");
-      expect(m.delivery.geometry()).toMatchObject({ rail: 0, shortcuts: 0, bodyColumns: 78 });
-    } finally { await m.close(); f.close(); }
-    // 150 without the token: the manual cockpit keeps its rail and its shortcuts.
-    f = boardFixture();
-    m = await mountBoard(f.cwd, f.runId, { columns: 150, rows: 40, owner: false });
-    try {
-      expect(m.delivery.geometry()).toMatchObject({ rail: 15, shortcuts: 22, bodyColumns: 109 });
-      const lines = stripAnsi(m.frame()).split("\n");
-      expect(lines.some((l) => l.startsWith("│1 Home"))).toBe(true);
-      expect(lines.some((l) => l.includes("❯ T1   SPEC+GATE"))).toBe(true);
-    } finally { await m.close(); f.close(); }
+  test("D-840: daemon-owned boards keep the manual cockpit rails at 150 and 113 columns, preserve the pinned narrow frames, and keep stacked gates at 80 columns", async () => {
+    for (const columns of [150, 113, 80]) {
+      const f = boardFixture();
+      const owned = await mountBoard(f.cwd, f.runId, { columns, rows: columns === 80 ? 24 : 40, owner: true });
+      let ownedFrame: string[];
+      try {
+        const geometry = owned.delivery.geometry()!;
+        expect(geometry).toMatchObject(planShell(columns, columns === 80 ? 24 : 40));
+        const lines = stripAnsi(owned.frame()).split("\n");
+        ownedFrame = lines;
+        expect(lines.some(l => l.includes("❯ T1   SPEC+GATE"))).toBe(true);
+        if (columns >= 90) {
+          expect(geometry.rail).toBe(15);
+          expect(lines.some(l => l.startsWith("│1 Home"))).toBe(true);
+          expect(lines.some(l => l.startsWith("│7 Log"))).toBe(true);
+        }
+        if (columns === 150) expect(geometry.shortcuts).toBe(22);
+        if (columns === 113) expect(lines).toEqual(pinned("rails.113x40.txt"));
+        if (columns === 80) {
+          expect(lines).toEqual(pinned("compact.80x24.txt"));
+          const t1 = lines.findIndex(l => l.includes("❯ T1   SPEC+GATE"));
+          expect(lines[t1]).not.toContain("✔");
+          expect(lines[t1 + 1]).toMatch(/^│ {9}✔ {2}✔ {2}✔ {2}· {2}· {2}· {2}· {4}claude-cod +3 +│$/u);
+          expect(lines[t1 + 2]).toContain("◍ parked ×3 · 3/7 gates run");
+        }
+      } finally { await owned.close(); }
+      f.close();
+      const manualFixture = boardFixture();
+      const manual = await mountBoard(manualFixture.cwd, manualFixture.runId, { columns, rows: columns === 80 ? 24 : 40 });
+      try { expect(stripAnsi(manual.frame()).split("\n")).toEqual(ownedFrame!); }
+      finally { await manual.close(); manualFixture.close(); }
+    }
+  });
+
+  test("D-842: stacked task heads use every remaining cell for the title while the full and wrap frames stay byte-identical", () => {
+    const title = "A long task title reaches the pane edge 界 👩‍💻 without an artificial label cap";
+    const graph = { ...boardGraph, tasks: boardGraph.tasks.map(task => ({ ...task, title })) };
+    const events = boardEvents.map(event => event.event === "run-start" ? { ...event, data: { ...event.data, graphDefinitionHash: graphDefinitionHash(graph) } } : event);
+    const input = { runId: BOARD_RUN_ID, snapshot: readOperatorState({ events, graph }), graph, now: BOARD_NOW, colour: false };
+    for (const width of [60, 80, 109]) {
+      const lines = renderBoardLines(input, width);
+      const head = lines.find(line => line.startsWith("    T1 "))!;
+      const prefix = "    T1   SPEC+GATE       —             ";
+      expect(head.startsWith(prefix)).toBe(true);
+      const room = width - cellWidth(prefix);
+      const expected = sliceCells(title, room).head;
+      expect(head.slice(prefix.length)).toBe(expected + " ".repeat(room - cellWidth(expected)));
+      expect(cellWidth(head)).toBeLessThanOrEqual(width);
+      expect(lines[lines.indexOf(head) + 1]).toContain("✔");
+    }
+    for (const width of [110, 113, 149, 150, 180]) {
+      expect(renderBoardLines({ ...input, colour: true }, width).join("\n")).toBe(pinned(`unchanged.${width}.txt`).join("\n"));
+    }
   });
 
   test("a parked task's Actions flow opened by the bytes a and carriage return written as one chunk on the tty fake shows the confirm preview, and the bytes n a carriage return written as one chunk while a confirm is open cancel it and show a fresh preview, so a cockpit that reads a multi-key chunk as one unknown key fails", async () => {

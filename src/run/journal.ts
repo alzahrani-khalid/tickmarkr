@@ -2623,9 +2623,24 @@ const COMMIT_ID = /^[0-9a-f]{40}([0-9a-f]{24})?$/;
  * these and is refused as ambiguous; containment never counts.
  * Both verify (before discharging) and the fold (re-reading every discharge) decide through here.
  */
-export function integrationMapped(cwd: string, events: readonly JournalEvent[], o: OwedCheck, mergeBase: unknown, head: unknown): boolean {
+export function integrationMapped(cwd: string, events: readonly JournalEvent[], o: OwedCheck, mergeBase: unknown, head: unknown, memo?: OwedProofMemo): boolean {
   if (typeof mergeBase !== "string" || typeof head !== "string" || !COMMIT_ID.test(mergeBase) || !COMMIT_ID.test(head)) return false;
   if (!events.some((e) => e.event === "merge" && e.taskId === o.taskId && e.data.commit === head)) return false;
+  // Only the git component is memoised, and only a completed proof: commit ids name immutable history,
+  // so the key is the obligation's id and recorded range facts plus the claimed mergeBase..head. A refusal
+  // or git failure (a shallow or partial object store can refuse a range it later proves) is never cached
+  // and is re-proved next fold. The merge-row eligibility above is rechecked on every fold.
+  const key = JSON.stringify([o.id, mergeBase, head, o.base, o.head, o.patch, o.patches]);
+  if (memo?.has(key)) return true;
+  const proved = integrationProved(cwd, o, mergeBase, head);
+  if (proved) memo?.add(key);
+  return proved;
+}
+
+/** I2: a caller-scoped set of completed integration re-proofs (see integrationMapped); absent, every fold re-proves. */
+export type OwedProofMemo = Set<string>;
+
+function integrationProved(cwd: string, o: OwedCheck, mergeBase: string, head: string): boolean {
   try {
     const parents = owedGit(cwd, ["show", "-s", "--format=%P", head]).trim().split(" ");
     if (parents.length !== 2 || parents[0] !== mergeBase) return false;
@@ -2798,13 +2813,13 @@ const declaredVendors = (o: OwedCheck): Map<string, Set<string>> => {
 };
 
 /** Why a discharge row no longer proves its obligation, re-read from its artifact; undefined when it does. */
-function dischargeProblem(row: JournalEvent, o: OwedCheck, events: readonly JournalEvent[], cwd: string): string | undefined {
+function dischargeProblem(row: JournalEvent, o: OwedCheck, events: readonly JournalEvent[], cwd: string, memo?: OwedProofMemo): string | undefined {
   const d = row.data;
   if (row.taskId !== o.taskId) return "discharge names another task";
   if (d.criteria !== o.criteria) return "discharge proved other criteria";
   const exact = d.mapping === "exact" && d.mergeBase === o.base && d.head === o.head;
   // The integration mapping is re-proved from git on every fold, never taken from the row's claims.
-  const integration = d.mapping === "integration" && integrationMapped(cwd, events, o, d.mergeBase, d.head);
+  const integration = d.mapping === "integration" && integrationMapped(cwd, events, o, d.mergeBase, d.head, memo);
   if (!exact && !integration) return "discharge range does not bind the obligation";
   let artifact: { head?: unknown; mergeBase?: unknown; green?: unknown; files?: unknown; criteria?: unknown; gateRows?: unknown };
   try {
@@ -2849,16 +2864,18 @@ type GateRowFact = { gate?: unknown; pass?: unknown; meta?: { skipped?: unknown;
  * The CURRENT owed-check fold: accepted-risk history, outstanding debt, and whether it is known.
  * `cwd` is any checkout of the run's repository (integration discharges are re-proved from git).
  * It never throws: a fold that cannot be computed is unknown debt, not a crash and never zero.
+ * `memo` (I2, optional): a store-scoped table reusing the immutable git re-proof of an integration mapping
+ * across folds; every artifact, hash, criteria and reviewer condition is still re-read on every fold.
  */
-export function foldOwedChecks(events: readonly JournalEvent[], cwd: string): OwedFold {
+export function foldOwedChecks(events: readonly JournalEvent[], cwd: string, memo?: OwedProofMemo): OwedFold {
   try {
-    return foldOwedChecksOrThrow(events, cwd);
+    return foldOwedChecksOrThrow(events, cwd, memo);
   } catch (error) {
     return { known: false, debt: "unknown", outstanding: [], acceptedRisk: [], discharged: [], unknown: [{ reason: `owed-check fold failed: ${String(error).split("\n")[0]}` }] };
   }
 }
 
-function foldOwedChecksOrThrow(events: readonly JournalEvent[], cwd: string): OwedFold {
+function foldOwedChecksOrThrow(events: readonly JournalEvent[], cwd: string, memo?: OwedProofMemo): OwedFold {
   const accepted = new Map<string, OwedCheck>();
   const discharged = new Set<string>();
   const unknown: OwedFold["unknown"] = [];
@@ -2875,7 +2892,7 @@ function foldOwedChecksOrThrow(events: readonly JournalEvent[], cwd: string): Ow
       const ids = Array.isArray(e.data.ids) ? e.data.ids as unknown[] : [];
       const problems = ids.map((id) => {
         const o = accepted.get(String(id));
-        return o ? dischargeProblem(e, o, events, cwd) : "discharge names no recorded obligation";
+        return o ? dischargeProblem(e, o, events, cwd, memo) : "discharge names no recorded obligation";
       });
       const problem = ids.length ? problems.find((p) => p !== undefined) : "discharge names no obligation";
       if (problem) unknown.push({ taskId: e.taskId, reason: problem });

@@ -1,5 +1,5 @@
 tickmarkr fixture | RUN | run-20260912-100000
-1 Home  4 Run  5 Evidence | content | 1–17/98 | 81 hidden
+1 Home  4 Run  5 Evidence  7 Log | content | 1–17/98 | 81 hidden
 ────────────────────────────────────────────────────────────────────────────────
 │RUN / RUNNING · 1/8 merged | human T1,T3 | current-cycle tip PENDING | RUNNING│
 │ tickmarkr  run-20260912-100000  │  1/8 done  │  2 esc  │  0h38m              │
@@ -9,13 +9,13 @@ tickmarkr fixture | RUN | run-20260912-100000
 │         area            deps          task                                   │
 │         bu te li ev sc ac re   channel     att  note                         │
 │    ──────────────────────────────────────────────────────────────────────────│
-│  ❯ T1   SPEC+GATE       —             Spec loader parks                      │
+│  ❯ T1   SPEC+GATE       —             Spec loader parks on every human gate i│
 │         ✔  ✔  ✔  ·  ·  ·  ·    claude-cod  3                                 │
 │         ◍ parked ×3 · 3/7 gates run                                          │
-│    T2   RUN             —             Runner survives t                      │
+│    T2   RUN             —             Runner survives three review rounds bef│
 │         ✔  ✔  ✔  ✔  ✔  ✔  ✔    claude-cod  1                                 │
 │         ↻ 3 review rounds                                                    │
-│    T3   UI              —             Board renderer fa                      │
+│    T3   UI              —             Board renderer fails its test gate     │
 │         ✔  ✖  ·  ·  ·  ·  ·    claude-cod  1                                 │
 │         ✖ test · 2/7 gates run                                               │
 ────────────────────────────────────────────────────────────────────────────────

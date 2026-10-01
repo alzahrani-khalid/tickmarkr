@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { renderMarkdownRecord } from "../../cli/commands/report.js";
 import { loadConfig } from "../../config/config.js";
@@ -6,13 +6,14 @@ import { estimateCosts } from "../../report/cost.js";
 import { PerformanceObserver, performance } from "node:perf_hooks";
 import { render, useInput, useStdin } from "ink";
 import { useLayoutEffect, useSyncExternalStore } from "react";
-import { createLiveStore, type LiveStore, type LiveStoreSnapshot } from "./live-store.js";
+import { createLiveStore, journalBasis, readObservedJournal, type LiveStore, type LiveStoreSnapshot } from "./live-store.js";
 import { HomeView, deriveHomeView, selectNeedsYouTarget, type HomeNeedsYouTarget } from "./home-view.js";
 import { RunView, applyRunViewKey, initialRunViewSession, runGateCells, evidenceLookup } from "./run-view.js";
 import { renderBoardLines, stripBoardAnsi } from "./board.js";
 import { EvidenceView, deriveEvidenceView, type EvidenceRow, defaultExportPath, planEvidenceExport, writeEvidenceExport } from "./evidence-view.js";
 import { ShellGridFlow, ShellJournalSelection } from "./components.js";
 import { CockpitShell, initialShellState, type ShellState, type ShellCommit } from "./shell.js";
+import { LogView, readLogPage, moveLogEnd } from "./log-view.js";
 import { planShell } from "./layout.js";
 import { shellBindings, type RunKeyEvent } from "./keys.js";
 import { createPointerReportReader, POINTER_TRACKING_ON, POINTER_TRACKING_OFF, type PointerReport } from "./pointer.js";
@@ -20,9 +21,9 @@ import { deriveRunDecisions, previewDecision, executeDecision, withDecisionPrevi
 import { approvalRunOwner } from "../../cli/commands/approve.js";
 import { GLYPHS } from "../../brand.js";
 import { effectiveEvents, Journal, parseJournalText, physicalLine } from "../../run/journal.js";
-import { observeNamedRun, WATCH_OWNER_ENV } from "../../run/supervision.js";
+import { observeNamedRun } from "../../run/supervision.js";
 import { formatOwnedName, type FocusTarget, type FocusResult } from "../../drivers/types.js";
-import { readOperatorState, type EvidenceIdentity } from "../../run/operator-state.js";
+import { readOperatorState, type EvidenceIdentity, type OperatorRecord } from "../../run/operator-state.js";
 import { cellWidth, wrapCells } from "./width.js";
 import { resolveShellColourMode } from "./theme.js";
 
@@ -83,6 +84,10 @@ export interface ConsolidatedOptions {
   diagnostics?: readonly HomeNeedsYouTarget[];
 }
 
+/** Rows not bound to the store's observation: only the store's own observation is served, with debt unknown
+ * (the fold's formula then gives PARTIAL for a headline that was green — green implies ended and unapproved). */
+const unbound = (snap: LiveStoreSnapshot): LiveStoreSnapshot => ({ ...snap, owed: undefined, operator: { ...snap.operator, debt: "unknown", outstanding: [],
+  green: false, ...(snap.operator.green ? { lifecycle: "PARTIAL" as const, label: "PARTIAL" } : {}) } });
 /**
  * OBS-1178: the store's incremental fold reads every task-approved row as a release. A refused or unsound
  * decision released nothing, so whenever the rows the store has read hold one — whatever state the raw
@@ -94,30 +99,40 @@ export interface ConsolidatedOptions {
  */
 export function decidedLiveStore(store: LiveStore): LiveStore {
   let key: string | undefined;
-  let operator: LiveStoreSnapshot["operator"] | undefined;
+  let events: OperatorRecord[] | undefined;
+  // I2: the refold is keyed by the store's owed authority too, so a debt the store re-folded (an artifact
+  // removed or altered under unchanged journal bytes) is never served from an earlier observation's refold.
+  let folded: { owed: LiveStoreSnapshot["owed"]; operator: LiveStoreSnapshot["operator"] } | undefined;
   const decided = (snap: LiveStoreSnapshot): LiveStoreSnapshot => {
     const { journal, graph } = snap;
-    const observed = `${journal.source}:${journal.generation}:${journal.offset}:${graph.identity}:${graph.status}`;
+    const observed = `${journalBasis(journal)}:${graph.identity}:${graph.status}:${snap.lock.state}`;
     if (observed !== key) {
       key = observed;
-      operator = undefined;
+      events = undefined; folded = undefined;
       let bytes: Buffer;
-      try { bytes = readFileSync(journal.source).subarray(0, journal.offset); } catch { return snap; }
+      // I2 (D-857): the refold reads the very journal version the store observed — the one its owed authority
+      // and basis name. A changed or failed read is never cached (un-keyed, re-read next observation) and
+      // decides nothing meanwhile: debt unknown, never green.
+      try { bytes = readObservedJournal(journal); } catch { key = undefined; return unbound(snap); }
       if (bytes.includes("task-approved")) {
         const rows = parseJournalText(bytes.subarray(0, bytes.lastIndexOf(10) + 1).toString("utf8"))
           .filter(e => e !== null && typeof e === "object" && typeof e.event === "string" && typeof e.data === "object" && e.data !== null);
         const kept = effectiveEvents(rows);
         if (kept.length !== rows.length) {
-          const events = kept.map((event, i) => {
+          events = kept.map((event, i) => {
             const line = physicalLine(kept, i);
             return { source: journal.source, line, id: `${journal.source}#L${line}`, generation: journal.generation, event };
           });
-          operator = readOperatorState({ events, graph: graph.status === "readable" ? graph.value : undefined,
-            readable: journal.status === "readable" && journal.backlogBytes === 0 });
         }
       }
     }
-    if (!operator) return snap;
+    if (!events) return snap;
+    if (!folded || folded.owed !== snap.owed) {
+      folded = { owed: snap.owed, operator: readOperatorState({ events, graph: graph.status === "readable" ? graph.value : undefined,
+        readable: journal.status === "readable" && journal.backlogBytes === 0, daemonDead: snap.lock.state === "dead",
+        owed: snap.owed, basis: journalBasis(journal) }) };
+    }
+    const operator = folded.operator;
     const { sequence, observedAt, graphAvailability } = snap.operator;
     return { ...snap, operator: { ...operator, sequence, observedAt, graphAvailability } };
   };
@@ -162,10 +177,8 @@ export async function runConsolidatedCockpit(options: ConsolidatedOptions): Prom
     store = createLiveStore({ cwd, runId, now: options.now });
     const source = decidedLiveStore(store);
     if (options.observeRun !== false) observation = observeNamedRun(cwd, runId, options.environment);
-    // BD-1 (RULING-231-19 §2): the daemon-placed board carries the watch owner token and mounts
-    // rail-less — a zero shortcut budget the plan honours at every width. The manual cockpit keeps its rail.
-    const railless = Boolean((options.environment ?? process.env)[WATCH_OWNER_ENV]);
-    let state = { ...initialShellState(), view: options.initialView ?? "home", ...(railless ? { shortcutColumns: 0 } : {}) };
+    // Daemon-placed and manual boards share the same rails and navigation.
+    let state = { ...initialShellState(), view: options.initialView ?? "home" };
     let runSession = initialRunViewSession();
     if (options.initialParks) {
       runSession = { ...runSession, selection: Math.max(0, source.snapshot().operator.tasks.findIndex(t => t.state === "human" || t.state === "blocked")) };
@@ -217,6 +230,9 @@ export async function runConsolidatedCockpit(options: ConsolidatedOptions): Prom
         snap.journal.generation, snap.journal.offset, snap.journal.status, snap.journal.malformedCount, snap.journal.backlogBytes, snap.journal.pending, snap.journal.error,
         snap.graph.identity, snap.graph.status, snap.config.identity, snap.config.status, snap.cache.identity, snap.cache.status,
         snap.lock.value, snap.lock.status, snap.lock.state, snap.lock.alive,
+        // I2: owed-check debt moves under unchanged journal bytes (an artifact removed or altered) and
+        // decides the drawn lifecycle and board headline.
+        snap.operator.lifecycle, snap.operator.debt, snap.operator.outstanding,
         // D-383: supervision tier state is not drawn by any view; an ARMED→STALE transition earns no
         // frame. Its UNREADABLE case already surfaces through snap.errors above.
       ]);
@@ -373,12 +389,19 @@ export async function runConsolidatedCockpit(options: ConsolidatedOptions): Prom
         state = { ...state, focus: focus[(Math.max(0, focus.indexOf(state.focus)) + (k.shift ? focus.length - 1 : 1)) % focus.length]! };
       } else {
         const action = shellBindings(state).find(b => b.key === text)?.action;
-        if (action === "home" || action === "run" || action === "evidence") state = { ...state, view: action, scroll: 0, evidenceSection: action === state.view ? state.evidenceSection : 0 };
+        if (action === "home" || action === "run" || action === "evidence" || action === "log") state = { ...state, view: action, scroll: 0, evidenceSection: action === state.view ? state.evidenceSection : 0 };
         else if (action === "widen" || action === "narrow") state = { ...state, shortcutColumns: planShell(geometry().columns, geometry().rows, geometry().shortcuts + (action === "widen" ? 1 : -1)).shortcuts };
         else if (action === "help") state = { ...state, help: true, overlayOffset: 0 };
         else if (action === "filter") state = { ...state, editor: state.query, editorKind: "filter" };
         else if (action === "export") { if (!terminal) forwardLeaf("e"); }
         else if (state.view === "evidence" && (k.leftArrow || k.rightArrow)) state = { ...state, evidenceSection: ((state.evidenceSection ?? 0) + (k.rightArrow ? 1 : 4)) % 5 };
+        else if (state.view === "log" && (k.pageDown || k.pageUp || k.upArrow || k.downArrow || action === "follow")) {
+          const snap = source.snapshot();
+          const sourceLog = { journal: snap.journal, page: source.page, runId, columns: geometry().bodyColumns };
+          const delta = (k.pageDown || k.downArrow ? 1 : -1) * (k.pageDown || k.pageUp ? geometry().bodyRows : 1);
+          state = { ...state, logEnd: action === "follow" ? state.logEnd === undefined ? snap.journal.lines : undefined
+            : moveLogEnd(sourceLog, state.logEnd, delta), scroll: 0 };
+        }
         else if ((k.pageDown || k.pageUp) && state.view !== "run") state = { ...state, scroll: Math.max(0, state.scroll + (k.pageDown ? 1 : -1) * geometry().bodyRows) };
         else if (k.return || action === "open") {
           if (state.view === "run") openDetail();
@@ -403,7 +426,7 @@ export async function runConsolidatedCockpit(options: ConsolidatedOptions): Prom
           else if (text === "a") state = { ...state, overlay: ["No actionable park selected", "tickmarkr resume " + runId], overlayOffset: 0 };
         } else if (text === "a") state = { ...state, overlay: ["Existing CLI actions", "tickmarkr fleet", "tickmarkr plan", "tickmarkr doctor"], overlayOffset: 0 };
       }
-      if (!terminal && state.view !== "run" && !state.overlay && !state.help && state.editor === undefined) {
+      if (!terminal && state.view !== "run" && state.view !== "log" && !state.overlay && !state.help && state.editor === undefined) {
         const bytes = k.upArrow ? "\x1b[A" : k.downArrow ? "\x1b[B" : k.rightArrow ? "\x1b[C" : k.leftArrow ? "\x1b[D" : k.pageUp ? "\x1b[5~" : k.pageDown ? "\x1b[6~" : text === "f" ? "f" : undefined;
         if (bytes) forwardLeaf(bytes);
       }
@@ -575,7 +598,7 @@ export async function runConsolidatedCockpit(options: ConsolidatedOptions): Prom
         const usedTasks = new Set<string>();
         for (const row of plan.paintedRows) {
           if (row.row < plan.bodyRow && (row.text.startsWith("1 Home") || row.text.startsWith("1H"))) {
-            for (const binding of bindings.filter(binding => ["home", "run", "evidence"].includes(binding.action))) {
+            for (const binding of bindings.filter(binding => ["home", "run", "evidence", "log"].includes(binding.action))) {
               const caption = plan.columns < 60 ? `${binding.key}${binding.label[0]}` : `${binding.key} ${binding.label}`;
               const index = row.text.indexOf(caption);
               if (index >= 0) targets.push({ ...row, column: row.column + cellWidth(row.text.slice(0, index)), columns: cellWidth(caption), kind: "key", binding });
@@ -625,6 +648,7 @@ export async function runConsolidatedCockpit(options: ConsolidatedOptions): Prom
           onOpenDiagnostic={id => { state = { ...state, overlay: [id], overlayOffset: 0 }; publish(); }} onOpenEvidence={openEvidence}
           onSelectNeedsYou={reportHomeNeedsYouSelection} /></ShellGridFlow> :
         state.view === "run" ? <RunView snapshot={snap.operator} rows={snap.journal.history} page={source.page} graph={snap.graph.value} decisions={visibleDecisions} session={runSession} columns={p.bodyColumns} run={approvalRunOwner(cwd, runId)} now={options.now} /> :
+        state.view === "log" ? <LogView page={readLogPage({ journal: snap.journal, page: source.page, runId, columns: p.bodyColumns }, p.bodyRows, state.logEnd)} /> :
         <ShellJournalSelection.Provider value={reportEvidenceSelection}><EvidenceView key={`${state.query}:${evidenceNavigation}`} width={p.bodyColumns} model={{ ...model, journal: evidenceRows }} focusEvidence={selectedEvidence} focused={focused} onExport={beginExport} onSelect={id => { selectedEvidence = id; openDetail(); publish(); }} /></ShellJournalSelection.Provider>}
       </CockpitShell>;
     }

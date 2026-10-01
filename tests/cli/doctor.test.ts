@@ -3,9 +3,10 @@ import { mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } fro
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { beforeEach, afterEach, describe, expect, test, vi } from "vitest";
-import { CLAUDE_ALIAS_IDENTITY_STAMPS } from "../../src/adapters/claude-code.js";
+import { CLAUDE_ALIAS_IDENTITY_STAMPS, type ClaudeAlias, resolveClaudeAliasIdentity } from "../../src/adapters/claude-code.js";
 import { codex, hasCodexTrustedProject, seedCodexTrust } from "../../src/adapters/codex.js";
-import { ARTIFICIAL_ANALYSIS_CATALOG_URL, CATALOG_REFRESH_TIMEOUT_MS, LIVEBENCH_CATEGORIES_URL, LIVEBENCH_TABLE_DATE, LIVEBENCH_TABLE_URL, MODELS_DEV_CATALOG_URL, readCachedCatalog } from "../../src/adapters/catalog-remote.js";
+import { ARTIFICIAL_ANALYSIS_CATALOG_URL, CATALOG_REFRESH_TIMEOUT_MS, LIVEBENCH_CATEGORIES_URL, LIVEBENCH_TABLE_DATE, LIVEBENCH_TABLE_URL, MODELS_DEV_CATALOG_URL, readCachedCatalog, refreshCatalogCommand } from "../../src/adapters/catalog-remote.js";
+import type { CodexCommitProbe, CodexSandbox } from "../../src/adapters/codex-commit-check.js";
 import { FakeAdapter } from "../../src/adapters/fake.js";
 import * as registry from "../../src/adapters/registry.js";
 import { channelsFromConfig, type TrustVerdict, type WorkerAdapter } from "../../src/adapters/types.js";
@@ -1349,5 +1350,218 @@ describe("B1a codex retirement notices (doctor)", () => {
       expect(unknown, cache).not.toMatch(/gpt-5\.5 retir/);
       expect(unknown, cache).not.toContain("tiers lists gpt-5.5");
     }
+  });
+});
+
+describe("v2.6.5 T3 — Codex linked-worktree commit probe", () => {
+  test("doctor reports linked-worktree git metadata protected only when an injected Codex sandbox writes the ordinary control but denies index.lock while allowed metadata and unreadable probes remain distinct", async () => {
+    const control = (p: CodexCommitProbe) => writeFileSync(p.control, p.token);
+    const sandboxes: Record<string, CodexSandbox> = {
+      protected: async (p) => { control(p); return `control=ok\nlock=fail sh: ${p.lock}: Operation not permitted\n`; },
+      allowed: async (p) => { control(p); writeFileSync(p.lock, p.token); return "control=ok\nlock=ok\n"; },
+      // the sandbox ran and the control landed, but nothing readable says what happened to the lock
+      unknown: async (p) => { control(p); return "control=ok\n"; },
+      // a denial claim without the positive control is a sandbox that never ran, not a protected verdict
+      "unknown ": async (p) => `lock=fail sh: ${p.lock}: Operation not permitted\n`,
+    };
+    const rows: Record<string, string> = {};
+    for (const [want, codexSandbox] of Object.entries(sandboxes)) {
+      const repo = makeRepo({ "keep.txt": "x" });
+      const out = await doctor(["--"], repo, [stub("codex")], { banner: false, codexSandbox });
+      const saved = JSON.parse(readFileSync(join(repo, ".tickmarkr", "doctor.json"), "utf8"));
+      expect(saved.codex.codexCommit, want).toBe(want.trim());
+      rows[want] = out.split("\n").find((l) => l.includes("linked-worktree")) ?? "";
+      expect(out, want).not.toMatch(/--add-dir|writable_roots/);
+    }
+    expect(rows.protected).toContain("linked-worktree git metadata protected — the sandbox wrote an ordinary worktree file but denied index.lock; a Codex worker cannot commit in its worktree");
+    expect(rows.allowed).toContain("linked-worktree commit probe: index.lock writable");
+    expect(rows.allowed).not.toContain("protected");
+    expect(rows.unknown).toContain("linked-worktree commit probe unknown — the sandbox result for index.lock was unreadable");
+    expect(rows["unknown "]).toContain("linked-worktree commit probe unknown — the sandbox did not write the ordinary control file");
+
+    // a codex-id stub with no injected sandbox: no probe, no field, no output
+    const repo = makeRepo({ "keep.txt": "x" });
+    const out = await doctor(["--"], repo, [stub("codex")], { banner: false });
+    expect(JSON.parse(readFileSync(join(repo, ".tickmarkr", "doctor.json"), "utf8")).codex).not.toHaveProperty("codexCommit");
+    expect(out).not.toContain("linked-worktree");
+  });
+});
+
+describe("v2.6.5 T9 (H) discovery coverage and sourced alias identities", () => {
+  const response = (body: unknown, status = 200) => ({ ok: status >= 200 && status < 300, status, json: async () => body, text: async () => String(body) });
+  const now = () => new Date("2026-09-30T12:00:00.000Z");
+  const freshCache = (repo: string) => {
+    mkdirSync(join(repo, ".tickmarkr"), { recursive: true });
+    const at = now().toISOString();
+    writeFileSync(join(repo, ".tickmarkr", "catalog-cache.json"), JSON.stringify({
+      schemaVersion: 1,
+      fetchedAt: at,
+      modelsDev: { fakeco: { id: "fakeco", models: { "seen-model": { id: "seen-model", cost: { input: 1, output: 2 } } } } },
+      legFetchedAt: { modelsDev: at, liveBench: at },
+    }));
+  };
+  const routes = () => vi.fn(async (input: string | URL | Request) => {
+    const url = String(input);
+    if (url.startsWith(MODELS_DEV_CATALOG_URL)) {
+      return response({ fakeco: { id: "fakeco", models: {
+        "seen-model": { id: "seen-model", cost: { input: 1, output: 2 } },
+        "new-model": { id: "new-model", cost: { input: 3, output: 4 } },
+      } } });
+    }
+    if (url.startsWith(LIVEBENCH_TABLE_URL)) return response("model,javascript,typescript,python,code_generation,code_completion\nnew-model,1,2,3,4,5\n");
+    if (url.startsWith(LIVEBENCH_CATEGORIES_URL)) return response({ "Agentic Coding": ["javascript", "typescript", "python"], Coding: ["code_generation", "code_completion"] });
+    throw new Error(`unexpected ${url}`);
+  });
+  // discovery is injected: the adapter's own model-list surface reports these ids
+  const lister = (models: string[]) => ({
+    id: "fakeco", vendor: "fakeco",
+    probe: async () => ({ installed: true, authed: true, models: [] }),
+    listModels: async () => models,
+    channels: (cfg: any) => channelsFromConfig("fakeco", cfg),
+    headlessCommand: () => "printf OK",
+  }) as unknown as WorkerAdapter;
+  const modelsDevCalls = (fetcher: ReturnType<typeof routes>) =>
+    fetcher.mock.calls.filter(([url]) => String(url).startsWith(MODELS_DEV_CATALOG_URL)).length;
+
+  test("test: doctor refreshes catalog coverage once after injected discovery adds an uncovered model despite a fresh initial cache while an already-covered discovery performs no extra fetch and failed refresh stays unknown", async () => {
+    vi.stubEnv("ARTIFICIAL_ANALYSIS_API_KEY", "");
+    expect(readCachedCatalog((() => { const r = makeRepo({ "keep.txt": "x" }); freshCache(r); return r; })(), { now }).stale).toBe(false);
+
+    const added = makeRepo({ "keep.txt": "x" });
+    freshCache(added);
+    const addedFetch = routes();
+    const addedOut = await doctor(["--models"], added, [lister(["seen-model", "new-model"])], { banner: false, catalogNow: now, catalogFetcher: addedFetch });
+    expect(modelsDevCalls(addedFetch)).toBe(1);
+    expect(addedOut).toContain("catalog coverage refreshed once after discovery added 1 uncovered model(s) (fakeco:new-model); now covered");
+    expect(addedOut).toContain("models.dev id=new-model");
+    // the same discovery again is no longer an addition: no second fetch, so no per-run refresh loop
+    await doctor(["--"], added, [lister(["seen-model", "new-model"])], { banner: false, catalogNow: now, catalogFetcher: addedFetch });
+    expect(modelsDevCalls(addedFetch)).toBe(1);
+
+    // an operator classification never establishes catalog coverage: a configured model the fresh cache misses still earns the one refresh
+    const configured = makeRepo({ "keep.txt": "x" });
+    withOverlay(configured, "tiers:\n  fakeco:\n    vendor: fakeco\n    channel: sub\n    models:\n      seen-model: cheap\n      new-model: mid\n");
+    freshCache(configured);
+    const configuredFetch = routes();
+    const configuredOut = await doctor(["--"], configured, [lister(["seen-model", "new-model"])], { banner: false, catalogNow: now, catalogFetcher: configuredFetch });
+    expect(modelsDevCalls(configuredFetch)).toBe(1);
+    expect(configuredOut).toContain("catalog coverage refreshed once after discovery added 1 uncovered model(s) (fakeco:new-model); now covered");
+    expect(loadConfig(configured).tiers.fakeco?.models["new-model"]).toBe("mid");
+
+    const covered = makeRepo({ "keep.txt": "x" });
+    freshCache(covered);
+    const coveredFetch = routes();
+    const coveredOut = await doctor(["--"], covered, [lister(["seen-model"])], { banner: false, catalogNow: now, catalogFetcher: coveredFetch });
+    expect(coveredFetch).not.toHaveBeenCalled();
+    expect(coveredOut).not.toContain("catalog coverage");
+
+    const failed = makeRepo({ "keep.txt": "x" });
+    freshCache(failed);
+    const failedFetch = vi.fn(async () => { throw new Error("offline"); });
+    const failedOut = await doctor(["--models"], failed, [lister(["seen-model", "new-model"])], { banner: false, catalogNow: now, catalogFetcher: failedFetch });
+    expect(failedFetch.mock.calls.filter(([url]) => String(url).startsWith(MODELS_DEV_CATALOG_URL))).toHaveLength(1);
+    expect(failedOut).toContain("catalog coverage unknown for fakeco:new-model — the one post-discovery refresh failed: catalog refresh: models.dev failed (offline");
+    expect(failedOut).not.toContain("now covered");
+    expect(failedOut).not.toContain("models.dev id=new-model");
+    // the unknown carries into the catalog advisory row and the suggested overlay — never "uncovered"
+    expect(failedOut).toContain("catalog · new-model — catalog coverage unknown (post-discovery refresh failed); no tier suggestion");
+    expect(failedOut.split("\n").find((l) => l.includes("# new-model: ???"))).toContain("catalog coverage unknown (post-discovery refresh failed)");
+    expect(failedOut).not.toContain("uncovered by cached catalogs");
+    // a repeat doctor fetches nothing (new-model is no longer an addition) and the unknown persists — never relabeled uncovered
+    const repeatOut = await doctor(["--models"], failed, [lister(["seen-model", "new-model"])], { banner: false, catalogNow: now, catalogFetcher: failedFetch });
+    expect(failedFetch.mock.calls.filter(([url]) => String(url).startsWith(MODELS_DEV_CATALOG_URL))).toHaveLength(1);
+    expect(repeatOut).toContain("catalog · new-model — catalog coverage unknown (post-discovery refresh failed); no tier suggestion");
+    expect(repeatOut.split("\n").find((l) => l.includes("# new-model: ???"))).toContain("catalog coverage unknown (post-discovery refresh failed)");
+    expect(repeatOut).not.toContain("uncovered by cached catalogs");
+    // a later successful refresh (any path) supersedes the unknown with real coverage evidence
+    const later = () => new Date("2026-09-30T13:00:00.000Z");
+    expect((await refreshCatalogCommand({ repoRoot: failed, fetcher: routes(), now: later })).updated).toBe(true);
+    const settledOut = await doctor(["--models"], failed, [lister(["seen-model", "new-model"])], { banner: false, catalogNow: later, catalogFetcher: failedFetch });
+    expect(settledOut).toContain("models.dev id=new-model");
+    expect(settledOut).not.toContain("coverage unknown");
+    // the default view's counted summary keeps it unknown too, still from the one failed fetch
+    const failedDefault = makeRepo({ "keep.txt": "x" });
+    freshCache(failedDefault);
+    const failedDefaultFetch = vi.fn(async () => { throw new Error("offline"); });
+    const failedDefaultOut = await doctor(["--"], failedDefault, [lister(["seen-model", "new-model"])], { banner: false, catalogNow: now, catalogFetcher: failedDefaultFetch });
+    expect(failedDefaultFetch.mock.calls.filter(([url]) => String(url).startsWith(MODELS_DEV_CATALOG_URL))).toHaveLength(1);
+    expect(failedDefaultOut).toContain("catalog · 1 coverage unknown after a failed refresh · 1 covered without a tier suggestion");
+    expect(failedDefaultOut).not.toContain("uncovered by cached catalogs");
+  });
+
+  const claudeAliasAdapter = () => ({
+    id: "claude-code", vendor: "anthropic",
+    probe: async () => ({ installed: true, authed: true, models: [] }),
+    channels: (cfg: any) => channelsFromConfig("claude-code", cfg),
+    headlessCommand: vi.fn(() => "printf OK"),
+  }) as unknown as WorkerAdapter;
+  const aliasOverlay = (sonnetTier: string) => `tiers:
+  claude-code:
+    vendor: anthropic
+    channel: sub
+    models:
+      fable: null
+      opus: frontier
+      sonnet: ${sonnetTier}
+      haiku: null
+`;
+  // the fake CLI answers the stated-identity probe; the production resolver reads the store first, then asks it
+  const doctorWithFakeCli = async (repo: string, answers: Partial<Record<ClaudeAlias, string>>) =>
+    doctor(["--"], repo, [claudeAliasAdapter()], {
+      banner: false,
+      resolveClaudeAliasIdentity: (cwd, alias) => resolveClaudeAliasIdentity(cwd, alias, (_cwd, asked) => answers[asked]),
+    });
+
+  test("test: doctor fake CLI sonnet→claude-sonnet-5-5 resolves the Sonnet/Opus 5-5 sourced tier/price/window table versus stale five-date drift or unknown/disagreeing identities", async () => {
+    const current = makeRepo({ "keep.txt": "x" });
+    withOverlay(current, aliasOverlay("mid"));
+    const out = await doctorWithFakeCli(current, { sonnet: "claude-sonnet-5-5", opus: "claude-opus-5-5" });
+    expect(out).toContain("identity record: claude-code:sonnet → claude-sonnet-5-5 · $2/$10 per Mtok (API) · window 1000000/128000 · sourced 2026-09-30");
+    expect(out).toContain("INFERRED tier mid by continuity of the existing sonnet=mid configuration");
+    expect(out).toContain("identity record: claude-code:opus → claude-opus-5-5 · $4/$20 per Mtok (API) · window 1000000/128000 · sourced 2026-09-30");
+    expect(out).toContain("INFERRED tier frontier by continuity of the existing opus=frontier configuration");
+    expect(out).not.toContain("resolved-identity drift: claude-code:sonnet");
+    expect(registry.readDoctor(current)?.["claude-code"]?.modelAuth?.sonnet?.identity).toBe("claude-sonnet-5-5");
+
+    const stale = makeRepo({ "keep.txt": "x" });
+    withOverlay(stale, aliasOverlay("mid"));
+    const staleOut = await doctorWithFakeCli(stale, { sonnet: "claude-sonnet-5", opus: "claude-opus-5-5" });
+    expect(staleOut).toContain("resolved-identity drift: claude-code:sonnet resolved to claude-sonnet-5, stamped identity claude-sonnet-5-5");
+    expect(staleOut).toContain("identity record: claude-code:sonnet → claude-sonnet-5 has no sourced record — tier/price/window unknown");
+    expect(staleOut).not.toContain("$2/$10");
+
+    const unknown = makeRepo({ "keep.txt": "x" });
+    withOverlay(unknown, aliasOverlay("mid"));
+    const unknownOut = await doctorWithFakeCli(unknown, {});
+    expect(unknownOut).toContain("identity record: claude-code:opus, sonnet identity unknown — no sourced tier/price/window applies");
+    expect(unknownOut).not.toContain("INFERRED");
+
+    const disagreeing = makeRepo({ "keep.txt": "x" });
+    withOverlay(disagreeing, aliasOverlay("mid"));
+    const disagreeingOut = await doctorWithFakeCli(disagreeing, { sonnet: "claude-opus-5-5", opus: "claude-opus-7" });
+    expect(disagreeingOut).toContain("identity record: claude-code:sonnet → claude-opus-5-5 disagrees with the sonnet family — tier/price/window unknown");
+    expect(disagreeingOut).toContain("identity record: claude-code:opus → claude-opus-7 has no sourced record — tier/price/window unknown");
+    expect(disagreeingOut).not.toContain("INFERRED");
+  });
+
+  test("test: doctor prints an inferred model classification for confirmation without writing configuration while a separately confirmed Fleet choice remains the routing authority", async () => {
+    const repo = makeRepo({ "keep.txt": "x" });
+    // the operator's Fleet-confirmed classification promotes sonnet above the continuity inference
+    withOverlay(repo, aliasOverlay("frontier"));
+    const configPath = join(repo, ".tickmarkr", "config.yaml");
+    const beforeBytes = readFileSync(configPath, "utf8");
+    const adapter = claudeAliasAdapter();
+    const beforeCfg = loadConfig(repo);
+    const task = { id: "T9", title: "authority", goal: "g", shape: "implement", complexity: 3, acceptance: ["a"], routingHints: { floor: "frontier" } } as any;
+    const beforeRoute = route(task, beforeCfg, adapter.channels(beforeCfg));
+
+    const out = await doctorWithFakeCli(repo, { sonnet: "claude-sonnet-5-5", opus: "claude-opus-5-5" });
+
+    expect(out).toContain("INFERRED tier mid by continuity of the existing sonnet=mid configuration, not derived from the name or price — inference for operator confirmation (tickmarkr fleet); doctor writes no configuration · routing authority: configured claude-code:sonnet=frontier");
+    const afterCfg = loadConfig(repo);
+    expect(readFileSync(configPath, "utf8")).toBe(beforeBytes);
+    expect(afterCfg.tiers["claude-code"]?.models.sonnet).toBe("frontier");
+    expect(adapter.channels(afterCfg).find((c) => c.model === "sonnet")?.tier).toBe("frontier");
+    expect(route(task, afterCfg, adapter.channels(afterCfg))).toEqual(beforeRoute);
   });
 });

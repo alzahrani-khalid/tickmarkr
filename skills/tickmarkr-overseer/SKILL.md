@@ -121,13 +121,13 @@ through brief lineage. **An executor choice nobody made is still an executor cho
      tab OVERSEER; create ONE tab ORCHESTRATOR.
      **FIVE-TAB CANON (standing operator layout — corrected three times on 2026-07-27, layout approved
      2026-07-29, re-earned 2026-08-17):**
-     - `OVERSEER` — you. Do not add a second live run surface: the daemon self-places the shipped board
-       ABOVE the supervising seat that invokes the run.
-     - `ORCH` — the orchestrator with the daemon-placed, run-id-pinned shipped board BESIDE it: the board
+     - `OVERSEER` — you. Do not add a live run surface here: launch the daemon from the ORCH tab
+       using the host-owned split form below; it self-places the shipped board there.
+     - `ORCH` — the orchestrator, its host-owned daemon split, and the daemon-placed, run-id-pinned shipped board BESIDE it: the board
        takes the RIGHT half of the tab and the orchestrator's own narration keeps the LEFT half. (It was a
        full-width board above a narration rail until 2026-08-25; the operator changed it, because a task
        table is a few rows and it was spending height it did not need while squeezing the narration.) **Look for that `role: "watch"` pane; never hand-place or hand-roll a live
-       run surface. Nothing else, ever: a work seat NEVER splits into the ORCH tab.** Operator verbatim:
+       run surface. Only the orchestrator, daemon and board belong here: a work seat NEVER splits into the ORCH tab.** Operator verbatim:
        *"in orch tab should be the orch and the watcher only."* Re-earned 2026-08-17: a planning seat split
        beside the orchestrator, and the operator caught it, again. The daemon owns this vertical stack and
        places it the same way at every terminal width; neither the worker-pane halving floor, nor a
@@ -147,12 +147,13 @@ through brief lineage. **An executor choice nobody made is still an executor cho
      fraction (`ORCH · v1.19 4/5`, updated on every task-done); tickmarkr opens ONE TAB PER TASK, labelled
      with the task id and holding that task's worker plus its judge/review/consult panes (tickmarkr
      updates it). Never long context strings or ✓-chains.
-   - **On Orca (`TERM_PROGRAM=Orca` and non-empty `ORCA_TERMINAL_HANDLE`)**: Do not load the `herdr` skill and do not map a Herdr workspace. Work from the current Orca terminal context. Keep the overseer in the launching terminal, name it in the same act — `orca terminal rename --terminal "$ORCA_TERMINAL_HANDLE" --title "OVERSEER · <version>"` (tab title; see the seat-name law under Seat-spawn recipes) — and inspect terminals with `orca terminal list --json`. The daemon self-places the watch board as a horizontal split of the launching terminal (`ORCA_TERMINAL_HANDLE`).
+   - **On Orca (`TERM_PROGRAM=Orca` and non-empty `ORCA_TERMINAL_HANDLE`)**: Do not load the `herdr` skill and do not map a Herdr workspace. Work from the current Orca terminal context. Keep the overseer in the launching terminal, name it in the same act — `orca terminal rename --terminal "$ORCA_TERMINAL_HANDLE" --title "OVERSEER · <version>"` (tab title; see the seat-name law under Seat-spawn recipes) — and inspect terminals with `orca terminal list --json`. Launch the daemon in a host-owned split of the orchestrator terminal using the form below; its self-placed watch board stays in the ORCH tab.
 2. **Orchestrator**: First consume a successful `tickmarkr fleet --pick consult` in the seat repository, per the Fleet selection contract below; then launch the returned adapter/model with your agent host.
    - **On herdr (`HERDR_ENV=1`)**: Spawning on current herdr is two-step — the one-shot `agent start --cwd` form was removed in the herdr CLI redesign and now fails with `unknown option` (OBS-138): first create the pane with `herdr tab create --workspace <ws> --cwd <repo> --label "ORCH · <version>"` and parse `result.root_pane.pane_id` from its JSON, then start the agent in it. For Claude Code, use `herdr agent start orchestrator --kind claude --pane <root-pane-id> -- --permission-mode bypassPermissions` (append `--model <picked-model>` after the `--` from the Fleet receipt). For Codex, use `herdr agent start orchestrator --kind codex --pane <root-pane-id> -- --dangerously-bypass-approvals-and-sandbox` (add `--model <picked-model>` from the Fleet receipt). The unsandboxed flag is REQUIRED: codex's `workspace-write` sandbox keeps `.git` refs read-only, so a sandboxed orchestrator's `tickmarkr run` dies at integration-branch creation — do not downgrade it. Workers you never spawn — tickmarkr spawns its own visible worker panes. Auxiliary agents you do spawn (consultants, reviewers, scouts) follow the same forms: never launch a claude session in plan mode or default permission mode for autonomous work — both stall on per-command approval prompts nobody is watching; claude is always `--permission-mode bypassPermissions --settings '{"promptSuggestionEnabled":false}'`. **For a codex consultant, use `-a never --sandbox workspace-write` — NOT `--sandbox read-only`.** ⚠ **`--sandbox read-only` CONTRADICTS this skill's own completion protocol and will hang the seat.** Every seat you spawn is told to deliver an ARTIFACT ending in a terminal MARKER, because that is the only completion signal the artifact watcher can key on (`done` is turn end). A read-only sandbox cannot write that artifact, so codex blocks on `Would you like to make the following edits?` for its OWN report — and the report exists ONLY in the pending edit, so abandoning the prompt destroys the work rather than merely delaying it. Measured 2026-08-28: a consultant spawned `--sandbox read-only` finished a 14,604-byte verdict, sat blocked on the write, and the operator saw the prompt before the supervising tier did. `read-only` is correct ONLY for a seat that writes nothing at all — which, under the artifact+marker rule, is no seat this skill tells you to spawn. When the prompt does appear, answer **"Yes, and don't ask again for these files"** rather than plain yes: plain yes re-blocks on the next write of the same file. **That `--settings` pair is not cosmetic and it is not optional:** claude-code's AUTOSUGGEST renders context-plausible ghost text into an idle seat's prompt line that is BYTE-IDENTICAL to a typed draft in text-format reads (OBS-482), so a supervising tier cannot tell a seat's own unsent work from a rendering artifact without `agent read --format ansi`. Turning the suggester off at spawn removes the ambiguity at its source instead of paying for the discrimination at every read. Verified against the shipped binary: `claude --settings '{"promptSuggestionEnabled":false}' -p …` exits 0 with a real response, and the key appears in the binary's own settings schema. **For kimi, pass `-y`** (`herdr agent start <name> --kind kimi --pane <id> -- -y`) — the adapter already launches its own workers that way (`src/adapters/kimi.ts:204`), and a kimi seat spawned without it sits on an approval prompt having done nothing. **Herdr cannot see that state**: it reports a kimi pane as `agent_status: working` with `screen_detection_skipped: true` while the prompt is up, so the BLOCKED-STATE watcher below is blind on this vendor and the spawn flag is the ONLY control. Every vendor you spawn needs its auto-approve form named here; a vendor absent from this list is a seat that will hang.
    - **On Orca (`TERM_PROGRAM=Orca` and non-empty `ORCA_TERMINAL_HANDLE`)**: Seats spawn with `orca terminal create` on a path worktree selector with a command:
      `orca terminal create --worktree path:<repo> --title "ORCH · <version>" --command "<agent-cmd>" --json`
      For Claude Code: `orca terminal create --worktree path:<repo> --title "ORCH · <version>" --command "claude --model <picked-model> --permission-mode bypassPermissions --settings '{\"promptSuggestionEnabled\":false}'" --json`. For Codex: `orca terminal create --worktree path:<repo> --title "ORCH · <version>" --command "codex --model <picked-model> --dangerously-bypass-approvals-and-sandbox" --json`. Parse `result.terminal.handle` from the create receipt.
+   Require the orchestrator to use the host-owned daemon and detached-beat lifecycle below for both run and resume, and to report the lock pid ancestry check.
 3. **Standing instructions travel as a brief FILE, never as pane text** — PTY input truncates at ~1024B and a
    truncated brief silently drops policy. Write the full brief to `<repo>/.tickmarkr/overseer/ORCH-BRIEF.md`
    (inside the tickmarkr state dir — already self-gitignored, no exclude step needed), then announce the brief file:
@@ -196,8 +197,22 @@ through brief lineage. **An executor choice nobody made is still an executor cho
 The orchestrator's run log, handoff, and plan live inside its sandbox root and are artifacts of that orchestrator.
 The overseer reads them from there, using the path the orchestrator reports; do not substitute the
 overseer's repository or a machine-global planning directory. The orchestrator brief must say: if the seat's
-sandbox denies writes under `.git`, report the denial to the overseer and stop; the overseer launches the daemon itself;
+sandbox denies writes under `.git`, report the denial to the overseer and stop; the overseer launches the daemon itself; use the host-owned split of the ORCH pane, never the overseer tab;
 and the daemon host is never sandboxed.
+
+**Sandbox-denial daemon launch (OVERSEER):** use the ORCH address recorded at seat creation,
+re-resolved by title if stale; the launching overseer's own terminal is not the target.
+
+- **On Orca (`TERM_PROGRAM=Orca` and non-empty `ORCA_TERMINAL_HANDLE`)**: record the ORCH's
+  `result.terminal.handle` from its seat-create receipt. For the fallback, run
+  `orca terminal split --terminal <ORCH handle> --direction vertical --command "tickmarkr run"`.
+  Here `$ORCA_TERMINAL_HANDLE` names the OVERSEER's own terminal; use it only when the ORCH
+  launches its own daemon, never when the OVERSEER launches on the ORCH's behalf.
+- **On herdr (`HERDR_ENV=1`)**: record the ORCH's `result.root_pane.pane_id` from its tab-create
+  receipt. For the fallback, use `herdr pane split` targeting that recorded ORCH pane id, then
+  `herdr pane run <new> "tickmarkr run"`; never target the OVERSEER's pane.
+
+The same recorded ORCH address is required for a fallback `tickmarkr resume <runId>`.
 
 **On herdr (`HERDR_ENV=1`)**, after every `agent start`, wait for and read the model banner. Only then
 deliver the brief with `pane run`, then read the transcript back and verify that the brief's first words are
@@ -291,6 +306,40 @@ Kimi `-y`, artifact plus terminal marker, and verified file-brief delivery. Flee
   nothing the tab did not already hold. Brief delivery travels as a file announced by `orca terminal send --terminal <handle> --text "<announcement>" --enter --wait-submit 15 --json`. Read `result.send.prompt.stages` and treat the brief as delivered only when a `turn_started` stage is present; `accepted: true` proves input acceptance, not a started turn; never resend on `accepted` alone.
 For Leg-2 (both hosts), a Codex reviewer under `workspace-write` must be briefed with an in-worktree verdict path such as
 `<repo>/.tickmarkr/overseer/verdicts/<task>.md`, and its verdict must be written there before it is read.
+## Host-owned daemon and detached beats
+
+Launch the daemon as a SPLIT of the orchestrator's own pane in the ORCH tab, owned by the
+host PTY. Never launch it as an agent harness background task or in a separate tab. The daemon
+self-places its board from that split, keeping both daemon and board in the ORCH tab.
+
+- **On Orca (`TERM_PROGRAM=Orca` and non-empty `ORCA_TERMINAL_HANDLE`)**: only when the ORCH
+  launches its own daemon, use
+  `orca terminal split --terminal "$ORCA_TERMINAL_HANDLE" --direction vertical --command "tickmarkr run"`.
+  When the OVERSEER launches the sandbox-denial fallback, substitute the ORCH handle recorded
+  at seat creation: `orca terminal split --terminal <ORCH handle> --direction vertical --command "tickmarkr run"`.
+- **On herdr (`HERDR_ENV=1`)**: use `herdr pane split` on the orchestrator's own pane, then
+  `herdr pane run <new> "tickmarkr run"` in the returned split. When the OVERSEER launches the
+  fallback, target the ORCH pane id recorded at seat creation, never the OVERSEER's pane.
+
+For `resume`, use the same host-owned split form with `tickmarkr resume <runId>` in place of
+`tickmarkr run`. After either launch, read this repository's lock pid and walk its ppid chain
+in the process table to the host PTY; verify no agent session is an ancestor. If an agent is
+an ancestor, stop that launch and relaunch through the host split before continuing.
+
+Start `tickmarkr beat <tier> --seat <seat> --loop` as a DETACHED background process, one per
+(tier, seat), from the repository root. Use setsid plus nohup (or the host's equivalent detached
+session facility), redirect output to a file, and record a pidfile under the repository's state
+dir. Verify ppid 1 and no agent-session ancestor. Never put beats in a harness background task
+or a visible tab. The lifecycle must be idempotent: start checks the pidfile against the live
+process payload and returns an "already running" no-op for the same (repo, tier, seat); status
+checks that payload and beat freshness; stop sends `--stand-down` for the same tier and seat,
+verifies the loop exits within one interval, then removes its pidfile. A stale or reused pid
+must never be killed without matching its live payload. Include a run-end stop item for every
+beat started, also on failure, park or handoff; verify DISARMED and remove retired beat files.
+
+Keep only watchers that must WAKE the seat in the harness. Re-arm them on each wake and at
+their harness cap; daemon and beat lifetimes must not depend on that cap.
+
 ## Supervising tickmarkr as the executor — WHO DOES WHAT
 
 When the mission runs `/tickmarkr-auto` (tickmarkr dispatches the workers), supervision changes shape —
@@ -411,6 +460,29 @@ journal tail to decide what happens next, or sweeping orphans — you have taken
   its death. Liveness comes from the lock's OWN pid (`kill -0`), never a command-name grep. Recovery is
   `tickmarkr resume <runId>` — **the orchestrator's command, not yours** — and note that resume REPLAYS the
   journal's `baseRef`, so a fix landed on the base branch is unreachable by the running run.
+- **macOS host: a launchservicesd restart is a host failure, not a kill spree (D-787/D-789).** Measured
+  2026-09-30: during a local full suite launchservicesd crashed at 17:15:00Z (Mach IPC name space
+  exhausted, `0x1000600b`, under node `process.title` check-ins) and launchd respawned it at 17:15:09Z
+  with an empty app registry. Every GUI app launched before then read "The application … is not open
+  anymore", though none had been killed. Replay it from evidence, in this order:
+  1. **Daemon identity.** `/bin/ps -o pid=,lstart= -p "$(pgrep -x launchservicesd)"` beside Dock and
+     Finder: a lone young launchservicesd is the tell. Record its pid/lstart before a run and at every lap.
+  2. **Recorded log.** `/usr/bin/log show --start '<that lstart minus two minutes>' --predicate 'process ==
+     "launchservicesd" OR process == "launchd"'`, looking for `0x1000600b`, then `service inactive` and
+     `Successfully spawned launchservicesd`. Always type the full `/usr/bin/log`: in zsh a bare `log` is a
+     builtin that prints nothing, and that silence was once misread as a rotated log (D-787 add.1).
+  3. **Crash report.** `~/Library/Logs/DiagnosticReports/ExcUserFault_node-*.ips` at the same second
+     (`uv_set_process_title → _LSApplicationCheckIn`).
+  `tickmarkr doctor` and standalone `tickmarkr verify` read step 1 themselves. The check lives in its own
+  module, `src/run/launchservices-check.ts`: one bounded `/bin/ps` read with a 5000 ms kill ceiling.
+  doctor's wiring is five lines in `src/cli/commands/doctor.ts` around `writeDoctor`. A changed pid or
+  start persists one advisory in the `launchServices` object on the FIRST `doctor.json` record. An
+  unreadable read is unknown and keeps the prior identity. The advisory never changes a verdict or a
+  retry, and the check never reads `/usr/bin/log`, so steps 2–3 stay yours. **The remedy is the
+  operator's call, made actionable by that evidence:** quit and relaunch each affected app, or log out /
+  restart the Mac. A restart ends every agent session and wipes `/private/tmp`, so stand the run down at
+  a clean boundary first and write the handoff; after the reboot, re-resolve seat handles and re-arm
+  watchers. Never kill or restart launchservicesd yourself.
 - **SWEEPING A WORKER ORPHANS ITS CLEANUP, NOT JUST ITS WORK — kill the process GROUP.** Measured
   2026-08-06: a worker running a legitimate load experiment had spawned CPU burners and held a trailing
   `kill` line. It was SIGTERM'd as an orphan; **the cleanup never ran**, and **59 surviving burner shells
@@ -1095,9 +1167,11 @@ watching it. Two thirds of that line were constants, not measurements.
 The beat is one shipped command and it arms through two explicit verbs, `--new-arm` and `--loop` —
 never a bare invocation. `--loop` already implies `--new-arm`: it creates a durable arm and beats in
 this process every 10 seconds, exiting on its own within one interval after a stand-down. Run it from
-the repo root as its own `run_in_background` Bash call:
+the repo root as a detached setsid+nohup process with a pidfile, following the idempotent
+start/stop/status lifecycle in Host-owned daemon and detached beats; never as a harness task or visible tab:
 
 ```bash
+# Payload for the detached start above; do not execute as a foreground or harness task.
 cd <repo> && tickmarkr beat overseer --seat <overseer-agent-or-pane> --loop
 cd <repo> && tickmarkr beat overseer --seat <overseer-agent-or-pane> --stand-down  # deliberately hand off; --loop exits
 ```
@@ -1156,6 +1230,7 @@ but its process ownership still needs a live check. So:
   legacy bare shell wrapper: unlike `--loop`, it cannot observe the marker and was the form that
   re-armed a stand-down.
 
+Keep only watchers that must WAKE this seat in the harness, re-armed at their cap.
 Arm the bundled watcher as its OWN Bash call with `run_in_background` — chaining it after other commands
 with `&` orphans it from the wake chain. It prints one wake reason and exits; re-arm after every wake.
 
@@ -1478,7 +1553,7 @@ Create specialist seats using `orca terminal create --worktree path:<repo> --com
      states an act and lets the successor read a fact, and it survived into a handoff exactly once before
      costing two unwatched consult verdicts (OBS-622). The admissible form names the lifetime and the
      work it leaves the successor — *"watchers armed by this session (journal, artifact, dialog, beat);
-     they die with it — re-arm on adopt"* — and, per rule 11, says which tier's watchers were NOT armed.
+     harness watchers die with it — re-arm on adopt; detached beats require explicit stop"* — and, per rule 11, says which tier's watchers were NOT armed.
      A detached watcher is the one exception and must be labelled as such, with its heartbeat file, since
      it outlives the seat instead.
    - **SWEEP THE PANES THE RUN LEFT.** A daemon killed by a signal flushes its journal and releases its

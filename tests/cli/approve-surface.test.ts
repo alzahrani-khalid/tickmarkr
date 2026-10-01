@@ -4,7 +4,7 @@ import { expect, test } from "vitest";
 import { approve } from "../../src/cli/commands/approve.js";
 import { SURFACE_CONTRACT_EXCEPTIONS } from "../../src/compile/collateral.js";
 import { graphDefinitionHash, loadGraph } from "../../src/graph/graph.js";
-import { Journal } from "../../src/run/journal.js";
+import { applyScopeAmendments, bindingToken, effectiveDecisions, journaledFailureBrief, Journal, parseBindingToken, pendingApprovalActions } from "../../src/run/journal.js";
 import { setupRepo, T } from "../helpers/tmprepo.js";
 
 const criteria = (n: number) => Array.from({ length: n }, (_, i) => `criterion ${i + 1}`);
@@ -96,4 +96,38 @@ test("test: approve files with a non positive review rounds value is refused bef
   }
   expect(approvals(journal)).toHaveLength(0);
   expect(readFileSync(journalPath, "utf8")).toBe(before);
+});
+
+test("test: production approve refuses missing reason using an actionable CLI error naming approve --reason; stale park binding or over-budget files expansion also refuses; a bound reason-only refusal legally redispatches within the existing scope", async () => {
+  // Four criteria × six patterns sits AT the 24 bound: any expansion is over budget, the refusal is not.
+  const { repo, journal, before, journalPath } = parked("T1", criteria(4), patterns(6), "needed.txt");
+  const graphPath = join(repo, ".tickmarkr", "graph.json");
+  const graphBefore = readFileSync(graphPath, "utf8");
+  const { events, lines } = journal.readSourced();
+  const at = (event: string) => events.findIndex((e) => e.event === event);
+  const parkToken = bindingToken({ line: lines[at("task-human")]!, ts: events[at("task-human")]!.ts });
+  const staleToken = bindingToken({ line: lines[at("run-start")]!, ts: events[at("run-start")]!.ts });
+  const reason = "D-1: needed.txt is out of bounds; repair inside the declared files";
+
+  for (const argv of [[], ["--reason", "   "], ["--park", parkToken]]) {
+    await expect(approve([journal.runId, "T1", ...argv], repo))
+      .rejects.toThrow(`scope-request for T1 requires --files <glob,…> to widen files[], or \`tickmarkr approve ${journal.runId} T1 --reason <text>\``);
+  }
+  await expect(approve([journal.runId, "T1", "--park", staleToken, "--reason", reason], repo)).rejects.toThrow(/refusing stale decision for T1/);
+  await expect(approve([journal.runId, "T1", "--park", parkToken, "--files", "needed.txt", "--reason", reason], repo))
+    .rejects.toThrow(/surface of 28 .*above the 24 bound/);
+  expect(readFileSync(journalPath, "utf8")).toBe(before);
+
+  expect(await approve([journal.runId, "T1", "--park", parkToken, "--reason", reason, "--by", "operator"], repo))
+    .toMatch(/^approval disposition dispatch: .*scope expansion refused, files\[\] unchanged/);
+  const rows = approvals(journal);
+  expect(rows).toHaveLength(1);
+  expect(rows[0]!.data).toEqual({ by: "operator", reason, via: "cli", park: parseBindingToken(parkToken) });
+  const after = journal.read();
+  expect(effectiveDecisions(after).size).toBe(1);
+  expect(journal.replayStatuses().get("T1")).toBe("pending");
+  expect(pendingApprovalActions(after).get("T1")).toMatchObject({ authority: "worker", release: "plain" });
+  expect(journaledFailureBrief(after, "T1")).toEqual([`approval: ${reason}`]);
+  expect(applyScopeAmendments(loadGraph(repo), journal).tasks[0]!.files).toEqual(patterns(6));
+  expect(readFileSync(graphPath, "utf8")).toBe(graphBefore);
 });

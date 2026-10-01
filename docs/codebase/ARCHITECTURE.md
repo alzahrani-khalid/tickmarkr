@@ -90,7 +90,7 @@ Side modules (CLI-facing, not in the dispatch loop):
 | Run lock | Advisory per-run lock over `.tickmarkr/graph.json` (link idiom + heartbeat) | `src/run/lock.ts` |
 | Pane reconcile | Pure fold over journal rows → desired herdr pane set for orphan cleanup | `src/run/reconcile.ts` |
 | Stall normalize | Presentation-token stripper for stall-inactivity compare (spinner-safe) | `src/run/stall.ts` |
-| Gate sequencer | Mandatory deterministic battery stops at first failure; enabled acceptance/review run concurrently afterward, both fail closed | `src/gates/run-gates.ts` |
+| Gate sequencer | Mandatory deterministic battery stops at first failure; enabled acceptance/review run concurrently afterward, both fail closed; a review-driven repair runs them before its test screen, and the full merge-candidate suite still runs last | `src/gates/run-gates.ts` |
 | LLM dispatch | Shared headless-vs-pane execution for judge/review/consult prompts + defensive JSON extraction | `src/gates/llm.ts` |
 
 ## Pattern Overview
@@ -213,10 +213,27 @@ rejects a dirty entry and screens evidence/scope before shell work,
 then run build, lint, evidence, scope and test, stopping at the first deterministic red.
 `src/gates/baseline.ts` compares tool failures against the recorded baseline. The cheap
 screen does not replace the later evidence/scope checks. Only after that battery passes
+(or, in the one repair mode below, after build, lint, evidence and scope)
 do enabled acceptance and review start concurrently; both must pass, and each completion
 is journaled when it arrives. All callers and fixtures use this same execution path.
 If a non-final round selects covering tests, a green selection is held until the full
 suite runs on the same merge-candidate commit; no subset-only result authorizes merge.
+
+The repair mode is decided by what the round carries, closed over three cases. A repair the
+review sent back — it carries a `review:material` finding, test selection is on and no repair
+test is required — runs build, lint, evidence and scope, then acceptance ‖ review, then its
+test screen, then the unchanged merge-candidate full suite. A semantic red ends that round with
+zero test starts; dirt the judge's oracles or a reviewer's CLI left is refused at the test gate
+before any screen runs or any cached green answers for the changed subject; a seatless,
+cancelled semantic round starts no test either, and records its test as owed. A review that
+returns no verdict is not a semantic red: the daemon re-asks only the review, so the round still
+runs its screen and full suite beside it. A test-red repair (selection off, or a
+required repair test) and every first attempt keep the battery-first order above.
+Replay of the T4 shape — a review-driven repair whose worker lands no change: build and lint
+reuse their verdicts for the unchanged tree, the review re-judges the same subject first, and
+when it re-reds the round buys no test run; when it passes, the screen and the full suite on
+the merge-candidate commit still decide (a qualified full green on that exact identity may
+answer), so semantic success never stands in for full proof.
 
 A declared gate is not a passed gate. Replay `task-dispatch T1` without a build result:
 build is **not-run**, not pass. `gate-start build` makes it **running**; a `gate-result`
@@ -253,7 +270,7 @@ instead of introducing another help skill or independent instructions.
 7. The task prompt is written to disk (`writePrompt`, `src/adapters/prompt.ts:27-32`) and dispatched into a named slot via `driver.slot()` + `driver.run()` — interactive TUI by default, print-mode fallback otherwise (`src/run/daemon.ts:168-218`)
 8. Daemon waits for the `TICKMARKR_RESULT` trailer (regex-anchored to avoid matching the prompt's own template text) or the `TICKMARKR_EXIT:` fast-fail marker, paging the operator once if the pane goes `blocked`/`idle` (`src/run/daemon.ts:181-211`, `src/adapters/prompt.ts:37`)
 9. Output is parsed by the adapter (`adapter.parse()` → `parseWorkerResult`, `src/adapters/prompt.ts:39-73`); a quota-exhaustion signal triggers channel failover without consuming the escalation ladder (`src/run/daemon.ts:224-238`)
-10. `runGates()` runs the mandatory deterministic battery, then enabled acceptance and review concurrently; see the execution and selected/full-suite rules above (`src/gates/run-gates.ts`).
+10. `runGates()` runs the mandatory deterministic battery, then enabled acceptance and review concurrently — or, for a review-driven repair, the cheap gates, then acceptance ‖ review, then the test screen and the full suite; see the execution, repair-mode and selected/full-suite rules above (`src/gates/run-gates.ts`).
 11. All gates pass → `mergeTask()` merges the task branch into the integration branch through a serialized merge queue (`mergeSerial`, `src/run/daemon.ts:80-84`, `src/run/merge.ts:28-41`); task status becomes `done`
 12. Any gate fails → escalation ladder step (`retry` → `escalate` channel → `consult` → `human`); a `consult()` call can also fire directly on stall or merge conflict (`src/run/daemon.ts:294-315`, `src/run/consult.ts:52-81`)
 13. Every state transition is appended to `journal.jsonl` (`src/run/journal.ts:58-61`); on run end, kept panes close, an operator notification fires, and a `RunSummary` is returned (`src/run/daemon.ts:338-350`)

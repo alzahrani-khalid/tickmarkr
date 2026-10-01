@@ -895,6 +895,7 @@ export const SHELL_BINDINGS = [
   { key: "1", label: "Home", action: "home" },
   { key: "4", label: "Run", action: "run" },
   { key: "5", label: "Evidence", action: "evidence" },
+  { key: "7", label: "Log", action: "log" },
   { key: "Tab", label: "Focus", action: "focus" },
   { key: "Enter", label: "Open", action: "open" },
   { key: "a", label: "Actions", action: "actions" },
@@ -914,7 +915,8 @@ export function shellBindings(context: { view: string; evidenceSection?: number;
     if (binding.action === "open") return context.canOpen !== false && (context.view !== "evidence" || !context.evidenceSection);
     if (binding.action === "widen" || binding.action === "narrow") return context.canResize === true;
     if (binding.action === "export") return context.view === "evidence";
-    if (binding.action === "filter" || binding.action === "follow") return context.view === "evidence" && !context.evidenceSection;
+    if (binding.action === "follow") return context.view === "log" || context.view === "evidence" && !context.evidenceSection;
+    if (binding.action === "filter") return context.view === "evidence" && !context.evidenceSection;
     return true;
   });
 }

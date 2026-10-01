@@ -1,13 +1,13 @@
 import { createHash } from "node:crypto";
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { parseArgs } from "node:util";
-import { allAdapters, probeAll, readDoctor, rolePools } from "../../adapters/registry.js";
+import { allAdapters, probeAll, readDoctor, rolePools, writeDoctor } from "../../adapters/registry.js";
 import { channelKey, type Assignment, type BillingChannel } from "../../adapters/types.js";
 import { loadConfig } from "../../config/config.js";
 import { captureBaseline, detectGateCommands, staleFileCountCommands, type Baseline, type GateEvidenceOptions } from "../../gates/baseline.js";
-import { getVerdictStore, type StoredVerdictRecord } from "../../gates/cache.js";
+import { getVerdictStore, runnerInputsHash, type StoredVerdictRecord } from "../../gates/cache.js";
 import { modelProvider } from "../../gates/review.js";
 import { runGates } from "../../gates/run-gates.js";
 import type { GateResult } from "../../gates/types.js";
@@ -18,6 +18,7 @@ import { linkNodeModules, removeWorktree, shGit, shGitOk } from "../../run/git.j
 import { foldOwedChecks, integrationMapped, owedCriteria, Journal, OWED_DISCHARGE_EVENT, type OwedCheck, type OwedFold } from "../../run/journal.js";
 import { withRepositoryLease } from "../../run/lease.js";
 import { isPidLive } from "../../run/lock.js";
+import { recordLaunchServices } from "../../run/launchservices-check.js";
 
 /**
  * tickmarkr verify — the gate battery as a standalone command (OPERATING-MODEL-2026-08-11 item 3).
@@ -94,7 +95,7 @@ const hashParts = (parts: Array<string | Buffer>): string => {
   return hash.digest("hex").slice(0, 12);
 };
 
-/** Cache identity is repository content, never a checkout path. */
+/** Repository content plus the effective runner inputs the daemon hashes; never a checkout path. */
 export function baselineCachePath(cwd: string, baseSha: string, commands: Record<string, string>): string {
   const lockParts: Array<string | Buffer> = [];
   for (const file of LOCKFILES) {
@@ -103,7 +104,7 @@ export function baselineCachePath(cwd: string, baseSha: string, commands: Record
   }
   const commandParts = Object.entries(commands).sort(([a], [b]) => a.localeCompare(b)).map(([name, command]) => `${name}\0${command}\0`);
   return join(realpathSync(tmpdir()), "tickmarkr-verify", "cache",
-    `baseline-${baseSha.slice(0, 12)}-${hashParts(lockParts)}-${hashParts(commandParts)}.json`);
+    `baseline-${baseSha.slice(0, 12)}-${hashParts(lockParts)}-${hashParts(commandParts)}-${runnerInputsHash()}.json`);
 }
 
 const verdictlessCommands = (baseline: Baseline, commands: Record<string, string>): string[] =>
@@ -377,7 +378,7 @@ export async function verify(argv: string[], cwd = process.cwd(), options: { evi
       console.error(`verify: reusing cached baseline for ${mergeBase.slice(0, 12)} (${names.join(", ")}: ${cachePath})`);
       return cached;
     }
-    console.error(`verify: capturing baseline at merge-base ${mergeBase.slice(0, 12)} for ${names.join(", ")} (cached by base, lockfile and command hashes at ${cachePath})`);
+    console.error(`verify: capturing baseline at merge-base ${mergeBase.slice(0, 12)} for ${names.join(", ")} (cached by base, lockfile, command and effective runner hashes at ${cachePath})`);
     // Unleased captures of the SAME checkout overlap, so each owns a unique base worktree and removes
     // only its own; the pid in the name lets a later verify sweep what a killed one left behind.
     for (const entry of readdirSync(stateDir)) {
@@ -555,6 +556,25 @@ export async function verify(argv: string[], cwd = process.cwd(), options: { evi
       ...review,
     });
   }
+  // A1 (D-787/D-789): one bounded launchservicesd identity read AFTER the verdict is final, so a suite
+  // that restarted the daemon is caught and the verdict, exit code and retries never depend on it.
+  // It rides the doctor.json verify read; with none there it creates no state file.
+  const doctorRoot = fileRoot("doctor.json");
+  const priorDoctor = readDoctor(doctorRoot);
+  const launchServices = priorDoctor ? await recordLaunchServices(priorDoctor, priorDoctor) : undefined;
+  if (launchServices && launchServices.health !== priorDoctor) {
+    // Evidence only, not a probe: keep doctor.json's mtime (the auth-cache freshness signal, doctorAgeMs),
+    // and a failed write is an advisory diagnostic — the verdict below is returned regardless.
+    const doctorFile = join(doctorRoot, ".tickmarkr", "doctor.json");
+    try {
+      const { atime, mtime } = statSync(doctorFile);
+      writeDoctor(doctorRoot, launchServices.health);
+      utimesSync(doctorFile, atime, mtime);
+    } catch (e) {
+      console.error(`verify: launchservicesd evidence not persisted (${e instanceof Error ? e.message : String(e)}) (advisory — verdict unchanged)`);
+    }
+  }
+  if (launchServices?.line) console.error(`verify: ${launchServices.line}`);
   if (values.json) {
     return { out: JSON.stringify({ base: baseTip, head, mergeBase, green, artifactPath, artifactSha256, artifactAvailability, results,
       ...(owedAfter && owedLines.length ? { owed: { debt: owedAfter.debt, discharged: dischargeRefusal ? [] : owed.map((o) => o.id), ...(dischargeRefusal ? { refused: dischargeRefusal } : {}) } } : {}),

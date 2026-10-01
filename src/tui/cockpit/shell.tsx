@@ -7,10 +7,11 @@ import { SHELL_PALETTE, SHELL_REDUCED_PALETTE } from "./theme.js";
 import { fitCells } from "./width.js";
 import type { LiveStoreSnapshot } from "./live-store.js";
 
-export type ShellView = "home" | "run" | "evidence";
+export type ShellView = "home" | "run" | "evidence" | "log";
 export type ShellFocus = ShellPlan["focus"][number];
 export interface ShellState {
   view: ShellView; focus: ShellFocus; scroll: number; help: boolean;
+  logEnd?: number;
   evidenceSection?: number; canOpen?: boolean;
   shortcutColumns?: number; canResize?: boolean;
   editorKind?: "filter" | "export";
@@ -24,7 +25,8 @@ export const shellHelp = (bindings: readonly (typeof SHELL_BINDINGS)[number][] =
   "Esc closes deepest overlay; it never quits.",
   "Text: q1? is literal; Enter applies; Esc cancels.",
   "Confirm: y alone confirms; n/Esc cancels.",
-  "Tab now moves focus; view numbers are 1/4/5.",
+  "Tab now moves focus; view numbers are 1/4/5/7.",
+  "Log: arrows/page keys scroll; f toggles tail follow.",
   "Fleet: tickmarkr fleet", "Plan: tickmarkr plan", "Health: tickmarkr doctor",
 ];
 
@@ -75,7 +77,8 @@ export function CockpitShell({ snapshot, state, columns, rows, version, children
   const overlay = state.editor !== undefined ? [`${state.editorKind === "export" ? "Export destination" : "Filter"}: ${state.editor}`, "Enter Apply | Esc Cancel"] : state.overlay ?? (state.help ? shellHelp(bindings) : undefined);
   const totalRows = overlay?.length ?? contentRows;
   const displayOffset = overlay ? Math.min(state.overlayOffset, Math.max(0, totalRows - plan.bodyRows)) : scroll;
-  const position = `${totalRows ? displayOffset + 1 : 0}–${Math.min(totalRows, displayOffset + plan.bodyRows)}/${totalRows} | ${Math.max(0, totalRows - plan.bodyRows)} hidden`;
+  const logMode = state.view === "log" ? `${state.logEnd === undefined ? "FOLLOW" : "PAUSED"} | ` : "";
+  const position = `${logMode}${totalRows ? displayOffset + 1 : 0}–${Math.min(totalRows, displayOffset + plan.bodyRows)}/${totalRows} | ${Math.max(0, totalRows - plan.bodyRows)} hidden`;
   const keybar = bindings.filter(b => ["focus", "open", "actions", "help", "quit"].includes(b.action) && (columns >= 60 || b.action !== "focus")).map(b => `${b.key} ${columns < 60 && b.action === "actions" ? "Act" : b.label}`).join(" | ");
   const status = columns < 60 ? `${op.label} | tip ${op.currentTip.toUpperCase()}` : `${op.label} | MERGED ${op.merged}/${op.planned ?? "?"} | CURRENT TIP ${op.currentTip.toUpperCase()} | ${snapshot.freshness}`;
   return <ShellPresentation.Provider value={true}>
@@ -83,12 +86,12 @@ export function CockpitShell({ snapshot, state, columns, rows, version, children
     <Box ref={root} flexDirection="column" width={columns} height={rows} flexShrink={0} backgroundColor={ink(palette.surface)}>
       {line(`tickmarkr ${version} | ${state.view.toUpperCase()} | ${snapshot.journal.source.split("/").at(-2) ?? "run identity unknown"}`)}
       {line(columns < 60
-        ? `1H 4R 5E | ${position}`
-        : `1 Home  4 Run  5 Evidence | ${state.focus} | ${position}`)}
+        ? `1H 4R 5E 7L | ${position}`
+        : `1 Home  4 Run  5 Evidence  7 Log | ${state.focus} | ${position}`)}
       {line("─".repeat(columns), columns, palette.chrome)}
       <Box height={plan.bodyRows} flexShrink={0} flexDirection="row" overflow="hidden">
         {<Box width={1} flexDirection="column">{Array.from({ length: plan.bodyRows }, (_, i) => <Text key={i} color={ink(palette.chrome)}>│</Text>)}</Box>}
-        {plan.rail > 0 && <><Box width={plan.rail} flexDirection="column">{["1 Home", "4 Run", "5 Evidence", "", "CLI:", "fleet", "plan", "doctor"].map((t, i) => <Text key={i} color={ink(palette.chrome)}>{fitCells(t, plan.rail)}</Text>)}</Box>{<Box width={1} flexDirection="column">{Array.from({ length: plan.bodyRows }, (_, i) => <Text key={i} color={ink(palette.chrome)}>│</Text>)}</Box>}</>}
+        {plan.rail > 0 && <><Box width={plan.rail} flexDirection="column">{["1 Home", "4 Run", "5 Evidence", "7 Log", "", "CLI:", "fleet", "plan", "doctor"].map((t, i) => <Text key={i} color={ink(palette.chrome)}>{fitCells(t, plan.rail)}</Text>)}</Box>{<Box width={1} flexDirection="column">{Array.from({ length: plan.bodyRows }, (_, i) => <Text key={i} color={ink(palette.chrome)}>│</Text>)}</Box>}</>}
         <Box width={plan.bodyColumns} height={plan.bodyRows} flexDirection="column" overflow="hidden" flexShrink={0}>
           {overlay?.slice(displayOffset, displayOffset + plan.bodyRows).map((t, i) => <Text key={i} wrap="truncate-end" color={ink(palette.text)}>{fitCells(t, plan.bodyColumns)}</Text>)}
           <Box ref={leaf} display={overlay ? "none" : "flex"} flexDirection="column" flexShrink={0} marginTop={-scroll}>{children}</Box>
