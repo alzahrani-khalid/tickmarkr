@@ -3,14 +3,23 @@ import { existsSync, readdirSync, readFileSync, rmSync, writeFileSync } from "no
 import { dirname } from "node:path";
 import { join } from "node:path";
 import { expect, test } from "vitest";
+import { CODEX_GIT_GRANT } from "../../src/adapters/codex.js";
 import { type CodexCommitProbe, type CodexSandbox, codexSandboxArgs, probeCodexCommit } from "../../src/adapters/codex-commit-check.js";
 import { makeRepo } from "../helpers/tmprepo.js";
+
+// The probe's own commit, made the way its sandbox script makes it (v2.6.6 T9 K receipts).
+const commitAsProbe = (p: CodexCommitProbe) => {
+  writeFileSync(p.control, p.token);
+  execFileSync("git", ["add", "--", p.control], { cwd: p.worktree });
+  execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@t.invalid", "commit", "-q", "--no-gpg-sign", "-m", `tickmarkr-probe ${p.token}`], { cwd: p.worktree });
+};
+const probeBranches = (repo: string) => execFileSync("git", ["for-each-ref", "--format=%(refname:short)", "refs/heads/tickmarkr-probe-*"], { cwd: repo, encoding: "utf8" }).trim();
 
 test("doctor removes its probe lock and fixture worktree after allowed denied or cancelled probes while preserving a pre-existing foreign lock", async () => {
   const cancel = new AbortController();
   const cases: Array<{ want: string; sandbox: CodexSandbox; signal?: AbortSignal }> = [
-    { want: "allowed", sandbox: async (p) => { writeFileSync(p.control, p.token); writeFileSync(p.lock, p.token); return "control=ok\nlock=ok\n"; } },
-    { want: "protected", sandbox: async (p) => { writeFileSync(p.control, p.token); return `control=ok\nlock=fail sh: ${p.lock}: Permission denied\n`; } },
+    { want: "allowed", sandbox: async (p) => { commitAsProbe(p); writeFileSync(p.lock, p.token); return "control=ok\ncommit=ok\nhook=denied\nroot=denied\n"; } },
+    { want: "protected", sandbox: async (p) => { writeFileSync(p.control, p.token); return "control=ok\ncommit=fail\nhook=denied\nroot=denied\n"; } },
     // cancelled mid-probe, after the lock landed: the verdict is unknown and the lock still goes
     { want: "unknown", signal: cancel.signal, sandbox: async (p) => { writeFileSync(p.control, p.token); writeFileSync(p.lock, p.token); cancel.abort(); throw new Error("aborted"); } },
   ];
@@ -30,8 +39,10 @@ test("doctor removes its probe lock and fixture worktree after allowed denied or
     expect(readdirSync(join(repo, ".git")), want).not.toContain("worktrees");
     expect(execFileSync("git", ["worktree", "list"], { cwd: repo, encoding: "utf8" }).trim().split("\n")).toHaveLength(1);
     expect(readFileSync(foreign, "utf8"), want).toBe("foreign");
-    // the production sandbox grant names the exact directory holding index.lock, beside the common dir
-    expect(codexSandboxArgs(seen!)).toContain(`sandbox_workspace_write.writable_roots=${JSON.stringify([seen!.commonDir, dirname(seen!.lock)])}`);
+    // the fixture branch is the probe's own, and it goes with the fixture
+    expect(probeBranches(repo), want).toBe("");
+    // the production sandbox runs `codex sandbox` under the worker's exact grant fragment, never a rebuilt grant
+    expect(codexSandboxArgs(seen!)[1]).toContain(`codex sandbox -c 'sandbox_mode="workspace-write"' ${CODEX_GIT_GRANT} -- sh -c `);
   }
 
   // a foreign lock at the FIXTURE's own index.lock path (another process won the race right after checkout):
@@ -44,17 +55,19 @@ test("doctor removes its probe lock and fixture worktree after allowed denied or
   expect(called).toBe(false);
   const [name] = readdirSync(join(repo, ".git", "worktrees"));
   expect(readFileSync(join(repo, ".git", "worktrees", name!, "index.lock"), "utf8")).toBe("foreign");
-  // the fixture checkout itself is still gone
+  // the fixture checkout itself is still gone; its branch stays with the metadata left to the lock's owner
   expect(existsSync(dirname(readFileSync(join(repo, ".git", "worktrees", name!, "gitdir"), "utf8").trim()))).toBe(false);
+  expect(probeBranches(repo)).toBe(name);
 
   // consecutive probes: a later allowed probe in the same repository cleans up only its own fixture and
   // leaves the earlier probe's foreign lock (and its metadata) alone
   const hook = join(repo, ".git", "hooks", "post-checkout");
   rmSync(hook);
-  const next = await probeCodexCommit(repo, async (p) => { writeFileSync(p.control, p.token); writeFileSync(p.lock, p.token); return "control=ok\nlock=ok\n"; });
+  const next = await probeCodexCommit(repo, async (p) => { commitAsProbe(p); writeFileSync(p.lock, p.token); return "control=ok\ncommit=ok\nhook=denied\nroot=denied\n"; });
   expect(next.status).toBe("allowed");
   expect(readdirSync(join(repo, ".git", "worktrees"))).toEqual([name]);
   expect(readFileSync(join(repo, ".git", "worktrees", name!, "index.lock"), "utf8")).toBe("foreign");
+  expect(probeBranches(repo)).toBe(name);
 
   // a post-checkout hook that writes a foreign lock and then FAILS `worktree add`: the lock path is known
   // before the add, so cleanup still sees the lock as foreign and keeps it

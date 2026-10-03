@@ -3259,7 +3259,8 @@ describe("B2 Fleet saves machine model choices to the user overlay", () => {
     const first = review();
     expect(first.path).toBe(userPath);
     expect(first.before).toBe(userBytes);
-    expect(first.notes ?? []).toEqual([]); // the repo overlay decides none of these keys
+    // the repo overlay decides none of these keys: no repo-shadowed note, only the future-loads note (T10)
+    expect(first.notes).toEqual(["the save changes future config loads only — a tickmarkr run already in progress keeps the config it loaded"]);
     expect(props.reloadGuard(first.after)).toBeNull();
 
     // malformed reviewed bytes: refused on y and at save, nothing lands
@@ -3390,10 +3391,12 @@ describe("B2 Fleet saves machine model choices to the user overlay", () => {
     expect(route(taskOf("implement"), cfg, channelsFromConfig("fake", cfg)).assignment).toMatchObject({ adapter: "fake", model: "fake-3" });
   });
 
-  test("a touched membership replaces the user's own repo-hidden deny, so discovery here and in a second repository admits exactly the saved fleet", async () => {
+  // T10 rewrite of this B2 row: the repository holds routing.deny.models, so the membership family's
+  // effective layer is the repo overlay — the save lands there, never as a user deny it shadows.
+  test("a touched membership the repository overlay holds lands in that overlay, so discovery here admits exactly the saved fleet while the user's own deny still decides a second repository", async () => {
     // the user denies fake-1; this repository's deny list replaces that list with fake-2
-    const { repo, globalDir } = b2Repo(`${fakeTiers(["fake-1", "fake-2", "fake-3"])}routing:\n  deny:\n    models: [fake:fake-1]\n`,
-      "routing:\n  deny:\n    models: [fake:fake-2]\n", { fake: ["fake-1", "fake-2", "fake-3"] });
+    const userBytes = `${fakeTiers(["fake-1", "fake-2", "fake-3"])}routing:\n  deny:\n    models: [fake:fake-1]\n`;
+    const { repo, globalDir, repoPath } = b2Repo(userBytes, "routing:\n  deny:\n    models: [fake:fake-2]\n", { fake: ["fake-1", "fake-2", "fake-3"] });
     const adapter = tiered(repo);
     const { props, commit, reviewOf } = await b2Editor(repo, [adapter], globalDir);
     expect(props.initialDenyModels).toEqual(["fake:fake-2"]);
@@ -3401,12 +3404,15 @@ describe("B2 Fleet saves machine model choices to the user overlay", () => {
       .map((c) => `${c.adapter}:${c.model}`);
     expect(admitted(repo)).toEqual(["fake:fake-1", "fake:fake-3"]);
 
-    // stage fake-3 out beside the repo's fake-2: the saved fleet is fake-1 alone, in every repository
+    // stage fake-3 out beside the repo's fake-2: the saved fleet here is fake-1 alone
     const staged = reviewOf({ denyModels: ["fake:fake-2", "fake:fake-3"] });
+    expect(staged.path).toBe(repoPath);
     expect(props.reloadGuard(staged.after)).toBeNull();
-    expect(commit({ kind: "write", review: staged })).toMatch(/^fleet: wrote /);
+    expect(commit({ kind: "write", review: staged })).toBe(`fleet: wrote ${repoPath}`);
+    expect(readFileSync(overlayFile(repo), "utf8")).toBe(userBytes);
     expect(admitted(repo)).toEqual(["fake:fake-1"]);
-    expect(admitted(makeRepo({ "keep.txt": "x" }))).toEqual(["fake:fake-1"]);
+    // a second repository has no repo overlay: the user's own deny (fake-1) still decides it
+    expect(admitted(makeRepo({ "keep.txt": "x" }))).toEqual(["fake:fake-2", "fake:fake-3"]);
   });
 
   test("shape rows rank the channel metadata a repository layer changed after assembly, equal to production routing over the reviewed bytes", async () => {

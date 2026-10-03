@@ -664,7 +664,8 @@ export async function init(argv: string[], cwd = process.cwd(), io: InitIO = {})
 
   // Act 1 — preferences. Only when the repo config does not exist yet: init never rewrites an
   // operator's config; re-tuning is `tickmarkr fleet` (act 3 below still runs). Act 1 writes only
-  // project execution preferences; model choices are act 3's, saved to the USER overlay (B2).
+  // project execution preferences; model choices are act 3's, saved by Fleet's one destination rule:
+  // the USER overlay (B2), except a membership edit the repo overlay holds (T10).
   if (!repoConfigExists) {
     if (interactive) {
       emitBanner();
@@ -706,7 +707,9 @@ export async function init(argv: string[], cwd = process.cwd(), io: InitIO = {})
   // Act 3 — fleet. The compact discovery surface prints BETWEEN the acts so the operator reads
   // what the fleet browser (and its presets overlay, raised on the first Shapes entry) ranks
   // with; the final summary then carries a pointer, not a repeat. Its confirmation is the shared
-  // Fleet actuator's: the reviewed choices land in the user overlay (gdir), never the repo's.
+  // Fleet actuator's: a preset (routing.mode) lands in the user overlay (gdir), and so does every
+  // choice except a routing.allow/deny membership edit this repo overlay holds — T10 writes that one
+  // where it is effective, and the review names the destination before y.
   if (interactive) {
     output.write(`${doc}\n`);
     doc = "discovery shown above — full matrix any time with `tickmarkr doctor`";

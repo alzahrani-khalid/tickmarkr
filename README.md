@@ -258,9 +258,13 @@ two-pane surface: the left rail lists views (**All models**, **Shapes**, **Steer
 installed agent CLI with its auth state and model count; the right pane is a searchable model list
 with tier, context, price, and probe-latency columns. `Space` allows/denies, `Enter` classifies an
 unclassified model (with a required benchmark-provenance note) or pins a classified one to a shape,
-`m` opens the routing-mode presets, and `w` renders the unified diff of your repo config overlay.
-Nothing is written until you confirm the diff with `y`; quitting leaves config unchanged. The
-Shapes view pins from a candidate picker ranked by the production router.
+`m` opens the routing-mode presets, and `w` renders the unified diff of the one overlay the save
+lands in, named in the review: an allow/deny membership edit goes to the layer that holds it (the
+repo overlay when it declares that family, else your user overlay), everything else to the user
+overlay; a batch needing both is refused — save each half in its own session. Nothing is written
+until you confirm with `y`. A worker-only deny on a partially excluded adapter takes two rail
+presses: out · all seats, then out · workers. The Shapes view pins from a candidate picker ranked by
+the production router.
 
 Routing-mode semantics, pin/floor/prefer precedence, review and consult steering syntax,
 provenance rules, and `--quality` / `--mode` flags are documented in

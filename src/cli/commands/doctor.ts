@@ -16,6 +16,7 @@ import { ORCA_FIXTURE_VERSION, parseEnvelope, resolveOrcaCliBinary } from "../..
 import type { WorkerAdapter } from "../../adapters/types.js";
 import { kimi, type KimiDoctorTurnResult, probeKimiDoctorTurn } from "../../adapters/kimi.js";
 import { type CodexSandbox, recordCodexCommit } from "../../adapters/codex-commit-check.js";
+import { codex } from "../../adapters/codex.js";
 import { denyPreferCollisionLine, denyPreferCollisions, disallowedBy, excludedChannels, exclusionLine, observedSeat, preferRanks } from "../../route/preference.js";
 import { CATALOG_REFRESH_TIMEOUT_MS, LIVEBENCH_TABLE_DATE, formatCatalogRefreshLegs, readCachedCatalog, refreshCatalogCommand, type CatalogFetcher, type CatalogReadResult } from "../../adapters/catalog-remote.js";
 import { sh, type ShResult } from "../../run/git.js";
@@ -742,7 +743,8 @@ export async function doctor(
     const h = health[a.id];
     // OBS-503: a crash-on-version verdict carries its reason in note — print it instead of the lie.
     const state = !h.installed ? (h.note ?? "not installed") : `${h.version ?? "installed"}${h.note ? ` (${h.note})` : ""}`;
-    const healthy = h.installed && (a.id !== kimi.id || h.authed);
+    // v2.6.6 T9 (K): a Codex sandbox escape is a BLOCKING security warning — never a passing row
+    const healthy = h.installed && (a.id !== kimi.id || h.authed) && !(a.id === codex.id && h.codexCommit === "escape");
     return alignedStatusRow(healthy ? "pass" : "fail", a.id, state);
   });
   const reviewDemotions = recentReviewDemotions(cwd);

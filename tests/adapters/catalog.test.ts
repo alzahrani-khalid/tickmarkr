@@ -368,7 +368,9 @@ test("the fable alias stamp reads claude-fable-5-1 with a dated comment and the 
     // 2026-09-05 (OBS-889): repinned when headless prompts moved to stdin and TUI fallback became explicit.
     // 2026-09-05 (OBS-930): repinned when the interactive form became the real TUI launch with the
     // prompt as the last positional (the argv-safe shape the claude adapter uses).
-    codex: "ac955b630139704f37697deefdb8c10424a4842ce747d168b03bc81be02d24ed",
+    // 2026-10-02 (v2.6.6 T9, K / D-912): repinned when both forms replaced the common-root grant with
+    // CODEX_GIT_GRANT's minimal linked roots (gitdir only when distinct, common objects/refs/logs).
+    codex: "b242b20148a7e21de4d8f1babca541c3880d57b7de2168c53962108b1f4b3d48",
     "cursor-agent": "b7ce2cbb18f5ccb2749739ffcc80c2d036b72193554189e4f07eff11ce16d8de",
     opencode: "15ce06482a58b5096642974bf4f9a1c3031b62b4aa4de46e6d8038f6cb94ad82",
     pi: "d8c6ab42a4052ee982ead3e119d02d4df8734429b36a129a9e926cf1c2f8c3b7",

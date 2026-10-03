@@ -35,9 +35,16 @@ const STEERING_KEYS: FleetSteeringKey[] = ["review", "consult"];
 
 // OBS-1099 add.1: one staged list per schema-enumerated deny scope, keyed as FleetEditable — a
 // scope the schema gains is carried here without a hand field (the command bridge copies it over).
+/** T10 (D-939): the routing.allow entry a classification staged this session excluded — the row's own
+ * entry in its ownAllow spelling, added to the staged complement so Space can admit it in-session.
+ * `model` is the classified id (the tiers key), `displayModel` the browser row it was staged from. */
+export type FleetSeededAllow = { adapter: string; model: string; displayModel: string; identity?: string; entry: string };
+
 export type FleetEditorState = Record<DenyScopeKey, string[]> & {
   /** OBS-1046: the staged routing.allow complement, distinct from the authored deny lists above */
   allowOut?: string[];
+  /** T10: one seed per staged classification the current allow form left out */
+  seededAllowOut?: FleetSeededAllow[];
   classifications: FleetClassification[];
   /** OBS-1182: staged launch effort per adapter → model; absent = the CLI's own default */
   efforts?: Record<string, Record<string, Effort>>;
@@ -51,7 +58,7 @@ export type FleetEditorState = Record<DenyScopeKey, string[]> & {
 
 /** T8: the staged classifications and efforts every preview folds — the same metadata a review stages,
  * so a preview ranks what w would write before the first review and after an escaped one. */
-export type FleetStagedMetadata = Pick<FleetEditorState, "classifications" | "efforts">;
+export type FleetStagedMetadata = Pick<FleetEditorState, "classifications" | "efforts" | "seededAllowOut">;
 
 /** OBS-525: auto reverts the shape's WHOLE routing declaration — pool included, not just the pin.
  * prefer survives: it biases auto routing and is valid without pin/pool. */
@@ -62,6 +69,8 @@ export function autoMapEntry(entry: MapEntry | undefined): MapEntry {
 
 export type FleetOverlayReview =
   | { kind: "empty" }
+  /** T10: a staged batch the one-destination review cannot write (mixed destinations, a stray seed) */
+  | { kind: "refused"; reason: string }
   | {
     kind: "diff";
     before: string;
@@ -187,7 +196,7 @@ function ledgerChannelId(line: string): string | undefined {
 type View = "models" | "shapes" | "steering";
 type DiffReview = Extract<FleetOverlayReview, { kind: "diff" }>;
 
-type ClassifyBulk = { adapter: string; vendor: string; rows: Array<{ model: string; suggestion: FleetModelSuggestion }> };
+type ClassifyBulk = { adapter: string; vendor: string; rows: Array<{ model: string; displayModel: string; suggestion: FleetModelSuggestion }> };
 
 /** OBS-530: `excludedNote` names the channels the picker CANNOT offer (staged out, denied,
  * unauthed, unclassified) — the picker's silence was indistinguishable from a bug. */
@@ -281,6 +290,8 @@ type ModelRow = {
   reasons: string[];
   /** a resolved alias no deny scope of the staged policy covers */
   uncoveredAlias: boolean;
+  /** T10: each reason's scope with the overlay `path:line` that holds it (the file w writes) */
+  held: string[];
   covering?: Covering;
 };
 
@@ -306,6 +317,8 @@ type Ui = {
   lastEdit: { id: string; text: string } | null;
   /** OBS-1046: channels routing.allow leaves out — a reason of its own, never merged into deny */
   allowOut: Set<string>;
+  /** T10: the allow entries staged classifications seeded into allowOut */
+  seededAllowOut: FleetSeededAllow[];
   classifications: FleetClassification[];
   efforts: Record<string, Record<string, Effort>>;
   selectedMode: RoutingMode;
@@ -339,6 +352,7 @@ export function FleetApp({
   reviewOverlay,
   reloadGuard,
   stagedRouting,
+  holderOf,
   entry = "probe",
   initialJudge = "",
   judgeSeats = [],
@@ -375,7 +389,9 @@ export function FleetApp({
   reloadGuard: (bytes: string) => string | null;
   /** the routing policy the staged deny sets load as (fleet: the config loader over the candidate
    * bytes); absent ⇒ the four staged sets alone, with no allowlist */
-  stagedRouting?: (deny: FleetStagedDeny) => FleetStagedRouting;
+  stagedRouting?: (deny: FleetStagedDeny, stage?: FleetStagedMetadata) => FleetStagedRouting;
+  /** T10: the overlay `path:line` holding a dotted config scope in this repository, undefined = defaults */
+  holderOf?: (dotted: string) => string | undefined;
   // "presets" is init's entry point: the browser still opens on the models view (fleet scoping
   // first), but Esc is HOME to the routing-preset overlay instead of quit; Enter on a preset
   // there goes straight to the review diff, custom closes back into the browser.
@@ -414,6 +430,7 @@ export function FleetApp({
     notice: "",
     lastEdit: null,
     allowOut: new Set(initialAllowOut),
+    seededAllowOut: [],
     ...(Object.fromEntries(DENY_SCOPES.map((scope) => [scope.key, new Set(initialDeny[scope.key])])) as Record<DenyScopeKey, Set<string>>),
     classifications: [],
     efforts: structuredClone(initialEfforts),
@@ -476,12 +493,13 @@ export function FleetApp({
   let routingMemo: { key: string; policy: FleetStagedRouting } | null = null;
   const stagedPolicy = (): FleetStagedRouting => {
     const deny = stagedDeny();
-    const key = JSON.stringify(deny);
+    const stage = stagedMetadata();
+    const key = JSON.stringify([deny, stage]);
     if (routingMemo?.key !== key) {
       routingMemo = {
         key,
         policy: stagedRouting
-          ? stagedRouting(deny)
+          ? stagedRouting(deny, stage)
           : { ok: true, routing: { deny: denyBlockFrom(denyLists()) } as TickmarkrConfig["routing"] },
       };
     }
@@ -498,9 +516,9 @@ export function FleetApp({
         .map((entry) => ({ scope: scope.dotted, path: scope.dotted, configPath: scope.dotted, entry, by: "deny" as const }))),
     ...exclusionCollector(channel, routing, role).filter((found) => found.by === "allow"),
   ];
-  const reachFor = (adapter: string, model: string, identity?: string): Pick<ModelRow, "reach" | "reasons" | "uncoveredAlias"> => {
+  const reachFor = (adapter: string, model: string, identity?: string): Pick<ModelRow, "reach" | "reasons" | "uncoveredAlias" | "held"> => {
     const policy = stagedPolicy();
-    if (!policy.ok) return { reach: "unknown", reasons: [`preview unavailable (${policy.error})`], uncoveredAlias: false };
+    if (!policy.ok) return { reach: "unknown", reasons: [`preview unavailable (${policy.error})`], uncoveredAlias: false, held: [] };
     const channel = { adapter, model, ...(identity !== undefined ? { identity } : {}) };
     const worker = exclusionsOf(channel, policy.routing, "worker");
     const allSeats = exclusionsOf(channel, policy.routing, "judge");
@@ -512,6 +530,10 @@ export function FleetApp({
       reach,
       reasons: worker.map(exclusionReason),
       uncoveredAlias: identity !== undefined && !worker.some((scope) => scope.by === "deny"),
+      held: [...new Set(worker.map((scope) => scope.configPath))].flatMap((dotted) => {
+        const holder = holderOf?.(dotted);
+        return holder === undefined ? [] : [`${dotted} @ ${holder}`];
+      }),
     };
   };
 
@@ -725,13 +747,14 @@ export function FleetApp({
 
   // T8: the previews fold the CURRENT staged metadata — never only what the last review saw
   const stagedMetadata = (): FleetStagedMetadata => {
-    const { classifications, efforts } = editorState();
-    return { classifications, efforts };
+    const { classifications, efforts, seededAllowOut } = editorState();
+    return { classifications, efforts, seededAllowOut };
   };
 
   const editorState = (): FleetEditorState => ({
     ...denyLists(),
     allowOut: [...ui.allowOut].sort(),
+    seededAllowOut: structuredClone(ui.seededAllowOut),
     classifications: ui.classifications.map((classification) =>
       classification.vendor && classification.channel
         ? {
@@ -780,14 +803,41 @@ export function FleetApp({
       finish({ kind: "no-changes" });
       return;
     }
+    if (nextReview.kind === "refused") {
+      ui.notice = `w refused — ${nextReview.reason}`;
+      bump();
+      return;
+    }
     setOverlay({ kind: "review", review: nextReview, scroll: 0 });
+  };
+
+  // T10 (D-925/D-939): a model the current allow form leaves out gets its OWN allow entry staged beside
+  // its classification — the ownAllow spelling Space clears — so it can be admitted in this session.
+  // Re-staging a classification replaces its seed; a row the allow form admits seeds nothing. A row a
+  // flat deny ALSO excludes still seeds, so successive owning lifts (deny, then allow) admit it.
+  const seedAllow = (adapter: string, model: string, displayModel: string) => {
+    // ponytail: a collapsed variant row's allow entry would name no channel (its display name is not the real
+    // model), so it is not seeded for same-session admission — classify, save, then admit next session;
+    // full grouped-row membership (collapse + catalog fold) is 2.6.7 (T10 owed review F1, D-1016)
+    if (model !== displayModel) return;
+    const identity = groupOf(adapter)?.rows.find((row) => row.model === displayModel)?.evidence?.identity;
+    const self = { adapter, model: displayModel, ...(identity !== undefined ? { identity } : {}) };
+    const policy = stagedPolicy();
+    if (!policy.ok || !exclusionsOf(self, policy.routing, "judge").some((scope) => scope.by === "allow")) return;
+    const entry = selectOwn(ui.allowOut, self) ?? `${adapter}:${displayModel}`;
+    ui.allowOut = new Set([...ui.allowOut, entry]);
+    ui.seededAllowOut = [
+      ...ui.seededAllowOut.filter((seed) => seed.adapter !== adapter || seed.model !== model),
+      { adapter, model, displayModel, ...(identity !== undefined ? { identity } : {}), entry },
+    ];
   };
 
   const stageSuggested = (
     adapter: string,
-    rows: Array<{ model: string; suggestion: FleetModelSuggestion }>,
+    rows: Array<{ model: string; displayModel: string; suggestion: FleetModelSuggestion }>,
     firstTouch?: { vendor: string; channel: "sub" | "api" },
   ) => {
+    for (const row of rows) seedAllow(adapter, row.model, row.displayModel);
     ui.classifications = [
       ...ui.classifications,
       ...rows.map((row) => ({
@@ -844,6 +894,7 @@ export function FleetApp({
 
   const applyClassification = (overlay: Extract<Overlay, { kind: "classify" }>) => {
     const answered = overlay.vendor ? ui.channelByAdapter[overlay.adapter] : undefined;
+    seedAllow(overlay.adapter, overlay.model, overlay.displayModel ?? overlay.model);
     ui.classifications = [
       ...ui.classifications,
       {
@@ -1908,7 +1959,7 @@ export function FleetApp({
         const suggested = rows
           .filter((candidate): candidate is ModelRow & { suggestion: FleetModelSuggestion } =>
             candidate.adapter === group.adapter && !candidate.tier && candidate.suggestion !== undefined)
-          .map((candidate) => ({ model: candidate.classifyModel ?? candidate.model, suggestion: candidate.suggestion }));
+          .map((candidate) => ({ model: candidate.classifyModel ?? candidate.model, displayModel: candidate.model, suggestion: candidate.suggestion }));
         if (!suggested.length) {
           ui.notice = "no catalog tier suggestions among the visible unclassified models — evidence comes from the cached catalogs (AA index / API pricing)";
           bump();
@@ -2039,7 +2090,8 @@ export function FleetApp({
   // config path and matching entry (an unauthed row instead points at the doctor re-probe).
   const reachDetail = (row: ModelRow): string => {
     if (row.evidence?.unauthed !== undefined) return "unauthed — re-probe with tickmarkr doctor (Space does not toggle reach)";
-    const reasons = row.reasons.join("; ");
+    // T10: the reasons, then where each scope is held — the overlay a reviewed w writes
+    const reasons = `${row.reasons.join("; ")}${row.held.length ? ` — held: ${row.held.join("; ")}` : ""}`;
     if (row.reach === "out-all") return `reach: out · all seats — ${reasons} — Space picks in or out · workers`;
     if (row.reach === "out-allow") return `reach: out · all seats · allow — ${reasons} — Space picks in or out · workers`;
     if (row.reach === "out-workers") return `reach: out · workers only (judge/review/consult unaffected) — ${reasons} — Space picks in or out · all seats`;
@@ -2573,8 +2625,8 @@ export function FleetApp({
         if (row.covering) lines.push(coveringDetail(row));
         if (!row.tier) {
           lines.push(row.suggestion
-            ? `catalog suggests ${row.suggestion.tier} — Space/Enter classifies with the note pre-typed · s stages every visible suggestion`
-            : "unclassified — Space/Enter classifies; unclassified models are never routed");
+            ? `catalog suggests ${row.suggestion.tier} — Space/Enter classifies with the note pre-typed (t too) · s stages every visible suggestion`
+            : "unclassified — Space/Enter classifies (t too), then Space sets its reach in this session; unclassified models are never routed");
         }
       }
       return lines;
@@ -2738,6 +2790,7 @@ export async function runFleetInkEditor({
   reviewOverlay,
   reloadGuard,
   stagedRouting,
+  holderOf,
   entry = "probe",
   initialJudge = "",
   judgeSeats = [],
@@ -2776,7 +2829,9 @@ export async function runFleetInkEditor({
   reloadGuard: (bytes: string) => string | null;
   /** the routing policy the staged deny sets load as (fleet: the config loader over the candidate
    * bytes); absent ⇒ the four staged sets alone, with no allowlist */
-  stagedRouting?: (deny: FleetStagedDeny) => FleetStagedRouting;
+  stagedRouting?: (deny: FleetStagedDeny, stage?: FleetStagedMetadata) => FleetStagedRouting;
+  /** T10: the overlay `path:line` holding a dotted config scope in this repository, undefined = defaults */
+  holderOf?: (dotted: string) => string | undefined;
   /** "presets" = init's entry: Esc in the browser is HOME to the preset overlay, not quit */
   entry?: "presets" | "probe";
   initialJudge?: string;
@@ -2829,6 +2884,7 @@ export async function runFleetInkEditor({
       reviewOverlay={reviewOverlay}
       reloadGuard={reloadGuard}
       stagedRouting={stagedRouting}
+      holderOf={holderOf}
       entry={entry}
       initialJudge={initialJudge}
       judgeSeats={judgeSeats}

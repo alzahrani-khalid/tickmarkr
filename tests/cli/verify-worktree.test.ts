@@ -473,6 +473,39 @@ test("verify record excludes both contributing authors by stable patch ownership
   expect(discharge.data).toMatchObject({ reviewer: { key: "fake:fake-2", vendor: "fake-b" }, authorChannels: [{ key: "fake:fake-1", vendor: "fake-a" }] });
 }, 240_000);
 
+test("test: production verify preserves recorded owed-check author exclusions when explicit author claims name an outside-pool installed identity while an undiscoverable identity refuses before baseline capture", async () => {
+  const { repo, git: g } = owedRepo();
+  // codex:gpt-6.1-sol is installed and doctor-listed but unseeded, so it is no review channel (G, D-874).
+  writeDoctor(repo, { ...FAKE_DOCTOR, codex: { installed: true, authed: true, models: ["gpt-6.1-sol"], modelsDetectedAt: "2026-10-02T00:00:00.000Z" } });
+  const counter = join(makeTestTempDir("tickmarkr-owed-claim-"), "captures");
+  appendFileSync(join(repo, ".tickmarkr", "config.yaml"), `gates:\n  build: "printf x >> '${counter}'"\n`);
+  g("branch -f tickmarkr/run-claim main");
+  g("checkout -q -B tickmarkr/run-claim--T1 main");
+  const journal = Journal.create(repo, "run-claim");
+  journal.append("run-start", undefined, {});
+  journal.append("task-dispatch", "T1", dispatchRow("fake-1"));
+  journal.append("worker-launch", "T1", {});
+  commitFile(repo, "a\nclaim\n", "claim");
+  g("checkout -q main");
+  const owed = await parkAndWaive(repo, "run-claim", journal);
+  expect(owed).toMatchObject({ known: true, authors: ["fake:fake-1"] });
+  g(`checkout -q --detach ${owed.head}`);
+  const record = (claim: string) => verify(["--task", "T1", "--no-acceptance", "--author", claim, "--record", "run-claim"], repo);
+
+  // Undiscoverable: refused by name before the merge-base is captured, and the check stays owed.
+  await expect(record("codex:gpt-9-nova")).rejects.toThrow("--author codex:gpt-9-nova does not name a discoverable author identity");
+  expect(existsSync(counter)).toBe(false);
+  expect(foldOwedChecks(journal.read(), repo)).toMatchObject({ known: true, debt: 1, outstanding: [{ id: owed.id }] });
+
+  // An outside-pool openai claim would leave fake-1 seatable; the recorded author still binds, so fake-2 reviews.
+  const result = await record("codex:gpt-6.1-sol");
+  expect(result.code, result.out).toBe(0);
+  expect(readFileSync(counter, "utf8")).not.toBe("");
+  expect(result.out).toContain("owed checks for run-claim: debt 0");
+  const discharge = journal.read().find((e) => e.event === "owed-check-discharged")!;
+  expect(discharge.data).toMatchObject({ reviewer: { key: "fake:fake-2", vendor: "fake-b" }, authorChannels: [{ key: "fake:fake-1", vendor: "fake-a" }] });
+}, 120_000);
+
 test("approve waive followed by runDaemon restart persists exactly one accepted-risk obligation in the run-end row across carried replay or findings resets; verify record returns exit 0 debt 0 for validated proof versus exit 2 unknown debt for legacy missing or malformed evidence; accepted-risk history survives discharge", async () => {
   const { repo, fake } = setupRepo([T("T1", { files: ["*.txt"] })], {
     judge: { pass: false, criteria: [{ criterion: "c1", met: false, reason: "operator override required" }] },

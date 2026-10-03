@@ -1,3 +1,4 @@
+// Default runtime advisory pin is 1.4.218; historical 1.4.195 transport captures below stay historical.
 import { execFileSync, spawn } from "node:child_process";
 import { existsSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
@@ -860,7 +861,8 @@ export function withheldProofExec(
  * with its next cursor missing or repeating the one asked for; with `cursorless`, the anchor answers
  * without its oldestCursor (and its `truncated` flag says whether it is the whole scrollback). With
  * `malform`, every read (cursor pages only, with `pagesOnly`) answers a malformed tail: missing, a
- * string instead of an array, or rows that are objects instead of strings.
+ * string instead of an array, or rows that are objects instead of strings. With `omitFlags` (F, D-832),
+ * every read answers with those paging flags omitted — its tail and cursors untouched.
  * `onRead` sees every read as issued.
  */
 export function pacedReadExec(
@@ -869,6 +871,7 @@ export function pacedReadExec(
   opts: {
     readMs: number; honor?: boolean; failCursor?: number; failUntil?: number; stall?: "missing" | "repeat"; cursorless?: boolean;
     malform?: { shape: "missing" | "non-array" | "non-string"; pagesOnly?: boolean };
+    omitFlags?: readonly ("limited" | "truncated")[];
     onRead?: (read: { at: number; timeoutMs?: number; cut: boolean }) => void;
   },
 ): OrcaExec {
@@ -884,10 +887,11 @@ export function pacedReadExec(
     if (cut) return { code: 137, signalExit: true, stdout: "", stderr: "", timedOut: true };
     const r = await exec(args, cwd, timeoutMs);
     const malform = opts.malform !== undefined && (cursor !== undefined || !opts.malform.pagesOnly) ? opts.malform.shape : undefined;
-    const rewrite = malform !== undefined || (cursor === undefined ? opts.cursorless : opts.stall !== undefined);
+    const rewrite = malform !== undefined || (opts.omitFlags?.length ?? 0) > 0 || (cursor === undefined ? opts.cursorless : opts.stall !== undefined);
     if (!rewrite || r.code !== 0) return r;
     const env = JSON.parse(r.stdout) as { result: { terminal: Record<string, unknown> } };
     const term = { ...env.result.terminal };
+    for (const flag of opts.omitFlags ?? []) delete term[flag];
     const rows = term.tail as string[];
     if (malform === "missing") delete term.tail;
     else if (malform === "non-array") term.tail = rows.join("\n");

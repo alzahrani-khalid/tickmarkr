@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import { DEFAULT_CONFIG } from "../../src/config/config.js";
 import { claudeCode } from "../../src/adapters/claude-code.js";
-import { codex, codexMcpSuppressionFlags } from "../../src/adapters/codex.js";
+import { CODEX_GIT_GRANT, codex, codexMcpSuppressionFlags } from "../../src/adapters/codex.js";
 import { cursorAgent } from "../../src/adapters/cursor-agent.js";
 import { grok } from "../../src/adapters/grok.js";
 import { kimi } from "../../src/adapters/kimi.js";
@@ -64,10 +64,13 @@ describe("real adapters", () => {
     expect(cxInteractive).toMatch(/^codex -a never -s workspace-write --dangerously-bypass-hook-trust /);
     expect(cxInteractive).toContain(`-c 'mcp_servers={}'`);
     expect(cxInteractive).toContain("--disable plugins");
-    expect(cxInteractive).toContain('sandbox_workspace_write.writable_roots=[\\"$(git rev-parse --path-format=absolute --git-common-dir)\\"]');
+    // v2.6.6 T9 (K): both forms carry the one minimal git grant fragment, never the shipped common-root grant
+    expect(cxInteractive).toContain(CODEX_GIT_GRANT);
+    expect(cxInteractive).not.toContain('writable_roots=[\\"$(git rev-parse --path-format=absolute --git-common-dir)\\"]');
     expect(cxInteractive).toMatch(/--model 'gpt-5.2' "\$\(cat '\/p'\)"$/);
     expect(cxInteractive).not.toContain(" exec ");
-    expect(cxHeadless).toContain('sandbox_workspace_write.writable_roots=[\\"$(git rev-parse --path-format=absolute --git-common-dir)\\"]');
+    expect(cxHeadless).toContain(CODEX_GIT_GRANT);
+    expect(cxHeadless).not.toContain('writable_roots=[\\"$(git rev-parse --path-format=absolute --git-common-dir)\\"]');
     expect(cxHeadless).not.toContain("--full-auto");
     // OBS-125: codex 0.144.x per-worktree "Hooks need review" gate — bypass hook trust so the operator's
     // own trusted hooks run without stalling; the workspace-write sandbox stays (NOT the sandbox bypass).

@@ -88,6 +88,22 @@ describe("T5 fleet documentation split", () => {
   });
 });
 
+describe("v2.6.6 L fleet save destinations", () => {
+  test("the fleet docs name where a save lands, the separate-session refusal, and the two-press worker deny without claiming universal byte preservation", () => {
+    const doc = readFileSync(fleetAdvancedPath, "utf8");
+    expect(doc).toMatch(/## Where a fleet save lands/);
+    expect(doc).toMatch(/repo overlay[\s\S]*declares any of those leaves/);
+    expect(doc).toMatch(/each `routing\.deny\.workers\.\*` leaf follows its own holder/);
+    expect(doc).toMatch(/separate sessions/);
+    expect(doc).toMatch(/Press out · all seats on the rail, then out · workers/);
+    expect(doc).toMatch(/never reaches the review or the file/);
+    expect(doc).toMatch(/comma spacing/);
+    const section = readmeFleetSection();
+    expect(section).toMatch(/out · all seats, then out · workers/);
+    expect(section).toMatch(/membership edit goes to the layer that holds it/);
+  });
+});
+
 describe("T7 routing precedence documentation", () => {
   test("the routing precedence documentation states floors filter channel eligibility before preference ordering applies", () => {
     const doc = readFileSync(fleetAdvancedPath, "utf8");

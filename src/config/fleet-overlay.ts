@@ -1,6 +1,6 @@
 // Fleet-overlay mutation, serialization, and diff rendering for the `tickmarkr fleet` write path.
-import { type Alias, type Node as YamlNode, isAlias, isMap, isNode, isScalar, isSeq, parseDocument, stringify, visit } from "yaml";
-import { DENY_SCOPES, type DenyScope, type FleetEditable, type FleetUniverseRow, type LowerLayerModelOverrides, type MapEntry, type RoutingMode, type Tier, universeCovers, universeEntryMatches } from "./config.js";
+import { type Alias, type Node as YamlNode, isAlias, isCollection, isMap, isNode, isScalar, isSeq, parseDocument, stringify, visit } from "yaml";
+import { ConfigError, DENY_SCOPES, type DenyScope, type FleetEditable, type FleetUniverseRow, type LowerLayerModelOverrides, type MapEntry, type RoutingMode, type Tier, universeCovers, universeEntryMatches } from "./config.js";
 
 // OBS-1099 add.1: the writer ranges over the schema-derived scopes. The flat (all-seats) scopes
 // take part in the membership/allow-form write; every nested scope (routing.deny.workers.*) is a
@@ -46,6 +46,13 @@ type FleetOverlayWriteFields = {
   // deepMerge prunes it before schema validation, so Auto masks the inherited pin instead of
   // revealing it, and MapEntry itself never carries null. Absent ⇒ a cleared pin is deleted.
   lowerMap?: Record<string, MapEntry>;
+  // T10: the effective routing.allow before the write — an authored entry the universe does not cover
+  // (an unserved or unprobed channel) is admitted on purpose and rides the regenerated form verbatim.
+  preservedAllow?: { adapters?: string[]; models?: string[] };
+  // T10: the routing.allow a layer below the destination declares — "whole fleet in" masks it with
+  // `allow: null`, and an empty generated leaf masks that layer's own leaf with `null`, instead of
+  // deleting the key and resurrecting the lower restriction.
+  lowerAllow?: { adapters?: string[]; models?: string[] };
 };
 
 // OBS-1188: only a write whose editables provably carry no efforts keeps the pre-effort contract.
@@ -111,9 +118,13 @@ function residualDeny(
 // list keeps its node. A staged entry the allow form cannot express as a membership key (outside the
 // probe universe, or a bare-model/identity spelling) is written verbatim too; canonical keys the
 // session added ride the allow form alone.
+// T10 (D-973): read as the loader reads these bytes (readYaml parses with yaml's defaults, as toJS does
+// here) — aliases at the leaf, its items and every ancestor resolve, and `<<` merges only in a document
+// whose YAML version merges — so an aliased list's entries are authored entries too.
 function authoredEntries(doc: OverlayDocument, path: OverlayPath): string[] {
-  const node = doc.getIn(path, true);
-  return isSeq(node) ? node.items.flatMap((item) => (isScalar(item) ? [String(item.value)] : [])) : [];
+  const value = path.reduce<unknown>((node, key) =>
+    (node !== null && typeof node === "object" ? (node as Record<string, unknown>)[key] : undefined), doc.toJS());
+  return Array.isArray(value) ? value.flatMap((item) => (item === null || typeof item !== "object" ? [String(item)] : [])) : [];
 }
 
 function flatDenyAfterWrite(
@@ -175,8 +186,10 @@ function setScalarPreservingComment(
   authoredComment?: string,
 ): void {
   const existing = doc.getIn(path, true);
-  if (isScalar(existing)) existing.value = value;
-  else setAt(doc, path, doc.createNode(value));
+  if (isScalar(existing)) {
+    releaseAnchors(doc, path);
+    existing.value = value;
+  } else setAt(doc, path, doc.createNode(value));
   if (authoredComment !== undefined) {
     const written = doc.getIn(path, true);
     if (isScalar(written)) written.comment = ` ${authoredComment}`;
@@ -210,6 +223,9 @@ function setStringSequencePreservingComments(
     setAt(doc, path, doc.createNode(values));
     return;
   }
+  // T10 owed review F2: an unchanged list is not edited, so its anchor and every alias keep their bytes
+  if (existing.items.length === values.length && existing.items.every((item, at) => isScalar(item) && String(item.value) === values[at])) return;
+  releaseAnchors(doc, path); // an anchored list is edited in place: its other aliases keep the original
   const available = [...existing.items];
   existing.items = values.map((value) => {
     const at = available.findIndex((item) => isScalar(item) && String(item.value) === value);
@@ -236,6 +252,28 @@ function materializeAliases(doc: OverlayDocument, path: OverlayPath): void {
     if (target === undefined) return;
     doc.setIn(path.slice(0, depth), detachedCopy(doc, node, target, new Set()));
   }
+}
+
+// T10 (D-973): a write mutates every ancestor on its path and edits or replaces the leaf with all it
+// holds; any of those nodes may be an anchor other aliases share. Each such alias first becomes a
+// detached copy of what it resolved to, so the write never changes another consumer's value nor
+// leaves its alias dangling.
+function releaseAnchors(doc: OverlayDocument, path: OverlayPath): void {
+  const held = new Set<YamlNode>();
+  for (let depth = 1; depth <= path.length; depth++) {
+    const node = doc.getIn(path.slice(0, depth), true);
+    if (!isNode(node)) break;
+    for (const inner of depth < path.length ? [node] : nodesOf(node)) {
+      if (!isAlias(inner) && inner.anchor) held.add(inner);
+    }
+  }
+  if (!held.size) return;
+  visit(doc, {
+    Alias: (_key, alias) => {
+      const target = alias.resolve(doc) as YamlNode | undefined;
+      return target !== undefined && held.has(target) ? detachedCopy(doc, alias, target, new Set()) : undefined;
+    },
+  });
 }
 
 const nodesOf = (root: YamlNode): YamlNode[] => {
@@ -289,25 +327,54 @@ function deleteAt(doc: OverlayDocument, path: OverlayPath): void {
     if (!isMap(doc.getIn(path.slice(0, depth), true))) return;
   }
   // deleteIn throws on an empty document — only delete keys that exist.
-  if (doc.getIn(path) !== undefined) doc.deleteIn(path);
+  if (doc.getIn(path) === undefined) return;
+  releaseAnchors(doc, path);
+  doc.deleteIn(path);
 }
 
 function setAt(doc: OverlayDocument, path: OverlayPath, value: unknown): void {
   materializeAliases(doc, path); // edit a copy of an aliased mapping, never drop what it resolved to
+  releaseAnchors(doc, path);
   for (let depth = 1; depth < path.length; depth++) {
     const node = doc.getIn(path.slice(0, depth), true);
     if (node === undefined) break;
     if (!isMap(node)) {
-      doc.deleteIn(path.slice(0, depth));
+      const prefix = path.slice(0, depth);
+      doc.deleteIn(prefix);
+      // T10: a null mask over membership lists stays a mask for every deny leaf — and the routing.allow
+      // block — this write does not set, so materializing one leaf never resurrects a lower layer's
+      // other deny lists or its allow form (judge/review/consult reach)
+      if (isScalar(node) && node.value === null) {
+        const under = (inner: readonly string[], outer: readonly string[]) => outer.every((key, at) => inner[at] === key);
+        for (const masked of [...DENY_SCOPES.map((scope) => scope.path), ["routing", "allow"]]) {
+          if (under(masked, prefix) && !under(masked, path) && !under(path, masked)) doc.setIn(masked, doc.createNode(null));
+        }
+      }
       break;
     }
   }
   doc.setIn(path, value);
 }
 
+// T10 (D-987): Fleet writes through no YAML merge key — a membership write whose edited path (the edited
+// leaf or any map above it) takes keys through `<<` is refused, fail-closed, so nothing is published.
+function refuseMerge(doc: OverlayDocument, priorBytes: string, path: OverlayPath): void {
+  let node: unknown = doc.contents;
+  for (let depth = 0; depth <= path.length && isMap(node); depth++) {
+    const merge = node.items.find((item) => isScalar(item.key) && typeof item.key.value === "symbol");
+    if (merge) {
+      const range = isNode(merge.value) ? merge.value.range : undefined;
+      const shape = range ? priorBytes.slice(range[0], range[1]).trim().replace(/\s+/g, " ") : "…";
+      throw new ConfigError(`${path.join(".")} takes keys through the YAML merge key \`<<: ${shape}\` in ${path.slice(0, depth).join(".") || "the document root"} — Fleet does not write through merge keys; inline the merged keys there by hand, then save again`);
+    }
+    node = depth < path.length ? node.get(path[depth], true) : undefined;
+    if (isAlias(node)) node = node.resolve(doc);
+  }
+}
+
 function deleteEmptyMap(doc: OverlayDocument, path: OverlayPath): void {
   const node = doc.getIn(path, true);
-  if (isMap(node) && node.items.length === 0) doc.deleteIn(path);
+  if (isMap(node) && node.items.length === 0) deleteAt(doc, path);
 }
 
 /** Apply only fields fleet authored to the parsed YAML document. Untouched nodes retain their
@@ -325,29 +392,55 @@ export function renderFleetOverlayWrite(priorBytes: string, write: FleetOverlayW
   const flatChanged = new Map(FLAT_DENY_SCOPES.map((scope) => [scope.key, changed(...listsOf(write, scope))]));
   if ([...flatChanged.values()].some(Boolean) || changed(initial.allowOut, edited.allowOut)) {
     if (write.universe) {
+      refuseMerge(doc, priorBytes, ["routing", "allow"]);
       // Membership write: the allow form IS the fleet; deny adapters/models scopes are tombstoned
       // so a lower layer can never re-exclude behind the operator's back (workers untouched).
       const form = allowFormFromExclusions(write.universe, edited);
+      const universe = write.universe;
+      const known = (entry: string) => universe.some((row) =>
+        entry === row.adapter || row.models.some((m) => universeEntryMatches(row, m, entry)));
+      const retainedAll: string[] = [];
+      for (const leaf of ["adapters", "models"] as const) {
+        const retained = [...(write.preservedAllow?.[leaf] ?? []), ...authoredEntries(doc, ["routing", "allow", leaf])]
+          .filter((entry) => !known(entry));
+        if (!retained.length) continue;
+        retainedAll.push(...retained);
+        form[leaf] = sortedUnique([...form[leaf], ...retained]);
+        form.excluded = true;
+      }
+      // T10 review: a retained allow entry admits a channel the allow form cannot see, so a staged flat
+      // deny covering it stays in deny verbatim — folded into the allow form alone, the retained entry
+      // would re-admit what the operator just excluded (rail out · all over an unprobed fake:U).
+      // Either allow leaf admits a bare model (routing matches both leaves alike), so coverage never
+      // depends on which leaf retained the entry.
+      // ponytail: a bare retained entry's adapter is unknown, so any discovered adapter id covers it;
+      // an identity alias of an unprobed channel is unknowable and is matched by spelling only.
+      const coversRetained = (entry: string) => retainedAll.some((kept) => {
+        const colon = kept.indexOf(":");
+        if (colon !== -1) {
+          const model = kept.slice(colon + 1);
+          return universeEntryMatches({ adapter: kept.slice(0, colon), models: [model] }, model, entry);
+        }
+        return entry === kept || universe.some((row) => row.adapter === entry);
+      });
       if (form.excluded) {
         const allowNode = doc.getIn(["routing", "allow"], true);
-        if (allowNode !== undefined && !isMap(allowNode)) doc.deleteIn(["routing", "allow"]);
-        if (form.adapters.length) {
-          setStringSequencePreservingComments(doc, ["routing", "allow", "adapters"], form.adapters);
-        } else {
-          deleteAt(doc, ["routing", "allow", "adapters"]);
-        }
-        if (form.models.length) {
-          setStringSequencePreservingComments(doc, ["routing", "allow", "models"], form.models);
-        } else {
-          deleteAt(doc, ["routing", "allow", "models"]);
+        if (allowNode !== undefined && !isMap(allowNode)) deleteAt(doc, ["routing", "allow"]);
+        for (const leaf of ["adapters", "models"] as const) {
+          const path = ["routing", "allow", leaf];
+          if (form[leaf].length) setStringSequencePreservingComments(doc, path, form[leaf]);
+          else if (write.lowerAllow?.[leaf] != null) setStringSequencePreservingComments(doc, path, null);
+          else deleteAt(doc, path);
         }
         // Whole fleet out: allow stays present but empty — fail-closed, nothing admitted.
         if (doc.getIn(["routing", "allow"]) === undefined) {
           setAt(doc, ["routing", "allow"], doc.createNode({}));
         }
       } else {
-        // Whole fleet in: no restriction to express — the allow block goes away entirely.
-        deleteAt(doc, ["routing", "allow"]);
+        // Whole fleet in: no restriction to express — the allow block goes away entirely, or is
+        // masked when a lower layer's allow would otherwise come back (T10 A/B resurrection).
+        if (write.lowerAllow) setAt(doc, ["routing", "allow"], doc.createNode(null));
+        else deleteAt(doc, ["routing", "allow"]);
       }
       // Authored and non-canonical entries stay in deny (LEG2-T3 finding 4, round 2 finding 2).
       // OBS-1046: only an EDITED scope is rewritten, and only when its bytes must change — an
@@ -367,7 +460,8 @@ export function renderFleetOverlayWrite(priorBytes: string, write: FleetOverlayW
         const authored = authoredEntries(doc, path);
         const stale = authored.some((entry) => admitted.includes(entry));
         if (!touched && !stale) continue;
-        const remaining = flatDenyAfterWrite(doc, path, after, write.universe);
+        refuseMerge(doc, priorBytes, path);
+        const remaining = [...new Set([...flatDenyAfterWrite(doc, path, after, write.universe), ...after.filter(coversRetained)])];
         if (remaining.length) {
           if (remaining.join("\n") !== authored.join("\n")) setStringSequencePreservingComments(doc, path, remaining);
         } else if (stale || before.some((entry) => !after.includes(entry))) {
@@ -377,6 +471,7 @@ export function renderFleetOverlayWrite(priorBytes: string, write: FleetOverlayW
     } else {
       for (const scope of FLAT_DENY_SCOPES) {
         if (!flatChanged.get(scope.key)) continue;
+        refuseMerge(doc, priorBytes, scope.path);
         const after = edited[scope.key] ?? [];
         setStringSequencePreservingComments(doc, scope.path, after.length ? sortedUnique(after) : null);
       }
@@ -391,6 +486,7 @@ export function renderFleetOverlayWrite(priorBytes: string, write: FleetOverlayW
   for (const scope of nestedDenyScopes()) {
     const [before, after] = listsOf(write, scope);
     if (!changed(before, after)) continue;
+    refuseMerge(doc, priorBytes, scope.path);
     setStringSequencePreservingComments(doc, scope.path, after.length ? sortedUnique(after) : null);
   }
 
@@ -564,8 +660,9 @@ export function renderFleetOverlayWrite(priorBytes: string, write: FleetOverlayW
   // byte-identical to yaml's own stringifyComment. OBS-1046: a scalar parsed from the prior bytes
   // keeps the exact whitespace it had before its hash sign (yaml itself emits one space, so the
   // sentinel carries the rest); only a comment fleet authored gets the two-space style.
+  // T10 (D-936): a flow collection's trailing note (`[codex]  # c`) is inline too, so it keeps its gap.
   visit(doc, (_key, node) => {
-    if (isScalar(node) && typeof node.comment === "string" && !node.comment.includes("\n")) {
+    if ((isScalar(node) || (isCollection(node) && node.flow)) && typeof node.comment === "string" && !node.comment.includes("\n")) {
       const tail = node.range ? priorBytes.slice(node.range[1], node.range[2]) : "";
       const gap = /^([ \t]+)#/.exec(tail)?.[1] ?? "  ";
       node.comment = `${INLINE_COMMENT_SENTINEL}${gap.slice(1)}#${node.comment}`;
@@ -580,6 +677,35 @@ export function renderFleetOverlayWrite(priorBytes: string, write: FleetOverlayW
     // unpadded form; emit it.
     flowCollectionPadding: false,
   });
+}
+
+/** T10: the 1-based line of the key that holds `path` in these overlay bytes — the path's own key, the
+ * key whose `null` masks it from above, or a `<<` merge key on it (D-987: the write there refuses) — else
+ * undefined (the overlay neither declares nor masks it). */
+export function overlayHoldingLine(bytes: string, path: readonly string[]): number | undefined {
+  const doc = parseDocument(bytes);
+  if (doc.errors.length) return undefined;
+  const lineOf = (offset: number) => bytes.slice(0, offset).split("\n").length;
+  let node: unknown = doc.contents;
+  let line: number | undefined;
+  for (const key of path) {
+    if (isAlias(node)) node = node.resolve(doc);
+    if (line !== undefined && isScalar(node) && node.value === null) return line; // a mask at or above
+    if (!isMap(node)) return undefined;
+    const merge = node.items.find((item) => isScalar(item.key) && typeof item.key.value === "symbol");
+    const pair = merge ?? node.items.find((item) => isScalar(item.key) && String(item.key.value) === key);
+    if (!pair || !isScalar(pair.key) || !pair.key.range) return undefined;
+    line = lineOf(pair.key.range[0]);
+    if (merge) return line;
+    node = pair.value;
+  }
+  return line;
+}
+
+/** T10: does `path` hold a mapping in these overlay bytes — neither absent nor a `null` mask? */
+export function overlayHoldsMap(bytes: string, path: readonly string[]): boolean {
+  const doc = parseDocument(bytes);
+  return !doc.errors.length && isMap(doc.getIn(path, true));
 }
 
 /** Build the repo overlay fragment fleet would write for edits since session start. */

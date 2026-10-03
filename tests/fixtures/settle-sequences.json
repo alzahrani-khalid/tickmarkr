@@ -1,0 +1,1335 @@
+{
+  "base": "c9cd491620673b50b87d0b7eb6208010b8eb58f0",
+  "scenarios": {
+    "fresh/merged": [
+      {
+        "event": "gate-result",
+        "gate": "build",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "lint",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "evidence",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "scope",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "test",
+        "pass": true
+      },
+      {
+        "event": "task-done"
+      },
+      {
+        "event": "merge"
+      }
+    ],
+    "fresh/tip-once": [
+      {
+        "event": "gate-result",
+        "gate": "build",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "lint",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "evidence",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "scope",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "test",
+        "pass": true
+      },
+      {
+        "event": "tip-moved"
+      },
+      {
+        "event": "gate-result",
+        "gate": "build",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "lint",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "evidence",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "scope",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "test",
+        "pass": true
+      },
+      {
+        "event": "task-done"
+      },
+      {
+        "event": "merge"
+      }
+    ],
+    "fresh/tip-twice": [
+      {
+        "event": "gate-result",
+        "gate": "build",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "lint",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "evidence",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "scope",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "test",
+        "pass": true
+      },
+      {
+        "event": "tip-moved"
+      },
+      {
+        "event": "gate-result",
+        "gate": "build",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "lint",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "evidence",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "scope",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "test",
+        "pass": true
+      },
+      {
+        "event": "tip-moved"
+      },
+      {
+        "event": "task-human",
+        "kind": "tip-moved"
+      }
+    ],
+    "fresh/conflict": [
+      {
+        "event": "gate-result",
+        "gate": "build",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "lint",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "evidence",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "scope",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "test",
+        "pass": true
+      },
+      {
+        "event": "merge-conflict"
+      },
+      {
+        "event": "consult-verdict"
+      },
+      {
+        "event": "task-human",
+        "kind": "merge-conflict"
+      }
+    ],
+    "fresh/no-eligible": [
+      {
+        "event": "gate-result",
+        "gate": "build",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "lint",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "evidence",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "scope",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "test",
+        "pass": false
+      },
+      {
+        "event": "task-human",
+        "kind": "gate-fail"
+      }
+    ],
+    "fresh/no-eligible-and-infra": [
+      {
+        "event": "gate-result",
+        "gate": "build",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "lint",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "evidence",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "scope",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "test",
+        "pass": false
+      },
+      {
+        "event": "task-human",
+        "kind": "gate-fail"
+      }
+    ],
+    "fresh/infra": [
+      {
+        "event": "gate-result",
+        "gate": "build",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "lint",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "evidence",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "scope",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "test",
+        "pass": false
+      },
+      {
+        "event": "task-human",
+        "kind": "infra"
+      }
+    ],
+    "fresh/diff-cap": [
+      {
+        "event": "gate-result",
+        "gate": "build",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "lint",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "evidence",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "scope",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "test",
+        "pass": false
+      },
+      {
+        "event": "task-human",
+        "kind": "diff-cap"
+      }
+    ],
+    "fresh/shaped-passed": [
+      {
+        "event": "gate-result",
+        "gate": "build",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "lint",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "evidence",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "scope",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "test",
+        "pass": false
+      },
+      {
+        "event": "gate-reobserved",
+        "outcome": "passed"
+      },
+      {
+        "event": "task-human",
+        "kind": "infra"
+      }
+    ],
+    "fresh/shaped-reproduced": [
+      {
+        "event": "gate-result",
+        "gate": "build",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "lint",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "evidence",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "scope",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "test",
+        "pass": false
+      },
+      {
+        "event": "gate-reobserved",
+        "outcome": "reproduced"
+      },
+      {
+        "event": "repair-attempt"
+      },
+      {
+        "event": "escalation"
+      },
+      {
+        "event": "gate-fresh-forced",
+        "reason": "no-commit-timeout-red"
+      },
+      {
+        "event": "gate-result",
+        "gate": "build",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "lint",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "evidence",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "scope",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "test",
+        "pass": false
+      },
+      {
+        "event": "gate-reobserved",
+        "outcome": "reproduced"
+      },
+      {
+        "event": "gate-fingerprint-cap"
+      },
+      {
+        "event": "escalation"
+      },
+      {
+        "event": "consult-verdict"
+      },
+      {
+        "event": "task-human",
+        "kind": "gate-fail"
+      }
+    ],
+    "fresh/outside-scope": [
+      {
+        "event": "gate-result",
+        "gate": "build",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "lint",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "evidence",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "scope",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "test",
+        "pass": false
+      },
+      {
+        "event": "repair-attempt"
+      },
+      {
+        "event": "escalation"
+      },
+      {
+        "event": "gate-fresh-forced",
+        "reason": "no-commit-out-of-scope-red"
+      },
+      {
+        "event": "gate-result",
+        "gate": "build",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "lint",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "evidence",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "scope",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "test",
+        "pass": false
+      },
+      {
+        "event": "task-human",
+        "kind": "gate-fail"
+      }
+    ],
+    "fresh/authoring": [
+      {
+        "event": "gate-result",
+        "gate": "evidence",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "scope",
+        "pass": false
+      },
+      {
+        "event": "scope-authoring"
+      },
+      {
+        "event": "task-human",
+        "kind": "authoring"
+      }
+    ],
+    "fresh/ordinary-red": [
+      {
+        "event": "gate-result",
+        "gate": "build",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "lint",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "evidence",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "scope",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "test",
+        "pass": false
+      },
+      {
+        "event": "repair-attempt"
+      },
+      {
+        "event": "escalation"
+      },
+      {
+        "event": "gate-result",
+        "gate": "build",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "lint",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "evidence",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "scope",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "test",
+        "pass": false
+      },
+      {
+        "event": "repair-attempt"
+      },
+      {
+        "event": "escalation"
+      },
+      {
+        "event": "gate-result",
+        "gate": "build",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "lint",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "evidence",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "scope",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "test",
+        "pass": false
+      },
+      {
+        "event": "escalation"
+      },
+      {
+        "event": "gate-result",
+        "gate": "build",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "lint",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "evidence",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "scope",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "test",
+        "pass": false
+      },
+      {
+        "event": "escalation"
+      },
+      {
+        "event": "gate-result",
+        "gate": "build",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "lint",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "evidence",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "scope",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "test",
+        "pass": false
+      },
+      {
+        "event": "escalation"
+      },
+      {
+        "event": "consult-verdict"
+      },
+      {
+        "event": "task-human",
+        "kind": "gate-fail"
+      }
+    ],
+    "resume/merged": [
+      {
+        "event": "gate-result",
+        "gate": "lint",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "evidence",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "scope",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "test",
+        "pass": true
+      },
+      {
+        "event": "task-done"
+      },
+      {
+        "event": "merge"
+      }
+    ],
+    "resume/tip-once": [
+      {
+        "event": "gate-result",
+        "gate": "lint",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "evidence",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "scope",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "test",
+        "pass": true
+      },
+      {
+        "event": "tip-moved"
+      },
+      {
+        "event": "gate-result",
+        "gate": "lint",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "evidence",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "scope",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "test",
+        "pass": true
+      },
+      {
+        "event": "task-done"
+      },
+      {
+        "event": "merge"
+      }
+    ],
+    "resume/tip-twice": [
+      {
+        "event": "gate-result",
+        "gate": "lint",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "evidence",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "scope",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "test",
+        "pass": true
+      },
+      {
+        "event": "tip-moved"
+      },
+      {
+        "event": "gate-result",
+        "gate": "lint",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "evidence",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "scope",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "test",
+        "pass": true
+      },
+      {
+        "event": "tip-moved"
+      },
+      {
+        "event": "task-human",
+        "kind": "tip-moved"
+      }
+    ],
+    "resume/conflict": [
+      {
+        "event": "gate-result",
+        "gate": "lint",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "evidence",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "scope",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "test",
+        "pass": true
+      },
+      {
+        "event": "merge-conflict"
+      },
+      {
+        "event": "task-human",
+        "kind": "merge-conflict"
+      }
+    ],
+    "resume/no-eligible": [
+      {
+        "event": "gate-result",
+        "gate": "lint",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "evidence",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "scope",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "test",
+        "pass": false
+      },
+      {
+        "event": "task-human",
+        "kind": "gate-fail"
+      }
+    ],
+    "resume/no-eligible-and-infra": [
+      {
+        "event": "gate-result",
+        "gate": "lint",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "evidence",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "scope",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "test",
+        "pass": false
+      },
+      {
+        "event": "task-human",
+        "kind": "gate-fail"
+      }
+    ],
+    "resume/infra": [
+      {
+        "event": "gate-result",
+        "gate": "lint",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "evidence",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "scope",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "test",
+        "pass": false
+      },
+      {
+        "event": "task-human",
+        "kind": "infra"
+      }
+    ],
+    "resume/diff-cap": [
+      {
+        "event": "gate-result",
+        "gate": "lint",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "evidence",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "scope",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "test",
+        "pass": false
+      },
+      {
+        "event": "task-human",
+        "kind": "diff-cap"
+      }
+    ],
+    "resume/shaped-passed": [
+      {
+        "event": "gate-result",
+        "gate": "lint",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "evidence",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "scope",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "test",
+        "pass": false
+      },
+      {
+        "event": "gate-reobserved",
+        "outcome": "passed"
+      },
+      {
+        "event": "task-human",
+        "kind": "infra"
+      }
+    ],
+    "resume/shaped-reproduced": [
+      {
+        "event": "gate-result",
+        "gate": "lint",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "evidence",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "scope",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "test",
+        "pass": false
+      },
+      {
+        "event": "gate-reobserved",
+        "outcome": "reproduced"
+      },
+      {
+        "event": "repair-attempt"
+      },
+      {
+        "event": "gate-result",
+        "gate": "build",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "lint",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "evidence",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "scope",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "test",
+        "pass": false
+      },
+      {
+        "event": "repair-attempt"
+      },
+      {
+        "event": "escalation"
+      },
+      {
+        "event": "gate-fresh-forced",
+        "reason": "no-commit-timeout-red"
+      },
+      {
+        "event": "gate-result",
+        "gate": "build",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "lint",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "evidence",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "scope",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "test",
+        "pass": false
+      },
+      {
+        "event": "gate-reobserved",
+        "outcome": "reproduced"
+      },
+      {
+        "event": "gate-fingerprint-cap"
+      },
+      {
+        "event": "escalation"
+      },
+      {
+        "event": "consult-verdict"
+      },
+      {
+        "event": "task-human",
+        "kind": "gate-fail"
+      }
+    ],
+    "resume/outside-scope": [
+      {
+        "event": "gate-result",
+        "gate": "lint",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "evidence",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "scope",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "test",
+        "pass": false
+      },
+      {
+        "event": "repair-attempt"
+      },
+      {
+        "event": "gate-result",
+        "gate": "build",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "lint",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "evidence",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "scope",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "test",
+        "pass": false
+      },
+      {
+        "event": "repair-attempt"
+      },
+      {
+        "event": "escalation"
+      },
+      {
+        "event": "gate-fresh-forced",
+        "reason": "no-commit-out-of-scope-red"
+      },
+      {
+        "event": "gate-result",
+        "gate": "build",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "lint",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "evidence",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "scope",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "test",
+        "pass": false
+      },
+      {
+        "event": "task-human",
+        "kind": "gate-fail"
+      }
+    ],
+    "resume/authoring": [
+      {
+        "event": "gate-result",
+        "gate": "evidence",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "scope",
+        "pass": false
+      },
+      {
+        "event": "scope-authoring"
+      },
+      {
+        "event": "task-human",
+        "kind": "authoring"
+      }
+    ],
+    "resume/ordinary-red": [
+      {
+        "event": "gate-result",
+        "gate": "lint",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "evidence",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "scope",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "test",
+        "pass": false
+      },
+      {
+        "event": "repair-attempt"
+      },
+      {
+        "event": "gate-result",
+        "gate": "build",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "lint",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "evidence",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "scope",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "test",
+        "pass": false
+      },
+      {
+        "event": "repair-attempt"
+      },
+      {
+        "event": "escalation"
+      },
+      {
+        "event": "gate-result",
+        "gate": "build",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "lint",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "evidence",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "scope",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "test",
+        "pass": false
+      },
+      {
+        "event": "escalation"
+      },
+      {
+        "event": "gate-result",
+        "gate": "build",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "lint",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "evidence",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "scope",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "test",
+        "pass": false
+      },
+      {
+        "event": "escalation"
+      },
+      {
+        "event": "gate-result",
+        "gate": "build",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "lint",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "evidence",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "scope",
+        "pass": true
+      },
+      {
+        "event": "gate-result",
+        "gate": "test",
+        "pass": false
+      },
+      {
+        "event": "escalation"
+      },
+      {
+        "event": "consult-verdict"
+      },
+      {
+        "event": "task-human",
+        "kind": "gate-fail"
+      }
+    ]
+  }
+}

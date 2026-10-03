@@ -17,6 +17,7 @@ import { marginalCostRank } from "../route/router.js";
 import { carriedAuthorVendors, gateReviewerFloor, pickReviewer, type PriorReviewer, reviewGate } from "./review.js";
 import { scopeGate } from "./scope.js";
 import { discoverTestManifest, evaluateManifestedTest, isVitestTestCommand, VITEST_CACHE_ENV, worktreeVitestCache } from "./test-manifest.js";
+import { RUNNER_INFRA_DIAGNOSTIC_RE, timeoutShaped } from "./timeout-shaped.js";
 import type { GateResult } from "./types.js";
 import { executionSignal } from "../run/execution-budget.js";
 import { failureDisposition, type VerificationRetryCause } from "../run/recovery.js";
@@ -374,7 +375,13 @@ async function listFullManifest(cmd: string, worktree: string): Promise<string[]
   } catch { return undefined; } finally { rmSync(dir, { recursive: true, force: true }); }
 }
 
-/** The manifest-report path for a detected vitest test command — never the stdout-count/file-count path. */
+/** The manifest-report path for a detected vitest test command — never the stdout-count/file-count path.
+ * ONE outer latch (`retried`) buys at most one more measurement of the exact same selection: the bounded
+ * infrastructure retry, or — v2.6.6 C (D-873), default-on — a behavioral timeout red carrying runner
+ * infra diagnostics, read by the daemon's own predicate (timeout-shaped.ts). Either waits for calm and
+ * spends the bounded allowance when one is configured; neither follows a receipt-backed recovery
+ * (retryable:false) or a diagnostic re-observation, and the second sample never stacks the stranded
+ * single-fork recovery. The second sample is authoritative; the first keeps its receipts beside it. */
 async function runVitestManifestGate(
   worktree: string,
   cmd: string,
@@ -392,20 +399,27 @@ async function runVitestManifestGate(
     artifactDir,
     evidence: retry.evidence,
     retryBaseCommand: retry.retryBaseCommand, // OBS-1166: the un-narrowed command for a selected screen's stranded retry
+    allowStrandedRecovery: !retried,
   });
   const reportPath = outcome.reportPath;
   const evidence = { evidenceReceipt: outcome.evidenceReceipt, evidenceReceipts: outcome.evidenceReceipts };
-  if (!retried && retry.authorizeRetry && failureDisposition(outcome) === "infrastructure"
-      && outcome.meta?.retryable !== false) {
+  const disposition = failureDisposition(outcome);
+  const shaped = disposition === "behavioral" && timeoutShaped(outcome.details) && RUNNER_INFRA_DIAGNOSTIC_RE.test(outcome.details);
+  if (!retried && outcome.meta?.retryable !== false && retry.retryBaseCommand !== REOBSERVATION_RETRY_BASE
+      && (shaped || (retry.authorizeRetry && disposition === "infrastructure"))) {
     const waitedMs = await waitForCalmWindow(executionSignal());
     if (!calmWindowReady()) return { ...evidence, gate: "test", pass: false, details: outcome.details,
       meta: { ...outcome.meta, reportPath, recoveryBlocked: "calm window unavailable within the existing wait ceiling" } };
-    if (!retry.authorizeRetry("infra")) {
+    if (retry.authorizeRetry && !retry.authorizeRetry("infra")) {
       return { ...evidence, gate: "test", pass: false, details: outcome.details,
         meta: { ...outcome.meta, reportPath, recoveryBlocked: "infrastructure retry allowance exhausted or subject unavailable" } };
     }
     const result = await runVitestManifestGate(worktree, cmd, baseline, selected, artifactDir, retry, true);
-    return { ...result, evidenceReceipts: [...(outcome.evidenceReceipts ?? []), ...(result.evidenceReceipts ?? [])], meta: { ...result.meta, runnerInfraRerun: { count: 1, waitedMs, firstReportPath: reportPath } } };
+    const rerun = { count: 1, waitedMs, firstReportPath: reportPath };
+    return { ...result, evidenceReceipts: [...(outcome.evidenceReceipts ?? []), ...(result.evidenceReceipts ?? [])],
+      meta: { ...result.meta, ...(shaped
+        ? { remeasured: { ...rerun, first: { pass: outcome.pass, details: outcome.details, meta: outcome.meta } } }
+        : { runnerInfraRerun: rerun }) } };
   }
   return {
     ...evidence,
@@ -419,7 +433,8 @@ async function runVitestManifestGate(
 /** A retry base no runner invocation parses. evaluateManifestedTest builds its stranded single-fork
  * retry from the base it is handed, and one it cannot parse throws before any spawn — so this base
  * disables that inner recovery: a worker-RPC-stranded re-observation comes back infra (the caller
- * parks it as ambiguous) instead of launching a second execution. */
+ * parks it as ambiguous) instead of launching a second execution. runVitestManifestGate reads it as
+ * the mark of a diagnostic subset, which never buys the outer timeout-shaped remeasurement either. */
 export const REOBSERVATION_RETRY_BASE = "tickmarkr-reobservation-refuses-stranded-retry";
 
 /** OBS-1106 residual: ONE isolated re-observation of a timeout-shaped red's attributed failing files on

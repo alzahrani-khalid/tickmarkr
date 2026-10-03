@@ -19,7 +19,8 @@ import { auditNamedTestOracles, listVitestTests, type VitestListResult } from ".
 import { carriedAuthorVendors, gateReviewerFloor, modelId, modelProvider, pickReviewer } from "../../gates/review.js";
 import { Journal, loadRoutingProfile, readProfileCursor, recordedGraphDefinitionHash, RUNS_WINDOW, type JournalEvent } from "../../run/journal.js";
 import { harnessLine, resolveHarness } from "../harness.js";
-import { codexCommitHeadline } from "../../adapters/codex-commit-check.js";
+import { codexCommitHeadline, codexEscapeRoleLine } from "../../adapters/codex-commit-check.js";
+import { codex } from "../../adapters/codex.js";
 import { channelKey, shq, type Assignment, type BillingChannel, type WorkerAdapter } from "../../adapters/types.js";
 import { shGit } from "../../run/git.js";
 import { runLockRunId, runStatusLine } from "../../run/lock.js";
@@ -295,6 +296,15 @@ export async function plan(
   if (aliasHeadlines.length) lines.push(...aliasHeadlines, "");
   const entrySeats = routingEntrySeatLines(cfg);
   if (entrySeats.length) lines.push(...entrySeats, "");
+  // v2.6.6 T9 (K): Codex judge/review/consult seats launch with the worker grant (llm.ts, consult.ts), so a
+  // doctor-probed escape blocks them too; worker rows carry their own headline below.
+  const codexRoles = [
+    ...(cfg.judge.adapter === codex.id ? ["judge"] : []),
+    ...(pools.review.some((c) => c.adapter === codex.id) ? ["review"] : []),
+    ...(cfg.consult.adapter === codex.id || pools.consult.some((c) => c.adapter === codex.id) ? ["consult"] : []),
+  ];
+  const codexEscape = codexEscapeRoleLine(codexRoles, adapters, health);
+  if (codexEscape) lines.push(codexEscape, "");
   // OBS-1185: the floor route() resolved for THIS task — a task hint over the configured/mode floor.
   const derivation = (t: Task): string | null => {
     const floor = resolvedFloor(t, cfg);

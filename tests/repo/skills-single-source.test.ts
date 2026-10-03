@@ -246,6 +246,16 @@ describe.skipIf(skipReason !== undefined)(suiteName, () => {
     }
   });
 
+  test("the tracked installed overseer script copies are executable regular files byte-identical to canonical", () => {
+    for (const file of ["watch-parks.sh"]) {
+      const installed = join(INSTALLED, "tickmarkr-overseer", "scripts", file);
+      const stat = lstatSync(installed);
+      expect(stat.isFile(), `${file} is a tracked copy, not a symlink`).toBe(true);
+      expect(stat.mode & 0o111, `${file} must stay executable`).not.toBe(0);
+      expect(readFileSync(installed)).toEqual(readFileSync(join(CANONICAL, "tickmarkr-overseer", "scripts", file)));
+    }
+  });
+
   test("test: live tree: shared files match and every .claude-only orphan has an explicit decision", () => {
     const explicitInstalledOnly: Violation[] = [
       {

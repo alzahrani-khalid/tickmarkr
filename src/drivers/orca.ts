@@ -48,7 +48,7 @@ export const ORCA_RESPONSE_FAMILIES = [
 ] as const;
 export type OrcaFamily = (typeof ORCA_RESPONSE_FAMILIES)[number];
 
-export const ORCA_FIXTURE_VERSION = "1.4.195";
+export const ORCA_FIXTURE_VERSION = "1.4.218";
 export const ORCA_CLI_COMMAND_ENV = "ORCA_CLI_COMMAND";
 export const STALE_HANDLE_CODE = "terminal_handle_stale";
 export const TERMINAL_GONE_CODE = "terminal_gone";
@@ -690,6 +690,28 @@ export interface OrcaDriverOpts {
   launchingHandle?: string;
 }
 
+/**
+ * F (D-832): what one proof page's OWN metadata says about the scrollback it was read from — the closed
+ * seam checkoutProven decides paging and absence by. `complete`: explicit `limited:false` and
+ * `truncated:false` with cursors that agree — nothing lies past this page. `partial`: explicit booleans,
+ * one of them true, cursors that agree — more scrollback exists. `unread`: everything else — a flag
+ * missing or not a boolean, a cursor that is not a string, `limited:false` with a next cursor short of
+ * the latest one (the contradictory "last" page), a blind stream page
+ * (isBlindStreamPage), or a source that is not the stream (`screen-unavailable`). Missing metadata is
+ * never inferred complete: its page's bytes still count as read evidence, but no absence rests on it.
+ */
+export function classifyProofPage(term: Record<string, unknown>): "complete" | "partial" | "unread" {
+  const { limited, truncated } = term;
+  if (typeof limited !== "boolean" || typeof truncated !== "boolean") return "unread";
+  if (isBlindStreamPage(term) || (term.source !== undefined && term.source !== "stream")) return "unread";
+  const next = str(term.nextCursor), latest = str(term.latestCursor);
+  if ((term.nextCursor !== undefined && next === undefined) || (term.latestCursor !== undefined && latest === undefined)) return "unread";
+  // a page that says it is the last while its next cursor stops short of the latest one contradicts itself.
+  // (A limited page whose next cursor IS the latest is not: the read from that cursor settles it.)
+  if (!limited && next !== undefined && latest !== undefined && next !== latest) return "unread";
+  return limited || truncated ? "partial" : "complete";
+}
+
 export class OrcaDriver implements ExecutorDriver {
   id = "orca";
   interactive = true; // a visible terminal the operator can watch and answer
@@ -1123,13 +1145,18 @@ export class OrcaDriver implements ExecutorDriver {
    * and none carries a trace of the mark; `unread` — every other exit: PROOF_PAGES reached, a limited
    * read with no (or the same) next cursor or a truncated anchor without one, a read that threw, a read
    * the ceiling cut off or never let start (the anchor included), or a page that landed late (even one
-   * carrying the right proof), a malformed page (its tail, cursors or paging flags), or a blind stream
-   * page (isBlindStreamPage). Unread output is unknown — never an empty page, never absence.
+   * carrying the right proof), a malformed page (its tail or cursors), a blind stream page
+   * (isBlindStreamPage), or — F (D-832) — any page read whose paging metadata classifyProofPage cannot
+   * call complete or partial (flags missing, not boolean or contradicted; even when they were omitted,
+   * that page's bytes stay evidence and its matching proof still proves). Unread output is unknown —
+   * never an empty page, never absence.
    * Without a deadline (reconcile, recovery) only `proven` is consumed.
    */
   private async checkoutProven(handle: string, checkout: string | undefined, from: string, runtimeId: string, deadline?: number): Promise<CheckoutProof> {
-    let late = false;
-    const page = async (cursor?: string): Promise<{ term: Record<string, unknown>; text: string } | undefined> => {
+    // F (D-832): a page read whose own metadata does not say how complete it is (classifyProofPage):
+    // its bytes are evidence, but the scrollback it came from is not known to be read whole.
+    let late = false, unknown = false;
+    const page = async (cursor?: string): Promise<{ term: Record<string, unknown>; text: string; kind: ReturnType<typeof classifyProofPage> } | undefined> => {
       const budget = deadline === undefined ? undefined : deadline - this.time.now();
       if (budget !== undefined && budget <= 0) return undefined; // no budget left: the read is never issued
       let env: OrcaEnvelope;
@@ -1150,20 +1177,21 @@ export class OrcaDriver implements ExecutorDriver {
         throw new OrcaError("read", `proof page names terminal ${str(term.handle) ?? "none"}, not the candidate ${handle}`, env.raw);
       }
       // E1: only a well-formed page is read text. A tail that is missing, not an array or carries a
-      // non-string row (tailText), a cursor that is not a non-empty string, or a paging flag that is not
-      // a boolean is a malformed page: it throws, so it is unread output — never filtered to an empty
-      // page that would read as an absent proof.
+      // non-string row (tailText), or a cursor that is not a non-empty string is a malformed page: it
+      // throws, so it is unread output — never filtered to an empty page that would read as an absent proof.
       for (const key of ["oldestCursor", "nextCursor"]) {
         if (term[key] !== undefined && str(term[key]) === undefined) throw new OrcaError("read", `proof page ${key} is not a cursor`, env.raw);
-      }
-      for (const key of ["limited", "truncated"]) {
-        if (term[key] !== undefined && typeof term[key] !== "boolean") throw new OrcaError("read", `proof page ${key} is not a boolean`, env.raw);
       }
       // E1: the OBS-1011 add.1 blind stream (exited, empty tail, zero lines returned) is the shape a
       // live terminal's stream answers while its screen still paints — and a dead terminal's too. The
       // stream alone cannot tell them apart, so its empty tail is unread scrollback, never absence.
       if (isBlindStreamPage(term)) throw new OrcaError("read", "proof page is a blind stream page (status exited, empty tail): its scrollback is unread", env.raw);
-      return { term, text: this.tailText("read", term, env.raw) };
+      const text = this.tailText("read", term, env.raw);
+      // F: paging flags missing, not boolean or contradicted by the cursors leave the page's bytes read
+      // but its completeness unknown — it ends paging, and the poll can never read as absent.
+      const kind = classifyProofPage(term);
+      if (kind === "unread") unknown = true;
+      return { term, text, kind };
     };
     // Every validated read is evidence, whatever stops the next one: the anchor's tail and the pages
     // read from the oldest cursor are inspected even when paging hits PROOF_PAGES or a read throws.
@@ -1187,12 +1215,13 @@ export class OrcaDriver implements ExecutorDriver {
       tail = first.text;
       let cursor = str(anchor.oldestCursor);
       // why paging ended with scrollback still unread. Every exit is one of: complete (an anchor that
-      // is the whole scrollback, or a page that is not limited), whole frames found, or one of these.
+      // is the whole scrollback, or a page whose metadata says it is the last), whole frames found, a
+      // page whose completeness is unknown (`unknown`, classifyProofPage), or one of these.
       let stop: "cut" | "exhausted" | "stalled" | undefined;
       if (cursor === undefined) {
         text = tail;
         // A cursorless anchor that says it holds less than the scrollback leaves the rest unreadable.
-        if (anchor.truncated === true || anchor.limited === true) stop = "stalled";
+        if (first.kind === "partial") stop = "stalled";
       }
       for (let n = 0; cursor !== undefined; n++) {
         if (n === PROOF_PAGES) { stop = "exhausted"; break; } // more scrollback than the bound: unread, not absent
@@ -1202,11 +1231,19 @@ export class OrcaDriver implements ExecutorDriver {
         text += `${got.text}\n`;
         const frames = checkoutFrames(text);
         if (frames.complete.length > 0 && !frames.incomplete) break; // whole frames, nothing dangling
-        if (term.limited !== true) break; // the last page: the scrollback was read to its end
+        if (got.kind === "complete") break; // the last page: the scrollback was read to its end
         const next = str(term.nextCursor);
-        // A limited page with no next cursor, or the same one, says more scrollback exists that no
-        // read can reach: unread, never absent.
-        if (next === undefined || next === cursor) { stop = "stalled"; break; }
+        const advancing = next !== undefined && next !== cursor;
+        if (got.kind === "unread") {
+          // F: no absence rests on this page (`unknown`), but a cursor that still advances toward more
+          // scrollback — the page says limited, or its next cursor is short of the latest one — is
+          // followed for positive proof, inside PROOF_PAGES and the ceiling.
+          if (advancing && (term.limited === true || next !== str(term.latestCursor))) { cursor = next; continue; }
+          break;
+        }
+        // A partial page that is not limited, or a limited one with no next cursor or the same one, says
+        // more scrollback exists that no read can reach: unread, never absent.
+        if (term.limited !== true || !advancing) { stop = "stalled"; break; }
         cursor = next;
       }
       const frames = checkoutFrames(text);
@@ -1220,9 +1257,11 @@ export class OrcaDriver implements ExecutorDriver {
       if (proven && !late) return { proven: true, reason: "" };
       const why = `${late ? "read past the ceiling, " : ""}${stop === "cut" ? "the ceiling cut off paging, "
         : stop === "exhausted" ? `paging stopped at ${PROOF_PAGES} pages with scrollback unread, `
-        : stop === "stalled" ? "a limited read gave no next cursor with scrollback unread, " : ""}`;
+        : stop === "stalled" ? "a limited read gave no next cursor with scrollback unread, " : ""}${
+        unknown ? "a page carried missing, non-boolean or contradictory paging metadata, " : ""}`;
       const read = described(why);
-      return { ...read, seen: read.seen ?? (stop || late ? "unread" : "absent") };
+      // F: absent only when every page read said, explicitly and consistently, how complete it was.
+      return { ...read, seen: read.seen ?? (stop || late || unknown ? "unread" : "absent") };
     } catch (error) {
       // A read that failed midway keeps what was already read as evidence; what it could not read is
       // unread output — never an absent proof.

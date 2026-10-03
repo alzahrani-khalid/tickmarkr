@@ -200,3 +200,37 @@ test("a diagnostic re-observation is one manifested execution whose stranded sin
   expect(() => singleForkRetryCommand(opts.retryBaseCommand!, repo, ["tests/a.test.ts"], ["tests/b.test.ts"])).toThrow(/not a supported direct runner invocation/);
   expect(result).toMatchObject({ pass: false, meta: { infra: true, retryable: false, recoveryRefused: true } });
 });
+
+// v2.6.6 C: the infrastructure retry and the timeout-shaped remeasure share ONE outer latch — a shaped
+// red on the infra retry's own second sample buys no third, and that second sample never runs the
+// stranded single-fork recovery while the first one still may.
+test("a timeout-shaped red on the bounded infrastructure retry's second sample buys no third measurement and that sample refuses stranded recovery", async () => {
+  const repo = makeRepo({ "tests/a.test.ts": "export {};\n" });
+  const baseRef = await gitHead(repo);
+  writeFileSync(join(repo, "tests/a.test.ts"), "export const work = true;\n");
+  await shGitOk("git add -A && git commit --no-gpg-sign -m work", repo);
+  const shaped = "test report names failing fingerprint(s):\nError: Test timed out in 20000ms.\nclassification: regression; runner-level diagnostic: never-started 1; reporter errors 1; runner vitest\nError: [vitest-worker]: Timeout calling \"onTaskUpdate\"";
+  manifest.outcomes = [
+    { pass: false, kind: "infra", details: "Error: spawn EAGAIN", classification: "infra", meta: { classification: "infra", infra: true }, exitCode: 1, reportPath: "/reports/first.json" },
+    { pass: false, kind: "work", details: shaped, classification: "regression", meta: { classification: "regression", failingFiles: ["tests/a.test.ts"] }, exitCode: 1, reportPath: "/reports/second.json" },
+    { pass: true, kind: "pass", details: "complete", meta: {}, exitCode: 0, reportPath: "/reports/third.json" },
+  ];
+  const authorization = vi.fn((_subject: string) => true);
+  const task = validateGraph({ version: 1, spec: { source: "prd", paths: ["p"], hash: "h" }, tasks: [
+    { id: "T1", title: "t", goal: "g", shape: "implement", complexity: 3, acceptance: ["a"], gates: ["build", "test", "lint", "evidence", "scope"] },
+  ] }).tasks[0];
+  const { results } = await runGates(task, {
+    worktree: repo, baseRef, commands: { test: "vitest run" }, baseline,
+    author: { adapter: "fake", model: "fake-1", channel: "sub", tier: "frontier" }, channels: [], adapters: [],
+    result: { ok: true, summary: "", deviations: [], raw: "" }, cfg: structuredClone(DEFAULT_CONFIG),
+    authorizeInfraRetry: authorization,
+  });
+  expect(manifest.calls).toBe(2);
+  expect(authorization).toHaveBeenCalledTimes(1);
+  expect(manifest.args.map((a) => (a[2] as { allowStrandedRecovery?: boolean }).allowStrandedRecovery)).toEqual([true, false]);
+  const result = results.find((r) => r.gate === "test")!;
+  expect(result.pass).toBe(false);
+  expect(failureDisposition(result)).toBe("behavioral");
+  expect(result.meta).toMatchObject({ reportPath: "/reports/second.json", runnerInfraRerun: { count: 1, firstReportPath: "/reports/first.json" } });
+  expect(result.meta?.remeasured).toBeUndefined();
+});

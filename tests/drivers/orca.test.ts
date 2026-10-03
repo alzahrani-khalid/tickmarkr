@@ -1695,3 +1695,17 @@ test("test: a production Orca split timing out after starting the matching board
     await killBoardObservers();
   }
 }, 90_000);
+
+
+test("the Orca 1.4.218 advisory pin passes the default fake runtime while historical 1.4.195 runtime remains a warning", async () => {
+  const { probeOrcaCapability } = await import("../../src/cli/commands/doctor.js");
+  const probe = async (appVersion?: string) => {
+    const fake = new FakeOrca({ appVersion });
+    return probeOrcaCapability(WT, { resolveOrcaBinary: () => "/fixture/orca", orcaEnv: {},
+      orcaStatusProbe: async () => ({ ...await fake.exec(["status", "--json"], WT), timedOut: false }),
+      orcaHooksStatusProbe: async () => ({ code: 0, stdout: "{}", stderr: "", timedOut: false }),
+    });
+  };
+  const current = await probe(); expect(current.verdict).toBe("pass"); expect(current.detail).toContain("appVersion 1.4.218; fixture pin 1.4.218");
+  const historical = await probe("1.4.195"); expect(historical.verdict).toBe("warn"); expect(historical.detail).toContain("appVersion 1.4.195; fixture pin 1.4.218");
+});

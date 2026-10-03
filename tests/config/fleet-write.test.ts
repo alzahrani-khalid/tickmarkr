@@ -503,6 +503,62 @@ test("OBS-518 write churn: an untouched flow sequence keeps its unpadded [kimi] 
   expect(written).not.toContain("[ kimi ]");
 });
 
+test("T10 owed review F2: a membership write that leaves an anchored allow list unchanged keeps it and its alias byte-identical to the frozen 4497942f writer, in flow and block-with-item-comment form", () => {
+  // the frozen 4497942f writer's bytes for the same input and edit (fake:A admitted through allow.models),
+  // captured as literals; the unchanged &whole list is never rewritten, so `mirror: *whole` stays an alias
+  const initial = editable({ allowOut: ["fake:A", "fake:C"] });
+  const write = {
+    initial,
+    edited: { ...initial, allowOut: ["fake:C"] },
+    universe: [{ adapter: "codex", models: ["x"] }, { adapter: "fake", models: ["A", "B", "C"] }],
+  };
+  const rows: Array<{ member: string; prior: string; frozen: string }> = [
+    {
+      member: "flow list",
+      prior: "routing:\n  allow:\n    adapters: &whole [codex]\n    models: [fake:B]\nmirror: *whole\n",
+      frozen: "routing:\n  allow:\n    adapters: &whole [codex]\n    models: [fake:A, fake:B]\nmirror: *whole\n",
+    },
+    {
+      member: "block list with an item comment",
+      prior: "routing:\n  allow:\n    adapters: &whole\n      - codex  # whole adapter admitted\n    models: [fake:B]\nmirror: *whole\n",
+      frozen: "routing:\n  allow:\n    adapters: &whole\n      - codex  # whole adapter admitted\n    models: [fake:A, fake:B]\nmirror: *whole\n",
+    },
+  ];
+  for (const { member, prior, frozen } of rows) expect(renderFleetOverlayWrite(prior, write), member).toBe(frozen);
+});
+
+test("T10 null-mask materialization: a worker deny written under `routing: null` keeps routing.allow and every flat deny leaf masked, so a lower user allow or deny never returns to change judge, review or consult reach", () => {
+  const repo = mkdtempSync(join(tmpdir(), "tickmarkr-fleet-mask-"));
+  const user = [
+    "tiers:",
+    "  fake: { vendor: fake, channel: sub, models: { A: mid, B: mid } }",
+    "routing:",
+    "  allow:",
+    "    models: [fake:B]",
+    "  deny:",
+    "    adapters: [codex]",
+    "",
+  ].join("\n");
+  // `routing: null` alone never loads (the routing block is required) — the writer still stays total
+  expect(() => loadConfigWithMode(repo, { globalDir: repo, userOverlayText: user, repoOverlayText: "routing: null\n" })).toThrow(/routing/);
+  const written = renderFleetOverlayWrite("routing: null  # repository mask\n", {
+    initial: editable(),
+    edited: editable({ denyWorkersModels: ["fake:A"] }),
+  });
+  expect(parse(written).routing).toEqual({
+    allow: null,
+    deny: { adapters: null, models: null, workers: { adapters: null, models: ["fake:A"] } },
+  });
+  const { routing } = loadConfigWithMode(repo, { globalDir: repo, userOverlayText: user, repoOverlayText: written }).cfg;
+  expect(routing.allow).toBeUndefined();
+  expect(routing.deny?.adapters).toBeUndefined();
+  for (const role of ["judge", "review", "consult"] as const) {
+    expect(disallowedBy({ adapter: "fake", model: "A" }, routing, role), role).toBeNull();
+    expect(disallowedBy({ adapter: "codex", model: "gpt-6-sol" }, routing, role), role).toBeNull();
+  }
+  expect(disallowedBy({ adapter: "fake", model: "A" }, routing, "worker")).not.toBeNull();
+});
+
 test("OBS-533 tombstone crash: a fleet write stays total over legal scalar intermediates, proven over the closed set of crash sites — a pin delete under a `spec:` null tombstone no-ops and keeps the operator's mask, a pin set over the tombstone rebuilds the map entry, and an unpin against an empty overlay returns the bytes verbatim", () => {
   // `spec:` is the v1.1 null tombstone — deepMerge prunes it before schema validation, so the
   // overlay loads clean; yaml's setIn/deleteIn then threw "Expected YAML collection at spec.

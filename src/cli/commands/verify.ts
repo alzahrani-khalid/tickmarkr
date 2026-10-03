@@ -4,8 +4,8 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { allAdapters, probeAll, readDoctor, rolePools, writeDoctor } from "../../adapters/registry.js";
-import { channelKey, type Assignment, type BillingChannel } from "../../adapters/types.js";
-import { loadConfig } from "../../config/config.js";
+import { channelKey, type Assignment, type AuthHealth, type BillingChannel, type WorkerAdapter } from "../../adapters/types.js";
+import { loadConfig, type TickmarkrConfig } from "../../config/config.js";
 import { captureBaseline, detectGateCommands, staleFileCountCommands, type Baseline, type GateEvidenceOptions } from "../../gates/baseline.js";
 import { getVerdictStore, runnerInputsHash, type StoredVerdictRecord } from "../../gates/cache.js";
 import { modelProvider } from "../../gates/review.js";
@@ -113,6 +113,37 @@ const verdictlessCommands = (baseline: Baseline, commands: Record<string, string
 export function excludeAuthorProvider(channels: BillingChannel[], author: BillingChannel): BillingChannel[] {
   const provider = modelProvider(author.model, author.vendor);
   return [author, ...channels.filter((candidate) => candidate !== author && modelProvider(candidate.model, candidate.vendor) !== provider)];
+}
+
+/**
+ * G (D-874): `--author` names who wrote the diff so review can EXCLUDE it — it never asks for a seat. So
+ * it resolves against installed identities (an installed adapter's doctor-listed or configured model),
+ * not against the review pool, whose role allow/deny, model-auth and tier gates say nothing about
+ * authorship. A pool member resolves to itself, unchanged. Anything else is an author-only identity: its
+ * vendor is the configured declaration (the model's override, else the adapter entry's; the adapter's own
+ * only when config has no entry), never inferred, and an unseeded model carries no tier of its own — it
+ * holds the human sentinel's frontier floor, so the reviewer floor is never lowered. Same-vendor, so it
+ * can never be seated. An identity nothing declares refuses by name.
+ */
+function authorIdentity(claim: string, cfg: TickmarkrConfig, adapters: WorkerAdapter[], health: Record<string, AuthHealth>, pool: BillingChannel[]): BillingChannel {
+  const [adapter = "", ...rest] = claim.split(":");
+  const model = rest.join(":");
+  const member = pool.find((c) => c.adapter === adapter && c.model === model);
+  if (member) return member;
+  const a = adapters.find((x) => x.id === adapter);
+  const h = health[adapter];
+  const seeded = a?.channels(cfg).find((c) => c.model === model);
+  const entry = cfg.tiers[adapter];
+  const vendor = seeded?.vendor ?? (entry ? entry.modelOverrides?.[model]?.vendor ?? entry.vendor : a?.vendor);
+  const why = !a ? `no registered adapter "${adapter}"`
+    : !h?.installed ? `doctor does not record ${adapter} as installed`
+    : !seeded && !h.models?.includes(model) ? `${adapter} neither lists "${model}" in doctor nor configures it`
+    : !vendor ? `no vendor is declared for ${adapter}:${model}`
+    : undefined;
+  if (why) {
+    throw new Error(`--author ${claim} does not name a discoverable author identity (${why}) — name an installed adapter's doctor-listed or configured model as <adapter>:<model>, or human`);
+  }
+  return seeded ?? { adapter, vendor: vendor!, model, channel: entry?.modelOverrides?.[model]?.channel ?? entry?.channel ?? "sub", tier: "frontier" };
 }
 
 function recordedMerges(repoRoot: string): Array<{ runId: string; taskId: string; commit: string }> {
@@ -292,6 +323,9 @@ export async function verify(argv: string[], cwd = process.cwd(), options: { evi
     const pools = rolePools(cfg, adapters, health);
     judgeChannels = pools.judge;
     channels = pools.review;
+    // Resolved before either branch so an undiscoverable claim refuses here, ahead of any capture —
+    // even where recorded authors bind and the claim is otherwise ignored.
+    const claimed = values.author && values.author !== "human" ? authorIdentity(values.author, cfg, adapters, health, channels) : undefined;
     if (owed.length) {
       // The run's lifetime patch authors bind the reviewer's exclusions; --author never overrides
       // them. An author the pool cannot resolve leaves review unseatable, which fails closed.
@@ -299,15 +333,9 @@ export async function verify(argv: string[], cwd = process.cwd(), options: { evi
       if (values.author) console.error(`verify: --author ${values.author} ignored — ${values.record}'s recorded patch authors (${carriedAuthors.join(", ")}) bind this discharge`);
       const first = channels.find((c) => channelKey(c) === carriedAuthors[0]);
       if (first) author = { adapter: first.adapter, model: first.model, channel: first.channel, tier: first.tier };
-    } else if (values.author && values.author !== "human") {
-      const [adapter, ...rest] = values.author.split(":");
-      const model = rest.join(":");
-      const c = channels.find((ch) => ch.adapter === adapter && ch.model === model);
-      if (!c) {
-        throw new Error(`--author ${values.author} does not name a discoverable review channel — one of: ${channels.map(channelKey).join(", ") || "(none)"}`);
-      }
-      author = { adapter: c.adapter, model: c.model, channel: c.channel, tier: c.tier };
-      channels = excludeAuthorProvider(channels, c);
+    } else if (claimed) {
+      author = { adapter: claimed.adapter, model: claimed.model, channel: claimed.channel, tier: claimed.tier };
+      channels = excludeAuthorProvider(channels, claimed);
     } else {
       channels = [...channels, HUMAN_CHANNEL];
     }

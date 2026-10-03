@@ -1356,13 +1356,19 @@ describe("B1a codex retirement notices (doctor)", () => {
 describe("v2.6.5 T3 — Codex linked-worktree commit probe", () => {
   test("doctor reports linked-worktree git metadata protected only when an injected Codex sandbox writes the ordinary control but denies index.lock while allowed metadata and unreadable probes remain distinct", async () => {
     const control = (p: CodexCommitProbe) => writeFileSync(p.control, p.token);
+    // v2.6.6 T9 (K): the receipts are a real fixture-branch commit plus two denied shared-metadata members
+    const commit = (p: CodexCommitProbe) => {
+      control(p);
+      childProcess.execFileSync("git", ["add", "--", p.control], { cwd: p.worktree });
+      childProcess.execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@t.invalid", "commit", "-q", "--no-gpg-sign", "-m", `tickmarkr-probe ${p.token}`], { cwd: p.worktree });
+    };
     const sandboxes: Record<string, CodexSandbox> = {
-      protected: async (p) => { control(p); return `control=ok\nlock=fail sh: ${p.lock}: Operation not permitted\n`; },
-      allowed: async (p) => { control(p); writeFileSync(p.lock, p.token); return "control=ok\nlock=ok\n"; },
-      // the sandbox ran and the control landed, but nothing readable says what happened to the lock
+      protected: async (p) => { control(p); return "control=ok\ncommit=fail\nhook=denied\nroot=denied\n"; },
+      allowed: async (p) => { commit(p); return "control=ok\ncommit=ok\nhook=denied\nroot=denied\n"; },
+      // the sandbox ran and the control landed, but nothing readable says what happened to the metadata
       unknown: async (p) => { control(p); return "control=ok\n"; },
       // a denial claim without the positive control is a sandbox that never ran, not a protected verdict
-      "unknown ": async (p) => `lock=fail sh: ${p.lock}: Operation not permitted\n`,
+      "unknown ": async () => "commit=fail\nhook=denied\nroot=denied\n",
     };
     const rows: Record<string, string> = {};
     for (const [want, codexSandbox] of Object.entries(sandboxes)) {
@@ -1373,10 +1379,10 @@ describe("v2.6.5 T3 — Codex linked-worktree commit probe", () => {
       rows[want] = out.split("\n").find((l) => l.includes("linked-worktree")) ?? "";
       expect(out, want).not.toMatch(/--add-dir|writable_roots/);
     }
-    expect(rows.protected).toContain("linked-worktree git metadata protected — the sandbox wrote an ordinary worktree file but denied index.lock; a Codex worker cannot commit in its worktree");
-    expect(rows.allowed).toContain("linked-worktree commit probe: index.lock writable");
+    expect(rows.protected).toContain("linked-worktree git metadata protected — the sandbox wrote an ordinary worktree file but denied the linked-worktree commit; a Codex worker cannot commit in its worktree");
+    expect(rows.allowed).toContain("linked-worktree commit probe: commit allowed, shared hooks/config denied");
     expect(rows.allowed).not.toContain("protected");
-    expect(rows.unknown).toContain("linked-worktree commit probe unknown — the sandbox result for index.lock was unreadable");
+    expect(rows.unknown).toContain("linked-worktree commit probe unknown — the sandbox result for the shared-metadata members was unreadable");
     expect(rows["unknown "]).toContain("linked-worktree commit probe unknown — the sandbox did not write the ordinary control file");
 
     // a codex-id stub with no injected sandbox: no probe, no field, no output

@@ -5,7 +5,7 @@ import { isolatedBuild } from "../fixtures/screen-soak/isolated-build.js";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import ts from "typescript";
-import { describe, expect, test, vi } from "vitest";
+import { describe, expect, test } from "vitest";
 
 const src = readFileSync(fileURLToPath(new URL("../../src/drivers/herdr.ts", import.meta.url)), "utf8");
 
@@ -71,84 +71,16 @@ describe("driver placement audit (VIS-10 structural guarantee)", () => {
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { PassThrough, Writable } from "node:stream";
-import { boardHost, type HostPane } from "../fixtures/screen-soak/board-host.js";
-import { root } from "../fixtures/screen-soak/test-support.js";
+import { boardHost } from "../fixtures/screen-soak/board-host.js";
 import { makeRepo, setupRepo, T } from "../helpers/tmprepo.js";
 import { runLiveCockpit } from "../../src/tui/cockpit/live.js";
 import type { ShellDelivery } from "../../src/tui/cockpit/live-runtime.js";
 import { formatOwnedName, type Slot, type FocusTarget } from "../../src/drivers/types.js";
-import { HerdrDriver, tabLabelFor } from "../../src/drivers/herdr.js";
+import { tabLabelFor } from "../../src/drivers/herdr.js";
 import { OrcaDriver } from "../../src/drivers/orca.js";
 import { SubprocessDriver } from "../../src/drivers/subprocess.js";
 import { FakeOrca, steppedTime } from "../helpers/fake-orca.js";
 import { ev, rawOf } from "../fixtures/operator-state/fixture.js";
-
-const readEvidence = (path: string | undefined): string => {
-  if (!path) return "(no log)";
-  try { return readFileSync(path, "utf8").trimEnd() || "(empty)"; } catch { return "(absent)"; }
-};
-/** A Node board's stdout never reaches the pane log: tty-bootstrap captures it as the pane's screen frame. */
-const readScreen = (path: string | undefined): string => {
-  if (!path) return "(no frame)";
-  try { return (JSON.parse(readFileSync(path, "utf8")) as { frame: string }).frame.trimEnd() || "(empty)"; } catch { return "(absent)"; }
-};
-
-/** The fake board's own stdout/stderr, pane by pane, then its owner record and the stop/ack messages under that owner's token. */
-function keptBoardEvidence(host: ReturnType<typeof boardHost>, repo: string, runId: string): string {
-  const supervision = join(repo, ".tickmarkr", "supervision");
-  const owner = readEvidence(join(supervision, `watch-board.${runId}.json`));
-  let token = "unknown";
-  try { token = (JSON.parse(owner) as { token: string }).token; } catch { /* the owner line above says why */ }
-  return [
-    ...(host.read().panes as Array<HostPane & { log?: string }>).map(pane =>
-      `pane ${pane.pane_id} screen stdout:\n${readScreen(pane.frame)}\npane ${pane.pane_id} stdout/stderr:\n${readEvidence(pane.log)}`),
-    `owner: ${owner}`,
-    `stop: ${readEvidence(join(supervision, `watch-board.${token}.stop`))}`,
-    `ack: ${readEvidence(join(supervision, `watch-board.${token}.ack`))}`,
-  ].join("\n");
-}
-
-/** C-16 (D-697) tolerance, kept: an unacknowledged kept-board close prints the board's pane log and owner stop/ack
- *  evidence so the next occurrence carries its own diagnosis (root cause queued for v2.6.4). Any other close error fails. */
-async function closeKeptBoard(close: Promise<void>, host: ReturnType<typeof boardHost>, repo: string, runId: string): Promise<void> {
-  try { await close; } catch (error) {
-    if (!String(error).includes("watch cleanup unacknowledged")) throw error;
-    console.warn(`tolerated unacknowledged kept-board close: ${String(error)}\n${keptBoardEvidence(host, repo, runId)}`);
-  }
-}
-
-test("test: placement-audit prints the fake board stdout/stderr pane log plus owner stop/ack evidence for its tolerated unacknowledged close whereas a different close error still fails", async () => {
-  const host = boardHost();
-  const repo = makeRepo({ "base.txt": "kept board evidence" });
-  const runId = "run-keep-evidence";
-  const printed = vi.spyOn(console, "warn").mockImplementation(() => {});
-  try {
-    // A board that exits without ever acknowledging: its streams are all that can explain it. A real Node process
-    // runs through tty-bootstrap, so its stdout lands in the screen frame while stderr and shell output land in the log.
-    const node = `node -e 'process.stdout.write("kept-board-stdout\\n"); process.stderr.write("kept-board-stderr\\n")'`;
-    const board = await host.driver().narrator(repo, `echo kept-board-shell; ${node}`, runId);
-    const [pane] = host.read().panes as Array<HostPane & { log?: string }>;
-    await expect.poll(() => readEvidence(pane?.log), { timeout: 5000 }).toContain("kept-board-stderr");
-    await expect.poll(() => readScreen(pane?.frame), { timeout: 5000 }).toBe("kept-board-stdout");
-    expect(readEvidence(pane?.log)).not.toContain("kept-board-stdout");
-    // A stepped clock spends the acknowledgement window at once; ownership still comes from the owner record on disk.
-    const closer = new HerdrDriver(join(root, "tests/fixtures/screen-soak/fake-herdr.mjs"), 3, steppedTime());
-    await closeKeptBoard(closer.close(board), host, repo, runId);
-    expect(printed).toHaveBeenCalledTimes(1);
-    const text = String(printed.mock.calls[0]![0]);
-    const token = (JSON.parse(readFileSync(join(repo, ".tickmarkr", "supervision", `watch-board.${runId}.json`), "utf8")) as { token: string }).token;
-    expect(text).toContain(`watch cleanup unacknowledged for ${board.name}`);
-    expect(text).toContain(`pane ${board.id} screen stdout:\nkept-board-stdout\npane ${board.id} stdout/stderr:\n`);
-    expect(text.split(`pane ${board.id} stdout/stderr:\n`)[1]).toContain("kept-board-shell\nkept-board-stderr\nowner: ");
-    expect(text).toContain(`owner: {"repo":`);
-    expect(text).toContain(`stop: {"token":"${token}"}`);
-    expect(text).toContain("ack: (absent)");
-    expect(host.read().panes.map(p => p.pane_id)).toEqual([board.id]); // the unacknowledged board stays protected
-    host.write({ ...host.read(), panes: [] });
-    await expect(closeKeptBoard(closer.close(board), host, repo, runId)).rejects.toThrow(/closed without presence acknowledgement/);
-    expect(printed).toHaveBeenCalledTimes(1);
-  } finally { printed.mockRestore(); host.dispose(); }
-});
 
 test("Run’s o action reaches the new driver focus capability using recorded run/task/attempt ownership and verifies the actual target before focus. Fake Herdr/Orca fixtures distinguish matching, foreign, closed and unsupported panes without title-text guesses, and daemon source commands preserve grouping, right/no-focus launch, canonical names, titles at most 20 characters and keepPanes forever. A selected task focusing a same-title foreign pane or a placement failure advertised as an opened board fails.", async () => {
   const host = boardHost();
@@ -218,10 +150,8 @@ test("Run’s o action reaches the new driver focus capability using recorded ru
     expect(board).toBeDefined();
     expect(preservation.read().panes).toHaveLength(1);
     expect(preservation.calls().filter(args => args[1] === "close")).toEqual([]);
-    // Test-owned teardown after proving the forever contract. C-16 (D-697): on public macOS CI the kept board
-    // sometimes never acknowledges the stop, even given 20 s, so close fails closed and protects the pane; that
-    // is not this case's subject. The tolerated close prints the board's evidence; any other close error still fails.
-    await closeKeptBoard(herdr.close(board!), preservation, keptRepo, "run-keep-forever");
+    // Test-owned teardown after proving the forever contract.
+    await herdr.close(board!);
   } finally { preservation.dispose(); }
   expect((await new SubprocessDriver().focus()).status).toBe("unsupported");
 }, 30000);

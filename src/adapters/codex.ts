@@ -83,9 +83,15 @@ function codexRetirement(upgrade: unknown): ModelRetirement | null | undefined {
 
 // tickmarkr worktrees keep their gitdir under the MAIN repo's .git/worktrees/<name> — outside the
 // workspace-write sandbox root — so git commit dies on index.lock (incident run-20260709-104447
-// P87-08: "Unable to create …/.git/worktrees/…/index.lock"). Expanded by the pane shell at the
-// worktree cwd; in a plain repo it resolves to ./.git (already writable, harmless).
-const GITDIR_WRITABLE = `-c "sandbox_workspace_write.writable_roots=[\\"$(git rev-parse --path-format=absolute --git-common-dir)\\"]"`;
+// P87-08: "Unable to create …/.git/worktrees/…/index.lock"). Expanded by the launching shell at the
+// worktree cwd, for EVERY Codex role (worker, judge, review, consult share these builders).
+// v2.6.6 T9 (K, D-912): the grant is exactly what a linked-worktree branch commit writes — the worktree's
+// own gitdir (only when it differs from the common dir), common/objects, common/refs, common/logs. The
+// shipped [common] grant (and D-910's [common, gitdir]) let a sandboxed seat write <common>/hooks and
+// <common>/config, which unsandboxed git later runs. No common-root fallback: an ordinary checkout gets
+// no gitdir root and its commit fails closed. packed-refs is not granted (packed-ref ops fail closed).
+// doctor's probe (codex-commit-check.ts) executes these exact bytes; it never rebuilds the grant.
+export const CODEX_GIT_GRANT = `-c "sandbox_workspace_write.writable_roots=[$(tkr_common=$(git rev-parse --path-format=absolute --git-common-dir); tkr_gitdir=$(git rev-parse --absolute-git-dir); if [ "$tkr_gitdir" != "$tkr_common" ]; then printf '"%s",' "$tkr_gitdir"; fi; printf '"%s/objects","%s/refs","%s/logs"' "$tkr_common" "$tkr_common" "$tkr_common")]"`;
 
 // OBS-125: codex 0.144.x gates enabled hooks behind PER-PROJECT-PATH hook trust — a NEW gate distinct
 // from the directory trust seedCodexTrust seeds. Every worker runs in a fresh ephemeral worktree, an
@@ -249,13 +255,13 @@ export const codex: WorkerAdapter = {
   probe: async () => probeVersion("codex"),
   channels: (cfg: TickmarkrConfig): BillingChannel[] => channelsFromConfig("codex", cfg),
   // v1.65 T3: every flag the command builder below hardcodes (incl. codexMcpSuppressionFlags' -c/
-  // --disable and GITDIR_WRITABLE's -c) — all listed by top-level `codex --help`, verified 2026-07-22.
+  // --disable and CODEX_GIT_GRANT's -c) — all listed by top-level `codex --help`, verified 2026-07-22.
   hardcodedFlags: { binary: "codex", flags: ["--sandbox", "-a", "-s", "--model", "-c", "--disable", "--dangerously-bypass-hook-trust"] },
   // --sandbox workspace-write is the autonomous sandbox mode (codex v0.144.1+)
   // MCP suppression built per dispatch (config can change between runs) — see codexMcpSuppressionFlags.
   // CODEX_HOOK_TRUST (OBS-125) clears the per-worktree "Hooks need review" gate while keeping the sandbox.
   headlessCommand: (promptFile: string, model: string, effort?: Effort) =>
-    `codex exec --sandbox workspace-write ${CODEX_HOOK_TRUST} ${codexMcpSuppressionFlags()} ${GITDIR_WRITABLE}${codexEffortFlag(effort)} --model ${shq(model)} - < ${shq(promptFile)}`,
+    `codex exec --sandbox workspace-write ${CODEX_HOOK_TRUST} ${codexMcpSuppressionFlags()} ${CODEX_GIT_GRANT}${codexEffortFlag(effort)} --model ${shq(model)} - < ${shq(promptFile)}`,
   // OBS-930: the visible pane runs the REAL TUI. Codex's TUI takes its prompt only as the [PROMPT]
   // positional (`codex --help`, 0.153.4 — no file/stdin form), so the launch inlines the file exactly
   // as the claude adapter does: the prompt is the LAST positional and every flag value is followed by
@@ -268,7 +274,7 @@ export const codex: WorkerAdapter = {
   // prompt over promptArgvCeiling() returns null → worker-mode-fallback → the headless form (types.ts).
   interactiveCommand: (promptFile: string, model: string, effort?: Effort) =>
     promptFitsArgv(promptFile)
-      ? `codex -a never -s workspace-write ${CODEX_HOOK_TRUST} ${codexMcpSuppressionFlags()} ${GITDIR_WRITABLE}${codexEffortFlag(effort)} --model ${shq(model)} "$(cat ${shq(promptFile)})"`
+      ? `codex -a never -s workspace-write ${CODEX_HOOK_TRUST} ${codexMcpSuppressionFlags()} ${CODEX_GIT_GRANT}${codexEffortFlag(effort)} --model ${shq(model)} "$(cat ${shq(promptFile)})"`
       : null,
   invoke(task: Task, _cwd: string, a: Assignment, ctx: { promptFile: string }): Invocation {
     return { command: this.headlessCommand(ctx.promptFile, a.model, a.effort) };

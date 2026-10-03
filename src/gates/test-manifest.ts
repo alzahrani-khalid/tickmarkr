@@ -653,6 +653,9 @@ export async function evaluateManifestedTest(cmd: string, cwd: string, opts: {
   /** OBS-1166: the configured command BEFORE a selected screen narrowed it, so a stranded retry's
    * only positional filters are the stranded files. Absent (a full suite), `cmd` is that command. */
   retryBaseCommand?: string;
+  /** v2.6.6 C: false on the manifest gate's one outer re-measurement — the second sample is one
+   * execution and never stacks the stranded single-fork recovery on top of the retry it already is. */
+  allowStrandedRecovery?: boolean;
 }): Promise<ManifestGateOutcome> {
   const dir = opts.artifactDir ?? mkdtempSync(join(tmpdir(), "tickmarkr-test-report-"));
   let nonce = randomBytes(16).toString("hex");
@@ -690,7 +693,7 @@ export async function evaluateManifestedTest(cmd: string, cwd: string, opts: {
       hangActiveMs: invoked.hangActiveMs, hangWallMs: invoked.hangWallMs });
     evidenceReceipts.push(...invoked.evidenceReceipts);
     const interruptions = [...invoked.interruptions];
-    const stranded = strandedSingleForkFiles(files, nonce, invoked);
+    const stranded = opts.allowStrandedRecovery === false ? undefined : strandedSingleForkFiles(files, nonce, invoked);
     if (stranded) {
       const first = invoked.report!;
       const retryNonce = randomBytes(16).toString("hex");

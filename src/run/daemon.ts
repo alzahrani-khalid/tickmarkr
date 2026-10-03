@@ -4,7 +4,7 @@ import { COMMAND_LEASE_TOKEN_ENV, commandLeaseEnvironment, CommandLeases, curren
 import { execFileSync, spawn } from "node:child_process";
 import { createHash, type Hash, randomBytes } from "node:crypto";
 import { shq } from "../adapters/types.js";
-import { appendFileSync, closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, readlinkSync, readSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { appendFileSync, closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, readlinkSync, readSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, posix, relative, resolve, sep } from "node:path";
@@ -26,6 +26,7 @@ import { formatOwnedName, type ExecutorDriver, type Slot } from "../drivers/type
 import { type Baseline, type BaselineProvenance, captureBaseline, detectGateCommands, detectVacuousOracles, type GateEvidenceOptions } from "../gates/baseline.js";
 import { reobserveTestFiles, runGates, type GateContext, type GateEvent } from "../gates/run-gates.js";
 import { isInfraResult } from "../gates/cache.js";
+import { RUNNER_INFRA_DIAGNOSTIC_RE, timeoutShaped } from "../gates/timeout-shaped.js";
 import type { GateResult } from "../gates/types.js";
 import { filesGlob } from "../graph/files-glob.js";
 import { addEvidence, attributeBlocked, batteryPriority, blockedTasks, getTask, graphDefinitionHash, loadGraph, pendingTasks, readyTasks, saveGraph, setStatus, taskContentDigest, tickmarkrDir } from "../graph/graph.js";
@@ -36,7 +37,8 @@ import { executionSignal, remainingExecutionMs, withExecutionBudget, withoutExec
 import { repairSelectionDecision, repairSelectionEnabled } from "./repair-selection.js";
 import { failureDisposition, reserveInfrastructureRetry } from "./recovery.js";
 import { runEnvironment } from "./environment.js";
-import { changeRepresented, cleanupRunWorktrees, deriveForkCap, FORK_CAP_ENV, gitHead, linkNodeModules, npmDependencyInstallCommand, npmDependencyManifestChanged, PRESERVE_COMMIT_SUBJECT, PRESERVE_PRODUCER_TRAILER, preserveWorktree, type PreserveProducer, producerFields, resolvedCapacity, runWithForkBudget, runWithVerificationBudget, type RunCapacity, sameCapacity, sameVerification, sh, shGit, SUITE_PARENT_ENV, verificationProtocol, WORKTREE_LAYOUT_CONTRACT, worktreePath } from "./git.js";
+import { changeRepresented, cleanupRunWorktrees, deriveForkCap, FORK_CAP_ENV, gitHead, linkNodeModules, npmDependencyInstallCommand, npmDependencyManifestChanged, PRESERVE_COMMIT_SUBJECT, PRESERVE_PRODUCER_TRAILER, preserveWorktree, type PreserveProducer, producerFields, removeWorktree, resolvedCapacity, runWithForkBudget, runWithVerificationBudget, type RunCapacity, sameCapacity, sameVerification, sh, shGit, SUITE_PARENT_ENV, verificationProtocol, WORKTREE_LAYOUT_CONTRACT, WORKTREES_DIR, worktreePath } from "./git.js";
+import { MASK } from "./redact.js";
 import { runInteractiveSeed, type InteractiveSeedResult } from "./interactive-seed.js";
 import { classifyRepairDisposition, resolveScopeHints } from "./repair-disposition.js";
 import { applyScopeAmendments, activeRetryBan, interruptedAttempt, RESUME_HARVEST_SOURCE, resumeHarvestAuthor, approvalAction, APPROVAL_REFUSED, bindingToken, effectiveEvents, foldDecisions, physicalLine, staleApprovals, classifyTaskFailure, classifyWorkerResultCause, deferredReviewFindings, engagementComparable, formatPriorFindingEvidence, GATE_FINGERPRINT_CAP, GATE_SATISFIED_RELEASE, identicalGateFailures, isDeferredFinding, journaledFailureBrief, Journal, loadRoutingProfile, newRunId, normalizeGateFailure, outstandingConsultGuidance, readableExcerpt, receiptOrigin, outstandingReviewFindings, pendingApprovalActions, pendingRechecks, pendingRepairFindings, phaseForGate, priorJudgments, readPriorRunEvidence, recordedTaskFailureKind, reraisedReviewChains, RECHECK_RELEASE, renderStructuredReviewFinding, repairReachSinceApproval, repairsSinceApproval, reviewRoundsSinceApproval, runHasEnded, standingRulings, structuredFindings, upheldFeedbackByTask, type CurrentAttemptGateReplay, type JournalEvent, type ParkKind, type ResumeState, type RetryMode, type StructuredFinding } from "./journal.js";
@@ -489,9 +491,6 @@ function classifyInfraResult(g: GateResult): void {
 // diagnostics (never-started files, a worker RPC timeout) that make such a red infrastructure-SHAPED.
 // Shape alone never parks anything: it only buys one isolated re-observation before a charge. A
 // fresh-fingerprint section masks digits to `#`, so both spellings of a number are read.
-const TIMEOUT_SHAPED_RE = /\b(?:Test|Hook) timed out in (?:\d+|#)\s*ms\b|\bexpected (?:\d+|#)(?:\.(?:\d+|#))? to be (?:less than|below)(?: or equal to)? (?:\d+|#)/i;
-const RUNNER_INFRA_DIAGNOSTIC_RE = /\bnever-started (?:[1-9]\d*|#)(?![\d#])|\[vitest-worker\]: Timeout calling\b/;
-const timeoutShaped = (details: string) => TIMEOUT_SHAPED_RE.test(readableExcerpt(details));
 /** C (E1): the one no-verdict that is the host's slowness, not the seat's — the same predicate run-gates
  * applies to its run-scoped tally, read here for the live task strike and the resume reconstruction. */
 const proofTimeoutNote = (data: Record<string, unknown>): boolean =>
@@ -2787,7 +2786,28 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         to: loadedHash,
       });
     }
-    baseline = JSON.parse(readFileSync(join(journal.dir, "baseline.json"), "utf8"));
+    // B (D-812): a daemon interrupted inside its capture leaves run-start without baseline.json. Only
+    // that absence recaptures; existing bytes that do not parse fail closed and are never written over.
+    const baselinePath = join(journal.dir, "baseline.json");
+    let recapture = false;
+    try {
+      baseline = JSON.parse(readFileSync(baselinePath, "utf8"));
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        throw new Error(`refusing to resume ${runId}: existing baseline.json is unreadable (${error instanceof Error ? error.message : String(error)}) — it is never recaptured over`);
+      }
+      // The recapture measures run-start's commands; current config is no authority for that base.
+      // Only unmasked bytes prove equality: redaction maps a changed credential onto the same mask, so a
+      // journaled command carrying the mask cannot be proven unchanged and is refused like a change.
+      const recorded = (typeof start.data.commands === "object" && start.data.commands !== null ? start.data.commands : {}) as Record<string, unknown>;
+      const effective: Record<string, unknown> = commands;
+      const changed = [...new Set([...Object.keys(recorded), ...Object.keys(effective)])]
+        .filter((name) => recorded[name] !== effective[name] || String(recorded[name]).includes(MASK)).sort();
+      if (changed.length > 0) {
+        throw new Error(`refusing to resume ${runId}: baseline recapture refused — effective commands differ from (or are masked in) run-start's journaled commands: ${changed.join(", ")}`);
+      }
+      recapture = true;
+    }
     const replayEvents = journal.read();
     // journal.replayStatuses predates typed releases and re-pends even inert rows. Keep that
     // legacy reader intact; scheduling accepts only the fold's recognised authorities.
@@ -2828,8 +2848,41 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     });
     runStarted = true;
     await placeBoard();
-    // A terminal resume with no commands has no execution to admit.
-    if (Object.keys(commands).length > 0 || graph.tasks.some(t => ["pending", "running", "gated"].includes(t.status))) {
+    if (recapture) {
+      // Moved HEAD is never baseline authority: measure the journaled base in a detached checkout this
+      // daemon owns, and publish by rename so any interruption leaves no baseline.json or a whole one.
+      journal.append("baseline-recapture-start", undefined, { baseRef, commands, capacity: resolvedCapacity() });
+      baselinePending = true;
+      baselineCapture = withCommandContext(undefined, async () => {
+        const parent = join(tickmarkrDir(repoRoot), WORKTREES_DIR);
+        mkdirSync(parent, { recursive: true });
+        // A killed daemon never reaches the finally below; sweep checkouts whose owner is dead.
+        for (const entry of readdirSync(parent)) {
+          const owner = /^baseline-recapture-(\d+)-\w{6}$/.exec(entry)?.[1];
+          if (owner && !isPidLive(Number(owner))) await removeWorktree(repoRoot, join(parent, entry));
+        }
+        const pristine = mkdtempSync(join(parent, `baseline-recapture-${process.pid}-`));
+        const staged = `${baselinePath}.${process.pid}.tmp`;
+        try {
+          const added = await shGit(`git worktree add --detach ${shq(pristine)} ${shq(baseRef)}`, repoRoot);
+          if (added.code !== 0) throw new Error(`baseline recapture: journaled base ${baseRef} cannot be checked out: ${added.stderr.trim()}`);
+          if (!linkNodeModules(repoRoot, pristine, { force: true })) throw new Error("baseline recapture: pristine node_modules link could not be provisioned");
+          await initializeHost();
+          const captured: Baseline = { ...await captureBaseline(pristine, commands),
+            provenance: { baseRef, capturedAt: new Date().toISOString() } };
+          writeFileSync(staged, JSON.stringify(captured, null, 2));
+          renameSync(staged, baselinePath);
+          baseline = captured;
+          journal.append("baseline-recapture-complete", undefined, { provenance: captured.provenance });
+          for (const warning of captured.warnings ?? []) journal.append("baseline-warning", undefined, { ...warning });
+        } finally {
+          rmSync(staged, { force: true });
+          await removeWorktree(repoRoot, pristine);
+        }
+      }).finally(() => { baselinePending = false; });
+      void baselineCapture.catch(() => { baselineFailed = true; });
+    } else if (Object.keys(commands).length > 0 || graph.tasks.some(t => ["pending", "running", "gated"].includes(t.status))) {
+      // A terminal resume with no commands has no execution to admit.
       baselineCapture = initializeHost();
       void baselineCapture.catch(() => { baselineFailed = true; });
     }
@@ -3776,6 +3829,88 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       e.event === "gate-result" && e.taskId === t.id && e.data.gate === "test" && e.data.pass === false
       && !(cfg.executionPolicy?.boundedInfrastructure && e.data.disposition === "infrastructure"));
     let retryMode: RetryMode = "fresh";
+    // v2.6.6 A: the ONE post-result settlement both gate loops call. Order is the contract:
+    // satisfied → merge (tip-moved once regates, twice parks; a conflict goes back to the caller), else
+    // noEligible → infra → diff-cap → adjudication → outside-scope → disposition, and whatever survives
+    // is the caller's "red". Every declared resume/live difference arrives as a parameter; nothing here
+    // normalizes one. Preparation, replay, conflict handling, repair funding, feedback and cleanup stay
+    // in the callers.
+    const settleResults = async (results: GateResult[], p: {
+      wt: string; taskBase: string; taskBranch: string; gated: string; commit: string; outsideScopeForced: boolean;
+      author: Assignment; attempts: number; infraReason: (g: GateResult) => string;
+      reobserve: { attempt: number; replayed: boolean };
+      disposition: () => { author: Assignment; attempt: number };
+      beforeMerge?: () => void; firstAttemptOk: boolean;
+      metering: { tokens?: TokenUsage | undefined; meteredAttempts?: number | undefined };
+    }): Promise<{ kind: "merged" | "regate" | "parked" | "red" } | { kind: "conflict"; conflict: string | undefined }> => {
+      const parkAs = (reason: string, kind: ParkKind) =>
+        park(t, reason, kind, p.author, p.attempts, startMs, gateFails, consults, tokens, metered, retryMode);
+      if (results.every(gateSatisfied)) {
+        p.beforeMerge?.();
+        const m = await mergeSerial(p.taskBranch, t, p.gated);
+        if (m.tipMoved) {
+          journal.append("tip-moved", t.id, m.tipMoved);
+          if (tipMoves++ === 0) return { kind: "regate" };
+          await parkAs("task branch tip moved twice after gating", "tip-moved");
+          return { kind: "parked" };
+        }
+        if (!m.ok) {
+          journal.append("merge-conflict", t.id, { conflict: m.conflict });
+          return { kind: "conflict", conflict: m.conflict };
+        }
+        graph = setStatus(graph, t.id, "done");
+        saveGraph(repoRoot, graph);
+        journal.append("task-done", t.id, {
+          attempts: p.attempts, assignment: p.author, taskContentDigest: contentDigest,
+          authors: mergedAuthors(await subjectAuthors(journal.read(), t.id, p.wt, p.taskBase)),
+        });
+        journal.append("merge", t.id, { branch: p.taskBranch, commit: await integrationHead(intWt) });
+        await trackedDriver.project?.(t.id, "completed");
+        // firstAttemptOk/gateFails/consults are recorded FACTS, not policy — a parkKind:"stall" row is
+        // recorded but NOT quality-negative in v1.6; Phase 12 owns reward policy, so flipping it later needs zero data migration.
+        journal.telemetry({
+          taskId: t.id, shape: t.shape, adapter: p.author.adapter, model: p.author.model,
+          channel: p.author.channel, attempts: p.attempts, outcome: "done",
+          durationMs: Date.now() - startMs, firstAttemptOk: p.firstAttemptOk, gateFails, consults, ...p.metering, retryMode,
+        });
+        return { kind: "merged" };
+      }
+      // OBS-540: infra is a fail-closed NON-verdict, not quality degradation. Park with the blocker
+      // already journaled by onGate, before gateFails and before any ladder selection can fund an
+      // identical retry in the same environment. Parsed judge refusals never carry infra and keep
+      // flowing through the chargeable quality path below.
+      const unavailableReview = results.find((g) => gateFailed(g) && g.meta?.noEligibleReviewer === true);
+      if (unavailableReview) {
+        await parkAs(gateFailApprovalReason(t.id, unavailableReview.details, true), "gate-fail");
+        return { kind: "parked" };
+      }
+      // OBS-1106: same predicate as classification — an infra replay is parked, never repaired.
+      const infra = results.find((g) => gateFailed(g) && isInfraResult(g));
+      if (infra) {
+        await parkAs(p.infraReason(infra), "infra");
+        return { kind: "parked" };
+      }
+      // OBS-1007: a cap trip is a typed park of its own — the diff cannot shrink by retrying and the
+      // only honest verb is a recheck under a raised cap. Decided BEFORE the authoring classifier, which
+      // used to lift `gates.diffCap` out of the cap prose as a files[] hint.
+      const capTrip = results.find(isDiffCapPark);
+      if (capTrip) {
+        await parkAs(`${capTrip.gate}: ${capTrip.details}`, "diff-cap");
+        return { kind: "parked" };
+      }
+      if (await adjudicateInfraShapedRed(t, results, p.wt, p.commit, p.reobserve.attempt, p.reobserve.replayed,
+        (reason) => parkAs(reason, "infra"))) return { kind: "parked" };
+      if (p.outsideScopeForced && freshOutsideScopeRed(t, p.commit)) {
+        await parkAs(outsideScopePark(t), "gate-fail");
+        return { kind: "parked" };
+      }
+      // OBS-547: who pays for this red is decided by the run's collateral prediction (see
+      // dispositionScopeRed) — an authoring defect parks unchargeable before any accounting below.
+      const d = p.disposition();
+      if (await dispositionScopeRed(t, results, d.author, d.attempt, startMs, gateFails, consults, tokens, metered,
+        retryMode, await treeOrDiffPaths(p.taskBase, p.wt))) return { kind: "parked" };
+      return { kind: "red" };
+    };
     let lastContextTokens: number | undefined; // v1.23 reset signal, including stalled/quota attempts
     // v1.29: only a gate-failed attempt can seed same-session retry. The next attempt consumes this
     // once; a changed channel, unknown context, or missing resumeCommand falls back to fresh.
@@ -4362,26 +4497,11 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         const approvedCommits = await commitsAheadOf(taskBase, wt);
         graph = addEvidence(graph, t.id, { commits: approvedCommits, gateResults: results });
         saveGraph(repoRoot, graph);
-        if (!results.every(gateSatisfied)) {
-          const unavailableReview = results.find((g) => gateFailed(g) && g.meta?.noEligibleReviewer === true);
-          if (unavailableReview) {
-            await park(t, gateFailApprovalReason(t.id, unavailableReview.details, true), "gate-fail", gateAuthor, rs?.attempts ?? 0,
-              startMs, gateFails, consults, tokens, metered, retryMode);
-            return;
-          }
-          // OBS-1106: same predicate as classification — an infra replay is parked, never repaired.
-          const infra = results.find((g) => gateFailed(g) && isInfraResult(g));
-          if (infra) {
-            await park(t, `${infra.gate}: ${infra.details}`, "infra", gateAuthor, rs?.attempts ?? 0,
-              startMs, gateFails, consults, tokens, metered, retryMode);
-            return;
-          }
-          const capTrip = results.find(isDiffCapPark);
-          if (capTrip) {
-            await park(t, `${capTrip.gate}: ${capTrip.details}`, "diff-cap", gateAuthor, rs?.attempts ?? 0,
-              startMs, gateFails, consults, tokens, metered, retryMode);
-            return;
-          }
+        const n = rs?.attempts ?? 0;
+        const settled = await settleResults(results, {
+          wt, taskBase, taskBranch, gated, commit: gateSubject.commit, outsideScopeForced,
+          author: gateAuthor, attempts: n, infraReason: (g) => `${g.gate}: ${g.details}`,
+          reobserve: { attempt: n, replayed: false }, firstAttemptOk: false, metering: {},
           // OBS-547: disposition FIRST, and through the same helper the ordinary attempt path uses. A
           // crash between a journaled scope red and its classification must not turn a predicted red
           // into a charged one just because a resume is what observed it.
@@ -4393,17 +4513,12 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           // erase an EARLIER chargeable attempt and attribute the park to the assignment the rewind
           // restored. Ask the journal which state this is, and take the classified dispatch's own
           // assignment back with it.
-          if (await adjudicateInfraShapedRed(t, results, wt, gateSubject.commit, rs?.attempts ?? 0, false, (reason) =>
-            park(t, reason, "infra", gateAuthor, rs?.attempts ?? 0, startMs, gateFails, consults, tokens, metered, retryMode))) return;
-          if (outsideScopeForced && freshOutsideScopeRed(t, gateSubject.commit)) {
-            await park(t, outsideScopePark(t), "gate-fail", gateAuthor, rs?.attempts ?? 0,
-              startMs, gateFails, consults, tokens, metered, retryMode);
-            return;
-          }
-          const classified = journal.classifiedDispatch(t.id);
-          if (await dispositionScopeRed(t, results, classified?.assignment ?? gateAuthor,
-            classified ? (rs?.attempts ?? 0) : Math.max(0, (rs?.attempts ?? 0) - 1),
-            startMs, gateFails, consults, tokens, metered, retryMode, await treeOrDiffPaths(taskBase, wt))) return;
+          disposition: () => {
+            const classified = journal.classifiedDispatch(t.id);
+            return { author: classified?.assignment ?? gateAuthor, attempt: classified ? n : Math.max(0, n - 1) };
+          },
+        });
+        if (settled.kind === "red") {
           gateFails++;
           // Observed green gates are only measurements. If the resumed suffix is red, preserve that
           // result in the journal and return to the ordinary attempt/consult ladder, which rebuilds
@@ -4449,34 +4564,13 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           return;
         }
 
-        const m = await mergeSerial(taskBranch, t, gated);
-        if (m.tipMoved) {
-          journal.append("tip-moved", t.id, m.tipMoved);
-          if (tipMoves++ === 0) continue gateLoop;
-          await park(t, "task branch tip moved twice after gating", "tip-moved", gateAuthor,
-            rs?.attempts ?? 0, startMs, gateFails, consults, tokens, metered, retryMode);
-          return;
-        }
-        if (!m.ok) {
-          journal.append("merge-conflict", t.id, { conflict: m.conflict });
-          await park(t, `merge conflict after ${resumeReason}: ${m.conflict ?? "unknown conflict"}`,
+        if (settled.kind === "regate") continue gateLoop;
+        if (settled.kind === "parked") return;
+        if (settled.kind === "conflict") {
+          await park(t, `merge conflict after ${resumeReason}: ${settled.conflict ?? "unknown conflict"}`,
             "merge-conflict", gateAuthor, rs?.attempts ?? 0, startMs, gateFails, consults, tokens, metered, retryMode);
           return;
         }
-
-        graph = setStatus(graph, t.id, "done");
-        saveGraph(repoRoot, graph);
-        journal.append("task-done", t.id, {
-          attempts: rs?.attempts ?? 0, assignment: gateAuthor, taskContentDigest: contentDigest,
-          authors: mergedAuthors(await subjectAuthors(journal.read(), t.id, wt, taskBase)),
-        });
-        journal.append("merge", t.id, { branch: taskBranch, commit: await integrationHead(intWt) });
-        await trackedDriver.project?.(t.id, "completed");
-        journal.telemetry({
-          taskId: t.id, shape: t.shape, adapter: gateAuthor.adapter, model: gateAuthor.model,
-          channel: gateAuthor.channel, attempts: rs?.attempts ?? 0, outcome: "done",
-          durationMs: Date.now() - startMs, firstAttemptOk: false, gateFails, consults, retryMode,
-        });
         await reconcile({ spareLiveLlm: true });
         return;
       }
@@ -6470,7 +6564,14 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         if (results.some((g) => g.gate === "test" && !g.pass
           && !(cfg.executionPolicy?.boundedInfrastructure && failureDisposition(g) === "infrastructure"))) testGateFailed = true;
 
-        if (results.every(gateSatisfied)) {
+        const live = assignment;
+        const settled = await settleResults(results, {
+          wt, taskBase, taskBranch, gated, commit: gateSubject.commit, outsideScopeForced,
+          author: live, attempts: attempt + 1,
+          infraReason: (g) => `${g.gate}: ${g.details}${g.meta?.recoveryBlocked ? ` — ${g.meta.recoveryBlocked}` : ""}`,
+          reobserve: { attempt, replayed: gateSubject.replayedFromAttempt !== undefined },
+          disposition: () => ({ author: live, attempt }),
+          firstAttemptOk: attempt === 0, metering: { tokens, meteredAttempts: tokens ? metered : undefined },
           // T6: every gate — the review included — is satisfied on this commit, so the failure brief
           // this loop is still holding describes nothing outstanding. It is dropped HERE, before the
           // merge, because a conflict below sends the task around the attempt loop again: a brief kept
@@ -6479,33 +6580,20 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           // leaving that dispatch's row indistinguishable from an amnesiac one. Rebuilt exactly as the
           // gate-fail brief is, so prior-RUN evidence (retired by its own rule, not by this reviewer)
           // survives and only this run's settled findings go.
-          feedback = withCarriedEvidence("");
-          fatalStop.signal.throwIfAborted();
-          executionSignal()?.throwIfAborted();
-          const m = await mergeSerial(taskBranch, t, gated);
-          if (m.tipMoved) {
-            journal.append("tip-moved", t.id, m.tipMoved);
-            if (tipMoves++ === 0) continue gateLoop;
-            await park(t, "task branch tip moved twice after gating", "tip-moved", assignment, attempt + 1, startMs, gateFails, consults, tokens, metered, retryMode);
-            return;
-          }
-          if (!m.ok) {
-            journal.append("merge-conflict", t.id, { conflict: m.conflict });
-            const v = await runConsult("merge-conflict", output, m.conflict ?? "", results);
-            if (await applyVerdict(v, attempt + 1, "merge-conflict")) continue attempts;
-            return;
-          }
-          graph = setStatus(graph, t.id, "done");
-          saveGraph(repoRoot, graph);
-          journal.append("task-done", t.id, {
-            attempts: attempt + 1, assignment, taskContentDigest: contentDigest,
-            authors: mergedAuthors(await subjectAuthors(journal.read(), t.id, wt, taskBase)),
-          });
-          journal.append("merge", t.id, { branch: taskBranch, commit: await integrationHead(intWt) });
-          await trackedDriver.project?.(t.id, "completed");
-          // firstAttemptOk/gateFails/consults are recorded FACTS, not policy — a parkKind:"stall" row is
-          // recorded but NOT quality-negative in v1.6; Phase 12 owns reward policy, so flipping it later needs zero data migration.
-          journal.telemetry({ taskId: t.id, shape: t.shape, adapter: assignment.adapter, model: assignment.model, channel: assignment.channel, attempts: attempt + 1, outcome: "done", durationMs: Date.now() - startMs, firstAttemptOk: attempt === 0, gateFails, consults, tokens, meteredAttempts: tokens ? metered : undefined, retryMode });
+          beforeMerge: () => {
+            feedback = withCarriedEvidence("");
+            fatalStop.signal.throwIfAborted();
+            executionSignal()?.throwIfAborted();
+          },
+        });
+        if (settled.kind === "regate") continue gateLoop;
+        if (settled.kind === "parked") return;
+        if (settled.kind === "conflict") {
+          const v = await runConsult("merge-conflict", output, settled.conflict ?? "", results);
+          if (await applyVerdict(v, attempt + 1, "merge-conflict")) continue attempts;
+          return;
+        }
+        if (settled.kind === "merged") {
           // D-07 done means gone (merged-P42-01-worker incident): a merged task's worker pane closes on
           // the task-done path, not at run end. Only THIS successful attempt's `slot` is in scope — prior
           // failed attempts' slots stay in keptSlots governed by keepPanes (they hold failure context the
@@ -6524,52 +6612,6 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         }
         break gateLoop;
       }
-
-      // OBS-540: infra is a fail-closed NON-verdict, not quality degradation. Park with the blocker
-      // already journaled by onGate, before gateFails and before any ladder selection can fund an
-      // identical retry in the same environment. Parsed judge refusals never carry infra and keep
-      // flowing through the chargeable quality path below.
-      const unavailableReview = results.find((g) => gateFailed(g) && g.meta?.noEligibleReviewer === true);
-      if (unavailableReview) {
-        await park(t, gateFailApprovalReason(t.id, unavailableReview.details, true), "gate-fail", assignment, attempt + 1,
-          startMs, gateFails, consults, tokens, metered, retryMode);
-        return;
-      }
-      const infraFailure = results.find((g) => gateFailed(g) && isInfraResult(g));
-      if (infraFailure) {
-        await park(
-          t,
-          `${infraFailure.gate}: ${infraFailure.details}${infraFailure.meta?.recoveryBlocked ? ` — ${infraFailure.meta.recoveryBlocked}` : ""}`,
-          "infra",
-          assignment,
-          attempt + 1,
-          startMs,
-          gateFails,
-          consults,
-          tokens,
-          metered,
-          retryMode,
-        );
-        return;
-      }
-
-      // OBS-1007: a cap trip is a typed park of its own — the diff cannot shrink by retrying and the
-      // only honest verb is a recheck under a raised cap. Decided BEFORE the authoring classifier, which
-      // used to lift `gates.diffCap` out of the cap prose as a files[] hint.
-      const capTrip = results.find(isDiffCapPark);
-      if (capTrip) {
-        await park(t, `${capTrip.gate}: ${capTrip.details}`, "diff-cap", assignment, attempt + 1, startMs, gateFails, consults, tokens, metered, retryMode);
-        return;
-      }
-      if (await adjudicateInfraShapedRed(t, results, wt, gateSubject!.commit, attempt, gateSubject!.replayedFromAttempt !== undefined, (reason) =>
-        park(t, reason, "infra", assignment, attempt + 1, startMs, gateFails, consults, tokens, metered, retryMode))) return;
-      if (outsideScopeForced && freshOutsideScopeRed(t, gateSubject!.commit)) {
-        await park(t, outsideScopePark(t), "gate-fail", assignment, attempt + 1, startMs, gateFails, consults, tokens, metered, retryMode);
-        return;
-      }
-      // OBS-547: who pays for this red is decided by the run's collateral prediction (see
-      // dispositionScopeRed) — an authoring defect parks unchargeable before any accounting below.
-      if (await dispositionScopeRed(t, results, assignment, attempt, startMs, gateFails, consults, tokens, metered, retryMode, await treeOrDiffPaths(taskBase, wt))) return;
 
       gateFails++; // this attempt's gates failed — the one place quality degradation is verified (never inferred from attempts)
       // v1.53 T3: prefer the CLI's own session id captured from this attempt's output (kimi's resume

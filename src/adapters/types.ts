@@ -56,15 +56,19 @@ export interface AuthHealth {
   // = the CLI's notice. A missing key is unknown (the CLI's notice was absent or malformed); the whole
   // field missing is unknown too (pre-2.6.4 doctor.json, unreadable cache). Advisory: routing never reads it.
   modelRetirements?: Record<string, ModelRetirement | null>;
-  // v2.6.5 T3: Codex record only — doctor's linked-worktree index.lock probe (codex-commit-check.ts).
-  // Absent = unknown (pre-2.6.5 doctor.json, stubbed adapter). Advisory: plan names it, routing never reads it.
-  codexCommit?: "protected" | "allowed" | "unknown";
+  // v2.6.5 T3 → v2.6.6 T9 (K): Codex record only — doctor's worker-grant probe (codex-commit-check.ts), the
+  // closed table below. Absent or outside the table = unknown (pre-2.6.5 doctor.json, stubbed adapter).
+  // escape is a BLOCKING security warning in doctor and plan for every Codex role; routing never reads it.
+  codexCommit?: CodexCommitStatus;
   // v2.6.5 T10 (A1): the FIRST record of doctor.json only (registry order) — launchservicesd's last
   // readable identity and the one advisory its last change raised (launchservices-check.ts). Absent =
   // unknown. Retained across doctor writes. Advisory: verdicts, retries and routing never read it.
   launchServices?: LaunchServicesRecord;
 }
 export interface LaunchServicesRecord { pid: number; start: string; advisory?: string }
+/** allowed: linked branch commit landed, shared hooks/common root denied · protected: commit denied, controls
+ *  readable · escape: a unique hostile member was written · unknown: unreadable or contradictory receipts. */
+export type CodexCommitStatus = "allowed" | "protected" | "escape" | "unknown";
 
 export function modelAuthed(health: AuthHealth | undefined, model: string, allowUnverifiedModels = false): boolean {
   const authed = health?.modelAuth?.[model]?.authed;

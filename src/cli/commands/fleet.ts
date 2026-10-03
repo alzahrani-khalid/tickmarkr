@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { homedir } from "node:os";
+import { dirname, join, relative } from "node:path";
 import { parseArgs } from "node:util";
 import { allAdapters, discoverChannels, doctorAgeMs, initDoctorReuse, modelAuthExclusions, PREFERENCE_ROLES } from "../../adapters/registry.js";
 import { catalogModelAdvisory, catalogTierRanking, declaredModelWindow, fleetUnclassifiedModels } from "../../adapters/model-lints.js";
@@ -38,6 +39,7 @@ import {
   universeEntryMatches,
 } from "../../config/config.js";
 import { exclusionReason, projectFleetWhy, renderFleetWhy, type FleetWhyValue } from "../../config/fleet-why.js";
+import { overlayHoldingLine, overlayHoldsMap } from "../../config/fleet-overlay.js";
 import { SHAPES, TIERS, type Shape, type Task } from "../../graph/schema.js";
 import { doctor } from "./doctor.js";
 import { candidateRow, costSignal, shapeCandidates } from "./fleet-picker.js";
@@ -52,6 +54,7 @@ import type {
   FleetEditorState,
   FleetModelEvidence,
   FleetOverlayReview,
+  FleetSeededAllow,
   FleetStagedDeny,
   FleetStagedMetadata,
   FleetSteeringKey,
@@ -159,6 +162,11 @@ function formatFleetSteering(cfg: ResolvedRunMode["cfg"]): string {
 }
 
 // v1.51 T4: one gloss per routing mode on the fleet mode screen — mirrors the preset compiler.
+// T10: what every review says about where its bytes land and when they take effect
+const REPO_DESTINATION_NOTE = (path: string) =>
+  `destination: the repository overlay ${path} holds this repository's routing.allow/deny membership, so the edit lands there — the file is tracked: Fleet never stages or commits it; commit it to share the change`;
+const FUTURE_LOADS_NOTE = "the save changes future config loads only — a tickmarkr run already in progress keeps the config it loaded";
+
 const MODE_GLOSS: Record<RoutingMode, string> = {
   "partner-led": "every shape frontier · explore off",
   "risk-based": "risk-tiered default floors",
@@ -309,10 +317,17 @@ export async function assembleFleetEditor(
   | { unavailable: string }
 > {
   const globalDir = opts.globalDir;
-  // B2: the editor's choices are the operator's MACHINE choices — every save lands in the USER
-  // overlay, which every repository on this machine inherits. The repo overlay is read, never written.
+  // B2: the editor's choices are the operator's MACHINE choices — a save lands in the USER overlay,
+  // which every repository on this machine inherits. T10 (D-925/D-926): except a membership edit the
+  // repository overlay holds — it lands where it is effective (destinationEdits below).
   const userPath = join(globalDir, "config.yaml");
+  const repoPath = repoOverlayPath(cwd);
   const currentUserText = () => (existsSync(userPath) ? readFileSync(userPath, "utf8") : "");
+  type Destination = "user" | "repo";
+  const pathOf = (destination: Destination) => (destination === "repo" ? repoPath : userPath);
+  // the candidate bytes stand in for the destination layer in the one loader path
+  const layerOf = (destination: Destination, bytes: string) =>
+    (destination === "repo" ? { repoOverlayText: bytes } : { userOverlayText: bytes });
   const { reuse, health: cached } = initDoctorReuse(cwd, false);
   if (!reuse || !cached) {
     return {
@@ -473,7 +488,9 @@ export async function assembleFleetEditor(
     Object.fromEntries(DENY_SCOPES.map((scope) => [stagedDenyKeyOf(scope), editable[scope.key] ?? []])) as StagedDeny;
   // T8: staged classifications and efforts as the editable tiers/efforts a review writes — one fold for
   // the review and every preview, so the mode/shape/picker callbacks rank exactly what w would write.
-  const stagedMetadataOf = (stage: FleetStagedMetadata): Pick<FleetEditable, "tiers" | "efforts"> => {
+  // T10 (D-939): each classification's seeded allow entry rides beside the metadata, never inside FleetEditable
+  type StagedMetadata = Pick<FleetEditable, "tiers" | "efforts"> & { seeds: FleetSeededAllow[] };
+  const stagedMetadataOf = (stage: FleetStagedMetadata): StagedMetadata => {
     const tiers = structuredClone(initial.tiers);
     const today = new Date().toISOString().slice(0, 10);
     for (const classification of stage.classifications) {
@@ -485,20 +502,21 @@ export async function assembleFleetEditor(
     }
     // OBS-1182: staged efforts replace the loaded ones; none staged anywhere ⇒ no key, as loaded
     const efforts = Object.fromEntries(Object.entries(stage.efforts ?? {}).filter(([, models]) => Object.keys(models).length));
-    return { tiers, ...(Object.keys(efforts).length ? { efforts } : {}) };
+    return { tiers, ...(Object.keys(efforts).length ? { efforts } : {}), seeds: stage.seededAllowOut ?? [] };
   };
   // B2: the classifications and efforts of the last reviewed state — what a preview called without a
   // stage (the browser's staged routing, --why) ranks; the editor passes its current stage (T8).
-  let reviewedStage: Pick<FleetEditable, "tiers" | "efforts"> = { tiers: initial.tiers, efforts: initial.efforts };
-  // OBS-1182: the layers under the written overlay — B2: the defaults alone under the USER overlay —
-  // read raw, so clearing an effort masks an inherited one. OBS-1188: re-read at every review and
-  // save, never an assembly-time snapshot; an unreadable read keeps the last good one for the
-  // preview only — the save guard below refuses it.
-  let lowerOverrides: LowerLayerModelOverrides = {};
-  const stagedEditable = (map: Record<string, MapEntry>, deny: StagedDeny, metadata: Pick<FleetEditable, "tiers" | "efforts">): FleetEditable => ({
+  let reviewedStage: StagedMetadata = { tiers: initial.tiers, efforts: initial.efforts, seeds: [] };
+  // OBS-1182: the layers under the written overlay — B2: the defaults alone under the USER overlay;
+  // T10: defaults + user under the repository overlay — read raw, so clearing an effort masks an
+  // inherited one. OBS-1188: re-read at every review and save, never an assembly-time snapshot; an
+  // unreadable read keeps the last good one for the preview only — the save guard below refuses it.
+  const lowerOverrides: Record<Destination, LowerLayerModelOverrides> = { user: {}, repo: {} };
+  const stagedEditable = (map: Record<string, MapEntry>, deny: StagedDeny, metadata: StagedMetadata): FleetEditable => ({
     ...structuredClone(initial),
-    efforts: undefined, // metadata carries efforts only when some are staged — as a review writes them
-    ...structuredClone(metadata),
+    // metadata carries efforts only when some are staged — as a review writes them
+    tiers: structuredClone(metadata.tiers),
+    efforts: metadata.efforts && structuredClone(metadata.efforts),
     ...Object.fromEntries(DENY_SCOPES.map((scope) => [scope.key, deny[stagedDenyKeyOf(scope)]])),
     // OBS-1046: the allow complement is staged beside the deny lists, never folded into them
     allowOut: deny.allowOut ?? initial.allowOut,
@@ -514,12 +532,16 @@ export async function assembleFleetEditor(
   // it in every other repository.
   const membershipKeys = [...DENY_SCOPES.filter((scope) => scope.path.length === 3).map((scope) => scope.key), "allowOut"] as const;
   const sameSet = (a: string[] = [], b: string[] = []) => [...new Set(a)].sort().join() === [...new Set(b)].sort().join();
-  const destinationInitial = <T extends FleetEditable>(base: T, edited: FleetEditable, userText: string, target: FleetUniverseRow[]): T => {
+  // T10: a repository destination diffs against the effective layers (defaults + user + repo).
+  const destinationInitial = <T extends FleetEditable>(base: T, edited: FleetEditable, destination: Destination, text: string, target: FleetUniverseRow[]): T => {
     let userCfg: TickmarkrConfig;
     try {
-      userCfg = loadConfigWithMode(cwd, { globalDir, userOverlayText: userText, repoOverlayText: "" }).cfg;
+      userCfg = loadConfigWithMode(cwd, {
+        globalDir,
+        ...(destination === "repo" ? { repoOverlayText: text } : { userOverlayText: text, repoOverlayText: "" }),
+      }).cfg;
     } catch {
-      return base; // ponytail: user bytes that load only beside this repo — the reload guard refuses the write
+      return base; // ponytail: bytes that load only beside another layer — the reload guard refuses the write
     }
     const userLayer = userCfg.routing.map;
     const editedMap = edited.map;
@@ -535,11 +557,11 @@ export async function assembleFleetEditor(
       };
     }
     const membershipTouched = membershipKeys.some((key) => !sameSet(base[key], edited[key]));
-    const destination = membershipTouched ? fleetEditableFromConfig(userCfg, target) : undefined;
+    const layer = membershipTouched ? fleetEditableFromConfig(userCfg, target) : undefined;
     return {
       ...base,
       map,
-      ...(destination ? Object.fromEntries(membershipKeys.map((key) => [key, destination[key] ?? []])) : {}),
+      ...(layer ? Object.fromEntries(membershipKeys.map((key) => [key, layer[key] ?? []])) : {}),
     };
   };
   // B2: a changed slot staged with no declaration (auto, no prefer) where the defaults under the user
@@ -558,36 +580,217 @@ export async function assembleFleetEditor(
     }
     return { ...staged, map };
   };
-  // B2: the one user-layer write builder the previews and the review share, so a preview ranks the
-  // bytes y would land. A touched membership serializes against the universe the candidate itself
-  // serves (current layers plus staged classifications), rendered first with membership unchanged;
-  // a channel only that universe adds keeps the verdict the current layers' allow form gives it.
-  const userLayerWrite = (
-    staged: FleetEditable,
-    userText: string,
+  // T10 (D-939): ONE pure baseline — the session's initial allow complement plus the allow entry Ink
+  // seeded beside each classification it staged (FleetSeededAllow) — serves every preview, the review
+  // and the destination choice. `initial` is never mutated.
+  const baselineOf = (seeds: FleetSeededAllow[]): FleetEditable => (seeds.length
+    ? { ...initial, allowOut: [...new Set([...(initial.allowOut ?? []), ...seeds.map((seed) => seed.entry)])].sort() }
+    : initial);
+  const FLAT_SCOPES = DENY_SCOPES.filter((scope) => scope.path.length === 3);
+  // one browser channel: a seed, or (T10 review) a classified row with no seed
+  type RowChannel = Pick<FleetSeededAllow, "adapter" | "displayModel" | "identity">;
+  const seedChannel = (seed: RowChannel) =>
+    ({ adapter: seed.adapter, model: seed.displayModel, ...(seed.identity !== undefined ? { identity: seed.identity } : {}) });
+  // an allow-complement entry excludes a seeded channel by the allow form's own matching (adapter id,
+  // model, adapter:model, recorded identity) — the seed's spelling is one such entry, never the only one
+  const seedRow = (seed: RowChannel): FleetUniverseRow => ({
+    adapter: seed.adapter,
+    models: [seed.displayModel],
+    ...(seed.identity !== undefined ? { identities: { [seed.displayModel]: seed.identity } } : {}),
+  });
+  const allowExcludes = (staged: FleetEditable, seed: RowChannel) =>
+    (staged.allowOut ?? []).some((entry) => universeEntryMatches(seedRow(seed), seed.displayModel, entry));
+  // membership keeps the channel out: its allow complement or a flat (all-seats) deny entry
+  const excludedIn = (staged: FleetEditable, seed: RowChannel) => allowExcludes(staged, seed)
+    || FLAT_SCOPES.some((scope) => (staged[scope.key] ?? []).some((entry) => entryMatchesChannel(entry, seedChannel(seed), true)));
+  // a seed cleared while another staged complement entry (its adapter's, say) still excludes its
+  // channel admitted nothing: the press is a no-op, so the seed stays staged and the shared exclusion
+  // is no membership edit — its classification stays a lone tier
+  const settled = (staged: FleetEditable, seeds: FleetSeededAllow[]): FleetEditable => {
+    const kept = seeds.filter((seed) => !(staged.allowOut ?? []).includes(seed.entry) && allowExcludes(staged, seed));
+    return kept.length
+      ? { ...staged, allowOut: [...new Set([...(staged.allowOut ?? []), ...kept.map((seed) => seed.entry)])].sort() }
+      : staged;
+  };
+  // an END state, re-derived per call: no staged complement entry and no flat deny excludes the seed's
+  // channel any more — an admission undone by out · all is no admission
+  const admittedSeeds = (staged: FleetEditable, seeds: FleetSeededAllow[]) => seeds.filter((seed) => !excludedIn(staged, seed));
+  // ponytail: rows re-render per key press, each naming its scopes' holders — memoized per (bytes, path),
+  // cleared wholesale past 256 entries; a keyed LRU if a fleet ever outgrows it
+  const holdingMemo = new Map<string, number | undefined>();
+  const holdingLine = (text: string, path: readonly string[]): number | undefined => {
+    const key = `${path.join(".")}\0${text}`;
+    if (!holdingMemo.has(key)) {
+      if (holdingMemo.size > 256) holdingMemo.clear();
+      holdingMemo.set(key, overlayHoldingLine(text, path));
+    }
+    return holdingMemo.get(key);
+  };
+  // routing.allow is held through its leaves: a bare `allow: {}` declares none, so the merge keeps the
+  // lower layer's leaves effective; a null mask at a leaf or above still holds it
+  const heldLine = (text: string, path: readonly string[]): number | undefined =>
+    path.join(".") === "routing.allow" && ["adapters", "models"].every((leaf) => holdingLine(text, [...path, leaf]) === undefined)
+      ? undefined
+      : holdingLine(text, path);
+  // T10: the repository holds a path when it declares it ([] included) or masks it with null at it or above
+  const repoHolds = (path: readonly string[]): boolean => heldLine(currentRepoOverlayText(cwd), path) !== undefined;
+  // T10: where a scope lives in this repository's merge — `path:line` of the repository overlay when it
+  // holds it, else of the user overlay when that one does; undefined = the defaults alone. Paths are
+  // short (repo-relative, ~ for home) so the row's detail line keeps them on screen.
+  const home = homedir();
+  const shown = (path: string) => (path.startsWith(`${home}/`) ? `~${path.slice(home.length)}` : path);
+  const holderOf = (dotted: string): string | undefined => {
+    const path = dotted.split(".");
+    const repoLine = heldLine(currentRepoOverlayText(cwd), path);
+    if (repoLine !== undefined) return `${relative(cwd, repoPath)}:${repoLine}`;
+    const userLine = heldLine(currentUserText(), path);
+    return userLine === undefined ? undefined : `${shown(userPath)}:${userLine}`;
+  };
+  // the allow + flat-deny family is ONE coupled write (the allow form is
+  // regenerated from the whole staged fleet), so it has one holder: the repository when it holds any of
+  // its leaves, else the user. A bare repository `allow: {}` holds no leaf, yet its presence alone keeps
+  // the allowlist on: a user save that drops the user allow form would fail-close this repository, so
+  // only the repository (which masks it) can take that save. Whether the user form goes away is read off
+  // the one writer's user bytes — a staged flat deny, an allow exclusion, or a retained authored entry
+  // for a channel this probe never served each keep it, and with it the save, in the user overlay.
+  const userFormDropped = (staged: FleetEditable, seeds: FleetSeededAllow[]): boolean => {
+    const text = currentUserText();
+    try {
+      const bytes = renderFleetOverlayWrite(text, layerWrite(staged, seeds, "user", text, { lowerOverrides: lowerOverrides.user }));
+      return !overlayHoldsMap(bytes, ["routing", "allow"]);
+    } catch {
+      return false; // the review renders the same write and names its refusal
+    }
+  };
+  const familyHolder = (staged: FleetEditable, seeds: FleetSeededAllow[]): Destination =>
+    [["routing", "allow"], ...FLAT_SCOPES.map((scope) => scope.path)].some(repoHolds)
+    || (holdingLine(currentRepoOverlayText(cwd), ["routing", "allow"]) !== undefined && userFormDropped(staged, seeds))
+      ? "repo" : "user";
+  type DestinationEdit = { name: string; destination: Destination };
+  const destinationEdits = (pressed: FleetEditable, seeds: FleetSeededAllow[], controls: string[]): DestinationEdit[] => {
+    const staged = settled(pressed, seeds);
+    const baseline = baselineOf(seeds);
+    const admitted = admittedSeeds(staged, seeds);
+    let held: Destination | undefined;
+    const family = () => (held ??= familyHolder(staged, seeds));
+    const edits: DestinationEdit[] = [];
+    if (admitted.length || membershipKeys.some((key) => !sameSet(baseline[key], staged[key]))) {
+      edits.push({ name: "routing.allow/routing.deny membership", destination: family() });
+    }
+    // a worker leaf follows the layer that holds it
+    for (const scope of DENY_SCOPES.filter((candidate) => candidate.path.length > 3)) {
+      if (!sameSet(initial[scope.key], staged[scope.key])) edits.push({ name: scope.dotted, destination: repoHolds(scope.path) ? "repo" : "user" });
+    }
+    for (const [adapter, models] of Object.entries(staged.tiers)) {
+      for (const [model, value] of Object.entries(models)) {
+        if (JSON.stringify(value) === JSON.stringify(initial.tiers[adapter]?.[model])) continue;
+        // a classification co-locates only with its own admission — its seed cleared, or (T10 review) its
+        // own flat-deny lift: a row the baseline membership kept out that the staged one admits; a lone or
+        // unrelated tier stays user
+        const own = admitted.some((seed) => seed.adapter === adapter && seed.model === model)
+          || (modelGroups.find((group) => group.adapter === adapter)?.rows ?? [])
+            .filter((row) => row.model === model || ("classifyModel" in row && row.classifyModel === model))
+            .some((row) => {
+              const channel = { adapter, displayModel: row.model, ...(row.evidence?.identity !== undefined ? { identity: row.evidence.identity } : {}) };
+              return excludedIn(baseline, channel) && !excludedIn(staged, channel);
+            });
+        edits.push({ name: `tiers.${adapter}.models.${model}`, destination: own ? family() : "user" });
+      }
+    }
+    // {} ≡ absent: pin-then-auto leaves an empty entry that writes nothing (fleet-app stagedCount)
+    if ([...new Set([...Object.keys(initial.map), ...Object.keys(staged.map)])]
+      .some((shape) => JSON.stringify(initial.map[shape] ?? {}) !== JSON.stringify(staged.map[shape] ?? {}))) {
+      edits.push({ name: "routing.map", destination: "user" });
+    }
+    if (JSON.stringify(initial.efforts ?? {}) !== JSON.stringify(staged.efforts ?? {})) edits.push({ name: "model efforts", destination: "user" });
+    return [...edits, ...controls.map((name) => ({ name, destination: "user" as const }))];
+  };
+  // ONE review confirms ONE destination; a batch needing both is refused before any write (no
+  // multi-file transaction) and names what to save in separate sessions
+  const chooseDestination = (edits: DestinationEdit[]): { ok: true; destination: Destination } | { ok: false; reason: string } => {
+    if (new Set(edits.map((edit) => edit.destination)).size <= 1) return { ok: true, destination: edits[0]?.destination ?? "user" };
+    const side = (destination: Destination) =>
+      `${edits.filter((edit) => edit.destination === destination).map((edit) => edit.name).join(", ")} → ${pathOf(destination)}`;
+    return {
+      ok: false,
+      reason: `mixed destinations — one review writes one overlay: ${side("repo")}; ${side("user")} — save them in separate sessions (stage one side, w, y; then the other)`,
+    };
+  };
+  // T10: the universe a write edits — the candidate's own discovery plus every seeded channel, so an
+  // unprobed classified model can still be admitted (membership ≠ routability). A seed whose channel
+  // the browser never showed, or whose spelling names no channel, is refused.
+  const editingUniverse = (candidate: TickmarkrConfig, seeds: FleetSeededAllow[]): FleetUniverseRow[] => {
+    const target = universeOf(candidateChannels(candidate));
+    const covers = (seed: FleetSeededAllow) => target.some((row) => row.adapter === seed.adapter
+      && row.models.some((model) => universeEntryMatches(row, model, seed.entry)));
+    for (const seed of seeds) {
+      if (covers(seed)) continue;
+      const shown = modelGroups.some((group) => group.adapter === seed.adapter && group.rows.some((row) => row.model === seed.displayModel));
+      const row = target.find((candidateRow) => candidateRow.adapter === seed.adapter);
+      if (shown && row) {
+        row.models = [...row.models, seed.displayModel];
+        if (seed.identity !== undefined) row.identities = { ...row.identities, [seed.displayModel]: seed.identity };
+      }
+      if (!covers(seed)) throw new ConfigError(`the seeded allow entry ${seed.entry} names no channel of the discovered fleet — re-probe with tickmarkr doctor, then classify it again`);
+    }
+    return target;
+  };
+  // T10: the routing.allow the layers BELOW the destination declare (the defaults declare none; under
+  // the repository, the user overlay's, read now). "Whole fleet in" masks it, never resurrects it, and
+  // while the repository declares no allow of its own, that inherited form's unserved entries are
+  // effective here, so the regenerated repository form keeps them.
+  const lowerAllow = (destination: Destination): FleetOverlayWrite["preservedAllow"] => {
+    if (destination === "user") return DEFAULT_CONFIG.routing.allow;
+    const user = readOverlayFile(userPath) as { routing?: { allow?: FleetOverlayWrite["preservedAllow"] | null } | null };
+    return user.routing?.allow ?? undefined;
+  };
+  // B2: the one write builder the previews and the review share, so a preview ranks the bytes y would
+  // land. A touched membership serializes against the universe the candidate itself serves (current
+  // layers plus staged classifications), rendered first with membership unchanged; a channel only that
+  // universe adds keeps the verdict the current layers' allow form gives it — T10: unless it is an
+  // admitted seed, which the operator just let in.
+  const layerWrite = (
+    pressed: FleetEditable,
+    seeds: FleetSeededAllow[],
+    destination: Destination,
+    text: string,
     rest: Pick<FleetOverlayWrite, "mode" | "judge" | "steering"> & { lowerOverrides: LowerLayerModelOverrides },
   ): FleetOverlayWrite => {
+    const staged = settled(pressed, seeds);
+    const baseline = baselineOf(seeds);
+    const admitted = admittedSeeds(staged, seeds);
+    const lower = lowerAllow(destination);
+    // per leaf: an inherited allow leaf the repository neither declares nor masks (at it or above) is
+    // effective here, so its unserved entries ride the regenerated form even beside a declared sibling
+    const inherited = lower && Object.fromEntries((["adapters", "models"] as const)
+      .filter((leaf) => lower[leaf] != null && !repoHolds(["routing", "allow", leaf]))
+      .map((leaf) => [leaf, lower[leaf]]));
+    const fixed = {
+      lowerMap: DEFAULT_CONFIG.routing.map,
+      ...(lower !== undefined ? { lowerAllow: lower } : {}),
+      ...(inherited && Object.keys(inherited).length ? { preservedAllow: inherited } : {}),
+    };
     let edited = maskClearedSlots(initial, staged);
-    let target = universe;
-    if (membershipKeys.some((key) => !sameSet(initial[key], edited[key]))) {
-      const unchanged = { ...edited, ...Object.fromEntries(membershipKeys.map((key) => [key, initial[key]])) };
+    let target = editingUniverse(cfg, seeds);
+    if (membershipKeys.some((key) => !sameSet(baseline[key], edited[key]))) {
+      const unchanged = { ...edited, ...Object.fromEntries(membershipKeys.map((key) => [key, baseline[key]])) };
       try {
-        const bytes = renderFleetOverlayWrite(userText, {
-          ...rest, initial: destinationInitial(initial, unchanged, userText, universe), edited: unchanged, universe,
-          lowerMap: DEFAULT_CONFIG.routing.map,
+        const bytes = renderFleetOverlayWrite(text, {
+          ...rest, ...fixed, initial: destinationInitial(baseline, unchanged, destination, text, target), edited: unchanged, universe: target,
         });
-        const candidate = loadConfigWithMode(cwd, { globalDir, userOverlayText: bytes }).cfg;
-        target = universeOf(candidateChannels(candidate));
+        const candidate = loadConfigWithMode(cwd, { globalDir, ...layerOf(destination, bytes) }).cfg;
+        target = editingUniverse(candidate, seeds);
         const known = (entry: string) => universe.some((row) =>
           entry === row.adapter || row.models.some((model) => universeEntryMatches(row, model, entry)));
-        const grown = (fleetEditableFromConfig(candidate, target).allowOut ?? []).filter((entry) => !known(entry));
+        const admits = (entry: string) => admitted.some((seed) => target.some((row) => row.adapter === seed.adapter
+          && row.models.some((model) => universeEntryMatches(row, model, seed.entry) && universeEntryMatches(row, model, entry))));
+        const grown = (fleetEditableFromConfig(candidate, target).allowOut ?? []).filter((entry) => !known(entry) && !admits(entry));
         if (grown.length) edited = { ...edited, allowOut: [...new Set([...(edited.allowOut ?? []), ...grown])].sort() };
       } catch {
         // the full render below (or the reload guard) names the refusal
       }
     }
-    // T8: the user overlay's lower layer is the defaults alone (B2) — a pin cleared over one is tombstoned
-    return { ...rest, initial: destinationInitial(initial, edited, userText, target), edited, universe: target, lowerMap: DEFAULT_CONFIG.routing.map };
+    return { ...rest, ...fixed, initial: destinationInitial(baseline, edited, destination, text, target), edited, universe: target };
   };
   // LEG2-T3 finding 2: a preview is the config loader over the candidate bytes the writer would
   // produce — never a second in-memory merge of the staged sets over the resolved config, which
@@ -603,16 +806,23 @@ export async function assembleFleetEditor(
     // T8: so are the staged tiers/efforts — a metadata edit never serves the preview cached before it
     const metadata = stage ? stagedMetadataOf(stage) : reviewedStage;
     const userText = currentUserText();
-    const key = JSON.stringify([mode, map, deny, metadata, userText, currentRepoOverlayText(cwd)]);
+    const repoText = currentRepoOverlayText(cwd);
+    const key = JSON.stringify([mode, map, deny, metadata, userText, repoText]);
     const hit = candidateMemo.get(key);
     if (hit) return hit;
     let preview: CandidatePreview;
     try {
-      const bytes = renderFleetOverlayWrite(userText, userLayerWrite(stagedEditable(map, deny, metadata), userText, {
-        lowerOverrides,
+      const staged = stagedEditable(map, deny, metadata);
+      // T10: a preview loads the bytes the chosen destination would hold; a mixed batch (refused at w)
+      // previews with the repository side, so a row's reach never turns unknown mid-session
+      const chosen = chooseDestination(destinationEdits(staged, metadata.seeds, mode !== rm.mode.mode ? ["routing.mode"] : []));
+      const destination: Destination = chosen.ok ? chosen.destination : "repo";
+      const text = destination === "repo" ? repoText : userText;
+      const bytes = renderFleetOverlayWrite(text, layerWrite(staged, metadata.seeds, destination, text, {
+        lowerOverrides: lowerOverrides[destination],
         ...(mode !== rm.mode.mode ? { mode } : {}),
       }));
-      preview = { ok: true, ...loadConfigWithMode(cwd, { globalDir, userOverlayText: bytes }) };
+      preview = { ok: true, ...loadConfigWithMode(cwd, { globalDir, ...layerOf(destination, bytes) }) };
     } catch (error) {
       preview = { ok: false, error: (error as Error).message.replace(/\s+/g, " ").trim() };
     }
@@ -622,8 +832,9 @@ export async function assembleFleetEditor(
   };
   const previewUnavailable = (error: string) =>
     `preview unavailable (${error}) — the staged overlay does not load, so w would be refused`;
-  const stagedRouting = (deny: StagedDeny): { ok: true; routing: TickmarkrConfig["routing"] } | { ok: false; error: string } => {
-    const preview = previewCfg(rm.mode.mode, editable.map, deny);
+  // T10: the staged metadata rides along, so a seeded classification's admission reads `in` before w
+  const stagedRouting = (deny: StagedDeny, stage?: FleetStagedMetadata): { ok: true; routing: TickmarkrConfig["routing"] } | { ok: false; error: string } => {
+    const preview = previewCfg(rm.mode.mode, editable.map, deny, stage);
     return preview.ok ? { ok: true, routing: preview.cfg.routing } : preview;
   };
   // B2: the candidate config's own discovery, blind to both membership scopes — classifications and
@@ -990,36 +1201,41 @@ export async function assembleFleetEditor(
   // The judge is one seat by schema (config.judge: { adapter, model }); the editor offers the same
   // discovered seats universe plus a keep-default row, and a write is staged only on a real change.
   const initialJudge = `${cfg.judge.adapter}:${cfg.judge.model}`;
-  // B2: the staged write plus the user and repo overlay bytes its review (and shadow notes) were rendered against
-  type PendingWrite = { write: FleetOverlayWrite; repo: string; user: string };
+  // B2: the staged write plus the user and repo overlay bytes its review (and shadow notes) were rendered
+  // against; T10: and the one destination it confirmed
+  type PendingWrite = { write: FleetOverlayWrite; repo: string; user: string; destination: Destination; path: string };
   let pendingWrite: PendingWrite | null = null;
-  const lowerLayers = () => lowerLayerModelOverrides({ globalDir, below: "user" });
+  const lowerLayers = (destination: Destination) => lowerLayerModelOverrides({ globalDir, below: destination });
   // OBS-1188: the reviewed bytes are the only bytes that may land. Any byte of the user or repo overlay
   // that moved since the review is a stale preview — a re-render alone would overwrite a same-key edit
   // with the staged value and still match — then the lower layers are re-rendered as they are NOW.
-  // Null = still current.
-  const stalePreview = (pending: PendingWrite, reviewed: string, prior = currentUserText()): string | null => {
-    if (currentRepoOverlayText(cwd) !== pending.repo) {
-      return `stale preview — the repository overlay ${repoOverlayPath(cwd)} changed after the review diff was rendered; press w to review what would be written now`;
+  // T10: both overlays are guarded whichever one is written, so a holder that moved after the review
+  // (the destination itself) refuses instead of retargeting. Null = still current.
+  const stalePreview = (pending: PendingWrite, reviewed: string, prior?: string): string | null => {
+    const destinationNow = prior ?? (pending.destination === "repo" ? currentRepoOverlayText(cwd) : currentUserText());
+    const repoNow = pending.destination === "repo" ? destinationNow : currentRepoOverlayText(cwd);
+    const userNow = pending.destination === "user" ? destinationNow : currentUserText();
+    if (repoNow !== pending.repo) {
+      return `stale preview — the repository overlay ${repoPath} changed after the review diff was rendered; press w to review what would be written now`;
     }
-    if (prior !== pending.user) {
+    if (userNow !== pending.user) {
       return `stale preview — the user overlay ${userPath} changed after the review diff was rendered; press w to review what would be written now`;
     }
-    const lower = lowerLayers();
+    const lower = lowerLayers(pending.destination);
     if (!lower.ok) return lower.error;
     try {
-      if (renderFleetOverlayWrite(prior, { ...pending.write, lowerOverrides: lower.overrides }) === reviewed) return null;
+      if (renderFleetOverlayWrite(destinationNow, { ...pending.write, lowerOverrides: lower.overrides }) === reviewed) return null;
     } catch (error) {
       return (error as Error).message;
     }
-    return `stale preview — the user overlay ${userPath} or a lower config layer changed after the review diff was rendered; press w to review what would be written now`;
+    return `stale preview — the overlay ${pending.path} or a lower config layer changed after the review diff was rendered; press w to review what would be written now`;
   };
   // B2: a saved user key the repository overlay also decides does not apply in THIS repository —
   // each is named with the value that still applies here, never reported as applied.
   const repoShadowNotes = (before: string, after: string): string[] =>
     repoShadowedUserKeys(cwd, before, after, { globalDir }).map(({ path, value }) => {
       const shown = value === undefined ? "absent" : typeof value === "string" ? value : JSON.stringify(value);
-      return `repo-shadowed: ${path} stays ${shown} in this repository — ${repoOverlayPath(cwd)} sets it above the user overlay`;
+      return `repo-shadowed: ${path} stays ${shown} in this repository — ${repoPath} sets it above the user overlay`;
     });
   const reviewOverlay = (state: FleetEditorState): FleetOverlayReview => {
     // B2: a review re-reads every layer, so no preview rendered before it is served after it
@@ -1037,10 +1253,7 @@ export async function assembleFleetEditor(
 
     // This callback is the sole candidate-overlay builder. The Ink component renders
     // the diff and asks for confirmation, but owns neither filesystem access nor a writer.
-    // B2: defaults/user/repo are re-read here, at review — the destination is the user overlay.
-    const before = currentUserText();
-    const repo = currentRepoOverlayText(cwd);
-    const path = userPath;
+    // B2: defaults/user/repo are re-read here, at review. T10: so is the destination.
     const modeChanged = state.selectedMode !== rm.mode.mode;
     const steeringChanged = (["review", "consult"] as const).some(
       (key) => JSON.stringify(state.steering[key]) !== JSON.stringify(initialSteering[key]),
@@ -1052,51 +1265,82 @@ export async function assembleFleetEditor(
       pendingWrite = null;
       return { kind: "empty" };
     }
-    const lower = lowerLayers();
-    if (lower.ok) lowerOverrides = lower.overrides;
-    const write = userLayerWrite(staged, before, {
-      lowerOverrides,
-      ...(modeChanged ? { mode: state.selectedMode } : {}),
-      ...(judgeChanged && judgeSeat ? { judge: judgeSeat } : {}),
-      steering: { initial: initialSteering, edited: state.steering },
-    });
-    const after = renderFleetOverlayWrite(before, write);
+    const chosen = chooseDestination(destinationEdits(staged, metadata.seeds, [
+      ...(modeChanged ? ["routing.mode"] : []),
+      ...(steeringChanged ? ["review/consult prefer"] : []),
+      ...(judgeChanged ? ["judge"] : []),
+    ]));
+    if (!chosen.ok) {
+      pendingWrite = null;
+      return { kind: "refused", reason: chosen.reason };
+    }
+    const destination = chosen.destination;
+    const user = currentUserText();
+    const repo = currentRepoOverlayText(cwd);
+    const before = destination === "repo" ? repo : user;
+    const path = pathOf(destination);
+    const lower = lowerLayers(destination);
+    if (lower.ok) lowerOverrides[destination] = lower.overrides;
+    let write: FleetOverlayWrite;
+    let after: string;
+    try {
+      write = layerWrite(staged, metadata.seeds, destination, before, {
+        lowerOverrides: lowerOverrides[destination],
+        ...(modeChanged ? { mode: state.selectedMode } : {}),
+        ...(judgeChanged && judgeSeat ? { judge: judgeSeat } : {}),
+        steering: { initial: initialSteering, edited: state.steering },
+      });
+      after = renderFleetOverlayWrite(before, write); // T10 (D-987): a merge-key path refuses here
+    } catch (error) {
+      if (!(error instanceof ConfigError)) throw error;
+      pendingWrite = null;
+      return { kind: "refused", reason: error.message };
+    }
     if (before === after) {
       pendingWrite = null;
       return { kind: "empty" };
     }
-    pendingWrite = { write, repo, user: before };
+    pendingWrite = { write, repo, user, destination, path };
     // OBS-1144: the review names every dead pool entry the written config carries, with its reason and
     // what still routes — before y. Unloadable bytes carry no notes: the reload guard refuses them anyway.
     let poolNotes: string[] = [];
     try {
-      const written = loadConfigWithMode(cwd, { globalDir, userOverlayText: after }).cfg;
+      const written = loadConfigWithMode(cwd, { globalDir, ...layerOf(destination, after) }).cfg;
       poolNotes = deadPoolEntries(written, undefined, health).map(deadPoolEntryLine);
     } catch {
       poolNotes = [];
     }
-    const notes = [...repoShadowNotes(before, after), ...(lower.ok ? [] : [`${lower.error} — y will be refused`]), ...poolNotes];
+    const notes = [
+      // T10: the review names where the edit lands and what that file is
+      ...(destination === "repo" ? [REPO_DESTINATION_NOTE(repoPath)] : repoShadowNotes(before, after)),
+      FUTURE_LOADS_NOTE,
+      ...(lower.ok ? [] : [`${lower.error} — y will be refused`]),
+      ...poolNotes,
+    ];
     return {
       kind: "diff",
       before,
       after,
       diff: unifiedYamlDiff(before, after, path),
       path,
-      ...(notes.length ? { notes } : {}),
+      notes,
     };
   };
   // B2: every repository inherits the user overlay, so its bytes must load here AND on their own —
-  // a tiers entry whose vendor/channel only this repository declares would break every other one
-  const loaderGuard = io.reloadGuard
+  // a tiers entry whose vendor/channel only this repository declares would break every other one.
+  // T10: repository bytes load through the same loader in the repository layer.
+  const loaderGuard = (destination: Destination) => io.reloadGuard
     ?? ((bytes: string) => {
+      if (destination === "repo") return overlayBytesLoadError(cwd, bytes, { globalDir, layer: "repo" });
       const here = overlayBytesLoadError(cwd, bytes, { globalDir, layer: "user" });
       if (here !== null) return here;
       const alone = overlayBytesLoadError(cwd, bytes, { globalDir, layer: "user", repoOverlayText: "" });
       return alone === null ? null
-        : `the user overlay ${userPath} loads only beside ${repoOverlayPath(cwd)} — every repository inherits it, and without that overlay it fails: ${alone}`;
+        : `the user overlay ${userPath} loads only beside ${repoPath} — every repository inherits it, and without that overlay it fails: ${alone}`;
     });
   // OBS-1188: a stale preview or an unreadable lower layer answers on the same error channel as the loader
-  const reloadGuard = (bytes: string) => (pendingWrite && stalePreview(pendingWrite, bytes)) || loaderGuard(bytes);
+  const reloadGuard = (bytes: string) =>
+    (pendingWrite && stalePreview(pendingWrite, bytes)) || loaderGuard(pendingWrite?.destination ?? "user")(bytes);
 
   const props: FleetEditorProps = {
     ageMs: doctorAgeMs(cwd),
@@ -1122,6 +1366,7 @@ export async function assembleFleetEditor(
     reviewOverlay,
     reloadGuard,
     stagedRouting,
+    holderOf,
     entry: opts.entry,
     initialJudge,
     judgeSeats: seats,
@@ -1145,12 +1390,12 @@ export async function assembleFleetEditor(
     if (!pending) throw new Error("fleet write reached confirmation without a staged overlay mutation");
     const write = pending.write;
     // OBS-1188: re-checked against the bytes on disk at write time; a refusal throws before the temp file exists.
-    // B2: the one destination is the user overlay, and bytes the loader refuses never land there either.
+    // T10: the one destination is the one the review confirmed, and bytes the loader refuses never land there.
     try {
-      writeFleetOverlay(userPath, (prior) => {
-        const refusal = result.review.path === userPath
-          ? stalePreview(pending, result.review.after, prior) ?? loaderGuard(result.review.after)
-          : `the reviewed destination ${result.review.path} is not the user overlay ${userPath}`;
+      writeFleetOverlay(pending.path, (prior) => {
+        const refusal = result.review.path === pending.path
+          ? stalePreview(pending, result.review.after, prior) ?? loaderGuard(pending.destination)(result.review.after)
+          : `the reviewed destination ${result.review.path} is not the staged destination ${pending.path}`;
         if (refusal !== null) throw new ConfigError(refusal);
         return result.review.after;
       });
@@ -1170,7 +1415,9 @@ export async function assembleFleetEditor(
       }
     }
     // B2: a repo-shadowed save says what still applies here — never claimed applied
-    const head = [`fleet: wrote ${userPath}`, ...repoShadowNotes(result.review.before, result.review.after).map((note) => `fleet: ${note}`)].join("\n");
+    const head = [`fleet: wrote ${pending.path}`, ...(pending.destination === "user"
+      ? repoShadowNotes(result.review.before, result.review.after).map((note) => `fleet: ${note}`)
+      : [])].join("\n");
     if (!unprobed.length) return head;
     const named = unprobed.slice(0, 3).join(", ") + (unprobed.length > 3 ? `, +${unprobed.length - 3} more` : "");
     return `${head}\nfleet: ${unprobed.length} newly classified model(s) have no probe verdict yet (${named}) — run \`tickmarkr fleet --fresh\` to probe them; unverified models stay unroutable`;

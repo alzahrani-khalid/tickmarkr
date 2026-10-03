@@ -516,7 +516,7 @@ describe("tickmarkr init wizard (T4)", () => {
       // 2. Under both Orca terminal markers with HERDR_ENV unset
       delete process.env.HERDR_ENV;
       process.env.TERM_PROGRAM = "Orca";
-      process.env.TERM_PROGRAM_VERSION = "1.4.195";
+      process.env.TERM_PROGRAM_VERSION = "1.4.218";
       process.env.ORCA_TERMINAL_HANDLE = "terminal-1";
 
       const orcaRepo = makeRepo({ "keep.txt": "x" });

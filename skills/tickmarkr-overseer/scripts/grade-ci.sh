@@ -1,7 +1,9 @@
 #!/bin/bash
 # grade-ci.sh <run-id> <expected-count> [tag] — grade both public CI jobs from their JOB LOGS.
 # Grade only at run-end. A missing/in-progress/empty log is UNREADABLE, never evidence of green.
-# Tri-state: exit 0 GREEN, 1 RED, 2 UNREADABLE. UNREADABLE dominates a mixed result.
+# Exit 0 GREEN, 1 RED, 2 UNREADABLE, 3 INFRA_KILLED: a job the GitHub runner shut down or cancelled with
+# no failed or timed-out test (the classifier's class, D-897) — never green, never a pass, only unproven.
+# UNREADABLE dominates a mixed result, then RED: a failure anywhere dominates a kill.
 set -u
 
 run=${1:?run id required}
@@ -14,7 +16,8 @@ mkdir -p "$out_dir" || { echo "UNREADABLE: cannot create log directory $out_dir"
 
 verdict=0
 mark_unreadable() { verdict=2; }
-mark_red() { [ "$verdict" -eq 0 ] && verdict=1; }
+mark_red() { [ "$verdict" -eq 2 ] || verdict=1; }
+mark_killed() { [ "$verdict" -ne 0 ] || verdict=3; }
 field() { printf '%s\n' "$classified" | sed -n "s/^VITEST_LOG.* $1=\([^ ]*\).*/\1/p"; }
 
 jobs=$(gh run view "$run" --repo "$repo" --json jobs \
@@ -52,10 +55,12 @@ while IFS=$'\t' read -r id name status conclusion; do
   # (scripts/run-ci-vitest.sh), so the badge and this grade cannot disagree. Its rules — complete
   # summaries, failed/timed-out tests, coverage-threshold misses, and the RPC-timeout-only exception
   # to "any unhandled error is RED" (OBS-1058) — live in classify-vitest-log.sh, stated once there.
-  classified=$(bash "$here/classify-vitest-log.sh" "$log" 2>&1)
+  # The expected count is the job's declared file contract: both steps' summaries must collect it all.
+  classified=$(bash "$here/classify-vitest-log.sh" "$log" "$expected" 2>&1)
   log_verdict=$(field verdict)
   passed=$(field passed); skipped=$(field skipped); failed=$(field failed); timedout=$(field timedout)
   unhandled=$(field unhandled); rpc=$(field runner_rpc_timeouts); coverage=$(field coverage_misses)
+  kills=$(field runner_kills)
   errors=$(grep -oE '##\[error\].*' "$log" | sort | uniq -c | sed 's/^ *//' | tr '\n' ';')
   # The commands' own outcomes stand, as in the wrapper: GREEN needs a success conclusion with no step
   # exit annotation, or a failure explained ONLY by steps that exited exactly 1 on a log of their own
@@ -81,8 +86,16 @@ while IFS=$'\t' read -r id name status conclusion; do
     done <<< "$exits"
   fi
 
-  echo "$name: oracle=[${oracle:-MISSING}] files=[$(printf '%s' "$files" | tr '\n' '|')] passed=$passed skipped=$skipped failed=$failed timedout=$timedout unhandled=$unhandled runner_rpc_timeouts=$rpc coverage_misses=$coverage log=[$(field reason)] outcome=[$outcome] errors=[$errors]"
-  if [ -z "$oracle" ] || [ -z "$files" ] || [ -z "$log_verdict" ]; then
+  echo "$name: oracle=[${oracle:-MISSING}] files=[$(printf '%s' "$files" | tr '\n' '|')] passed=$passed skipped=$skipped failed=$failed timedout=$timedout unhandled=$unhandled runner_rpc_timeouts=$rpc coverage_misses=$coverage runner_kills=${kills:-?} log=[$(field reason)] outcome=[$outcome] errors=[$errors]"
+  # A killed runner skips the count step, so its missing oracle is the kill's, not an unreadable log:
+  # INFRA_KILLED unless a step's own failing exit or a failed/timed-out test dominates it (then RED).
+  if [ "$log_verdict" = INFRA_KILLED ] && [ "${outcome#exit-}" = "$outcome" ]; then
+    echo "$name: INFRA_KILLED"
+    mark_killed
+  elif [ "${kills:-0}" -gt 0 ] 2>/dev/null; then
+    echo "$name: RED"
+    mark_red
+  elif [ -z "$oracle" ] || [ -z "$files" ] || [ -z "$log_verdict" ]; then
     echo "$name: UNREADABLE"
     mark_unreadable
   elif [ "$oracle" = "COUNT_ORACLE GREEN expected=$expected actual=$expected" ] \
@@ -104,5 +117,5 @@ if [ "$seen_macos" -ne 1 ]; then
   mark_unreadable
 fi
 
-echo "VERDICT rc=$verdict (0=all GREEN 1=RED 2=UNREADABLE)"
+echo "VERDICT rc=$verdict (0=all GREEN 1=RED 2=UNREADABLE 3=INFRA_KILLED)"
 exit "$verdict"

@@ -49,9 +49,79 @@ Floor provenance recorded at compile time:
 - Shapes still governed by an explicit overlay floor → `"config floors"`
 - Shapes filled from the mode preset → `"mode <name>"` (e.g. `mode partner-led`)
 
+## Where a fleet save lands
+
+Every `w` review writes exactly ONE overlay and names it in the review title (`review · <path>`).
+Before you press `w`, an excluded row's detail line already names where each excluding scope is held,
+as `held: <scope> @ <path>:<line>` (for example `held: routing.allow @ .tickmarkr/config.yaml:13`).
+The choice follows the config merge (defaults → user → repo; a list replaces the lower list whole,
+`null` deletes it), so an edit always lands where it is effective in this repository:
+
+- **Membership** — `routing.allow` (`adapters`, `models`) plus the all-seats deny lists
+  (`routing.deny.adapters`, `routing.deny.models`) are one coupled family: the allow form is
+  regenerated from the whole staged fleet. It goes to the **repo overlay** (`.tickmarkr/config.yaml`)
+  when that file declares any of those leaves — an empty list `[]` counts — or masks one with
+  `null` at the leaf or above (`allow: null`, `deny: null`); otherwise to the **user overlay**
+  (`~/.config/tickmarkr/config.yaml`), which every repository on the machine inherits. A bare
+  `allow: {}` declares no leaf, so an inherited user allow edit stays a user save — except one whose
+  user save would drop the user allow form: that empty map alone keeps the allowlist on, so that save
+  goes to the repository, which masks it. The user form stays (and so does the save) while anything
+  still needs it: an allow exclusion, a staged all-seats deny, or an authored entry for a channel this
+  probe never served. A whole
+  `routing: null` is no holder: the routing block is required, so that overlay does not load and
+  Fleet does not open on it. A worker deny materialized under a `deny: null` mask keeps every other
+  deny leaf masked, so a lower layer's lists never return beside it.
+  An inherited allow leaf the repository leaves undeclared stays effective, so a repository save
+  keeps its entries for channels this probe never served (one `allow.adapters` declared beside an
+  inherited `allow.models` keeps the inherited models).
+- **Worker denies** — each `routing.deny.workers.*` leaf follows its own holder: the repo overlay
+  when it declares or masks that leaf, else the user overlay.
+- **A classification** (a tier you typed with `t`, or Space/Enter on an unclassified row) goes to
+  the user overlay, except one admitted in the same session — its own allow entry or its own all-seats
+  deny lifted: it co-locates with its own admission.
+- **Everything else** — routing mode, Shapes pins/pools/prefer, effort, judge, review/consult
+  steering — goes to the user overlay.
+
+A batch whose edits need both overlays is refused at `w` before anything is written; the refusal
+names each edit with its path. Save them in separate sessions: stage one side, `w`, `y`, then the
+other. A repo-overlay review says the file is **tracked** — Fleet never stages or commits it; commit
+it to share the change. Either save affects **future config loads only**; a run already in progress
+keeps the config it loaded. Both overlays are re-read at `y`: if either changed after the review
+(including a change that moves which layer holds the family), the save is refused as a stale
+preview — press `w` again — and it is never retargeted to the other file.
+
+**Admitting an unclassified model in one session.** An unclassified model is never routed, and an
+allow form names only classified models, so a new model the allow form leaves out reads
+`out allow`. Classify it (`t`), and the editor stages that model's own allow entry beside the tier;
+Space → in then admits it before `w`, and the preview row reads `in`. Membership is not
+routability: a model with no probe verdict yet stays unroutable until `tickmarkr fleet --fresh`.
+Pressing out · all seats after admitting it undoes the admission — the model stays out, and that
+new deny is a membership edit of its own (so its tier and it are then saved separately). Space on a
+model whose adapter the allow form leaves out whole clears only its own entry: the adapter's entry
+still excludes it, so nothing is admitted and its tier is saved to the user overlay alone.
+
+**Worker-only deny on a partially excluded adapter (two presses).** When some of an adapter's
+channels are out through the allow form, a direct out · workers on its rail is refused (the rail edits
+only the adapter's own entries). Press out · all seats on the rail, then out · workers: the second
+press moves that same entry to `routing.deny.workers.adapters`. Only the final state is reviewed and
+written — the intermediate `routing.deny.adapters` entry never reaches the review or the file, so
+review, judge and consult seats keep that adapter.
+
+**Byte preservation.** A save rewrites only the nodes it changes; untouched block and flow lists,
+full-line and inline comments (including a flow list's `[codex]  # note` gap), authored entries and
+unknown subtrees keep their bytes. An aliased or anchored list is read as the config
+loader reads it, so its entries for channels this probe never served stay admitted; an edit through a
+shared anchor never changes the anchor's other aliases — each one is written out as a copy of its
+original value first. One pre-existing limit remains: the writer re-serializes the
+whole document, so a flow collection's comma spacing (`[one,two]` → `[one, two]`) and an anchored
+flow mapping can be reformatted. Fleet writes through no YAML merge key: a membership edit whose path
+(the edited list or any mapping above it) takes keys through `<<` is refused at review — it names the
+path and the merge (`<<: *base`), publishes nothing and leaves both overlays byte for byte; inline the
+merged keys into that mapping by hand, then save again.
+
 ## Tier and deny provenance (fleet writes)
 
-The fleet editor (`tickmarkr fleet`) persists tier assignments into the repo overlay. When you
+The fleet editor (`tickmarkr fleet`) persists tier assignments into the overlay chosen above. When you
 classify a model that has no tier yet, step 3 requires a typed **benchmark-provenance note**;
 the serializer stores it on the assignment and writes it as a trailing `#` comment beside that
 model line in YAML.

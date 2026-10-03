@@ -43,6 +43,7 @@ const CITED_FILES = [
   // INTEGRATIONS.md citations
   "src/adapters/claude-code.ts",
   "src/adapters/codex.ts",
+  "src/adapters/codex-commit-check.ts",
   "src/adapters/cursor-agent.ts",
   "src/adapters/opencode.ts",
   "src/adapters/pi.ts",
@@ -210,6 +211,17 @@ describe.skipIf(!existsSync(codebaseDocs))("docs-truth-stack", () => {
     // OBS-930 Linux: the row names the size fallback the builder carries (null over the ceiling)
     expect(codexDocBlock(integrations)).toContain("promptArgvCeiling()");
     expect(codexDocBlock(integrations)).toContain("worker-mode-fallback");
+  });
+
+  test("test: the integrations page names the Codex git grant and the doctor probe's closed table with escape as a blocking warning", () => {
+    const block = codexDocBlock(readFileSync(join(codebaseDocs, "INTEGRATIONS.md"), "utf8"));
+    // v2.6.6 T9 (K): the grant is named, its roots listed, and the shipped common-root grant is gone
+    expect(block).toContain("`CODEX_GIT_GRANT`");
+    for (const root of ["`<common>/objects`", "`<common>/refs`", "`<common>/logs`"]) expect(block).toContain(root);
+    expect(block).not.toContain('writable_roots=[\\"$(git rev-parse --path-format=absolute --git-common-dir)\\"]');
+    for (const status of ["`allowed`", "`protected`", "`escape`", "`unknown`"]) expect(block).toContain(status);
+    expect(block).toContain("`escape` is a BLOCKING security warning");
+    expect(block).toContain("judge, review (`src/gates/llm.ts`) and consult (`src/run/consult.ts`)");
   });
 
   test("test: the integrations page describes the portable driving skill install command", () => {
