@@ -132,13 +132,24 @@ you were handed the whole picture — list the repository root, open every guida
   predate a project rename, so **search by CONCEPT, not by the current product name.** A memory nobody opens
   is worse than none: every seat assumes the lesson is recorded somewhere and no seat looks.
 - **The gates are the product.** Seven, defined in \`src/graph/schema.ts\`:
-  \`build test lint evidence scope acceptance review\`. **That is DECLARATION order, not execution order** —
-  the first five run as a battery that stops at its first red, then \`acceptance\` and \`review\` run
-  CONCURRENTLY (\`run-gates.ts:39\`, *"judge ‖ review"*). One repair reorders them: a repair the REVIEW sent
-  back (carried \`review:material\`, test selection on, no required repair test) runs build, lint, evidence and
-  scope, then \`acceptance\` ‖ \`review\`, then its test screen, so a review that re-reds an unchanged subject
-  starts no test at all; a test-red repair keeps the battery first. Either way nothing merges until the FULL
-  suite has passed on the merge-candidate commit. The first five are MANDATORY; only \`acceptance\` and
+  \`build test lint evidence scope acceptance review\`. **That is DECLARATION order, not execution order.**
+  The cheap checks run first and stop at their first red: \`build\`, \`lint\`, then \`evidence\` and \`scope\`.
+  A fresh or semantic-repair candidate then runs \`acceptance\` ‖ \`review\` CONCURRENTLY (\`run-gates.ts\`,
+  *"judge ‖ review"*) before any test payload: a decisive semantic red ends the round with zero diagnostic
+  or full test-gate runs (a required acceptance oracle still executes); otherwise ONE full verification job
+  follows, with no selected screen. Only an attributed behavioral test-red repair may buy one diagnostic
+  first — every required failing file plus conservatively selected tests reaching the diff — admitted only
+  on comparable harness timing with ratio <= 0.15 AND estimated cost <= 60000 ms; its behavioral red stops
+  the round before semantics, otherwise semantics precede the full job. Disabled, unsupported, over-cap or
+  unknown-cost selection skips the diagnostic instead of running a full suite before semantics, and a
+  killed diagnostic is never green. A seatless or no-verdict review lets acceptance finish and publish and
+  the full job run in-round, and stays unsatisfied until review-only recovery; a seatless acceptance
+  cancels its sibling, records the unrun test (\`testOwed\`) and every enabled gate still owed (an unrecorded
+  review included), cannot merge and parks infra; an actual cancellation or throw awaits cleanup and leaves
+  no mergeable partial set. Test-only verification and an explicit full recheck keep their full scope with
+  no invented semantics and no diagnostic. Nothing merges until the FULL suite has passed on the exact
+  merge-candidate commit; an exact full green answers only after identity, environment, cleanliness and
+  current complete-manifest checks. The first five are MANDATORY; only \`acceptance\` and
   \`review\` may be omitted per task. Implementations are in \`src/gates/\` — \`baseline.ts\` (build/test/lint,
   diffed against a recorded baseline so pre-existing failures are forgiven), \`evidence.ts\`, \`scope.ts\`,
   \`acceptance.ts\` (its judge reads the DIFF and every criterion must cite a changed hunk), \`review.ts\`

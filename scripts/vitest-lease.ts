@@ -4,12 +4,12 @@
 // unrelated repository keeps its own lease. vitest.config.ts registers this module as globalSetup:
 // Vitest runs it in the main process before the first fork is spawned (the fork environment is built
 // after global setup), so the exported token reaches every fork and every nested runner they start,
-// and its teardown releases the lease only after the runner has completed.
+// and its close hook releases the lease only after the runner's children have completed.
 // Bounds: this is cooperation between configured entries, not enforcement over arbitrary shells or
-// foreign runner configurations; a SIGKILLed holder is reclaimed by the lease's dead-pid rule.
+// foreign runner configurations; a dead holder is reclaimed only once its token-bound tree ceases.
 import { execFileSync, spawnSync } from "node:child_process";
 import { rmSync } from "node:fs";
-import { parseCLI } from "vitest/node";
+import { parseCLI, type TestProject } from "vitest/node";
 import { readHolder, REPOSITORY_LEASE_TOKEN_ENV, repositoryLeasePath, withRepositoryLease } from "../src/run/lease.js";
 
 /** `vitest list` (manifest discovery) collects and never executes a test body: it takes no lease, so a
@@ -60,12 +60,20 @@ export function stopOwnedRunners(deadlineMs = 10_000): boolean {
   return left.length === 0;
 }
 
+/** Vitest closes its pool after global teardown. Let that normal shutdown reap the workers
+ * before repository cleanup signals any residual children. The public close hook is awaited
+ * alongside pool shutdown, so waiting here cannot hold up the pool's own close operation. */
+async function awaitRunnerShutdown(deadlineMs = 10_000): Promise<void> {
+  const end = Date.now() + deadlineMs;
+  while (descendants().length && Date.now() < end) await new Promise(resolve => setTimeout(resolve, 20));
+}
+
 // Vitest runs globalSetup once per project in this one process; the first call holds, the rest share it.
 const HELD = Symbol.for("tickmarkr.vitest-lease");
 type Held = { users: number; release: () => void; done: Promise<unknown> };
 const registry = globalThis as { [HELD]?: Held };
 
-export default async function vitestLease(): Promise<(() => Promise<void>) | undefined> {
+export default async function vitestLease(project: TestProject): Promise<(() => Promise<void>) | undefined> {
   if (isListingInvocation()) return undefined;
   const cwd = process.cwd();
   let path: string;
@@ -95,13 +103,19 @@ export default async function vitestLease(): Promise<(() => Promise<void>) | und
     };
     process.prependOnceListener("exit", onExit);
     held = registry[HELD] = { users: 0, release: () => { process.off("exit", onExit); release(); }, done };
+    const own = held;
+    project.vitest.onClose(async () => {
+      await awaitRunnerShutdown();
+      own.release();
+      await own.done;
+    });
   }
   held.users++;
   const own = held;
   return async () => {
     if (--own.users > 0) return;
     delete registry[HELD];
-    own.release();
-    await own.done;
+    // Returning lets Vitest close its servers and pool in its normal order. The public onClose
+    // hook keeps the reservation and exit protection until those children have ceased.
   };
 }

@@ -1,11 +1,16 @@
 import { EventEmitter } from "node:events";
+import * as childProcesses from "node:child_process";
 import { PassThrough } from "node:stream";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
-import { COMMAND_LEASE_TOKEN_ENV, commandLeaseEnvironment, CommandLeases, currentCommandLeaseToken, isRunnerCommand, readHolder, reclaimDead, repositoryLeasePath, runWithCommandLease, tryReserve, withCommandLease, withRepositoryLease, observeIdentity } from "../../src/run/lease.js";
+import { COMMAND_LEASE_TOKEN_ENV, commandLeaseEnvironment, CommandLeases, currentCommandLeaseToken, isRunnerCommand, readHolder, reclaimDead, reentrantHolder, REPOSITORY_LEASE_TOKEN_ENV, repositoryLeasePath, runWithCommandLease, tryReserve, withCommandLease, withRepositoryLease, observeIdentity, type RepositoryLeaseHolder } from "../../src/run/lease.js";
 import { resetSpawnForTests, setSpawnForTests, sh } from "../../src/run/git.js";
 import { captureBaseline } from "../../src/gates/baseline.js";
 import { verifyIntegrationTip } from "../../src/run/merge.js";
 import { makeRepo, makeTestTempDir } from "../helpers/tmprepo.js";
+
+vi.mock("node:child_process", async importOriginal => ({
+  ...await importOriginal<typeof import("node:child_process")>(),
+}));
 
 const deferred = () => {
   let resolve!: () => void;
@@ -14,6 +19,129 @@ const deferred = () => {
 // These fixtures exercise root admission even when the containing suite is itself leased.
 beforeEach(() => { vi.stubEnv(COMMAND_LEASE_TOKEN_ENV, undefined); });
 afterEach(() => { resetSpawnForTests(); vi.restoreAllMocks(); vi.useRealTimers(); vi.unstubAllEnvs(); });
+
+test.each(["deadline", "census"] as const)("a release %s failure hands the owned generation to orphan protection until its tree ceases even while the owner stays alive", async fault => {
+  const { existsSync } = await import("node:fs");
+  const repo = makeRepo({ "base.txt": "base" });
+  const path = await repositoryLeasePath(repo);
+  let holder!: RepositoryLeaseHolder;
+  let orphanLive = true;
+  let censusFails = fault === "census";
+  let now = 0;
+  let censuses = 0;
+  const realKill = process.kill;
+  const kill = vi.spyOn(process, "kill").mockImplementation((pid, signal) => pid === 900001 ? true : realKill(pid, signal));
+  // The escaped token carrier has neither an owner ancestor nor a recorded root group, so
+  // cleanup cannot signal it. Advance only the reap clock; no slow-runner wall deadline.
+  vi.spyOn(childProcesses, "execFile").mockImplementation(((file: string, args: string[], _options: childProcesses.ExecFileOptions,
+    done: (error: Error | null, stdout: string, stderr: string) => void) => {
+    expect(file).toBe("ps");
+    expect(args).toEqual(["eww", "-A", "-o", "pid=,ppid=,pgid=,stat=,command="]);
+    if (fault === "deadline" && ++censuses === 2) now = 15_000;
+    queueMicrotask(() => done(censusFails ? new Error("census unavailable") : null,
+      orphanLive ? `900001 1 900001 S node ${REPOSITORY_LEASE_TOKEN_ENV}=${holder.token}\n` : "", ""));
+    return { pid: 900002 } as childProcesses.ChildProcess;
+  }) as unknown as typeof childProcesses.execFile);
+  vi.spyOn(Date, "now").mockImplementation(() => now);
+  let releaseReported = false;
+  const owner = withRepositoryLease(repo, async () => { holder = readHolder(path)!; }, {
+    isolated: true, inherited: "", pollMs: 10, onRelease: () => { releaseReported = true; },
+  });
+  await expect(owner).rejects.toThrow(fault === "census" ? "census unavailable" : "verification children did not cease");
+  const released = { ...holder, ownerReleased: true };
+  expect(readHolder(path)).toEqual(released);
+  expect(releaseReported).toBe(false); // neither child reaping nor file release was proven
+  expect(kill).not.toHaveBeenCalledWith(900001, "SIGKILL");
+  expect(() => process.kill(holder.pid, 0)).not.toThrow();
+
+  // A later unreadable census still refuses admission and leaves the recovery record intact.
+  censusFails = true;
+  await expect(withRepositoryLease(repo, async () => { throw new Error("must not enter"); }, {
+    isolated: true, inherited: "", pollMs: 10,
+  })).rejects.toThrow("census unavailable");
+  expect(readHolder(path)).toEqual(released);
+  censusFails = false;
+
+  const waiting = deferred(), finish = deferred();
+  const order: string[] = [];
+  const older = withRepositoryLease(repo, async () => {
+    expect(readHolder(path)?.token).not.toBe(holder.token);
+    order.push("older");
+    await finish.promise;
+  }, { isolated: true, inherited: "", pollMs: 10, onWait: observed => { expect(observed).toEqual(released); waiting.resolve(); } });
+  const settled = Promise.allSettled([older]);
+  await waiting.promise;
+  expect(order).toEqual([]);
+  expect(readHolder(path)).toEqual(released);
+  const controller = new AbortController();
+  try {
+    const cancelled = withRepositoryLease(repo, async () => { throw new Error("cancelled waiter entered"); }, {
+      isolated: true, inherited: "", pollMs: 10, signal: controller.signal,
+    });
+    const rejection = expect(cancelled).rejects.toThrow("waiter cancelled");
+    controller.abort(new Error("waiter cancelled"));
+    await rejection;
+    expect(readHolder(path)).toEqual(released);
+    orphanLive = false;
+  } finally {
+    orphanLive = false;
+    finish.resolve();
+    await settled;
+  }
+  expect(await settled).toEqual([{ status: "fulfilled", value: undefined }]);
+  expect(order).toEqual(["older"]);
+  expect(existsSync(path)).toBe(false);
+});
+
+test("a released ancestor cannot authorize inherited reentry and a failed release never marks a superseding generation", async () => {
+  const { rmSync } = await import("node:fs");
+  const repo = makeRepo({ "base.txt": "base" });
+  const path = await repositoryLeasePath(repo);
+  const ancestor: RepositoryLeaseHolder = { pid: process.ppid, cwd: repo, at: 1, token: "released-ancestor", ownerReleased: true, protectOrphans: true };
+  expect(tryReserve(path, ancestor)).toBe(true);
+  const census = vi.spyOn(childProcesses, "execFile").mockImplementation(((_file: string, _args: string[], _options: childProcesses.ExecFileOptions,
+    done: (error: Error | null, stdout: string, stderr: string) => void) => {
+    queueMicrotask(() => done(new Error("census unavailable"), "", ""));
+    return { pid: 900002 } as childProcesses.ChildProcess;
+  }) as unknown as typeof childProcesses.execFile);
+  try {
+    expect(await reentrantHolder(path, ancestor.token)).toBeUndefined();
+    expect(census).not.toHaveBeenCalled();
+    rmSync(path);
+    const replacement = { pid: process.pid, cwd: repo, at: 2, token: "replacement" };
+    await expect(withRepositoryLease(repo, async () => {
+      rmSync(path);
+      expect(tryReserve(path, replacement)).toBe(true);
+    }, { isolated: true, inherited: "", pollMs: 10 })).rejects.toThrow("census unavailable");
+    expect(readHolder(path)).toEqual(replacement);
+  } finally { rmSync(path, { force: true }); }
+});
+
+test.skipIf(process.platform === "linux")("Darwin process birth formatting preserves a live legacy generation while a changed birth requires independent admission", async () => {
+  const { existsSync, rmSync } = await import("node:fs");
+  const repo = makeRepo({ "base.txt": "base" });
+  const path = await repositoryLeasePath(repo);
+  const padded = "Sun Oct  4 13:00:00 2026";
+  const canonical = "Sun Oct 4 13:00:00 2026";
+  const holder = { pid: process.pid, cwd: repo, at: 1, token: "legacy-token", identity: `${process.pid}:${padded}` };
+  expect(tryReserve(path, holder)).toBe(true);
+  const birth = vi.spyOn(childProcesses, "execFileSync").mockReturnValue(canonical + "\n");
+  const cancelled = new AbortController();
+  let entered = false;
+  try {
+    await expect(withRepositoryLease(repo, async () => { entered = true; }, {
+      independent: true, isolated: true, inherited: "", pollMs: 10, signal: cancelled.signal,
+      onWait: observed => { expect(observed).toEqual(holder); cancelled.abort(new Error("still live")); },
+    })).rejects.toThrow("still live");
+    expect(entered).toBe(false);
+    expect(readHolder(path)).toEqual(holder);
+    birth.mockReturnValue("Sun Oct 4 13:00:01 2026\n");
+    await withRepositoryLease(repo, async () => {
+      expect(readHolder(path)?.token).not.toBe(holder.token);
+    }, { isolated: true, inherited: "", protectOrphans: false, pollMs: 10 });
+    expect(existsSync(path)).toBe(false);
+  } finally { rmSync(path, { force: true }); }
+});
 
 test("test: two leased commands started together run one at a time with the second's suite-wait row naming the count, a leased command killed at its ceiling releases only its own lease and the waiting command starts within one poll while a third command's lease is untouched, and the baseline capture and tip verify each hold a lease for their command's span, so a lease outliving its job or a capture that runs unleased fails", async () => {
   const repo = makeRepo({ "base.txt": "base" });

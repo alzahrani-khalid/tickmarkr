@@ -1,6 +1,7 @@
 import type { CommandReceiptAttribution, ShellReceipt } from "./protocol.js";
+import { observeVerificationReceipt, observeVerificationSpawn, verificationJobEnvironment } from "./verification-job.js";
 import { executionSignal } from "./execution-budget.js";
-import { commandLeaseEnvironment, withCommandLease } from "./lease.js";
+import { commandLeaseEnvironment, repositoryLeaseEnvironment, registerRepositoryChild, withCommandLease } from "./lease.js";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { execFile, execFileSync, spawn } from "node:child_process";
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
@@ -11,6 +12,7 @@ import { shq } from "../adapters/types.js";
 import { tickmarkrDir } from "../graph/graph.js";
 import { ROUTING_ENV_SEAMS } from "../route/router.js";
 import { titleEnvironment } from "./title-environment.js";
+import { assertGitTrust, protectedGitEnv, trustedCommonDir } from "./git-trust.js";
 
 export { ROUTING_ENV_SEAMS };
 
@@ -361,6 +363,7 @@ export function shell(cmd: string, cwd: string, timeoutMs: number, login = false
       if (activePid !== undefined && activeShells.get(activePid)?.invocation === activeInvocation) activeShells.delete(activePid);
       activePid = undefined;
     }
+    observeVerificationReceipt({ ...receipt, confirmedStart });
     // Observational callbacks must not change process cleanup, retries or cancellation.
     try { options.onReceipt?.({ ...receipt, confirmedStart, ...(attribution ? { attribution: { ...attribution } } : {}) }); }
     catch { /* receipt sinks are observational */ }
@@ -390,7 +393,9 @@ function executeShell(cmd: string, cwd: string, timeoutMs: number, login: boolea
   // TICKMARKR_QUALITY leaked it into baseline/gate/tip-verify children, turning a dogfood
   // repo's route() tests red inside the gates. Scrub a copy at this one choke point so
   // children are hermetic by construction; the daemon's own process.env stays unchanged.
-  const env = commandLeaseEnvironment(options.env ?? process.env);
+  // v2.6.7 T4 (E1): git children run with core.fsmonitor=false and an inert hooksPath whatever the
+  // repository or inherited GIT_CONFIG_* say; every other parent, capability and explicit value survives.
+  const env = protectedGitEnv(verificationJobEnvironment(repositoryLeaseEnvironment(commandLeaseEnvironment(options.env ?? process.env))));
   for (const k of ROUTING_ENV_SEAMS) delete env[k];
   // A run freezes the operator override and cores at startup; admission can lower the round cap.
   env[FORK_CAP_ENV] = verificationBudget.getStore()
@@ -417,6 +422,14 @@ function executeShell(cmd: string, cwd: string, timeoutMs: number, login: boolea
     // SIGKILLing bash alone orphans grandchildren (codex/pi) that hold the stdio pipes
     // open, so "close" never fires and the promise wedges forever (v1.33.1 init hang).
     let p: ReturnType<typeof spawn>;
+    // v2.6.7 T4: the trust check runs before EVERY spawn attempt (retries included) and caches nothing — a
+    // seat can rewrite its gitdir's commondir/config.worktree between any two calls. A refusal names the file.
+    try {
+      assertGitTrust(cwd);
+    } catch (error) {
+      observation.emit({ outcome: "spawn-failed", exitCode: null, signal: null, error: String(error) });
+      throw error;
+    }
     try {
       p = (spawnChild ?? spawn)("bash", [login ? "-lc" : "-c", cmd], { cwd, env, stdio: ["ignore", "pipe", "pipe"], detached: true });
     } catch (error) {
@@ -489,6 +502,12 @@ function executeShell(cmd: string, cwd: string, timeoutMs: number, login: boolea
       boundDrain();
     };
     options.signal?.addEventListener("abort", abort, { once: true });
+    try { registerRepositoryChild(p.pid); }
+    catch (error) {
+      try { process.kill(-p.pid!, "SIGKILL"); } catch { p.kill("SIGKILL"); }
+      spawnError = String(error);
+    }
+    observeVerificationSpawn(p.pid);
     options.onSpawn?.(p.pid);
     if (options.signal?.aborted) abort();
     p.on("spawn", () => { started = true; observation.emit({ outcome: "started", pid: p.pid }); }); // the command exists from here on — never retryable past it
@@ -766,19 +785,14 @@ export async function createWorktree(repo: string, branch: string, baseRef: stri
 // match the provisioned SYMLINK, so a worker staging with `git add -A` commits the link and burns an
 // attempt on the scope gate. Write `node_modules` (no slash: matches the link too) into the exclude
 // file git actually consults for this worktree. Per-worktree `info/` is ignored in linked worktrees
-// (gitrepository-layout redirects it), so resolve through the `.git` gitfile + `commondir` indirection
-// to the common git dir. Local git metadata only — the target repository's .gitignore is never edited.
+// (gitrepository-layout redirects it), so write the common git dir's exclude. Local git metadata only — the target repository's .gitignore is never edited.
 // Idempotent (appends only when no entry exists) and best-effort, like the link itself.
+// v2.6.7 T4 (W1): the common dir is the independently derived one (trustedCommonDir), never what a
+// seat-writable commondir names — a redirected commondir never receives the write.
 function excludeNodeModules(dir: string): void {
   try {
-    let gitDir = join(dir, ".git");
-    if (lstatSync(gitDir).isFile()) { // linked worktree: .git is a gitfile naming the real git dir
-      const m = /^gitdir:\s*(.+?)\s*$/m.exec(readFileSync(gitDir, "utf8"));
-      if (!m) return;
-      gitDir = resolve(dir, m[1]);
-    }
-    const commondir = join(gitDir, "commondir");
-    if (existsSync(commondir)) gitDir = resolve(gitDir, readFileSync(commondir, "utf8").trim());
+    lstatSync(join(dir, ".git")); // only the checkout itself, never an enclosing repository
+    const gitDir = trustedCommonDir(dir);
     const exclude = join(gitDir, "info", "exclude");
     const current = existsSync(exclude) ? readFileSync(exclude, "utf8") : "";
     if (/^node_modules$/m.test(current)) return; // already excluded — repeated re-asserts add nothing

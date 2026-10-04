@@ -156,7 +156,8 @@ describe("VIS-08 execution and declaration order contracts", () => {
     const { trace, hook } = traceOf(() => {});
     const result = await runGates(task, { ...(await ctxFor(repo, base, task, fake, commands)), onGate: hook });
     const starts = trace.filter((e) => e.phase === "start").map((e) => e.gate);
-    expect(starts).toEqual(["build", "lint", "evidence", "scope", "test", "acceptance", "review"]);
+    // v2.6.7 T1 (closed order table): a fresh candidate's judge ‖ review precede its one full test job.
+    expect(starts).toEqual(["build", "lint", "evidence", "scope", "acceptance", "review", "test"]);
     expect(result.results.map((gate) => gate.gate)).toEqual(GATE_NAMES);
     expect(trace.length).toBeGreaterThan(0);
   });

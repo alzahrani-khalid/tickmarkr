@@ -57,7 +57,7 @@ usage: tickmarkr <command>
   profile       show learned routing profile (profile reset = forget history via cursor, keeps telemetry)
   ui            open Home, Run or Evidence (--view home|run|evidence; --setup <id> opens Run Parks)
   unlock        remove a stale/garbage run lock (refuses if the holder is alive)
-  beat <tier>   record one supervision beat for orchestrator|orchestrator-context|overseer|overseer-context|watch, --seat <identity> required (--stand-down to hand off); a supervising seat's own watcher loop calls it, and status reads the tier STALE once the beats stop
+  beat <tier>   supervision beats for orchestrator|orchestrator-context|overseer|overseer-context|watch, --seat <identity> required: beat start|stop|status <tier> owns one detached loop per tier (status is read-only); the legacy beat <tier> records one beat (--stand-down to hand off), and status reads the tier STALE once the beats stop
   approve <id> <task>  release a park (--uphold sides with the reviewer and funds a fixed attempt; --by <name> --reason <text>); takes effect on resume
   version       print the installed version (--dist adds build location and fingerprint)
 

@@ -1,13 +1,20 @@
 // OBS-880 suite (2) / OBS-1071: the production Vitest configuration's suite lease hook
 // (scripts/vitest-lease.ts), exercised through real Vitest processes over fixture repositories.
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
+import * as childProcesses from "node:child_process";
 import { copyFileSync, existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { afterEach, expect, test } from "vitest";
+import { afterEach, expect, test, vi } from "vitest";
+import type { TestProject } from "vitest/node";
+import * as lease from "../../src/run/lease.js";
 import { discoverTestManifest } from "../../src/gates/test-manifest.js";
 import { COMMAND_LEASE_TOKEN_ENV, REPOSITORY_LEASE_TOKEN_ENV, readHolder, repositoryLeasePath, withRepositoryLease } from "../../src/run/lease.js";
-import { isListingInvocation, stopOwnedRunners } from "../../scripts/vitest-lease.js";
+import vitestLease, { isListingInvocation, stopOwnedRunners } from "../../scripts/vitest-lease.js";
 import { makeRepo, makeTestTempDir } from "../helpers/tmprepo.js";
+
+vi.mock("node:child_process", async importOriginal => ({
+  ...await importOriginal<typeof import("node:child_process")>(),
+}));
 
 const root = process.cwd();
 const VITEST = join(root, "node_modules/vitest/vitest.mjs");
@@ -110,6 +117,49 @@ function vitest(cwd: string, name: string, log: string, extra: NodeJS.ProcessEnv
   return runner;
 }
 const passed = async (r: Runner) => { const code = await r.exit; expect(code, r.out()).toBe(0); };
+
+test("configured Vitest preserves its shutdown order and retains the repository reservation until the public close hook observes that workers have ceased", async () => {
+  const events: string[] = [];
+  let workerLive = true;
+  let closing!: () => Promise<void>;
+  const pool = { close: vi.fn() };
+  const runner = { pool, onClose: vi.fn((callback: () => Promise<void>) => { closing = callback; }) };
+  const project = { vitest: runner } as unknown as TestProject;
+  vi.spyOn(childProcesses, "spawnSync").mockImplementation(() => ({
+    status: 0, stdout: workerLive ? `999999 ${process.pid} S\n` : "", stderr: "", pid: 999998,
+    output: [], signal: null,
+  }));
+  vi.spyOn(lease, "repositoryLeasePath").mockResolvedValue(join(root, "unused.lease"));
+  const reserve = vi.spyOn(lease, "withRepositoryLease").mockImplementation(async (_cwd, run) => {
+    events.push("reserved");
+    try { return await run(); } finally { events.push("released"); }
+  });
+  const first = await vitestLease(project);
+  const last = await vitestLease(project);
+  let teardown: Promise<void> | undefined;
+  await first!();
+  try {
+    expect(reserve).toHaveBeenCalledTimes(1);
+    expect(events).toEqual(["reserved"]);
+    await last!();
+    expect(runner.onClose).toHaveBeenCalledTimes(1);
+    expect(events).toEqual(["reserved"]);
+    teardown = closing();
+    expect(events).toEqual(["reserved"]);
+    expect(pool.close).not.toHaveBeenCalled();
+    expect(runner.pool).toBe(pool);
+    workerLive = false;
+    await teardown;
+    expect(events).toEqual(["reserved", "released"]);
+    expect(pool.close).not.toHaveBeenCalled();
+    expect(runner.pool).toBe(pool);
+  } finally {
+    workerLive = false;
+    await (teardown ?? closing());
+    vi.restoreAllMocks();
+  }
+});
+
 /** A waiter shows the holder it queued behind and never starts its test body; then it is cancelled. */
 async function waits(r: Runner, log: string, name: string) {
   await until(() => r.out().includes(WAITING), 30_000, `${name} to report waiting:\n${r.out()}`);

@@ -60,7 +60,7 @@ export function baselineIdentity(baseline?: Baseline): string {
   const commands = Object.fromEntries(Object.entries(baseline.commands).map(([gate, entry]) => {
     const {
       durationMs: _duration, fileDurationSumMs: _sum, impliedParallelism: _parallelism,
-      longestFile: _longest, fileDurations: _files, ceilingMs: _ceiling, ...evidence
+      longestFile: _longest, fileDurations: _files, fileOutcomes: _outcomes, ceilingMs: _ceiling, ...evidence
     } = entry;
     return [gate, evidence];
   }));

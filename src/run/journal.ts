@@ -19,6 +19,7 @@ import {
   type TrackedJournalRow,
 } from "./protocol.js";
 import { PRESERVE_COMMIT_SUBJECT, PRESERVE_PRODUCER_TRAILER } from "./git.js";
+import { assertGitTrust, protectedGitEnv } from "./git-trust.js";
 import { normalizeGateOutcome } from "./outcome.js";
 import { redactSecrets } from "./redact.js";
 
@@ -2585,9 +2586,17 @@ export interface OwedFold {
   unknown: Array<{ taskId?: string; gate?: string; reason: string }>;
 }
 
-const owedGit = (cwd: string, args: string[], input?: string): string => execFileSync("git", args, {
-  cwd, encoding: "utf8", maxBuffer: 64 * 1024 * 1024, ...(input === undefined ? { stdio: ["ignore", "pipe", "pipe"] } : { input }),
-});
+// v2.6.7 T4: every owed-identity git call runs the uncached trust check and the forced child config, and its
+// diff-producing verbs never run an external diff or textconv driver; a refusal throws, so the fold is unknown.
+const NO_DRIVERS = new Set(["diff", "show", "log"]);
+const owedGit = (cwd: string, args: string[], input?: string): string => {
+  assertGitTrust(cwd);
+  const argv = NO_DRIVERS.has(args[0]!) ? [args[0]!, "--no-ext-diff", "--no-textconv", ...args.slice(1)] : args;
+  return execFileSync("git", argv, {
+    cwd, env: protectedGitEnv(process.env), encoding: "utf8", maxBuffer: 64 * 1024 * 1024,
+    ...(input === undefined ? { stdio: ["ignore", "pipe", "pipe"] } : { input }),
+  });
+};
 const sha256 = (text: string): string => createHash("sha256").update(text).digest("hex");
 
 export const owedCriteria = (acceptance: unknown): string => sha256(JSON.stringify(acceptance));
@@ -2876,6 +2885,9 @@ export function foldOwedChecks(events: readonly JournalEvent[], cwd: string, mem
 }
 
 function foldOwedChecksOrThrow(events: readonly JournalEvent[], cwd: string, memo?: OwedProofMemo): OwedFold {
+  // v2.6.7 T4 (G2): checkout trust is re-derived at the fold boundary, before a memoised proof can answer —
+  // a memo hit runs no git, so hostile metadata would otherwise ride a clean fold's cached proof to known debt.
+  assertGitTrust(cwd);
   const accepted = new Map<string, OwedCheck>();
   const discharged = new Set<string>();
   const unknown: OwedFold["unknown"] = [];

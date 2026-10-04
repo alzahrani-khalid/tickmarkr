@@ -11,6 +11,7 @@ import { HerdrDriver } from "../../src/drivers/herdr.js";
 import { SubprocessDriver } from "../../src/drivers/subprocess.js";
 import type { ExecutorDriver } from "../../src/drivers/types.js";
 import { captureBaseline, compareToBaseline, type Baseline } from "../../src/gates/baseline.js";
+import { computeVerificationIdentity, getVerdictStore } from "../../src/gates/cache.js";
 import { extractPromptNonce, type GateVia } from "../../src/gates/llm.js";
 import { type GateContext, type GateEvent, runGates } from "../../src/gates/run-gates.js";
 import type { GateResult } from "../../src/gates/types.js";
@@ -20,7 +21,7 @@ import {
   gateSatisfied, NUDGEABLE_ADAPTERS, resetHarvestSilentMsForTests, resetNudgeTimingForTests, runDaemon,
   setHarvestSilentMsForTests, setNudgeTimingForTests, verifyIntegrationTipCached, WORKER_NUDGE_MESSAGE,
 } from "../../src/run/daemon.js";
-import { gitHead } from "../../src/run/git.js";
+import { gitHead, resolvedCapacity } from "../../src/run/git.js";
 import { Journal, type StructuredFinding } from "../../src/run/journal.js";
 import { COMMIT, makeRepo, makeTestTempDir, setupRepo, T } from "../helpers/tmprepo.js";
 
@@ -159,11 +160,13 @@ async function gates(
   repo: string,
   baseRef: string,
   commands: Record<string, string>,
-  opts: { selectTests?: boolean; adapters?: FakeAdapter[]; onGate?: (e: GateEvent) => void | Promise<void>; armAfterBaseline?: () => void } = {},
+  opts: { selectTests?: boolean; adapters?: FakeAdapter[]; onGate?: (e: GateEvent) => void | Promise<void>; armAfterBaseline?: () => void;
+    requiredRepairTests?: string[] } = {},
 ): Promise<{ results: GateResult[] }> {
   const cfg = structuredClone(DEFAULT_CONFIG);
   cfg.judge.adapter = "fake";
-  const baseline = await captureBaseline(repo, commands);
+  // v2.6.7 T1: an attributed test-red repair carries comparable harness timing that admits its diagnostic.
+  const baseline = opts.requiredRepairTests ? admitting(await captureBaseline(repo, commands)) : await captureBaseline(repo, commands);
   opts.armAfterBaseline?.(); // the baseline is the PRE-work state: a failure armed after it is a new one
   return runGates(mkTask(taskOver), {
     worktree: repo, baseRef, author,
@@ -171,9 +174,14 @@ async function gates(
     commands, baseline, channels,
     adapters: opts.adapters ?? [fakeWith({}).adapter],
     cfg, selectTests: opts.selectTests,
+    ...(opts.requiredRepairTests ? { requiredRepairTests: opts.requiredRepairTests, selectionReason: "known-failing-files" } : {}),
     onGate: opts.onGate,
   });
 }
+
+/** Harness timing under which every fixture test file is a cheap diagnostic (1 % of the suite, 1 ms each). */
+const admitting = (baseline: Baseline): Baseline => ({ ...baseline, commands: { ...baseline.commands, test: { ...baseline.commands.test!,
+  fileDurations: [{ file: "tests/a.test.ts", durationMs: 1 }, { file: "tests/b.test.ts", durationMs: 1 }, { file: "tests/heavy.test.ts", durationMs: 98 }] } } });
 
 describe("T4 — the deterministic gates run before the battery (OBS-265)", () => {
   test("a scope failure is journaled before any battery command has run", async () => {
@@ -796,9 +804,12 @@ function corpusRepo(): { repo: string; baseRef: Promise<string> } {
 }
 
 const argvLines = (repo: string) => readFileSync(join(repo, "argv.log"), "utf8").split("\n").slice(0, -1);
+// v2.6.7 T1: a diagnostic only runs beside a semantic gate — test-only verification keeps its full scope.
+const DIAGNOSED = [...DETERMINISTIC, "acceptance"];
+const judgeOk = () => fakeWith({ judge: { pass: true, criteria: [{ criterion: "c1", met: true, reason: "ok" }] } }).adapter;
 
 describe("T4 — selection is a round's economy, never a merge's licence (OBS-265)", () => {
-  test("a diff pairing one changed source file with one changed file no test can reach selects only the tests covering that source file", async () => {
+  test("a diff pairing one changed source file with one changed source no test can reach screens nothing and runs the full suite once", async () => {
     const corpus: Array<{ shape: string; mutate: (repo: string) => void; selected?: string[] }> = [
       {
         shape: "a source file with a direct test mirror",
@@ -821,7 +832,9 @@ describe("T4 — selection is a round's economy, never a merge's licence (OBS-26
           writeFileSync(join(r, "src/a.ts"), "import { deep } from \"./deep.js\";\nexport const a = () => deep() + 22;\n");
           writeFileSync(join(r, "src/orphan.ts"), "export const orphan = () => 33;\n");
         },
-        selected: ["tests/a.test.ts"],
+        // v2.6.7 T1: an unreachable changed source makes the WHOLE attribution unsupported — a screen over
+        // the covered half would run around it (the 2.1.8 behavior selected tests/a.test.ts here).
+        selected: undefined,
       },
       {
         shape: "a file with no covering tests",
@@ -842,17 +855,19 @@ describe("T4 — selection is a round's economy, never a merge's licence (OBS-26
       member.mutate(repo);
       commitAll(repo, "work");
       const ends: GateEvent[] = [];
+      // v2.6.7 T1: selection now serves only an attributed test-red repair's admitted diagnostic.
       const { results } = await gates(
-        { gates: DETERMINISTIC, files: ["**"] }, repo, base, { test: "sh run.sh" },
-        { selectTests: true, onGate: (e) => { if (e.phase === "end") ends.push(e); } },
+        { gates: DIAGNOSED, files: ["**"] }, repo, base, { test: "sh run.sh" },
+        { selectTests: true, adapters: [judgeOk()], requiredRepairTests: [member.selected?.[0] ?? "tests/a.test.ts"], onGate: (e) => { if (e.phase === "end") ends.push(e); } },
       );
       const testGate = results.find((r) => r.gate === "test")!;
       const runs = argvLines(repo).slice(1); // line 0 is gates()' own baseline capture
-      // ONE test verdict per round, however many suites the round had to run to reach it: the selected
-      // run is a screen the full suite supersedes, never a second indistinguishable `test` gate-result.
+      // ONE full verdict per round: the diagnostic publishes its own selected row, distinguishable from
+      // (and superseded by) the full suite's, never a second indistinguishable `test` gate-result.
       const testEnds = ends.filter((e) => e.gate === "test");
-      expect({ shape: member.shape, verdicts: testEnds.length }).toEqual({ shape: member.shape, verdicts: 1 });
-      expect({ shape: member.shape, verdict: testEnds[0]!.phase === "end" && testEnds[0]!.result }).toEqual({ shape: member.shape, verdict: testGate });
+      const last = testEnds[testEnds.length - 1]!;
+      expect({ shape: member.shape, verdicts: testEnds.length }).toEqual({ shape: member.shape, verdicts: member.selected ? 2 : 1 });
+      expect({ shape: member.shape, verdict: last.phase === "end" && last.result }).toEqual({ shape: member.shape, verdict: testGate });
 
       if (member.selected) {
         expect({ shape: member.shape, selected: testGate.meta?.selectedTests }).toEqual({ shape: member.shape, selected: member.selected });
@@ -881,8 +896,8 @@ describe("T4 — selection is a round's economy, never a merge's licence (OBS-26
     writeFileSync(join(repo, "src/a.ts"), "import { deep } from \"./deep.js\";\nexport const a = () => deep() + 2;\n");
     commitAll(repo, "work");
     const missed = await gates(
-      { gates: DETERMINISTIC, files: ["**"] }, repo, missBase, { test: "sh run.sh" },
-      { selectTests: true, armAfterBaseline: () => writeFileSync(join(repo, "miss.flag"), "a failure the selection cannot see\n") },
+      { gates: DIAGNOSED, files: ["**"] }, repo, missBase, { test: "sh run.sh" },
+      { selectTests: true, adapters: [judgeOk()], requiredRepairTests: ["tests/a.test.ts"], armAfterBaseline: () => writeFileSync(join(repo, "miss.flag"), "a failure the selection cannot see\n") },
     );
     const missedTest = missed.results.find((r) => r.gate === "test")!;
     expect(missedTest.meta?.selectedTests).toEqual(["tests/a.test.ts"]); // the selection happened
@@ -896,8 +911,8 @@ describe("T4 — selection is a round's economy, never a merge's licence (OBS-26
     git(repo, "mv src/old.ts src/renamed.ts");
     commitAll(repo, "rename");
     const { results } = await gates(
-      { gates: DETERMINISTIC, files: ["**"] }, repo, await baseRef, { test: "sh run.sh" },
-      { selectTests: true },
+      { gates: DIAGNOSED, files: ["**"] }, repo, await baseRef, { test: "sh run.sh" },
+      { selectTests: true, adapters: [judgeOk()], requiredRepairTests: ["tests/b.test.ts"] },
     );
     const testGate = results.find((r) => r.gate === "test")!;
     expect(testGate.meta?.selectedTests).toBeUndefined();
@@ -921,7 +936,8 @@ describe("T4 — selection is a round's economy, never a merge's licence (OBS-26
     const { results } = await runGates(mkTask({ files: ["**"] }), {
       worktree: repo, baseRef: base, author,
       result: { ok: true, summary: "", deviations: [], raw: "" },
-      commands, baseline: await captureBaseline(repo, commands), channels,
+      commands, baseline: admitting(await captureBaseline(repo, commands)), channels,
+      requiredRepairTests: ["tests/a.test.ts"], selectionReason: "known-failing-files",
       // the judge refuses, so the round ends at the verdict gates — before the merge-candidate suite
       adapters: [fakeWith({
         judge: { pass: false, criteria: [{ criterion: "a", met: false, reason: "no" }] },
@@ -967,7 +983,8 @@ describe("T4 — selection is a round's economy, never a merge's licence (OBS-26
     const selectedRound = await runGates(mkTask({ files: ["**"] }), {
       worktree: repo, baseRef: base, author,
       result: { ok: true, summary: "", deviations: [], raw: "" },
-      commands, baseline, channels,
+      commands, baseline: admitting(baseline), channels,
+      requiredRepairTests: ["tests/a.test.ts"], selectionReason: "known-failing-files",
       adapters: [fakeWith({
         judge: { pass: false, criteria: [{ criterion: "a", met: false, reason: "screen-only" }] },
         review: { approve: true, issues: [] },
@@ -1042,14 +1059,12 @@ describe("T4 — selection is a round's economy, never a merge's licence (OBS-26
     const cfg = structuredClone(DEFAULT_CONFIG);
     cfg.judge.adapter = "fake";
     const ends: GateEvent[] = [];
-    const { results } = await runGates(mkTask({ gates: DETERMINISTIC, files: ["**"] }), {
+    const { results } = await runGates(mkTask({ gates: DIAGNOSED, files: ["**"] }), {
       worktree: repo, baseRef: base, author,
       result: { ok: true, summary: "", deviations: [], raw: "" },
-      commands, baseline, channels,
-      adapters: [fakeWith({
-        judge: { pass: true, criteria: [] },
-        review: { approve: true, issues: [] },
-      }).adapter],
+      commands, baseline: admitting(baseline), channels,
+      requiredRepairTests: ["tests/a.test.ts"], selectionReason: "known-failing-files",
+      adapters: [judgeOk()],
       cfg, selectTests: true,
       onGate: (e) => { if (e.phase === "end") ends.push(e); },
     });
@@ -1071,7 +1086,7 @@ describe("T4 — selection is a round's economy, never a merge's licence (OBS-26
   // park, a `resume`, or a daemon restart. Seeded from process memory it always starts clean, so one
   // miss could be re-bought every cycle instead of costing exactly one round.
   test("a journaled test failure survives a restart — the resumed round runs the full suite, never a selection", async () => {
-    const selectionRun = async (runId: string, seed: boolean) => {
+    const selectionRun = async (runId: string, seed: "attributed" | "unattributed") => {
       const log = join(makeTestTempDir("tickmarkr-argv-"), "argv.log");
       const { repo, fake } = setupRepo(
         [T("T1", { files: ["**"] })],
@@ -1090,19 +1105,24 @@ describe("T4 — selection is a round's economy, never a merge's licence (OBS-26
       journal.append("run-start", undefined, {
         baseRef: await gitHead(repo), commands, graphDefinitionHash: graphDefinitionHash(loadGraph(repo)),
       });
-      // the interrupted process's evidence: this task's test gate already went red once
-      if (seed) journal.append("gate-result", "T1", { gate: "test", pass: false, details: "the suite the selection could not see" });
-      writeFileSync(join(journal.dir, "baseline.json"), JSON.stringify(await captureBaseline(repo, commands)));
+      // the interrupted process's evidence: this task's test gate already went red once — either with full
+      // attribution (a behavioral full-suite red naming its failing file) or with none at all
+      journal.append("gate-result", "T1", seed === "attributed"
+        ? { gate: "test", pass: false, details: "FAIL tests/a.test.ts > known defect", disposition: "behavioral",
+          commit: "a".repeat(40), failingFiles: ["tests/a.test.ts"], selectionDecision: { scope: "full" } }
+        : { gate: "test", pass: false, details: "the suite the selection could not see" });
+      // v2.6.7 T1: comparable harness timing, so only attribution decides whether a diagnostic is admitted
+      writeFileSync(join(journal.dir, "baseline.json"), JSON.stringify(admitting(await captureBaseline(repo, commands))));
 
       const summary = await runDaemon(repo, { adapters: [fake], runId, resume: true });
       expect(summary.done).toEqual(["T1"]);
       return readFileSync(log, "utf8").split("\n").slice(0, -1);
     };
 
-    // the falsifier first: with nothing journaled against it, the resumed round DOES select
-    expect(await selectionRun("run-select-clean", false)).toContain("tests/a.test.ts");
-    // and with the failure on the record, no run of the suite ever carries a filter again
-    expect(await selectionRun("run-select-banned", true)).not.toContain("tests/a.test.ts");
+    // the falsifier first: with an attributed red journaled against it, the resumed round DOES select
+    expect(await selectionRun("run-select-clean", "attributed")).toContain("tests/a.test.ts");
+    // and with an unattributed failure on the record, no run of the suite ever carries a filter again
+    expect(await selectionRun("run-select-banned", "unattributed")).not.toContain("tests/a.test.ts");
   }, 60_000);
 });
 
@@ -1269,8 +1289,10 @@ describe("T4 — merged-task invariants under the reordered pipeline", () => {
       // the daemon's own round, end to end: deterministic gates retain their sequence; the two
       // independently-published verdicts each land once in whichever fulfillment order is true.
       const gateNames = gateEvents.map((e) => e.data.gate as string);
-      expect(gateNames.slice(0, 5)).toEqual(["build", "lint", "evidence", "scope", "test"]);
-      expect(gateNames.slice(5).sort()).toEqual(["acceptance", "review"]);
+      // v2.6.7 T1 (closed order table): the fresh candidate's judge ‖ review precede its one full job.
+      expect(gateNames.slice(0, 4)).toEqual(["build", "lint", "evidence", "scope"]);
+      expect(gateNames.slice(4, 6).sort()).toEqual(["acceptance", "review"]);
+      expect(gateNames.slice(6)).toEqual(["test"]);
       // the round's parallelism reaches the JOURNAL, not just the gate stream. The marker is the
       // gate stream's shared parentAt reduced to a run-identical boolean: two runs of one graph still
       // journal byte-identical events (tests/run/notify-identity.test.ts), and a surface can still say
@@ -1570,22 +1592,23 @@ describe("review empty-output note", () => {
 
 describe("OBS-635 — an in-battery full green is revalidated after the semantic gates", () => {
   test("runGates revalidates tree command baseline environment resolution capacity protocol lifecycle and full manifest after semantic oracles, so changed identity or oracle dirt cannot reuse an earlier full green whereas an unchanged complete identity can", async () => {
-    // Each oracle runs AFTER the full suite spoke in the battery. The identity is recomputed as one
-    // key over every component; these members move the tree, the environment and the capacity.
+    // v2.6.7 T1 (closed order table): each oracle now runs BEFORE the one full job, so the full job
+    // measures the subject the oracle left — once — and no earlier full green exists to reuse. Oracle
+    // dirt is refused before any test starts.
     const corpus: Array<{ shape: string; oracle: string; before?: () => void; onAcceptance?: () => void; runs: string[]; pass: boolean }> = [
       { shape: "unchanged complete identity", oracle: "true", runs: [""], pass: true },
-      { shape: "tree moved by a committing oracle", oracle: "echo moved > moved.txt && git add -A && git commit -q --no-gpg-sign -m oracle", runs: ["", ""], pass: true },
-      { shape: "environment moved by an ignored lockfile", oracle: "echo '{}' > package-lock.json", runs: ["", ""], pass: true },
-      { shape: "capacity moved during semantics", oracle: "true", onAcceptance: () => { process.env.VITEST_MAX_FORKS = "1"; }, runs: ["", ""], pass: true },
-      { shape: "runner NODE_OPTIONS moved during semantics", oracle: "true", onAcceptance: () => { process.env.NODE_OPTIONS = "--max-old-space-size=4096"; }, runs: ["", ""], pass: true },
-      { shape: "runner PATH moved during semantics", oracle: "true", onAcceptance: () => { process.env.PATH = `${priorPath}:/nonexistent-tickmarkr-runner`; }, runs: ["", ""], pass: true },
+      { shape: "tree moved by a committing oracle", oracle: "echo moved > moved.txt && git add -A && git commit -q --no-gpg-sign -m oracle", runs: [""], pass: true },
+      { shape: "environment moved by an ignored lockfile", oracle: "echo '{}' > package-lock.json", runs: [""], pass: true },
+      { shape: "capacity moved during semantics", oracle: "true", onAcceptance: () => { process.env.VITEST_MAX_FORKS = "1"; }, runs: [""], pass: true },
+      { shape: "runner NODE_OPTIONS moved during semantics", oracle: "true", onAcceptance: () => { process.env.NODE_OPTIONS = "--max-old-space-size=4096"; }, runs: [""], pass: true },
+      { shape: "runner PATH moved during semantics", oracle: "true", onAcceptance: () => { process.env.PATH = `${priorPath}:/nonexistent-tickmarkr-runner`; }, runs: [""], pass: true },
       // D-598: npm is unreachable for the whole round, so both identities carry lifecycle "unknown"
       // and hash equal; an unmeasurable policy is never an unchanged one — the full suite reruns.
       { shape: "unmeasurable lifecycle on both sides", oracle: "true", before: () => {
         delete process.env.npm_config_ignore_scripts; delete process.env.NPM_CONFIG_IGNORE_SCRIPTS;
         process.env.PATH = "/usr/bin:/bin"; process.env.NPM_CONFIG_USERCONFIG = join(mkdtempSync(join(tmpdir(), "tkr-npmrc-")), ".npmrc");
       }, runs: ["", ""], pass: true },
-      { shape: "oracle dirt", oracle: "echo dirt > oracle-dirt.txt", runs: [""], pass: false },
+      { shape: "oracle dirt", oracle: "echo dirt > oracle-dirt.txt", runs: [], pass: false },
     ];
     const priorForks = process.env.VITEST_MAX_FORKS;
     const priorOptions = process.env.NODE_OPTIONS;
@@ -1624,7 +1647,7 @@ describe("OBS-635 — an in-battery full green is revalidated after the semantic
         expect({ shape, test: verdict.pass }).toEqual({ shape, test: member.pass });
         // A rerun is the merge candidate's own full suite, never the earlier green reused.
         if (member.runs.length === 2) expect({ shape, full: verdict.meta?.fullSuite, reused: verdict.meta?.reused }).toEqual({ shape, full: true, reused: undefined });
-        if (!member.pass) expect(verdict.meta).toMatchObject({ dirtyWorktree: true, dirtyAtRoundEnd: true });
+        if (!member.pass) expect(verdict.meta).toMatchObject({ dirtyWorktree: true, paths: ["oracle-dirt.txt"] });
         expect({ shape, lastTestEnd: ends.filter((e) => e.gate === "test").at(-1) }).toEqual({ shape, lastTestEnd: expect.objectContaining({ result: verdict }) });
       }
     } finally {
@@ -1637,8 +1660,7 @@ describe("OBS-635 — an in-battery full green is revalidated after the semantic
     }
 
     // The full manifest, through a manifested runner: an oracle writes an ignored generated test the
-    // runner collects. No tree, command or environment component moves, so only the rediscovered
-    // manifest can withdraw the earlier green; an unchanged manifest keeps it.
+    // runner collects. The one full job runs after it and certifies the manifest it actually listed.
     for (const generated of [false, true]) {
       const repo = makeRepo({
         ".gitignore": "node_modules/\ntests/generated.test.ts\n",
@@ -1656,7 +1678,7 @@ describe("OBS-635 — an in-battery full green is revalidated after the semantic
       const verdict = results.find((r) => r.gate === "test")!;
       expect({ generated, pass: results.every((r) => r.pass), full: verdict.meta?.fullSuite, reused: verdict.meta?.reused, manifest: verdict.meta?.manifest })
         .toEqual(generated
-          ? { generated, pass: true, full: true, reused: undefined, manifest: ["tests/a.test.ts", "tests/generated.test.ts"] }
+          ? { generated, pass: true, full: undefined, reused: undefined, manifest: ["tests/a.test.ts", "tests/generated.test.ts"] }
           : { generated, pass: true, full: undefined, reused: undefined, manifest: ["tests/a.test.ts"] });
     }
   }, 120_000);
@@ -1708,16 +1730,17 @@ async function reviewRepair(review: object) {
   cfg.judge.adapter = "fake";
   const baseline = await captureBaseline(repo, commands);
   const { adapter, scriptPath } = fakeWith({ judge: { pass: true, criteria: [{ criterion: "c1", met: true, reason: "ok" }] }, review });
-  const round = async (over: Partial<GateContext> = {}, taskOver: { gates?: GateName[] } = {}) => {
+  const round = async ({ onGate, expired, ...over }: Partial<GateContext> & { expired?: Error[] } = {}, taskOver: { gates?: GateName[] } = {}) => {
     rmSync(join(repo, "battery.log"), { force: true });
     const stream: string[] = [];
     // spread AFTER validation, as the daemon's recovery builds `{ ...task, gates: ["review"] }`
     const { results } = await runGates({ ...mkTask({ files: ["**"] }), ...taskOver }, {
       worktree: repo, baseRef, author, result: { ok: true, summary: "repaired", deviations: [], raw: "" },
       commands, baseline, channels, adapters: [adapter], cfg, selectTests: true, carriedFindings: [MATERIAL],
-      onGate: (e) => { if (e.phase !== "note") stream.push(`${e.gate}:${e.phase}`); },
+      onGate: async (e) => { if (e.phase !== "note") stream.push(`${e.gate}:${e.phase}`); await onGate?.(e); },
       ...over,
     });
+    if (expired?.length) throw expired[0]; // a barrier's deadlock guard fired: fail by name, never assert over another sequence
     const log = existsSync(join(repo, "battery.log")) ? readFileSync(join(repo, "battery.log"), "utf8").trim().split("\n") : [];
     return { results, stream, log, row: (gate: string) => results.find((r) => r.gate === gate) };
   };
@@ -1738,17 +1761,49 @@ const recoverReview = async (fixture: Awaited<ReturnType<typeof reviewRepair>>, 
   return { retried, replacement, merges: first.map((g) => g.gate === "review" ? replacement : g).every(gateSatisfied) };
 };
 
+// A real subprocess driver whose pane creation refuses the roles `fails` names. A `held` role's pane is
+// created only after the `after` gate has PUBLISHED its end row — an explicit barrier released by onGate,
+// never a timer — and one event-loop turn later, so whatever that gate does next in its turn (a sibling
+// cancel) lands first. The 30 s ceiling is a deadlock guard only: a gate that never publishes REJECTS the
+// held seat (never launched) and the round rethrows that named error instead of hanging or proceeding.
+const seatDriver = (fails: (name: string) => boolean, held?: { role: string; after: GateName }): Pick<GateContext, "via" | "onGate"> & { expired: Error[] } => {
+  const expired: Error[] = [];
+  let release!: () => void;
+  const published = new Promise<void>((resolve) => { release = resolve; });
+  const inner = new SubprocessDriver();
+  const driver = new Proxy(inner, { get(target, property) {
+    if (property === "slot") return async (cwd: string, name: string) => {
+      if (held && name.startsWith(held.role)) {
+        let guard: NodeJS.Timeout | undefined;
+        await Promise.race([published, new Promise<never>((_, reject) => {
+          guard = setTimeout(() => {
+            const error = new Error(`barrier: ${held.after} never published before ${name}`);
+            expired.push(error);
+            reject(error);
+          }, 30_000);
+        })]).finally(() => clearTimeout(guard));
+      }
+      if (fails(name)) throw new Error(`pane create refused for ${name}`);
+      return target.slot(cwd, name);
+    };
+    const value: unknown = Reflect.get(target, property, target);
+    return typeof value === "function" ? value.bind(target) : value;
+  } }) as unknown as ExecutorDriver;
+  return { via: { driver, nameFor: (role, adapter) => `${role}-${adapter}`, labelFor: (role) => role.toUpperCase() },
+    onGate: (e) => { if (e.phase === "end" && e.gate === held?.after) setImmediate(release); }, expired };
+};
+
 const CHEAP = ["build", "lint", "evidence", "scope"].flatMap((g) => [`${g}:start`, `${g}:end`]);
 
 describe("v2.6.5 T6 — a semantic repair is reviewed before its test battery is bought (D)", () => {
-  test("runGates review-material repair follows cheap→acceptance‖review→screen→full versus zero test starts on a semantic red", async () => {
+  test("runGates review-material repair follows cheap→acceptance‖review→one full job versus zero test starts on a semantic red", async () => {
     const green = await (await reviewRepair(APPROVE)).round();
     expect(green.stream.slice(0, 10)).toEqual([...CHEAP, "acceptance:start", "review:start"]);
     expect(green.stream.slice(10, 12).sort()).toEqual(["acceptance:end", "review:end"]); // judge ‖ review
-    // the screen, then the merge-candidate full suite, which speaks for the held screen in one row
-    expect(green.stream.slice(12)).toEqual(["test:start", "test:start", "test:end"]);
-    expect(green.log).toEqual(["build", "lint", "test tests/a.test.ts", "test"]);
-    expect(green.row("test")?.meta).toMatchObject({ fullSuite: true, selectedTests: ["tests/a.test.ts"] });
+    // v2.6.7 T1: one full verification job, with no selected screen
+    expect(green.stream.slice(12)).toEqual(["test:start", "test:end"]);
+    expect(green.log).toEqual(["build", "lint", "test"]);
+    expect(green.row("test")?.meta?.selectedTests).toBeUndefined();
     expect(green.results.every((r) => r.pass)).toBe(true);
 
     const red = await (await reviewRepair(REJECT)).round();
@@ -1764,17 +1819,18 @@ describe("v2.6.5 T6 — a semantic repair is reviewed before its test battery is
     const unproven = await reviewRepair(APPROVE);
     writeFileSync(join(unproven.repo, "full-red.flag"), "");
     const regressed = await unproven.round();
-    expect(regressed.log).toEqual(["build", "lint", "test tests/a.test.ts", "test"]);
+    expect(regressed.log).toEqual(["build", "lint", "test"]);
     expect(regressed.row("acceptance")?.pass).toBe(true);
     expect(regressed.row("review")?.pass).toBe(true);
-    expect(regressed.row("test")).toMatchObject({ pass: false, meta: { fullSuite: true } });
+    expect(regressed.row("test")?.pass).toBe(false);
+    expect(regressed.row("test")?.meta?.selectedTests).toBeUndefined();
     expect(regressed.row("test")?.details).toContain("tests/hidden.test.ts");
 
     // A green round measures the clean subject; its rows are then in the verdict store.
     const fixture = await reviewRepair(APPROVE);
     const proven = await fixture.round();
-    expect(proven.log).toEqual(["build", "lint", "test tests/a.test.ts", "test"]);
-    expect(proven.row("test")).toMatchObject({ pass: true, meta: { fullSuite: true } });
+    expect(proven.log).toEqual(["build", "lint", "test"]);
+    expect(proven.row("test")?.pass).toBe(true);
     const head = await gitHead(fixture.repo);
 
     // The reviewer's CLI writes into the checkout: the changed subject borrows neither cached green,
@@ -1790,9 +1846,12 @@ describe("v2.6.5 T6 — a semantic repair is reviewed before its test battery is
     rmSync(join(fixture.repo, "litter.txt"));
 
     // No seat can launch: the seatless sibling cancels the other and the round ends before any test.
-    const driver = { slot: async () => { throw new Error("no pane could be created"); }, close: async () => {} } as unknown as ExecutorDriver;
-    const via: GateVia = { driver, nameFor: (role, adapter) => `${role}-${adapter}`, labelFor: (role) => role.toUpperCase() };
-    const seatless = await fixture.round({ via });
+    // D-1196: acceptance is refused FIRST — the review's pane is asked for only after acceptance PUBLISHED its
+    // terminal row (every judge failover spent). D-974 lets a seatless judge that lands after a settled
+    // no-verdict review buy the full job, so an unordered race could lawfully start a test here (clause 3 r1).
+    const { expired, ...barrier } = seatDriver(() => true, { role: "review", after: "acceptance" });
+    const seatless = await fixture.round(barrier);
+    if (expired.length) throw expired[0]; // a fired guard fails BY NAME, never asserts over another sequence
     expect(seatless.stream.filter((e) => e === "test:start")).toEqual([]);
     expect(seatless.log.filter((line) => line.startsWith("test"))).toEqual([]);
     // absent, or (when a no-verdict review recorded before the cancel) recorded as owed — never a green
@@ -1809,10 +1868,10 @@ describe("v2.6.5 T6 — a semantic repair is reviewed before its test battery is
     const first = await fixture.round({ adapters: [new SilentReviewFake(fixture.scriptPath)] });
     expect(first.row("review")?.meta).toMatchObject({ noVerdict: true, infra: true });
     expect(first.row("acceptance")?.pass).toBe(true);
-    // the no-verdict is not a semantic red: the round goes on to the screen and the merge-candidate suite
-    expect(first.stream.slice(12)).toEqual(["test:start", "test:start", "test:end"]);
-    expect(first.log).toEqual(["build", "lint", "test tests/a.test.ts", "test"]);
-    expect(first.row("test")).toMatchObject({ pass: false, meta: { fullSuite: true } });
+    // the no-verdict is not a semantic red: the round goes on to its one full job
+    expect(first.stream.slice(12)).toEqual(["test:start", "test:end"]);
+    expect(first.log).toEqual(["build", "lint", "test"]);
+    expect(first.row("test")?.pass).toBe(false);
     // recovery re-asks only the review, starts no test, approves — and the task still does not merge
     const recovered = await recoverReview(fixture, first.results);
     expect(recovered.retried.log).toEqual([]);
@@ -1823,19 +1882,92 @@ describe("v2.6.5 T6 — a semantic repair is reviewed before its test battery is
     // (a fresh subject: the red full suite above is a cached verdict for this one's identity)
     const clean = await reviewRepair(APPROVE);
     const green = await clean.round({ adapters: [new SilentReviewFake(clean.scriptPath)] });
-    expect(green.row("test")).toMatchObject({ pass: true, meta: { fullSuite: true } });
+    expect(green.row("test")?.pass).toBe(true);
     expect((await recoverReview(clean, green.results)).merges).toBe(true);
 
-    // A cancelled round (the only reviewer could not launch) starts no test: its test proof is OWED.
+    // v2.6.7 T1: a seatless review (the only reviewer could not launch) is recoverable, not a
+    // cancellation — the round still buys its in-round full job, and that red refuses the recovery.
     const driver = { slot: async () => { throw new Error("no pane could be created"); }, close: async () => {} } as unknown as ExecutorDriver;
     const via: GateVia = { driver, nameFor: (role, adapter) => `${role}-${adapter}`, labelFor: (role) => role.toUpperCase() };
     const reviewOnly = { gates: GATE_NAMES.filter((g) => g !== "acceptance") };
-    const cancelled = await fixture.round({ via }, reviewOnly);
-    expect(cancelled.row("review")?.meta).toMatchObject({ noVerdict: true, cause: "seat-launch-failed" });
-    expect(cancelled.stream.filter((e) => e === "test:start")).toEqual([]);
+    const seatlessReview = await fixture.round({ via }, reviewOnly);
+    expect(seatlessReview.row("review")?.meta).toMatchObject({ noVerdict: true, cause: "seat-launch-failed" });
+    // (the subject's earlier full red answers from the verdict store, so the stream, not the log, shows the job)
+    expect(seatlessReview.stream.filter((e) => e.startsWith("test:"))).toEqual(["test:start", "test:end"]);
+    expect(seatlessReview.row("test")?.pass).toBe(false);
+    expect((await recoverReview(fixture, seatlessReview.results)).merges).toBe(false);
+  }, 120_000);
+
+  // v2.6.7 T1 (closed semantic-result set + D-974 closed missing-proof table): the returned gate-row
+  // projection at each entry. This extends the seat-launch case above, whose acceptance-disabled round
+  // alone proves nothing about a PENDING acceptance sibling.
+  test("production runGates returns the closed semantic-result set for pending acceptance seatless acceptance and D-974 missing-proof cases", async () => {
+    const owed = (results: GateResult[]) => results.filter((r) => r.meta?.gateOwed !== undefined)
+      .map((r) => ({ gate: r.gate, pass: r.pass, meta: r.meta }));
+    const OWED = { skipped: true, infra: true, classification: "infra", retryable: false };
+
+    // Pending acceptance, seatless review: acceptance finishes independently and publishes its approval,
+    // the full job still runs in-round, and the review stays an unsatisfied no-verdict — no owed row.
+    const pending = await reviewRepair(APPROVE);
+    const approved = await pending.round(seatDriver((name) => name.startsWith("review"), { role: "judge", after: "review" }));
+    expect(approved.row("acceptance")?.pass).toBe(true);
+    expect(approved.row("review")?.meta).toMatchObject({ noVerdict: true, infra: true, cause: "seat-launch-failed" });
+    expect(approved.stream.filter((e) => e.startsWith("test:"))).toEqual(["test:start", "test:end"]);
+    expect(approved.row("test")?.pass).toBe(true);
+    expect(owed(approved.results)).toEqual([]);
+    expect(approved.results.every(gateSatisfied)).toBe(false);
+
+    // Pending acceptance that REJECTS beside the seatless review: a decisive red — its rejecting row is
+    // published, no full job starts, and the unrun test owes nothing.
+    const rejecting = await reviewRepair(APPROVE);
+    const judgeRed = fakeWith({ review: APPROVE, judge: { pass: false, criteria: [{ criterion: "c1", met: false, reason: "src/a.ts still drops the row" }] } }).adapter;
+    const rejected = await rejecting.round({ adapters: [judgeRed],
+      ...seatDriver((name) => name.startsWith("review"), { role: "judge", after: "review" }) });
+    expect(rejected.row("acceptance")).toMatchObject({ pass: false });
+    expect(rejected.row("acceptance")?.meta?.infra).toBeUndefined();
+    expect(rejected.row("review")?.meta).toMatchObject({ noVerdict: true, cause: "seat-launch-failed" });
+    expect(rejected.stream.filter((e) => e.startsWith("test:"))).toEqual([]);
+    expect(rejected.row("test")).toBeUndefined();
+    expect(owed(rejected.results)).toEqual([]);
+
+    // Seatless ACCEPTANCE while the review is still pending: the sibling is cancelled (a genuinely cancelled
+    // round), so the acceptance infra row stands beside an owed review and the existing testOwed shape.
+    const seatless = await reviewRepair(APPROVE);
+    const cancelled = await seatless.round(seatDriver((name) => name.startsWith("judge"), { role: "review", after: "acceptance" }));
+    expect(cancelled.row("acceptance")).toMatchObject({ pass: false, meta: { cause: "seat-launch-failed", infra: true } });
+    expect(cancelled.stream.filter((e) => e.startsWith("test:"))).toEqual(["test:end"]); // the owed row is published, never started
     expect(cancelled.log.filter((line) => line.startsWith("test"))).toEqual([]);
-    expect(cancelled.row("test")).toMatchObject({ pass: false, meta: { skipped: true, infra: true, testOwed: true } });
-    expect((await recoverReview(fixture, cancelled.results)).merges).toBe(false);
+    expect(owed(cancelled.results)).toEqual([
+      { gate: "test", pass: false, meta: expect.objectContaining({ ...OWED, gateOwed: "test", testOwed: true }) },
+      { gate: "review", pass: false, meta: expect.objectContaining({ ...OWED, gateOwed: "review" }) },
+    ]);
+    expect(cancelled.row("review")?.meta?.testOwed).toBeUndefined();
+    // a green review-only recovery cannot merge the cancelled round: the owed rows stay unsatisfied
+    expect((await recoverReview(seatless, cancelled.results)).merges).toBe(false);
+
+    // A judge that cannot launch only AFTER the seatless review settled cancels nothing: acceptance is MISSING
+    // proof — its owed row stands beside the in-round full green (D-974).
+    const late = await (await reviewRepair(APPROVE)).round(seatDriver(() => true, { role: "judge", after: "review" }));
+    expect(late.row("review")?.meta).toMatchObject({ noVerdict: true, cause: "seat-launch-failed" });
+    expect(late.row("test")?.pass).toBe(true);
+    expect(owed(late.results)).toEqual([{ gate: "acceptance", pass: false, meta: expect.objectContaining({ ...OWED, gateOwed: "acceptance" }) }]);
+
+    // A material review red with the test unrun: no owed test row.
+    const material = await (await reviewRepair(REJECT)).round();
+    expect(material.row("review")?.pass).toBe(false);
+    expect(material.row("test")).toBeUndefined();
+    expect(owed(material.results)).toEqual([]);
+
+    // Complete eligible results: no synthetic owed row.
+    const complete = await (await reviewRepair(APPROVE)).round();
+    expect(complete.results.every(gateSatisfied)).toBe(true);
+    expect(owed(complete.results)).toEqual([]);
+
+    // A gate the task omits creates no debt: the acceptance-less seatless review owes no acceptance row.
+    const omitted = await reviewRepair(APPROVE);
+    const reviewOnly = await omitted.round(seatDriver((name) => name.startsWith("review")), { gates: GATE_NAMES.filter((g) => g !== "acceptance") });
+    expect(reviewOnly.row("acceptance")).toBeUndefined();
+    expect(owed(reviewOnly.results)).toEqual([]);
   }, 120_000);
 
   test("runGates semantic-first full-suite fallback revalidates identity and the full manifest after its own test command, so a rewritten ignored lockfile or a newly collected ignored test reruns while an unchanged identity runs once", async () => {
@@ -1896,4 +2028,138 @@ describe("v2.6.5 T6 — a semantic repair is reviewed before its test battery is
     expect(collected.verdict).toMatchObject({ pass: true, meta: { fullSuite: true, manifest: ["tests/a.test.ts", "tests/generated.test.ts"] } });
     expect(collected.results.every((r) => r.pass)).toBe(true);
   }, 120_000);
+});
+
+// ---------------------------------------------------------------------------------------------
+// v2.6.7 close, OOB M1: the re-proof's listing is itself a command. A synthetic protocol peer (no
+// vitest import, no suite execution) whose LISTING creates an ignored collectable test after taking
+// its own file snapshot returns the manifest it just made stale; cleanliness and identity cannot see
+// an ignored file. argv.log is the actual command trace.
+// ---------------------------------------------------------------------------------------------
+
+const GENERATED = "tests/generated.test.ts";
+const LISTING_PEER = String.raw`
+import { appendFileSync, existsSync, readFileSync, writeFileSync } from "node:fs";
+import { resolve } from "node:path";
+const ctrl = existsSync("control.json") ? JSON.parse(readFileSync("control.json", "utf8")) : {};
+const args = process.argv.slice(2);
+const listing = args[0] === "list";
+const filter = args.filter((a) => a.endsWith(".test.ts"));
+let files = ["tests/a.test.ts", "tests/b.test.ts", ...(existsSync("${GENERATED}") ? ["${GENERATED}"] : [])];
+if (filter.length) files = files.filter((f) => filter.some((x) => x.endsWith(f)));
+const runs = existsSync("argv.log") ? readFileSync("argv.log", "utf8").split("\n").filter((l) => l.startsWith("run ")).length : 0;
+appendFileSync("argv.log", (listing ? "list " : "run ") + files.join(",") + "\n");
+if (listing) {
+  // The snapshot above is already taken: the side effect lands AFTER it.
+  if (ctrl.generateAfterRuns === runs) writeFileSync("${GENERATED}", "// generated\n");
+  process.stdout.write(JSON.stringify(files.map((file) => ({ file: resolve(file) }))));
+} else {
+  const now = Date.now();
+  const red = files.includes("${GENERATED}");
+  const report = { nonce: process.env.TICKMARKR_TEST_NONCE, requested: files,
+    started: Object.fromEntries(files.map((f) => [f, now])),
+    completed: Object.fromEntries(files.map((f) => [f, f === "${GENERATED}"
+      ? { at: now + 1, status: "failed", failures: ["FAIL ${GENERATED} > omitted regression"], tests: { passed: 0, failed: 1, skipped: 0 } }
+      : { at: now + 1, status: "passed", tests: { passed: 1, failed: 0, skipped: 0 } }])),
+    certificate: { at: now + 2, exitCode: red ? 1 : 0, errors: 0 } };
+  if (process.env.TICKMARKR_TEST_REPORT) writeFileSync(process.env.TICKMARKR_TEST_REPORT, JSON.stringify(report));
+  // One full run rewrites an ignored lockfile: the identity it measured is gone, so a fresh job follows.
+  if (ctrl.lockOnce && !filter.length && !existsSync("package-lock.json")) writeFileSync("package-lock.json", "{}");
+  process.stdout.write("synthetic protocol completion\n");
+  if (red) process.exit(1);
+}
+`;
+
+describe("v2.6.7 close (OOB M1) — a listing with side effects never certifies a full green", () => {
+  test("production runGates and its reuse path publish, cache and reuse no full green on a manifest the re-proof listing itself made stale, in all seven modes, whereas a side-effect-free listing publishes and reuses green", async () => {
+    interface Mode { name: string; generateAfterRuns?: number; prime?: "before" | "during-semantics"; recheck?: boolean; semantic?: boolean; diagnostic?: boolean; lockOnce?: boolean }
+    const OLD = ["tests/a.test.ts", "tests/b.test.ts"];
+    const fixture = async (mode: Mode) => {
+      const repo = makeRepo({
+        ".gitignore": `argv.log\ncontrol.json\npackage-lock.json\n${GENERATED}\n`,
+        "src/a.ts": "export const a = 1;\n", "src/b.ts": "export const b = 1;\n",
+        "tests/a.test.ts": 'import { a } from "../src/a.js";\na;\n', "tests/b.test.ts": 'import { b } from "../src/b.js";\nb;\n',
+        "vitest.mjs": LISTING_PEER,
+      });
+      const baseRef = await gitHead(repo);
+      writeFileSync(join(repo, "src/a.ts"), "export const a = 2;\n");
+      commitAll(repo, "work");
+      const test = "node vitest.mjs run";
+      const cfg = structuredClone(DEFAULT_CONFIG);
+      cfg.judge.adapter = "fake";
+      const baseline: Baseline = { commands: { test: { exitCode: 0, fingerprints: [], capacity: resolvedCapacity(),
+        fileDurations: [{ file: "tests/a.test.ts", durationMs: 10 }, { file: "tests/b.test.ts", durationMs: 90 }] } } };
+      const stateDir = join(repo, ".tickmarkr");
+      const store = getVerdictStore(stateDir);
+      const identity = () => computeVerificationIdentity({ worktree: repo, gate: "test", command: test, baseline, capacity: resolvedCapacity() });
+      const prime = async () => { store.set(await identity(), { gate: "test", pass: true, details: "cached complete green",
+        evidenceReceipt: { termination: { kind: "exit", exitCode: 0, signal: null } }, meta: { manifest: OLD } } as Parameters<typeof store.set>[1]); };
+      if (mode.prime === "before") await prime();
+      writeFileSync(join(repo, "control.json"), JSON.stringify({ generateAfterRuns: mode.generateAfterRuns, lockOnce: mode.lockOnce }));
+      const adapter = fakeWith({ judge: { pass: true, criteria: [{ criterion: "c1", met: true, reason: "ok" }] }, review: { approve: true, issues: [] } }).adapter;
+      const round = async (primeDuringSemantics = false) => {
+        const ends: GateResult[] = [];
+        const { results } = await runGates(mkTask({ files: ["**"], ...(mode.semantic ? {} : { gates: DETERMINISTIC }) }), {
+          worktree: repo, baseRef, author, result: { ok: true, summary: "", deviations: [], raw: "" },
+          commands: { test }, baseline, channels, adapters: [adapter], cfg, stateDir, recheck: mode.recheck,
+          selectTests: mode.diagnostic === true,
+          ...(mode.diagnostic ? { requiredRepairTests: ["tests/a.test.ts"], selectionReason: "known-failing-files" } : {}),
+          onGate: async (e) => {
+            if (e.phase === "end" && e.gate === "test") ends.push(e.result);
+            if (primeDuringSemantics && e.phase === "end" && e.gate === "review") await prime();
+          },
+        });
+        // a full-suite green row, as published: the diagnostic's own selected row is not one
+        const fullGreens = ends.filter((r) => r.pass && (r.meta?.fullSuite === true || r.meta?.selectedTests === undefined)).map((r) => r.meta?.manifest);
+        return { verdict: results.find((r) => r.gate === "test")!, fullGreens, merges: results.every(gateSatisfied), cached: store.get(await identity()) };
+      };
+      return { repo, round, log: () => argvLines(repo) };
+    };
+
+    const modes: Mode[] = [
+      { name: "cached-reuse", generateAfterRuns: 0, prime: "before" },
+      { name: "fresh-test-only", generateAfterRuns: 1 },
+      { name: "fresh-recheck", generateAfterRuns: 1, recheck: true },
+      { name: "fresh-semantic", generateAfterRuns: 1, semantic: true },
+      { name: "diagnosed-full", generateAfterRuns: 2, semantic: true, diagnostic: true },
+      { name: "diagnosed-full-reuse", generateAfterRuns: 1, semantic: true, diagnostic: true, prime: "during-semantics" },
+      // the first full job moves a lockfile, so the mutating listing re-proves the round's LAST job: it fails closed
+      { name: "last-reproof-job", generateAfterRuns: 2, lockOnce: true },
+    ];
+    for (const mode of modes) {
+      const { name } = mode;
+      const f = await fixture(mode);
+      const first = await f.round(mode.prime === "during-semantics");
+      // the listing's side effect really happened, after a snapshot that did not hold it
+      expect({ name, generated: existsSync(join(f.repo, GENERATED)), staleListing: f.log().includes(`list ${OLD.join(",")}`) })
+        .toEqual({ name, generated: true, staleListing: true });
+      expect({ name, fullGreens: first.fullGreens, pass: first.verdict.pass, merges: first.merges, cachedGreen: first.cached?.pass === true })
+        .toEqual({ name, fullGreens: [], pass: false, merges: false, cachedGreen: false });
+      if (name === "last-reproof-job") expect({ name, meta: first.verdict.meta }).toEqual({ name, meta: expect.objectContaining({ staleProof: true, infra: true }) });
+      else {
+        // withdrawn, then the CURRENT complete manifest measured once: the generated test's red speaks
+        expect({ name, details: first.verdict.details }).toEqual({ name, details: expect.stringContaining(`FAIL ${GENERATED}`) });
+        expect({ name, run: f.log().filter((l) => l.startsWith("run ")).at(-1) }).toEqual({ name, run: `run ${[...OLD, GENERATED].join(",")}` });
+      }
+      // The reuse path: a later round on the same subject finds no green to reuse and measures the generated test.
+      const again = await f.round();
+      expect({ name, fullGreens: again.fullGreens, pass: again.verdict.pass, cachedGreen: again.cached?.pass === true })
+        .toEqual({ name, fullGreens: [], pass: false, cachedGreen: false });
+      expect({ name, details: again.verdict.details }).toEqual({ name, details: expect.stringContaining(`FAIL ${GENERATED}`) });
+    }
+
+    // CONTROL: a listing without side effects publishes and caches its green, and a later round reuses it —
+    // each proof paying exactly one confirming listing and no extra run.
+    const control = await fixture({ name: "control" });
+    const fresh = await control.round();
+    const list = `list ${OLD.join(",")}`;
+    expect(control.log()).toEqual([list, `run ${OLD.join(",")}`, list, list]);
+    expect(fresh.verdict).toMatchObject({ pass: true, meta: { manifest: OLD } });
+    expect(fresh.verdict.meta?.reused).toBeUndefined();
+    expect({ fullGreens: fresh.fullGreens, merges: fresh.merges, cached: fresh.cached?.pass }).toEqual({ fullGreens: [OLD], merges: true, cached: true });
+    const reused = await control.round();
+    expect(control.log().slice(4)).toEqual([list, list]);
+    expect(reused.verdict).toMatchObject({ pass: true, meta: { reused: true, manifest: OLD } });
+    expect(reused.merges).toBe(true);
+  }, 240_000);
 });

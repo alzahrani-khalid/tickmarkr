@@ -13,6 +13,7 @@ import {
   fileCountDeficit,
   waitForCalmWindow,
   effectiveCeilingMs,
+  classifiedFileDurations,
   type FailureClassification,
   fingerprint,
   freshFailures,
@@ -312,7 +313,7 @@ export async function verifyIntegrationTip(
       const manifestedEvidence: GateEvidenceOptions = { ...evidenceSetup, artifactDir: evidence.root };
       evidenceRoots.set(gate, evidence.root);
       const outcome = await evaluateManifestedTest(cmd, intWt, {
-        baselineDurations: entry?.fileDurations,
+        baselineDurations: classifiedFileDurations(entry),
         longestFile: entry?.longestFile,
         overallCeilingMs: effectiveCeilingMs(entry),
         artifactDir: runDir,

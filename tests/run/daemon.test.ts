@@ -152,9 +152,10 @@ describe("daemon integration (fake adapter, zero tokens)", () => {
       "gate:lint",
       "gate:evidence",
       "gate:scope",
-      "gate:test",
+      // v2.6.7 T1 (closed order table): the fresh candidate's judge ‖ review precede its test gate
       "judge",
       "review",
+      "gate:test",
       "merge",
     ]);
     const gateStarts = starts.filter((event) => typeof event.data.gate === "string");

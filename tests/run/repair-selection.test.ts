@@ -94,14 +94,16 @@ class DriverAs extends SubprocessDriver {
 
 // A prior attempt left two attributed full-suite reds on its subject: an ordinary full run and the
 // replacement that followed a green screen. The operator releases the park and the daemon resumes.
-async function repairRun(driverId: string, recordedConfig: Record<string, unknown>, attributed: boolean) {
-  const runId = `run-repair-${driverId}-${attributed ? "a" : "u"}-${recordedConfig.gates ? "off" : "on"}`;
+// v2.6.7 T1: a diagnostic only runs beside a semantic gate; `testOnly` drops acceptance (test-only verification).
+async function repairRun(driverId: string, recordedConfig: Record<string, unknown>, attributed: boolean, testOnly = false) {
+  const runId = `run-repair-${driverId}-${attributed ? "a" : "u"}-${recordedConfig.gates ? "off" : "on"}${testOnly ? "-t" : ""}`;
   const dir = makeTestTempDir("tkr-repair-selection-");
   const log = join(dir, "argv.log");
   const runner = join(dir, "tests.sh");
   writeFileSync(runner, `printf '[%s]\\n' "$*" >> ${shq(log)}\nexit 0\n`);
   const command = `bash ${shq(runner)}`;
-  const { repo, fake } = setupRepo([T("T1", { files: ["**"], gates: ["build", "test", "lint", "evidence", "scope"] })], {
+  const gates = ["build", "test", "lint", "evidence", "scope", ...(testOnly ? [] : ["acceptance"])];
+  const { repo, fake } = setupRepo([T("T1", { files: ["**"], gates })], {
     tasks: { T1: [{ shell: `echo "export const value = 2;" > src/a.ts && ${COMMIT} repaired`, result: { ok: true, summary: "repaired" } }] },
   }, `gates: { test: ${JSON.stringify(command)} }\n`);
   for (const [file, body] of Object.entries({ "src/a.ts": "export const value = 0;\n", "tests/a.test.ts": 'import { value } from "../src/a.js";\n',
@@ -118,6 +120,9 @@ async function repairRun(driverId: string, recordedConfig: Record<string, unknow
   const commit = await gitHead(wt);
   const commands = { test: command };
   const baseline = await captureBaseline(repo, commands);
+  // v2.6.7 T1: comparable harness timing admits the attributed diagnostic (3 % of the suite, 3 ms); synthetic, so no capacity claim
+  baseline.commands.test = { ...baseline.commands.test!, capacity: undefined, fileDurations: ["tests/a.test.ts", "tests/ordinary.test.ts", "tests/replacement.test.ts"]
+    .map((file) => ({ file, durationMs: 1 })).concat({ file: "tests/heavy.test.ts", durationMs: 97 }) };
   const journal = Journal.create(repo, runId);
   journal.append("run-start", undefined, { baseRef, commands, branch, graphDefinitionHash: graphDefinitionHash(loadGraph(repo)),
     effectivePolicy: { config: recordedConfig } });
@@ -135,8 +140,9 @@ async function repairRun(driverId: string, recordedConfig: Record<string, unknow
   await approve([runId, "T1", "--by", "test"], repo);
   const summary = await runDaemon(repo, { runId, resume: true, adapters: [fake], driver: new DriverAs(driverId) });
   const screens = journal.read().filter((e) => e.event === "gate-result" && e.data.gate === "test" && Array.isArray(e.data.selectedTests)
-    && e.data.commit !== commit);
-  return { summary, executions: readFileSync(log, "utf8").trim().split("\n"), screens };
+    && e.data.fullSuite !== true && e.data.commit !== commit);
+  const tests = journal.read().filter((e) => e.event === "gate-result" && e.data.gate === "test" && e.data.commit !== commit);
+  return { summary, executions: readFileSync(log, "utf8").trim().split("\n"), screens, tests };
 }
 
 const union = "tests/a.test.ts tests/ordinary.test.ts tests/replacement.test.ts";
@@ -149,7 +155,7 @@ test("runDaemon selects the attributed ordinary or replacement full-red failing-
     // screen = diff-affected test ∪ both full-red failing files; then the complete merge candidate and the tip.
     expect({ driverId, executions }).toEqual({ driverId, executions: [`[${union}]`, "[]", "[]"] });
     expect(screens.map((e) => e.data.selectionDecision)).toEqual([expect.objectContaining({ scope: "selected",
-      reason: "known-failing-files", requiredFiles: ["tests/ordinary.test.ts", "tests/replacement.test.ts"] })]);
+      reason: "diagnostic-admitted", requiredFiles: ["tests/ordinary.test.ts", "tests/replacement.test.ts"] })]);
   }
   const off = await repairRun("orca", { gates: { repairSelection: false } }, true);
   expect(off.summary.done).toEqual(["T1"]);
@@ -157,4 +163,14 @@ test("runDaemon selects the attributed ordinary or replacement full-red failing-
   const untrusted = await repairRun("herdr", {}, false);
   expect(untrusted.summary.done).toEqual(["T1"]);
   expect(untrusted.executions).toEqual(["[]", "[]"]);
+}, 60_000);
+
+test("runDaemon keeps test-only verification at full scope after an attributed prior test red, so a selected diagnostic before its full job fails", async () => {
+  const { summary, executions, screens, tests } = await repairRun("subprocess", {}, true, true);
+  expect(summary.done).toEqual(["T1"]);
+  // the merge-candidate full job and the tip only: no diagnostic precedes the full job
+  expect(executions).toEqual(["[]", "[]"]);
+  expect(screens).toEqual([]);
+  expect(tests.map((e) => e.data.selectionDecision)).toEqual([expect.objectContaining({ scope: "full",
+    reason: "test-only-verification", requiredFiles: ["tests/ordinary.test.ts", "tests/replacement.test.ts"] })]);
 }, 60_000);

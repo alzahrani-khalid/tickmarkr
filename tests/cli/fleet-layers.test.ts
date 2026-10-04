@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { PassThrough } from "node:stream";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
-import { parse } from "yaml";
+import { parse, stringify } from "yaml";
 import * as registry from "../../src/adapters/registry.js";
 import { FakeAdapter } from "../../src/adapters/fake.js";
 import { channelsFromConfig, type WorkerAdapter } from "../../src/adapters/types.js";
@@ -79,6 +79,8 @@ function fixture(opts: {
   repo: string;
   extra?: Record<string, string[]>;
   unprobed?: Record<string, string[]>;
+  /** served, probed and recorded unauthed by doctor (T5) */
+  unauthed?: Record<string, string[]>;
   identities?: Record<string, Record<string, string>>;
 }): Fixture {
   const repo = makeRepo({ "keep.txt": "x", ".tickmarkr/config.yaml": opts.repo });
@@ -110,9 +112,9 @@ function fixture(opts: {
       version: "cached",
       models: [...served, ...unprobed],
       modelsDetectedAt: at,
-      modelAuth: Object.fromEntries(served.map((m) => [m, {
-        authed: true, probedAt: at, ...(opts.identities?.[id]?.[m] ? { identity: opts.identities[id][m] } : {}),
-      }])),
+      modelAuth: Object.fromEntries(served.map((m) => [m, opts.unauthed?.[id]?.includes(m)
+        ? { authed: false, reason: "quota exceeded", probedAt: at }
+        : { authed: true, probedAt: at, ...(opts.identities?.[id]?.[m] ? { identity: opts.identities[id][m] } : {}) }])),
     }];
   }));
   registry.writeDoctor(repo, health);
@@ -1002,27 +1004,23 @@ describe("v2.6.6 L Fleet membership edits reach their effective overlay", () => 
       expect(pools(fx).worker).toEqual(expect.arrayContaining(["fake:A", "fake:B", "fake:C"]));
     }
 
-    // collapsed variant (T10 owed review F1, fallback D-1016): doctor serves only fake:C-high, shown as the row C
-    // that classifies C-high; its display name names no channel, so it is not seeded for same-session admission —
-    // the row never reads in, the save is the lone tier, and production serves what it served before
+    // collapsed variant (T5 retires the 2.6.6 same-session guard): doctor serves only fake:C-high, shown as the
+    // row C; t seeds the REAL member fake:C-high, so Space admits it in this session and tier + admission land
+    // together in the repository — never the phantom fake:C
     {
       const fx = fixture({ user: TIERS, repo, extra: { fake: ["C-high"] } });
-      const before = pools(fx);
       const s = await session(fx);
       await classify(s, "fake/C", 1);
       expect(rowLine(s.last(), "C")).toMatch(/mid\s+out allow/);
       await s.key(REACH.in);
-      expect(rowLine(s.last(), "C")).toMatch(/mid\s+out allow/);
-      expect(rowLine(s.last(), "C")).not.toMatch(/mid\s+in\s/);
-      const review = await diffAt(s, fx.userPath);
-      expect(s.staged?.seededAllowOut).toEqual([]);
+      expect(rowLine(s.last(), "C")).toMatch(/mid\s+in\s/);
+      const review = await diffAt(s, fx.repoPath);
+      expect(s.staged?.seededAllowOut).toEqual([{ adapter: "fake", model: "C-high", displayModel: "C", entry: "fake:C-high" }]);
       await published(s, review);
-      const written = parse(read(fx.userPath));
-      expect(written.tiers.fake.models["C-high"]).toBe("mid");
-      expect(written.routing).toBeUndefined();
-      expect(read(fx.repoPath)).toBe(repo);
-      expect(disallowedBy({ adapter: "fake", model: "C-high" }, cfgOf(fx).routing, "judge")).not.toBeNull();
-      expect(pools(fx)).toEqual(before);
+      const written = parse(read(fx.repoPath));
+      expect(written.tiers.fake.models).toEqual({ "C-high": "mid" });
+      expect(disallowedBy({ adapter: "fake", model: "C-high" }, cfgOf(fx).routing, "judge")).toBeNull();
+      for (const role of ["worker", "judge", "review", "consult"]) expect(pools(fx)[role], role).toEqual(expect.arrayContaining(["fake:A", "fake:C-high"]));
     }
 
     // classified over its own deny: fake:C is out by the allow form AND its own deny.models entry; t still
@@ -1079,6 +1077,454 @@ describe("v2.6.6 L Fleet membership edits reach their effective overlay", () => 
       expect(outcome).toContain("no probe verdict yet (codex:gpt-6.1-sol)");
       expect(disallowedBy(sol, cfgOf(fx).routing, "review")).toBeNull();
       for (const role of ["worker", "judge", "review", "consult"]) expect(pools(fx)[role], role).not.toContain("codex:gpt-6.1-sol");
+    }
+  }, CEILING);
+});
+
+// v2.6.7 T5: a displayed row stands for every REAL member doctor served — collapsed variants (the bare id only
+// when served) and every catalog-fold constituent. Each case's expected member set is derived here from the
+// fixture's own health/catalog input, never from fleet's derivation, and checked id by id.
+const GROUP_REPO = "routing:\n  allow:\n    models:\n      - codex:gpt-6-sol\n      - fake:A\n      - fake:B\n";
+const ROLES = ["worker", "judge", "review", "consult"] as const;
+const groupRowLine = (frame: string, label: string) => frame.split("\n").findLast((line) => line.includes(`fake/${label} `) || line.includes(`fake/${label}…`)) ?? "";
+// a cached catalog where every listed id resolves to one models.dev record (no score ⇒ no suggestion)
+const foldCatalog = (fx: Fixture, record: string) => writeFileSync(join(fx.repo, ".tickmarkr", "catalog-cache.json"), JSON.stringify({
+  schemaVersion: 1,
+  fetchedAt: new Date().toISOString(),
+  modelsDev: { fake: { id: "fake", models: { [record]: { id: record, limit: { context: 200_000 } } } } },
+}));
+// t on the row, the mid band, a provenance note
+async function classifyRow(s: Session, label: string) {
+  await s.select(`fake/${label}`);
+  await s.key("t");
+  await s.key(K.down);
+  await s.key(K.enter);
+  await s.key("cached benchmark");
+  await s.key(K.enter);
+}
+
+describe("v2.6.7 T5 Fleet membership acts on every grouped member's real ID", () => {
+  test("production Fleet classifies seeds and admits every real member in the closed grouped-member table through actual Ink reviewed bytes publication and all four role pools versus a phantom display ID or representative-only admission", async () => {
+    // closed grouped-member table: label = the displayed row, members = the real ids the input served
+    const cases: Array<{ name: string; served: string[]; label: string; members: string[]; record?: string; phantom?: string }> = [
+      { name: "ordinary control", served: ["D"], label: "D", members: ["D"] },
+      { name: "suffix-only collapse", served: ["C-low", "C-high", "C-max"], label: "C", members: ["C-low", "C-high", "C-max"], phantom: "C" },
+      { name: "bare-plus-variant collapse", served: ["C", "C-low", "C-max"], label: "C", members: ["C", "C-low", "C-max"] },
+      { name: "catalog fold", served: ["gw-a/D", "gw-b/D"], label: "gw-a/D", members: ["gw-a/D", "gw-b/D"], record: "D" },
+      {
+        name: "collapse then catalog fold",
+        served: ["C-pro-low", "C-pro-high", "gateway/C-pro-low", "gateway/C-pro-high"],
+        label: "C-pro",
+        members: ["C-pro-low", "C-pro-high", "gateway/C-pro-low", "gateway/C-pro-high"],
+        record: "C-pro",
+        phantom: "C-pro",
+      },
+      { name: "F1′ pair", served: ["C-pro-high", "gateway/C-pro-high"], label: "C-pro", members: ["C-pro-high", "gateway/C-pro-high"], record: "C-pro", phantom: "C-pro" },
+    ];
+    for (const c of cases) {
+      // the expected set is the input's served ids, independently of fleet's grouping
+      expect(c.members, c.name).toEqual(c.served);
+      expect(c.members.length, c.name).toBeGreaterThan(c.name === "ordinary control" ? 0 : 1);
+      const fx = fixture({ user: TIERS, repo: GROUP_REPO, extra: { fake: c.served } });
+      if (c.record) foldCatalog(fx, c.record);
+      const s = await session(fx);
+      await classifyRow(s, c.label);
+      // classified and seeded before any admission: the row is out by the allow form, every member seeded
+      expect(groupRowLine(s.last(), c.label), c.name).toMatch(/mid\s+out allow/);
+      await s.key(REACH.in);
+      // same session: the whole group reads in — before w
+      expect(groupRowLine(s.last(), c.label), `${c.name}\n${s.last()}`).toMatch(/mid\s+in\s/);
+      const review = await diffAt(s, fx.repoPath);
+      const staged = s.staged!;
+      expect(staged.classifications.map((x) => x.model).sort(), c.name).toEqual([...c.members].sort());
+      expect(staged.classifications.every((x) => x.adapter === "fake" && x.tier === "mid"), c.name).toBe(true);
+      expect(staged.seededAllowOut, c.name).toEqual(expect.arrayContaining(c.members.map((model) => ({ adapter: "fake", model, displayModel: c.label, entry: `fake:${model}` }))));
+      expect(staged.seededAllowOut, c.name).toHaveLength(c.members.length);
+      await published(s, review);
+      const written = parse(read(fx.repoPath));
+      for (const model of c.members) expect(written.tiers.fake.models[model], `${c.name} ${model}`).toBe("mid");
+      if (c.phantom) {
+        expect(written.tiers.fake.models[c.phantom], c.name).toBeUndefined();
+        expect(review.after, c.name).not.toMatch(new RegExp(`fake:${c.phantom}(\\s|,|\\]|$)`, "m"));
+      }
+      const routing = cfgOf(fx).routing;
+      const now = pools(fx);
+      for (const model of c.members) {
+        expect(disallowedBy({ adapter: "fake", model }, routing, "judge"), `${c.name} ${model}`).toBeNull();
+        for (const role of ROLES) expect(now[role], `${c.name} ${role} ${model}`).toContain(`fake:${model}`);
+      }
+      // the unrelated admitted channels stay admitted beside the group
+      for (const role of ROLES) expect(now[role], `${c.name} ${role}`).toEqual(expect.arrayContaining(["fake:A", "fake:B"]));
+    }
+
+    // bulk s (OBS-508): a cached catalog suggestion on the grouped row stages the suggested tier on EVERY real
+    // member, each with its own seed, so Space → in admits the whole group in the same session
+    const bulk = cases.filter((x) => x.phantom && x.members.length > 2);
+    expect(bulk.map((x) => x.name)).toEqual(["suffix-only collapse", "collapse then catalog fold"]);
+    for (const c of bulk) {
+      const record = c.record ?? c.label;
+      const fx = fixture({ user: TIERS, repo: GROUP_REPO, extra: { fake: c.served } });
+      // a three-model AA universe (configured A and B beside the group's record) ranks the record first → frontier
+      writeFileSync(join(fx.repo, ".tickmarkr", "catalog-cache.json"), JSON.stringify({
+        schemaVersion: 1,
+        fetchedAt: new Date().toISOString(),
+        modelsDev: { fake: { id: "fake", models: Object.fromEntries(["A", "B", record].map((id) => [id, { id, limit: { context: 200_000 } }])) } },
+        artificialAnalysis: { intelligence_index_version: "4.1.1", data: [{ id: record, intelligence_index: 50 }, { id: "B", intelligence_index: 45 }, { id: "A", intelligence_index: 40 }] },
+      }));
+      const s = await session(fx);
+      await s.key(K.tab + K.down.repeat(3) + K.enter);
+      await s.key("s");
+      await s.select(`fake/${c.label}`);
+      expect(groupRowLine(s.last(), c.label), `bulk ${c.name}\n${s.last()}`).toMatch(/frontier\s+out allow/);
+      await s.key(REACH.in);
+      expect(groupRowLine(s.last(), c.label), `bulk ${c.name}`).toMatch(/frontier\s+in\s/);
+      const review = await diffAt(s, fx.repoPath);
+      const staged = s.staged!;
+      expect(staged.classifications.map((x) => x.model).sort(), `bulk ${c.name}`).toEqual([...c.members].sort());
+      expect(staged.classifications.every((x) => x.adapter === "fake" && x.tier === "frontier"), `bulk ${c.name}`).toBe(true);
+      expect(staged.seededAllowOut, `bulk ${c.name}`).toEqual(expect.arrayContaining(c.members.map((model) => ({ adapter: "fake", model, displayModel: c.label, entry: `fake:${model}` }))));
+      expect(staged.seededAllowOut, `bulk ${c.name}`).toHaveLength(c.members.length);
+      await published(s, review);
+      const written = parse(read(fx.repoPath));
+      for (const model of c.members) expect(written.tiers.fake.models[model], `bulk ${c.name} ${model}`).toBe("frontier");
+      expect(written.tiers.fake.models[c.phantom!], `bulk ${c.name}`).toBeUndefined();
+      const now = pools(fx);
+      for (const model of c.members) for (const role of ROLES) expect(now[role], `bulk ${c.name} ${role} ${model}`).toContain(`fake:${model}`);
+    }
+
+    // already configured control: two separately configured variants stay two rows with their own tiers; admitting
+    // one never regroups them or rewrites the untouched sibling's tier
+    {
+      const user = TIERS.replace("      B: mid\n", "      B: mid\n      C-low: cheap\n      C-high: frontier\n");
+      const fx = fixture({ user, repo: GROUP_REPO, extra: { fake: ["C-low", "C-high"] } });
+      const s = await session(fx);
+      await s.select("fake/C-low");
+      expect(groupRowLine(s.last(), "C-low")).toMatch(/cheap\s+out allow/);
+      await s.key(REACH.in);
+      expect(groupRowLine(s.last(), "C-low")).toMatch(/cheap\s+in\s/);
+      await s.clearFilter();
+      expect(groupRowLine(s.last(), "C-high")).toMatch(/frontier\s+out allow/);
+      const review = await diffAt(s, fx.repoPath);
+      expect(s.staged?.classifications).toEqual([]);
+      await published(s, review);
+      expect(parse(read(fx.userPath)).tiers.fake.models).toMatchObject({ "C-low": "cheap", "C-high": "frontier" });
+      const now = pools(fx);
+      for (const role of ROLES) {
+        expect(now[role], role).toContain("fake:C-low");
+        expect(now[role], role).not.toContain("fake:C-high");
+      }
+    }
+  }, CEILING);
+
+  test("production Fleet renders the closed grouped reach table from every real member so denying only a nonrepresentative member changes the row rail and staged preview versus a false in row over that denied member", async () => {
+    // suffix-only collapse: classifyModel (the reference) is the highest-effort C-max; the denied member is
+    // C-low, LAST in the reversed input order, so neither the reference nor the first member hides it
+    const ALL = "routing:\n  allow:\n    models: [codex:gpt-6-sol, codex:gpt-6-luna, fake:A, fake:B, fake:C-high, fake:C-max]\n";
+    const exclusions = [
+      { scope: "workers deny", repo: "routing:\n  deny:\n    workers:\n      models: [fake:C-low]\n", reach: "out-workers", reason: "routing.deny.workers.models (fake:C-low)", roles: ["worker"] },
+      { scope: "all-seats deny", repo: "routing:\n  deny:\n    models: [fake:C-low]\n", reach: "out-all", reason: "routing.deny.models (fake:C-low)", roles: [...ROLES] },
+      { scope: "restrictive allow", repo: ALL, reach: "out-all", reason: "routing.allow (not admitted)", roles: [...ROLES] },
+    ];
+    for (const order of [["C-low", "C-high", "C-max"], ["C-max", "C-high", "C-low"]]) {
+      expect(order.at(order.indexOf("C-low"))).toBe("C-low");
+      for (const x of exclusions) {
+        const name = `${x.scope} ${order.join(",")}`;
+        const fx = fixture({ user: TIERS, repo: x.repo, extra: { fake: order } });
+        const s = await session(fx);
+        await classifyRow(s, "C");
+        // uniform members only would read in; one excluded nonrepresentative member makes the row partial
+        const row = groupRowLine(s.last(), "C");
+        expect(row, name).toMatch(/mid\s+partial\s/);
+        expect(row, name).not.toMatch(/mid\s+in\s/);
+        expect(s.last(), name).toContain(`reach: partial — ${x.reach} for some members only — C-low: ${x.reason}`);
+        expect(s.last(), name).not.toContain("C-high:");
+        expect(s.last(), name).not.toContain("C-max:");
+        // the adapter rail aggregates every real member the same way
+        await s.clearFilter();
+        await s.rail("fake");
+        await s.key(K.space);
+        expect(s.last(), name).toContain(`now: ${x.reach} (partial: not every channel) — C-low: ${x.reason}`);
+        await s.key(K.escape);
+        // staged preview = the reviewed bytes' loaded policy, then saved discovery agree member by member
+        const review = await diffAt(s, fx.userPath);
+        const reviewed = cfgOf(fx, { userOverlayText: review.after }).routing;
+        for (const role of ROLES) {
+          expect(disallowedBy({ adapter: "fake", model: "C-low" }, reviewed, role) !== null, `${name} ${role}`).toBe(x.roles.includes(role));
+          expect(disallowedBy({ adapter: "fake", model: "C-high" }, reviewed, role), `${name} ${role}`).toBeNull();
+        }
+        await published(s, review);
+        const now = pools(fx);
+        for (const role of ROLES) {
+          expect(now[role].includes("fake:C-low"), `${name} ${role}`).toBe(!x.roles.includes(role));
+          expect(now[role], `${name} ${role}`).toEqual(expect.arrayContaining(["fake:A", "fake:C-high", "fake:C-max"]));
+        }
+      }
+    }
+    // uniform: every member out by one workers deny each — the whole-group state renders, no partial
+    {
+      const repo = "routing:\n  deny:\n    workers:\n      models: [fake:C-low, fake:C-high, fake:C-max]\n";
+      const fx = fixture({ user: TIERS, repo, extra: { fake: ["C-low", "C-high", "C-max"] } });
+      const s = await session(fx);
+      await classifyRow(s, "C");
+      expect(groupRowLine(s.last(), "C")).toMatch(/mid\s+out workers\s/);
+      expect(s.last()).not.toContain("reach: partial");
+      expect(await s.quit()).toBe("fleet: quit without writing");
+    }
+  }, CEILING);
+
+  test("production Fleet out workers publishes real worker deny IDs for every grouped member and removes each from worker discovery while retaining authenticated judge review and consult eligibility versus a representative-only or display-ID deny", async () => {
+    const cases = [
+      { label: "C", served: ["C-low", "C-high", "C-max"], reference: "C-max", record: undefined },
+      { label: "C-pro", served: ["C-pro-low", "C-pro-high", "gateway/C-pro-low", "gateway/C-pro-high"], reference: "C-pro-high", record: "C-pro" },
+    ];
+    for (const c of cases) {
+      expect(c.served.length).toBeGreaterThan(1);
+      const fx = fixture({ user: TIERS, repo: "# the repository declares no fleet family\n", extra: { fake: c.served } });
+      if (c.record) foldCatalog(fx, c.record);
+      const s = await session(fx);
+      await classifyRow(s, c.label);
+      expect(groupRowLine(s.last(), c.label), c.label).toMatch(/mid\s+in\s/);
+      await s.key(REACH.workers);
+      expect(groupRowLine(s.last(), c.label), c.label).toMatch(/mid\s+out workers\s/);
+      // the detail line clips at the frame width: its head names the first two real members' own entries
+      expect(s.last(), c.label).toContain(`space: added fake:${c.served[0]} to routing.deny.workers.models; added fake:${c.served[1]}`);
+      const review = await diffAt(s, fx.userPath);
+      await published(s, review);
+      const written = parse(read(fx.userPath));
+      // every real member's own adapter:model id — never the display label, never the reference alone
+      expect([...written.routing.deny.workers.models].sort(), c.label).toEqual(c.served.map((model) => `fake:${model}`).sort());
+      expect(written.routing.deny.workers.models, c.label).not.toContain(`fake:${c.label}`);
+      const now = pools(fx);
+      for (const model of c.served) {
+        expect(now.worker, `${c.label} ${model}`).not.toContain(`fake:${model}`);
+        for (const role of ["judge", "review", "consult"]) expect(now[role], `${c.label} ${role} ${model}`).toContain(`fake:${model}`);
+      }
+      expect(now.worker, c.label).toEqual(expect.arrayContaining(["fake:A", "fake:B"]));
+      // versus the F3 display-ID deny and the F1′ representative-only deny: both leave members in worker discovery
+      const displayOnly = cfgOf(fx, { userOverlayText: read(fx.userPath).replace(/workers:\n\s+models:[\s\S]*$/, `workers:\n      models: [fake:${c.label}]\n`) });
+      const referenceOnly = cfgOf(fx, { userOverlayText: read(fx.userPath).replace(/workers:\n\s+models:[\s\S]*$/, `workers:\n      models: [fake:${c.reference}]\n`) });
+      for (const wrong of [displayOnly, referenceOnly]) {
+        expect(pools(fx, wrong).worker.filter((id) => c.served.some((model) => id === `fake:${model}`)).length, c.label).toBeGreaterThan(0);
+      }
+    }
+
+    // D-1081: overlapping recorded identities — doctor recorded C-high as resolving to C-low, so C-low's own
+    // fresh deny also covers C-high. Each member's addition is decided from the reach before the act, so in
+    // BOTH member orders every real worker-deny id is published, never one member's entry standing for both
+    for (const order of [["C-low", "C-high"], ["C-high", "C-low"]]) {
+      const name = `overlap ${order.join(",")}`;
+      const fx = fixture({ user: TIERS, repo: "# the repository declares no fleet family\n", extra: { fake: order }, identities: { fake: { "C-high": "C-low" } } });
+      const s = await session(fx);
+      await classifyRow(s, "C");
+      expect(groupRowLine(s.last(), "C"), name).toMatch(/mid\s+in\s/);
+      await s.key(REACH.workers);
+      expect(groupRowLine(s.last(), "C"), name).toMatch(/mid\s+out workers\s/);
+      expect(s.last(), name).toContain(`space: added fake:${order[0]} to routing.deny.workers.models; added fake:${order[1]}`);
+      const review = await diffAt(s, fx.userPath);
+      expect(s.staged?.denyWorkersModels, name).toEqual(expect.arrayContaining(["fake:C-low", "fake:C-high"]));
+      await published(s, review);
+      expect([...parse(read(fx.userPath)).routing.deny.workers.models].sort(), name).toEqual(["fake:C-high", "fake:C-low"]);
+      const now = pools(fx);
+      for (const model of order) {
+        expect(now.worker, `${name} ${model}`).not.toContain(`fake:${model}`);
+        for (const role of ["judge", "review", "consult"]) expect(now[role], `${name} ${role} ${model}`).toContain(`fake:${model}`);
+      }
+    }
+  }, CEILING);
+
+  test("production Fleet publishes the closed destination and authentication table with reviewed bytes equal to saved bytes versus a shadowed mixed stale or unauthenticated false admission", async () => {
+    const GROUP = ["C-low", "C-high", "C-max"];
+    const subjects = [{ label: "D", members: ["D"] }, { label: "C", members: GROUP }];
+    const admits = (fx: Fixture, models: string[], roles: readonly string[] = ROLES) => {
+      const now = pools(fx);
+      for (const role of roles) for (const model of models) expect(now[role], `${role} ${model}`).toContain(`fake:${model}`);
+    };
+    const excludes = (fx: Fixture, models: string[], roles: readonly string[] = ROLES) => {
+      const now = pools(fx);
+      for (const role of roles) for (const model of models) expect(now[role], `${role} ${model}`).not.toContain(`fake:${model}`);
+    };
+
+    for (const subject of subjects) {
+      // repository holds the family: tier + admission co-locate in the repository; a user save of the same
+      // bytes is shadowed by the repository restriction and admits nothing
+      {
+        const fx = fixture({ user: TIERS, repo: GROUP_REPO, extra: { fake: subject.members } });
+        const s = await session(fx);
+        await classifyRow(s, subject.label);
+        await s.key(REACH.in);
+        const review = await diffAt(s, fx.repoPath);
+        expect(s.last()).toContain(`review · ${fx.repoPath}`);
+        await published(s, review);
+        admits(fx, subject.members);
+        // the same admission saved as a USER allow.models leaf: the repository's own allow.models masks it
+        const userLayer = parse(TIERS);
+        userLayer.tiers.fake.models = { ...userLayer.tiers.fake.models, ...parse(read(fx.repoPath)).tiers.fake.models };
+        const userAllow = { allow: { models: ["codex:gpt-6-sol", "fake:A", "fake:B", ...subject.members.map((m) => `fake:${m}`)] } };
+        const shadowed = cfgOf(fx, { userOverlayText: stringify({ ...userLayer, routing: userAllow }), repoOverlayText: GROUP_REPO });
+        for (const model of subject.members) expect(pools(fx, cfgOf(fx, { userOverlayText: stringify({ ...userLayer, routing: userAllow }), repoOverlayText: "" })).judge, `unshadowed ${model}`).toContain(`fake:${model}`);
+        for (const model of subject.members) expect(pools(fx, shadowed).judge, `shadowed ${model}`).not.toContain(`fake:${model}`);
+      }
+      // user holds the family: everything lands in the user overlay; the repository stays byte-identical
+      {
+        const userFamily = `${TIERS}routing:\n  allow:\n    models: [codex:gpt-6-sol, fake:A, fake:B]\n`;
+        const fx = fixture({ user: userFamily, repo: "# the repository declares no fleet family\n", extra: { fake: subject.members } });
+        const s = await session(fx);
+        await classifyRow(s, subject.label);
+        await s.key(REACH.in);
+        await saved(s, fx.userPath);
+        admits(fx, subject.members);
+      }
+      // the repository declares the worker leaf: out · workers follows it there with the co-located admission
+      {
+        const repo = `${GROUP_REPO}  deny:\n    workers:\n      models: []\n`;
+        const fx = fixture({ user: TIERS, repo, extra: { fake: subject.members } });
+        const s = await session(fx);
+        await classifyRow(s, subject.label);
+        await s.key(REACH.in);
+        await s.key(REACH.workers);
+        await saved(s, fx.repoPath);
+        expect([...parse(read(fx.repoPath)).routing.deny.workers.models].sort()).toEqual(subject.members.map((m) => `fake:${m}`).sort());
+        excludes(fx, subject.members, ["worker"]);
+        admits(fx, subject.members, ["judge", "review", "consult"]);
+      }
+    }
+
+    // a shared exclusion remains: the repository admits only codex, so clearing every member's seed admits
+    // nothing — the row stays out, the lone tiers are a user save and the repository keeps its bytes
+    {
+      const repo = "routing:\n  allow:\n    adapters: [codex]  # repository restriction\n";
+      const fx = fixture({ user: TIERS, repo, extra: { fake: GROUP } });
+      const s = await session(fx);
+      await classifyRow(s, "C");
+      await s.key(REACH.in);
+      expect(groupRowLine(s.last(), "C")).toMatch(/mid\s+out allow/);
+      // the remaining shared reason is reported (the picker's now-line; the detail line clips)
+      await s.key(K.space);
+      expect(s.last()).toContain("now: out-allow — routing.allow (not admitted)");
+      await s.key(K.escape);
+      await saved(s, fx.userPath);
+      expect(Object.keys(parse(read(fx.userPath)).tiers.fake.models)).toEqual(expect.arrayContaining(GROUP));
+      excludes(fx, GROUP);
+    }
+    // admission undone by out · all seats: no admitted seed, no false in frame; the split batch is refused
+    {
+      const fx = fixture({ user: TIERS, repo: GROUP_REPO, extra: { fake: GROUP } });
+      const s = await session(fx);
+      await classifyRow(s, "C");
+      await s.key(REACH.in);
+      await s.key(REACH.all);
+      expect(groupRowLine(s.last(), "C")).toMatch(/mid\s+out all/);
+      await s.key("w");
+      if (s.review?.kind !== "refused") throw new Error(`expected a refusal, got ${JSON.stringify(s.review)}`);
+      // every member's tier is user-bound once no member is admitted; the membership edit stays repository-bound
+      expect(s.review.reason).toContain(`${GROUP.map((model) => `tiers.fake.models.${model}`).join(", ")} → ${fx.userPath}`);
+      expect(s.review.reason).toContain(`routing.allow/routing.deny membership → ${fx.repoPath}`);
+      expect(await s.quit()).toBe("fleet: quit without writing");
+      expect(read(fx.userPath)).toBe(fx.user);
+      expect(read(fx.repoPath)).toBe(GROUP_REPO);
+      excludes(fx, GROUP);
+    }
+    // stale: either overlay changes after w — named refusal, both keep their bytes, no temp artifact; a fresh
+    // review over the resolved overlays then publishes
+    for (const inject of ["repo", "user"] as const) {
+      const fx = fixture({ user: TIERS, repo: GROUP_REPO, extra: { fake: GROUP } });
+      const s = await session(fx);
+      await classifyRow(s, "C");
+      await s.key(REACH.in);
+      const review = await diffAt(s, fx.repoPath);
+      if (inject === "repo") writeFileSync(fx.repoPath, `${GROUP_REPO}# foreign edit after review\n`);
+      else writeFileSync(fx.userPath, `${TIERS}# foreign edit after review\n`);
+      const [user, repoNow] = [read(fx.userPath), read(fx.repoPath)];
+      await s.key("y");
+      expect(s.last(), inject).toContain(`stale preview — the ${inject === "repo" ? "repository" : "user"} overlay`);
+      expect(await s.quit(), inject).toBe("fleet: quit without writing");
+      expect(read(fx.userPath), inject).toBe(user);
+      expect(read(fx.repoPath), inject).toBe(repoNow);
+      expect(noTemp(fx), inject).toBe(true);
+      expect(review.after).not.toBe(repoNow);
+      const fresh = await session({ ...fx, user, repoBytes: repoNow });
+      await classifyRow(fresh, "C");
+      await fresh.key(REACH.in);
+      await saved(fresh, fx.repoPath);
+      admits(fx, GROUP);
+    }
+    // untouched anchored allow list and its alias keep their bytes beside the grouped admission
+    {
+      // fake:B stays out, so the allow form survives and its anchored adapters list is untouched
+      const repo = "routing:\n  allow:\n    adapters: &whole [codex]\n    models: [fake:A]  # restriction\nmirror: *whole\n";
+      const fx = fixture({ user: TIERS, repo, extra: { fake: GROUP } });
+      const s = await session(fx);
+      await classifyRow(s, "C");
+      await s.key(REACH.in);
+      const review = await diffAt(s, fx.repoPath);
+      expect(review.after).toContain("    adapters: &whole [codex]\n");
+      expect(review.after).toContain("mirror: *whole\n");
+      await published(s, review);
+      admits(fx, GROUP);
+      excludes(fx, ["B"]);
+    }
+    // authentication is independent: every member admitted by its real id, but only doctor-authed members
+    // route; the unprobed and the unauthed member are each named with the re-probe step
+    {
+      const fx = fixture({ user: TIERS, repo: GROUP_REPO, extra: { fake: ["C-low", "C-high"] }, unprobed: { fake: ["C-max"] }, unauthed: { fake: ["C-low"] } });
+      const s = await session(fx);
+      await classifyRow(s, "C");
+      expect(s.last()).toContain("fake:C-low UNAUTHED — quota exceeded — re-probe with tickmarkr doctor");
+      await s.key(REACH.in);
+      expect(groupRowLine(s.last(), "C")).toMatch(/mid\s+in\s/);
+      const review = await diffAt(s, fx.repoPath);
+      const { outcome } = await s.y();
+      expect(read(fx.repoPath)).toBe(review.after);
+      expect(outcome).toContain("no probe verdict yet (fake:C-max)");
+      expect(outcome).toContain("are unauthed (fake:C-low) — re-probe with tickmarkr doctor");
+      const routing = cfgOf(fx).routing;
+      for (const model of GROUP) expect(disallowedBy({ adapter: "fake", model }, routing, "judge"), model).toBeNull();
+      admits(fx, ["C-high"]);
+      excludes(fx, ["C-low", "C-max"]);
+    }
+    // review D-1081: overlapping recorded identities (C-high recorded as C-low) while the allow form keeps an
+    // unrelated fake:B out and C-low is unauthed or unprobed — C-low's seed entry also matches C-high, yet
+    // C-low's OWN channel is published: reviewed = saved bytes admit both real ids, and once doctor's cached
+    // verdict authenticates C-low it joins all four pools (never C-high's identity standing for it)
+    const KEEP_B_OUT = "routing:\n  allow:\n    models:\n      - codex:gpt-6-sol\n      - fake:A\n";
+    const overlaps = [
+      { name: "unauthed C-low,C-high", extra: ["C-low", "C-high"], unauthed: ["C-low"] },
+      { name: "unauthed C-high,C-low", extra: ["C-high", "C-low"], unauthed: ["C-low"] },
+      { name: "unprobed C-low", extra: ["C-high"], unprobed: ["C-low"] },
+    ];
+    for (const o of overlaps) {
+      const fx = fixture({
+        user: TIERS, repo: KEEP_B_OUT, extra: { fake: o.extra }, identities: { fake: { "C-high": "C-low" } },
+        ...(o.unauthed ? { unauthed: { fake: o.unauthed } } : {}),
+        ...(o.unprobed ? { unprobed: { fake: o.unprobed } } : {}),
+      });
+      const s = await session(fx);
+      await classifyRow(s, "C");
+      await s.key(REACH.in);
+      expect(groupRowLine(s.last(), "C"), o.name).toMatch(/mid\s+in\s/);
+      const review = await diffAt(s, fx.repoPath);
+      const { outcome } = await s.y();
+      expect(outcome.split("\n")[0], o.name).toBe(`fleet: wrote ${fx.repoPath}`);
+      expect(outcome, o.name).toContain("fake:C-low");
+      expect(read(fx.repoPath), o.name).toBe(review.after);
+      expect(read(fx.userPath), o.name).toBe(fx.user);
+      const written = parse(read(fx.repoPath));
+      expect(written.routing.allow.models, o.name).toEqual(expect.arrayContaining(["fake:C-low", "fake:C-high"]));
+      expect(written.routing.allow.models, o.name).not.toContain("fake:B");
+      const cfg = cfgOf(fx);
+      for (const model of ["C-low", "C-high"]) expect(disallowedBy({ adapter: "fake", model }, cfg.routing, "judge"), `${o.name} ${model}`).toBeNull();
+      admits(fx, ["C-high"]);
+      excludes(fx, ["C-low", "B"]);
+      // a later successful doctor verdict for C-low: the saved membership already admits it everywhere
+      const reprobed = structuredClone(fx.health);
+      reprobed.fake.models = [...new Set([...(reprobed.fake.models ?? []), "C-low"])];
+      reprobed.fake.modelAuth = { ...reprobed.fake.modelAuth, "C-low": { authed: true, probedAt: "2026-10-02T00:00:00.000Z" } };
+      const now = Object.fromEntries(Object.entries(registry.rolePools(cfg, fx.adapters, reprobed))
+        .map(([role, channels]) => [role, channels.map((c) => `${c.adapter}:${c.model}`)]));
+      for (const role of ROLES) {
+        for (const model of ["C-low", "C-high"]) expect(now[role], `${o.name} ${role} ${model}`).toContain(`fake:${model}`);
+        expect(now[role], `${o.name} ${role}`).not.toContain("fake:B");
+      }
     }
   }, CEILING);
 });

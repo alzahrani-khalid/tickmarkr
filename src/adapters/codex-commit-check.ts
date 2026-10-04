@@ -4,6 +4,7 @@ import { existsSync, mkdtempSync, readFileSync, rmdirSync, rmSync } from "node:f
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { promisify } from "node:util";
+import { assertGitTrust, GitTrustRefusal, protectedGitEnv } from "../run/git-trust.js";
 import { CODEX_GIT_GRANT, codex } from "./codex.js";
 import { type AuthHealth, type CodexCommitStatus, shq, type WorkerAdapter } from "./types.js";
 
@@ -32,6 +33,19 @@ export interface CodexCommitResult { status: CodexCommitStatus; detail: string }
 
 const exec = promisify(execFile);
 const git = async (cwd: string, ...args: string[]) => (await exec("git", args, { cwd })).stdout.trim();
+// v2.6.7 T4: host git after the sandbox has had the fixture — validation and cleanup — runs the uncached trust
+// check and the forced child config on every call, so seat-rewritten metadata can neither run a config program
+// nor answer for the probe's commit.
+const hostGit = async (cwd: string, ...args: string[]) => {
+  assertGitTrust(cwd);
+  return (await exec("git", args, { cwd, env: protectedGitEnv(process.env) })).stdout.trim();
+};
+/** The fixture checkout's trust after the sandbox returned or threw: a refusal is reported with its path. */
+const fixtureRefusal = (worktree: string): CodexCommitResult | undefined => {
+  try { assertGitTrust(worktree); return undefined; } catch (e) {
+    return unknown(e instanceof GitTrustRefusal ? `the sandbox left untrusted fixture git metadata (${e.message})` : `fixture git trust unreadable (${String(e)})`);
+  }
+};
 const CONTROL = "tickmarkr-codex-commit-control";
 
 // $1 control, $2 token, $3 hostile hooks member, $4 hostile common-root member. The commit disables hooks (the
@@ -71,12 +85,12 @@ const contradictory = (out: string): boolean => {
   return false;
 };
 const tipOf = async (repo: string, ref: string): Promise<string | undefined> =>
-  git(repo, "rev-parse", "--verify", "--quiet", `${ref}^{commit}`).catch(() => undefined);
+  hostGit(repo, "rev-parse", "--verify", "--quiet", `${ref}^{commit}`).catch(() => undefined);
 // This probe's commit and nothing else: one parent (the fixture base), its token in the subject and the control.
 const isProbeCommit = async (repo: string, commit: string, base: string, token: string): Promise<boolean> => {
   try {
-    return await git(repo, "log", "-1", "--format=%P %s", commit) === `${base} tickmarkr-probe ${token}`
-      && await git(repo, "cat-file", "blob", `${commit}:${CONTROL}`) === token;
+    return await hostGit(repo, "log", "-1", "--format=%P %s", commit) === `${base} tickmarkr-probe ${token}`
+      && await hostGit(repo, "cat-file", "blob", `${commit}:${CONTROL}`) === token;
   } catch { return false; }
 };
 
@@ -91,6 +105,7 @@ export async function probeCodexCommit(repoRoot: string, sandbox: CodexSandbox =
   let lock: string | undefined;
   let base: string | undefined;
   let hostile: string[] = [];
+  let sandboxed = false;
   try {
     const commonDir = await git(repoRoot, "rev-parse", "--path-format=absolute", "--git-common-dir");
     lock = join(commonDir, "worktrees", basename(worktree), "index.lock");
@@ -102,10 +117,13 @@ export async function probeCodexCommit(repoRoot: string, sandbox: CodexSandbox =
     if (join(await git(worktree, "rev-parse", "--absolute-git-dir"), "index.lock") !== lock) return unknown("the fixture worktree metadata is not where git was expected to put it");
     const control = join(worktree, CONTROL);
     if (existsSync(lock)) return unknown("a foreign index.lock already holds the fixture worktree");
+    sandboxed = true;
     const out = await sandbox({ worktree, commonDir, branch, control, lock, hostileHook, hostileRoot, token, signal });
-    // An escape on disk dominates; every other verdict needs consistent receipts AND disk.
+    // An escape on disk dominates; every other verdict needs consistent receipts AND disk — and trusted metadata.
     const escape = escaped(hostile, token);
     if (escape) return escape;
+    const refused = fixtureRefusal(worktree);
+    if (refused) return refused;
     if (contradictory(out)) return unknown("the sandbox receipts contradict each other");
     if (!/^control=ok$/m.test(out) || !holds(control, token)) return unknown("the sandbox did not write the ordinary control file");
     if (!/^hook=denied$/m.test(out) || !/^root=denied$/m.test(out) || hostile.some((m) => existsSync(m))) {
@@ -128,6 +146,8 @@ export async function probeCodexCommit(repoRoot: string, sandbox: CodexSandbox =
     // a sandbox that wrote a hostile member and then failed (or was cancelled) still escaped: inspect before cleanup
     const escape = escaped(hostile, token);
     if (escape) return escape;
+    const refused = sandboxed ? fixtureRefusal(worktree) : undefined;
+    if (refused) return refused;
     return unknown(signal?.aborted ? "probe cancelled" : `probe did not run (${(e instanceof Error ? e.message : String(e)).split("\n")[0]})`);
   } finally {
     // only files holding this probe's token are ours to remove; a foreign occupant is never touched
@@ -138,7 +158,7 @@ export async function probeCodexCommit(repoRoot: string, sandbox: CodexSandbox =
     // prune — that would take an earlier probe's preserved foreign lock (or anyone's prunable worktree).
     const foreign = lock !== undefined && existsSync(lock);
     if (lock && !foreign) {
-      await git(repoRoot, "worktree", "remove", "--force", worktree).catch(() => undefined);
+      await hostGit(repoRoot, "worktree", "remove", "--force", worktree).catch(() => undefined);
       // a failed `worktree add` leaves metadata git no longer removes by path: drop this probe's own directory
       rmSync(dirname(lock), { recursive: true, force: true });
       try { rmdirSync(dirname(dirname(lock))); } catch { /* other worktrees live there */ }
@@ -148,7 +168,7 @@ export async function probeCodexCommit(repoRoot: string, sandbox: CodexSandbox =
     // Metadata preserved for a foreign lock keeps its branch too: that checkout's HEAD still names it.
     const tip = base === undefined || foreign ? undefined : await tipOf(repoRoot, ref);
     if (tip && base && (tip === base || await isProbeCommit(repoRoot, tip, base, token))) {
-      await git(repoRoot, "update-ref", "-d", ref, tip).catch(() => undefined);
+      await hostGit(repoRoot, "update-ref", "-d", ref, tip).catch(() => undefined);
     }
     rmSync(parent, { recursive: true, force: true });
   }
@@ -163,7 +183,7 @@ const NOTE: Record<CodexCommitStatus, string> = {
 const CONSEQUENCE: Record<CodexCommitStatus, string> = {
   protected: "; a Codex worker cannot commit in its worktree",
   allowed: "",
-  escape: "; every Codex role (worker, judge, review, consult) launches with this grant — stop Codex seats and inspect .git/hooks and git config --list --show-origin (core.hooksPath, core.fsmonitor, filter.*, diff.external)",
+  escape: "; every Codex worker (headless and interactive) launches with this grant, while judge, review and consult seats launch grantless — stop Codex seats and inspect .git/hooks and git config --list --show-origin (core.hooksPath, core.fsmonitor, filter.*, diff.external)",
   unknown: "",
 };
 const STATUSES = new Set<string>(Object.keys(NOTE));
@@ -202,9 +222,10 @@ export function codexCommitHeadline(worker: string, adapters: WorkerAdapter[], h
     : null;
 }
 
-/** Plan's one line for Codex's NON-worker roles (judge, review, consult): they launch with the same grant, so
- *  only an escape earns it — allowed, protected and unknown concern commits, which those roles never make. */
+/** Plan's one line for Codex's NON-worker roles (judge, review, consult). v2.6.7 T4: those seats launch
+ *  grantless, but they run in the same repository whose shared metadata a Codex worker's grant let the sandbox
+ *  write — so an escape still blocks; allowed, protected and unknown concern commits, which they never make. */
 export function codexEscapeRoleLine(roles: string[], adapters: WorkerAdapter[], health: Record<string, AuthHealth>): string | null {
   if (!roles.length || !adapters.includes(codex) || codexCommitStatus(health) !== "escape") return null;
-  return `BLOCKING security warning: codex sandbox escape (doctor probe) — Codex ${roles.join("/")} seats launch with the worker grant that let the sandbox write shared git metadata; ${ESCAPE_ACTION}`;
+  return `BLOCKING security warning: codex sandbox escape (doctor probe) — Codex ${roles.join("/")} seats launch grantless, but the Codex worker grant let the sandbox write shared git metadata they run against; ${ESCAPE_ACTION}`;
 }

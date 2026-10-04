@@ -69,8 +69,10 @@ describe("real adapters", () => {
     expect(cxInteractive).not.toContain('writable_roots=[\\"$(git rev-parse --path-format=absolute --git-common-dir)\\"]');
     expect(cxInteractive).toMatch(/--model 'gpt-5.2' "\$\(cat '\/p'\)"$/);
     expect(cxInteractive).not.toContain(" exec ");
-    expect(cxHeadless).toContain(CODEX_GIT_GRANT);
-    expect(cxHeadless).not.toContain('writable_roots=[\\"$(git rev-parse --path-format=absolute --git-common-dir)\\"]');
+    // v2.6.7 T4 (D-1046): the headless form judge/review/consult launch is grantless; the worker's invoke() keeps the grant
+    expect(cxHeadless).not.toContain("writable_roots");
+    const cxWorker = codex.invoke({} as never, "/wt", { model: "gpt-5.2", channel: "sub", tier: "mid" }, { promptFile: "/p" }).command;
+    expect(cxWorker).toBe(cxHeadless.replace(" --model ", ` ${CODEX_GIT_GRANT} --model `));
     expect(cxHeadless).not.toContain("--full-auto");
     // OBS-125: codex 0.144.x per-worktree "Hooks need review" gate — bypass hook trust so the operator's
     // own trusted hooks run without stalling; the workspace-write sandbox stays (NOT the sandbox bypass).
@@ -86,8 +88,10 @@ describe("real adapters", () => {
     expect(pi.headlessCommand("/p", "m")).toContain("--approve");
     expect(pi.vendor).toBe("zhipu");
     for (const ad of REAL) {
+      // v2.6.7 T4 (D-1046): codex's worker invoke() is its grantless headless form plus the worker grant
+      const headless = ad.headlessCommand("/p", "x");
       expect(ad.invoke(task, "/w", { ...a, adapter: ad.id }, { promptFile: "/p" }).command).toBe(
-        ad.headlessCommand("/p", "x"),
+        ad.id === "codex" ? headless.replace(" --model ", ` ${CODEX_GIT_GRANT} --model `) : headless,
       );
     }
   });
@@ -121,7 +125,7 @@ describe("real adapters", () => {
     expect(cx).toMatch(/--model 'gpt-5.2' "\$\(cat '\/p'\)"$/);
     expect(cx).not.toMatch(/\s-p\s|--print|\bexec\b/);
     expect(cx.split(/\s+/, 4).join(" ")).toBe("codex -a never -s");
-    expect(codex.headlessCommand("/p", "gpt-5.2")).toContain("sandbox_workspace_write.writable_roots");
+    expect(codex.headlessCommand("/p", "gpt-5.2")).not.toContain("sandbox_workspace_write.writable_roots");
     // which real adapters still return null: exactly the one that launches then seeds (kimi, v1.69 T6).
     // OBS-930: enumerated on a SMALL real prompt — codex and claude return null for a prompt over the
     // platform's single-argv-string ceiling (tests/adapters/prompt-argv-ceiling.test.ts), so the size

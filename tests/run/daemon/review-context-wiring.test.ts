@@ -203,8 +203,9 @@ test("test: production worker and review briefs retain A before B after an inter
   expect(workerBriefs).toHaveLength(1);
   expect(workerBriefs[0]).toContain(`approval: ${A}`);
   await approve([runId, "T1", "--uphold", "--reason", B, "--review-rounds", "1"], repo);
-  // v2.6.5 T6: launch 2 repairs a review material, so its review runs BEFORE its test screen — the
-  // reviewer approves it, the screen reds; launch 3 is a test-red repair (battery-first) and reds again.
+  // v2.6.7 T1 (closed order table): every candidate's review runs BEFORE its test payload — launch 2
+  // (a review-material repair) is approved and its full job reds; launch 3 is an unattributed test-red
+  // repair, so no diagnostic is admitted: its review approves first and its full job reds again.
   approveReview = true;
   expect((await resume()).human).toEqual(["T1"]); // launches 2 and 3 under A then B; test red twice
   expect(journal().read().filter((e) => e.event === "worker-launch")).toHaveLength(3);
@@ -215,8 +216,8 @@ test("test: production worker and review briefs retain A before B after an inter
 
   expect(journal().read().filter((e) => e.event === "task-approved").map((e) => e.data.release))
     .toEqual([undefined, "review-upheld", "gate-satisfied"]);
-  // one under A alone, one reviewing launch 2 before its screen, one after the waive released the red test
-  expect(reviewBriefs).toHaveLength(3);
+  // one under A alone, one each reviewing launches 2 and 3 before their full jobs, one after the waive released the red test
+  expect(reviewBriefs).toHaveLength(4);
   expect(operatorContext(reviewBriefs[0]!)).toContain(`- ${A}`);
   expect(operatorContext(reviewBriefs[0]!)).not.toContain(B);
   for (const brief of reviewBriefs.slice(1)) {

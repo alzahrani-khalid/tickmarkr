@@ -1,9 +1,10 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import { execFile } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { closeSync, constants, fstatSync, linkSync, mkdirSync, openSync, readFileSync, readdirSync, readlinkSync, rmdirSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { closeSync, constants, fstatSync, linkSync, mkdirSync, openSync, readFileSync, readdirSync, readlinkSync, renameSync, rmdirSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
-import { join, resolve } from "node:path";
+import { join } from "node:path";
+import { trustedCommonDir } from "./git-trust.js";
 
 // The process census and command admission deliberately use the same command-head classifier.
 export function isRunnerCommand(command: string): boolean {
@@ -98,7 +99,16 @@ export class CommandLeases {
  * holder is dead. Each reservation releases only itself: a waiter that never acquired removes nothing,
  * so cancelling it never frees the holder. The daemon's adoption is deferred to 2.5.7.
  */
-export interface RepositoryLeaseHolder { pid: number; cwd: string; at: number; token: string }
+export interface RepositoryLeaseHolder {
+  pid: number; cwd: string; at: number; token: string;
+  /** Exact owner birth and token-bound execution roots; retained across owner death. */
+  identity?: string;
+  protectOrphans?: true;
+  /** The owner settled; only its protected tree can still block reclamation. */
+  ownerReleased?: true;
+  roots?: number[];
+  rootBirths?: Record<string, string>;
+}
 export interface RepositoryLeaseOptions {
   pollMs?: number;
   signal?: AbortSignal;
@@ -106,6 +116,13 @@ export interface RepositoryLeaseOptions {
   onWait?: (holder: RepositoryLeaseHolder) => void;
   /** The token a descendant inherited; defaults to REPOSITORY_LEASE_TOKEN_ENV. */
   inherited?: string;
+  /** Manifest jobs bridge capabilities through explicit child environments, never process.env. */
+  isolated?: boolean;
+  protectOrphans?: boolean;
+  onAdmission?: (holder: RepositoryLeaseHolder) => void;
+  onRelease?: () => void;
+  /** A new job inside an existing job cannot borrow that job's async capability. */
+  independent?: boolean;
 }
 
 /** OBS-880/1071: the file lease's token, exported to the holder's descendants for the span it is held
@@ -134,16 +151,14 @@ const ancestorPids = (): Promise<Set<number>> => new Promise((ok) => execFile("p
 export async function reentrantHolder(path: string, inherited: string | undefined): Promise<RepositoryLeaseHolder | undefined> {
   if (!inherited) return undefined;
   const holder = readHolder(path);
-  if (holder?.token !== inherited || holder.pid === process.pid || !alive(holder.pid)) return undefined;
+  if (holder?.token !== inherited || holder.pid === process.pid || !holderAlive(holder)) return undefined;
   return (await ancestorPids()).has(holder.pid) ? holder : undefined;
 }
 
 const LEASE_FILE = "tickmarkr-runner.lease";
 
 export async function repositoryLeasePath(cwd: string): Promise<string> {
-  const commonDir = await new Promise<string>((ok, fail) => execFile("git", ["rev-parse", "--git-common-dir"], { cwd, encoding: "utf8" },
-    (error, stdout) => error ? fail(error) : ok(stdout.trim())));
-  return join(resolve(cwd, commonDir), LEASE_FILE);
+  return join(trustedCommonDir(cwd), LEASE_FILE);
 }
 
 const alive = (pid: number): boolean => {
@@ -274,9 +289,9 @@ const reclaimDeadLocked = (path: string, identity: string): boolean => {
 export const reclaimDead = async (path: string, identity: string, pollMs = 10): Promise<boolean> =>
   withMutationLock(path, pollMs, undefined, () => reclaimDeadLocked(path, identity));
 
-const inspectAndReserve = (path: string, mine: RepositoryLeaseHolder): { acquired: boolean; holder?: RepositoryLeaseHolder } => {
+const inspectAndReserve = async (path: string, mine: RepositoryLeaseHolder): Promise<{ acquired: boolean; holder?: RepositoryLeaseHolder }> => {
   let occupant = readOccupant(path);
-  if (occupant && (!occupant.holder || !alive(occupant.holder.pid))) {
+  if (occupant && (!occupant.holder || (!holderAlive(occupant.holder) && !(occupant.holder.protectOrphans && (await protectedProcesses(occupant.holder)).length)))) {
     reclaimDeadLocked(path, occupant.identity);
     occupant = readOccupant(path);
   }
@@ -284,34 +299,195 @@ const inspectAndReserve = (path: string, mine: RepositoryLeaseHolder): { acquire
   return { acquired: false, holder: occupant?.holder };
 };
 
-export async function withRepositoryLease<T>(cwd: string, run: () => Promise<T>, opts: RepositoryLeaseOptions = {}): Promise<T> {
-  const path = await repositoryLeasePath(cwd);
-  // A descendant of the live holder runs inside its ancestor's reservation and releases nothing.
-  if (await reentrantHolder(path, opts.inherited ?? process.env[REPOSITORY_LEASE_TOKEN_ENV])) return run();
-  const pollMs = opts.pollMs ?? 1_000;
-  const mine: RepositoryLeaseHolder = { pid: process.pid, cwd, at: Date.now(), token: randomUUID() };
-  let waitingOn: number | undefined;
-  for (;;) {
-    opts.signal?.throwIfAborted();
-    const attempt = await withMutationLock(path, pollMs, opts.signal, () => inspectAndReserve(path, mine));
-    if (attempt.acquired) break;
-    if (attempt.holder && attempt.holder.pid !== waitingOn) { waitingOn = attempt.holder.pid; opts.onWait?.(attempt.holder); }
-    await new Promise((wake) => setTimeout(wake, pollMs));
-  }
-  // Exported before run() so every descendant forked or spawned during the hold can reenter; restored
-  // at release unless another reservation in this process has since exported its own.
-  const exported = process.env[REPOSITORY_LEASE_TOKEN_ENV];
-  process.env[REPOSITORY_LEASE_TOKEN_ENV] = mine.token;
-  try {
-    return await run();
-  } finally {
-    if (process.env[REPOSITORY_LEASE_TOKEN_ENV] === mine.token) {
-      if (exported === undefined) delete process.env[REPOSITORY_LEASE_TOKEN_ENV];
-      else process.env[REPOSITORY_LEASE_TOKEN_ENV] = exported;
+// A durable capability is also a crash owner: census checks the exact generation's inherited
+// environment and recorded process groups, including live orphans reparented after owner death.
+// An unreadable census refuses reclamation/release. No dead-pid shortcut admits over a live tree.
+export async function protectedProcesses(holder: RepositoryLeaseHolder, tokenEnv = REPOSITORY_LEASE_TOKEN_ENV, ownedOnly = false): Promise<number[]> {
+  let censusPid: number | undefined;
+  const rows = await new Promise<string>((ok, fail) => { const census = execFile("ps", ["eww", "-A", "-o", "pid=,ppid=,pgid=,stat=,command="],
+    { encoding: "utf8", timeout: 15_000, maxBuffer: 16 * 1024 * 1024 }, (error, stdout) => error ? fail(error) : ok(stdout)); censusPid = census.pid; });
+  const token = `${tokenEnv}=${holder.token}`;
+  const lines = rows.split("\n");
+  const safeGroups = new Set((holder.roots ?? []).filter(pid => {
+    const leader = lines.some(line => new RegExp(`^\\s*${pid}\\s+\\d+\\s+${pid}\\s+`).test(line));
+    // A leaderless group still belongs to its recorded root; a reused leader must match its birth.
+    return !leader || sameProcessBirth(processBirth(pid), holder.rootBirths?.[pid]);
+  }));
+  const parsed = lines.flatMap(line => {
+    const match = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(.*)$/.exec(line);
+    return match ? [{ pid: Number(match[1]), parent: Number(match[2]), group: Number(match[3]), stat: match[4]!, command: match[5]! }] : [];
+  });
+  const parents = new Map(parsed.map(row => [row.pid, row.parent]));
+  const descendant = (pid: number) => {
+    const seen = new Set<number>();
+    for (let at = parents.get(pid) ?? 0; at > 1 && !seen.has(at); at = parents.get(at) ?? 0) {
+      if (at === holder.pid) return true;
+      seen.add(at);
     }
-    // Release is serialized with reclamation/acquisition and removes only this generation.
-    await withMutationLock(path, pollMs, undefined, () => {
-      if (readHolder(path)?.token === mine.token) unlinkSync(path);
+    return false;
+  };
+  return parsed.flatMap(row => {
+    if (row.stat.startsWith("Z") || row.pid === holder.pid || row.pid === censusPid) return [];
+    const group = safeGroups.has(row.group);
+    const capability = row.command.split(/\s+/).includes(token);
+    // Copied environment text outside the owned tree can conservatively block reclamation, but
+    // can never authorize signalling an unrelated process. Birth-checked groups survive reparenting.
+    return group || (capability && (!ownedOnly || descendant(row.pid))) ? [row.pid] : [];
+  });
+}
+interface RepositoryOwnership { path: string; holder: RepositoryLeaseHolder; active: boolean }
+const repositoryOwnership = new AsyncLocalStorage<RepositoryOwnership>();
+export const repositoryLeaseEnvironment = (env: NodeJS.ProcessEnv): NodeJS.ProcessEnv => {
+  const own = repositoryOwnership.getStore();
+  if (!own) return { ...env };
+  const child = { ...env };
+  if (own.active) child[REPOSITORY_LEASE_TOKEN_ENV] = own.holder.token;
+  else delete child[REPOSITORY_LEASE_TOKEN_ENV];
+  return child;
+};
+/** Called synchronously at spawn, before any user callback, and only on an owned generation. */
+export function registerRepositoryChild(pid: number | undefined): void {
+  const own = repositoryOwnership.getStore();
+  if (!own?.active || !own.holder.protectOrphans || pid === undefined) return;
+  if (readHolder(own.path)?.token !== own.holder.token) throw new Error("verification reservation superseded before child registration");
+  own.holder.roots = [...new Set([...(readHolder(own.path)?.roots ?? []), pid])];
+  const birth = processBirth(pid);
+  own.holder.rootBirths = { ...readHolder(own.path)?.rootBirths, ...(birth ? { [pid]: birth } : {}) };
+  const draft = `${own.path}.${own.holder.token}.${process.pid}.roots`;
+  try {
+    writeFileSync(draft, JSON.stringify(own.holder) + "\n");
+    renameSync(draft, own.path);
+  } finally { rmSync(draft, { force: true }); }
+}
+export const withFreshCommandLease = <T>(command: string, run: () => Promise<T>): Promise<T> =>
+  ownership.run({ token: "", active: false }, () => withCommandLease(command, run));
+const repositoryQueues = new Map<string, Set<symbol>>();
+
+/** The standalone wrapper uses the same command-then-repository order when a scheduler exists.
+ * Without one (CLI/global setup), this remains exactly the outer file reservation API. */
+export function withRepositoryLease<T>(cwd: string, run: () => Promise<T>, opts: RepositoryLeaseOptions = {}): Promise<T> {
+  return opts.isolated ? repositoryLease(cwd, run, opts)
+    : withCommandLease("vitest run", () => repositoryLease(cwd, run, opts));
+}
+export const hasRepositoryLeaseOwnership = (): boolean => repositoryOwnership.getStore()?.active === true;
+async function repositoryLease<T>(cwd: string, run: () => Promise<T>, opts: RepositoryLeaseOptions): Promise<T> {
+  const path = await repositoryLeasePath(cwd);
+  const own = repositoryOwnership.getStore();
+  // Only the private async capability can reenter within this process. Environment text cannot.
+  if (!opts.independent && own?.active && own.path === path && readHolder(path)?.token === own.holder.token) {
+    opts.onAdmission?.(own.holder);
+    const value = await run();
+    opts.onRelease?.(); // this caller's span ends; the outer reservation stays owned
+    return value;
+  }
+  if (await reentrantHolder(path, opts.inherited ?? process.env[REPOSITORY_LEASE_TOKEN_ENV])) {
+    const holder = readHolder(path)!;
+    const inheritedOwner = { path, holder, active: true };
+    return repositoryOwnership.run(inheritedOwner, async () => {
+      opts.onAdmission?.(holder);
+      try { const value = await run(); opts.onRelease?.(); return value; } finally { inheritedOwner.active = false; }
     });
   }
+  const pollMs = opts.pollMs ?? 1_000;
+  const mine: RepositoryLeaseHolder = { pid: process.pid, cwd, at: Date.now(), token: randomUUID(),
+    ...(opts.protectOrphans !== false ? { protectOrphans: true, roots: [], identity: ownerIdentity() } : {}) };
+  const queue = repositoryQueues.get(path) ?? new Set<symbol>();
+  repositoryQueues.set(path, queue);
+  const ticket = Symbol("repository job");
+  queue.add(ticket);
+  let waitingOn: string | undefined;
+  const waitOn = (holder: RepositoryLeaseHolder | undefined) => {
+    if (holder && holder.token !== waitingOn) { waitingOn = holder.token; opts.onWait?.(holder); }
+  };
+  try {
+    for (;;) {
+      opts.signal?.throwIfAborted();
+      if (queue.values().next().value === ticket) {
+        const attempt = await withMutationLock(path, pollMs, opts.signal, () => inspectAndReserve(path, mine));
+        if (attempt.acquired) break;
+        waitOn(attempt.holder);
+      } else waitOn(readHolder(path));
+      await new Promise(wake => setTimeout(wake, pollMs));
+    }
+    const exported = process.env[REPOSITORY_LEASE_TOKEN_ENV];
+    if (!opts.isolated) process.env[REPOSITORY_LEASE_TOKEN_ENV] = mine.token;
+    const owner = { path, holder: mine, active: true };
+    try {
+      return await repositoryOwnership.run(owner, async () => {
+        opts.signal?.throwIfAborted();
+        opts.onAdmission?.(mine);
+        return run();
+      });
+    } finally {
+      owner.active = false;
+      if (!opts.isolated && process.env[REPOSITORY_LEASE_TOKEN_ENV] === mine.token) {
+        if (exported === undefined) delete process.env[REPOSITORY_LEASE_TOKEN_ENV];
+        else process.env[REPOSITORY_LEASE_TOKEN_ENV] = exported;
+      }
+      // All token-bound children, including escaped descendants, cease before release. Shell has
+      // already reaped its group; this closes the inherited-pipe/escaped-child boundary as well.
+      if (mine.protectOrphans) await reapRepositoryChildren(mine, pollMs).catch(async error => {
+        // A failed census or reap deadline must not leave a settled job naming a live owner
+        // forever. Retain the exact generation and its roots for the orphan rule: admission
+        // still requires a successful census proving the protected tree has ceased.
+        await withMutationLock(path, pollMs, undefined, () => {
+          const holder = readHolder(path);
+          if (holder?.token !== mine.token) return;
+          const draft = `${path}.${mine.token}.${process.pid}.released`;
+          try {
+            writeFileSync(draft, JSON.stringify({ ...holder, ownerReleased: true }) + "\n");
+            renameSync(draft, path);
+          } finally { rmSync(draft, { force: true }); }
+        });
+        throw error;
+      });
+      await withMutationLock(path, pollMs, undefined, () => {
+        if (readHolder(path)?.token === mine.token) unlinkSync(path);
+      });
+      opts.onRelease?.();
+    }
+  } finally {
+    queue.delete(ticket);
+    if (!queue.size) repositoryQueues.delete(path);
+    // A waiter removes no repository generation, including cancellation before acquisition.
+  }
+}
+function processBirth(pid: number): string | undefined {
+  try {
+    if (process.platform === "linux") {
+      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+      return stat.slice(stat.lastIndexOf(")") + 2).split(/\s+/)[19];
+    }
+    return execFileSync("ps", ["-p", String(pid), "-o", "lstart="], { encoding: "utf8", timeout: 15_000, stdio: ["ignore", "pipe", "ignore"] }).trim() || undefined;
+  } catch { return undefined; }
+}
+
+function ownerIdentity(): string | undefined {
+  const birth = processBirth(process.pid);
+  // Match git.ts's independent identity format without changing recorded raw root births.
+  return birth ? `${process.pid}:${canonicalBirth(birth)}` : undefined;
+}
+
+const canonicalBirth = (birth: string): string => birth.trim().replace(/\s+/g, " ");
+const sameProcessBirth = (actual: string | undefined, expected: string | undefined): boolean =>
+  actual !== undefined && expected !== undefined && canonicalBirth(actual) === canonicalBirth(expected);
+
+export async function reapRepositoryChildren(holder: RepositoryLeaseHolder, pollMs: number, tokenEnv = REPOSITORY_LEASE_TOKEN_ENV): Promise<void> {
+  const deadline = Date.now() + 15_000;
+  for (const pid of await protectedProcesses(holder, tokenEnv, true)) {
+    try { process.kill(pid, "SIGKILL"); } catch (error) { if (!isCode(error, "ESRCH")) throw error; }
+  }
+  while ((await protectedProcesses(holder, tokenEnv)).length) {
+    if (Date.now() >= deadline) throw new Error("verification children did not cease; reservation retained");
+    await new Promise(wake => setTimeout(wake, pollMs));
+  }
+}
+
+function holderAlive(holder: RepositoryLeaseHolder): boolean {
+  if (holder.ownerReleased === true) return false;
+  if (!alive(holder.pid)) return false;
+  if (!holder.identity) return true; // legacy live holder remains protected
+  const birth = processBirth(holder.pid);
+  // Older live generations may contain ps's space-padded day. Formatting cannot prove owner death.
+  return birth === undefined || sameProcessBirth(`${holder.pid}:${birth}`, holder.identity);
 }

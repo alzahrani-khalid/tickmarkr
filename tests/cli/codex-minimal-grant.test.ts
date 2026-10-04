@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { CODEX_GIT_GRANT, codex } from "../../src/adapters/codex.js";
@@ -11,6 +11,7 @@ import { doctor } from "../../src/cli/commands/doctor.js";
 import { plan } from "../../src/cli/commands/plan.js";
 import { DEFAULT_CONFIG } from "../../src/config/config.js";
 import { saveGraph, tickmarkrDir } from "../../src/graph/graph.js";
+import { shGit } from "../../src/run/git.js";
 import { validateGraph } from "../../src/graph/schema.js";
 import { authedModels, makeRepo, makeTestTempDir } from "../helpers/tmprepo.js";
 
@@ -68,6 +69,9 @@ afterEach(() => {
 });
 
 const git = (cwd: string, ...args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
+const workerHeadless = (prompt: string, model = "fixture-model") =>
+  codex.invoke({} as never, "/wt", { model, channel: "sub", tier: "mid" }, { promptFile: prompt }).command;
+const loggedArgv = (): string[] => JSON.parse(readFileSync(argvLog, "utf8")) as string[];
 const grantedRoots = (): string[] => {
   const grants = (JSON.parse(readFileSync(argvLog, "utf8")) as string[]).filter((a) => a.startsWith("sandbox_workspace_write.writable_roots="));
   expect(grants).toHaveLength(1);
@@ -91,7 +95,8 @@ test("both production Codex builders expand exactly the minimal linked grant ver
     { cwd: repo, minimal: objectsRefsLogs, d910: [common, common] },
   ];
   for (const { cwd, minimal, d910 } of rows) {
-    const builders = [codex.headlessCommand(prompt, "fixture-model"), codex.interactiveCommand(prompt, "fixture-model")!];
+    // v2.6.7 T4 (D-1046): the two WORKER builders — invoke()'s headless worker form and the interactive TUI
+    const builders = [workerHeadless(prompt), codex.interactiveCommand(prompt, "fixture-model")!];
     for (const command of builders) {
       expect(command).toContain(CODEX_GIT_GRANT);
       execFileSync("sh", ["-c", command], { cwd });
@@ -141,7 +146,7 @@ test("doctor worker-grant probe discriminates the allowed protected escape unkno
   for (const broad of [D910, SHIPPED]) {
     const escaped = await doctorProbe(codexSandboxFor(broad));
     expect(escaped.codexCommit, broad).toBe("escape");
-    expect(escaped.note).toMatch(/^BLOCKING security warning: codex sandbox escape into shared git metadata — the sandbox wrote \S+\/hooks\/tickmarkr-probe-\S+ and \S+\/\.git\/tickmarkr-probe-\S+ outside the worker grant; every Codex role \(worker, judge, review, consult\) launches with this grant/);
+    expect(escaped.note).toMatch(/^BLOCKING security warning: codex sandbox escape into shared git metadata — the sandbox wrote \S+\/hooks\/tickmarkr-probe-\S+ and \S+\/\.git\/tickmarkr-probe-\S+ outside the worker grant; every Codex worker \(headless and interactive\) launches with this grant, while judge, review and consult seats launch grantless/);
     expect(snapshot(), broad).toEqual(before);
   }
 
@@ -166,7 +171,7 @@ test("doctor worker-grant probe discriminates the allowed protected escape unkno
   // dominant over contradictory receipts, blocking in the note — and the probe still removes only its own files
   const failedAfterWrite = await doctorProbe(async (p) => { await codexSandboxFor(D910)(p); throw new Error("Command failed: exit 17"); });
   expect(failedAfterWrite.codexCommit).toBe("escape");
-  expect(failedAfterWrite.note).toMatch(/^BLOCKING security warning: codex sandbox escape into shared git metadata — the sandbox wrote \S+\/hooks\/tickmarkr-probe-\S+ and \S+\/\.git\/tickmarkr-probe-\S+ outside the worker grant; every Codex role/);
+  expect(failedAfterWrite.note).toMatch(/^BLOCKING security warning: codex sandbox escape into shared git metadata — the sandbox wrote \S+\/hooks\/tickmarkr-probe-\S+ and \S+\/\.git\/tickmarkr-probe-\S+ outside the worker grant; every Codex worker \(headless and interactive\) launches with this grant/);
   expect((await doctorProbe(async (p) => `${await codexSandboxFor(D910)(p)}commit=fail\n`)).codexCommit).toBe("escape");
   expect(snapshot()).toEqual(before);
 
@@ -216,7 +221,7 @@ test("doctor and plan block a Codex escape for a review-only Codex role versus a
   // doctor: the codex row FAILS and carries the blocking warning; the allowed row passes without it
   expect(escape.codexRow.trimStart().startsWith(statusRow("fail", ""))).toBe(true);
   expect(escape.codexRow).toContain("BLOCKING security warning: codex sandbox escape into shared git metadata");
-  expect(escape.codexRow).toContain("every Codex role (worker, judge, review, consult) launches with this grant — stop Codex seats and inspect .git/hooks");
+  expect(escape.codexRow).toContain("every Codex worker (headless and interactive) launches with this grant, while judge, review and consult seats launch grantless — stop Codex seats and inspect .git/hooks");
   expect(allowed.codexRow.trimStart().startsWith(statusRow("pass", ""))).toBe(true);
   expect(allowed.codexRow).toContain("linked-worktree commit probe: commit allowed, shared hooks/config denied");
   expect(allowed.codexRow).not.toContain("BLOCKING");
@@ -227,9 +232,78 @@ test("doctor and plan block a Codex escape for a review-only Codex role versus a
     expect(planOut[row]).toContain("→ claude-code:");
     expect(planOut.slice(row).find((l) => l.startsWith("    review: "))).toMatch(/^ {4}review: codex:/);
   }
-  expect(escape.planOut).toContain("BLOCKING security warning: codex sandbox escape (doctor probe) — Codex review/consult seats launch with the worker grant that let the sandbox write shared git metadata; stop Codex seats and inspect .git/hooks and git config --list --show-origin (core.hooksPath, core.fsmonitor, filter.*, diff.external) before dispatch");
+  expect(escape.planOut).toContain("BLOCKING security warning: codex sandbox escape (doctor probe) — Codex review/consult seats launch grantless, but the Codex worker grant let the sandbox write shared git metadata they run against; stop Codex seats and inspect .git/hooks and git config --list --show-origin (core.hooksPath, core.fsmonitor, filter.*, diff.external) before dispatch");
   expect(allowed.planOut.join("\n")).not.toContain("BLOCKING");
   expect(allowed.planOut.join("\n")).not.toContain("worker restriction");
   // a Codex WORKER row under the same escape carries its own blocking headline
   expect(codexCommitHeadline("codex", [codex], { codex: { ...verified("codex"), codexCommit: "escape" } })).toBe("    BLOCKING security warning: codex sandbox escape (doctor probe) — this worker's launch grant let the sandbox write shared git metadata; stop Codex seats and inspect .git/hooks and git config --list --show-origin (core.hooksPath, core.fsmonitor, filter.*, diff.external) before dispatch");
 }, 300_000);
+
+test("production Codex commands satisfy the closed role-access table G1 G3 versus grant-bearing non-worker commands", async () => {
+  const repo = makeRepo({ "a.txt": "x\n" });
+  const common = realpathSync(join(repo, ".git"));
+  const linked = join(makeTestTempDir("codex-role-"), "task");
+  git(repo, "worktree", "add", "-q", "-b", "task", linked, "HEAD");
+  const gitdir = join(common, "worktrees", "task");
+  const prompt = join(makeTestTempDir("codex-role-prompt-"), "prompt.md");
+  writeFileSync(prompt, "fixture prompt");
+  // an operator MCP server: suppression must reach invoke().command too
+  writeFileSync(join(process.env.CODEX_HOME!, "config.toml"), "[mcp_servers.fixture-mcp]\ncommand = \"x\"\n");
+  const objectsRefsLogs = [`${common}/objects`, `${common}/refs`, `${common}/logs`];
+  const launch = (command: string, cwd: string): string[] => { execFileSync("sh", ["-c", command], { cwd }); return loggedArgv(); };
+  const grants = (argv: string[]) => argv.filter((a) => a.includes("writable_roots"));
+
+  // G1: the documented command forms and the production builders, executed by a launching shell
+  const block = readFileSync(new URL("../../docs/codebase/INTEGRATIONS.md", import.meta.url), "utf8").split("**codex**")[1]!.split("\n- **")[0]!;
+  const documented = (label: string) => block.match(new RegExp(`\\n\\s+-\\s+${label}:\\s+\`([^\`]+)\``))![1]!
+    .replaceAll("'<prompt>'", `'${prompt}'`).replaceAll("'<model>'", "'fixture-model'");
+  const nonWorker = [
+    ["headlessCommand (judge/review/consult/probe-model)", codex.headlessCommand(prompt, "fixture-model")],
+    ["documented Headless", documented("Headless")],
+  ];
+  const worker = [
+    ["invoke().command", workerHeadless(prompt)],
+    ["documented Worker headless", documented("Worker headless \\(`invoke\\(\\)`\\)")],
+    ["interactiveCommand", codex.interactiveCommand(prompt, "fixture-model")!],
+    ["documented Interactive", documented("Interactive")],
+  ];
+  for (const [cwd, expected] of [[linked, [gitdir, ...objectsRefsLogs]], [repo, objectsRefsLogs]] as const) {
+    for (const [name, command] of nonWorker) {
+      const argv = launch(command!, cwd);
+      expect(grants(argv), name).toEqual([]);
+      expect(argv, name).toContain("mcp_servers={}");
+      // the documented rows are the zero-config rendering; the production builder adds per-server suppression
+      if (!name!.startsWith("documented")) expect(argv, name).toContain("mcp_servers.fixture-mcp.enabled=false");
+    }
+    for (const [name, command] of worker) {
+      const argv = launch(command!, cwd);
+      expect(grants(argv), name).toHaveLength(1);
+      expect(grantedRoots(), `${name} at ${cwd}`).toEqual(expected);
+      expect(grantedRoots(), name).not.toContain(common); // no common-root fallback
+      expect(argv, name).toContain("mcp_servers={}");
+      if (!name!.startsWith("documented")) expect(argv, name).toContain("mcp_servers.fixture-mcp.enabled=false");
+      expect(argv, name).toContain("--dangerously-bypass-hook-trust");
+    }
+  }
+  // the grant-bearing non-worker form this release removes would expand the worker grant: the check discriminates
+  const grantBearing = codex.headlessCommand(prompt, "fixture-model").replace(" --model ", ` ${CODEX_GIT_GRANT} --model `);
+  expect(grantBearing).toBe(workerHeadless(prompt));
+  expect(grants(launch(grantBearing, linked))).toHaveLength(1);
+
+  // G3: read-only linked gitdir — judge/review read verbs equal the writable control; git add fails on index.lock
+  writeFileSync(join(linked, "a.txt"), "changed\n");
+  const verbs = ["git status --porcelain", "git diff", "git log --format=%H%n%s", "git show --stat HEAD"];
+  const readAll = async () => Promise.all(verbs.map(async (v) => { const r = await shGit(v, linked); expect(r.code, v).toBe(0); return r.stdout; }));
+  const writable = await readAll();
+  const modes = [gitdir, ...readdirSync(gitdir).map((e) => join(gitdir, e))].map((p) => [p, statSync(p).mode & 0o7777] as const);
+  try {
+    for (const [p, mode] of modes) chmodSync(p, mode & ~0o222);
+    expect(await readAll()).toEqual(writable);
+    const add = await shGit("git add a.txt", linked);
+    expect(add.code).not.toBe(0);
+    expect(add.stderr).toContain("index.lock");
+  } finally {
+    for (const [p, mode] of modes) chmodSync(p, mode);
+  }
+  expect((await shGit("git add a.txt", linked)).code).toBe(0);
+}, 120_000);

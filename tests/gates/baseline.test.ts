@@ -2,8 +2,10 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, test, vi } from "vitest";
 import { DEFAULT_CONFIG } from "../../src/config/config.js";
-import { captureBaseline, classifyFailureOutput, compareToBaseline, detectGateCommands, detectPackageManager, detectVacuousOracles, effectiveCeilingMs, fingerprint, UNRECOGNIZED_FAILURE } from "../../src/gates/baseline.js";
+import { type Baseline, captureBaseline, classifiedFileDurations, classifyFailureOutput, compareToBaseline, detectGateCommands, detectPackageManager, detectVacuousOracles, effectiveCeilingMs, fingerprint, UNRECOGNIZED_FAILURE } from "../../src/gates/baseline.js";
 import { NO_EXPLORE_ENV, QUALITY_ENV } from "../../src/route/router.js";
+import { diagnosticAdmission } from "../../src/gates/run-gates.js";
+import { fileHangBudgetMs } from "../../src/gates/test-manifest.js";
 import { DEFAULT_SHELL_TIMEOUT_MS, sh, type ShellOptions, type ShResult } from "../../src/run/git.js";
 import { makeRepo } from "../helpers/tmprepo.js";
 
@@ -115,6 +117,41 @@ test("test: a baseline capture over a runner that names per-file durations recor
   } finally {
     shSpy.stub = undefined;
   }
+});
+
+test("test: a baseline-red file early-ending timing never supplies its green hang budget or diagnostic cost — captured through the production seam, in either duplicate order, while a green file keeps its known budget and a red capture without outcome classification (an older binary, a cached or hand-supplied baseline) reads every file as untimed", async () => {
+  const run = (lines: string[], code = 1) => { shSpy.stub = (cmd) => cmd === "red-runner" ? { code, stdout: lines.join("\n"), stderr: "", durationMs: 50_000 } : undefined; };
+  const capture = async () => { try { return (await captureBaseline("/tmp/tickmarkr-timing", { test: "red-runner" })).commands.test; } finally { shSpy.stub = undefined; } };
+  const RED = " ❯ |suite| tests/docs.test.ts (13 tests | 1 failed) 47053ms", ECHO = " ✓ |echo| tests/docs.test.ts (1 test) 6ms";
+  const BACKGROUND = [" ✓ |suite| tests/harvest.test.ts (9 tests) 217543ms", " × tests/crashed.test.ts (1 test) 2s",
+    ...Array.from({ length: 12 }, (_, i) => ` ✓ |suite| tests/bg${i}.test.ts (4 tests) 100000ms`)];
+  for (const order of [[RED, ECHO], [ECHO, RED]]) {
+    run([...order, ...BACKGROUND]);
+    const entry = await capture();
+    // survives the JSON round trip a cached or persisted baseline takes
+    const persisted = JSON.parse(JSON.stringify({ commands: { test: entry } })) as Baseline;
+    const test = persisted.commands.test!;
+    expect(test.fileOutcomes).toBe(true);
+    expect(test.fileDurations).toContainEqual({ file: "tests/docs.test.ts", durationMs: 47_053, failed: true });
+    expect(test.fileDurations).toContainEqual({ file: "tests/crashed.test.ts", durationMs: 2_000, failed: true });
+    expect(test.fileDurations).toContainEqual({ file: "tests/harvest.test.ts", durationMs: 217_543 });
+    expect(test.longestFile).toEqual({ file: "tests/harvest.test.ts", durationMs: 217_543 }); // measurements unchanged
+    const durations = classifiedFileDurations(test);
+    expect(fileHangBudgetMs("tests/docs.test.ts", durations, 1_000_000, test.longestFile)).toBe(652_629); // 3 × longest, not 217_543
+    expect(fileHangBudgetMs("tests/harvest.test.ts", durations, 1_000_000, test.longestFile)).toBe(652_629); // green control: 3 × its own
+    expect(diagnosticAdmission(persisted, ["tests/docs.test.ts"]).reason).toBe("diagnostic-unknown-cost");
+  }
+  // the same file GREEN: its own measurement is a known budget and a costed (here cheap) diagnostic
+  run([" ✓ |suite| tests/docs.test.ts (13 tests) 47053ms", ...BACKGROUND.filter((l) => !l.includes("crashed"))], 0);
+  const green = await capture();
+  expect(green.fileDurations?.some((d) => d.failed)).toBe(false);
+  expect(fileHangBudgetMs("tests/docs.test.ts", classifiedFileDurations(green), 1_000_000, green.longestFile)).toBe(217_543);
+  expect(diagnosticAdmission({ commands: { test: green } } as Baseline, ["tests/docs.test.ts"])).toMatchObject({ admitted: true, estimatedMs: 47_053 });
+  // a RED legacy capture (no fileOutcomes): every file untimed and uncosted; a GREEN legacy capture is unchanged
+  const legacy = (exitCode: number) => ({ exitCode, fingerprints: [], fileDurations: [{ file: "tests/docs.test.ts", durationMs: 47_053 }, { file: "tests/harvest.test.ts", durationMs: 217_543 }] });
+  expect(fileHangBudgetMs("tests/docs.test.ts", classifiedFileDurations(legacy(1)), 1_000_000)).toBe(652_629);
+  expect(diagnosticAdmission({ commands: { test: legacy(1) } } as unknown as Baseline, ["tests/docs.test.ts"]).reason).toBe("diagnostic-unknown-cost");
+  expect(fileHangBudgetMs("tests/docs.test.ts", classifiedFileDurations(legacy(0)), 1_000_000)).toBe(217_543);
 });
 
 test("test: a baseline capture over a runner naming no per-file durations records the wall clock and marks the other three unavailable; a record normalizing an unmeasurable sum to zero reads as perfect parallelism and fails", async () => {

@@ -1,0 +1,37 @@
+{
+  "platform": "darwin",
+  "darwinRelease": "27",
+  "recipe": {
+    "source": "skills/tickmarkr-overseer/SKILL.md",
+    "start": "cd <repo> && tickmarkr beat start <tier> --seat <seat>",
+    "status": "cd <repo> && tickmarkr beat status <tier> --seat <seat>",
+    "stop": "cd <repo> && tickmarkr beat stop <tier> --seat <seat>"
+  },
+  "detachedChild": {
+    "ownSessionGroup": true,
+    "survivedLauncherSessionDeath": true,
+    "exactIdentityUnchanged": true,
+    "beatAdvancedAfterLauncherDeath": true,
+    "reportedDetached": true
+  },
+  "sameSessionControl": {
+    "inLauncherGroup": true,
+    "diedWithSession": true,
+    "reportedDetached": false
+  },
+  "ppidOneControl": {
+    "ppidWasOne": true,
+    "inLauncherGroup": true,
+    "diedWithSession": true,
+    "reportedDetached": false
+  },
+  "status": {
+    "code": 0,
+    "armed": true
+  },
+  "stop": {
+    "code": 0,
+    "disarmed": true,
+    "childExited": true
+  }
+}

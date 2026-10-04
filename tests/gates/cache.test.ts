@@ -149,6 +149,19 @@ async function assertCancelledTipWritesNothing(): Promise<void> {
   expect(readFileSync(join(repo, "calls.log"), "utf8").trim().split("\n")).toEqual(["build", "lint", "build", "lint"]);
 }
 
+// v2.6.7 T1: a selected run is now only an attributed test-red repair's diagnostic, admitted on comparable timing.
+const ATTRIBUTED_DIAGNOSTIC = { requiredRepairTests: ["tests/a.test.ts"], selectionReason: "known-failing-files" };
+const ADMITTING_TIMING = [{ file: "tests/a.test.ts", durationMs: 1 }, { file: "tests/heavy.test.ts", durationMs: 99 }];
+// ...and only beside a semantic gate: test-only verification keeps its full scope.
+const DIAGNOSED_GATES = ["build", "test", "lint", "evidence", "scope", "acceptance"] as const;
+function judged(): Pick<GateContext, "cfg" | "adapters"> {
+  const scriptPath = join(makeTestTempDir("tickmarkr-judged-"), "s.json");
+  writeFileSync(scriptPath, JSON.stringify({ tasks: {}, judge: { pass: true, criteria: [{ criterion: "c1", met: true, reason: "ok" }] } }));
+  const cfg = structuredClone(DEFAULT_CONFIG);
+  cfg.judge.adapter = "fake";
+  return { cfg, adapters: [new FakeAdapter(scriptPath)] };
+}
+
 async function assertScopeRedPolicies(): Promise<void> {
   const repo = makeRepo({
     "tests/a.test.ts": "// initial\n", ".gitignore": "calls.log\n",
@@ -158,12 +171,13 @@ async function assertScopeRedPolicies(): Promise<void> {
   writeFileSync(join(repo, "tests/a.test.ts"), "// changed\n");
   commitAll(repo, "change test");
   const task = validateGraph({ version: 1, spec: { source: "native", paths: ["s"], hash: "h" },
-    tasks: [T("T1", { gates: ["build", "test", "lint", "evidence", "scope"], files: ["tests/**"] })] }).tasks[0]!;
+    tasks: [T("T1", { gates: DIAGNOSED_GATES, files: ["tests/**"] })] }).tasks[0]!;
   const ctx = {
-    worktree: repo, baseRef, commands: { test: "sh check.sh" }, baseline: { commands: { test: { exitCode: 0, fingerprints: [] } } },
+    worktree: repo, baseRef, commands: { test: "sh check.sh" },
+    baseline: { commands: { test: { exitCode: 0, fingerprints: [], fileDurations: ADMITTING_TIMING } } },
     author: { adapter: "fake", model: "fake-1", channel: "sub", tier: "frontier" } as const,
     result: { ok: true, summary: "", deviations: [], raw: "" },
-    channels: [], adapters: [], cfg: structuredClone(DEFAULT_CONFIG), selectTests: true,
+    channels: [], ...judged(), selectTests: true, ...ATTRIBUTED_DIAGNOSTIC,
   };
   const first = await runGates(task, ctx);
   expect(first.results.find((r) => r.gate === "test")).toMatchObject({ pass: false, meta: { fullSuite: true } });
@@ -212,13 +226,13 @@ async function signalCacheFixture(selectTests: boolean, outcome = "exit 137") {
   writeFileSync(join(repo, "tests/a.test.ts"), "// changed\n");
   commitAll(repo, "change test");
   const task = validateGraph({ version: 1, spec: { source: "native", paths: ["s"], hash: "h" },
-    tasks: [T("T1", { gates: ["build", "test", "lint", "evidence", "scope"], files: ["tests/**"] })] }).tasks[0]!;
+    tasks: [T("T1", { gates: selectTests ? DIAGNOSED_GATES : ["build", "test", "lint", "evidence", "scope"], files: ["tests/**"] })] }).tasks[0]!;
   const ctx: GateContext = {
     worktree: repo, baseRef, commands: { test: "sh check.sh" },
-    baseline: { commands: { test: { exitCode: 0, fingerprints: [] } } },
+    baseline: { commands: { test: { exitCode: 0, fingerprints: [], ...(selectTests ? { fileDurations: ADMITTING_TIMING } : {}) } } },
     author: { adapter: "fake", model: "fake-1", channel: "sub", tier: "frontier" },
     result: { ok: true, summary: "", deviations: [], raw: "" },
-    channels: [], adapters: [], cfg: structuredClone(DEFAULT_CONFIG), selectTests,
+    channels: [], ...(selectTests ? judged() : { adapters: [], cfg: structuredClone(DEFAULT_CONFIG) }), selectTests, ...(selectTests ? ATTRIBUTED_DIAGNOSTIC : {}),
     stateDir: makeTestTempDir("tickmarkr-signal-cache-"),
   };
   const store = getVerdictStore(ctx.stateDir!);
@@ -245,8 +259,9 @@ describe.each([false, true])("D1 signal-exit cache protection (selected screen: 
       expect(result.meta?.fullSuite).toBe(selectTests ? true : undefined);
     }
     expect(calls()).toEqual(selectTests ? ["selected", "full", "full"] : ["full", "full"]);
-    expect(emitted).toHaveLength(2);
-    expect(emitted.every((meta) => (meta as { infra?: boolean }).infra === true)).toBe(true);
+    // a semantic round publishes each green diagnostic as its own row beside the full job's
+    expect(emitted).toHaveLength(selectTests ? 4 : 2);
+    expect(emitted.filter((meta) => (meta as { infra?: boolean }).infra === true)).toHaveLength(2);
   });
 
   test.each([false, true])("a planted infra verdict (pass: %s) is rejected before reuse", async (pass) => {
@@ -268,6 +283,22 @@ describe.each([false, true])("D1 signal-exit cache protection (selected screen: 
     expect(calls()).toEqual(selectTests ? ["selected", "full"] : ["full"]);
     expect(store.get(identity)).toMatchObject({ pass: true, details: "exit 0" });
     expect(store.get(identity)?.meta?.infra).not.toBe(true);
+  });
+
+  test("a planted receiptless full green is unavailable proof and a fresh job measures the failing command", async () => {
+    const { task, ctx, store, identity, calls } = await signalCacheFixture(selectTests, "echo 'AssertionError: expected 1 to be 2'; exit 1");
+    // Matching identity, pass: true, but no termination receipt: nothing shows the job ever exited normally.
+    expect(store.set(identity, { gate: "test", pass: true, details: "planted green" })).toBe(true);
+    const notes: unknown[] = [];
+    ctx.onGate = (e) => { if (e.phase === "note" && e.name === "gate-reused-verdict") notes.push(e.payload); };
+    const { results } = await runGates(task, ctx);
+    const result = results.find((r) => r.gate === "test")!;
+    expect(result.pass).toBe(false);
+    expect(result.meta?.reused).not.toBe(true);
+    expect(result.evidenceReceipt?.termination).toMatchObject({ kind: "exit", exitCode: 1 });
+    expect(results.every((r) => r.pass)).toBe(false);
+    expect(notes).toEqual([]);
+    expect(calls()).toEqual(selectTests ? ["selected", "full"] : ["full"]);
   });
 
   test("a legacy signal-only red without infra metadata is rejected before reuse", async () => {
@@ -638,18 +669,18 @@ gates:
       result: { ok: true, summary: "", deviations: [], raw: "" },
       commands, baseline, channels: [], adapters: [adapter], cfg,
     });
-    // b) the full suite reuses the run's verdict — OBS-635: before any screen is bought
+    // b) the full suite reuses the run's verdict — OBS-635: a test-only round never buys a screen
     const selectScreen = await runGates(task, {
       worktree: taskWorktree, baseRef,
       author: { adapter: "fake", model: "fake-1", channel: "sub", tier: "frontier" },
       result: { ok: true, summary: "", deviations: [], raw: "" },
       commands, baseline, channels: [], adapters: [adapter], cfg,
-      selectTests: true,
+      selectTests: true, requiredRepairTests: ["tests/index.test.ts"], selectionReason: "known-failing-files",
     });
     const fullGate = selectScreen.results.find((r) => r.gate === "test")!;
     expect(fullGate.pass).toBe(true);
     expect(fullGate.meta?.selectedTests).toBeUndefined();
-    expect(fullGate.meta?.selectionDecision).toMatchObject({ scope: "full", reason: "full-green-cache" });
+    expect(fullGate.meta?.selectionDecision).toMatchObject({ scope: "full", reason: "test-only-verification" });
     expect(fullGate.details).toMatch(/reused/i);
 
     // c) Standalone must first execute, then reuse only its own greens.

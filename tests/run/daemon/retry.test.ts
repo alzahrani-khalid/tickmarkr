@@ -1,5 +1,5 @@
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execSync } from "node:child_process";
@@ -1317,35 +1317,49 @@ describe("T3 retry economics (fake adapter, zero tokens)", () => {
 
   test("test: a funded repair whose battery died at the test gate before reaching the review gate it was funded for is not charged so a third repair is still funded and the repair-exhausted row names per repair the funded gates the gate reached and the gate it died at whereas the shipped counter that charges every repair-attempt row and names only the last round's failing gates fails", async () => {
     const runId = "run-repair-reached";
-    // The two test reds name different defects, so the second is a new failure rather than a repeat.
-    const testCmd = "test ! -f broken.txt || { cat broken.txt; exit 1; }";
+    // v2.6.7 T1 (closed order table): semantics precede the full job, so a round dies at the test gate
+    // before its review only through an admitted attributed test-red diagnostic. The task's suite is a
+    // real vitest file whose red names its failing file, a full-provenance red on record attributes it,
+    // and harness timing admits the diagnostic. The two diagnostic reds name different defects, so the
+    // second is a new failure rather than a repeat; the review-funded repair 2 dies at that diagnostic.
+    const testCmd = "vitest run";
+    const touch = (n: string) => `echo '// ${n}' >> tests/broken.test.ts && echo ${n} > marker.txt`;
     const { repo, fake, scriptPath } = setupRepo(
       [T("T1", { status: "human", humanGate: true, complexity: 8, acceptance: [{ oracle: "command", command: "true" }] })],
       {
         review: { approve: false, findings: [{ note: "`fixReview` in src/review.ts is incomplete", severity: "material" }] },
         consult: { action: "human", notes: "repair ladder exhausted" },
-        // v2.6.5 T6: a repair reviews first unless its task has a test red on record, so the opening
-        // attempt reds the test gate — every later repair is then battery-first, and the review-funded
-        // repair 2 dies at the test gate before reaching its review.
         tasks: { T1: [
-          { shell: `echo 'AssertionError: first defect' > broken.txt && echo one > marker.txt && ${COMMIT} one`, result: { ok: true, summary: "one" } },
-          { shell: `git rm -q broken.txt && echo two > marker.txt && ${COMMIT} two`, result: { ok: true, summary: "two" } },
-          { shell: `echo 'AssertionError: second defect' > broken.txt && echo three > marker.txt && ${COMMIT} three`, result: { ok: true, summary: "three" } },
-          { shell: `git rm -q broken.txt && echo four > marker.txt && ${COMMIT} four`, result: { ok: true, summary: "four" } },
-          { shell: `echo five > marker.txt && ${COMMIT} five`, result: { ok: true, summary: "five" } },
-          { shell: `echo six > marker.txt && ${COMMIT} six`, result: { ok: true, summary: "six" } },
+          { shell: `echo 'AssertionError: first defect' > broken.txt && ${touch("one")} && ${COMMIT} one`, result: { ok: true, summary: "one" } },
+          { shell: `git rm -q broken.txt && ${touch("two")} && ${COMMIT} two`, result: { ok: true, summary: "two" } },
+          { shell: `echo 'AssertionError: second defect' > broken.txt && ${touch("three")} && ${COMMIT} three`, result: { ok: true, summary: "three" } },
+          { shell: `git rm -q broken.txt && ${touch("four")} && ${COMMIT} four`, result: { ok: true, summary: "four" } },
+          { shell: `${touch("five")} && ${COMMIT} five`, result: { ok: true, summary: "five" } },
+          { shell: `${touch("six")} && ${COMMIT} six`, result: { ok: true, summary: "six" } },
         ] },
       },
       `gates: { test: ${JSON.stringify(testCmd)} }\n`,
     );
+    mkdirSync(join(repo, "tests"), { recursive: true });
+    writeFileSync(join(repo, "tests/broken.test.ts"), [
+      'import { existsSync, readFileSync } from "node:fs";',
+      'import { test } from "vitest";',
+      'test("defect", () => { if (existsSync("broken.txt")) throw new Error(readFileSync("broken.txt", "utf8")); });',
+    ].join("\n") + "\n");
+    writeFileSync(join(repo, ".gitignore"), "node_modules\n");
+    symlinkSync(join(import.meta.dirname, "../../../node_modules"), join(repo, "node_modules"), "dir");
+    execSync("git add -A && git commit --no-gpg-sign -qm suite", { cwd: repo });
     const journal = Journal.create(repo, runId);
     journal.append("run-start", undefined, {
       baseRef: await gitHead(repo), commands: { test: testCmd },
       graphDefinitionHash: graphDefinitionHash(loadGraph(repo)),
     });
+    journal.append("gate-result", "T1", { gate: "test", pass: false, details: "FAIL tests/broken.test.ts > defect", disposition: "behavioral",
+      commit: "a".repeat(40), failingFiles: ["tests/broken.test.ts"], selectionDecision: { scope: "full" } });
     journal.append("task-human", "T1", { kind: "human-gate", reason: "seed repair accounting" });
     writeFileSync(join(journal.dir, "baseline.json"), JSON.stringify({
-      commands: { test: { exitCode: 0, fingerprints: [] } },
+      commands: { test: { exitCode: 0, fingerprints: [],
+        fileDurations: [{ file: "tests/broken.test.ts", durationMs: 5_000 }, { file: "tests/heavy.test.ts", durationMs: 80_000 }] } },
     }));
     await approve([runId, "T1", "--review-rounds", "10", "--by", "test"], repo);
     await runDaemon(repo, { adapters: [fake, reviewOnlySeat(repo, scriptPath)], runId, resume: true });
@@ -2583,9 +2597,12 @@ describe("RT-2 red replay", () => {
         expect(cap).toBeGreaterThan(freshReds[1]!);
       }
       const commands = readFileSync(log, "utf8").trim().split("\n");
-      if (changed) expect(commands).toEqual(["build", "lint", "test", "build", "lint", "test"]);
+      // v2.6.7 T1 (closed order table): the acceptance oracle's decisive red ends each round before any
+      // test payload, so the trace holds the cheap commands only
+      if (changed) expect(commands).toEqual(["build", "lint", "build", "lint"]);
       else {
-        expect(commands.slice(0, 3)).toEqual(["build", "lint", "test"]);
+        expect(commands.slice(0, 2)).toEqual(["build", "lint"]);
+        expect(commands).not.toContain("test");
         // every build the log records belongs to a battery that executed; no replay ran a command
         expect(commands.filter((c) => c === "build")).toHaveLength(rows.filter((e) => e.data.gate === "build"
           && e.data.replayedFromAttempt === undefined && e.data.reused !== true).length);
@@ -2670,7 +2687,8 @@ describe("ES-2 daemon tier climb", () => {
     const made = setupRepo([T("T1", {
       files: ["src/a.ts"],
       ...(options.pin ? { routingHints: { pin: { via: "fake", model: "fake-1" } } } : {}),
-      acceptance: [{ oracle: "command", command: options.changing ? "cat src/a.ts; exit 1" : `echo 'expected true in ${options.unowned ? "elsewhere/b.ts" : "src/a.ts"}'; exit 1` }],
+      // v2.6.7 T1: semantics precede the test gate, so the infra fixture's oracle passes and its round reaches the infra test
+      acceptance: [{ oracle: "command", command: options.infra ? "true" : options.changing ? "cat src/a.ts; exit 1" : `echo 'expected true in ${options.unowned ? "elsewhere/b.ts" : "src/a.ts"}'; exit 1` }],
     })], {
       consult: { action: "human", notes: "exhausted" },
       tasks: { T1: Array.from({ length: 7 }, (_, i) => ({

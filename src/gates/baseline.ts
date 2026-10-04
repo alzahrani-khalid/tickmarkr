@@ -252,6 +252,9 @@ export interface BaselineCommand {
   /** VL-1: every per-file duration the runner named, so a later per-file hang budget (test-manifest.ts)
    * can be derived per file rather than from one slowest-file number; null when unavailable. */
   fileDurations?: BaselineFileDuration[] | null;
+  /** v2.6.7 close: set when fileTiming classified each duration's outcome (`failed` on a red file). A red capture
+   * without it (an older binary, a cached or hand-supplied baseline) never says which files were red. */
+  fileOutcomes?: true;
   /** The ceiling that measurement implies, persisted so every later battery uses the same number. */
   ceilingMs?: number;
   /**
@@ -273,6 +276,8 @@ export interface BaselineCommand {
 export interface BaselineFileDuration {
   file: string;
   durationMs: number;
+  /** The file was RED in this capture (× or ❯): its duration ended early and is no measure of its green runtime. */
+  failed?: true;
 }
 
 /**
@@ -523,17 +528,18 @@ const normalizeLine = (l: string) => l.replace(/\d+/g, "#").replace(/\s+/g, " ")
 // turbo-prefixed, but a test-name timing has no parenthesized file tally and therefore cannot enter
 // this measurement. These are observations of runner output, not a promise that every runner exposes
 // them — callers record null, never zero, when no line matches.
-const FILE_DURATION_RE = /^\s*(?:(?:[\w@./-]+:\s*)*)[✓✔×❯]\s+(?:\|[^|\r\n]+\|\s+)?(\S+)\s+\([^\r\n)]*\)\s+(\d+(?:\.\d+)?)\s*(ms|s|m)\b/;
+const FILE_DURATION_RE = /^\s*(?:(?:[\w@./-]+:\s*)*)([✓✔×❯])\s+(?:\|[^|\r\n]+\|\s+)?(\S+)\s+\([^\r\n)]*\)\s+(\d+(?:\.\d+)?)\s*(ms|s|m)\b/;
 
 const durationUnitMs = (unit: string): number => unit === "m" ? 60_000 : unit === "s" ? 1_000 : 1;
 
-function fileTiming(output: string, wallClockMs: number): Pick<BaselineCommand, "fileDurationSumMs" | "impliedParallelism" | "longestFile" | "fileDurations"> {
+function fileTiming(output: string, wallClockMs: number): Pick<BaselineCommand, "fileDurationSumMs" | "impliedParallelism" | "longestFile" | "fileDurations" | "fileOutcomes"> {
   const files: BaselineFileDuration[] = [];
   for (const line of output.split("\n")) {
     const match = FILE_DURATION_RE.exec(line.replace(ANSI_RE, ""));
     if (!match) continue;
-    const durationMs = Number(match[2]) * durationUnitMs(match[3]);
-    if (Number.isFinite(durationMs)) files.push({ file: match[1], durationMs });
+    const durationMs = Number(match[3]) * durationUnitMs(match[4]);
+    // vitest marks a red file ❯ (suiteFail) and a red test × (taskFail)
+    if (Number.isFinite(durationMs)) files.push({ file: match[2], durationMs, ...(match[1] === "×" || match[1] === "❯" ? { failed: true as const } : {}) });
   }
   if (!files.length) return { fileDurationSumMs: null, impliedParallelism: null, longestFile: null, fileDurations: null };
   const fileDurationSumMs = files.reduce((sum, entry) => sum + entry.durationMs, 0);
@@ -543,7 +549,17 @@ function fileTiming(output: string, wallClockMs: number): Pick<BaselineCommand, 
     impliedParallelism: wallClockMs > 0 ? fileDurationSumMs / wallClockMs : null,
     longestFile,
     fileDurations: files,
+    fileOutcomes: true,
   };
+}
+
+/** The per-file timings a consumer may read as green runtimes. A red capture that never classified its files
+ * (no fileOutcomes) marks every file failed, so each is budgeted and costed as untimed — never as the early-ending
+ * time of a run that may have been red for it. */
+export function classifiedFileDurations(entry: BaselineCommand | undefined): BaselineFileDuration[] | null | undefined {
+  const files = entry?.fileDurations;
+  if (!Array.isArray(files) || entry?.fileOutcomes || entry?.exitCode === 0) return files;
+  return files.map((f) => ({ ...f, failed: true as const }));
 }
 
 // A failing command whose output holds no shape any runner here names. The marker is content-free and

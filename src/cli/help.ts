@@ -152,17 +152,22 @@ export const COMMAND_HELP = {
     ],
   },
   beat: {
-    usage: "beat <orchestrator|orchestrator-context|overseer|overseer-context|watch> --seat <identity> [options]",
-    description: "Write one supervision beat using the recorded arm. Stood-down arms stay DISARMED until explicitly re-armed; stopped beats become STALE.",
+    usage: "beat <start|stop|status> <orchestrator|orchestrator-context|overseer|overseer-context|watch> --seat <identity> | beat <tier> --seat <identity> [options]",
+    description: "start launches one detached --loop beat per tier and exits 0 only after reading back that child's own advancing beat; stop retires only that recorded generation and reads back DISARMED; status is read-only and exits nonzero for STALE, MISMATCH or UNREADABLE. The legacy <tier> form writes one supervision beat using the recorded arm: stood-down arms stay DISARMED until explicitly re-armed; stopped beats become STALE.",
     options: {
-      "--seat <identity>": "Required: identify the supervising pane or agent.",
+      "--seat <identity>": "Required for start, stop and every write: identify the supervising pane or agent; optional for status.",
       "--new-arm": "Create a new durable arm, allowing beats to resume after stand-down; the hand-off step for a seat taking over a stood-down tier (combine with --arm-id and --pct on a context tier).",
-      "--loop": "Create a new durable arm and beat in this process every 10 seconds; exit within one interval after stand-down.",
+      "--loop": "Create a new durable arm and beat in this process every 10 seconds; exit nonzero with its reason within one interval after stand-down, supersession or a refused write.",
       "--arm-id <identity>": "Name a newly created arm; with --pct, identify the context observation arm. Never refuses a tick.",
       "--pct <0..100>": "Report current context consumption percentage.",
       "--threshold-pct <0..100>": "Set the context warning threshold (default 75).",
       "--stand-down": "Record an explicit handoff and stand down this tier. A later one-shot tick on the old arm exits non-zero; context observations still raise and discharge the clear duty.",
-    }, examples: ["beat overseer --seat supervisor", "beat overseer --seat supervisor --loop", "beat overseer --seat supervisor --stand-down", "beat overseer --seat supervisor --new-arm"],
+      "--status": "Legacy spelling of beat status <tier>: the same read-only result, writing nothing.",
+    }, examples: [
+      "beat start overseer --seat supervisor", "beat status overseer --seat supervisor", "beat stop overseer --seat supervisor",
+      "beat overseer --seat supervisor", "beat overseer --seat supervisor --loop", "beat overseer --seat supervisor --stand-down",
+      "beat overseer --seat supervisor --new-arm", "beat overseer --status",
+    ],
   },
   version: {
     usage: "version [--dist]", description: "Print the installed package version. Top-level aliases: --version and -v.",

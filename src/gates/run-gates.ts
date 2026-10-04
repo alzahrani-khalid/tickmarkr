@@ -8,7 +8,7 @@ import { type TickmarkrConfig, TIER_RANK } from "../config/config.js";
 import { getAdapter } from "../adapters/registry.js";
 import { type Effort, GATE_NAMES, type GateName, type Task } from "../graph/schema.js";
 import { acceptanceGate, type JudgedCriterion } from "./acceptance.js";
-import { type Baseline, type RetryOptions, type GateEvidenceOptions, compareToBaseline, effectiveCeilingMs, waitForCalmWindow, calmWindowReady } from "./baseline.js";
+import { type Baseline, type RetryOptions, type GateEvidenceOptions, classifiedFileDurations, compareToBaseline, effectiveCeilingMs, waitForCalmWindow, calmWindowReady } from "./baseline.js";
 import { evidenceGate } from "./evidence.js";
 import { captureLlmOutput, type GateVia } from "./llm.js";
 import type { Slot } from "../drivers/types.js";
@@ -21,7 +21,7 @@ import { RUNNER_INFRA_DIAGNOSTIC_RE, timeoutShaped } from "./timeout-shaped.js";
 import type { GateResult } from "./types.js";
 import { executionSignal } from "../run/execution-budget.js";
 import { failureDisposition, type VerificationRetryCause } from "../run/recovery.js";
-import { dependencyLinkRefusal, FORK_CAP_ENV, preserveWorktree, type PreserveProducer, producerFields, ROUTING_ENV_SEAMS, shGit, resolvedCapacity, SUITE_PARENT_ENV, verificationProtocol } from "../run/git.js";
+import { dependencyLinkRefusal, FORK_CAP_ENV, preserveWorktree, type PreserveProducer, producerFields, readCapacity, ROUTING_ENV_SEAMS, shGit, resolvedCapacity, sameCapacity, SUITE_PARENT_ENV, verificationProtocol } from "../run/git.js";
 import { type StructuredFinding, type JudgeInvocationEvidence, withJudgeInvocationEvidence } from "../run/journal.js";
 import {
   computeVerificationIdentity,
@@ -257,6 +257,9 @@ const TEST_FILE_RE = /(?:^|\/)[^/]*\.(?:test|spec)\.[cm]?[jt]sx?$/;
 // relative specifiers only — `from "./x.js"`, `import("./x.js")`, `require("./x.js")`
 const IMPORT_RE = /(?:\bfrom\s*|\bimport\s*\(\s*|\brequire\s*\(\s*)["'](\.[^"']*)["']/g;
 const SELECTION_FILE_CAP = 3000;
+// v2.6.7 T1: the paths the import scan can analyze — the cap bounds THESE, never every tracked path, so
+// planning files, fixtures and docs cannot push an attributable source/test change over it.
+const ANALYZABLE_RE = /\.[cm]?[jt]sx?$/;
 
 /**
  * T4: the tests covering this round's diff, or undefined when the diff cannot be attributed with
@@ -270,26 +273,32 @@ const SELECTION_FILE_CAP = 3000;
  * full suite on the same commit, so a miss costs one round and can never merge. Teach it a resolver
  * (tsconfig paths, package exports) if selection ever misses often enough to be worth a round.
  */
-async function coveringTests(worktree: string, baseRef: string): Promise<string[] | undefined> {
-  const diff = await shGit(`git diff --name-status ${shq(baseRef)} HEAD`, worktree);
-  if (diff.code !== 0) return undefined;
+async function coveringTests(worktree: string, baseRef: string): Promise<{ files?: string[]; reason?: string }> {
+  const unsupported = { reason: "unsupported-attribution" };
+  // -z: NUL-delimited and never C-quoted, so a non-ASCII path keeps its real extension (v2.6.7 T1 review)
+  const diff = await shGit(`git diff -z --name-status ${shq(baseRef)} HEAD`, worktree);
+  if (diff.code !== 0) return unsupported;
   const changed: string[] = [];
-  for (const line of diff.stdout.split("\n")) {
-    if (!line.trim()) continue;
-    const parts = line.split("\t");
-    const status = parts[0] ?? "";
+  const fields = diff.stdout.split("\0");
+  for (let i = 0; i < fields.length; i++) {
+    const status = fields[i]!;
+    if (!status) continue;
     // R (rename) and D (delete): whatever used to cover the old path is unattributable now — full suite.
-    if (!status || status[0] === "R" || status[0] === "D" || parts.length < 2) return undefined;
-    changed.push(parts[parts.length - 1]!);
+    if (status[0] === "R" || status[0] === "D") return unsupported;
+    if (status[0] === "C") i++; // a copy carries its source path first; attribute the destination
+    const path = fields[++i];
+    if (!path) return unsupported;
+    changed.push(path);
   }
-  if (!changed.length) return undefined;
-  const listed = await shGit("git ls-files", worktree);
-  if (listed.code !== 0) return undefined;
-  const tracked = listed.stdout.split("\n").filter(Boolean);
-  if (tracked.length > SELECTION_FILE_CAP) return undefined; // ponytail: a huge repo pays the full suite rather than a long scan
+  if (!changed.length) return unsupported;
+  const listed = await shGit("git ls-files -z", worktree);
+  if (listed.code !== 0) return unsupported;
+  const tracked = listed.stdout.split("\0").filter(Boolean);
+  // ponytail: a huge repo pays the full suite rather than a long scan — counted over analyzable paths only
+  if (tracked.filter((p) => ANALYZABLE_RE.test(p)).length > SELECTION_FILE_CAP) return { reason: "analyzable-path-cap" };
   const trackedSet = new Set(tracked);
   const tests = tracked.filter((p) => TEST_FILE_RE.test(p));
-  if (!tests.length) return undefined;
+  if (!tests.length) return { reason: "no-covering-tests" };
 
   const resolveSpec = (from: string, spec: string): string | undefined => {
     const base = posix.join(posix.dirname(from), spec);
@@ -326,10 +335,12 @@ async function coveringTests(worktree: string, baseRef: string): Promise<string[
       continue;
     }
     const covering = tests.filter((t) => reachOf(t).has(file));
-    if (!covering.length) continue; // nothing covers this file — keep every attributable selection already accumulated
+    // A changed source no test reaches is unattributable: a diagnostic over the rest would screen around
+    // it, so the whole selection is unsupported. A non-source path (docs, planning) carries no imports.
+    if (!covering.length && ANALYZABLE_RE.test(file)) return unsupported;
     for (const t of covering) selected.add(t);
   }
-  return selected.size ? [...selected].sort() : undefined;
+  return selected.size ? { files: [...selected].sort() } : { reason: "no-covering-tests" };
 }
 
 /**
@@ -343,22 +354,58 @@ export function testCommandForFiles(testCmd: string, files: string[]): string {
   return `${testCmd}${fwd} ${files.map(shq).join(" ")}`;
 }
 
-/** OBS-635: a screen costing at least this share of the full suite runs the full suite instead. */
-export const SCREEN_PROMOTION_RATIO = 0.75;
+/** v2.6.7 T1 (closed order table): an attributed test-red diagnostic is admitted only when BOTH hold. */
+export const DIAGNOSTIC_MAX_RATIO = 0.15;
+export const DIAGNOSTIC_MAX_ESTIMATE_MS = 60_000;
+
+export interface DiagnosticAdmission {
+  admitted: boolean;
+  reason: "diagnostic-admitted" | "diagnostic-unknown-cost" | "diagnostic-capacity-mismatch" | "diagnostic-cost-ratio" | "diagnostic-cost-estimate";
+  costRatio?: number;
+  estimatedMs?: number;
+}
 
 /**
- * The screen's share of the full suite's cost, from the per-file durations the harness measured at
- * baseline capture — never a worker's timing. Undefined (unknown) unless every selected file has a
- * measured duration and the measured total is positive; unknown keeps the conservative screen path.
+ * The diagnostic's admission evidence, from the per-file durations the harness measured at baseline
+ * capture — never a worker's timing. Unknown (any selected file unmeasured, any measurement that is not a
+ * finite number > 0 ms, an infra baseline, or no positive total) skips: an expensive or unknown screen must
+ * never become a full suite before semantics.
+ * So does timing recorded under a malformed or different capacity (git.ts sameCapacity): it divided the
+ * machine by another number, so it is not comparable evidence about this one.
+ * `estimatedMs` is the serial sum of those files: admission evidence, not a kill ceiling and not a
+ * claim about the parallel-plus-serial wall time the runner will actually take.
  */
-export function screenCostRatio(baseline: Baseline, selected: readonly string[]): number | undefined {
+export function diagnosticAdmission(baseline: Baseline, selected: readonly string[]): DiagnosticAdmission {
   const entry = baseline.commands.test;
-  const files = entry?.infra ? undefined : entry?.fileDurations;
-  if (!files?.length) return undefined;
-  const cost = new Map(files.map((f) => [f.file, f.durationMs]));
+  // The CURRENT capacity is validated on its own first: an unstamped (absent) baseline capacity is comparable
+  // to anything, so it must never wave through a zero, negative, NaN, infinite or fractional current one.
+  const current = resolvedCapacity();
+  if (readCapacity(current).state !== "present" || !sameCapacity(entry?.capacity, current)) return { admitted: false, reason: "diagnostic-capacity-mismatch" };
+  const raw: unknown = entry?.infra ? [] : classifiedFileDurations(entry) ?? [];
+  const unknown = { admitted: false, reason: "diagnostic-unknown-cost" } as const;
+  // Every input is checked BEFORE any arithmetic touches it: an entry that is not an object whose duration
+  // is a finite number > 0 (0 ms, negative, NaN, non-numeric, an object with no primitive value), selected
+  // or not, is unknown cost — never a free screen and never a throw.
+  const measured = (f: unknown): f is { file: string; durationMs: number } => {
+    const d = typeof f === "object" && f !== null ? (f as { durationMs?: unknown }).durationMs : undefined;
+    return typeof d === "number" && Number.isFinite(d) && d > 0;
+  };
+  if (!Array.isArray(raw) || !raw.every(measured) || !selected.length) return unknown;
+  const files = raw as { file: string; durationMs: number }[];
+  // Baseline capture keeps one entry per (project, file): a file's cost is the sum of its measurements.
+  const cost = new Map<string, number>();
+  for (const f of files) cost.set(f.file, (cost.get(f.file) ?? 0) + f.durationMs);
   const total = files.reduce((sum, f) => sum + f.durationMs, 0);
-  if (!(total > 0) || selected.some((file) => !cost.has(file))) return undefined;
-  return selected.reduce((sum, file) => sum + cost.get(file)!, 0) / total;
+  // Finite inputs can still overflow: a non-finite total or estimate is no comparable evidence either.
+  if (!(total > 0) || !Number.isFinite(total) || selected.some((file) => !((cost.get(file) ?? 0) > 0))) return unknown;
+  // A selected file that was RED in the baseline ended early there: its cost is unknown, never cheap.
+  if (files.some((f) => (f as { failed?: unknown }).failed === true && selected.includes(f.file))) return unknown;
+  const estimatedMs = selected.reduce((sum, file) => sum + cost.get(file)!, 0);
+  if (!Number.isFinite(estimatedMs)) return unknown;
+  const costRatio = estimatedMs / total;
+  const reason = costRatio > DIAGNOSTIC_MAX_RATIO ? "diagnostic-cost-ratio"
+    : estimatedMs > DIAGNOSTIC_MAX_ESTIMATE_MS ? "diagnostic-cost-estimate" : "diagnostic-admitted";
+  return { admitted: reason === "diagnostic-admitted", reason, costRatio, estimatedMs };
 }
 
 /** OBS-635: the full manifest the runner lists NOW, under the environment evaluateManifestedTest's own
@@ -393,7 +440,7 @@ async function runVitestManifestGate(
 ): Promise<GateResult> {
   const entry = baseline.commands.test;
   const outcome = await evaluateManifestedTest(cmd, worktree, {
-    baselineDurations: entry?.fileDurations,
+    baselineDurations: classifiedFileDurations(entry),
     longestFile: entry?.longestFile,
     overallCeilingMs: effectiveCeilingMs(entry),
     artifactDir,
@@ -457,12 +504,24 @@ const FAILURE_IDENTITY_RE = /\b(?:AssertionError|FAIL\s+\S|Tests?\s+\d+\s+failed
 
 /** D1: apply the daemon's signal-only rider before either battery cache read or write. Its onGate
  * classification happens after persistence, too late to keep a scripted runner's non-verdict out.
- * Keep named failures as work verdicts and preserve details for failure-policy fingerprinting. */
-function classifySignalOnlyTest(g: GateResult): void {
-  if (g.gate !== "test" || g.pass || g.meta?.infra === true || !SIGNAL_EXIT_RE.test(g.details)) return;
+ * Keep named failures as work verdicts and preserve details for failure-policy fingerprinting.
+ * A baseline-forgiven "green" whose runner was signal-killed is the same non-verdict: a killed job
+ * completed no suite, so forgiveness never publishes or caches it green. The authoritative termination
+ * receipt decides, never the verdict text: a signal-terminated job is killed whatever its details say, and
+ * a green stands only on a receipt showing a normal exit — a receiptless CACHED one (an older or planted
+ * entry) is unavailable proof, so a fresh job measures instead. A fresh row is this invocation's own: every
+ * production runner attaches its receipt, and the manifest path's verdict already requires a clean exit
+ * (test-manifest.ts verifyManifestReport). A no-command skip ran nothing and claims none. */
+function classifySignalOnlyTest(g: GateResult, cached = false): void {
+  const termination = g.evidenceReceipt?.termination.kind;
+  const exitCode = g.evidenceReceipt?.termination.exitCode;
+  const killed = termination === "signal" || exitCode === 137 || exitCode === 143 || (!g.pass && SIGNAL_EXIT_RE.test(g.details));
+  const unproven = g.pass && g.meta?.skipped !== true && termination !== "exit" && (cached || termination !== undefined);
+  if (g.gate !== "test" || g.meta?.infra === true || !(killed || unproven)) return;
   const named = Array.isArray(g.meta?.failingTests) && g.meta.failingTests.length > 0;
-  if (named || FAILURE_IDENTITY_RE.test(g.details)) return;
-  g.meta = { ...g.meta, classification: "infra", infra: true, retryable: false, kind: "signal-exit" };
+  if (!g.pass && (named || FAILURE_IDENTITY_RE.test(g.details))) return;
+  g.pass = false;
+  g.meta = { ...g.meta, classification: "infra", infra: true, retryable: false, kind: killed || termination ? "signal-exit" : "no-exit-receipt" };
 }
 
 /** OBS-1151: one parsed judgment as the journal keeps it — the judged commit, the seat, and per criterion
@@ -563,9 +622,8 @@ export async function runGates(
     await receiptNotes;
   };
   let selectionDecision: Record<string, unknown> | undefined;
-  // OBS-635: the identity a full suite measured inside the battery, revalidated after semantics.
-  let fullInBattery = false;
-  let batteryFullIdentity: VerificationIdentity | undefined;
+  // OBS-635: a stale in-battery full green buys one fresh merge-candidate job (see answersNow).
+  let rerunFull = false;
   let commits: string[] = [];
   // Check before cache identity, npm policy probes, or any gate command.
   const dependencyRefusal = dependencyLinkRefusal(ctx.worktree);
@@ -622,28 +680,20 @@ export async function runGates(
   const shapeGates = ctx.cfg.gates.byShape?.[task.shape];
   const enabled = (g: GateName) =>
     task.gates.includes(g) && (g !== "acceptance" && g !== "review" || shapeGates?.[g] !== false);
-  // T4 (OBS-265): a GREEN selected-test run is a screen, not the round's verdict — the merge-candidate
-  // round re-runs the full suite on the same commit and THAT is what the round reports. With no
-  // semantic gate to act on it, the screen is held so its full suite speaks for it in one row.
-  // (A RED screen IS the verdict: the round ends there, so it is recorded immediately.)
-  let heldTest: GateResult | undefined;
   const semantic = enabled("acceptance") || enabled("review");
-  // v2.6.5 T6 (D): the closed repair-mode table. A repair the REVIEW sent back (carried review:material)
-  // whose test history is clean — selection allowed, no required repair test — asks the question it
-  // was sent back for first: cheap gates → acceptance ‖ review → screen → merge-candidate full suite,
-  // so a semantic red costs zero test starts. selectTests false or a nonempty requiredRepairTests is a
-  // test-red repair and keeps battery-first order; so does every first attempt (nothing carried).
-  const semanticFirst = semantic && ctx.selectTests === true && !ctx.requiredRepairTests?.length
-    && (ctx.carriedFindings ?? []).some((f) => f.class === "review:material");
-  // Semantic-first, a review that returned NO verdict is not a red that ends the round before its
-  // test proof: the daemon re-asks only the review (runReviewRecovery) and merges on the rows beside
-  // it, so the round still buys its screen and full suite. The row stays red; the round is unsatisfied.
-  const failed = () => results.some((r) => !r.pass && !(semanticFirst && r.gate === "review" && r.meta?.noVerdict === true));
-  // OBS-1176: when acceptance/review WILL act on a green screen, the screen is published before they
-  // start, as its own selected row. The full suite afterwards is a second invocation on its own row —
-  // it carries only its own receipts and interval, so it neither erases nor re-counts the screen.
-  // Semantic-first, nothing acts on the screen but its full suite: it is held like a gate-less round's.
-  const publishScreen = semantic && !semanticFirst;
+  // v2.6.7 T1 (closed order table): after the cheap build/lint/evidence/scope checks, acceptance and
+  // review run BEFORE any test-gate payload for every candidate — fresh, semantic repair, or a test-red
+  // repair without an admitted diagnostic — so a decisive semantic red costs zero test starts. Only a
+  // concrete attributed behavioral test-red repair may buy one cheap diagnostic first (see below).
+  // A review that returned NO verdict is not a red that ends the round before its test proof: the
+  // daemon re-asks only the review (runReviewRecovery) and merges on the rows beside it, so the round
+  // still buys its full job. The row stays red; the round is unsatisfied until that recovery answers.
+  // A gate that DECLINED (meta.skipped, R3) is no red either: a declined review no longer ends the round
+  // just because it now precedes the test gate.
+  const failed = () => results.some((r) => !r.pass && r.meta?.skipped !== true && !(r.gate === "review" && r.meta?.noVerdict === true));
+  // D-974: set once the cheap checks pass. From then on an enabled gate the round leaves unrun is owed
+  // proof (done()) unless a decisive red already decided the round.
+  let proofOwed = false;
   // v2.0 T2 (OBS-554): this round's per-gate measurement. Every interval a gate actually spends
   // executing is added HERE, at the call site that runs it, so a gate that runs twice (the test
   // gate's screen and its full suite) sums to its own cost and never to the span between them.
@@ -723,14 +773,7 @@ export async function runGates(
   };
 
   // The returned array stays in GATE_NAMES order however few gates a short-circuiting round reached.
-  // A round that ends before its merge-candidate stage flushes the held screen on the way out, so a
-  // green subset run is still journaled exactly once — as a selected run, which is what it was.
   const done = async () => {
-    if (heldTest) {
-      const held = heldTest;
-      heldTest = undefined;
-      await ctx.onGate?.({ phase: "end", gate: "test", result: held }); // stamped when it was held
-    }
     const sorted = [...results].sort((a, b) => GATE_NAMES.indexOf(a.gate as GateName) - GATE_NAMES.indexOf(b.gate as GateName));
     // v1.87 T5: no round returns a MERGEABLE GREEN on a dirty tree. The battery is not the only gate
     // that executes shell in this worktree — the acceptance gate runs command and named-test oracles
@@ -748,6 +791,26 @@ export async function runGates(
         sorted[sorted.length - 1] = refusal;
         await ctx.onGate?.({ phase: "end", gate: refusal.gate as GateName, result: refusal });
       }
+    }
+    // D-974 (closed missing-proof table): owed rows land ONLY when the round holds no decisive red —
+    // every unsatisfied row is infra or no-verdict and could be recovered — so a review-only recovery
+    // can never merge over a gate the round never ran. After a decisive rejection the gates it left
+    // unrun owe nothing. A selected diagnostic green is not full proof, so it is owed too. Gates the
+    // task omits or its shape disables are outside `sequence` and create no debt.
+    const unsatisfied = results.filter((r) => !(r.pass || r.meta?.skipped === true) || r.meta?.infra === true);
+    if (proofOwed && unsatisfied.length && unsatisfied.every((r) => r.meta?.infra === true || r.meta?.noVerdict === true)) {
+      for (const gate of sequence) {
+        if (gate === "test" && ctx.commands.test === undefined) continue;
+        const at = results.findIndex((r) => r.gate === gate);
+        const diagnosticOnly = gate === "test" && at >= 0 && results[at]!.pass
+          && Array.isArray(results[at]!.meta?.selectedTests) && results[at]!.meta?.fullSuite !== true;
+        if (at >= 0 && !diagnosticOnly) continue;
+        if (at >= 0) results.splice(at, 1);
+        await record({ gate, pass: false, details: `${gate} not run — the round ended on a recoverable non-verdict before `
+          + `${gate === "test" ? "its full verification job" : "this gate published a verdict"}; that proof is still owed on this subject`,
+        meta: { skipped: true, infra: true, classification: "infra", retryable: false, gateOwed: gate, ...(gate === "test" ? { testOwed: true } : {}) } });
+      }
+      return { results: [...results].sort((a, b) => GATE_NAMES.indexOf(a.gate as GateName) - GATE_NAMES.indexOf(b.gate as GateName)), commits };
     }
     return { results: sorted, commits };
   };
@@ -954,17 +1017,44 @@ export async function runGates(
     capacity: resolvedCapacity(),
   });
   // OBS-635: a full green answers only for the manifest it certified. The tree identity cannot see an
-  // ignored generated test the runner would collect, so every full-green reuse rediscovers the
-  // runner's listing and requires the verdict's to equal it; a runner without a listing is bound by
-  // its identity alone. Reads before the semantic gates share one listing; `listing` resets after them.
-  let listing: Promise<string[] | undefined> | undefined;
-  const certifiesFullManifest = async (verdict: { pass: boolean; meta?: Record<string, unknown> }): Promise<boolean> => {
+  // ignored generated test the runner would collect, so every full-green check rediscovers the
+  // runner's listing NOW and requires the verdict's to equal it; a runner without a listing is bound by
+  // its identity alone. So is a FRESH green that certified no manifest beside a runner that lists none
+  // now: neither side holds a manifest that could have moved. A cached one certifies nothing (no reuse).
+  // OOB M1: the listing is itself a command — one that creates an ignored collectable test AFTER taking
+  // its own snapshot returns the manifest it just made stale, and neither cleanliness nor the identity
+  // sees an ignored file. So an agreeing listing certifies only when STABLE: one more listing, taken
+  // after the first one's side effects, must return the same set (one extra listing per proof, and only
+  // on the agreeing path). An unstable listing is stale proof like any other moved manifest.
+  const certifiesFullManifest = async (verdict: { pass: boolean; meta?: Record<string, unknown> }, fresh = false): Promise<boolean> => {
     if (!verdict.pass || !isVitestTestCommand(ctx.commands.test!, ctx.worktree)) return true;
     const certified = verdict.meta?.manifest;
-    const current = await (listing ??= listFullManifest(ctx.commands.test!, ctx.worktree));
-    return Array.isArray(certified) && current !== undefined
-      && certified.length === current.length && [...certified].sort().every((file, i) => file === current[i]);
+    const current = await listFullManifest(ctx.commands.test!, ctx.worktree);
+    if (fresh && certified === undefined && current === undefined) return true;
+    if (!Array.isArray(certified) || current === undefined
+      || certified.length !== current.length || ![...certified].sort().every((file, i) => file === current[i])) return false;
+    const settled = await listFullManifest(ctx.commands.test!, ctx.worktree);
+    return settled !== undefined && settled.length === current.length && settled.every((file, i) => file === current[i]);
   };
+  // OBS-635: a full green — fresh or cached — answers only while the identity it measured and the complete
+  // manifest the runner lists NOW still hold — the job's own command may have written an ignored lockfile or
+  // a test the runner now collects. Checked before that green is cached, reused or published. `strict` (the in-battery job,
+  // which may still buy a fresh one) adds D-598: an unmeasurable lifecycle on either side is not comparable
+  // to anything (VerdictStore R41 refuses it), so two `unknown`s hashing equal is no unchanged identity.
+  const answersNow = async (before: VerificationIdentity | undefined, verdict: GateResult, strict: boolean, fresh = strict): Promise<boolean> => {
+    // The listing is a command too (it may write an ignored lockfile or a tracked byte), so it runs FIRST
+    // and cleanliness and identity are sampled after it — never before.
+    if (!(await certifiesFullManifest(verdict, fresh)) || await dirtyWorktree()) return false;
+    const now = await fullTestIdentity();
+    const measurable = (id: VerificationIdentity) => !strict || id.envParts?.verification?.lifecycle !== "unknown";
+    return !!now && !!before && measurable(now) && measurable(before)
+      && verificationIdentityKey(now) === verificationIdentityKey(before);
+  };
+  // A stale green is never green: an infra row naming why, unverdicted (skipped) while a fresh job supersedes it.
+  const staleProof = (r: GateResult, superseded: boolean): GateResult => ({ ...r, pass: false,
+    details: `stale full proof: this job's own command moved the verification identity or the complete manifest the runner `
+      + `lists now, so its green answers an earlier subject — ${superseded ? "one fresh full job measures this one" : "failing closed"}\n${r.details}`,
+    meta: { ...r.meta, infra: true, classification: "infra", retryable: false, staleProof: true, ...(superseded ? { skipped: true } : {}) } });
 
   // shell tools vs the shared baseline
   const retryOptions = (identity: VerificationIdentity | undefined): RetryOptions => ctx.authorizeInfraRetry
@@ -993,13 +1083,18 @@ export async function runGates(
           capacity: resolvedCapacity(),
         });
         const hit = verdictStore.get(identity);
-        if (hit) classifySignalOnlyTest(hit); // Older entries predate classification at the write seam.
+        if (hit) classifySignalOnlyTest(hit, true); // Older entries predate classification at the write seam.
         if (hit && identity && !isInfraResult(hit) && (hit.pass || (ctx.verificationScope ?? "battery") === "battery")
-            && !(await discardCachedRed(g, hit)) && (g !== "test" || selected !== undefined || await certifiesFullManifest(hit))) {
-          r = formatReusedRow(hit, identity);
-          cached = true;
-          if (g === "build") await noBuild("reused-result", "verdict reused; no fresh build ran in this invocation");
-          await noteReuse(g, r, identity);
+            && !(await discardCachedRed(g, hit))) {
+          // RE-PROOF: a cached FULL green is reused only after the current manifest listing, then cleanliness
+          // and the identity sampled after it, agree with it. Stale, it is never relabelled: the fresh job
+          // measures under the identity sampled now.
+          if (g !== "test" || selected !== undefined || !hit.pass || await answersNow(identity, hit, false)) {
+            r = formatReusedRow(hit, identity);
+            cached = true;
+            if (g === "build") await noBuild("reused-result", "verdict reused; no fresh build ran in this invocation");
+            await noteReuse(g, r, identity);
+          } else identity = await fullTestIdentity();
         }
       }
       if (!r) {
@@ -1016,10 +1111,6 @@ export async function runGates(
       }
       // the screen's interval IS the test gate's first interval, so the split needs no second clock
       if (g === "test" && selected) selectedDurationMs = spans.get("test")?.durationMs ?? 0;
-      if (g === "test" && !selected) {
-        fullInBattery = true;
-        batteryFullIdentity = identity;
-      }
       // The pre-battery check proves the tree clean ONCE; a command that exits 0 having rewritten a
       // tracked file makes it dirty again, and every gate after it — including the next shell gate,
       // which would then run against bytes HEAD does not hold — inherits that. So re-check after each
@@ -1033,22 +1124,30 @@ export async function runGates(
         }
       }
       if (r) classifySignalOnlyTest(r);
+      // Every round's in-battery full job is its first — test-only verification included: stale, it is
+      // published unverdicted and buys one fresh merge-candidate job below, whose own stale green fails closed.
+      if (g === "test" && !selected && cmd !== undefined && !cached && r!.pass && !(await answersNow(identity, r!, true))) {
+        r = staleProof(r!, true);
+        rerunFull = true;
+      }
       if (!cached && identity && r && !isInfraResult(r)) {
         verdictStore.set(identity, { ...r, meta: { ...r.meta, source: "gate", runDir: ctx.artifactDir } });
       }
       if (g === "test" && selected) {
-        const screened = { ...r!, meta: { ...r!.meta, selectedTests: selected } };
-        if (!screened.pass) await record(screened);
-        else if (publishScreen) {
-          await record(screened);
-          // The screen's interval now lives on its own row; the full suite measures from zero.
-          spans.delete("test");
-          loadSamples.delete("test");
-          selectedDurationMs = undefined;
-        } else {
-          heldTest = withTelemetry(screened);
-          results.push(heldTest);
-        }
+        // v2.6.7 T1: the attributed diagnostic. A behavioral red IS the round's verdict and ends it
+        // before semantics. An infrastructure red is no verdict either way: it is published UNVERDICTED
+        // (skipped — the journal row keeps its infra evidence and receipts but no `pass`, so the review
+        // round counter never reads it as a decisive test red) and never enters the round's results, so
+        // it can neither end the round nor become green — semantics and the full job decide. A green is
+        // published as its own selected row; the full job afterwards replaces it in the results.
+        const inconclusive = !r!.pass && isInfraResult(r!);
+        const screened = withTelemetry({ ...r!, meta: { ...r!.meta, selectedTests: selected, ...(inconclusive ? { skipped: true } : {}) } });
+        if (!inconclusive) results.push(screened);
+        await ctx.onGate?.({ phase: "end", gate: "test", result: screened });
+        // The diagnostic's interval now lives on its own row; the full job measures from zero.
+        spans.delete("test");
+        loadSamples.delete("test");
+        selectedDurationMs = undefined;
       } else {
         await record(r!);
       }
@@ -1477,9 +1576,11 @@ export async function runGates(
     // enough: an acceptance-first await withholds a completed review behind a slow/hung judge and a
     // process death can lose that already-earned verdict. The returned result is still sorted into
     // GATE_NAMES order by done(); the event stream truthfully records each independent completion.
-    // OBS-1168(c): a sibling that throws, or that ends seatless (no seat could launch, so the round can
+    // OBS-1168(c): a sibling that throws, or a seatless JUDGE (no seat could launch, so the round can
     // only park infra), cancels the other — its seats are closed — and the round still AWAITS it, with
     // or without an execution policy, so no verdict of a settled round publishes after its engagement.
+    // v2.6.7 T1: a seatless REVIEW is recoverable (runReviewRecovery re-asks it alone), so it cancels
+    // nothing — acceptance finishes independently and publishes its own result.
     const seatless = (r: GateResult) => r.meta?.cause === "seat-launch-failed" && r.meta?.infra === true;
     let failure: { reason: unknown } | undefined;
     const fail = (reason: unknown) => {
@@ -1488,13 +1589,16 @@ export async function runGates(
     };
     const judged = judging?.then(async (outcome) => {
       if (cancelled) return;
-      await withJudgeInvocationEvidence(outcome.invocations, () => record(outcome.result));
-      if (seatless(outcome.result)) cancelSemantic();
+      // D-974: a seatless judge beside an already-settled no-verdict review has no sibling to cancel —
+      // acceptance is MISSING proof: its row is owed and the round still buys its full job.
+      const missing = seatless(outcome.result) && results.some((r) => r.gate === "review" && r.meta?.noVerdict === true);
+      await withJudgeInvocationEvidence(outcome.invocations, () => record(missing
+        ? { ...outcome.result, meta: { ...outcome.result.meta, skipped: true, gateOwed: "acceptance" } } : outcome.result));
+      if (seatless(outcome.result) && !missing) cancelSemantic();
     }).catch(fail);
     const reviewed = reviewing?.then(async (outcome) => {
       if (cancelled) return;
       await record(outcome);
-      if (seatless(outcome)) cancelSemantic();
     }).catch(fail);
     // ponytail: a headless seat has no slot to close; it is awaited to its own timeout, never abandoned.
     await Promise.all([judged, reviewed]);
@@ -1504,105 +1608,96 @@ export async function runGates(
     return cancelled || failed();
   };
 
-  if (semanticFirst) {
-    if (await runSemantics()) {
-      // A cancelled round starts no test, yet its no-verdict review can still be re-asked alone. Its test
-      // proof is recorded OWED — unsatisfied, never a verdict — so that re-ask cannot merge an unrun subject.
-      if (!failed() && enabled("test") && ctx.commands.test !== undefined) {
-        await record({ gate: "test", pass: false, details: "test not run — the semantic round was cancelled before its "
-          + "test screen; the merge-candidate full suite is still owed on this subject",
-        meta: { skipped: true, infra: true, classification: "infra", retryable: false, testOwed: true } });
+  proofOwed = true;
+  const testRuns = enabled("test") && ctx.commands.test !== undefined;
+  // v2.6.7 T1 (closed order table): the ONE diagnostic a round may buy before semantics — a concrete
+  // attributed behavioral test-red repair (the caller's known failing files) whose diagnostic covers
+  // every required failing file plus the conservatively selected tests reaching its diff, admitted only
+  // on comparable harness timing with ratio <= 0.15 AND estimate <= 60000 ms. Selection disabled,
+  // unsupported attribution, the analyzable-path cap or unknown/over-bound timing skip it: semantics
+  // then precede the one full job, never an expensive screen standing in front of them. Test-only
+  // verification (no semantic gate) or an explicit full recheck (no selection) keeps its full scope.
+  let diagnostic: string[] | undefined;
+  let decision: { reason: string; costRatio?: number; estimatedMs?: number } | undefined;
+  const required = ctx.requiredRepairTests ?? [];
+  if (testRuns && ctx.selectTests === true && required.length && !semantic) decision = { reason: "test-only-verification" };
+  else if (testRuns && ctx.selectTests === true && required.length) {
+    const safe = required.every((path) => posix.normalize(path) === path && !path.startsWith("../")
+      && !path.startsWith("/") && TEST_FILE_RE.test(path) && existsSync(join(ctx.worktree, path)));
+    const listed = safe ? await shGit(`git ls-files -z -- ${required.map(shq).join(" ")}`, ctx.worktree) : undefined;
+    const tracked = new Set(listed?.stdout.split("\0").filter(Boolean));
+    const covering = await coveringTests(ctx.worktree, ctx.baseRef);
+    if (!listed || listed.code !== 0 || required.some((path) => !tracked.has(path))) decision = { reason: "required-repair-test-unavailable" };
+    else if (!covering.files) decision = { reason: covering.reason! };
+    else {
+      const files = [...new Set([...covering.files, ...required])].sort();
+      // An exact full green already answers the full job; reusing it is the full job, not a screen.
+      const id = await fullTestIdentity();
+      const hit = verdictStore.get(id);
+      if (hit) classifySignalOnlyTest(hit, true);
+      if (hit?.pass === true && !isInfraResult(hit) && await answersNow(id, hit, false)) decision = { reason: "full-green-cache" };
+      else {
+        decision = diagnosticAdmission(ctx.baseline, files);
+        if ((decision as DiagnosticAdmission).admitted) diagnostic = files;
       }
-      return done();
     }
+  }
+  // The recorded reason is the one that actually decided scope: with no decision above, it is the
+  // eligibility check that failed. Selection off: the caller's reason is what turned it off (an explicit
+  // full recheck, a distrusted history) — unless it names selection itself, which cannot have disabled it.
+  if (ctx.selectionReason) selectionDecision = {
+    scope: diagnostic ? "selected" : "full",
+    reason: decision?.reason ?? (ctx.selectTests !== true
+      ? (ctx.selectionReason === "known-failing-files" ? "selection-disabled" : ctx.selectionReason)
+      : !required.length ? "no-required-repair-tests" : "test-gate-disabled"),
+    requiredFiles: [...required],
+    ...(decision?.costRatio !== undefined ? { costRatio: decision.costRatio } : {}),
+    ...(decision?.estimatedMs !== undefined ? { estimatedMs: decision.estimatedMs } : {}),
+  };
+  let diagnosed = false;
+  if (diagnostic) {
+    await runBattery({ ...ctx.commands, test: testCommandForFiles(ctx.commands.test!, diagnostic) }, diagnostic, ["test"]);
+    if (failed()) return done();
+    diagnosed = results.some((r) => r.gate === "test");
+    // An inconclusive (infrastructure) diagnostic answered nothing: the full job's row says so.
+    if (!diagnosed && selectionDecision) selectionDecision = { ...selectionDecision, scope: "full", reason: "diagnostic-inconclusive" };
+  }
+
+  if (semantic) {
+    // A cancelled round starts no test; done() records its proof OWED (D-974), never a verdict.
+    if (await runSemantics()) return done();
     // Subject freshness: the semantic gates ran oracles and vendor CLIs in this worktree. Their dirt is
-    // not the committed subject, so no screen measures it and no cached green row answers for it.
-    const dirt = enabled("test") && ctx.commands.test !== undefined ? await dirtyWorktree() : undefined;
+    // not the committed subject, so no full job measures it and no cached green row answers for it.
+    const dirt = testRuns ? await dirtyWorktree() : undefined;
     if (dirt) {
+      const at = results.findIndex((r) => r.gate === "test");
+      if (at >= 0) results.splice(at, 1);
       await emitStart("test");
       await record(await dirtyRefusal("test", dirt));
       return done();
     }
   }
-
-  // A non-final round may run only the tests covering its own diff; the merge-candidate round below
-  // pays the full suite anyway, so a selection that misses costs a round and can never merge.
-  let selected = ctx.selectTests && enabled("test") && ctx.commands.test
-    ? await coveringTests(ctx.worktree, ctx.baseRef)
-    : undefined;
-  let selectionReason = ctx.selectionReason ?? (selected ? "affected-tests" : "full-suite-fallback");
-  if (selected && ctx.requiredRepairTests?.length) {
-    const required = ctx.requiredRepairTests;
-    const safe = required.every((path) => posix.normalize(path) === path && !path.startsWith("../")
-      && !path.startsWith("/") && TEST_FILE_RE.test(path) && existsSync(join(ctx.worktree, path)));
-    const listed = safe ? await shGit(`git ls-files -z -- ${required.map(shq).join(" ")}`, ctx.worktree) : undefined;
-    const tracked = new Set(listed?.stdout.split("\0").filter(Boolean));
-    if (!listed || listed.code !== 0 || required.some((path) => !tracked.has(path))) {
-      selected = undefined;
-      selectionReason = "required-repair-test-unavailable";
-    } else selected = [...new Set([...selected, ...required])].sort();
+  if (!diagnosed) {
+    await runBattery(ctx.commands, undefined, enabled("test") ? ["test"] : []);
+    if (failed()) return done();
   }
-  // OBS-635: a screen buys nothing when the full suite that must follow it already has a qualified
-  // green on this exact identity (read BEFORE any screen), or when the harness-measured screen costs
-  // at least 75 % of it — then the full suite runs in the battery instead. Unknown timing keeps the
-  // screen. A selected-only green never answers here: its identity names its selection.
-  let promotion: { reason: string; costRatio?: number } | undefined;
-  if (selected) {
-    const hit = verdictStore.get(await fullTestIdentity());
-    const costRatio = screenCostRatio(ctx.baseline, selected);
-    if (hit?.pass === true && !isInfraResult(hit) && await certifiesFullManifest(hit)) promotion = { reason: "full-green-cache" };
-    else if (costRatio !== undefined && costRatio >= SCREEN_PROMOTION_RATIO) promotion = { reason: "screen-cost-promoted", costRatio };
-    if (promotion) selected = undefined;
-  }
-  if (ctx.selectionReason || promotion) selectionDecision = {
-    scope: selected ? "selected" : "full", reason: promotion?.reason ?? (selected ? selectionReason
-      : selectionReason === "known-failing-files" ? "unsupported-selection-full-suite" : selectionReason),
-    requiredFiles: [...(ctx.requiredRepairTests ?? [])],
-    ...(promotion?.costRatio !== undefined ? { costRatio: promotion.costRatio } : {}),
-  };
-  await runBattery(selected ? { ...ctx.commands, test: testCommandForFiles(ctx.commands.test!, selected) } : ctx.commands,
-    selected, enabled("test") ? ["test"] : []);
-  if (failed()) return done();
 
-  if (semantic && !semanticFirst && await runSemantics()) return done();
-
-  // OBS-635: the semantic gates ran oracles and vendor CLIs in this worktree after an in-battery full
-  // suite spoke, and its green stands only for the identity it measured. Oracle dirt withdraws it; a
-  // changed or unmeasurable identity — tree, command, baseline, environment, dependency resolution,
-  // capacity, protocol, lifecycle, full manifest — buys a fresh merge-candidate suite below.
-  // Semantic-first too: an in-battery full suite that ran AFTER the semantic gates is clear of their
-  // dirt, never of its own test command's effects (an ignored lockfile, a newly collected test).
-  let rerunFull = false;
-  listing = undefined;
-  if (fullInBattery && ctx.commands.test !== undefined && semantic) {
-    const dirt = await dirtyWorktree();
-    if (dirt) {
-      const refusal = withTelemetry(await dirtyRoundRefusal("test", dirt));
-      results[results.findIndex((r) => r.gate === "test")] = refusal;
-      await ctx.onGate?.({ phase: "end", gate: "test", result: refusal });
-      return done();
-    }
-    const now = await fullTestIdentity();
-    // D-598: an unmeasurable lifecycle on either side is not comparable to anything (VerdictStore R41
-    // refuses it); two `unknown`s hashing equal is not an unchanged identity, so the suite reruns.
-    const measurable = (id: VerificationIdentity | undefined) => id?.envParts?.verification?.lifecycle !== "unknown";
-    rerunFull = !now || !batteryFullIdentity || !measurable(now) || !measurable(batteryFullIdentity)
-      || verificationIdentityKey(now) !== verificationIdentityKey(batteryFullIdentity)
-      || !(await certifiesFullManifest(results.find((r) => r.gate === "test")!));
-    if (rerunFull) {
-      // The in-battery row keeps its own interval; the replacement measures from zero.
-      spans.delete("test");
-      loadSamples.delete("test");
-    }
+  if (rerunFull) {
+    // The superseded in-battery row keeps its own interval; the replacement measures from zero.
+    spans.delete("test");
+    loadSamples.delete("test");
   }
 
   // The merge-candidate round: every other gate is green, so THIS round is the one that can merge —
   // the full suite runs on the exact gated commit before the pipeline reports green. Nothing merges
   // on a subset (spec: "nothing merges without a complete green suite"). Its verdict replaces the
   // screen's entry in the returned record (one `test` entry), and `fullSuite` says which suite spoke
-  // while `selectedTests` keeps what the screen ran. In the stream, a held screen is superseded (one
-  // `test` end event); a published screen keeps its own earlier event and this is the second.
-  if (selected || rerunFull) {
+  // while `selectedTests` keeps what the screen ran. In the stream the diagnostic keeps its own
+  // earlier event and this is the second.
+  // OBS-635 (answersNow): a diagnosed round's full job is its first, so, like the in-battery job, a stale
+  // green buys one fresh job (published unverdicted); a stale last job fails closed. Neither is cached.
+  let spare = diagnosed ? 1 : 0;
+  while (diagnosed || rerunFull) {
     await emitStart("test");
     // This is the last shell command a round can run — the judge's named-test oracle (acceptance.ts)
     // may have run one before it, and every gate between the battery and here reads commits only, so
@@ -1615,12 +1710,15 @@ export async function runGates(
     if (ctx.commands.test !== undefined) {
       identity = await fullTestIdentity();
       const hit = verdictStore.get(identity);
-      if (hit) classifySignalOnlyTest(hit);
+      if (hit) classifySignalOnlyTest(hit, true);
       if (hit && identity && !isInfraResult(hit) && (hit.pass || (ctx.verificationScope ?? "battery") === "battery")
-          && !(await discardCachedRed("test", hit)) && await certifiesFullManifest(hit)) {
-        full = formatReusedRow(hit, identity);
-        cached = true;
-        await noteReuse("test", full, identity);
+          && !(await discardCachedRed("test", hit))) {
+        // RE-PROOF, as in the battery: listing, then cleanliness and identity; stale, a fresh job measures now.
+        if (!hit.pass || await answersNow(identity, hit, false)) {
+          full = formatReusedRow(hit, identity);
+          cached = true;
+          await noteReuse("test", full, identity);
+        } else identity = await fullTestIdentity();
       }
     }
     if (!full) {
@@ -1632,16 +1730,25 @@ export async function runGates(
     fullDurationMs = spans.get("test") ? spans.get("test")!.durationMs - (selectedDurationMs ?? 0) : 0;
     const dirt = (!cached && full!.pass) ? await dirtyWorktree() : undefined;
     if (full) classifySignalOnlyTest(full);
-    if (!cached && identity && full && !dirt && !isInfraResult(full)) {
+    const stale = !cached && !dirt && full!.pass && !(await answersNow(identity, full!, false, true));
+    if (!cached && identity && full && !dirt && !stale && !isInfraResult(full)) {
       verdictStore.set(identity, { ...full, meta: { ...full.meta, source: "gate", runDir: ctx.artifactDir } });
     }
+    const spoke = stale ? staleProof(full!, spare > 0) : full!;
     const merged = withTelemetry(dirt
       ? { ...await dirtyRefusal("test", dirt, ctx.commands.test!), evidenceReceipt: full!.evidenceReceipt, evidenceReceipts: full!.evidenceReceipts }
-      : { ...full!, meta: { ...full!.meta, fullSuite: true, selectedTests: selected } });
-    merged.evidenceReceipts = [...(heldTest?.evidenceReceipts ?? []), ...(full?.evidenceReceipts ?? [])];
+      : { ...spoke, meta: { ...spoke.meta, fullSuite: true, selectedTests: diagnosed ? diagnostic : undefined } });
+    merged.evidenceReceipts = [...(full?.evidenceReceipts ?? [])];
+    if (stale && spare-- > 0) {
+      await ctx.onGate?.({ phase: "end", gate: "test", result: merged });
+      // The superseded job keeps its own interval; the replacement measures from zero.
+      spans.delete("test");
+      loadSamples.delete("test");
+      continue;
+    }
     results[results.findIndex((r) => r.gate === "test")] = merged;
-    heldTest = undefined;
     await ctx.onGate?.({ phase: "end", gate: "test", result: merged });
+    break;
   }
   return done();
 }

@@ -11,7 +11,10 @@ import { join } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
 import { FakeAdapter } from "../../src/adapters/fake.js";
 import type { AuthHealth, BillingChannel } from "../../src/adapters/types.js";
+import { captureBaseline } from "../../src/gates/baseline.js";
 import { resetLoadProviderForTests, setLoadProviderForTests } from "../../src/gates/run-gates.js";
+import { graphDefinitionHash, loadGraph } from "../../src/graph/graph.js";
+import { gitHead } from "../../src/run/git.js";
 import { GATE_NAMES } from "../../src/graph/schema.js";
 import { runDaemon as daemon } from "../../src/run/daemon.js";
 import { Journal } from "../../src/run/journal.js";
@@ -37,6 +40,21 @@ const gateRows = (repo: string, runId: string): GateRow[] =>
 // setupRepo's fixture plus the extra seats a case needs; the scripted fake is always in the fleet.
 const runDaemon = async (fixture: { repo: string; fake: FakeAdapter }, runId: string, extra: FakeAdapter[] = []) => {
   await daemon(fixture.repo, { adapters: [fixture.fake, ...extra], runId });
+};
+
+/** v2.6.7 T1: a selected run is now only an attributed behavioral test-red repair's admitted diagnostic. The run
+ * resumes over a journaled full-provenance red naming `failing` and a baseline whose harness timing admits it. */
+const attributedRepair = async (fixture: { repo: string; fake: FakeAdapter }, runId: string, test: string, failing: string) => {
+  const commands = { test };
+  const journal = Journal.create(fixture.repo, runId);
+  journal.append("run-start", undefined, { baseRef: await gitHead(fixture.repo), commands, graphDefinitionHash: graphDefinitionHash(loadGraph(fixture.repo)) });
+  journal.append("gate-result", "T1", { gate: "test", pass: false, details: `FAIL ${failing} > known defect`, disposition: "behavioral",
+    commit: "a".repeat(40), failingFiles: [failing], selectionDecision: { scope: "full" } });
+  const baseline = await captureBaseline(fixture.repo, commands);
+  // synthetic timing claims no capacity (absent stays comparable wherever the daemon divides the machine)
+  baseline.commands.test = { ...baseline.commands.test!, capacity: undefined, fileDurations: [{ file: failing, durationMs: 500 }, { file: "heavy.test.js", durationMs: 9_500 }] };
+  writeFileSync(join(journal.dir, "baseline.json"), JSON.stringify(baseline));
+  await daemon(fixture.repo, { adapters: [fixture.fake], runId, resume: true });
 };
 
 const oneTask = (id: string, extra = "") => ({
@@ -146,14 +164,15 @@ describe("gate-result telemetry (v2.0 T2, fake adapter, zero tokens)", () => {
         { oracle: "command", command: `sleep ${INTERVENING_MS / 1000}`, text: "delayed intervening gate" },
         "done",
       ] })],
-      // the worker's only change is a TEST file, so coveringTests attributes the diff and the round
-      // runs a selection instead of falling back to the full suite
+      // the worker's only change is a TEST file, so coveringTests attributes the diff and the attributed
+      // test-red repair runs its admitted diagnostic instead of falling back to the full suite
       { tasks: { T1: [{ shell: `echo "// worker" > covered.test.js && ${COMMIT} covered`, result: { ok: true, summary: "done" } }] } },
       `gates: { test: "${testCmd}" }\n`,
     );
-    await runDaemon(fixture, "run-telemetry-composite");
+    await attributedRepair(fixture, "run-telemetry-composite", testCmd, "covered.test.js");
     const { repo } = fixture;
-    const rows = gateRows(repo, "run-telemetry-composite");
+    // (the seeded attributed red is the journal's prior evidence, not this round's measurement)
+    const rows = gateRows(repo, "run-telemetry-composite").filter((r) => r.commit !== "a".repeat(40));
     const testRows = rows.filter((r) => r.gate === "test");
     const intervening = rows.find((r) => r.gate === "acceptance")!;
     const events = Journal.open(repo, "run-telemetry-composite").read();
@@ -205,7 +224,7 @@ describe("gate-result telemetry (v2.0 T2, fake adapter, zero tokens)", () => {
         { shell: `echo "// worker" > covered.test.js && ${COMMIT} covered`, result: { ok: true, summary: "done" } },
         { shell: `echo "// repair" >> covered.test.js && ${COMMIT} repair`, result: { ok: true, summary: "done" } },
       ] } }, `gates: { test: "${testCmd}" }\n`);
-      await runDaemon(fixture, runId);
+      await attributedRepair(fixture, runId, testCmd, "covered.test.js");
       const events = Journal.open(fixture.repo, runId).read().filter((e) => e.taskId === "T1");
       const isRound = (e: (typeof events)[number]) => e.event === "phase-start" && e.data.phase === "gates";
       const start = events.findIndex(isRound);

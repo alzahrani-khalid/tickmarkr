@@ -61,12 +61,17 @@ const pathKind = (path: string): "directory" | "present" | "absent" => {
  * to create fresh state there or to wander into an enclosing repository. This function is read-only.
  */
 export function resolveSupervisionRoot(cwd: string): string {
+  const { root, state } = locateSupervisionRoot(cwd);
+  if (!state) throw new Error(`missing ${stateDirName(root)}/ state dir at repository root ${root}`);
+  return root;
+}
+
+/** Read-only twin for readers: a repository without a state dir is a root with no state, not a refusal. */
+export function locateSupervisionRoot(cwd: string): { root: string; state: boolean } {
   let current = resolve(cwd);
   for (;;) {
-    if (pathKind(join(current, stateDirName(current))) === "directory") return current;
-    if (pathKind(join(current, ".git")) !== "absent") {
-      throw new Error(`missing ${stateDirName(current)}/ state dir at repository root ${current}`);
-    }
+    if (pathKind(join(current, stateDirName(current))) === "directory") return { root: current, state: true };
+    if (pathKind(join(current, ".git")) !== "absent") return { root: current, state: false };
     const parent = dirname(current);
     if (parent === current) {
       throw new Error(`missing ${stateDirName(current)}/ state dir — no tickmarkr repository found from ${resolve(cwd)}`);
@@ -140,6 +145,11 @@ export interface SupervisionArm {
 export const supervisionArmPath = (repoRoot: string, tier: SupervisionTier): string =>
   join(supervisionDir(repoRoot), `${tier}.arm`);
 
+/** The durable arm on disk, undefined when none; a torn or invalid arm throws rather than reading as none. */
+export function readSupervisionArm(repoRoot: string, tier: SupervisionTier): SupervisionArm | undefined {
+  return readArm(repoRoot, tier);
+}
+
 function readArm(repoRoot: string, tier: SupervisionTier): SupervisionArm | undefined {
   try {
     const arm = JSON.parse(readFileSync(supervisionArmPath(repoRoot, tier), "utf8"));
@@ -184,6 +194,17 @@ export function newSupervisionArm(
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
   } finally { rmSync(tmp, { force: true }); }
   return readArm(repoRoot, tier)!;
+}
+
+// Stand-down is a RECORDED act, not a silence: the marker tells a reader this watcher left on purpose,
+// so the tier reads DISARMED rather than ageing out as a death. Published atomically — written aside,
+// renamed over — because a torn marker is rejected by the reader, and a rejected stand-down reports a
+// deliberate hand-off as a death. The marker names the seat for the same reason the beat does.
+export function publishStandDown(repoRoot: string, tier: SupervisionTier, seat: string): void {
+  tickmarkrDir(repoRoot); // the write path DOES create — markers land inside the gitignored state dir
+  atomicRecord(supervisionStandDownPath(repoRoot, tier), {
+    tier, seat, standDownId: randomUUID(), exitedWriterPid: process.pid, disarmedAt: new Date().toISOString(),
+  });
 }
 
 /** The independent latch a stand-down cannot overwrite or remove. */

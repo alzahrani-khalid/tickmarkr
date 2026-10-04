@@ -100,6 +100,30 @@ new deny is a membership edit of its own (so its tier and it are then saved sepa
 model whose adapter the allow form leaves out whole clears only its own entry: the adapter's entry
 still excludes it, so nothing is admitted and its tier is saved to the user overlay alone.
 
+**Grouped rows act on every real member.** One row can stand for several real models: effort/speed
+variants doctor reported collapse into one base row (`C` for `C-low`, `C-high`, `C-max`; the bare `C`
+is a member only when doctor served it too), and gateway ids that resolve to one catalog record fold
+under one row (`×N`), each constituent keeping all of its variants. The row's label is never substituted
+for the member set: when the label is itself a real id doctor served (the bare `C`, or a fold's first
+gateway id), it is written only as that one member, beside every other member's own id. `t` (or a bulk
+`s`) stages the tier and provenance on **every** real member — the detail line lists them after
+`classify writes` — and stages each member's own `adapter:model` allow entry, so Space → in admits the
+whole group in the same session, before `w`; no second session is needed. A staged allow entry another
+member's recorded identity also reaches (`C-high` recorded as `C-low`) is still the group's own, so the
+same in admits both. Each reach
+choice applies the same one-reason act to every member: out · workers writes a
+`routing.deny.workers.models` entry for each member's real id, so workers skip all of them while judge,
+review and consult keep every one; out · all seats and in work the same way, and a clear takes one own
+reason per member, so a member that still holds another reason stays out and is named. The row reads
+`in`, `out workers` or `out all` only when every member has that state; when members disagree it reads
+`partial`, and its detail line — like the rail's reach picker — names each affected member's real id and
+scope, so one excluded member never hides behind the others. An entry that also covers another real
+channel (another member included) or a whole adapter is never lifted from a row: the row names it, and
+`l` (or the rail, for an adapter entry) owns it. Admission is membership, not authentication: only
+members doctor probed and authed join the worker, judge, review and consult pools. A member doctor
+recorded unauthed, or never probed, is named on the row and in the save outcome — re-probe it with
+`tickmarkr doctor` (or `tickmarkr fleet --fresh`); the group's admission never makes it routable.
+
 **Worker-only deny on a partially excluded adapter (two presses).** When some of an adapter's
 channels are out through the allow form, a direct out · workers on its rail is refused (the rail edits
 only the adapter's own entries). Press out · all seats on the rail, then out · workers: the second

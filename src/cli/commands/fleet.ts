@@ -379,8 +379,15 @@ export async function assembleFleetEditor(
       : readClaudeAliasIdentity(cwd, model as ClaudeAlias) ?? CLAUDE_ALIAS_IDENTITY_STAMPS[model as ClaudeAlias];
   // One ranking universe for the whole screen: every unclassified row bands fleet-relatively
   // against the same set, so a suggestion never depends on which adapter group renders first.
+  // T5: a displayed row's real members — every id doctor actually served among its collapsed variants
+  // (the bare id only when served, never the display label alone) — folded constituents append theirs.
+  // Each real id is ONE member even when doctor's list repeats it, so one act takes one reason from it.
   const detectedRows = fleetUnclassifiedModels(cfg, health, adapters)
-    .map((row) => ({ ...row, resolvedModel: resolvedCatalogModel(row.adapter, row.model) }));
+    .map((row) => ({
+      ...row,
+      resolvedModel: resolvedCatalogModel(row.adapter, row.model),
+      members: [...new Set([row.model, ...(row.variants ?? [])])].filter((id) => health[row.adapter]?.models?.includes(id)),
+    }));
   const catalogRanking = catalogTierRanking(cfg, catalog, detectedRows, resolvedCatalogModel);
   const foldedRows: Array<(typeof detectedRows)[number] & {
     advisory: ReturnType<typeof catalogModelAdvisory>;
@@ -398,6 +405,8 @@ export async function assembleFleetEditor(
     if (first) {
       first.foldedModels ??= [first.model];
       first.foldedModels.push(row.model);
+      // T5: a collapsed constituent keeps every variant when it is catalog-folded
+      first.members = [...new Set([...first.members, ...row.members])];
     } else {
       foldedRows.push(next);
       if (foldKey) folds.set(foldKey, next);
@@ -449,10 +458,27 @@ export async function assembleFleetEditor(
           ...unclassified
             .filter((row) => !editable.tiers[adapter.id]?.[row.model])
             .map((row) => {
-              const evidence = rowEvidence(adapter.id, row.classifyModel ?? row.model,
+              const found = rowEvidence(adapter.id, row.classifyModel ?? row.model,
                 row.advisory.coverage === "covered" ? row.advisory.evidence : undefined);
+              // T5: each member keeps its own recorded identity and auth verdict; a group is unauthed as a
+              // row only when every member is — one member's failed probe never blocks the others' reach
+              const grouped = row.members.length > 1 || (row.members.length === 1 && row.members[0] !== row.model);
+              const members = grouped ? row.members.map((model) => {
+                const identity = resolvedModelIdentity(adapter.id, model);
+                const probed = health[adapter.id]?.modelAuth?.[model] as { authed?: boolean; reason?: string } | undefined;
+                return {
+                  model,
+                  ...(identity !== undefined ? { identity } : {}),
+                  ...(probed?.authed === false ? { unauthed: probed.reason ?? "probe failed" } : {}),
+                };
+              }) : undefined;
+              const { unauthed: _unauthed, ...authedEvidence } = found ?? {};
+              const evidence = members?.some((member) => member.unauthed === undefined) && found?.unauthed !== undefined
+                ? (Object.keys(authedEvidence).length ? authedEvidence : undefined)
+                : found;
               return {
                 model: row.model,
+                ...(members ? { members } : {}),
                 detectedAt: row.detectedAt,
                 ...(row.classifyModel ? { classifyModel: row.classifyModel } : {}),
                 ...(row.variants ? { variants: row.variants } : {}),
@@ -587,19 +613,24 @@ export async function assembleFleetEditor(
     ? { ...initial, allowOut: [...new Set([...(initial.allowOut ?? []), ...seeds.map((seed) => seed.entry)])].sort() }
     : initial);
   const FLAT_SCOPES = DENY_SCOPES.filter((scope) => scope.path.length === 3);
-  // one browser channel: a seed, or (T10 review) a classified row with no seed
-  type RowChannel = Pick<FleetSeededAllow, "adapter" | "displayModel" | "identity">;
+  // one browser channel: a seed, or (T10 review) a classified row's member with no seed — always its REAL
+  // model (T5), never a collapsed row's display label
+  type RowChannel = Pick<FleetSeededAllow, "adapter" | "model" | "identity">;
   const seedChannel = (seed: RowChannel) =>
-    ({ adapter: seed.adapter, model: seed.displayModel, ...(seed.identity !== undefined ? { identity: seed.identity } : {}) });
+    ({ adapter: seed.adapter, model: seed.model, ...(seed.identity !== undefined ? { identity: seed.identity } : {}) });
   // an allow-complement entry excludes a seeded channel by the allow form's own matching (adapter id,
   // model, adapter:model, recorded identity) — the seed's spelling is one such entry, never the only one
   const seedRow = (seed: RowChannel): FleetUniverseRow => ({
     adapter: seed.adapter,
-    models: [seed.displayModel],
-    ...(seed.identity !== undefined ? { identities: { [seed.displayModel]: seed.identity } } : {}),
+    models: [seed.model],
+    ...(seed.identity !== undefined ? { identities: { [seed.model]: seed.identity } } : {}),
   });
   const allowExcludes = (staged: FleetEditable, seed: RowChannel) =>
-    (staged.allowOut ?? []).some((entry) => universeEntryMatches(seedRow(seed), seed.displayModel, entry));
+    (staged.allowOut ?? []).some((entry) => universeEntryMatches(seedRow(seed), seed.model, entry));
+  // T5: the real channels a displayed row stands for (fleet's own derivation above); an ungrouped row is one
+  const rowMembers = (row: (typeof modelGroups)[number]["rows"][number]) =>
+    ("members" in row && row.members)
+      || [{ model: ("classifyModel" in row && row.classifyModel) || row.model, ...(row.evidence?.identity !== undefined ? { identity: row.evidence.identity } : {}) }];
   // membership keeps the channel out: its allow complement or a flat (all-seats) deny entry
   const excludedIn = (staged: FleetEditable, seed: RowChannel) => allowExcludes(staged, seed)
     || FLAT_SCOPES.some((scope) => (staged[scope.key] ?? []).some((entry) => entryMatchesChannel(entry, seedChannel(seed), true)));
@@ -688,12 +719,9 @@ export async function assembleFleetEditor(
         // own flat-deny lift: a row the baseline membership kept out that the staged one admits; a lone or
         // unrelated tier stays user
         const own = admitted.some((seed) => seed.adapter === adapter && seed.model === model)
-          || (modelGroups.find((group) => group.adapter === adapter)?.rows ?? [])
-            .filter((row) => row.model === model || ("classifyModel" in row && row.classifyModel === model))
-            .some((row) => {
-              const channel = { adapter, displayModel: row.model, ...(row.evidence?.identity !== undefined ? { identity: row.evidence.identity } : {}) };
-              return excludedIn(baseline, channel) && !excludedIn(staged, channel);
-            });
+          || (modelGroups.find((group) => group.adapter === adapter)?.rows ?? []).flatMap(rowMembers)
+            .filter((member) => member.model === model)
+            .some((member) => excludedIn(baseline, { adapter, ...member }) && !excludedIn(staged, { adapter, ...member }));
         edits.push({ name: `tiers.${adapter}.models.${model}`, destination: own ? family() : "user" });
       }
     }
@@ -721,15 +749,19 @@ export async function assembleFleetEditor(
   // the browser never showed, or whose spelling names no channel, is refused.
   const editingUniverse = (candidate: TickmarkrConfig, seeds: FleetSeededAllow[]): FleetUniverseRow[] => {
     const target = universeOf(candidateChannels(candidate));
+    // T5 review: the seed's OWN channel must be in the universe — its entry matching another member's
+    // recorded identity (C-high recorded as C-low) never stands for an unauthed or unprobed C-low
     const covers = (seed: FleetSeededAllow) => target.some((row) => row.adapter === seed.adapter
-      && row.models.some((model) => universeEntryMatches(row, model, seed.entry)));
+      && row.models.includes(seed.model) && universeEntryMatches(row, seed.model, seed.entry));
     for (const seed of seeds) {
       if (covers(seed)) continue;
-      const shown = modelGroups.some((group) => group.adapter === seed.adapter && group.rows.some((row) => row.model === seed.displayModel));
+      // T5: a seed names a real member of the row it was staged from — never that row's display label
+      const shown = modelGroups.some((group) => group.adapter === seed.adapter
+        && group.rows.some((row) => row.model === seed.displayModel && rowMembers(row).some((member) => member.model === seed.model)));
       const row = target.find((candidateRow) => candidateRow.adapter === seed.adapter);
       if (shown && row) {
-        row.models = [...row.models, seed.displayModel];
-        if (seed.identity !== undefined) row.identities = { ...row.identities, [seed.displayModel]: seed.identity };
+        if (!row.models.includes(seed.model)) row.models = [...row.models, seed.model];
+        if (seed.identity !== undefined) row.identities = { ...row.identities, [seed.model]: seed.identity };
       }
       if (!covers(seed)) throw new ConfigError(`the seeded allow entry ${seed.entry} names no channel of the discovered fleet — re-probe with tickmarkr doctor, then classify it again`);
     }
@@ -1407,20 +1439,32 @@ export async function assembleFleetEditor(
     // and it was not configured at probe time), so it stays unroutable — invisible in every
     // picker — until the next probe. Name the step, or the classify flow reads as broken.
     const unprobed: string[] = [];
+    // T5: a grouped classification admits every member's real id, yet a member doctor recorded unauthed
+    // stays unroutable — named, never implied routable by its group's admission
+    const unauthed: string[] = [];
     for (const [adapter, models] of Object.entries(write.edited.tiers)) {
       for (const [model, assigned] of Object.entries(models)) {
         if (assigned === null || assigned === undefined) continue;
         if (JSON.stringify(write.initial.tiers[adapter]?.[model]) === JSON.stringify(assigned)) continue;
-        if (health[adapter]?.modelAuth?.[model] === undefined) unprobed.push(`${adapter}:${model}`);
+        const probed = health[adapter]?.modelAuth?.[model];
+        if (probed === undefined) unprobed.push(`${adapter}:${model}`);
+        else if (probed.authed === false) unauthed.push(`${adapter}:${model}`);
       }
     }
     // B2: a repo-shadowed save says what still applies here — never claimed applied
     const head = [`fleet: wrote ${pending.path}`, ...(pending.destination === "user"
       ? repoShadowNotes(result.review.before, result.review.after).map((note) => `fleet: ${note}`)
       : [])].join("\n");
-    if (!unprobed.length) return head;
-    const named = unprobed.slice(0, 3).join(", ") + (unprobed.length > 3 ? `, +${unprobed.length - 3} more` : "");
-    return `${head}\nfleet: ${unprobed.length} newly classified model(s) have no probe verdict yet (${named}) — run \`tickmarkr fleet --fresh\` to probe them; unverified models stay unroutable`;
+    const listed = (ids: string[]) => ids.slice(0, 3).join(", ") + (ids.length > 3 ? `, +${ids.length - 3} more` : "");
+    return [
+      head,
+      ...(unprobed.length
+        ? [`fleet: ${unprobed.length} newly classified model(s) have no probe verdict yet (${listed(unprobed)}) — run \`tickmarkr fleet --fresh\` to probe them; unverified models stay unroutable`]
+        : []),
+      ...(unauthed.length
+        ? [`fleet: ${unauthed.length} newly classified model(s) are unauthed (${listed(unauthed)}) — re-probe with tickmarkr doctor; unauthed models stay unroutable`]
+        : []),
+    ].join("\n");
   };
 
   return {

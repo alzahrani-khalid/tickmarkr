@@ -98,7 +98,8 @@ describe("v1.85 gate-satisfied resume preserves parallel AND and full-suite auth
     expect(post.some((e) => e.event === "gate-result" && e.taskId === "T1"
       && e.data.gate === "acceptance" && e.data.pass === false)).toBe(true);
     expect(post.some((e) => e.event === "merge" && e.taskId === "T1")).toBe(false);
-    expect(readFileSync(suiteLog, "utf8").trim().split("\n")).toContain("argc=0 args=");
+    // v2.6.7 T1 (closed order table): the acceptance rejection is decisive, so it starts no new full job
+    expect(readFileSync(suiteLog, "utf8").trim().split("\n")).not.toContain("argc=0 args=");
   }, 60_000);
 
   test("approving acceptance after a selected-only screen forces a full test gate before merge", async () => {

@@ -222,6 +222,16 @@ describe.skipIf(!existsSync(codebaseDocs))("docs-truth-stack", () => {
     for (const status of ["`allowed`", "`protected`", "`escape`", "`unknown`"]) expect(block).toContain(status);
     expect(block).toContain("`escape` is a BLOCKING security warning");
     expect(block).toContain("judge, review (`src/gates/llm.ts`) and consult (`src/run/consult.ts`)");
+    // v2.6.7 T4 (D-1046): the role boundary as built — grantless non-worker headless, worker headless via invoke()
+    expect(block).toContain("`headlessCommand` is GRANTLESS");
+    expect(block).not.toContain("Every Codex role — worker, judge, review");
+    const worker = block.match(/\n\s+-\s+Worker headless \(`invoke\(\)`\):\s+`([^`]+)`/);
+    expect(worker).not.toBeNull();
+    vi.stubEnv("CODEX_HOME", "/var/empty/tickmarkr-hermetic-codex-home");
+    expect(worker![1]).toBe(codex.invoke({} as never, "/wt", { model: "<model>", channel: "sub", tier: "mid" }, { promptFile: "<prompt>" }).command);
+    expect(block).toContain("`GitTrustRefusal`");
+    expect(block).toContain("D-1046");
+    expect(block).toContain("D-1042");
   });
 
   test("test: the integrations page describes the portable driving skill install command", () => {

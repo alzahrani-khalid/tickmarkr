@@ -156,7 +156,8 @@ test("the read-first procedure on both hosts appends one opened line per cited f
 test("the beat recipe arms through the explicit new-arm and loop verbs and names the legacy wrapper loop as the unsafe form that re-armed after a stand-down, citing the changed lines", () => {
   const skill = readShippedSkill();
   expect(skill).toContain("it arms through two explicit verbs, `--new-arm` and `--loop` —\nnever a bare invocation");
-  expect(skill).toContain("cd <repo> && tickmarkr beat overseer --seat <overseer-agent-or-pane> --loop");
+  expect(skill).toContain("cd <repo> && tickmarkr beat start overseer --seat <overseer-agent-or-pane>");
+  expect(skill).toContain("Never launch it by hand: `beat start` runs it detached and owns it");
   expect(skill).not.toMatch(/while :; do tickmarkr beat overseer --seat <overseer-agent-or-pane>; sleep 10; done/);
   expect(skill).toMatch(/The legacy wrapper loop, `while :; do tickmarkr beat overseer --seat <pane>; sleep 10; done`, is the\s*\nUNSAFE form and must not be used\./);
   expect(skill).toMatch(/it is the shape that re-armed a recorded stand-down \(OBS-583, OBS-1088\)/);
@@ -262,8 +263,8 @@ test("replaying D-265 (4) against the changed beat section finds the stand-down 
     skill.indexOf("Arm the bundled watcher as its OWN Bash call"),
   );
   // skills/tickmarkr-overseer/SKILL.md — beat arm, stand-down, and the pre-arm probe (D-265 (4)).
-  expect(beat).toContain("cd <repo> && tickmarkr beat overseer --seat <overseer-agent-or-pane> --loop");
-  expect(beat).toContain("cd <repo> && tickmarkr beat overseer --seat <overseer-agent-or-pane> --stand-down");
+  expect(beat).toContain("cd <repo> && tickmarkr beat start overseer --seat <overseer-agent-or-pane>");
+  expect(beat).toContain("cd <repo> && tickmarkr beat stop overseer --seat <overseer-agent-or-pane>  # deliberately hand off; reads back DISARMED");
   expect(beat).toContain('(`pgrep -f "tickmarkr beat <tier>"`, **read twice and intersected**');
   expect(beat).toContain("**Reconcile this probe with the recorded-pid ownership rule.**");
   expect(beat).toMatch(/retires watchers this seat\s+armed by the exact recorded pid/);
@@ -312,9 +313,10 @@ test("D-837/D-838: loop, auto and overseer keep run and resume in host-owned ORC
     expect(recipe).toContain("Verify ppid 1");
     expect(recipe).toContain('(tier, seat)');
     expect(recipe).toContain('"already running" no-op');
-    expect(recipe).toContain("status\nchecks that payload and beat freshness");
-    expect(recipe).toContain("stop sends `--stand-down`");
-    expect(recipe).toContain("run-end stop item for every\nbeat started, also on failure, park or handoff");
+    expect(recipe).toContain("cd <repo> && tickmarkr beat start <tier> --seat <seat>\ncd <repo> && tickmarkr beat status <tier> --seat <seat>\ncd <repo> && tickmarkr beat stop <tier> --seat <seat>");
+    expect(recipe).toContain("`status`\nis the check: it reads the recorded process identity and beat freshness, writes nothing");
+    expect(recipe).toContain("`stop` signals only that recorded pid after its\ngeneration and identity still match, and reads back DISARMED");
+    expect(recipe).toContain("Include a run-end `beat stop` item for every beat started, also\non failure, park or handoff");
     expect(recipe).toContain("Keep only watchers that must WAKE the seat in the harness");
     expect(recipe).toContain("their harness cap");
     expect(skill).not.toContain('the repo root as its own `run_in_background` Bash call');

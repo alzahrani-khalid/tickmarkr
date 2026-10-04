@@ -4,10 +4,12 @@ import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSy
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { expect, test, vi } from "vitest";
+import { FakeAdapter } from "../../src/adapters/fake.js";
 import { DEFAULT_CONFIG } from "../../src/config/config.js";
 import { captureBaseline, compareToBaseline, type Baseline, type BaselineCommand } from "../../src/gates/baseline.js";
 import { runGates, testCommandForFiles } from "../../src/gates/run-gates.js";
-import { discoverTestManifest, fileHangBudgetMs, isVitestTestCommand, readTestReport, resetHangClocksForTests, setHangClocksForTests, singleForkRetryCommand, verifyManifestReport } from "../../src/gates/test-manifest.js";
+import type { GateResult } from "../../src/gates/types.js";
+import { discoverTestManifest, evaluateManifestedTest, fileHangBudgetMs, isVitestTestCommand, readTestReport, resetHangClocksForTests, setHangClocksForTests, singleForkRetryCommand, verifyManifestReport } from "../../src/gates/test-manifest.js";
 import { TEST_REPORTER_SOURCE } from "../../src/gates/test-reporter.js";
 import { preserveWorktree, shGitOk, VERIFICATION_PROTOCOL } from "../../src/run/git.js";
 import { SubprocessDriver } from "../../src/drivers/subprocess.js";
@@ -23,6 +25,15 @@ const commit = (repo: string) => { git(repo, "add", "-A"); git(repo, "commit", "
 const task = validateGraph({ version: 1, spec: { source: "native", paths: ["spec.md"], hash: "h" }, tasks: [
   { id: "T1", title: "report", goal: "report", shape: "implement", complexity: 3, gates: ["build", "test", "lint", "evidence", "scope"], acceptance: ["done"], files: ["**"] },
 ] }).tasks[0];
+// ...and only beside a semantic gate: test-only verification keeps its full scope.
+const diagnosed = { ...task, gates: [...task.gates, "acceptance" as const] };
+function judged() {
+  const scriptPath = join(makeTestTempDir("vl1-judged-"), "s.json");
+  writeFileSync(scriptPath, JSON.stringify({ tasks: {}, judge: { pass: true, criteria: [{ criterion: "c1", met: true, reason: "ok" }] } }));
+  const cfg = structuredClone(DEFAULT_CONFIG);
+  cfg.judge.adapter = "fake";
+  return { cfg, adapters: [new FakeAdapter(scriptPath)] };
+}
 
 function fixture(real = true) {
   const repo = makeRepo({
@@ -42,11 +53,17 @@ type Fixture = ReturnType<typeof fixture>;
 function baseline(cmd: string, over: Partial<BaselineCommand> = {}): Baseline {
   return { commands: { test: { cmd, exitCode: 0, fingerprints: [], ceilingMs: 30_000, fileCount: 999, ...over } } } as Baseline;
 }
+// v2.6.7 T1: a selected run is an attributed test-red repair's diagnostic, admitted on comparable harness timing
+// (5000 ms per selected file, at most 1/9 of the suite; per-file hang budgets stay at the 30000 ms ceiling).
+const ADMITTED: Partial<BaselineCommand> = { fileDurations: [{ file: "tests/a.test.ts", durationMs: 5_000 },
+  { file: "tests/b.test.ts", durationMs: 80_000 }, { file: "tests/c.test.ts", durationMs: 5_000 }] };
 async function round(f: Fixture, cmd = "vitest run --globals", over: Partial<BaselineCommand> = {}, selected = false) {
-  const out = await runGates(task, {
+  const out = await runGates(selected ? diagnosed : task, {
     worktree: f.repo, baseRef: f.base, author: { adapter: "fake", model: "fake", tier: "mid", channel: "sub" },
-    result: { ok: true, summary: "done", deviations: [], raw: "" }, commands: { test: cmd }, baseline: baseline(cmd, over),
+    result: { ok: true, summary: "done", deviations: [], raw: "" }, commands: { test: cmd },
+    baseline: baseline(cmd, selected ? { ...ADMITTED, ...over } : over),
     channels: [], adapters: [], cfg: structuredClone(DEFAULT_CONFIG), artifactDir: f.artifacts, selectTests: selected,
+    ...(selected ? { ...judged(), requiredRepairTests: ["tests/a.test.ts"], selectionReason: "known-failing-files" } : {}),
   });
   expect(out.results.filter(r => r.gate === "test")).toHaveLength(1);
   return out.results.find(r => r.gate === "test")!;
@@ -178,6 +195,26 @@ test("through runGates the repository's installed vitest run with the gate's rep
   }
 }, 90_000);
 
+test("a full green with a normal exit receipt stays green when its report names a skipped SIGTERM module, including cached reuse", async () => {
+  const f = fixture();
+  git(f.repo, "mv", "tests/b.test.ts", "tests/SIGTERM.test.ts");
+  writeFileSync(join(f.repo, "tests/SIGTERM.test.ts"), 'test.skip("skipped module", () => expect(1).toBe(2));\n');
+  commit(f.repo);
+  for (const reused of [false, true]) {
+    const row = await round(f);
+    expect(row.pass, row.details).toBe(true);
+    expect(row.meta?.infra).not.toBe(true);
+    expect(row.evidenceReceipt?.termination).toMatchObject({ kind: "exit", exitCode: 0 });
+    expect(row.meta).toMatchObject({ manifest: ["tests/SIGTERM.test.ts", "tests/a.test.ts"],
+      executedModules: 1, skippedModules: ["tests/SIGTERM.test.ts"] });
+    expect(row.details).toContain("tests/SIGTERM.test.ts");
+    expect(row.meta?.reused === true).toBe(reused);
+    const report = readTestReport(row.meta!.reportPath as string)!;
+    expect(report.completed["tests/a.test.ts"]?.status).toBe("passed");
+    expect(report.completed["tests/SIGTERM.test.ts"]?.status).toBe("skipped");
+  }
+});
+
 test("failing file identities come from completed records, never failure prose or passed records", () => {
   const manifest = ["tests/a.test.ts", "tests/b.test.ts", "tests/c.test.ts"];
   const verdict = verifyManifestReport({ manifest, nonce: "this-run", exitCode: 1, report: {
@@ -230,19 +267,35 @@ test("through runGates a round whose diff is covered by a selected screen passes
   const row = await round(f, "vitest run --globals", {}, true);
   expect(row.pass, row.details).toBe(true);
   expect(row.meta).toMatchObject({selectedTests:["tests/a.test.ts"],fullSuite:true,manifest:["tests/a.test.ts","tests/b.test.ts"]});
-  const reports = (await import("node:fs")).readdirSync(f.artifacts).filter(p => p.startsWith("test-manifest-report-"));
+  const reports = (await import("node:fs")).readdirSync(f.artifacts).filter(p => /^test-manifest-report-[a-f0-9]+\.json$/.test(p));
   expect(reports).toHaveLength(2);
   expect(reports.map(p => readTestReport(join(f.artifacts,p))!.requested.length).sort()).toEqual([1,2]);
   const broken = fixture(false);
   fault(broken, "selected-full", "selected-missing");
   const bad = await round(broken, "vitest run --globals", {}, true);
   expect(bad.pass).toBe(false); expect(bad.meta?.classification).toBe("infra"); expect(bad.details).toContain("tests/b.test.ts");
-  const snapshots = (await import("node:fs")).readdirSync(broken.artifacts).filter(p => p.startsWith("test-manifest-report-"));
+  const snapshots = (await import("node:fs")).readdirSync(broken.artifacts).filter(p => /^test-manifest-report-[a-f0-9]+\.json$/.test(p));
   expect(snapshots).toHaveLength(2);
   const screen = snapshots.map(p => readTestReport(join(broken.artifacts,p))!).find(r => r.requested.length === 1 && r.completed["tests/a.test.ts"]);
   expect(screen?.certificate?.exitCode).toBe(0);
   executed(broken, "selected-full", bad, "vitest run --globals");
 }, 90_000);
+
+test("a file that was RED in the baseline is budgeted as untimed at three times the longest usable duration, even beside a green per-project measurement of the same file, while a green file keeps the larger of three times its own duration and the longest, so a fixed slow file is never killed at a budget sized by its early-ending red run", () => {
+  const timings = [{ file: "tests/red.test.ts", durationMs: 47, failed: true as const }, { file: "tests/red.test.ts", durationMs: 6 },
+    { file: "tests/green.test.ts", durationMs: 40 }, { file: "tests/longest.test.ts", durationMs: 100 }];
+  expect(fileHangBudgetMs("tests/red.test.ts", timings, 10_000)).toBe(300); // was max(3 × 47, 100) = 141
+  expect(fileHangBudgetMs("tests/red.test.ts", timings, 200)).toBe(200); // still capped by the battery ceiling
+  expect(fileHangBudgetMs("tests/green.test.ts", timings, 10_000)).toBe(120);
+  expect(fileHangBudgetMs("tests/longest.test.ts", timings, 10_000)).toBe(300);
+  // a red entry whose own duration is unusable (0 ms, negative, NaN, infinite) still marks the file red, in either order
+  for (const durationMs of [0, -1, NaN, Infinity]) {
+    const redEntry = { file: "tests/a.test.ts", durationMs, failed: true as const }, green = { file: "tests/a.test.ts", durationMs: 6 };
+    for (const order of [[redEntry, green], [green, redEntry]]) {
+      expect({ durationMs, budget: fileHangBudgetMs("tests/a.test.ts", [...order, { file: "tests/b.test.ts", durationMs: 100 }], 1_000) }).toEqual({ durationMs, budget: 300 });
+    }
+  }
+});
 
 test("through runGates a fixture baseline with known per-file durations yields for each timed file the larger of three times its duration and the longest usable duration capped at the battery ceiling, three times the longest usable for an untimed file, and the positive battery ceiling when nothing usable was timed, including a baseline whose observations are all zero and a legacy baseline keeping only a zero longestFile, each budgeting at the ceiling rather than terminating at once, a stand-in runner resolved as the worktree's vitest that writes a file's started record and never completes it is killed at that file's budget with an infra hang result naming the file and the budget and the runner's process group gone, the same kill names the file when its budget equals the battery ceiling, and the same runner completing that file with a failed test is a work result, so a budget derived from the gate under test, a zero or non-finite duration used as a timing, a hang left to the battery ceiling, a hang reported as a regression, or an untimed file killed at zero fails", async () => {
   const timings = [{file:"tests/a.test.ts",durationMs:40},{file:"tests/b.test.ts",durationMs:100},{file:"zero",durationMs:0},{file:"nan",durationMs:NaN},{file:"inf",durationMs:Infinity}];
@@ -638,17 +691,25 @@ test("test: a receipt survives the dirty worktree substitution at both battery s
     writeFileSync(join(f.repo, "gate.sh"), `if ${fullOnly ? '[ "$#" = 0 ]' : 'true'}; then echo dirty >> src/a.ts; fi\necho completed\n`); commit(f.repo);
     const subjectCommit = git(f.repo, "rev-parse", "HEAD");
     const cmd = "sh gate.sh";
-    const result = await runGates(task, {
+    const published: GateResult[] = [];
+    const result = await runGates(fullOnly ? diagnosed : task, {
       worktree: f.repo, baseRef: f.base, author: { adapter: "fake", model: "fake", tier: "mid", channel: "sub" },
-      result: { ok: true, summary: "done", deviations: [], raw: "" }, commands: { test: cmd }, baseline: baseline(cmd, { fileCount: null }),
+      result: { ok: true, summary: "done", deviations: [], raw: "" }, commands: { test: cmd },
+      baseline: baseline(cmd, { fileCount: null, ...(fullOnly ? ADMITTED : {}) }),
       channels: [], adapters: [], cfg: structuredClone(DEFAULT_CONFIG), artifactDir: f.artifacts, selectTests: fullOnly,
+      // v2.6.7 T1: the selected run is an admitted attributed test-red diagnostic
+      ...(fullOnly ? { ...judged(), requiredRepairTests: ["tests/a.test.ts"], selectionReason: "known-failing-files" } : {}),
       buildReceiptIdentity: { runId: "receipt-run", taskId: "T1", attempt: 3, gateRound: 2 },
+      onGate: (e) => { if (e.phase === "end" && e.gate === "test") published.push(e.result); },
     });
     const row = result.results.find(r => r.gate === "test")!;
     expect(row.pass, row.details).toBe(false); expect(row.details).toMatch(/dirty|tracked/i);
     expect(row.evidenceReceipt?.termination.exitCode).toBe(0);
-    expect(row.evidenceReceipts).toHaveLength(fullOnly ? 2 : 1);
-    for (const receipt of row.evidenceReceipts!) {
+    expect(row.evidenceReceipts).toHaveLength(1);
+    // the diagnostic's receipt rides its own published row
+    const receipts = published.flatMap((r) => r.evidenceReceipts ?? []);
+    expect(receipts).toHaveLength(fullOnly ? 2 : 1);
+    for (const receipt of receipts) {
       expect(GateEvidenceReceiptSchema.safeParse(receipt).success).toBe(true);
       expect(receipt.subject).toEqual({ runId: "receipt-run", taskId: "T1", attempt: 3, gate: "test", subjectCommit });
       allIds.push(receipt.invocationId);
@@ -709,7 +770,7 @@ test("manifest evidence with an undefined artifact override persists at its repo
 
 // A deterministic pool-boundary fault, with real child processes and independent invocation logs.
 // Only the runner's transport failure is injected; discovery, gate, receipts and tip journal are real.
-function strandedFixture(mutate = "", retryMode = "pass", allSkipped = false) {
+function strandedFixture(mutate = "", retryMode = "pass", allSkipped = false, retryMutation = "", mismatch = false) {
   const f = fixture(false);
   const files = ["tests/a.test.ts", "tests/parallel-skip.test.ts", "tests/single.test.ts", "tests/single-skip.test.ts"];
   const log = join(f.artifacts, "invocations.json");
@@ -720,7 +781,7 @@ const args = process.argv.slice(2), all = ${JSON.stringify(files)}, log = ${JSON
 const filters = args.filter(a => !a.startsWith('-') && a.endsWith('.test.ts'));
 const excluded = args.filter(a => a.startsWith('--exclude=')).map(a => a.slice(10));
 const files = all.filter(f => (!filters.length || filters.some(q => path.resolve(f).includes(q))) && !excluded.includes(f));
-if (args[0] === 'list') { console.log(JSON.stringify(files.map(file => ({ file: path.resolve(file) })))); process.exit(0); }
+if (args[0] === 'list') { const listed = ${mismatch} && filters.length ? all : files; console.log(JSON.stringify(listed.map(file => ({ file: path.resolve(file) })))); process.exit(0); }
 const runs = fs.existsSync(log) ? JSON.parse(fs.readFileSync(log, 'utf8')) : [];
 const retry = runs.length > 0, now = Date.now();
 const present = retry ? files : files.filter(f => !f.includes('single'));
@@ -731,7 +792,7 @@ const report = { nonce: process.env.TICKMARKR_TEST_NONCE, requested: files,
  certificate: { at: now, exitCode: retry ? 0 : 1, errors: retry ? 0 : 1,
  diagnostics: retry ? [] : ['Error: [vitest-worker]: Timeout calling "onTaskUpdate"'] } };
 let code = retry ? 0 : 1;
-if (!retry) { ${mutate} }
+if (!retry) { ${mutate} } else { ${retryMutation} }
 if (retry && ${JSON.stringify(retryMode)} === 'failed') { report.completed[files[0]].status = 'failed'; report.certificate.exitCode = code = 1; }
 if (retry && ${JSON.stringify(retryMode)} === 'stranded') { delete report.started[files[0]]; delete report.completed[files[0]]; report.certificate.exitCode = code = 1; report.certificate.errors = 1; report.certificate.diagnostics = ['Error: [vitest-worker]: Timeout calling "onTaskUpdate"']; }
 if (retry && ${JSON.stringify(retryMode)} === 'skipped') for (const c of Object.values(report.completed)) c.status = 'skipped';
@@ -804,7 +865,8 @@ test("test: OBS-1166 under a real vitest projects config a stranded single-fork 
   // The gate battery: a selected screen over a changed parallel and single fork file strands the latter.
   const f = strandedFixture();
   writeFileSync(join(f.repo, "tests/single.test.ts"), 'import { a } from "../src/a"; test("single", () => expect(a).toBe(3));\n'); commit(f.repo);
-  const row = await round(f, "vitest run --globals", {}, true);
+  const row = await round(f, "vitest run --globals", { fileDurations: [{ file: "tests/a.test.ts", durationMs: 5_000 },
+    { file: "tests/single.test.ts", durationMs: 5_000 }, { file: "tests/heavy.test.ts", durationMs: 80_000 }] }, true);
   expect(row.pass, row.details).toBe(true);
   const runs = f.runs();
   expect(runs.slice(0, 2).map(r => r.files)).toEqual([["tests/a.test.ts", "tests/single.test.ts"], ["tests/single.test.ts"]]);
@@ -968,8 +1030,12 @@ if (rows.filter(r => !r.listing).length === 1) {
       const runs = rows.filter(r => !r.listing), listings = rows.filter(r => r.listing);
       // Recorded before the injected strand: the first real run executed every file; the retry only the serial one.
       expect(runs.map(r => r.started), label).toEqual([["tests/p1.test.ts", "tests/p2.test.ts", "tests/s.test.ts"], ["tests/s.test.ts"]]);
+      // A task round's fresh full green then re-lists the complete manifest it must still answer (OBS-635),
+      // test-only verification included, and an agreeing listing is confirmed stable by one more (OOB M1);
+      // the tip check lists only for its own run and retry.
+      const all = ["tests/p1.test.ts", "tests/p2.test.ts", "tests/s.test.ts"];
       expect(listings.map(r => r.listed!.map(f => f.slice(direct.length + 1)).sort()), label)
-        .toEqual([["tests/p1.test.ts", "tests/p2.test.ts", "tests/s.test.ts"], ["tests/s.test.ts"]]);
+        .toEqual([all, ["tests/s.test.ts"], ...(phase === "task" ? [all, all] : [])]);
       // The retry: the un-narrowed configured command, the stranded file rooted at the canonical realpath
       // as its only positional filter, and every completed file excluded by its relative manifest identity.
       const retry = runs[1]!.argv;
@@ -1260,4 +1326,37 @@ test("production manifest evaluation still distinguishes injected 120 ms and 180
     expect(green.meta?.kind).not.toBe("hang");
     expect(green.meta?.manifest).toEqual(["tests/a.test.ts", "tests/b.test.ts"]);
   }
+}, 180_000);
+
+
+test("test: production verification continues exactly the rediscovered stranded set once retaining first-pass failures and both receipts while mismatched partial or second continuation evidence cannot produce green", async () => {
+  const failedFirst = "report.completed[all[0]] = { at: now, status: 'failed', failures: ['parallel assertion'], tests: { passed: 0, failed: 1, skipped: 0 } };";
+  for (const first of ["", failedFirst]) {
+    const f = strandedFixture(first);
+    const row = await evaluateManifestedTest("vitest run", f.repo, { artifactDir: f.artifacts });
+    expect(row.pass, row.details).toBe(first === "");
+    expect(f.runs().map(run => run.files)).toEqual([f.files, f.files.slice(2)]);
+    expect(row.evidenceReceipts?.filter(receipt => f.runs().some(run => receipt.invocationId === run.nonce))).toHaveLength(2);
+    if (first) { expect(row.kind).toBe("work"); expect(row.details).toContain("parallel assertion"); expect(row.meta.failingTests).toContain("parallel assertion"); }
+    for (const run of f.runs()) { expect(readTestReport(run.reportPath)?.nonce).toBe(run.nonce); expect(row.details).toContain(run.nonce); }
+  }
+  const faults = [
+    { mode: "pass", mutation: "", mismatch: true },
+    { mode: "pass", mutation: "delete report.completed[files[0]];", mismatch: false },
+    { mode: "pass", mutation: "report.requested.pop();", mismatch: false },
+    { mode: "pass", mutation: "report.nonce = 'stale';", mismatch: false },
+    { mode: "pass", mutation: "report.duplicateCompletions = [files[0]];", mismatch: false },
+    { mode: "pass", mutation: "delete report.certificate;", mismatch: false },
+    { mode: "stranded", mutation: "", mismatch: false },
+    { mode: "failed", mutation: "", mismatch: false },
+  ];
+  for (const fault of faults) {
+    const f = strandedFixture("", fault.mode, false, fault.mutation, fault.mismatch);
+    const row = await evaluateManifestedTest("vitest run", f.repo, { artifactDir: f.artifacts });
+    expect(row.pass, JSON.stringify(fault)).toBe(false); expect(f.runs().length).toBeLessThanOrEqual(2);
+    expect(row.meta.retryable).toBe(false);
+  }
+  const disabled = strandedFixture();
+  expect((await evaluateManifestedTest("vitest run", disabled.repo, { artifactDir: disabled.artifacts, allowStrandedRecovery: false })).pass).toBe(false);
+  expect(disabled.runs()).toHaveLength(1);
 }, 180_000);

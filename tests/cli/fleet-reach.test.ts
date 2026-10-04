@@ -7,8 +7,10 @@ import { expect, test } from "vitest";
 import { FakeAdapter } from "../../src/adapters/fake.js";
 import * as registry from "../../src/adapters/registry.js";
 import { channelsFromConfig, type WorkerAdapter } from "../../src/adapters/types.js";
-import { fleet, type FleetIO } from "../../src/cli/commands/fleet.js";
-import { DENY_SCOPES, type DenyScope, denyEntriesAt, loadConfig } from "../../src/config/config.js";
+import { assembleFleetEditor, fleet, type FleetIO } from "../../src/cli/commands/fleet.js";
+import { DENY_SCOPES, type DenyScope, denyEntriesAt, loadConfig, loadConfigWithMode, type TickmarkrConfig } from "../../src/config/config.js";
+import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
+import type { FleetEditorState, FleetOverlayReview } from "../../src/tui/ink/fleet-app.js";
 import { exclusionCollector } from "../../src/route/preference.js";
 import { makeRepo } from "../helpers/tmprepo.js";
 
@@ -1305,3 +1307,246 @@ test("test: a channel excluded by an adapter wide entry in any enumerated deny s
     expect(lines(frames).find((line) => line.includes("reach: in")), `${scope.dotted} rendered as in`).toBeUndefined();
   }
 }, 90_000); // one production browser session per scope
+
+// v2.6.7 T5: the closed grouped membership edit table through production assembleFleetEditor → the actual Ink
+// editor → reviewOverlay → commit (the sequence fleet() runs), then a fresh load and production rolePools.
+// A suffix-only group (C-low, C-high, C-max; classifyModel C-max) beside unrelated admitted fake:A/B and codex.
+const T5_TIERS = "tiers:\n  fake:\n    vendor: fake\n    channel: sub\n    models:\n      A: mid\n      B: mid\n  codex:\n    vendor: openai\n    channel: sub\n    models:\n      gpt-6-sol: mid\n";
+const T5_ROLES = ["worker", "judge", "review", "consult"] as const;
+async function t5Session(user: string, served: Record<string, string[]>, identities: Record<string, string> = {}) {
+  const repo = makeRepo({ "keep.txt": "x", ".tickmarkr/config.yaml": "# no fleet family here\n" });
+  const globalDir = mkdtempSync(join(tmpdir(), "tickmarkr-t5-reach-g-"));
+  const userPath = join(globalDir, "config.yaml");
+  writeFileSync(userPath, user);
+  const script = join(repo, "fake.json");
+  writeFileSync(script, JSON.stringify({ tasks: {} }));
+  const adapters = ["fake", "codex"].map((id) => Object.assign(Object.create(new FakeAdapter(script)) as WorkerAdapter, {
+    id,
+    vendor: id === "codex" ? "openai" : "fake",
+    channels: (candidate: TickmarkrConfig) => channelsFromConfig(id, candidate),
+    probe: async () => {
+      throw new Error("fleet-reach forbids a live probe");
+    },
+  }));
+  const at = new Date().toISOString();
+  registry.writeDoctor(repo, Object.fromEntries(Object.entries(served).map(([id, models]) => [id, {
+    installed: true, authed: true, version: "cached", models, modelsDetectedAt: at,
+    modelAuth: Object.fromEntries(models.map((m) => [m, { authed: true, probedAt: at, ...(identities[`${id}:${m}`] ? { identity: identities[`${id}:${m}`] } : {}) }])),
+  }])));
+  const health = registry.readDoctor(repo)!;
+  const { input, output, writes } = terminal();
+  const assembled = await assembleFleetEditor(repo, adapters, { input, output, debug: true } as FleetIO, { globalDir });
+  if ("unavailable" in assembled) throw new Error(assembled.unavailable);
+  let review: FleetOverlayReview | undefined;
+  let staged: FleetEditorState | undefined;
+  const reviewOverlay = assembled.props.reviewOverlay;
+  assembled.props.reviewOverlay = (state) => {
+    staged = structuredClone(state);
+    review = reviewOverlay(state);
+    return review;
+  };
+  const { runFleetInkEditor } = await import("../../src/tui/ink/fleet-app.js");
+  const done = runFleetInkEditor(assembled.props);
+  const frame = () => strip(writes.findLast((chunk) => strip(chunk).includes("tickmarkr fleet")) ?? "");
+  // the terminal pumps one key per turn: settled once no frame has landed for 150 consecutive turns
+  const settle = async () => {
+    for (let idle = 0, turns = 0; idle < 150 && turns < 30_000; turns++) {
+      const count = writes.length;
+      await new Promise((resolve) => setTimeout(resolve, 2));
+      idle = writes.length === count ? idle + 1 : 0;
+    }
+  };
+  const key = async (bytes: string) => {
+    input.write(bytes);
+    await settle();
+  };
+  await settle();
+  const rowLine = (label: string) => frame().split("\n").findLast((line) => line.includes(`fake/${label} `)) ?? "";
+  const loaded = () => loadConfigWithMode(repo, { globalDir }).cfg;
+  return {
+    repo, userPath, key, frame, rowLine, loaded,
+    get review() { return review; },
+    get staged() { return staged; },
+    pools: (cfg = loaded()) => Object.fromEntries(Object.entries(registry.rolePools(cfg, adapters, health))
+      .map(([role, channels]) => [role, channels.map((c) => `${c.adapter}:${c.model}`)])) as Record<string, string[]>,
+    async classify(label: string) {
+      await key(`/fake/${label}\r`);
+      await key("t");
+      await key(KEYS.down + "\r");
+      await key("cached benchmark\r");
+    },
+    async save() {
+      await key("w");
+      if (review?.kind !== "diff") throw new Error(`expected a diff, got ${JSON.stringify(review)}`);
+      expect(review.path).toBe(userPath);
+      input.write("y");
+      const result = await done;
+      expect(assembled.commit(result)).toContain(`fleet: wrote ${userPath}`);
+      expect(readFileSync(userPath, "utf8")).toBe(review.after); // reviewed bytes = saved bytes
+      return parseYaml(review.after) as { routing?: Record<string, unknown> & { deny?: Record<string, unknown> } };
+    },
+    async quit() {
+      input.write("\x03");
+      return assembled.commit(await done);
+    },
+  };
+}
+
+test("production Fleet executes the closed grouped membership edit table for row rail and covering controls preserving one owning lift per member and shared-entry protection versus a group edit that misses a member or lifts another channel's entry", async () => {
+  const GROUP = ["C-low", "C-high", "C-max"];
+  const served = { fake: ["A", "B", ...GROUP], codex: ["gpt-6-sol"] };
+  expect(GROUP.length).toBeGreaterThan(1);
+  const has = (list: string[], model: string) => list.includes(`fake:${model}`);
+
+  // out · all seats, then out · workers, then in — each endpoint published from its own session; the
+  // promotion/demotion/clear applies to EVERY member and an intermediate state never reaches the file
+  // (the writer restates an all-seats deny in the allow form, so out · all reads `out allow`)
+  const endpoints = [
+    { presses: [REACH_ALL], cell: /mid\s+out all/, workers: [] as string[], out: [...T5_ROLES] as string[] },
+    { presses: [REACH_ALL, REACH_WORKERS], cell: /mid\s+out workers\s/, workers: GROUP, out: ["worker"] },
+    { presses: [REACH_ALL, REACH_WORKERS, REACH_IN], cell: /mid\s+in\s/, workers: [] as string[], out: [] as string[] },
+  ];
+  for (const endpoint of endpoints) {
+    const s = await t5Session(T5_TIERS, served);
+    await s.classify("C");
+    for (const press of endpoint.presses) await s.key(press);
+    expect(s.rowLine("C"), s.frame()).toMatch(endpoint.cell);
+    const written = await s.save();
+    const deny = (written.routing?.deny ?? {}) as { models?: string[]; workers?: { models?: string[] } };
+    expect([...(deny.workers?.models ?? [])].sort()).toEqual(endpoint.workers.map((model) => `fake:${model}`).sort());
+    // only the final state is published: no all-seats entry survives a demotion or a clear
+    if (endpoint.out.length < T5_ROLES.length) expect(deny.models ?? []).toEqual([]);
+    const pools = s.pools();
+    for (const role of T5_ROLES) {
+      for (const model of GROUP) expect(has(pools[role], model), `${endpoint.presses.length} ${role} ${model}`).toBe(!endpoint.out.includes(role));
+      expect(pools[role]).toEqual(expect.arrayContaining(["fake:A", "fake:B", "codex:gpt-6-sol"]));
+    }
+  }
+
+  // every schema-declared own deny scope beside an own allow-complement entry on the NONREPRESENTATIVE C-low:
+  // the first in lifts only the selected reason (the deny, then each other member's seed), the second admits it
+  const allowForm = "  allow:\n    models: [fake:A, fake:B, codex:gpt-6-sol]\n";
+  for (const scope of DENY_SCOPES) {
+    const leaf = scope.path.slice(2).reduceRight<unknown>((inner, segment) => ({ [segment]: inner }), ["fake:C-low"]);
+    const denyYaml = stringifyYaml({ deny: leaf }).split("\n").filter(Boolean).map((line) => `  ${line}`).join("\n");
+    const s = await t5Session(`${T5_TIERS}routing:\n${allowForm}${denyYaml}\n`, served);
+    await s.classify("C");
+    await s.key(REACH_IN);
+    expect(s.frame(), scope.dotted).toContain(`space: cleared fake:C-low from ${scope.dotted}; cleared fake:C-high from routing.allow`);
+    expect(s.rowLine("C"), scope.dotted).toMatch(/mid\s+partial\s/);
+    // the picker's now-line: only C-low's second own reason remains — every other member was admitted
+    await s.key(KEYS.space);
+    expect(s.frame(), scope.dotted).toContain("now: out-all (partial: not every channel) — C-low: routing.allow (not admitted)");
+    await s.key("\x1b");
+    await s.key(REACH_IN);
+    expect(s.frame(), scope.dotted).toContain("space: cleared fake:C-low from routing.allow");
+    expect(s.rowLine("C"), scope.dotted).toMatch(/mid\s+in\s/);
+    await s.save();
+    const cfg = s.loaded();
+    expect(denyEntriesAt(cfg.routing, scope) ?? [], scope.dotted).not.toContain("fake:C-low");
+    const pools = s.pools(cfg);
+    for (const role of T5_ROLES) for (const model of ["A", ...GROUP]) expect(has(pools[role], model), `${scope.dotted} ${role} ${model}`).toBe(true);
+  }
+
+  // a doctor list that repeats a member is still ONE member: one in takes one own reason from C-low (its deny),
+  // never its allow-complement seed too — C-low stays out while every other member is admitted
+  {
+    const doubled = { ...served, fake: ["A", "B", "C-low", ...GROUP] };
+    const s = await t5Session(`${T5_TIERS}routing:\n${allowForm}  deny:\n    models: [fake:C-low]\n`, doubled);
+    await s.classify("C");
+    await s.key(REACH_IN);
+    expect(s.frame()).toContain("space: cleared fake:C-low from routing.deny.models; cleared fake:C-high from routing.allow");
+    expect(s.frame()).not.toContain("cleared fake:C-low from routing.allow");
+    expect(s.rowLine("C")).toMatch(/mid\s+partial\s/);
+    const written = await s.save();
+    expect((written.routing?.deny as { models?: string[] } | undefined)?.models ?? []).not.toContain("fake:C-low");
+    const pools = s.pools();
+    for (const role of T5_ROLES) {
+      expect(has(pools[role], "C-low"), `${role} C-low`).toBe(false);
+      for (const model of ["C-high", "C-max"]) expect(has(pools[role], model), `${role} ${model}`).toBe(true);
+    }
+  }
+
+  // restrictive allow over overlapping recorded identities (C-high recorded as C-low): the seed classification
+  // generated for C-low also reaches its peer C-high, so it is the group's own — one in admits both members.
+  // An AUTHORED deny over the same overlap stays shared: in takes only the seeds, and l owns that entry
+  {
+    const overlap = { fake: ["A", "B", "C-low", "C-high"], codex: ["gpt-6-sol"] };
+    const recorded = { "fake:C-high": "C-low" };
+    for (const authored of [false, true]) {
+      const deny = authored ? "  deny:\n    models: [fake:C-low]\n" : "";
+      const s = await t5Session(`${T5_TIERS}routing:\n${allowForm}${deny}`, overlap, recorded);
+      await s.classify("C");
+      await s.key(REACH_IN);
+      expect(s.frame(), `authored ${authored}`).toContain("space: cleared fake:C-low from routing.allow; cleared fake:C-high from routing.allow");
+      if (authored) {
+        expect(s.rowLine("C")).toMatch(/mid\s+out all\s/);
+        expect(s.frame()).toContain("covered by routing.deny.models (fake:C-low) — shared: covers fake:C-low, fake:C-high (C-low) — l lifts that one entry");
+        await s.key("l");
+        expect(s.frame()).toContain("lift · routing.deny.models (fake:C-low)");
+        await s.key("\r");
+      }
+      expect(s.rowLine("C"), `authored ${authored}`).toMatch(/mid\s+in\s/);
+      await s.save();
+      const pools = s.pools();
+      for (const role of T5_ROLES) for (const model of ["C-low", "C-high"]) expect(has(pools[role], model), `${authored} ${role} ${model}`).toBe(true);
+    }
+  }
+
+  // a covering entry shared with another real channel: the bare model C-low also covers codex:C-low. The row act
+  // edits nothing it does not own and names the l control; l lifts that one entry for both channels
+  {
+    const shared = { fake: [...served.fake], codex: ["gpt-6-sol", "C-low"] };
+    const user = `${T5_TIERS.replace("      gpt-6-sol: mid\n", "      gpt-6-sol: mid\n      C-low: mid\n")}routing:\n  deny:\n    models: [C-low]\n`;
+    const s = await t5Session(user, shared);
+    await s.classify("C");
+    expect(s.rowLine("C")).toMatch(/mid\s+partial\s/);
+    expect(s.frame()).toContain("covered by routing.deny.models (C-low) — shared: covers fake:C-low, codex:C-low — l lifts that one entry");
+    await s.key(REACH_IN);
+    expect(s.frame()).toContain("fake:C-low stays out — routing.deny.models (C-low) covers 2 channels — Space edits only this channel's own entries");
+    expect(s.rowLine("C")).toMatch(/mid\s+partial\s/);
+    await s.key("l");
+    expect(s.frame()).toContain("lift · routing.deny.models (C-low)");
+    await s.key("\r");
+    expect(s.rowLine("C")).toMatch(/mid\s+in\s/);
+    await s.save();
+    const pools = s.pools();
+    for (const role of T5_ROLES) {
+      for (const model of GROUP) expect(has(pools[role], model), `${role} ${model}`).toBe(true);
+      expect(pools[role], role).toContain("codex:C-low");
+    }
+  }
+  // versus a group act lifting it: with the shared entry left, the other channel keeps its exclusion
+  {
+    const shared = { fake: [...served.fake], codex: ["gpt-6-sol", "C-low"] };
+    const user = `${T5_TIERS.replace("      gpt-6-sol: mid\n", "      gpt-6-sol: mid\n      C-low: mid\n")}routing:\n  deny:\n    models: [C-low]\n`;
+    const s = await t5Session(user, shared);
+    await s.classify("C");
+    await s.key(REACH_ALL);
+    await s.key(REACH_IN);
+    const written = await s.save();
+    expect((written.routing?.deny as { models?: string[] } | undefined)?.models).toEqual(["C-low"]);
+    const pools = s.pools();
+    for (const role of T5_ROLES) expect(pools[role], role).not.toContain("codex:C-low");
+  }
+
+  // an adapter-wide exclusion: the row refuses and names the rail; the rail edits only the adapter's own entry
+  {
+    const s = await t5Session(`${T5_TIERS}routing:\n  deny:\n    workers:\n      adapters: [fake]\n`, served);
+    await s.classify("C");
+    expect(s.rowLine("C")).toMatch(/mid\s+out workers\s/);
+    await s.key(REACH_IN);
+    expect(s.frame()).toContain("fake:C-low stays out · workers — routing.deny.workers.adapters (fake) covers");
+    expect(s.rowLine("C")).toMatch(/mid\s+out workers\s/);
+    await s.key("\x1b");
+    await s.key("\t" + KEYS.down + KEYS.down + KEYS.down);
+    await s.key(REACH_IN);
+    expect(s.frame()).toContain("space: cleared fake from routing.deny.workers.adapters");
+    const written = await s.save();
+    // the rail cleared its own adapter entry (a cleared list is tombstoned null, never left holding fake)
+    expect((written.routing?.deny as { workers?: { adapters?: string[] | null } } | undefined)?.workers?.adapters ?? null).toBeNull();
+    const pools = s.pools();
+    for (const role of T5_ROLES) for (const model of GROUP) expect(has(pools[role], model), `${role} ${model}`).toBe(true);
+  }
+}, 600_000);
+

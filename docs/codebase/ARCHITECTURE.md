@@ -47,8 +47,8 @@
                                 ▼
 ┌───────────────────────────────────────────────────────────────────┐
 │  GATES (never trust the worker) — `src/gates/`                       │
-│  mandatory build/test/lint/evidence/scope battery                   │
-│  → optional acceptance(judge) ‖ cross-vendor review                 │
+│  cheap build/lint/evidence/scope checks                             │
+│  → optional acceptance(judge) ‖ cross-vendor review → one full test │
 └──────────────────────────────┬──────────────────────────────────────┘
                                 │  every gate passes
                                 ▼
@@ -90,7 +90,7 @@ Side modules (CLI-facing, not in the dispatch loop):
 | Run lock | Advisory per-run lock over `.tickmarkr/graph.json` (link idiom + heartbeat) | `src/run/lock.ts` |
 | Pane reconcile | Pure fold over journal rows → desired herdr pane set for orphan cleanup | `src/run/reconcile.ts` |
 | Stall normalize | Presentation-token stripper for stall-inactivity compare (spinner-safe) | `src/run/stall.ts` |
-| Gate sequencer | Mandatory deterministic battery stops at first failure; enabled acceptance/review run concurrently afterward, both fail closed; a review-driven repair runs them before its test screen, and the full merge-candidate suite still runs last | `src/gates/run-gates.ts` |
+| Gate sequencer | Cheap build/lint/evidence/scope checks stop at first failure; enabled acceptance/review then run concurrently before any test payload, both fail closed; only an admitted attributed test-red diagnostic precedes them, and one full merge-candidate job still runs last | `src/gates/run-gates.ts` |
 | LLM dispatch | Shared headless-vs-pane execution for judge/review/consult prompts + defensive JSON extraction | `src/gates/llm.ts` |
 
 ## Pattern Overview
@@ -209,31 +209,51 @@ on the print side.
 order. The first five are mandatory; only acceptance and review may be omitted by task or
 disabled by supported shape policy. Declaration order is the Run matrix/returned-record
 order, not the execution timeline. The single pipeline in `src/gates/run-gates.ts`
-rejects a dirty entry and screens evidence/scope before shell work,
-then run build, lint, evidence, scope and test, stopping at the first deterministic red.
+rejects a dirty entry and screens evidence/scope before shell work, then runs the cheap
+checks — build, lint, evidence, scope — stopping at the first deterministic red.
 `src/gates/baseline.ts` compares tool failures against the recorded baseline. The cheap
-screen does not replace the later evidence/scope checks. Only after that battery passes
-(or, in the one repair mode below, after build, lint, evidence and scope)
-do enabled acceptance and review start concurrently; both must pass, and each completion
-is journaled when it arrives. All callers and fixtures use this same execution path.
-If a non-final round selects covering tests, a green selection is held until the full
-suite runs on the same merge-candidate commit; no subset-only result authorizes merge.
+screen does not replace the later evidence/scope checks. After the cheap checks the closed
+order table decides when any test-gate payload starts; all callers and fixtures use this path:
 
-The repair mode is decided by what the round carries, closed over three cases. A repair the
-review sent back — it carries a `review:material` finding, test selection is on and no repair
-test is required — runs build, lint, evidence and scope, then acceptance ‖ review, then its
-test screen, then the unchanged merge-candidate full suite. A semantic red ends that round with
-zero test starts; dirt the judge's oracles or a reviewer's CLI left is refused at the test gate
-before any screen runs or any cached green answers for the changed subject; a seatless,
-cancelled semantic round starts no test either, and records its test as owed. A review that
-returns no verdict is not a semantic red: the daemon re-asks only the review, so the round still
-runs its screen and full suite beside it. A test-red repair (selection off, or a
-required repair test) and every first attempt keep the battery-first order above.
+- **Fresh candidate or semantic repair:** enabled acceptance and review start concurrently
+  before any test payload; both must pass, and each completion is journaled when it arrives. A
+  decisive semantic red ends the round with zero diagnostic or full test-gate payloads (a required
+  acceptance oracle still executes); otherwise ONE full verification job follows, with no screen.
+- **Attributed behavioral test-red repair** (`src/run/repair-selection.ts`): one optional
+  diagnostic — every required failing file plus the tests the import scan reaches from the diff —
+  admitted only on comparable harness timing with ratio <= 0.15 AND estimated cost <= 60000 ms
+  (`diagnosticAdmission`; admission evidence, not a kill ceiling). Its behavioral red ends the
+  round before semantics; an infrastructure red is no verdict and never green; otherwise
+  semantics precede the full job.
+- **Selection disabled, unsupported (renames, deletions, unreachable changes, a missing required
+  file), over the 3000 analyzable-path cap (counted after planning and other non-analyzable paths
+  are filtered), or unknown/over-bound timing:** no diagnostic — semantics, then the full job. The
+  recorded `selectionDecision` names the reason that actually decided scope.
+- **Recoverable seatless or no-verdict review:** acceptance finishes and publishes independently;
+  the full job still runs in-round absent a decisive red; the review stays unsatisfied until the
+  daemon's review-only recovery (`runReviewRecovery`) supplies a verdict. A judge that then cannot
+  launch cancels nothing: acceptance is missing proof, owed (`gateOwed`) beside that full job.
+- **Seatless acceptance with review pending:** the sibling is cancelled (a genuinely cancelled
+  round); the test is owed (`testOwed`) and (D-974) every other enabled gate left without a
+  verdict, an unrecorded review included, gets an owed row (`pass: false`, `skipped`, `infra`,
+  `retryable: false`, `gateOwed`); no merge, an infra park. Owed rows land only when no decisive
+  red is present, and a gate the task omits or its shape disables is never owed.
+- **Actual cancellation or a thrown sibling:** cleanup is awaited and the round throws, leaving no
+  mergeable or recoverable partial set.
+- **Test-only verification (no acceptance or review gate enabled, daemon or standalone) or an
+  explicit full recheck:** full scope, no invented semantic gate, no diagnostic
+  (`selectionDecision.reason` `test-only-verification` or `recheck-full-suite`).
+
+Nothing merges on a subset: the full suite runs on the same merge-candidate commit, and a
+selected green never replaces it; an exact full green from the verdict store answers only after
+its identity, environment, cleanliness and current complete-manifest checks succeed. A fresh full green —
+test-only verification included — answers only while the identity it measured and the complete
+manifest the runner lists after its own command still hold: stale, it is published unverdicted and
+one fresh job measures again, and a stale last job fails closed; neither is cached.
 Replay of the T4 shape — a review-driven repair whose worker lands no change: build and lint
 reuse their verdicts for the unchanged tree, the review re-judges the same subject first, and
-when it re-reds the round buys no test run; when it passes, the screen and the full suite on
-the merge-candidate commit still decide (a qualified full green on that exact identity may
-answer), so semantic success never stands in for full proof.
+when it re-reds the round buys no test run; when it passes, the one full job on the
+merge-candidate commit still decides, so semantic success never stands in for full proof.
 
 A declared gate is not a passed gate. Replay `task-dispatch T1` without a build result:
 build is **not-run**, not pass. `gate-start build` makes it **running**; a `gate-result`
@@ -270,7 +290,7 @@ instead of introducing another help skill or independent instructions.
 7. The task prompt is written to disk (`writePrompt`, `src/adapters/prompt.ts:27-32`) and dispatched into a named slot via `driver.slot()` + `driver.run()` — interactive TUI by default, print-mode fallback otherwise (`src/run/daemon.ts:168-218`)
 8. Daemon waits for the `TICKMARKR_RESULT` trailer (regex-anchored to avoid matching the prompt's own template text) or the `TICKMARKR_EXIT:` fast-fail marker, paging the operator once if the pane goes `blocked`/`idle` (`src/run/daemon.ts:181-211`, `src/adapters/prompt.ts:37`)
 9. Output is parsed by the adapter (`adapter.parse()` → `parseWorkerResult`, `src/adapters/prompt.ts:39-73`); a quota-exhaustion signal triggers channel failover without consuming the escalation ladder (`src/run/daemon.ts:224-238`)
-10. `runGates()` runs the mandatory deterministic battery, then enabled acceptance and review concurrently — or, for a review-driven repair, the cheap gates, then acceptance ‖ review, then the test screen and the full suite; see the execution, repair-mode and selected/full-suite rules above (`src/gates/run-gates.ts`).
+10. `runGates()` runs the cheap build/lint/evidence/scope checks, then — after an admitted attributed test-red diagnostic, if any — enabled acceptance and review concurrently, then the one full test job; see the closed order table and the full-proof rules above (`src/gates/run-gates.ts`).
 11. All gates pass → `mergeTask()` merges the task branch into the integration branch through a serialized merge queue (`mergeSerial`, `src/run/daemon.ts:80-84`, `src/run/merge.ts:28-41`); task status becomes `done`
 12. Any gate fails → escalation ladder step (`retry` → `escalate` channel → `consult` → `human`); a `consult()` call can also fire directly on stall or merge conflict (`src/run/daemon.ts:294-315`, `src/run/consult.ts:52-81`)
 13. Every state transition is appended to `journal.jsonl` (`src/run/journal.ts:58-61`); on run end, kept panes close, an operator notification fires, and a `RunSummary` is returned (`src/run/daemon.ts:338-350`)

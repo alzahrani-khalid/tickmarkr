@@ -2,9 +2,10 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { stringify } from "yaml";
 import { afterEach, expect, test, vi } from "vitest";
+import { FakeAdapter } from "../../src/adapters/fake.js";
 import { DEFAULT_CONFIG } from "../../src/config/config.js";
 import { resetCalmWindowForTests, setCalmWindowForTests, type Baseline } from "../../src/gates/baseline.js";
-import { reobserveTestFiles, runGates } from "../../src/gates/run-gates.js";
+import { type GateContext, reobserveTestFiles, runGates } from "../../src/gates/run-gates.js";
 import { RUNNER_INFRA_DIAGNOSTIC_RE, TIMEOUT_SHAPED_RE, timeoutShaped } from "../../src/gates/timeout-shaped.js";
 import type { GateResult } from "../../src/gates/types.js";
 import { validateGraph } from "../../src/graph/schema.js";
@@ -78,19 +79,32 @@ const task = validateGraph({ version: 1, spec: { source: "native", paths: ["s"],
   { id: "T1", title: "proof", goal: "proof", shape: "implement", complexity: 3, files: ["**"], acceptance: ["done"],
     gates: ["build", "test", "lint", "evidence", "scope"] },
 ] }).tasks[0]!;
+// v2.6.7 T1: an attributed diagnostic only runs beside a semantic gate; test-only verification keeps full scope.
+const diagnosed = { ...task, gates: [...task.gates, "acceptance" as const] };
+function judged() {
+  const scriptPath = join(makeTestTempDir("tickmarkr-judged-"), "s.json");
+  writeFileSync(scriptPath, JSON.stringify({ tasks: {}, judge: { pass: true, criteria: [{ criterion: "c1", met: true, reason: "ok" }] } }));
+  const cfg = structuredClone(DEFAULT_CONFIG);
+  cfg.judge.adapter = "fake";
+  return { cfg, adapters: [new FakeAdapter(scriptPath)] };
+}
 const fixture = () => makeRepo({ ".gitignore": ".tickmarkr/\nnode_modules/\n.vitest-cache/\n",
   ...Object.fromEntries(FILES.map((f) => [f, "// stand-in runner fixture\n"])) });
 
-interface Policy { authorizeInfraRetry?: (subject: string, cause?: "infrastructure" | "host-starved") => boolean; selectTests?: boolean }
+interface Policy {
+  authorizeInfraRetry?: (subject: string, cause?: "infrastructure" | "host-starved") => boolean; selectTests?: boolean;
+  requiredRepairTests?: string[]; selectionReason?: string; baseline?: Baseline; onGate?: GateContext["onGate"];
+}
 /** One production runGates round over a worker commit; `touch` edits test files so a screen selects them. */
 async function round(repo: string, cmd: string, policy: Policy = {}, touch: string[] = []): Promise<GateResult> {
   const baseRef = await gitHead(repo);
   writeFileSync(join(repo, "work.txt"), "work\n");
   for (const f of touch) writeFileSync(join(repo, f), "// touched by the worker\n");
   await shGitOk("git add -A && git commit --no-gpg-sign -m work", repo);
-  const { results } = await runGates(task, { worktree: repo, baseRef, commands: { test: cmd }, baseline,
+  const { results } = await runGates(policy.requiredRepairTests ? diagnosed : task, { worktree: repo, baseRef, commands: { test: cmd }, baseline,
     author: { adapter: "fake", model: "fake-1", tier: "frontier", channel: "sub" }, channels: [], adapters: [],
-    result: { ok: true, summary: "work", deviations: [], raw: "" }, cfg: structuredClone(DEFAULT_CONFIG), ...policy });
+    result: { ok: true, summary: "work", deviations: [], raw: "" }, cfg: structuredClone(DEFAULT_CONFIG),
+    ...(policy.requiredRepairTests ? judged() : {}), ...policy });
   return results.find((g) => g.gate === "test")!;
 }
 
@@ -159,14 +173,20 @@ test("production runGates remeasures the exact original two-file D-873-shaped se
     expect(result.evidenceReceipt?.nonce, label).toBe(calls[1]!.nonce);
   }
 
-  // The same D-873 row as a selected screen: the screen's own two-file selection is what is remeasured,
-  // and the merge-candidate full suite still runs after it.
+  // The same D-873 row as an admitted attributed test-red diagnostic (v2.6.7 T1: comparable timing,
+  // 10000 ms and 1/13 of the suite, with per-file hang budgets far above the stand-in's runtime): the
+  // diagnostic's own two-file selection is what is remeasured, and the merge-candidate full suite still runs after it.
   const screen = runner([D873, clean, clean]);
-  const result = await round(fixture(), screen.command, { selectTests: true }, pair);
+  const timed: Baseline = { commands: { test: { ...baseline.commands.test!,
+    fileDurations: FILES.map((file) => ({ file, durationMs: pair.includes(file) ? 5_000 : 30_000 })) } } };
+  const ends: GateResult[] = [];
+  const result = await round(fixture(), screen.command, { selectTests: true, requiredRepairTests: pair, selectionReason: "known-failing-files",
+    baseline: timed, onGate: (e) => { if (e.phase === "end" && e.gate === "test") ends.push(e.result); } }, pair);
   expect(screen.calls().map((c) => c.files)).toEqual([pair, pair, FILES]);
   expect(result.pass, result.details).toBe(true);
   expect(result.meta).toMatchObject({ fullSuite: true, selectedTests: pair });
-  expect(result.evidenceReceipts).toHaveLength(6);
+  // the diagnostic's own published row keeps both remeasured histories; the full row keeps its own
+  expect(ends.map((r) => r.evidenceReceipts?.length)).toEqual([4, 2]);
 
   // A persistent shaped red stays red on its second sample: two payloads, never a third.
   const persistent = runner([D873, D873]);

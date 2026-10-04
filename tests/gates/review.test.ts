@@ -144,6 +144,14 @@ test("test: a task declaring no out of scope items renders delivered and saved r
     and marks its evidence executed (you ran the reproducer), static (you traced it by reading) or blocked (it
     could not run here). Blocked evidence never turns a finding into a pass, and a worker's own case table or
     enumeration never resolves a finding: judge the diff itself.
+    Report the whole class in this one review, never only its first example. Each material finding's "note" is one
+    line carrying the closed tuple "rule: <the goal clause, criterion or regressed behaviour violated> | found:
+    <every counterexample you ACTUALLY FOUND inside the declared scope, each as path:line input → consequence,
+    joined by "; "> | searched: <the boundary you actually searched: files, symbols, call sites> | uncertain:
+    <what lies outside that boundary or could not be established inside it>". Found one counterexample, list one;
+    found several, list every one in the same finding. Never list a case you did not find. Your search is bounded:
+    never claim it covered every input, caller or path beyond the boundary you name, and remaining uncertainty
+    alone is never a material finding — record it under uncertain, or as a deferred minor with its rationale.
 
     Respond with ONLY this JSON:
     {"nonce": "<nonce>", "approve": true|false, "resolved": [], "reraised": [], "findings": [{"note": "...", "severity": "material"|"minor", "defer": false, "rationale": ""}], "comments": [{"path": "path/to/file", "line": 42, "body": "actionable feedback", "finding": 1}]}
@@ -322,6 +330,14 @@ test("test: a task whose files[] names no test file receives a brief that says n
     and marks its evidence executed (you ran the reproducer), static (you traced it by reading) or blocked (it
     could not run here). Blocked evidence never turns a finding into a pass, and a worker's own case table or
     enumeration never resolves a finding: judge the diff itself.
+    Report the whole class in this one review, never only its first example. Each material finding's "note" is one
+    line carrying the closed tuple "rule: <the goal clause, criterion or regressed behaviour violated> | found:
+    <every counterexample you ACTUALLY FOUND inside the declared scope, each as path:line input → consequence,
+    joined by "; "> | searched: <the boundary you actually searched: files, symbols, call sites> | uncertain:
+    <what lies outside that boundary or could not be established inside it>". Found one counterexample, list one;
+    found several, list every one in the same finding. Never list a case you did not find. Your search is bounded:
+    never claim it covered every input, caller or path beyond the boundary you name, and remaining uncertainty
+    alone is never a material finding — record it under uncertain, or as a deferred minor with its rationale.
 
     Respond with ONLY this JSON:
     {"nonce": "<nonce>", "approve": true|false, "resolved": [], "reraised": [], "findings": [{"note": "...", "severity": "material"|"minor", "defer": false, "rationale": ""}], "comments": [{"path": "path/to/file", "line": 42, "body": "actionable feedback", "finding": 1}]}
@@ -1222,6 +1238,83 @@ describe("reviewGate material/minor classification (v1.70 T5)", () => {
   });
 });
 
+// D-966 (v2.6.7 T3): one review names the whole class a material finding belongs to, through the note.
+describe("class-complete review notes (D-966)", () => {
+  const tuple = (found: string[]) =>
+    `rule: criterion a — every retry stays inside the bounded loop | found: ${found.join("; ")} | searched: src/retry.ts and its two callers | uncertain: callers outside the declared scope were not searched`;
+  const one = ["src/retry.ts:41 attempt 3 → the final retry is dropped"];
+  const two = [...one, "src/retry.ts:57 attempt 0 → the loop never starts"];
+
+  async function reviewWith(findings: object[], channels = CH) {
+    const { repo, base } = repoWithCommit();
+    const fake = fakeWith({ review: { approve: false, findings } });
+    const command = fake.headlessCommand.bind(fake);
+    let brief = "";
+    fake.headlessCommand = (file, model) => {
+      brief = readFileSync(file, "utf8");
+      return command(file, model);
+    };
+    const result = await reviewGate(mkTask(), repo, base, author, channels, [fake], DEFAULT_CONFIG);
+    return { brief, result };
+  }
+
+  test("test: production reviewGate requests the closed finding-note tuple that a fake reviewer returns intact in recorded details for two found counterexamples versus one", async () => {
+    for (const found of [two, one]) {
+      const note = tuple(found);
+      const { brief, result } = await reviewWith([{ note, severity: "material", defer: false, rationale: "" }]);
+      // The request: the four closed labels, every found counterexample, a bounded search.
+      for (const label of ["rule: <", "| found:\n<every counterexample you ACTUALLY FOUND inside the declared scope", "| searched: <", "| uncertain:\n<"]) {
+        expect(brief).toContain(label);
+      }
+      expect(brief).toContain("never only its first example");
+      expect(brief).toContain("found several, list every one in the same finding. Never list a case you did not find.");
+      expect(brief).toContain("never claim it covered every input, caller or path beyond the boundary you name");
+      expect(brief).toContain("remaining uncertainty\nalone is never a material finding");
+      // The transport: the note survives byte for byte into details and the structured row.
+      expect(result.pass).toBe(false);
+      expect(result.details).toContain(`requested changes (1 material)\n- [material] ${note}`);
+      const rows = result.meta?.findings as StructuredFinding[];
+      expect(rows.map((row) => [row.class, row.note])).toEqual([["review:material", note]]);
+      const recorded = /\| found: (.*?) \| searched: /.exec(rows[0]!.note)![1]!.split("; ");
+      expect(recorded).toEqual(found);
+    }
+  });
+
+  test("test: production reviewGate still blocks one real material defect while minor deferred and bounded uncertainty keep their existing classification and author vendor floor selection", async () => {
+    const minor = { note: "rename the retry helper", severity: "minor" };
+    const deferred = { note: "helper could be memoized", severity: "minor", defer: true, rationale: "not hot on this path" };
+    const uncertain = {
+      note: "rule: criterion a | found: none | searched: src/retry.ts | uncertain: callers outside the declared scope were not searched",
+      severity: "minor", defer: true, rationale: "uncertainty alone is not a defect",
+    };
+    // A cheap cross-vendor seat is below the author's frontier floor and is never picked.
+    const pool: BillingChannel[] = [...CH, { adapter: "fake", vendor: "fake-c", model: "fake-3", channel: "api", tier: "cheap" }];
+    const selection = {
+      reviewer: "fake:fake-2", reviewerTier: "frontier", vendor: "fake-b", provider: "fake-b",
+      reviewerFloor: "frontier", reviewerFloorCause: "author-tier",
+    };
+
+    const blocked = (await reviewWith([{ note: tuple(one), severity: "material" }, minor, deferred, uncertain], pool)).result;
+    expect(blocked.pass).toBe(false);
+    expect(blocked.meta).toMatchObject(selection);
+    expect(blocked.details.split("\n").slice(1)).toEqual([
+      `- [material] ${tuple(one)}`,
+      "- [minor] rename the retry helper",
+      "- [deferred/minor] helper could be memoized — rationale: not hot on this path",
+      `- [deferred/minor] ${uncertain.note} — rationale: uncertainty alone is not a defect`,
+    ]);
+    expect(blocked.details).toContain("requested changes (1 material)");
+    expect((blocked.meta!.findings as StructuredFinding[]).map((row) => row.class))
+      .toEqual(["review:material", "review:minor", "review:deferred/minor", "review:deferred/minor"]);
+
+    const approved = (await reviewWith([minor, deferred, uncertain], pool)).result;
+    expect(approved.pass).toBe(true);
+    expect(approved.meta).toMatchObject(selection);
+    expect(approved.details).toContain("approved (2 deferred)");
+    expect(approved.details).toContain(uncertain.note);
+  });
+});
+
 describe("runGates ordering + short-circuit", () => {
   test("evidence failure stops before acceptance/review (no LLM spend on empty work)", async () => {
     const repo = makeRepo({ "a.txt": "x\n" }); // no commits after base
@@ -1992,6 +2085,14 @@ test("test: a round given no operator context over identical task diff plus carr
     and marks its evidence executed (you ran the reproducer), static (you traced it by reading) or blocked (it
     could not run here). Blocked evidence never turns a finding into a pass, and a worker's own case table or
     enumeration never resolves a finding: judge the diff itself.
+    Report the whole class in this one review, never only its first example. Each material finding's "note" is one
+    line carrying the closed tuple "rule: <the goal clause, criterion or regressed behaviour violated> | found:
+    <every counterexample you ACTUALLY FOUND inside the declared scope, each as path:line input → consequence,
+    joined by "; "> | searched: <the boundary you actually searched: files, symbols, call sites> | uncertain:
+    <what lies outside that boundary or could not be established inside it>". Found one counterexample, list one;
+    found several, list every one in the same finding. Never list a case you did not find. Your search is bounded:
+    never claim it covered every input, caller or path beyond the boundary you name, and remaining uncertainty
+    alone is never a material finding — record it under uncertain, or as a deferred minor with its rationale.
 
     Respond with ONLY this JSON:
     {"nonce": "<nonce>", "approve": true|false, "resolved": [], "reraised": [], "findings": [{"note": "...", "severity": "material"|"minor", "defer": false, "rationale": ""}], "comments": [{"path": "path/to/file", "line": 42, "body": "actionable feedback", "finding": 1}]}
@@ -2082,6 +2183,14 @@ test("test: a round given no operator context over identical task diff plus carr
     and marks its evidence executed (you ran the reproducer), static (you traced it by reading) or blocked (it
     could not run here). Blocked evidence never turns a finding into a pass, and a worker's own case table or
     enumeration never resolves a finding: judge the diff itself.
+    Report the whole class in this one review, never only its first example. Each material finding's "note" is one
+    line carrying the closed tuple "rule: <the goal clause, criterion or regressed behaviour violated> | found:
+    <every counterexample you ACTUALLY FOUND inside the declared scope, each as path:line input → consequence,
+    joined by "; "> | searched: <the boundary you actually searched: files, symbols, call sites> | uncertain:
+    <what lies outside that boundary or could not be established inside it>". Found one counterexample, list one;
+    found several, list every one in the same finding. Never list a case you did not find. Your search is bounded:
+    never claim it covered every input, caller or path beyond the boundary you name, and remaining uncertainty
+    alone is never a material finding — record it under uncertain, or as a deferred minor with its rationale.
 
     Respond with ONLY this JSON:
     {"nonce": "<nonce>", "approve": true|false, "resolved": [], "reraised": [], "findings": [{"note": "...", "severity": "material"|"minor", "defer": false, "rationale": ""}], "comments": [{"path": "path/to/file", "line": 42, "body": "actionable feedback", "finding": 1}]}

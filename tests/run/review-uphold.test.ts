@@ -219,7 +219,9 @@ describe("post-approval review uphold consumes an earlier waiver (OBS-571)", () 
     expect(scenario.staleSummary.human).toEqual(["T1"]);
     expect(scenario.staleEvents.some((e) => e.event === "task-dispatch")).toBe(false);
     expect(scenario.staleEvents.some((e) => e.event === "gate-result" && e.data.gate === "build")).toBe(false);
-    expect(scenario.staleEvents.some((e) => e.event === "gate-result" && e.data.gate === "test")).toBe(true);
+    // v2.6.7 T1 (closed order table): the stale round rejects on review before any test payload, and the
+    // decisive red leaves no test debt — neither a measured nor an owed test row
+    expect(scenario.staleEvents.some((e) => e.event === "gate-result" && e.data.gate === "test")).toBe(false);
     expect(scenario.staleEvents.some((e) =>
       e.event === "gate-result" && e.data.gate === "review" && e.data.pass === false
     )).toBe(true);
@@ -233,9 +235,11 @@ describe("post-approval review uphold consumes an earlier waiver (OBS-571)", () 
   });
 
   test("test: a gate waived for one enactment is run again on any later attempt's new commits so a funded attempt's battery includes the previously waived gate while a waiver that carries into commits it never released fails", () => {
+    // the recorded stale semantic subject (its review rejection) versus the funded build/test subject
     const staleCommit = scenario.staleEvents.find((e) =>
-      e.event === "gate-result" && e.data.gate === "test"
+      e.event === "gate-result" && e.data.gate === "review" && e.data.pass === false
     )?.data.commit;
+    expect(staleCommit).toEqual(expect.any(String));
     const fundedBuild = scenario.fundedEvents.find((e) =>
       e.event === "gate-result" && e.data.gate === "build"
     );

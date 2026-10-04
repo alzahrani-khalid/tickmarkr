@@ -4,6 +4,7 @@ import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileS
 import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { performance } from "node:perf_hooks";
+import { verificationPhase, withVerificationJob } from "../run/verification-job.js";
 import { TEST_REPORTER_SOURCE } from "./test-reporter.js";
 import { shq } from "../adapters/types.js";
 import { beginGateEvidence, redactGateOutput, type GateEvidenceOptions, type BaselineFileDuration } from "./baseline.js";
@@ -387,7 +388,10 @@ export function fileHangBudgetMs(file: string, baselineDurations?: readonly Base
   const timings = baselineDurations?.filter((d) => usable(d.durationMs)) ?? [];
   const longest = Math.max(0, ...timings.map((d) => d.durationMs), usable(longestFile?.durationMs) ? longestFile.durationMs : 0);
   if (!longest) return ceiling;
-  const known = timings.find((d) => d.file === file)?.durationMs;
+  // A file that was RED in the baseline ended early there: its duration is no measure of its green runtime. The
+  // failure is read from EVERY entry, before the usable-duration filter can drop a 0 ms or non-finite red one.
+  const red = baselineDurations?.some((d) => d.file === file && d.failed) ?? false;
+  const known = red ? undefined : timings.find((d) => d.file === file)?.durationMs;
   return Math.min(ceiling, known === undefined ? FILE_HANG_SLACK * longest : Math.max(FILE_HANG_SLACK * known, longest));
 }
 
@@ -621,9 +625,12 @@ function strandedSingleForkFiles(files: string[], nonce: string, run: ManifestRu
   const single = files.filter(f => scheduling[f]!.singleFork);
   const parallel = files.filter(f => !scheduling[f]!.singleFork);
   if (!single.length || !parallel.length || single.some(f => Object.hasOwn(r.started, f) || Object.hasOwn(r.completed, f))) return;
-  if (parallel.some(f => !Object.hasOwn(r.started, f)
-      || !["passed", "skipped"].includes(r.completed[f]?.status ?? "")
-      || (r.completed[f]?.tests?.failed ?? 0) !== 0)) return;
+  if (parallel.some(f => {
+    const completion = r.completed[f];
+    if (!Object.hasOwn(r.started, f) || !completion) return true;
+    if (completion.status === "failed") return !completion.failures?.length || !(completion.tests && completion.tests.failed > 0);
+    return !["passed", "skipped"].includes(completion.status) || (completion.tests?.failed ?? 0) !== 0;
+  })) return;
   return single;
 }
 
@@ -660,112 +667,131 @@ export async function evaluateManifestedTest(cmd: string, cwd: string, opts: {
   const dir = opts.artifactDir ?? mkdtempSync(join(tmpdir(), "tickmarkr-test-report-"));
   let nonce = randomBytes(16).toString("hex");
   let reportPath = join(dir, `test-manifest-report-${nonce}.json`);
-  const reporterPath = join(dir, `test-reporter-${nonce}.mjs`);
-  const evidenceReceipts: GateEvidenceReceipt[] = [];
-  let spawnedCommand = cmd;
-  let manifestPath: string | undefined;
-  let recovery: { firstNonce: string; firstReportPath: string; retryNonce: string; files: string[] } | undefined;
-  const { env, verification } = manifestEnvironment(cwd);
   try {
-    const invocation = await discoverTestManifest(cmd, cwd, { dir, nonce, env, overallCeilingMs: opts.overallCeilingMs, evidence: { ...opts.evidence, artifactDir: opts.evidence?.artifactDir ?? dir } });
-    evidenceReceipts.push(...invocation.evidenceReceipts);
-    const files = invocation.files;
-    // R41: the EXPECTED manifest is evidence in its own right — persisted beside the report with the
-    // exact discovery invocation, so a later reader can tell what this invocation was asked to prove
-    // without reconstructing it from the runner's own claims.
-    manifestPath = join(dir, `test-manifest-expected-${nonce}.json`);
-    writeFileSync(manifestPath, JSON.stringify({
-      nonce, verification, listingCommand: invocation.listing, listingExit: invocation.listingExit,
-      listingStdoutSha256: createHash("sha256").update(invocation.listingStdout).digest("hex"),
-      discoveredAt: Date.now(), files,
-    }, null, 2) + "\n");
-    writeFileSync(reporterPath, TEST_REPORTER_SOURCE);
-    spawnedCommand = `${cmd}${invocation.separator} --reporter=${shq(reporterPath)} --outputFile=${shq(reportPath)}`;
-    let invoked = await runManifestedTest(spawnedCommand, cwd, {
-      evidence: { ...opts.evidence, artifactDir: opts.evidence?.artifactDir ?? dir }, manifest: files, nonce, reportPath, env,
-      baselineDurations: opts.baselineDurations?.map((d) => ({ ...d, file: toManifestPath(d.file, cwd) })),
-      longestFile: opts.longestFile,
-      overallCeilingMs: opts.overallCeilingMs ?? DEFAULT_FILE_HANG_BUDGET_MS,
-      pollMs: 20,
-    });
-    let verdict = verifyManifestReport({ manifest: files, nonce, exitCode: invoked.exitCode,
-      report: invoked.report, killedFile: invoked.killedFile, hangBudgetMs: invoked.hangBudgetMs,
-      hangActiveMs: invoked.hangActiveMs, hangWallMs: invoked.hangWallMs });
-    evidenceReceipts.push(...invoked.evidenceReceipts);
-    const interruptions = [...invoked.interruptions];
-    const stranded = opts.allowStrandedRecovery === false ? undefined : strandedSingleForkFiles(files, nonce, invoked);
-    if (stranded) {
-      const first = invoked.report!;
-      const retryNonce = randomBytes(16).toString("hex");
-      recovery = { firstNonce: nonce, firstReportPath: reportPath, retryNonce, files: stranded };
-      nonce = retryNonce;
-      reportPath = join(dir, `test-manifest-report-${nonce}.json`);
-      const retryCommand = singleForkRetryCommand(opts.retryBaseCommand ?? cmd, cwd, stranded, files.filter(f => !stranded.includes(f)));
-      const listed = await discoverTestManifest(retryCommand, cwd, { dir, nonce, env,
-        overallCeilingMs: opts.overallCeilingMs, evidence: { ...opts.evidence, artifactDir: opts.evidence?.artifactDir ?? dir } });
-      evidenceReceipts.push(...listed.evidenceReceipts);
-      if (listed.files.length !== stranded.length || listed.files.some(f => !stranded.includes(f)))
-        throw new Error("single fork retry discovery does not match the stranded set");
-      writeFileSync(join(dir, `test-manifest-expected-${nonce}.json`), JSON.stringify({ nonce, files: stranded,
-        firstNonce: recovery.firstNonce, listingCommand: listed.listing, verification }, null, 2) + "\n");
-      spawnedCommand = `${retryCommand}${listed.separator} --reporter=${shq(reporterPath)} --outputFile=${shq(reportPath)}`;
-      invoked = await runManifestedTest(spawnedCommand, cwd, {
-        evidence: { ...opts.evidence, artifactDir: opts.evidence?.artifactDir ?? dir }, manifest: stranded, nonce, reportPath, env,
-        baselineDurations: opts.baselineDurations?.map(d => ({ ...d, file: toManifestPath(d.file, cwd) })),
-        longestFile: opts.longestFile, overallCeilingMs: opts.overallCeilingMs ?? DEFAULT_FILE_HANG_BUDGET_MS, pollMs: 20,
-      });
-      evidenceReceipts.push(...invoked.evidenceReceipts);
-      interruptions.push(...invoked.interruptions);
-      verdict = verifyManifestReport({ manifest: stranded, nonce, exitCode: invoked.exitCode,
-        report: invoked.report, killedFile: invoked.killedFile, hangBudgetMs: invoked.hangBudgetMs,
-      hangActiveMs: invoked.hangActiveMs, hangWallMs: invoked.hangWallMs });
-      // An all-skipped retry may contribute lifecycle accounting, but only the combined manifest
-      // can establish executed success. Never rewrite either invocation's persisted certificate.
-      if (verdict.pass || verdict.meta.noExecutedModules) {
-        const retry = invoked.report!;
-        if (retry.certificate?.errors !== 0 || !Array.isArray(retry.certificate.diagnostics) || retry.certificate.diagnostics.length)
-          verdict = { kind: "fail-closed", pass: false, details: "single fork retry has unknown or nonempty runner diagnostics", meta: { classification: "infra", infra: true } };
-        else verdict = verifyManifestReport({ manifest: files, nonce, exitCode: invoked.exitCode, report: {
-          ...retry, requested: files, started: { ...first.started, ...retry.started }, completed: { ...first.completed, ...retry.completed },
-        } });
+    return await withVerificationJob(cmd, cwd, reportPath, opts.evidence, async () => {
+      const reporterPath = join(dir, `test-reporter-${nonce}.mjs`);
+      const evidenceReceipts: GateEvidenceReceipt[] = [];
+      let spawnedCommand = cmd;
+      let manifestPath: string | undefined;
+      let retainedFirstVerdict: ManifestVerdict | undefined;
+      let recovery: { firstNonce: string; firstReportPath: string; retryNonce: string; files: string[] } | undefined;
+      const { env, verification } = manifestEnvironment(cwd);
+      try {
+        const invocation = await verificationPhase("discovery", `${nonce}-listing`, join(dir, `listing-${nonce}.json`), () => discoverTestManifest(cmd, cwd, { dir, nonce, env, overallCeilingMs: opts.overallCeilingMs, evidence: { ...opts.evidence, artifactDir: opts.evidence?.artifactDir ?? dir } }));
+        evidenceReceipts.push(...invocation.evidenceReceipts);
+        const files = invocation.files;
+        // R41: the EXPECTED manifest is evidence in its own right — persisted beside the report with the
+        // exact discovery invocation, so a later reader can tell what this invocation was asked to prove
+        // without reconstructing it from the runner's own claims.
+        manifestPath = join(dir, `test-manifest-expected-${nonce}.json`);
+        writeFileSync(manifestPath, JSON.stringify({
+          nonce, verification, listingCommand: invocation.listing, listingExit: invocation.listingExit,
+          listingStdoutSha256: createHash("sha256").update(invocation.listingStdout).digest("hex"),
+          discoveredAt: Date.now(), files,
+        }, null, 2) + "\n");
+        writeFileSync(reporterPath, TEST_REPORTER_SOURCE);
+        spawnedCommand = `${cmd}${invocation.separator} --reporter=${shq(reporterPath)} --outputFile=${shq(reportPath)}`;
+        let invoked = await verificationPhase("first-pass", nonce, reportPath, () => runManifestedTest(spawnedCommand, cwd, {
+          evidence: { ...opts.evidence, artifactDir: opts.evidence?.artifactDir ?? dir }, manifest: files, nonce, reportPath, env,
+          baselineDurations: opts.baselineDurations?.map((d) => ({ ...d, file: toManifestPath(d.file, cwd) })),
+          longestFile: opts.longestFile,
+          overallCeilingMs: opts.overallCeilingMs ?? DEFAULT_FILE_HANG_BUDGET_MS,
+          pollMs: 20,
+        }));
+        let verdict = verifyManifestReport({ manifest: files, nonce, exitCode: invoked.exitCode,
+          report: invoked.report, killedFile: invoked.killedFile, hangBudgetMs: invoked.hangBudgetMs,
+          hangActiveMs: invoked.hangActiveMs, hangWallMs: invoked.hangWallMs });
+        evidenceReceipts.push(...invoked.evidenceReceipts);
+        const interruptions = [...invoked.interruptions];
+        const stranded = opts.allowStrandedRecovery === false ? undefined : strandedSingleForkFiles(files, nonce, invoked);
+        if (stranded) {
+          const first = invoked.report!;
+          if (verdict.kind === "work") retainedFirstVerdict = verdict;
+          const retryNonce = randomBytes(16).toString("hex");
+          recovery = { firstNonce: nonce, firstReportPath: reportPath, retryNonce, files: stranded };
+          nonce = retryNonce;
+          reportPath = join(dir, `test-manifest-report-${nonce}.json`);
+          const retryCommand = singleForkRetryCommand(opts.retryBaseCommand ?? cmd, cwd, stranded, files.filter(f => !stranded.includes(f)));
+          const listed = await verificationPhase("continuation-discovery", `${nonce}-listing`, join(dir, `listing-${nonce}.json`), () => discoverTestManifest(retryCommand, cwd, { dir, nonce, env,
+            overallCeilingMs: opts.overallCeilingMs, evidence: { ...opts.evidence, artifactDir: opts.evidence?.artifactDir ?? dir } }), recovery.firstNonce);
+          evidenceReceipts.push(...listed.evidenceReceipts);
+          if (listed.files.length !== stranded.length || listed.files.some(f => !stranded.includes(f)))
+            throw new Error("single fork retry discovery does not match the stranded set");
+          writeFileSync(join(dir, `test-manifest-expected-${nonce}.json`), JSON.stringify({ nonce, files: stranded,
+            firstNonce: recovery.firstNonce, listingCommand: listed.listing, verification }, null, 2) + "\n");
+          spawnedCommand = `${retryCommand}${listed.separator} --reporter=${shq(reporterPath)} --outputFile=${shq(reportPath)}`;
+          invoked = await verificationPhase("continuation", nonce, reportPath, () => runManifestedTest(spawnedCommand, cwd, {
+            evidence: { ...opts.evidence, artifactDir: opts.evidence?.artifactDir ?? dir }, manifest: stranded, nonce, reportPath, env,
+            baselineDurations: opts.baselineDurations?.map(d => ({ ...d, file: toManifestPath(d.file, cwd) })),
+            longestFile: opts.longestFile, overallCeilingMs: opts.overallCeilingMs ?? DEFAULT_FILE_HANG_BUDGET_MS, pollMs: 20,
+          }), recovery.firstNonce);
+          evidenceReceipts.push(...invoked.evidenceReceipts);
+          interruptions.push(...invoked.interruptions);
+          verdict = verifyManifestReport({ manifest: stranded, nonce, exitCode: invoked.exitCode,
+            report: invoked.report, killedFile: invoked.killedFile, hangBudgetMs: invoked.hangBudgetMs,
+          hangActiveMs: invoked.hangActiveMs, hangWallMs: invoked.hangWallMs });
+          // An all-skipped retry may contribute lifecycle accounting, but only the combined manifest
+          // can establish executed success. Never rewrite either invocation's persisted certificate.
+          if (verdict.pass || verdict.meta.noExecutedModules) {
+            const retry = invoked.report!;
+            if (retry.certificate?.errors !== 0 || !Array.isArray(retry.certificate.diagnostics) || retry.certificate.diagnostics.length)
+              verdict = { kind: "fail-closed", pass: false, details: "single fork retry has unknown or nonempty runner diagnostics", meta: { classification: "infra", infra: true } };
+            else verdict = verifyManifestReport({ manifest: files, nonce, exitCode: invoked.exitCode, report: {
+              ...retry, requested: files, started: { ...first.started, ...retry.started }, completed: { ...first.completed, ...retry.completed },
+            } });
+          }
+          const firstFailures = verifyManifestReport({ manifest: files, nonce: recovery.firstNonce, exitCode: 1, report: first });
+          if (firstFailures.kind === "work") verdict = { ...firstFailures,
+            details: `${firstFailures.details}\ncontinuation: ${verdict.details}`,
+            meta: { ...firstFailures.meta, continuation: verdict.meta,
+              failingTests: [...new Set([...(firstFailures.meta.failingTests as string[]), ...((verdict.meta.failingTests as string[] | undefined) ?? [])])],
+              failingFiles: [...new Set([...(firstFailures.meta.failingFiles as string[]), ...((verdict.meta.failingFiles as string[] | undefined) ?? [])])],
+              failureEvidence: [...(firstFailures.meta.failureEvidence as FailureEvidence[]), ...((verdict.meta.failureEvidence as FailureEvidence[] | undefined) ?? [])] } };
+          verdict.details = `single fork retry ${nonce} after worker RPC timeout in ${recovery.firstNonce}: ${verdict.details}`;
+        }
+        // Preserve the validator's verdict and classification; runner evidence only explains it.
+        const evidenceReceipt = invoked.evidenceReceipt;
+        const evidenceRoot = opts.evidence?.artifactDir ?? dir;
+        const stdoutPath = join(evidenceRoot, evidenceReceipt.stdout.path);
+        const stderrPath = join(evidenceRoot, evidenceReceipt.stderr.path);
+        const stdoutTail = Buffer.from(redactGateOutput(invoked.stdout, env)).subarray(-16 * 1024);
+        const stderrTail = Buffer.from(redactGateOutput(invoked.stderr, env)).subarray(-16 * 1024);
+        const report = invoked.report?.nonce === nonce ? invoked.report : undefined;
+        const neverStarted = report ? files.filter(file => !(file in report.started)).length : "unknown";
+        const errors = report?.certificate?.errors;
+        const reporterErrors = typeof errors === "number" && Number.isInteger(errors) && errors >= 0 ? errors : "unknown";
+        const reportedDiagnostics = report?.certificate?.diagnostics;
+        const runnerErrors = Array.isArray(reportedDiagnostics) ? reportedDiagnostics.filter(error => typeof error === "string") : [];
+        const diagnostics = !verdict.pass
+          ? `\nclassification: ${verdict.meta.classification ?? "unknown"}; runner-level diagnostic: never-started ${neverStarted}; reporter errors ${reporterErrors}; runner vitest`
+            + [...runnerErrors,
+              stdoutTail.toString(), stderrTail.toString()].filter(Boolean).map(text => `\n${text}`).join("")
+          : "";
+        // The interruption is reported beside the verdict, never folded into it or into raw wall service.
+        const interrupted = interruptions.length
+          ? `\nhost interruptions: ${interruptions.map(i => `${i.kind} ${Math.round(i.wallMs)}ms wall / ${Math.round(i.monoMs)}ms monotonic, ${Math.round(i.subtractedMs)}ms subtracted`).join("; ")}`
+          : "";
+        return { evidenceReceipt, evidenceReceipts, pass: verdict.pass, kind: verdict.kind,
+          details: verdict.details + interrupted + diagnostics,
+          classification: verdict.meta.classification as "infra" | "regression" | undefined,
+          meta: { ...verdict.meta, nonce, manifest: files, manifestPath, listingCommand: invocation.listing, verification,
+            ...(recovery ? { recovery, retryable: false } : {}), ...(interruptions.length ? { interruptions } : {}),
+            spawnedCommand, processExit: invoked.exitCode, pid: invoked.pid, stdoutPath, stderrPath },
+          exitCode: invoked.exitCode ?? -1, reportPath };
+      } catch (error) {
+        const evidenceReceipt = (error as { evidenceReceipt?: GateEvidenceReceipt })?.evidenceReceipt;
+        if (evidenceReceipt) evidenceReceipts.push(...((error as { evidenceReceipts?: GateEvidenceReceipt[] }).evidenceReceipts ?? [evidenceReceipt]));
+        return { evidenceReceipt, evidenceReceipts, pass: false, kind: retainedFirstVerdict ? "work" : "infra", classification: retainedFirstVerdict ? "regression" : "infra", exitCode: -1, reportPath,
+          details: (retainedFirstVerdict ? `${retainedFirstVerdict.details}\n` : "") + (recovery ? `single fork retry ${recovery.retryNonce} after ${recovery.firstNonce}: ` : "") + (error instanceof Error ? error.message : String(error)),
+          meta: { ...(retainedFirstVerdict?.meta ?? { classification: "infra", infra: true }), ...(retainedFirstVerdict ? { firstPass: retainedFirstVerdict.meta } : {}), manifestDiscoveryFailed: true, spawnedCommand, verification,
+            ...(recovery ? { recovery, retryable: false } : {}), ...(manifestPath ? { manifestPath } : {}) } };
       }
-      verdict.details = `single fork retry ${nonce} after worker RPC timeout in ${recovery.firstNonce}: ${verdict.details}`;
-    }
-    // Preserve the validator's verdict and classification; runner evidence only explains it.
-    const evidenceReceipt = invoked.evidenceReceipt;
-    const evidenceRoot = opts.evidence?.artifactDir ?? dir;
-    const stdoutPath = join(evidenceRoot, evidenceReceipt.stdout.path);
-    const stderrPath = join(evidenceRoot, evidenceReceipt.stderr.path);
-    const stdoutTail = Buffer.from(redactGateOutput(invoked.stdout, env)).subarray(-16 * 1024);
-    const stderrTail = Buffer.from(redactGateOutput(invoked.stderr, env)).subarray(-16 * 1024);
-    const report = invoked.report?.nonce === nonce ? invoked.report : undefined;
-    const neverStarted = report ? files.filter(file => !(file in report.started)).length : "unknown";
-    const errors = report?.certificate?.errors;
-    const reporterErrors = typeof errors === "number" && Number.isInteger(errors) && errors >= 0 ? errors : "unknown";
-    const reportedDiagnostics = report?.certificate?.diagnostics;
-    const runnerErrors = Array.isArray(reportedDiagnostics) ? reportedDiagnostics.filter(error => typeof error === "string") : [];
-    const diagnostics = !verdict.pass
-      ? `\nclassification: ${verdict.meta.classification ?? "unknown"}; runner-level diagnostic: never-started ${neverStarted}; reporter errors ${reporterErrors}; runner vitest`
-        + [...runnerErrors,
-          stdoutTail.toString(), stderrTail.toString()].filter(Boolean).map(text => `\n${text}`).join("")
-      : "";
-    // The interruption is reported beside the verdict, never folded into it or into raw wall service.
-    const interrupted = interruptions.length
-      ? `\nhost interruptions: ${interruptions.map(i => `${i.kind} ${Math.round(i.wallMs)}ms wall / ${Math.round(i.monoMs)}ms monotonic, ${Math.round(i.subtractedMs)}ms subtracted`).join("; ")}`
-      : "";
-    return { evidenceReceipt, evidenceReceipts, pass: verdict.pass, kind: verdict.kind,
-      details: verdict.details + interrupted + diagnostics,
-      classification: verdict.meta.classification as "infra" | "regression" | undefined,
-      meta: { ...verdict.meta, nonce, manifest: files, manifestPath, listingCommand: invocation.listing, verification,
-        ...(recovery ? { recovery, retryable: false } : {}), ...(interruptions.length ? { interruptions } : {}),
-        spawnedCommand, processExit: invoked.exitCode, pid: invoked.pid, stdoutPath, stderrPath },
-      exitCode: invoked.exitCode ?? -1, reportPath };
+    });
   } catch (error) {
-    const evidenceReceipt = (error as { evidenceReceipt?: GateEvidenceReceipt })?.evidenceReceipt;
-    if (evidenceReceipt) evidenceReceipts.push(...((error as { evidenceReceipts?: GateEvidenceReceipt[] }).evidenceReceipts ?? [evidenceReceipt]));
-    return { evidenceReceipt, evidenceReceipts, pass: false, kind: "infra", classification: "infra", exitCode: -1, reportPath,
-      details: (recovery ? `single fork retry ${recovery.retryNonce} after ${recovery.firstNonce}: ` : "") + (error instanceof Error ? error.message : String(error)),
-      meta: { classification: "infra", infra: true, manifestDiscoveryFailed: true, spawnedCommand, verification,
-        ...(recovery ? { recovery, retryable: false } : {}), ...(manifestPath ? { manifestPath } : {}) } };
+    const job = error as { verificationJobPath?: string; verificationJob?: unknown };
+    return { pass: false, kind: "infra", classification: "infra", exitCode: -1, reportPath,
+      details: error instanceof Error ? error.message : String(error),
+      meta: { infra: true, classification: "infra", retryable: false,
+        verificationJobPath: job.verificationJobPath, verificationJob: job.verificationJob } };
   }
 }

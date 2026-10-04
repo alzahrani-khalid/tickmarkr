@@ -326,16 +326,25 @@ For `resume`, use the same host-owned split form with `tickmarkr resume <runId>`
 in the process table to the host PTY; verify no agent session is an ancestor. If an agent is
 an ancestor, stop that launch and relaunch through the host split before continuing.
 
-Start `tickmarkr beat <tier> --seat <seat> --loop` as a DETACHED background process, one per
-(tier, seat), from the repository root. Use setsid plus nohup (or the host's equivalent detached
-session facility), redirect output to a file, and record a pidfile under the repository's state
-dir. Verify ppid 1 and no agent-session ancestor. Never put beats in a harness background task
-or a visible tab. The lifecycle must be idempotent: start checks the pidfile against the live
-process payload and returns an "already running" no-op for the same (repo, tier, seat); status
-checks that payload and beat freshness; stop sends `--stand-down` for the same tier and seat,
-verifies the loop exits within one interval, then removes its pidfile. A stale or reused pid
-must never be killed without matching its live payload. Include a run-end stop item for every
-beat started, also on failure, park or handoff; verify DISARMED and remove retired beat files.
+Detached beats are product-owned, one per (tier, seat), from the repository root, through the
+shipped lifecycle verbs — never a hand-rolled setsid plus nohup wrapper, pidfile or shell loop:
+
+```bash
+cd <repo> && tickmarkr beat start <tier> --seat <seat>
+cd <repo> && tickmarkr beat status <tier> --seat <seat>
+cd <repo> && tickmarkr beat stop <tier> --seat <seat>
+```
+
+`start` launches the `--loop` child in its own session, logs to `<state-dir>/supervision/<tier>.log`,
+records its pid, birth, argv and cwd, and exits 0 only after it reads back that exact child's own
+advancing beat. A repeat start for the same (tier, seat) is an "already running" no-op; a stale,
+dead, foreign, reused-pid, unreadable or busy tier is a nonzero refusal that changes nothing.
+Verify ppid 1 is never proof on its own — an orphan of a dying session shows it too; `status`
+is the check: it reads the recorded process identity and beat freshness, writes nothing, and exits
+nonzero for STALE, MISMATCH or UNREADABLE. `stop` signals only that recorded pid after its
+generation and identity still match, and reads back DISARMED. Never put beats in a harness
+background task or a visible tab. Include a run-end `beat stop` item for every beat started, also
+on failure, park or handoff, and require its DISARMED read-back.
 
 Keep only watchers that must WAKE the seat in the harness. Re-arm them on each wake and at
 their harness cap; daemon and beat lifetimes must not depend on that cap.
@@ -1166,14 +1175,14 @@ watching it. Two thirds of that line were constants, not measurements.
 
 The beat is one shipped command and it arms through two explicit verbs, `--new-arm` and `--loop` —
 never a bare invocation. `--loop` already implies `--new-arm`: it creates a durable arm and beats in
-this process every 10 seconds, exiting on its own within one interval after a stand-down. Run it from
-the repo root as a detached setsid+nohup process with a pidfile, following the idempotent
-start/stop/status lifecycle in Host-owned daemon and detached beats; never as a harness task or visible tab:
+this process every 10 seconds, exiting nonzero with its reason within one interval after a stand-down.
+Never launch it by hand: `beat start` runs it detached and owns it, following the start/stop/status
+lifecycle in Host-owned daemon and detached beats; never as a harness task or visible tab:
 
 ```bash
-# Payload for the detached start above; do not execute as a foreground or harness task.
-cd <repo> && tickmarkr beat overseer --seat <overseer-agent-or-pane> --loop
-cd <repo> && tickmarkr beat overseer --seat <overseer-agent-or-pane> --stand-down  # deliberately hand off; --loop exits
+# beat start owns the detached --loop child; do not execute the loop as a foreground or harness task.
+cd <repo> && tickmarkr beat start overseer --seat <overseer-agent-or-pane>
+cd <repo> && tickmarkr beat stop overseer --seat <overseer-agent-or-pane>  # deliberately hand off; reads back DISARMED
 ```
 
 **The legacy wrapper loop, `while :; do tickmarkr beat overseer --seat <pane>; sleep 10; done`, is the

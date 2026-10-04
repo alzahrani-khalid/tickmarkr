@@ -679,6 +679,13 @@ export async function reviewGate(
     ? `You may run at most the task's own test files explicitly named in files[]; these are the only suites you may run: ${ownTestFiles.map((file) => `\`${file}\``).join(", ")}.`
     : "No suite may be run: files[] names no explicit test file owned by this task.";
   const responseRequirement = reviewResponseRequirement(nonce);
+  // D-966 (T3 E): a reviewer that stopped at the first example of a class drip-fed it one round at a
+  // time — T5's rounds carried 2→1→1→1→2→1 findings and T10's 3→2→1→1→1, each round's repair fixing
+  // the case it was shown while its same-class siblings waited for the next review. The closed note
+  // tuple asks for every counterexample ACTUALLY FOUND in scope at once, plus the boundary searched and
+  // what stays uncertain, so the repair sees the class and the next round knows what was covered. It
+  // rides the existing note text (details → repair brief unchanged) and never asks for an exhaustive
+  // search the reviewer cannot honestly make; uncertainty alone stays out of the material bar.
   const prompt = `TICKMARKR-REVIEW
 ${responseRequirement}
 
@@ -724,6 +731,14 @@ acceptance criterion it violates (or to the regression this diff introduces), st
 and marks its evidence executed (you ran the reproducer), static (you traced it by reading) or blocked (it
 could not run here). Blocked evidence never turns a finding into a pass, and a worker's own case table or
 enumeration never resolves a finding: judge the diff itself.
+Report the whole class in this one review, never only its first example. Each material finding's "note" is one
+line carrying the closed tuple "rule: <the goal clause, criterion or regressed behaviour violated> | found:
+<every counterexample you ACTUALLY FOUND inside the declared scope, each as path:line input → consequence,
+joined by "; "> | searched: <the boundary you actually searched: files, symbols, call sites> | uncertain:
+<what lies outside that boundary or could not be established inside it>". Found one counterexample, list one;
+found several, list every one in the same finding. Never list a case you did not find. Your search is bounded:
+never claim it covered every input, caller or path beyond the boundary you name, and remaining uncertainty
+alone is never a material finding — record it under uncertain, or as a deferred minor with its rationale.
 
 Respond with ONLY this JSON:
 {"nonce": "${nonce}", "approve": true|false, "resolved": [], "reraised": [], "findings": [{"note": "...", "severity": "material"|"minor", "defer": false, "rationale": ""}], "comments": [{"path": "path/to/file", "line": 42, "body": "actionable feedback", "finding": 1}]}

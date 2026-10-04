@@ -21,11 +21,13 @@ const seatOf = (e: JournalEvent) => channelKey(e.data.assignment as { adapter: s
  * between, the shape of a flake the operator rechecks. The first run parks on the red (consult →
  * human); the daemon's own battery caches that red for the task tree.
  */
-const flakyRepo = (opts: { judgePass?: boolean; pin?: { via: string; model: string }; testGreen?: boolean } = {}) => {
+const flakyRepo = (opts: { judgePass?: boolean; pin?: { via: string; model: string }; testGreen?: boolean; review?: object } = {}) => {
   const flag = join(makeTestTempDir("tickmarkr-recheck-red-"), "green");
   const { repo, fake, scriptPath } = setupRepo(
-    [T("T1", { gates: ["build", "test", "lint", "evidence", "scope", "acceptance"], ...(opts.pin ? { routingHints: { pin: opts.pin } } : {}) })],
+    [T("T1", { gates: ["build", "test", "lint", "evidence", "scope", "acceptance", ...(opts.review ? ["review"] : [])],
+      ...(opts.review ? { complexity: 8 } : {}), ...(opts.pin ? { routingHints: { pin: opts.pin } } : {}) })],
     {
+      ...(opts.review ? { review: opts.review } : {}),
       judge: { pass: opts.judgePass ?? true, criteria: [{ criterion: "c1", met: opts.judgePass ?? true, reason: opts.judgePass ?? true ? "ok" : "t1.txt:1 still wrong" }] },
       consult: { action: "human", notes: "operator decides" },
       tasks: { T1: [{ shell: `echo one > t1.txt && ${COMMIT} t1`, result: { ok: true, summary: "t1" } }] },
@@ -55,21 +57,26 @@ describe("v2.5.6 — a recheck re-measures: cached reds are discarded, the pin h
     expect(fresh).toHaveLength(1);
     expect(fresh[0]!.data.pass).toBe(true);
     expect(fresh[0]!.data.reused).toBeUndefined();
+    // an explicit full recheck: full scope, and the recorded reason is the recheck that decided it
+    expect(fresh[0]!.data.selectionDecision).toMatchObject({ scope: "full", reason: "recheck-full-suite" });
     expect(of(post, "recheck-battery")[0]?.data.pass).toBe(true);
     expect(of(post, "worker-launch")).toEqual([]);
     expect(of(post, "task-dispatch")).toEqual([]);
   }, 300_000);
 
   test("test: the same recheck over a task whose cached test verdict is GREEN replays it (gate-reused-verdict test pass:true, no recheck-rerun row, no second test run), so only reds are discarded and a recheck that re-runs every gate regardless of its cached verdict fails", async () => {
-    const { repo, fake, scriptPath } = flakyRepo({ judgePass: false, testGreen: true });
+    // v2.6.7 T1: re-seated on a round whose full job ran (no decisive red) — the only reviewer delivers
+    // no verdict, the in-round full job measures green, and with no seat left to recover the review the
+    // task parks infra. The recheck replays that measured green.
+    const { repo, fake, scriptPath } = flakyRepo({ testGreen: true, review: {} });
     const runId = "run-recheck-green-replayed";
     const first = await runDaemon(repo, { adapters: [fake], runId });
     expect(first.human).toEqual(["T1"]);
     const parked = rows(repo, runId);
-    expect(of(parked, "gate-result").filter((e) => e.data.gate === "test").every((e) => e.data.pass === true)).toBe(true);
-    // the judge relents; the battery's cached greens are not what the recheck questions
+    expect(of(parked, "gate-result").filter((e) => e.data.gate === "test").map((e) => e.data.pass)).toEqual([true]);
+    // the reviewer now answers; the battery's cached greens are not what the recheck questions
     const script = JSON.parse(readFileSync(scriptPath, "utf8")) as Record<string, unknown>;
-    writeFileSync(scriptPath, JSON.stringify({ ...script, judge: { pass: true, criteria: [{ criterion: "c1", met: true, reason: "ok" }] } }));
+    writeFileSync(scriptPath, JSON.stringify({ ...script, review: { approve: true, issues: [] } }));
     await approve([runId, "T1", "--recheck", "--by", "op"], repo);
     const resumed = await runDaemon(repo, { adapters: [new FakeAdapter(scriptPath)], runId, resume: true });
     expect(resumed.done).toEqual(["T1"]);
@@ -79,6 +86,19 @@ describe("v2.5.6 — a recheck re-measures: cached reds are discarded, the pin h
     expect(replayed).toHaveLength(1);
     expect(replayed[0]!.data.pass).toBe(true);
     expect(of(post, "worker-launch")).toEqual([]);
+    // A test a semantic rejection left unmeasured has no cached verdict: the recheck measures it fresh.
+    {
+      const { repo, fake, scriptPath } = flakyRepo({ judgePass: false, testGreen: true });
+      const runId = "run-recheck-unmeasured-test";
+      expect((await runDaemon(repo, { adapters: [fake], runId })).human).toEqual(["T1"]);
+      expect(of(rows(repo, runId), "gate-result").filter((e) => e.data.gate === "test")).toEqual([]);
+      writeFileSync(scriptPath, JSON.stringify({ ...JSON.parse(readFileSync(scriptPath, "utf8")), judge: { pass: true, criteria: [{ criterion: "c1", met: true, reason: "ok" }] } }));
+      await approve([runId, "T1", "--recheck", "--by", "op"], repo);
+      expect((await runDaemon(repo, { adapters: [new FakeAdapter(scriptPath)], runId, resume: true })).done).toEqual(["T1"]);
+      const post = afterResume(rows(repo, runId));
+      expect(of(post, "gate-reused-verdict").filter((e) => e.data.gate === "test")).toEqual([]);
+      expect(of(post, "gate-result").filter((e) => e.data.gate === "test").map((e) => e.data.pass)).toEqual([true]);
+    }
   }, 300_000);
 
   test("test: a pinned task whose recheck battery reds dispatches the repair on the pinned seat, and the same recheck over a task pinned to a seat the fleet cannot host parks naming the pin with no dispatch, so a recheck repair that takes the ladder off the pin, or that silently degrades an unavailable pin to the ladder, fails", async () => {

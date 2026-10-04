@@ -1,7 +1,7 @@
 import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { PassThrough } from "node:stream";
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readlinkSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
@@ -9,7 +9,7 @@ import { compareToBaseline, fingerprint } from "../../src/gates/baseline.js";
 import { DEFAULT_FORK_CAP, DEFAULT_SHELL_TIMEOUT_MS, FORK_CAP_ENV, ROUTING_ENV_SEAMS as SCRUBBED_AT_SPAWN, SPAWN_ATTEMPT_LIMIT, assertRefsWritable, classifyIdentityProbe, createWorktree, gitHead, linkNodeModules, preserveWorktree, probeRefsWritable, removeWorktree, resetSpawnForTests, setSpawnForTests, sh, shell, shOk, shGit, shGitOk, WORKTREES_DIR, worktreePath } from "../../src/run/git.js";
 import { GATE_FINGERPRINT_CAP, identicalGateFailures, normalizeGateFailure, type JournalEvent } from "../../src/run/journal.js";
 import { NO_EXPLORE_ENV, QUALITY_ENV, ROUTING_ENV_SEAMS } from "../../src/route/router.js";
-import { makeRepo } from "../helpers/tmprepo.js";
+import { makeRepo, makeTestTempDir } from "../helpers/tmprepo.js";
 import ts from "typescript";
 import { shq } from "../../src/adapters/types.js";
 import { NATIVE_PROCESS_TITLE_ENV, resetTitleEnvironmentForTests, setTitleEnvironmentForTests, TITLE_PREFLIGHT_TIMEOUT_MS } from "../../src/run/title-environment.js";
@@ -1158,4 +1158,64 @@ test("title", () => {
       expect(spawned).toEqual([...Array(2 + uncertified.length).fill(guarded), ...Array(underscored.length).fill(received)]);
     } finally { rmSync(dir, { recursive: true, force: true }); }
   }, 180_000);
+});
+
+describe("v2.6.7 T4 real-only provisioning", () => {
+  test("production linkNodeModules enforces W1 under redirected commondir writing node_modules once to the real exclude versus identical hostile metadata and unchanged target gitignore", async () => {
+    const raw = (cwd: string, ...args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
+    const repo = makeRepo({ ".gitignore": "node_modules/\n", "a.txt": "x\n" });
+    mkdirSync(join(repo, "node_modules", "dep"), { recursive: true });
+    writeFileSync(join(repo, "node_modules", "dep", "index.js"), "module.exports = 1;\n");
+    const common = realpathSync(join(repo, ".git"));
+    const realExclude = join(common, "info", "exclude");
+    writeFileSync(realExclude, "# real line kept\n*.real\n");
+    const linked = join(makeTestTempDir("tkr-w1-"), "task");
+    raw(repo, "worktree", "add", "-q", "-b", "task", linked, "HEAD");
+    const commondir = join(common, "worktrees", "task", "commondir");
+    const hostile = makeRepo({ "evil.txt": "evil\n" });
+    const hostileCommon = realpathSync(join(hostile, ".git"));
+    writeFileSync(join(hostileCommon, "info", "exclude"), "# hostile bytes\n");
+    const hostileBytes = () => [readFileSync(join(hostileCommon, "info", "exclude")), readFileSync(join(hostileCommon, "config"))];
+    const before = hostileBytes();
+    const gitignore = readFileSync(join(linked, ".gitignore"), "utf8");
+
+    writeFileSync(commondir, `${hostileCommon}\n`);
+    // authority derivation selects the REAL common directory however often provisioning repeats
+    expect(linkNodeModules(repo, linked)).toBe(true);
+    expect(linkNodeModules(repo, linked, { force: true })).toBe(true);
+    rmSync(join(linked, "node_modules"));
+    expect(linkNodeModules(repo, linked)).toBe(true);
+    expect(lstatSync(join(linked, "node_modules")).isSymbolicLink()).toBe(true);
+    expect(readFileSync(realExclude, "utf8")).toBe("# real line kept\n*.real\nnode_modules\n");
+    expect(hostileBytes()).toEqual(before);
+    expect(readFileSync(join(linked, ".gitignore"), "utf8")).toBe(gitignore);
+    expect(readFileSync(join(repo, ".gitignore"), "utf8")).toBe(gitignore);
+    // ...while execution validation separately refuses the mismatch, naming commondir
+    await expect(shGit("git status", linked)).rejects.toMatchObject({ name: "GitTrustRefusal", path: commondir });
+    // a deleted commondir beside planted standalone metadata (raw git's own repository) keeps the real authority too
+    const gitdir = join(common, "worktrees", "task");
+    rmSync(commondir);
+    mkdirSync(join(gitdir, "objects"));
+    writeFileSync(join(gitdir, "config"), "[core]\n\trepositoryformatversion = 0\n");
+    expect(raw(linked, "rev-parse", "--path-format=absolute", "--git-common-dir")).toBe(gitdir);
+    expect(linkNodeModules(repo, linked, { force: true })).toBe(true);
+    expect(readFileSync(realExclude, "utf8")).toBe("# real line kept\n*.real\nnode_modules\n");
+    expect(existsSync(join(gitdir, "info", "exclude"))).toBe(false);
+    await expect(shGit("git status", linked)).rejects.toMatchObject({ name: "GitTrustRefusal", path: commondir });
+    rmSync(join(gitdir, "objects"), { recursive: true });
+    rmSync(join(gitdir, "config"));
+
+    // clean ordinary and linked controls create the expected symlink and exclude
+    writeFileSync(commondir, "../..\n");
+    const clean = join(makeTestTempDir("tkr-w1-"), "clean");
+    raw(repo, "worktree", "add", "-q", "-b", "clean", clean, "HEAD");
+    expect(linkNodeModules(repo, clean)).toBe(true);
+    expect(readlinkSync(join(clean, "node_modules"))).toBe(join(repo, "node_modules"));
+    expect(readFileSync(realExclude, "utf8").match(/^node_modules$/gm)).toHaveLength(1);
+    expect(raw(clean, "status", "--porcelain")).toBe("");
+    const ordinary = makeRepo({ "o.txt": "o\n" });
+    expect(linkNodeModules(repo, ordinary)).toBe(true);
+    expect(readFileSync(join(ordinary, ".git", "info", "exclude"), "utf8")).toMatch(/^node_modules$/m);
+    expect(raw(ordinary, "status", "--porcelain")).toBe("");
+  }, 60_000);
 });

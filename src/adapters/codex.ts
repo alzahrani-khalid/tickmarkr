@@ -84,7 +84,9 @@ function codexRetirement(upgrade: unknown): ModelRetirement | null | undefined {
 // tickmarkr worktrees keep their gitdir under the MAIN repo's .git/worktrees/<name> — outside the
 // workspace-write sandbox root — so git commit dies on index.lock (incident run-20260709-104447
 // P87-08: "Unable to create …/.git/worktrees/…/index.lock"). Expanded by the launching shell at the
-// worktree cwd, for EVERY Codex role (worker, judge, review, consult share these builders).
+// worktree cwd, for Codex WORKERS only: v2.6.7 T4 (D-1046) — invoke() (the headless worker form, including
+// the interactive size fallback) and interactiveCommand carry it; headlessCommand, which judge, review,
+// consult and the model probe launch, carries no writable_roots at all (those seats never commit).
 // v2.6.6 T9 (K, D-912): the grant is exactly what a linked-worktree branch commit writes — the worktree's
 // own gitdir (only when it differs from the common dir), common/objects, common/refs, common/logs. The
 // shipped [common] grant (and D-910's [common, gitdir]) let a sandboxed seat write <common>/hooks and
@@ -246,6 +248,10 @@ export function codexMcpSuppressionFlags(configPath?: string): string {
   return flags.join(" ");
 }
 
+// The one headless form: `grant` is "" for every non-worker seat and ` ${CODEX_GIT_GRANT}` for the worker.
+const codexExec = (promptFile: string, model: string, effort: Effort | undefined, grant: string): string =>
+  `codex exec --sandbox workspace-write ${CODEX_HOOK_TRUST} ${codexMcpSuppressionFlags()}${grant}${codexEffortFlag(effort)} --model ${shq(model)} - < ${shq(promptFile)}`;
+
 export const codex: WorkerAdapter = {
   id: "codex",
   vendor: "openai",
@@ -260,15 +266,16 @@ export const codex: WorkerAdapter = {
   // --sandbox workspace-write is the autonomous sandbox mode (codex v0.144.1+)
   // MCP suppression built per dispatch (config can change between runs) — see codexMcpSuppressionFlags.
   // CODEX_HOOK_TRUST (OBS-125) clears the per-worktree "Hooks need review" gate while keeping the sandbox.
-  headlessCommand: (promptFile: string, model: string, effort?: Effort) =>
-    `codex exec --sandbox workspace-write ${CODEX_HOOK_TRUST} ${codexMcpSuppressionFlags()} ${CODEX_GIT_GRANT}${codexEffortFlag(effort)} --model ${shq(model)} - < ${shq(promptFile)}`,
+  // v2.6.7 T4 (D-1046): grantless — judge, review, consult and probe-model seats read the checkout and
+  // never commit, so they get no writable git metadata. Workers launch through invoke() below.
+  headlessCommand: (promptFile: string, model: string, effort?: Effort) => codexExec(promptFile, model, effort, ""),
   // OBS-930: the visible pane runs the REAL TUI. Codex's TUI takes its prompt only as the [PROMPT]
   // positional (`codex --help`, 0.153.4 — no file/stdin form), so the launch inlines the file exactly
   // as the claude adapter does: the prompt is the LAST positional and every flag value is followed by
   // a flag, never by the prompt. The argv hazard that once forbade this (OBS-889: `countLiveSuites`
   // matched a suite word 140 KB into a finished worker's argv) is closed on the counter side — the
   // census reads a command's first four tokens only — and those four never carry a suite word here.
-  // Same sandbox, hook trust and MCP suppression as the headless form; `-a never` is the TUI's
+  // Same sandbox, hook trust, MCP suppression and worker grant as invoke()'s headless worker form; `-a never` is the TUI's
   // autonomous approval policy (exec has no approvals to configure).
   // OBS-930 (Linux): the inlined prompt is ONE argv string and Linux caps one at 131072 bytes, so a
   // prompt over promptArgvCeiling() returns null → worker-mode-fallback → the headless form (types.ts).
@@ -277,7 +284,7 @@ export const codex: WorkerAdapter = {
       ? `codex -a never -s workspace-write ${CODEX_HOOK_TRUST} ${codexMcpSuppressionFlags()} ${CODEX_GIT_GRANT}${codexEffortFlag(effort)} --model ${shq(model)} "$(cat ${shq(promptFile)})"`
       : null,
   invoke(task: Task, _cwd: string, a: Assignment, ctx: { promptFile: string }): Invocation {
-    return { command: this.headlessCommand(ctx.promptFile, a.model, a.effort) };
+    return { command: codexExec(ctx.promptFile, a.model, a.effort, ` ${CODEX_GIT_GRANT}`) };
   },
   parse: parseWorkerResult,
   // v1.22 T5: seed [projects."<repoRoot>"] trust_level="trusted" so fresh worktrees never stall on

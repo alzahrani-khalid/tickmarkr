@@ -164,9 +164,11 @@ describe("SC4 — incident shape is red-capable: a judged pass:false fails the r
     const task = mkTask(INCIDENT_GATES);
     const { results } = await runGates(task, await ctxFor(repo, base, fake, finisherClaimsSuccess));
     // the deterministic gates all pass — exactly the L49-L52 "came back green + in-scope" shape
-    for (const g of ["build", "test", "evidence", "scope"]) {
+    for (const g of ["build", "evidence", "scope"]) {
       expect(results.find((r) => r.gate === g)?.pass, `${g} should pass`).toBe(true);
     }
+    // v2.6.7 T1 (closed order table): the decisive semantic red ends the round with no test-GATE invocation
+    expect(results.find((r) => r.gate === "test")).toBeUndefined();
     // acceptance FAILS on substance — the defect the deterministic gates structurally cannot see
     const acc = results.find((r) => r.gate === "acceptance");
     expect(acc?.pass).toBe(false);
@@ -181,6 +183,7 @@ describe("SC4 — incident shape is red-capable: a judged pass:false fails the r
     const task = mkTask(INCIDENT_GATES);
     const { results } = await runGates(task, await ctxFor(repo, base, fake, finisherClaimsSuccess));
     expect(results.every((r) => r.pass)).toBe(true);
+    expect(results.find((r) => r.gate === "test")?.pass).toBe(true); // the judge-green twin obtains its full proof
     // the ONLY thing standing between the incident shape and a merge is the judged verdict —
     // flip it to pass:false (test above) and the run fails. This IS the enforcement; no finisher-specific
     // machinery is needed for the gate chain to catch an OBS-06-shape incident.

@@ -123,6 +123,10 @@ export const openStagedDeny = (): FleetStagedDeny => ({
   allowOut: [],
 });
 
+/** T5: one real channel a displayed row stands for — a collapsed variant or catalog-fold constituent doctor
+ * served, with its own recorded identity and failed-probe reason */
+export type FleetGroupMember = { model: string; identity?: string; unauthed?: string };
+
 export type FleetModelGroup = {
   adapter: string;
   vendor?: string;
@@ -139,6 +143,8 @@ export type FleetModelGroup = {
     classifyModel?: string;
     variants?: string[];
     foldedModels?: string[];
+    /** T5: every real member of a grouped row; absent ⇒ the row's own model is its one member */
+    members?: FleetGroupMember[];
     score?: number;
   }>;
 };
@@ -196,7 +202,8 @@ function ledgerChannelId(line: string): string | undefined {
 type View = "models" | "shapes" | "steering";
 type DiffReview = Extract<FleetOverlayReview, { kind: "diff" }>;
 
-type ClassifyBulk = { adapter: string; vendor: string; rows: Array<{ model: string; displayModel: string; suggestion: FleetModelSuggestion }> };
+/** one staged member: its REAL id (T5), the row it was staged from, and its own recorded identity */
+type ClassifyBulk = { adapter: string; vendor: string; rows: Array<{ model: string; displayModel: string; identity?: string; suggestion: FleetModelSuggestion }> };
 
 /** OBS-530: `excludedNote` names the channels the picker CANNOT offer (staged out, denied,
  * unauthed, unclassified) — the picker's silence was indistinguishable from a bug. */
@@ -283,9 +290,12 @@ type ModelRow = {
   classifyModel?: string;
   variants?: string[];
   foldedModels?: string[];
+  members?: FleetGroupMember[];
   score?: number;
   denied: boolean;
   reach: FleetReach;
+  /** T5: a grouped row's members disagree — `reach` is the most-excluded member's */
+  partial?: boolean;
   /** every exclusion-collector scope for the worker seat, as `config.path (entry)` */
   reasons: string[];
   /** a resolved alias no deny scope of the staged policy covers */
@@ -537,20 +547,34 @@ export function FleetApp({
     };
   };
 
-  // OBS-1099 review: a displayed row may fold several discovered gateway ids (foldedModels);
-  // each folded id is a real channel the policy matches on its own, so every one but a row's
-  // own id counts as a sibling — an entry covering a folded id is shared, never row-owned
-  const displayedChannels = (): SeatChannel[] => modelGroups.flatMap((group) => group.rows
-    .flatMap((other) => (other.foldedModels?.length ? other.foldedModels : [other.model])
-      .map((model) => ({ adapter: group.adapter, model, identity: other.evidence?.identity }))));
+  // T5: the real channels a displayed row stands for — every collapsed variant and catalog-fold
+  // constituent fleet derived from the cached doctor list, each with its own identity; a row without
+  // them stands for its folded ids, else its reference real id (classifyModel) or its own. Display labels
+  // are never channels.
+  const membersOf = (
+    adapter: string,
+    row: { model: string; classifyModel?: string; foldedModels?: string[]; members?: FleetGroupMember[]; evidence?: FleetModelEvidence },
+  ): SeatChannel[] => {
+    const listed = row.members?.length ? row.members
+      : (row.foldedModels?.length ? row.foldedModels : [row.classifyModel ?? row.model]).map((model) => ({ model, identity: row.evidence?.identity }));
+    // one channel per real id: a repeated id is one member, so a grouped act takes ONE reason from it
+    return listed.filter((member, at) => listed.findIndex((other) => other.model === member.model) === at)
+      .map((member) => ({ adapter, model: member.model, ...(member.identity !== undefined ? { identity: member.identity } : {}) }));
+  };
+  // OBS-1099 review: a displayed row may fold several discovered gateway ids; each real member is a
+  // channel the policy matches on its own, so every one but a channel itself counts as a sibling —
+  // an entry covering another member is shared, never channel-owned (grouping never privatizes it)
+  const displayedChannels = (): SeatChannel[] => modelGroups.flatMap((group) => group.rows.flatMap((other) => membersOf(group.adapter, other)));
   const siblingsOf = (self: SeatChannel) => displayedChannels()
     .filter((other) => other.adapter !== self.adapter || other.model !== self.model);
   // Judge c3 (R107): exactly ONE selected entry per act — the channel's adapter:model key when it
-  // is a candidate, else the first candidate in sorted order; only an entry no sibling matches
-  const selectOwn = (entries: Set<string>, self: SeatChannel): string | undefined => {
+  // is a candidate, else the first candidate in sorted order; only an entry no sibling matches.
+  // T5: matched as production matches the list — a deny entry with family matching, an allow-complement
+  // entry exactly as routing.allow admits (`fake:C-low` never reaches a bare `fake:C` there)
+  const selectOwn = (entries: Set<string>, self: SeatChannel, family = true): string | undefined => {
     const others = siblingsOf(self);
-    const candidates = [...entries].filter((entry) => entryMatchesChannel(entry, self, true)
-      && !others.some((other) => entryMatchesChannel(entry, other, true)));
+    const candidates = [...entries].filter((entry) => entryMatchesChannel(entry, self, family)
+      && !others.some((other) => entryMatchesChannel(entry, other, family)));
     const id = `${self.adapter}:${self.model}`;
     return candidates.includes(id) ? id : candidates.sort()[0];
   };
@@ -637,13 +661,39 @@ export function FleetApp({
     return { entry: scope.entry, scope: scope.configPath, covers, shared, edits: reachEdits(owned) };
   };
 
+  // T5: a grouped row's reach over EVERY real member — the whole-group state only when every member
+  // holds it; otherwise the most-excluded member's reach, marked partial, each member-specific reason
+  // prefixed with its real id. A one-member row is exactly its channel's reach.
+  const rowReach = (members: SeatChannel[]): Pick<ModelRow, "reach" | "reasons" | "uncoveredAlias" | "held" | "partial"> => {
+    const each = members.map((member) => ({ model: member.model, ...reachFor(member.adapter, member.model, member.identity) }));
+    if (each.length === 1) {
+      const { model: _model, ...only } = each[0];
+      return { ...only, partial: false };
+    }
+    const folded = foldReach(each);
+    const uniform = each.every((channel) => channel.reach === each[0].reach);
+    return {
+      reach: uniform ? each[0].reach : folded.reach,
+      reasons: folded.reasons,
+      partial: folded.partial,
+      uncoveredAlias: each.some((channel) => channel.uncoveredAlias),
+      held: [...new Set(each.flatMap((channel) => channel.held))],
+    };
+  };
+  // T5: the covering entry a grouped row names — a shared one first, so l owns it
+  const rowCovering = (members: SeatChannel[]): Covering | undefined => {
+    const found = members.map(coveringFor).filter((covering): covering is Covering => covering !== undefined);
+    return found.find((covering) => covering.shared) ?? found[0];
+  };
+
   const groupRows = (group: FleetModelGroup): ModelRow[] => {
     const rows: ModelRow[] = group.rows.map((row) => {
+      const members = membersOf(group.adapter, row);
       const staged = ui.classifications.find(
         (classification) => classification.adapter === group.adapter
-          && (classification.model === row.model || classification.model === row.classifyModel),
+          && (classification.model === row.model || members.some((member) => member.model === classification.model)),
       );
-      const reach = reachFor(group.adapter, row.model, row.evidence?.identity);
+      const reach = rowReach(members);
       return {
         adapter: group.adapter,
         model: row.model,
@@ -655,16 +705,17 @@ export function FleetApp({
         classifyModel: row.classifyModel,
         variants: row.variants,
         foldedModels: row.foldedModels,
+        ...(row.members ? { members: row.members } : {}),
         score: row.score,
         denied: reach.reach !== "in",
         ...reach,
         // OBS-1099 item 2 (review round 2): every row is covered the same way — an alias through
         // its identity, a plain row by a bare-model or adapter entry — so a shared bare-model
         // entry across adapters has the one owning control too
-        covering: coveringFor({ adapter: group.adapter, model: row.model, identity: row.evidence?.identity }),
+        covering: rowCovering(members),
       };
     });
-    const known = new Set(rows.flatMap((row) => row.classifyModel ? [row.model, row.classifyModel] : [row.model]));
+    const known = new Set(group.rows.flatMap((row) => [row.model, ...membersOf(group.adapter, row).map((member) => member.model)]));
     for (const staged of ui.classifications) {
       if (staged.adapter === group.adapter && !known.has(staged.model)) {
         const reach = reachFor(group.adapter, staged.model);
@@ -815,29 +866,33 @@ export function FleetApp({
   // its classification — the ownAllow spelling Space clears — so it can be admitted in this session.
   // Re-staging a classification replaces its seed; a row the allow form admits seeds nothing. A row a
   // flat deny ALSO excludes still seeds, so successive owning lifts (deny, then allow) admit it.
-  const seedAllow = (adapter: string, model: string, displayModel: string) => {
-    // ponytail: a collapsed variant row's allow entry would name no channel (its display name is not the real
-    // model), so it is not seeded for same-session admission — classify, save, then admit next session;
-    // full grouped-row membership (collapse + catalog fold) is 2.6.7 (T10 owed review F1, D-1016)
-    if (model !== displayModel) return;
-    const identity = groupOf(adapter)?.rows.find((row) => row.model === displayModel)?.evidence?.identity;
-    const self = { adapter, model: displayModel, ...(identity !== undefined ? { identity } : {}) };
+  // T5: one seed per REAL member of a grouped row (collapsed variants, catalog-fold constituents), keyed and
+  // spelled by its real id with its own identity — the display label never names a channel.
+  const seedAllow = (self: SeatChannel, displayModel: string) => {
     const policy = stagedPolicy();
     if (!policy.ok || !exclusionsOf(self, policy.routing, "judge").some((scope) => scope.by === "allow")) return;
-    const entry = selectOwn(ui.allowOut, self) ?? `${adapter}:${displayModel}`;
+    const entry = selectOwn(ui.allowOut, self, false) ?? `${self.adapter}:${self.model}`;
     ui.allowOut = new Set([...ui.allowOut, entry]);
     ui.seededAllowOut = [
-      ...ui.seededAllowOut.filter((seed) => seed.adapter !== adapter || seed.model !== model),
-      { adapter, model, displayModel, ...(identity !== undefined ? { identity } : {}), entry },
+      ...ui.seededAllowOut.filter((seed) => seed.adapter !== self.adapter || seed.model !== self.model),
+      { adapter: self.adapter, model: self.model, displayModel, ...(self.identity !== undefined ? { identity: self.identity } : {}), entry },
     ];
+  };
+  // T5: the real members a classification of this browser row stages — a row the browser never listed
+  // (n adds one) is its own one member
+  const classifiedMembers = (adapter: string, displayModel: string): SeatChannel[] => {
+    const row = groupOf(adapter)?.rows.find((candidate) => candidate.model === displayModel);
+    return row ? membersOf(adapter, row) : [{ adapter, model: displayModel }];
   };
 
   const stageSuggested = (
     adapter: string,
-    rows: Array<{ model: string; displayModel: string; suggestion: FleetModelSuggestion }>,
+    rows: Array<{ model: string; displayModel: string; identity?: string; suggestion: FleetModelSuggestion }>,
     firstTouch?: { vendor: string; channel: "sub" | "api" },
   ) => {
-    for (const row of rows) seedAllow(adapter, row.model, row.displayModel);
+    for (const row of rows) {
+      seedAllow({ adapter, model: row.model, ...(row.identity !== undefined ? { identity: row.identity } : {}) }, row.displayModel);
+    }
     ui.classifications = [
       ...ui.classifications,
       ...rows.map((row) => ({
@@ -892,18 +947,22 @@ export function FleetApp({
     setOverlay({ ...base, stage: "channel", vendor: group.vendor });
   };
 
+  // T5: the picked tier and provenance land on EVERY real member of the row, each with its own seed —
+  // classifyModel stays the reference id the suggestion and the overlay title name
   const applyClassification = (overlay: Extract<Overlay, { kind: "classify" }>) => {
     const answered = overlay.vendor ? ui.channelByAdapter[overlay.adapter] : undefined;
-    seedAllow(overlay.adapter, overlay.model, overlay.displayModel ?? overlay.model);
+    const displayModel = overlay.displayModel ?? overlay.model;
+    const members = classifiedMembers(overlay.adapter, displayModel);
+    for (const member of members) seedAllow(member, displayModel);
     ui.classifications = [
       ...ui.classifications,
-      {
+      ...members.map((member) => ({
         adapter: overlay.adapter,
-        model: overlay.model,
+        model: member.model,
         tier: TIERS[overlay.tierAt],
         note: overlay.note.trim(),
         ...(overlay.vendor && answered ? { vendor: overlay.vendor, channel: answered } : {}),
-      },
+      })),
     ];
     setOverlay(null);
   };
@@ -934,8 +993,9 @@ export function FleetApp({
   // channel-specific one carries its channel, so a partial exclusion is never intersected away.
   const adapterReach = (id: string): { reach: FleetReach; reasons: string[]; partial: boolean } => {
     const group = modelGroups.find((candidate) => candidate.adapter === id);
-    const channels = (group?.rows ?? []).flatMap((row) => (row.foldedModels?.length ? row.foldedModels : [row.model])
-      .map((model) => ({ model, ...reachFor(id, model, row.evidence?.identity) })));
+    // T5: every real member of every row — a collapsed or folded row's display label is no channel
+    const channels = (group?.rows ?? []).flatMap((row) => membersOf(id, row))
+      .map((channel) => ({ model: channel.model, ...reachFor(id, channel.model, channel.identity) }));
     if (channels.length === 0) {
       // ponytail: a rail entry with no probed channels has only its own literal entries to show
       const reasons = [
@@ -948,6 +1008,11 @@ export function FleetApp({
         : NESTED_ADAPTER_SCOPES.some((scope) => ui[scope.key].has(id)) ? "out-workers" : "in";
       return { reach, reasons, partial: false };
     }
+    return foldReach(channels);
+  };
+  // the rail's (and a grouped row's) fold over its real channels — most-excluded reach, partial when they
+  // disagree, shared reasons once and channel-specific ones carrying their channel
+  function foldReach(channels: Array<{ model: string; reach: FleetReach; reasons: string[] }>): { reach: FleetReach; reasons: string[]; partial: boolean } {
     const unknown = channels.find((channel) => channel.reach === "unknown");
     if (unknown) return { reach: "unknown", reasons: unknown.reasons, partial: false };
     // OBS-1099 review round 5: out-allow and out-all are ONE picker choice (out · all seats), so a
@@ -961,7 +1026,7 @@ export function FleetApp({
       .filter((reason) => !shared.includes(reason))
       .map((reason) => `${channel.model}: ${reason}`));
     return { reach, reasons: [...shared, ...own], partial };
-  };
+  }
   const describeReach = (state: { reach: FleetReach; partial: boolean }) => state.partial ? `${state.reach} (partial: not every channel)` : state.reach;
 
   // OBS-1099 items 1 and 4: one picker choice changes exactly ONE selected entry in ONE scope —
@@ -1046,81 +1111,98 @@ export function FleetApp({
     const row = modelRows().find((candidate) => candidate.adapter === target.adapter && candidate.model === target.model);
     if (!row) return;
     const id = `${row.adapter}:${row.model}`;
-    const self = { adapter: row.adapter, model: row.model, identity: row.evidence?.identity };
-    // LEG2-T3 round 2 finding 1 / D-233 / D-235 (review round 10): ONE ordered selector —
-    // ownedDenies — feeds the detail line AND every Space edit, so the entry named is the entry
-    // edited: a clear takes its head (own key first, then collector order); a demotion takes its
-    // first flat entry, a promotion its first workers entry; a bare adapter id or a sibling's
-    // entry is never in it. OBS-1046: an allow exclusion is the LAST reason taken, never together
-    // with an authored deny.
-    const edits = reachEdits(ownedDenies(self));
-    const ownAllow = (): Owned | undefined => {
-      const fromAllow = selectOwn(ui.allowOut, self);
-      return fromAllow === undefined ? undefined : { entry: fromAllow, scope: "routing.allow" };
-    };
-    const ownFlat = () => edits.demote ?? ownAllow();
-    const ownWorkers = () => edits.promote;
-    const takeFlat = (found: { entry: string; scope: string }) => {
-      const scope = scopeOf(found.scope);
-      if (scope) ui[scope.key] = without(ui[scope.key], found.entry);
-      else ui.allowOut = without(ui.allowOut, found.entry);
-    };
-    const refuse = (reachLabel: string) => {
-      // OBS-1099 item 2: a covered row names the covering entry, every identity it covers, and
-      // the ONE control that lifts it — the T1 refusal wording stays in front of it
-      if (row.covering?.shared) {
-        // the notice clips at the browser width; the detail line and the l overlay list every identity
-        ui.notice = `${id} stays ${reachLabel} — ${row.covering.scope} (${row.covering.entry}) covers ${row.covering.covers.length} channels — Space edits only this channel's own entries; l lists and lifts it`;
-        return;
-      }
-      const shared = ui.denyAdapters.has(row.adapter) || ui.allowOut.has(row.adapter) || ui.denyWorkersAdapters.has(row.adapter)
-        ? `every ${row.adapter} channel is out together — set the adapter's reach on the rail`
-        : "a shared entry covers other channels too";
-      ui.notice = `${id} stays ${reachLabel} — ${row.reasons.join("; ")} — Space edits only this channel's own entries; ${shared}`;
-    };
+    // T5: a grouped row's act is the same one-reason act on EVERY real member, each decided from the reach
+    // it held BEFORE this act — a sibling's fresh entry that also matches a member's recorded identity never
+    // turns that member's own addition into "already" (review D-1081) — while every removal still takes only
+    // an entry the member owns alone over the staged sets; a member a shared entry keeps out is named and left
+    const members = membersOf(row.adapter, row);
+    const before = members.map((self) => (members.length === 1
+      ? { reach: row.reach, reasons: row.reasons, covering: row.covering }
+      : { ...reachFor(self.adapter, self.model, self.identity), covering: coveringFor(self) }));
+    const outcomes = members.map((self, at) => {
+      const memberId = `${self.adapter}:${self.model}`;
+      const { reasons, covering } = before[at];
+      // LEG2-T3 round 2 finding 1 / D-233 / D-235 (review round 10): ONE ordered selector —
+      // ownedDenies — feeds the detail line AND every Space edit, so the entry named is the entry
+      // edited: a clear takes its head (own key first, then collector order); a demotion takes its
+      // first flat entry, a promotion its first workers entry; a bare adapter id or a sibling's
+      // entry is never in it. OBS-1046: an allow exclusion is the LAST reason taken, never together
+      // with an authored deny.
+      const edits = reachEdits(ownedDenies(self));
+      // review D-1081 add.: the seed this session generated for this member is its own even when a peer
+      // member's recorded identity also reaches it (C-high recorded as C-low) — never authored, and lifting
+      // it admits only this act's members; a seed any channel outside the row matches stays shared
+      const ownSeed = () => ui.seededAllowOut.find((seed) => seed.adapter === self.adapter && seed.model === self.model
+        && ui.allowOut.has(seed.entry)
+        && !siblingsOf(self).some((other) => !members.some((peer) => peer.adapter === other.adapter && peer.model === other.model)
+          && entryMatchesChannel(seed.entry, other, false)))?.entry;
+      const ownAllow = (): Owned | undefined => {
+        const fromAllow = selectOwn(ui.allowOut, self, false) ?? ownSeed();
+        return fromAllow === undefined ? undefined : { entry: fromAllow, scope: "routing.allow" };
+      };
+      const ownFlat = () => edits.demote ?? ownAllow();
+      const ownWorkers = () => edits.promote;
+      const takeFlat = (found: { entry: string; scope: string }) => {
+        const scope = scopeOf(found.scope);
+        if (scope) ui[scope.key] = without(ui[scope.key], found.entry);
+        else ui.allowOut = without(ui.allowOut, found.entry);
+      };
+      const refuse = (reachLabel: string): { refused: string } => {
+        // OBS-1099 item 2: a covered row names the covering entry, every identity it covers, and
+        // the ONE control that lifts it — the T1 refusal wording stays in front of it
+        if (covering?.shared) {
+          // the notice clips at the browser width; the detail line and the l overlay list every identity
+          return { refused: `${memberId} stays ${reachLabel} — ${covering.scope} (${covering.entry}) covers ${covering.covers.length} channels — Space edits only this channel's own entries; l lists and lifts it` };
+        }
+        const shared = ui.denyAdapters.has(row.adapter) || ui.allowOut.has(row.adapter) || ui.denyWorkersAdapters.has(row.adapter)
+          ? `every ${row.adapter} channel is out together — set the adapter's reach on the rail`
+          : "a shared entry covers other channels too";
+        return { refused: `${memberId} stays ${reachLabel} — ${reasons.join("; ")} — Space edits only this channel's own entries; ${shared}` };
+      };
 
-    const reach = row.reach;
-    const outAll = reach === "out-all" || reach === "out-allow";
-    let edit = "";
-    if (choice === "out-workers" && reach === "in") {
-      ui.denyWorkersModels = withEntry(ui.denyWorkersModels, id);
-      edit = `added ${id} to routing.deny.workers.models`;
-    } else if (choice === "out-workers" && outAll) {
-      const found = ownFlat();
-      if (found === undefined) return refuse("out");
-      takeFlat(found);
-      ui.denyWorkersModels = withEntry(ui.denyWorkersModels, found.entry);
-      edit = `moved ${found.entry} to routing.deny.workers.models`;
-    } else if (choice === "out-all" && reach === "in") {
-      ui.denyModels = withEntry(ui.denyModels, id);
-      edit = `added ${id} to routing.deny.models`;
-    } else if (choice === "out-all" && reach === "out-workers") {
-      // OBS-1099 review: a promotion, like a clear, takes only an entry no sibling row matches —
-      // a shared workers entry (adapter-wide or a bare id another row serves) is refused by name,
-      // never moved for its siblings and never doubled by a fresh flat deny
-      const found = ownWorkers();
-      if (found === undefined) return refuse("out · workers");
-      takeFlat(found);
-      ui.denyModels = withEntry(ui.denyModels, found.entry);
-      edit = `moved ${found.entry} to routing.deny.models`;
-    } else if (choice === "in" && reach !== "in") {
-      // D-205: in clears ONE row-owned reason from either the flat scopes or the workers scope —
-      // a shared flat reason (routing.deny.adapters covering every channel) never blocks clearing
-      // this row's own workers entry; the recomputed reach then names the shared reason that remains
-      const found = edits.clear ?? (outAll ? ownAllow() : undefined);
-      if (found !== undefined) {
+      const reach = before[at].reach;
+      const outAll = reach === "out-all" || reach === "out-allow";
+      if (choice === "out-workers" && reach === "in") {
+        ui.denyWorkersModels = withEntry(ui.denyWorkersModels, memberId);
+        return { edit: `added ${memberId} to routing.deny.workers.models` };
+      } else if (choice === "out-workers" && outAll) {
+        const found = ownFlat();
+        if (found === undefined) return refuse("out");
         takeFlat(found);
-        edit = `cleared ${found.entry} from ${found.scope}`;
-      } else {
-        return refuse(outAll ? "out" : "out · workers");
+        ui.denyWorkersModels = withEntry(ui.denyWorkersModels, found.entry);
+        return { edit: `moved ${found.entry} to routing.deny.workers.models` };
+      } else if (choice === "out-all" && reach === "in") {
+        ui.denyModels = withEntry(ui.denyModels, memberId);
+        return { edit: `added ${memberId} to routing.deny.models` };
+      } else if (choice === "out-all" && reach === "out-workers") {
+        // OBS-1099 review: a promotion, like a clear, takes only an entry no sibling row matches —
+        // a shared workers entry (adapter-wide or a bare id another row serves) is refused by name,
+        // never moved for its siblings and never doubled by a fresh flat deny
+        const found = ownWorkers();
+        if (found === undefined) return refuse("out · workers");
+        takeFlat(found);
+        ui.denyModels = withEntry(ui.denyModels, found.entry);
+        return { edit: `moved ${found.entry} to routing.deny.models` };
+      } else if (choice === "in" && reach !== "in") {
+        // D-205: in clears ONE row-owned reason from either the flat scopes or the workers scope —
+        // a shared flat reason (routing.deny.adapters covering every channel) never blocks clearing
+        // this row's own workers entry; the recomputed reach then names the shared reason that remains
+        const found = edits.clear ?? (outAll ? ownAllow() : undefined);
+        if (found === undefined) return refuse(outAll ? "out" : "out · workers");
+        takeFlat(found);
+        return { edit: `cleared ${found.entry} from ${found.scope}` };
       }
-    } else {
-      ui.notice = `${id} is already ${label}`;
+      return { already: true };
+    });
+    const made = outcomes.flatMap((outcome) => ("edit" in outcome ? [outcome.edit] : []));
+    const refused = outcomes.flatMap((outcome) => ("refused" in outcome ? [outcome.refused] : []));
+    if (!made.length) {
+      ui.notice = refused[0] ?? `${id} is already ${label}`;
       return;
     }
-    const after = reachFor(row.adapter, row.model, row.evidence?.identity);
-    const still = reached(after.reach, choice) ? "" : ` — still out: ${after.reasons.join("; ")}`;
-    ui.lastEdit = { id, text: `space: ${edit}${still}` };
+    const after = rowReach(members);
+    const still = reached(after.reach, choice) && !after.partial ? "" : ` — still out: ${after.reasons.join("; ")}`;
+    ui.lastEdit = { id, text: `space: ${made.join("; ")}${still}` };
   };
 
   // OBS-1065: Enter on a greyed picker row lifts exactly its row-owned covering entry, then the
@@ -1959,7 +2041,13 @@ export function FleetApp({
         const suggested = rows
           .filter((candidate): candidate is ModelRow & { suggestion: FleetModelSuggestion } =>
             candidate.adapter === group.adapter && !candidate.tier && candidate.suggestion !== undefined)
-          .map((candidate) => ({ model: candidate.classifyModel ?? candidate.model, displayModel: candidate.model, suggestion: candidate.suggestion }));
+          // T5: every real member of each suggested row stages, never only its reference id
+          .flatMap((candidate) => membersOf(candidate.adapter, candidate).map((member) => ({
+            model: member.model,
+            displayModel: candidate.model,
+            ...(member.identity !== undefined ? { identity: member.identity } : {}),
+            suggestion: candidate.suggestion,
+          })));
         if (!suggested.length) {
           ui.notice = "no catalog tier suggestions among the visible unclassified models — evidence comes from the cached catalogs (AA index / API pricing)";
           bump();
@@ -2092,6 +2180,8 @@ export function FleetApp({
     if (row.evidence?.unauthed !== undefined) return "unauthed — re-probe with tickmarkr doctor (Space does not toggle reach)";
     // T10: the reasons, then where each scope is held — the overlay a reviewed w writes
     const reasons = `${row.reasons.join("; ")}${row.held.length ? ` — held: ${row.held.join("; ")}` : ""}`;
+    // T5: members disagree — never a whole-group state; each member-specific reason names its real id
+    if (row.partial) return `reach: partial — ${row.reach} for some members only — ${reasons} — Space applies one choice to every member`;
     if (row.reach === "out-all") return `reach: out · all seats — ${reasons} — Space picks in or out · workers`;
     if (row.reach === "out-allow") return `reach: out · all seats · allow — ${reasons} — Space picks in or out · workers`;
     if (row.reach === "out-workers") return `reach: out · workers only (judge/review/consult unaffected) — ${reasons} — Space picks in or out · all seats`;
@@ -2100,7 +2190,7 @@ export function FleetApp({
   };
 
   const reachCell = (row: ModelRow): string =>
-    row.reach === "in" || row.reach === "unknown" ? row.reach : `out ${row.reach === "out-workers" ? "workers" : row.reach.slice(4)}`;
+    row.partial ? "partial" : row.reach === "in" || row.reach === "unknown" ? row.reach : `out ${row.reach === "out-workers" ? "workers" : row.reach.slice(4)}`;
 
   const identityDetail = (row: ModelRow): string => {
     if (row.evidence?.identity === undefined) return "";
@@ -2133,11 +2223,16 @@ export function FleetApp({
       `${row.adapter}:${row.model}`,
       row.tier ?? "unclassified",
       ui.efforts[row.adapter]?.[row.model] ? `effort ${ui.efforts[row.adapter][row.model]}` : "",
+      // T5: a grouped row names each member doctor recorded unauthed — up front, before the line clips
+      ...(row.evidence?.unauthed === undefined ? (row.members ?? []).filter((member) => member.unauthed !== undefined)
+        .map((member) => `${row.adapter}:${member.model} UNAUTHED — ${member.unauthed} — re-probe with tickmarkr doctor`) : []),
       ui.lastEdit?.id === `${row.adapter}:${row.model}` ? ui.lastEdit.text : "",
       identityDetail(row),
       row.tier ? reachDetail(row) : "",
       row.variants?.length ? `variants ${row.variants.join(", ")}` : "",
-      row.classifyModel ? `classify writes ${row.classifyModel}` : "",
+      // T5: a grouped row classifies (and edits) every real member; classifyModel is its reference id
+      row.members?.length ? `classify writes ${row.members.map((member) => member.model).join(", ")}`
+        : row.classifyModel ? `classify writes ${row.classifyModel}` : "",
       row.foldedModels?.length ? `${row.foldedModels.length} gateway ids folded: ${row.foldedModels.join(", ")}` : "",
       row.evidence?.unauthed !== undefined ? `UNAUTHED — ${row.evidence.unauthed}` : "",
       row.evidence?.contextWindow !== undefined ? `${fmtCtx(row.evidence.contextWindow)} ctx` : "",
@@ -2165,7 +2260,9 @@ export function FleetApp({
     return (
       <Text key={`${row.adapter}:${row.model}`} wrap="truncate">
         <Pointer on={selected} />
-        {row.reach === "out-all" || row.reach === "out-allow"
+        {row.partial
+          ? <Glyph kind="warn" />
+          : row.reach === "out-all" || row.reach === "out-allow"
           ? <Glyph kind="off" />
           : row.evidence?.unauthed !== undefined || row.reach === "unknown"
             ? <Glyph kind="fail" />
@@ -2303,8 +2400,8 @@ export function FleetApp({
     if (overlay.kind === "classify") {
       const subject = overlay.bulk
         ? `${overlay.adapter} · ${overlay.bulk.rows.length} suggested models`
-        : overlay.displayModel
-          ? `${overlay.adapter}:${overlay.displayModel} · writes ${overlay.model}`
+        : overlay.displayModel || classifiedMembers(overlay.adapter, overlay.model).length > 1
+          ? `${overlay.adapter}:${overlay.displayModel ?? overlay.model} · writes ${classifiedMembers(overlay.adapter, overlay.displayModel ?? overlay.model).map((member) => member.model).join(", ")}`
           : `${overlay.adapter}:${overlay.model}`;
       return (
         <OverlayPanel title={`classify · ${subject}`} width={bodyW}>
@@ -2493,7 +2590,7 @@ export function FleetApp({
       const current = overlay.target.model === undefined
         ? adapterReach(overlay.target.adapter)
         : modelRows().find((row) => row.adapter === overlay.target.adapter && row.model === overlay.target.model) ?? { reach: "unknown", reasons: [] };
-      const partial = "partial" in current && current.partial;
+      const partial = "partial" in current && current.partial === true;
       // D-205: a partial rail marks no choice as selected — its channels disagree
       const on: ReachChoice | null = partial || current.reach === "unknown" ? null
         : current.reach === "out-all" || current.reach === "out-allow" ? "out-all" : current.reach;
