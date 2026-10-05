@@ -337,6 +337,13 @@ export type CheckedBeat =
 const sameIdentity = (a: { birth?: string; command?: string; cwd: string }, id: IdentityRead): id is ProcessIdentity =>
   typeof id === "object" && id.birth === a.birth && id.command === a.command && id.cwd === a.cwd;
 const sameProcess = (owner: BeatOwner, id: IdentityRead): id is ProcessIdentity => sameIdentity(owner, id);
+/**
+ * Linux frees an exiting process's memory (its argv) before its cwd and before it is a zombie, so in that window ps prints
+ * `[comm]` beside the same birth, group and cwd. Only a wait for death may read that as "not gone yet": it never authorises a
+ * signal or a removal (both still need a full identity or checked death); any other difference stays a mismatch.
+ */
+const exitingAfterSignal = (a: { birth?: string; pgid?: number; cwd: string }, id: IdentityRead): boolean =>
+  typeof id === "object" && id.birth === a.birth && id.pgid === a.pgid && id.cwd === a.cwd && /^\[.+\]$/.test(id.command);
 
 /** The durable arm, or UNREADABLE for a torn one — never mistaken for no arm. */
 function armOf(repoRoot: string, tier: SupervisionTier): SupervisionArm | undefined | "UNREADABLE" {
@@ -655,7 +662,7 @@ async function rollback(
       // A process exiting after our signal can disappear between its ps and cwd reads. UNKNOWN
       // proves neither death nor a changed identity: wait for checked death, and still require a
       // matching live identity at the separate barrier before any further signal.
-      if (proven && checked.identity !== "UNKNOWN" && !sameIdentity(proven, checked.identity)) failed(`pid ${pid} not signalled — its identity is not proven to be this generation's child; owner record retained`);
+      if (proven && checked.identity !== "UNKNOWN" && !sameIdentity(proven, checked.identity) && !exitingAfterSignal(proven, checked.identity)) failed(`pid ${pid} not signalled — its identity is not proven to be this generation's child; owner record retained`);
       return false;
     };
     for (const signal of ["SIGTERM", "SIGKILL"] as const) {
@@ -736,7 +743,7 @@ async function retire(repoRoot: string, tier: SupervisionTier, owner: BeatOwner 
   if (!Number.isInteger(owner.pid) || owner.pid <= 0) refuse(`${tier} recorded pid ${owner.pid} is not a positive pid`);
   const gone = () => {
     const { identity } = requireOwned(checkOwnedGeneration(repoRoot, tier, expectedGeneration(owner), deps, owner.pid), tier);
-    if (identity !== "DEAD" && identity !== "UNKNOWN" && !sameProcess(owner, identity)) refuse(`${tier} MISMATCH — pid ${owner.pid} changed identity while stopping; owner record retained`);
+    if (identity !== "DEAD" && identity !== "UNKNOWN" && !sameProcess(owner, identity) && !exitingAfterSignal(owner, identity)) refuse(`${tier} MISMATCH — pid ${owner.pid} changed identity while stopping; owner record retained`);
     return identity === "DEAD";
   };
   try { deps.kill(owner.pid, "SIGTERM"); } catch (error) {

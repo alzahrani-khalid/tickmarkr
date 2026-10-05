@@ -452,6 +452,66 @@ test("production dispatch refuses complete generation replacements during status
   } finally { await rig.close(); }
 }, 120_000);
 
+test("test: stop and start rollback wait through a Linux argv teardown ([comm] beside the same birth, group and cwd) after their own SIGTERM, while a different birth after the signal still refuses with the owner retained", async () => {
+  // Stop: the first two identity reads after our SIGTERM are the teardown form (twin: a different birth).
+  for (const flip of ["teardown", "birth"] as const) {
+    const rig = boundaryRig();
+    try {
+      const repo = mkRepo();
+      expect(await run(repo, ["start", "overseer", "--seat", "s"], rig.d)).toMatchObject({ code: 0 });
+      const pid = owner(repo, "overseer").pid;
+      const recorded = rig.children.get(pid)!.identity;
+      let altered = 0;
+      const d: BeatLifecycleDeps = {
+        ...rig.d,
+        identity: (p) => {
+          if (p !== pid || rig.kills.length === 0 || altered === 2) return rig.d.identity(p);
+          altered++;
+          return flip === "teardown" ? { ...recorded, command: "[node]" } : { ...recorded, birth: `${recorded.birth}-reused` };
+        },
+      };
+      const stopped = await run(repo, ["stop", "overseer", "--seat", "s"], d);
+      expect(rig.kills).toEqual([[pid, "SIGTERM"]]);
+      if (flip === "teardown") {
+        expect(altered).toBe(2);
+        expect(stopped).toMatchObject({ code: 0, out: expect.stringContaining(`retired detached pid ${pid}`) });
+        expect(existsSync(beatOwnerPath(repo, "overseer"))).toBe(false);
+        expect(supervisionStatus(repo, "overseer").state).toBe("DISARMED");
+      } else {
+        expect(stopped).toMatchObject({ code: 1, out: expect.stringContaining("changed identity while stopping; owner record retained") });
+        expect(existsSync(beatOwnerPath(repo, "overseer"))).toBe(true);
+      }
+    } finally { await rig.close(); }
+  }
+
+  // Start rollback: an overrun start retires its own child; the first two reads after that SIGTERM are the teardown form.
+  const overrun = mkRepo();
+  let launchedAt: number | undefined, lastSeen: ProcessIdentity | undefined, altered = 0;
+  const kills: Array<[number, string]> = [];
+  const late = deps({
+    now: () => {
+      launchedAt ??= Date.now();
+      return launchedAt + (existsSync(supervisionBeatPath(overrun, "overseer")) ? 60_001 : 0);
+    },
+    identity: (pid) => {
+      if (kills.length > 0 && lastSeen && altered < 2) { altered++; return { ...lastSeen, command: "[node]" }; }
+      const id = readProcessIdentity(pid);
+      if (typeof id === "object") lastSeen = id;
+      return id;
+    },
+    kill: (pid, signal) => { kills.push([pid, signal]); process.kill(pid, signal); },
+  });
+  const overran = await run(overrun, ["start", "overseer", "--seat", "s"], late);
+  expect(altered).toBe(2);
+  expect(overran).toMatchObject({ code: 1, out: expect.stringContaining("startup overran 60000 ms") });
+  expect(overran.out).toMatch(/rolled back/);
+  expect(overran.out).not.toContain("not proven");
+  const child = spawned.at(-1)!;
+  await until(() => child.exitCode !== null || child.signalCode !== null);
+  expect(kills).toEqual([[child.pid, "SIGTERM"]]);
+  expect(existsSync(beatOwnerPath(overrun, "overseer"))).toBe(false);
+}, 120_000);
+
 describe("beat start", () => {
   test("test: production beat start reports the closed start outcome table versus a falsely successful launch", async () => {
     // Invalid input / nonrepository: refused before any mutation.
