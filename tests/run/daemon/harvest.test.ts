@@ -1251,7 +1251,7 @@ function reviewOnlySeat(repo: string, scriptPath: string): FakeAdapter {
 // probe and its identity recheck is a normal race, not unreadable ownership. Treating it as unknown
 // parked the whole attempt as "cleanup unknown" and swallowed the harvest (7/9 reds at 3-way load).
 describe("reap: a candidate exiting after its cwd probe is spared, never unknown (OBS-1173)", () => {
-  const sweep = async (recheck: string | null | undefined, cwdReadable = true) => {
+  const sweep = async (recheck: string | null | undefined, cwdReadable = true, childListedFor = Infinity) => {
     const root = realpathSync(makeTestTempDir("reap-race"));
     const marker = join(root, "dispatch.sh");
     const group = 700_001;
@@ -1260,7 +1260,9 @@ describe("reap: a candidate exiting after its cwd probe is spared, never unknown
       [group, { pid: group, ppid: 1, group, session: "9", identity: `${group}:o`, command: `bash ${marker}` }],
       [child, { pid: child, ppid: group, group, session: "9", identity: `${child}:o`, command: "tool-child" }],
     ]);
-    vi.spyOn(stall.workerReapHost, "snapshot").mockImplementation(async () => [...rows.values()].map((r) => ({ ...r })));
+    let snapshots = 0;
+    vi.spyOn(stall.workerReapHost, "snapshot").mockImplementation(async () =>
+      [...rows.values()].filter((r) => r.pid !== child || snapshots++ < childListedFor).map((r) => ({ ...r })));
     vi.spyOn(stall.workerReapHost, "inspect").mockImplementation(async (pid) =>
       pid === child && !cwdReadable ? undefined : { cwd: root });
     vi.spyOn(stall.workerReapHost, "identity").mockImplementation(async (pid) =>
@@ -1279,6 +1281,14 @@ describe("reap: a candidate exiting after its cwd probe is spared, never unknown
   // OBS-1173 add.2: a probe that timed out or was signalled proves nothing. A live in-worktree
   // candidate whose recheck FAILS is unknown (harvest refused), on both the readable-cwd branch and
   // the unreadable-cwd branch; a pid that is really gone is still spared on both.
+  // Public CI 37302193795 (D-1263): a tool child exiting during the reap loses its cwd but keeps its
+  // birth identity until it is reaped. Once a fresh snapshot no longer lists it (ps drops Z rows) it has
+  // finished and is spared; while that snapshot still lists it live it stays unknown.
+  test("a candidate with no readable cwd and an unchanged identity is spared once a fresh snapshot no longer lists it, and unknown while it is still listed", async () => {
+    expect(await sweep("700002:o", false, 1)).toEqual([]);
+    expect(await sweep("700002:o", false)).toBeNull();
+  });
+
   test("a failed identity recheck is unknown, never gone — on either cwd branch", async () => {
     expect(await sweep(null)).toBeNull();
     expect(await sweep(null, false)).toBeNull();

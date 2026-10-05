@@ -272,7 +272,14 @@ async function reapWorkerProcesses(group: number | undefined, cwd: string, owner
       // OBS-1173 add.2: a FAILED recheck (null) is unknown too — it never reads as gone.
       if (!details) {
         const recheck = await workerReapHost.identity(row.pid);
-        return recheck === row.identity || recheck === null ? "unknown" : "spared";
+        if (recheck === null) return "unknown";
+        if (recheck !== row.identity) return "spared";
+        // An exiting child loses its cwd before it is reaped yet keeps its birth identity (a zombie, or
+        // on its way to one). The snapshot drops Z rows, so a fresh snapshot that no longer lists this
+        // pid and identity says it has finished; a still-listed live row with no readable cwd stays
+        // unknown, and so does an unreadable snapshot (public CI 37302193795, D-1263).
+        const fresh = await workerReapHost.snapshot();
+        return !fresh || fresh.some((r) => r.pid === row.pid && r.identity === row.identity) ? "unknown" : "spared";
       }
       if (details.suiteParent === process.pid || excludedPaths.some((path) => below(path, details.cwd))) return "spared";
       if (!below(root, details.cwd)) return "spared";
