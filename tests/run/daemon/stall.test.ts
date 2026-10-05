@@ -614,7 +614,16 @@ describe("T1 stall detection (OBS-262/263, fake adapter, zero tokens)", () => {
   // the short rolling window owns its eventual conclusion instead.
   // "Could not be delivered" means BOTH attempts failed — one in-slice retry (T1 review) filters a
   // driver flake, so a single false return never reaches this path.
-  test("an undeliverable nudge does not condemn a pane whose worktree changed — delivery failure is not worker evidence", async () => {
+  // Worktree contact rows are counted as AT LEAST the real changes, never exactly: observeWorktree reads HEAD, the index,
+  // status and content as four sequential git spawns, so a write landing between two of them is journaled once as a torn
+  // signature and again as the final one — two true rows from one echo (public CI on a loaded Ubuntu runner, D-1241). The
+  // second case makes two real changes, further apart than the in-slice redelivery hold, so an exact-one count fails it.
+  test.each([
+    ["an undeliverable nudge does not condemn a pane whose worktree changed — delivery failure is not worker evidence",
+      "echo scratch > scratch.txt && echo working-on-it", "run-t1-nudge-fail", 1],
+    ["an undeliverable nudge does not condemn a pane whose worktree changed twice — every real change is a contact row",
+      ": > scratch.txt && sleep 4 && echo scratch > scratch.txt && echo working-on-it", "run-t1-nudge-fail-twice", 2],
+  ] as const)("%s", async (_title, shell, runId, minContacts) => {
     NUDGEABLE_ADAPTERS.add("fake");
     setNudgeTimingForTests(200, 400);
     setDeadChannelFastKillMsForTests(1_500);
@@ -622,18 +631,19 @@ describe("T1 stall detection (OBS-262/263, fake adapter, zero tokens)", () => {
       const { repo, fake } = setupRepo(
         [T("T1", { timeoutMinutes: 0.05 })], // 3s window owns the conclusion after the delta is observed
         { consult: { action: "human", notes: "stalled worker" },
-          tasks: { T1: [{ shell: "echo scratch > scratch.txt && echo working-on-it" }] } }, // uncommitted delta
+          tasks: { T1: [{ shell }] } }, // uncommitted delta
       );
       const driver = idriver({
         status: async () => "working", // never pageable
         nudge: async () => false, // the pane cannot be reached
         notify: async () => {}, // keep expected consult/page delivery inside this fixture, not suite stdout
       });
-      const s = await runDaemon(repo, { adapters: [fake], runId: "run-t1-nudge-fail", driver });
+      const s = await runDaemon(repo, { adapters: [fake], runId, driver });
       expect(s.human).toEqual(["T1"]);
-      const evs = Journal.open(repo, "run-t1-nudge-fail").read();
+      const evs = Journal.open(repo, runId).read();
       expect(evs.filter((e) => e.event === "worker-nudge-failed" && e.taskId === "T1")).toHaveLength(1);
-      expect(evs.filter((e) => e.event === "worker-contact" && e.data.evidence === "worktree")).toHaveLength(1);
+      expect(evs.filter((e) => e.event === "worker-contact" && e.taskId === "T1" && e.data.evidence === "worktree").length)
+        .toBeGreaterThanOrEqual(minContacts);
       expect(evs.filter((e) => e.event === "worker-dead" && e.taskId === "T1")).toHaveLength(0);
     } finally {
       NUDGEABLE_ADAPTERS.delete("fake");
