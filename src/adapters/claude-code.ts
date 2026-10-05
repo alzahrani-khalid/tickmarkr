@@ -225,6 +225,8 @@ export function probeVersion(bin: string): AuthHealth {
 // it right after --model's value and before another flag, never before the prompt positional.
 const claudeEffortFlag = (effort?: Effort): string => (effort ? ` --effort ${shq(effort)}` : "");
 
+const WORKER_SETTINGS = `'{"promptSuggestionEnabled":false,"remoteControlAtStartup":false}'`;
+
 export const claudeCode: WorkerAdapter = {
   id: "claude-code",
   vendor: "anthropic",
@@ -263,19 +265,24 @@ export const claudeCode: WorkerAdapter = {
   // live check ate the prompt), and --prompt-suggestions takes an OPTIONAL value — appended directly
   // before the prompt it would swallow it the same way. So the setting's value is always followed by
   // another flag, never by the prompt positional.
+  // Remote Control is OFF for workers: a user's remoteControlAtStartup otherwise registers every pane
+  // worker as a Remote Control session and a local peer, an input channel tickmarkr never records (607 of
+  // 607 interactive workers on one host, 2026-10-05). --settings outranks the user setting (live-checked
+  // against claude 2.1.289: the banner's /rc marker is gone with the key, present without it). The -p form
+  // never registers.
   // OBS-931: the same ONE-argv-string hazard as codex (OBS-930) — over promptArgvCeiling() the TUI
   // launch would E2BIG on Linux, so it returns null → worker-mode-fallback → the headless form.
   // resumeCommand keeps the shape: its contract returns a string (composer delivery is 2.4.3 work).
   interactiveCommand: (promptFile: string, model: string, effort?: Effort) =>
     promptFitsArgv(promptFile)
-      ? `claude --model ${shq(model)}${claudeEffortFlag(effort)} --strict-mcp-config --mcp-config '{"mcpServers":{}}' --settings '{"promptSuggestionEnabled":false}' --prompt-suggestions false --permission-mode bypassPermissions "$(cat ${shq(promptFile)})"`
+      ? `claude --model ${shq(model)}${claudeEffortFlag(effort)} --strict-mcp-config --mcp-config '{"mcpServers":{}}' --settings ${WORKER_SETTINGS} --prompt-suggestions false --permission-mode bypassPermissions "$(cat ${shq(promptFile)})"`
       : null,
   trustDialog: CLAUDE_TRUST_DIALOG,
   inputBox: CLAUDE_INPUT_BOX,
   // A resumed attempt lands in the same painted editor, so it carries the same ghost-text suppression
   // and the same value-then-flag placement.
   resumeCommand: (sessionId: string, promptFile: string, model: string, effort?: Effort) =>
-    `claude -r ${shq(sessionId)} --model ${shq(model)}${claudeEffortFlag(effort)} --strict-mcp-config --mcp-config '{"mcpServers":{}}' --settings '{"promptSuggestionEnabled":false}' --prompt-suggestions false --permission-mode bypassPermissions "$(cat ${shq(promptFile)})"`,
+    `claude -r ${shq(sessionId)} --model ${shq(model)}${claudeEffortFlag(effort)} --strict-mcp-config --mcp-config '{"mcpServers":{}}' --settings ${WORKER_SETTINGS} --prompt-suggestions false --permission-mode bypassPermissions "$(cat ${shq(promptFile)})"`,
   invoke(task: Task, _cwd: string, a: Assignment, ctx: { promptFile: string }): Invocation {
     return { command: this.headlessCommand(ctx.promptFile, a.model, a.effort) };
   },

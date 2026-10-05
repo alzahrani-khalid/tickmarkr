@@ -218,7 +218,7 @@ describe("qwen native drive", () => {
 
     const argv = capturedArgv(capture.argv);
     const stdin = readFileSync(capture.stdin, "utf8");
-    const settings = `--settings '{"promptSuggestionEnabled":false}'`;
+    const settings = `--settings '{"promptSuggestionEnabled":false,"remoteControlAtStartup":false}'`;
     const paneCommands = [
       claudeCode.interactiveCommand(prompt, "fable")!,
       claudeCode.resumeCommand!("session", prompt, "fable"),
@@ -229,7 +229,7 @@ describe("qwen native drive", () => {
       expect(headlessStdin).toBe(promptText);
       for (const command of panes) {
         expect(command).toContain(settings);
-        expect(command).toMatch(/--settings '\{"promptSuggestionEnabled":false\}' --[A-Za-z]/);
+        expect(command).toMatch(/--settings '\{"promptSuggestionEnabled":false,"remoteControlAtStartup":false\}' --[A-Za-z]/);
       }
       expect(flags).toContain("--settings");
     };
@@ -247,6 +247,27 @@ describe("qwen native drive", () => {
     const banner = execSync(bannerShell(), { shell: "/bin/bash", encoding: "utf8" });
     return `${banner}${YOLO_WARNING}${stdout}\nTICKMARKR_EXIT_${NONCE}:${exitCode}\n`;
   };
+
+  // A user's remoteControlAtStartup must never register a worker: Remote Control and local peer messages
+  // would reach it beside the prompt file, unrecorded (D-1253; 607 of 607 interactive workers on one host).
+  test("test: the claude-code interactive and resume worker launches parse to a settings object that turns Remote Control off whereas a pane launch carrying only the user's settings fails", () => {
+    const settingsOf = (command: string): Record<string, unknown> => {
+      const m = command.match(/--settings '(\{[^']*\})' --[A-Za-z]/);
+      expect(m).not.toBeNull();
+      return JSON.parse(m![1]) as Record<string, unknown>;
+    };
+    const assertWorkerSettings = (commands: string[]) => {
+      for (const command of commands) {
+        expect(settingsOf(command)).toMatchObject({ remoteControlAtStartup: false, promptSuggestionEnabled: false });
+      }
+    };
+    const panes = [
+      claudeCode.interactiveCommand("/tmp/prompt.md", "fable", "high")!,
+      claudeCode.resumeCommand!("session", "/tmp/prompt.md", "fable"),
+    ];
+    assertWorkerSettings(panes);
+    expect(() => assertWorkerSettings(panes.map((command) => command.replace(',"remoteControlAtStartup":false', "")))).toThrow();
+  });
 
   test("test: a qwen event stream wrapped the way the daemon captures it (ANSI banner before, the driver's stderr warning interleaved, the nonce exit line after) decodes to ok true on a trailer and to cause startup-failure naming error.message on a no-auth result event, whereas a parser that JSON-parses the whole buffer reads both as malformed", () => {
     const trailer = `TICKMARKR_RESULT_${NONCE} {"ok":true,"summary":"decoded through the wrapper","deviations":[]}`;

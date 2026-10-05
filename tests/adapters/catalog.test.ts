@@ -364,7 +364,8 @@ test("the fable alias stamp reads claude-fable-5-1 with a dated comment and the 
   const expectedBeforeDigests = {
     // 2026-09-03: repinned when claude moved its print prompt to stdin, pane forms gained the
     // promptSuggestionEnabled settings pair, and Fable's stamp advanced to 5.1.
-    "claude-code": "c00cb8c0fc0e03ca99857237b98d73d59e223f4d2ec5156bc7500fc778c707d0",
+    // 2026-10-05 (v2.6.7, D-1253): repinned when the pane forms' settings turned Remote Control off for workers.
+    "claude-code": "203a707f4c396af852820e51aa32445ea9ad4aa49eae3bcb57adf4ec07a73751",
     // 2026-09-05 (OBS-889): repinned when headless prompts moved to stdin and TUI fallback became explicit.
     // 2026-09-05 (OBS-930): repinned when the interactive form became the real TUI launch with the
     // prompt as the last positional (the argv-safe shape the claude adapter uses).
