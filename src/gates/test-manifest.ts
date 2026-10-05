@@ -380,6 +380,15 @@ export function verifyManifestReport(opts: {
 /** How much longer than its baseline measurement one file may legitimately run before it is a hang. */
 export const FILE_HANG_SLACK = 3;
 export const DEFAULT_FILE_HANG_BUDGET_MS = 60_000;
+/**
+ * No file is a hang before this much active time, whatever its baseline says (the battery ceiling still wins below it). A fast
+ * suite's per-file timings are a few ms, so 3 × longest killed a new or slower file that would have passed, or a scheduling gap, as an infra hang.
+ */
+export const MIN_FILE_HANG_BUDGET_MS = 10_000;
+let hangBudgetFloorMs = MIN_FILE_HANG_BUDGET_MS;
+/** Tests of the baseline-derived budget's kill mechanics opt out of the floor; production never does. */
+export const setHangBudgetFloorForTests = (ms: number): void => { hangBudgetFloorMs = ms; };
+export const resetHangBudgetFloorForTests = (): void => { hangBudgetFloorMs = MIN_FILE_HANG_BUDGET_MS; };
 
 const usable = (n: number | undefined): n is number => n !== undefined && Number.isFinite(n) && n > 0;
 export function fileHangBudgetMs(file: string, baselineDurations?: readonly BaselineFileDuration[] | null,
@@ -498,7 +507,7 @@ export function runManifestedTest(
     for (const file of opts.manifest) {
       const startedAt = report.started[file];
       if (startedAt === undefined || file in report.completed) continue;
-      const budget = fileHangBudgetMs(file, opts.baselineDurations, overallCeilingMs, opts.longestFile);
+      const budget = Math.min(overallCeilingMs, Math.max(hangBudgetFloorMs, fileHangBudgetMs(file, opts.baselineDurations, overallCeilingMs, opts.longestFile)));
       const wallMs = at.wall - startedAt;
       const activeMs = wallMs - suspendedSince(interruptions, startedAt);
       if (activeMs >= budget || (atCeiling && budget === overallCeilingMs)) {

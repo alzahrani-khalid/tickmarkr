@@ -3,13 +3,13 @@ import { randomBytes } from "node:crypto";
 import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { expect, test, vi } from "vitest";
+import { expect, onTestFinished, test, vi } from "vitest";
 import { FakeAdapter } from "../../src/adapters/fake.js";
 import { DEFAULT_CONFIG } from "../../src/config/config.js";
 import { captureBaseline, compareToBaseline, type Baseline, type BaselineCommand } from "../../src/gates/baseline.js";
 import { runGates, testCommandForFiles } from "../../src/gates/run-gates.js";
 import type { GateResult } from "../../src/gates/types.js";
-import { discoverTestManifest, evaluateManifestedTest, fileHangBudgetMs, isVitestTestCommand, readTestReport, resetHangClocksForTests, setHangClocksForTests, singleForkRetryCommand, verifyManifestReport } from "../../src/gates/test-manifest.js";
+import { discoverTestManifest, evaluateManifestedTest, fileHangBudgetMs, isVitestTestCommand, MIN_FILE_HANG_BUDGET_MS, readTestReport, resetHangBudgetFloorForTests, resetHangClocksForTests, setHangBudgetFloorForTests, setHangClocksForTests, singleForkRetryCommand, verifyManifestReport } from "../../src/gates/test-manifest.js";
 import { TEST_REPORTER_SOURCE } from "../../src/gates/test-reporter.js";
 import { preserveWorktree, shGitOk, VERIFICATION_PROTOCOL } from "../../src/run/git.js";
 import { SubprocessDriver } from "../../src/drivers/subprocess.js";
@@ -298,6 +298,7 @@ test("a file that was RED in the baseline is budgeted as untimed at three times 
 });
 
 test("through runGates a fixture baseline with known per-file durations yields for each timed file the larger of three times its duration and the longest usable duration capped at the battery ceiling, three times the longest usable for an untimed file, and the positive battery ceiling when nothing usable was timed, including a baseline whose observations are all zero and a legacy baseline keeping only a zero longestFile, each budgeting at the ceiling rather than terminating at once, a stand-in runner resolved as the worktree's vitest that writes a file's started record and never completes it is killed at that file's budget with an infra hang result naming the file and the budget and the runner's process group gone, the same kill names the file when its budget equals the battery ceiling, and the same runner completing that file with a failed test is a work result, so a budget derived from the gate under test, a zero or non-finite duration used as a timing, a hang left to the battery ceiling, a hang reported as a regression, or an untimed file killed at zero fails", async () => {
+  setHangBudgetFloorForTests(0); onTestFinished(resetHangBudgetFloorForTests); // the derived budget's own kill mechanics
   const timings = [{file:"tests/a.test.ts",durationMs:40},{file:"tests/b.test.ts",durationMs:100},{file:"zero",durationMs:0},{file:"nan",durationMs:NaN},{file:"inf",durationMs:Infinity}];
   expect(fileHangBudgetMs("tests/a.test.ts",timings,1000)).toBe(120);
   expect(fileHangBudgetMs("tests/b.test.ts",timings,200)).toBe(200);
@@ -334,6 +335,19 @@ test("through runGates a fixture baseline with known per-file durations yields f
   writeFileSync(join(capture.repo,"timings.sh"), "printf ' ✓ tests/a.test.ts (1 test) 0ms\\n ✓ tests/b.test.ts (1 test) 12ms\\n ✓ tests/c.test.ts (1 test) 2s\\n'\n");
   const captured = await captureBaseline(capture.repo,{test:"sh timings.sh"});
   expect(captured.commands.test.fileDurations).toEqual([{file:"tests/a.test.ts",durationMs:0},{file:"tests/b.test.ts",durationMs:12},{file:"tests/c.test.ts",durationMs:2000}]);
+}, 90_000);
+
+test("test: a fast baseline's millisecond file timings no longer yield a millisecond hang budget — a new 400 ms test file passes the real runner under the 10000 ms hang-budget floor, while the same round with the floor removed kills it as an infra hang at three times the longest timing", async () => {
+  expect(MIN_FILE_HANG_BUDGET_MS).toBe(10_000);
+  for (const floor of [true, false]) {
+    if (!floor) { setHangBudgetFloorForTests(0); onTestFinished(resetHangBudgetFloorForTests); }
+    const f = fixture();
+    writeFileSync(join(f.repo, "tests/c.test.ts"), 'test("slow but lawful", async () => { await new Promise((r) => setTimeout(r, 400)); expect(1).toBe(1); });\n');
+    commit(f.repo);
+    const row = await round(f, "vitest run --globals", { fileDurations: [{ file: "tests/a.test.ts", durationMs: 1 }, { file: "tests/b.test.ts", durationMs: 1 }], ceilingMs: LISTING_ALLOWANCE_MS });
+    if (floor) expect({ pass: row.pass, kind: row.meta?.kind }, row.details).toEqual({ pass: true, kind: undefined });
+    else expect(row.meta, row.details).toMatchObject({ classification: "infra", kind: "hang", file: "tests/c.test.ts", hangBudgetMs: 3 });
+  }
 }, 90_000);
 
 test("through runGates a stand-in runner resolved as the worktree's vitest whose run branch alone writes a fresh case-specific marker recording its argv, absent before the gate and never written by its list branch, proves each case executed: its report written successful beside its own nonzero exit fails closed naming both, and its zero exit with no report fails closed naming the missing report, each with that case's marker present, its argv carrying the reporter, and the result row's spawned command line beginning with the configured command verbatim, so a fixture whose runner never ran, a marker any branch or an earlier case could leave, a configured command rewritten before it is spawned, or a report that rescues a red exit fails", async () => {
@@ -1297,6 +1311,7 @@ test("production manifest discovery completes a barrier-delayed listing within t
 }, 180_000);
 
 test("production manifest evaluation still distinguishes injected 120 ms and 180 ms hangs from released work when listing setup receives the separate 60000 ms allowance", async () => {
+  setHangBudgetFloorForTests(0); onTestFinished(resetHangBudgetFloorForTests); // the derived budget's own kill mechanics
   const cmd = "vitest run --globals";
   const budgets: Array<[Partial<BaselineCommand>, number]> = [
     [{ fileDurations: [{ file: "tests/a.test.ts", durationMs: 40 }, { file: "tests/b.test.ts", durationMs: 100 }] }, 120],

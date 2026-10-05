@@ -1676,10 +1676,12 @@ describe("OBS-635 — an in-battery full green is revalidated after the semantic
       const { results } = await gates({ gates: [...DETERMINISTIC, "acceptance"], files: ["**"], acceptance: [{ oracle: "command", command: oracle }] },
         repo, base, { test: "vitest run --globals" }, { selectTests: false });
       const verdict = results.find((r) => r.gate === "test")!;
-      expect({ generated, pass: results.every((r) => r.pass), full: verdict.meta?.fullSuite, reused: verdict.meta?.reused, manifest: verdict.meta?.manifest })
+      // A red names its gate and details (a CI red once printed only pass:false).
+      const failing = results.filter((r) => !r.pass).map((r) => [r.gate, r.details]);
+      expect({ generated, pass: results.every((r) => r.pass), failing, full: verdict.meta?.fullSuite, reused: verdict.meta?.reused, manifest: verdict.meta?.manifest })
         .toEqual(generated
-          ? { generated, pass: true, full: undefined, reused: undefined, manifest: ["tests/a.test.ts", "tests/generated.test.ts"] }
-          : { generated, pass: true, full: undefined, reused: undefined, manifest: ["tests/a.test.ts"] });
+          ? { generated, pass: true, failing: [], full: undefined, reused: undefined, manifest: ["tests/a.test.ts", "tests/generated.test.ts"] }
+          : { generated, pass: true, failing: [], full: undefined, reused: undefined, manifest: ["tests/a.test.ts"] });
     }
   }, 120_000);
 });
