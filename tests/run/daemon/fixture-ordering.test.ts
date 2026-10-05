@@ -56,8 +56,10 @@ describe("fixture ordering by events (fake adapter, zero tokens)", () => {
       };
       const s = await runDaemon(repo, { adapters: [fake], runId, driver, concurrency: 2, narrate: releaseOn(b, "task-done", first) })
         .finally(() => releaseAll(b));
-      expect(s.done.sort(), runId).toEqual(["T1", "T2"]);
+      // D-1278: a task that ends not done names its outcome and last rows here; teardown deletes the journal.
       const rows = events(repo, runId);
+      const tails = ORDERS.map((id) => `${id}: ${lastRows(rows, id).join(" | ")}`).join(" ;; ");
+      expect(s.done.sort(), `${runId} failed=[${s.failed}] human=[${s.human}] ${tails}`).toEqual(["T1", "T2"]);
       expectHeldAfterRelease(rows, b, held, "task-done", first);
       const worker = (id: Id) => ops.find((o) => o.kind === "slot" && o.name.includes(`${id}-worker-fake-a0-`))?.name;
       const firstClose = ops.find((o) => o.kind === "close" && /-worker-fake-a0-/.test(o.name));

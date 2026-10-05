@@ -277,9 +277,16 @@ async function reapWorkerProcesses(group: number | undefined, cwd: string, owner
         // An exiting child loses its cwd before it is reaped yet keeps its birth identity (a zombie, or
         // on its way to one). The snapshot drops Z rows, so a fresh snapshot that no longer lists this
         // pid and identity says it has finished; a still-listed live row with no readable cwd stays
-        // unknown, and so does an unreadable snapshot (public CI 37302193795, D-1263).
-        const fresh = await workerReapHost.snapshot();
-        return !fresh || fresh.some((r) => r.pid === row.pid && r.identity === row.identity) ? "unknown" : "spared";
+        // unknown, and so does an unreadable snapshot (public CI 37302193795, D-1263). A process still
+        // exiting can stay listed for a moment after its cwd is gone, so read up to three fresh
+        // snapshots 100 ms apart before calling it unknown (public CI 37324617042, D-1278).
+        for (let read = 0; read < 3; read++) {
+          if (read) await new Promise((resolve) => setTimeout(resolve, 100));
+          const fresh = await workerReapHost.snapshot();
+          if (!fresh) return "unknown";
+          if (!fresh.some((r) => r.pid === row.pid && r.identity === row.identity)) return "spared";
+        }
+        return "unknown";
       }
       if (details.suiteParent === process.pid || excludedPaths.some((path) => below(path, details.cwd))) return "spared";
       if (!below(root, details.cwd)) return "spared";

@@ -6060,12 +6060,21 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         } catch (error) {
           reapFailure = error instanceof Error ? error.message : String(error);
         }
-      } else if (keepOpen && (workerFinished || processExited || driver.id !== "subprocess")) {
-        await reapWorker(slot);
-        keptSlots.push(slot);
-        supersededWorkerSlot = slot;
       } else {
-        await closeSlot(slot);
+        // A worker that exited cleanly can still leave a census the reap cannot read. That is the
+        // same stall disposition as above, never a silent task failure; a kept slot is recorded
+        // first so run end still closes it (public CI 37324617042, D-1278).
+        try {
+          if (keepOpen && (workerFinished || processExited || driver.id !== "subprocess")) {
+            keptSlots.push(slot);
+            supersededWorkerSlot = slot;
+            await reapWorker(slot);
+          } else {
+            await closeSlot(slot);
+          }
+        } catch (error) {
+          reapFailure = error instanceof Error ? error.message : String(error);
+        }
       }
       if (retryMode === "resume") {
         const transcript = readResumeTranscript();
@@ -6086,7 +6095,8 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       // an absent record leaves `tokens`/`metered` untouched (never a materialized zero).
       const attemptUsage = adapter.collectUsage?.(wt, attemptStart);
       if (attemptUsage) { tokens = addUsage(tokens, attemptUsage); metered++; }
-      if (deadWorkerPark) {
+      // An unreadable cleanup outranks a dead-worker park: only the reapFailure park re-verifies the census.
+      if (deadWorkerPark && !reapFailure) {
         await park(
           t, deadWorkerPark.reason, "stall", assignment, attempt + 1, startMs,
           gateFails, consults, tokens, metered, retryMode, { ref: deadWorkerPark.ref },

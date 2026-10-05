@@ -344,9 +344,12 @@ test("test: a fast baseline's millisecond file timings no longer yield a millise
     const f = fixture();
     writeFileSync(join(f.repo, "tests/c.test.ts"), 'test("slow but lawful", async () => { await new Promise((r) => setTimeout(r, 400)); expect(1).toBe(1); });\n');
     commit(f.repo);
-    const row = await round(f, "vitest run --globals", { fileDurations: [{ file: "tests/a.test.ts", durationMs: 1 }, { file: "tests/b.test.ts", durationMs: 1 }], ceilingMs: LISTING_ALLOWANCE_MS });
+    // The baseline files are trivial; timed at 100 ms they get a 300 ms budget without the floor and finish
+    // far inside it even under load, so only the new 400 ms file can overrun it (D-1281: at 1 ms
+    // a 3 ms budget let a loaded baseline file overrun first).
+    const row = await round(f, "vitest run --globals", { fileDurations: [{ file: "tests/a.test.ts", durationMs: 100 }, { file: "tests/b.test.ts", durationMs: 100 }], ceilingMs: LISTING_ALLOWANCE_MS });
     if (floor) expect({ pass: row.pass, kind: row.meta?.kind }, row.details).toEqual({ pass: true, kind: undefined });
-    else expect(row.meta, row.details).toMatchObject({ classification: "infra", kind: "hang", file: "tests/c.test.ts", hangBudgetMs: 3 });
+    else expect(row.meta, row.details).toMatchObject({ classification: "infra", kind: "hang", file: "tests/c.test.ts", hangBudgetMs: 300 });
   }
 }, 90_000);
 

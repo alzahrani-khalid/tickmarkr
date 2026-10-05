@@ -1294,6 +1294,46 @@ describe("reap: a candidate exiting after its cwd probe is spared, never unknown
     expect(await sweep(null, false)).toBeNull();
     expect(await sweep(undefined, false)).toEqual([]);
   });
+
+  // Public CI 37324617042 (D-1278): an exiting process can stay listed for a moment after its cwd is
+  // gone, so the reap reads up to three fresh snapshots before calling it unknown.
+  test("a candidate with no readable cwd still listed by two fresh snapshots is spared once the third omits it, and unknown while all three list it", async () => {
+    expect(await sweep("700002:o", false, 3)).toEqual([]);
+    expect(await sweep("700002:o", false, 4)).toBeNull();
+  });
+});
+
+// Public CI 37324617042 (D-1278): a worker that exited cleanly can still leave a census the reap
+// cannot read. That is the same stall disposition as a reap before harvest — a printed park that
+// approve --recheck re-verifies — never a silent task failure, and a kept slot is still closed once.
+describe("reap after a clean exit: an unreadable census parks the task, never fails it silently (D-1278)", () => {
+  test.each([["kept panes", "visibility:\n  keepPanes: run\n"], ["attempt panes", "visibility:\n  keepPanes: attempt\n"]] as const)("%s: a clean exit whose census is unreadable parks a recheck-able stall and never starts gates", async (label, cfg) => {
+    const { repo, fake } = setupRepo([T("T1")], {
+      tasks: { T1: [{ shell: `echo one > one.txt && ${COMMIT} one`, result: { ok: true, summary: "one" } }] },
+    }, cfg);
+    vi.restoreAllMocks(); // the sweeps above leave reap-host spies installed
+    const snapshot = vi.spyOn(stall.workerReapHost, "snapshot").mockResolvedValue(undefined);
+    try {
+      const inner = new SubprocessDriver();
+      const closes: string[] = [];
+      const driver = {
+        id: "reap-exit", interactive: false,
+        status: inner.status.bind(inner), run: inner.run.bind(inner), waitOutput: inner.waitOutput.bind(inner),
+        waitAgentStatus: inner.waitAgentStatus.bind(inner), read: inner.read.bind(inner), notify: inner.notify.bind(inner),
+        worktree: inner.worktree.bind(inner), slot: inner.slot.bind(inner),
+        async close(s: Slot) { closes.push(s.name); return inner.close(s); },
+      } as ExecutorDriver;
+      const runId = `run-reap-exit-${label.split(" ")[0]}`;
+      const s = await runDaemon(repo, { adapters: [fake], runId, driver });
+      const evs = Journal.open(repo, runId).read();
+      expect(s.failed, label).toEqual([]);
+      expect(s.human, label).toEqual(["T1"]);
+      expect(evs.find((e) => e.event === "task-human" && e.taskId === "T1")?.data, label)
+        .toMatchObject({ kind: "stall", reapFailure: expect.stringMatching(/^worker group \d+ cleanup unknown$/) });
+      expect(evs.some((e) => e.event === "phase-start" && e.data.phase === "gates"), label).toBe(false);
+      if (label === "kept panes") expect(closes.filter((name) => name.includes("T1-worker-")), label).toHaveLength(1);
+    } finally { snapshot.mockRestore(); }
+  }, 60_000);
 });
 
 // OBS-1170: ownership is the recorded group, the dispatch root and descendants observed while the
