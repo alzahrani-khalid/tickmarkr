@@ -2210,21 +2210,21 @@ test("test: a round given no operator context over identical task diff plus carr
   `);
 });
 
-test("test: a review round given an operator context renders it under an operator context heading between the prior materials and the diff, so a brief that omits the reason fails", async () => {
+// v2.6.8 T7: an approve reason is the repair worker's standing instruction, never review input.
+test("test: a review round given an operator context renders delivered and saved briefs equal to the round given none, so a reason reaching the reviewer fails", async () => {
   const reason = "Keep the explicit selection policy; verify prepend preserves it.";
-  const { delivered, saved } = await operatorBrief(reason);
-  for (const brief of [delivered, saved]) {
-    const context = brief.indexOf("## Operator context\n");
-    expect(context).toBeGreaterThan(brief.indexOf("## Prior materials this attempt must close\n"));
-    expect(context).toBeLessThan(brief.indexOf("## Diff\n"));
-    expect(promptSection(brief, "Operator context")).toContain(reason);
-    expect(promptSection(brief, "Operator context")).toContain("never substitutes for an acceptance criterion or closes a prior material");
+  const given = await operatorBrief(reason);
+  const none = await operatorBrief();
+  for (const brief of [given.delivered, given.saved]) {
+    expect(brief).not.toContain(reason);
+    expect(brief).not.toContain("## Operator context");
+    expect(normalizeBriefNonce(brief)).toBe(normalizeBriefNonce(none.delivered));
   }
 });
 
-test("test: a verdict that resolves no prior material still fails the gate when the brief carried an operator reason, so a reason read as a closure fails", async () => {
+test("test: a verdict that resolves no prior material still fails the gate when the round was given an operator reason, so a reason read as a closure fails", async () => {
   const { delivered, result } = await operatorBrief("I approve this approach; keep the design.");
-  expect(delivered).toContain("I approve this approach; keep the design.");
+  expect(delivered).not.toContain("I approve this approach; keep the design.");
   expect(result.pass).toBe(false);
   expect(result.meta).toMatchObject({ cause: "malformed-verdict", unparseable: true });
 });

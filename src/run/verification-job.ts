@@ -1,12 +1,11 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { renameSync, rmSync, writeFileSync } from "node:fs";
 import type { ShellReceipt } from "./protocol.js";
 import type { GateEvidenceOptions } from "../gates/baseline.js";
-import { assertGitTrust, protectedGitEnv } from "./git-trust.js";
+import { shGit } from "./git.js";
 import { executionSignal } from "./execution-budget.js";
-import { hasRepositoryLeaseOwnership, REPOSITORY_LEASE_TOKEN_ENV, reentrantHolder, repositoryLeasePath, reapRepositoryChildren, withCommandLease, withFreshCommandLease, withRepositoryLease, type RepositoryLeaseHolder } from "./lease.js";
+import { hasRepositoryLeaseOwnership, readHolder, REPOSITORY_LEASE_TOKEN_ENV, reentrantHolder, repositoryLeasePath, reapRepositoryChildren, withCommandLease, withFreshCommandLease, withRepositoryLease, type RepositoryLeaseHolder } from "./lease.js";
 
 // closed job table: command admission precedes repository admission; the standalone wrapper
 // acquires that same scheduler reservation before its outer repository reservation. Both hold until the first pass and at most
@@ -49,9 +48,14 @@ export interface VerificationJobReport {
 interface Job { report: VerificationJobReport; path: string; persist: () => void; phase?: VerificationPhase }
 const jobs = new AsyncLocalStorage<Job>();
 export const VERIFICATION_JOB_TOKEN_ENV = "TICKMARKR_VERIFICATION_JOB_TOKEN";
+/** v2.6.8 T2: a child carries only THIS process's local job id; outside a local job an inherited (foreign) token
+ * is dropped, never forwarded — a nested verify mints and stamps its own. */
 export function verificationJobEnvironment(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const job = jobs.getStore();
-  return job ? { ...env, [VERIFICATION_JOB_TOKEN_ENV]: job.report.id } : { ...env };
+  const child = { ...env };
+  if (job) child[VERIFICATION_JOB_TOKEN_ENV] = job.report.id;
+  else delete child[VERIFICATION_JOB_TOKEN_ENV];
+  return child;
 }
 let clock = () => Date.now();
 export const setVerificationJobClockForTests = (now: () => number): void => { clock = now; };
@@ -97,7 +101,8 @@ export async function withVerificationJob<T extends { pass: boolean; meta: Recor
   const signal = executionSignal();
   let commit = evidence?.subjectCommit ?? null;
   if (!commit) {
-    try { assertGitTrust(cwd); commit = execFileSync("git", ["rev-parse", "HEAD"], { cwd, env: protectedGitEnv(process.env), encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim(); } catch { /* unknown remains explicit */ }
+    // v2.6.8 T2: the job-identity HEAD read is tickmarkr's own git — pinned in a linked checkout, refused when raced
+    try { const r = await shGit("git rev-parse HEAD", cwd); if (r.code === 0) commit = r.stdout.trim(); } catch { /* unknown remains explicit */ }
   }
   const report: VerificationJobReport = { version: 1, id: randomUUID(), command, cwd,
     subject: { commit, runId: evidence?.runId ?? "standalone", taskId: evidence?.taskId ?? null, attempt: evidence?.attempt ?? null },
@@ -116,22 +121,35 @@ export async function withVerificationJob<T extends { pass: boolean; meta: Recor
     report.reservationReused = hasRepositoryLeaseOwnership() && !jobs.getStore();
     // A process descendant may share its ancestor's scheduler capability only after the file
     // generation and strict ancestry have been verified. A same-pid sibling always queues fresh.
-    const inherited = !hasRepositoryLeaseOwnership()
-      && await reentrantHolder(await repositoryLeasePath(cwd), process.env[REPOSITORY_LEASE_TOKEN_ENV]);
+    const leasePath = await repositoryLeasePath(cwd);
+    const inherited = !hasRepositoryLeaseOwnership() && await reentrantHolder(leasePath, process.env[REPOSITORY_LEASE_TOKEN_ENV]);
     const reserveCommand = report.reservationReused || inherited ? withCommandLease : withFreshCommandLease;
+    let owner: RepositoryLeaseHolder | undefined; // the live holder the reservation's in-process owner reaps at release
     outcome = await reserveCommand(command, () => withRepositoryLease(cwd, () => {
       signal?.throwIfAborted();
       report.admittedAt = clock(); report.state = "running"; job.persist();
       return signals.run(signal, () => jobs.run(job, async () => {
         try { return await run(); }
         finally {
-          await reapRepositoryChildren({ pid: process.pid, cwd, at: report.queuedAt, token: report.id }, 20, VERIFICATION_JOB_TOKEN_ENV);
+          try {
+            await reapRepositoryChildren({ pid: process.pid, cwd, at: report.queuedAt, token: report.id }, 20, VERIFICATION_JOB_TOKEN_ENV);
+          } finally {
+            // v2.6.8 T2: a nested verify records its shells' birth-checked groups in the reservation FILE, never in the
+            // in-process owner's holder, which its release reaps. Carry them back to that owner — this job's own
+            // reservation or a reused enclosing one — the same in-memory merge registerRepositoryChild makes, even
+            // when the job census above failed (its error still propagates).
+            const recorded = owner?.pid === process.pid ? readHolder(leasePath) : undefined;
+            if (owner && recorded?.token === owner.token) {
+              owner.roots = [...new Set([...(owner.roots ?? []), ...(recorded.roots ?? [])])];
+              owner.rootBirths = { ...owner.rootBirths, ...recorded.rootBirths };
+            }
+          }
           report.reapedAt = clock(); job.persist();
         }
       }));
     }, { isolated: true, protectOrphans: true, independent: !!jobs.getStore(), signal, pollMs: 20,
       onWait: holder => { report.waitingOn = { ...holder }; job.persist(); },
-      onAdmission: holder => { report.repositoryAdmittedAt = clock(); report.reservation = { ...holder }; job.persist(); },
+      onAdmission: holder => { owner = holder; report.repositoryAdmittedAt = clock(); report.reservation = { ...holder }; job.persist(); },
       onRelease: () => { report.reapedAt ??= clock(); report.repositoryReleasedAt = clock(); job.persist(); } }));
     report.releasedAt = clock();
     report.state = signal?.aborted ? "cancelled" : outcome.pass ? "completed" : "failed";

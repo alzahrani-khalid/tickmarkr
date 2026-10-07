@@ -292,6 +292,9 @@ describe("v2.6.7 T4 closed invocation trust table", () => {
     const parentBefore = { ...process.env };
     for (const cwd of [f.repo, f.linked]) {
       for (const w of WRAPPERS) {
+        // v2.6.8 T2: protection belongs to the OWN-GIT entry (shGit/shGitOk); payload entries (shell, sh, shOk)
+        // keep the operator's git config, so they are hook- and fsmonitor-firing controls here.
+        const own = w.name.startsWith("shGit");
         const explicit = w.name === "shell explicit env";
         const run = explicit
           ? (c: string) => ok(shell(c, cwd, 60_000, false, { env: rawEnv(inherited) }))
@@ -299,10 +302,10 @@ describe("v2.6.7 T4 closed invocation trust table", () => {
         if (!explicit) Object.assign(process.env, inherited);
         try {
           const headBefore = git(cwd, "rev-parse", "HEAD");
-          expect((await run("git config core.fsmonitor")).trim(), w.name).toBe("false");
-          expect((await run("git config core.hooksPath")).trim(), w.name).toBe(INERT_HOOKS_PATH);
+          expect((await run("git config core.fsmonitor")).trim(), w.name).toBe(own ? "false" : fsmonitor);
+          expect((await run("git config core.hooksPath")).trim(), w.name).toBe(own ? INERT_HOOKS_PATH : hooks);
           await run(`git status --porcelain && git ${commit.map((a) => `'${a}'`).join(" ")} protected`);
-          // the protected commit still lands its expected object and ref; no witness byte is added
+          // the commit still lands its expected object and ref either way
           expect(git(cwd, "rev-parse", "HEAD^"), w.name).toBe(headBefore);
           expect(git(cwd, "log", "-1", "--format=%s"), w.name).toBe("protected");
           expect(git(cwd, "-c", "core.fsmonitor=false", "status", "--porcelain"), w.name).toBe("");
@@ -311,8 +314,14 @@ describe("v2.6.7 T4 closed invocation trust table", () => {
           for (const k of Object.keys(inherited)) delete process.env[k];
           Object.assign(process.env, parentBefore);
         }
-        expect(read(fsWitness), `${w.name} fsmonitor`).toBe("");
-        expect(read(hookWitness), `${w.name} hook`).toBe("");
+        if (own) {
+          expect(read(fsWitness), `${w.name} fsmonitor`).toBe("");
+          expect(read(hookWitness), `${w.name} hook`).toBe("");
+        } else {
+          expect(read(fsWitness), `${w.name} fsmonitor`).toContain("fsmonitor");
+          expect(read(hookWitness), `${w.name} hook`).toContain("pre-commit");
+          rmSync(fsWitness, { force: true }); rmSync(hookWitness, { force: true });
+        }
       }
     }
     // the parent environment survives the protected children

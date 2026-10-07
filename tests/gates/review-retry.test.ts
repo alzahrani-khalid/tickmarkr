@@ -479,12 +479,12 @@ describe("reviewer floor — max(author tier, task floor, review.floor, prior re
   });
 });
 
-// E1: the run-scoped tally retires a seat at two no-verdicts (OBS-1025 add.2). A checkout-proof timeout is
-// the host being slow, not the seat failing: two of them leave the seat in the rotation, where two ordinary
-// launch failures — a proof mark cut before its colon, a header the frame grammar cannot even parse and
-// never a timeout exemption — retire it. Every round
-// of both pairs still fails closed as a no-verdict infra row; keeping a seat never passes a review.
-test("runGates keeps a reviewer after two checkout-proof timeouts but retires it after two ordinary launch failures while both pairs remain fail-closed", async () => {
+// E1 / v2.6.8 T1: the run-scoped tally retires a seat at two REAL no-verdicts (OBS-1025 add.2). A launch
+// failure is not one: two checkout-proof timeouts and two ordinary launch failures — a proof mark cut before
+// its colon, a header the frame grammar cannot even parse, never a timeout exemption — all leave the seat in
+// the rotation, each round relaunching it once. Every round of both pairs still fails closed as a no-verdict
+// infra row; keeping a seat never passes a review.
+test("runGates keeps a reviewer after two checkout-proof timeouts and after two ordinary launch failures, relaunching it once per round, while both pairs remain fail-closed", async () => {
   const worker = new FakeAdapter(scriptWith({}));
   const seat = new GarbageReviewer(scriptWith({ review: { approve: true } }));
   const seatKey = "fake-b:fake-b-1";
@@ -563,7 +563,7 @@ test("runGates keeps a reviewer after two checkout-proof timeouts but retires it
     ["paced stalled", pacedStalled, undefined], ["paced repeat", pacedRepeat, undefined],
     ...malformed.map(([name, p]) => [name, p, undefined] as const),
   ] as const) {
-    expect(p.creates, name).toBe(2); // one launch attempt per round: the seat was seated both times
+    expect(p.creates, name).toBe(4); // one launch plus one same-seat relaunch per round: the seat was seated both times
     for (const review of p.rounds) {
       expect(review.pass, name).toBe(false);
       expect(review.meta, name).toMatchObject({ cause: "seat-launch-failed", noVerdict: true, infra: true, classification: "infra", reviewer: seatKey });
@@ -575,35 +575,36 @@ test("runGates keeps a reviewer after two checkout-proof timeouts but retires it
   expect(timeouts.reviewNoVerdicts.get(seatKey)).toBeUndefined();
   expect(timeouts.demotedReviewers.has(seatKey)).toBe(false);
   expect(timeouts.events.some((e) => e.phase === "note" && e.name === "review-pool-demotion")).toBe(false);
-  expect(timeouts.thirdCreates).toBe(1);
+  expect(timeouts.thirdCreates).toBe(2);
   expect(timeouts.third.pass).toBe(false);
   expect(timeouts.third.meta).toMatchObject({ cause: "seat-launch-failed", launchCause: "checkout-proof-timeout", noVerdict: true, infra: true });
 
-  // Retired: two strikes, demoted at the second, and the third round never launches it — no eligible seat.
-  expect(ordinary.reviewNoVerdicts.get(seatKey)).toEqual(["seat-launch-failed", "seat-launch-failed"]);
-  expect(ordinary.demotedReviewers.has(seatKey)).toBe(true);
-  expect(ordinary.events.filter((e) => e.phase === "note" && e.name === "review-pool-demotion").map((e) => e.phase === "note" && e.payload))
-    .toEqual([{ reviewer: seatKey, cause: "seat-launch-failed", seatAuthoredBytes: 0, causes: ["seat-launch-failed", "seat-launch-failed"] }]);
-  expect(ordinary.thirdCreates).toBe(0);
+  // Ordinary launch failures: no strike, no demotion either — the third round seats the reviewer again.
+  expect(ordinary.reviewNoVerdicts.get(seatKey)).toBeUndefined();
+  expect(ordinary.demotedReviewers.has(seatKey)).toBe(false);
+  expect(ordinary.events.some((e) => e.phase === "note" && e.name === "review-pool-demotion")).toBe(false);
+  expect(ordinary.events.filter((e) => e.phase === "note" && e.name === "review-infra-retry")).toHaveLength(3);
+  expect(ordinary.thirdCreates).toBe(2);
   expect(ordinary.third.pass).toBe(false);
-  expect(ordinary.third.meta?.noEligibleReviewer).toBe(true);
+  expect(ordinary.third.meta).toMatchObject({ cause: "seat-launch-failed", noVerdict: true, infra: true });
 
-  // The same split under production-shaped reads: slow-but-absent proof keeps the seat, a foreign
-  // frame retires it although its pages ran past PROOF_PAGES, its cursor reads failed, or the ceiling
-  // cut each launch's last paging off before the frame was ever read — or a stalled next cursor left the
-  // frame, or the whole scrollback, unreachable, or every read answered a malformed tail or a blind stream.
+  // The same under production-shaped reads: slow-but-absent proof keeps the seat, and so does a foreign
+  // frame although its pages ran past PROOF_PAGES, its cursor reads failed, or the ceiling cut each
+  // launch's last paging off before the frame was ever read — or a stalled next cursor left the frame, or
+  // the whole scrollback, unreachable, or every read answered a malformed tail or a blind stream. The
+  // launch cause still says which (above); none of them strikes.
   expect(pacedTimeouts.reviewNoVerdicts.get(seatKey)).toBeUndefined();
-  expect(pacedTimeouts.thirdCreates).toBe(1);
+  expect(pacedTimeouts.thirdCreates).toBe(2);
   expect(pacedTimeouts.third.meta).toMatchObject({ cause: "seat-launch-failed", launchCause: "checkout-proof-timeout", noVerdict: true, infra: true });
   for (const [name, p] of [
     ["paced foreign", pacedForeign], ["paced failing", pacedFailing], ["paced cut", pacedCut],
     ["paced stalled", pacedStalled], ["paced repeat", pacedRepeat], ["paced blind", pacedBlind], ...malformed,
   ] as const) {
-    expect(p.reviewNoVerdicts.get(seatKey), name).toEqual(["seat-launch-failed", "seat-launch-failed"]);
-    expect(p.demotedReviewers.has(seatKey), name).toBe(true);
-    expect(p.thirdCreates, name).toBe(0);
+    expect(p.reviewNoVerdicts.get(seatKey), name).toBeUndefined();
+    expect(p.demotedReviewers.has(seatKey), name).toBe(false);
+    expect(p.thirdCreates, name).toBe(2);
     expect(p.third.pass, name).toBe(false);
-    expect(p.third.meta?.noEligibleReviewer, name).toBe(true);
+    expect(p.third.meta, name).toMatchObject({ cause: "seat-launch-failed", noVerdict: true, infra: true, reviewer: seatKey });
   }
 });
 

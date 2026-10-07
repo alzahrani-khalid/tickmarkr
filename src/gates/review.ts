@@ -9,7 +9,7 @@ import {
 import { filesGlob } from "../graph/files-glob.js";
 import { renderAcceptanceItem, type Task, TIERS } from "../graph/schema.js";
 import { getAdapter } from "../adapters/registry.js";
-import { shOk } from "../run/git.js";
+import { shGitOk } from "../run/git.js";
 import { carryReviewFindings, isDeferredFinding, observedReviewFingerprints, reviewFingerprintMatches, structuredFindings, type StructuredFinding, UNIDENTIFIED } from "../run/journal.js";
 import { redactSecrets } from "../run/redact.js";
 import { rankPreferredChannels, reviewPreferenceTieBreak } from "../route/role-pick.js";
@@ -124,7 +124,7 @@ const DIFF_CAP_REMEDY = "split the task, or raise gates.diffCap";
  * the leaf class must be visible to the promotion test, and rename detection would hide the old side.
  */
 export async function changedPaths(worktree: string, baseRef: string): Promise<string[]> {
-  const out = await shOk(`git diff --name-only --no-renames -z '${baseRef}..HEAD'`, worktree);
+  const out = await shGitOk(`git diff --name-only --no-renames -z '${baseRef}..HEAD'`, worktree);
   return [...new Set(out.split("\0").map((p) => p.trim()).filter(Boolean))].sort();
 }
 
@@ -140,7 +140,7 @@ const VERSION_FIELD_LINE_RE = /^[+-]\s*"version":\s*"[^"]*",?\s*$/;
 export async function mirrorsVersionOnly(worktree: string, baseRef: string, path: string): Promise<boolean> {
   let diff: string;
   try {
-    diff = await shOk(`git diff --full-index -U0 '${baseRef}..HEAD' -- ${shq(path)}`, worktree);
+    diff = await shGitOk(`git diff --full-index -U0 '${baseRef}..HEAD' -- ${shq(path)}`, worktree);
   } catch {
     return false;
   }
@@ -166,8 +166,8 @@ export async function fetchTaskDiff(worktree: string, baseRef: string, files: re
   const matched = files.length ? (await changedPaths(worktree, baseRef)).filter(filesGlob([...files])) : [];
   const pathspec = matched.length ? ` -- ${matched.map(shq).join(" ")}` : "";
   const [rawFull, rawForCap] = files.length && matched.length === 0 ? ["", ""] : await Promise.all([
-    shOk(`git diff --full-index '${baseRef}..HEAD'${pathspec}`, worktree),
-    shOk(`git diff --full-index -U0 '${baseRef}..HEAD'${pathspec}`, worktree),
+    shGitOk(`git diff --full-index '${baseRef}..HEAD'${pathspec}`, worktree),
+    shGitOk(`git diff --full-index -U0 '${baseRef}..HEAD'${pathspec}`, worktree),
   ]);
   const fullMeasurement = measureArtifactDiff(rawFull);
   const capMeasurement = measureArtifactDiff(rawForCap);
@@ -435,6 +435,48 @@ The task DECLARED these write-scope patterns:
 ${files.map((path) => `- ${path}`).join("\n")}`;
 }
 
+// v2.6.8 T7: syntax only, never a filesystem glob. Explicit alternatives are finite at any count.
+// ponytail: no expansion ceiling; the operator authors files[], so its product of alternatives is theirs to size.
+const TEST_FILE_RE = /(?:^|\/)[^/]*\.(?:test|spec)\.[cm]?[jt]sx?$/;
+
+/** Every finite, explicit `{a,b}` alternative of one entry, deduplicated; null when any part is not finite. */
+function expandFiniteBraces(pattern: string): string[] | null {
+  const open = pattern.indexOf("{");
+  if (open < 0) return pattern.includes("}") ? null : [pattern];
+  if (pattern.slice(0, open).includes("}")) return null;
+  const cuts = [open];
+  let depth = 0;
+  for (let i = open; i < pattern.length; i++) {
+    const c = pattern[i];
+    if (c === "{") depth++;
+    else if (c === "," && depth === 1) cuts.push(i);
+    else if (c === "}" && --depth === 0) {
+      if (cuts.length < 2) return null; // `{}`, `{a}`, `{1..3}`: no finite alternation
+      cuts.push(i);
+      const out = new Set<string>();
+      for (let k = 0; k + 1 < cuts.length; k++) {
+        const alt = pattern.slice(cuts[k]! + 1, cuts[k + 1]);
+        const sub = alt ? expandFiniteBraces(pattern.slice(0, open) + alt + pattern.slice(i + 1)) : null;
+        if (!sub) return null;
+        for (const path of sub) out.add(path);
+      }
+      return [...out];
+    }
+  }
+  return null; // unclosed brace
+}
+
+/**
+ * The test files one files[] entry names explicitly. A wildcard, escape, malformed or empty brace, or
+ * a path leaving the repository anywhere in the expansion grants nothing for the whole entry.
+ */
+function explicitSuitePaths(entry: string): string[] {
+  const paths = expandFiniteBraces(entry);
+  const explicit = paths?.every((path) => !/[*?[\]{}()!\\]/.test(path)
+    && path.split("/").every((segment) => segment !== "" && segment !== "." && segment !== ".."));
+  return explicit ? paths!.filter((path) => TEST_FILE_RE.test(path)) : [];
+}
+
 /**
  * OBS-1033: the vendors of the seats that authored commits inside the accumulated diff. A seat is
  * never handed its own earlier work to approve. Unresolved channels are refused by reviewGate.
@@ -566,7 +608,9 @@ export async function reviewGate(
   priorReviewers: readonly PriorReviewer[] = [],
   // Closed list of actual subject authors; empty preserves legacy callers' single-author contract.
   carriedAuthors: readonly string[] = [],
-  operatorContext?: string,
+  // v2.6.8 T7: kept for compatible callers and read as empty. An approve reason is the repair worker's
+  // standing instruction; a reviewer handed "the previous finding is resolved" graded the reason, not the diff.
+  _operatorContext?: string,
 ): Promise<GateResult> {
   // R3 (OBS-186): participation is keyed on PATHS. The compiler's assignment comes from the DECLARED
   // files[]; the operator's floor may RAISE it to full and can never lower it. `complexityThreshold` is
@@ -671,10 +715,9 @@ export async function reviewGate(
   if (capFail) return capFail;
   const nonce = generateVerdictNonce();
   const repoRoot = daemonRepoRoot(worktree, artifactDir);
-  // OBS-880 add.1: guidance only. Do not expand scope globs into permission to run suites.
-  const ownTestFiles = [...new Set(task.files.filter((file) =>
-    !/[*?[\]{}()!]/.test(file) && /(?:^|\/)[^/]*\.(?:test|spec)\.[cm]?[jt]sx?$/.test(file),
-  ))];
+  // OBS-880 add.1: guidance only. Do not expand scope globs into permission to run suites; v2.6.8 T7:
+  // finite explicit brace alternatives are explicit files and each one is named.
+  const ownTestFiles = [...new Set(task.files.flatMap(explicitSuitePaths))];
   const suiteBudget = ownTestFiles.length
     ? `You may run at most the task's own test files explicitly named in files[]; these are the only suites you may run: ${ownTestFiles.map((file) => `\`${file}\``).join(", ")}.`
     : "No suite may be run: files[] names no explicit test file owned by this task.";
@@ -705,10 +748,6 @@ ${renderDeclaredWriteScope(task.files)}
 ${suiteBudget} Never run the whole suite (including an unfiltered npm test or vitest run). The gate suite owns the runner lease; a parallel full suite starves the gate.
 
 ${priorMaterials.length ? `${renderPriorMaterials(priorMaterials)}
-
-` : ""}${operatorContext?.trim() ? `## Operator context
-Context only: this never substitutes for an acceptance criterion or closes a prior material.
-${operatorContext.trim()}
 
 ` : ""}${task.outOfScope?.length ? `## Out of scope
 The task declares these items out of scope. A finding inside these declared bounds is not material and must not block approval.
@@ -829,7 +868,10 @@ ${responseRequirement}
   // a genuinely wrapped verdict behind it is reconstructed here, exactly as llm.ts would have.
   const echoFree = withoutExampleEcho(raw, nonce);
   const seat = via ? dewrapPaneVerdict(echoFree, nonce) : echoFree;
-  const v = extractVerdictJson<ReviewVerdict>(seat, nonce);
+  const parsed = extractVerdictJson<ReviewVerdict>(seat, nonce);
+  // v2.6.8 T7: with zero carried ids nothing was asked to close, so volunteered closure ids are ignored —
+  // a material red stays red, never no-verdict. With carried ids the closure protocol binds unchanged.
+  const v = parsed && !priorMaterials.length ? { ...parsed, resolved: undefined, reraised: undefined } : parsed;
   const findings = v && Array.isArray(v.findings) ? (v.findings as unknown[]) : null;
   const priorIds = priorMaterials;
   const closureInvalid = isReviewClosureInvalid(v, priorIds);

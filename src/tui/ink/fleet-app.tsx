@@ -360,6 +360,7 @@ export function FleetApp({
   steeringOptionsFor,
   reviewAdvisories = [],
   reviewOverlay,
+  layerStamp,
   reloadGuard,
   stagedRouting,
   holderOf,
@@ -396,6 +397,9 @@ export function FleetApp({
   /** OBS-1052(3): advisory review no-verdict history lines — display only, never a routing input */
   reviewAdvisories?: string[];
   reviewOverlay: (state: FleetEditorState) => FleetOverlayReview;
+  /** B-KEYS r2 (D-1446): the loaded overlay layers' identity (fleet: both overlay files' bytes) — the rows
+   * derive from them, so a layer written during the session re-derives every row; read once per render */
+  layerStamp?: () => string;
   reloadGuard: (bytes: string) => string | null;
   /** the routing policy the staged deny sets load as (fleet: the config loader over the candidate
    * bytes); absent ⇒ the four staged sets alone, with no allowlist */
@@ -500,21 +504,50 @@ export function FleetApp({
   // the STAGED policy (fleet loads the candidate bytes; see stagedRouting) and the recorded
   // identity — never literal membership of the staged sets, which missed identity, bare-model and
   // family entries and could not tell an allowlist exclusion from a deny.
-  let routingMemo: { key: string; policy: FleetStagedRouting } | null = null;
+  // B-KEYS (D-1338): the staged CONTENT every row and the staged policy derive from — the deny sets,
+  // the allow complement, classifications, efforts and seeds, read raw off ui (the provenance a
+  // review folds is a pure function of them). Computed per call, never per render: a handler
+  // mutates ui and reads rows in the same tick, before bump.
+  const stagedKey = (): string => JSON.stringify([
+    DENY_SCOPES.map((scope) => [...ui[scope.key]].sort()),
+    [...ui.allowOut].sort(),
+    ui.classifications,
+    ui.efforts,
+    ui.seededAllowOut,
+  ]);
+  // ponytail: both memos live in refs keyed on stagedKey — a render-local memo reset on every keypress,
+  // so each cursor move reloaded the policy and re-derived ~800 rows' reach (B-KEYS). A cursor move,
+  // a filter, showAll or an overlay never recompute a row; any staged edit changes the key and
+  // recomputes every group. Ceiling: one JSON.stringify of the staged sets per lookup (µs); a dirty
+  // counter bumped at every mutation site if a fleet ever outgrows it.
+  const routingMemo = useRef<{ key: string; policy: FleetStagedRouting } | null>(null);
   const stagedPolicy = (): FleetStagedRouting => {
+    const key = memoKey();
+    const memo = routingMemo.current;
+    if (memo?.key === key) return memo.policy;
     const deny = stagedDeny();
     const stage = stagedMetadata();
-    const key = JSON.stringify([deny, stage]);
-    if (routingMemo?.key !== key) {
-      routingMemo = {
-        key,
-        policy: stagedRouting
-          ? stagedRouting(deny, stage)
-          : { ok: true, routing: { deny: denyBlockFrom(denyLists()) } as TickmarkrConfig["routing"] },
-      };
-    }
-    return routingMemo.policy;
+    const policy: FleetStagedRouting = stagedRouting
+      ? stagedRouting(deny, stage)
+      : { ok: true, routing: { deny: denyBlockFrom(denyLists()) } as TickmarkrConfig["routing"] };
+    routingMemo.current = { key, policy };
+    return policy;
   };
+  const rowsMemo = useRef<{ key: string; byAdapter: Map<string, ModelRow[]> }>({ key: "", byAdapter: new Map() });
+  // B-KEYS r2 (D-1446): staged content alone does not identify a row — the rows also derive from the loaded
+  // overlay layers (stagedRouting and holderOf read both files) and the props they read. Once per render a
+  // generation moves when the layer bytes or one of those props changes, and both memos key on it beside the
+  // staged content: a layer written mid-session shows on the next frame, as on the base, while a cursor move
+  // over unchanged layers still derives nothing. Cost: one read of each overlay per frame (the B2 previewCfg key).
+  const layers = useRef<{ stamp: string; inputs: unknown[]; gen: number }>({ stamp: "", inputs: [], gen: 0 });
+  {
+    const stamp = layerStamp?.() ?? "";
+    const inputs = [modelGroups, stagedRouting, holderOf];
+    if (stamp !== layers.current.stamp || inputs.some((input, at) => input !== layers.current.inputs[at])) {
+      layers.current = { stamp, inputs, gen: layers.current.gen + 1 };
+    }
+  }
+  const memoKey = (): string => `${layers.current.gen}\u0000${stagedKey()}`;
   // OBS-1099 add.1: the browser's deny discovery ranges over the schema-enumerated scopes (the
   // route collector names its four paths by hand, so a scope the schema gains would never render
   // or lift here). A flat scope reaches every seat; a nested one only the seat its block names
@@ -686,7 +719,18 @@ export function FleetApp({
     return found.find((covering) => covering.shared) ?? found[0];
   };
 
+  // B-KEYS: one derivation per group per staged state — the memo above hands every later pass
+  // (visibleCount per rail row, modelRows, the hidden and folded counts, a handler's lookup) the
+  // same rows; the returned array is read, never mutated, by every caller.
   const groupRows = (group: FleetModelGroup): ModelRow[] => {
+    const key = memoKey();
+    if (rowsMemo.current.key !== key) rowsMemo.current = { key, byAdapter: new Map() };
+    const memo = rowsMemo.current.byAdapter;
+    const rows = memo.get(group.adapter) ?? deriveGroupRows(group);
+    memo.set(group.adapter, rows);
+    return rows;
+  };
+  const deriveGroupRows = (group: FleetModelGroup): ModelRow[] => {
     const rows: ModelRow[] = group.rows.map((row) => {
       const members = membersOf(group.adapter, row);
       const staged = ui.classifications.find(
@@ -2885,6 +2929,7 @@ export async function runFleetInkEditor({
   steeringOptionsFor,
   reviewAdvisories = [],
   reviewOverlay,
+  layerStamp,
   reloadGuard,
   stagedRouting,
   holderOf,
@@ -2923,6 +2968,8 @@ export async function runFleetInkEditor({
   /** OBS-1052(3): advisory review no-verdict history lines — display only, never a routing input */
   reviewAdvisories?: string[];
   reviewOverlay: (state: FleetEditorState) => FleetOverlayReview;
+  /** B-KEYS r2: the loaded overlay layers' identity (fleet: both overlay files' bytes), read once per render */
+  layerStamp?: () => string;
   reloadGuard: (bytes: string) => string | null;
   /** the routing policy the staged deny sets load as (fleet: the config loader over the candidate
    * bytes); absent ⇒ the four staged sets alone, with no allowlist */
@@ -2979,6 +3026,7 @@ export async function runFleetInkEditor({
       steeringOptionsFor={steeringOptionsFor}
       reviewAdvisories={reviewAdvisories}
       reviewOverlay={reviewOverlay}
+      layerStamp={layerStamp}
       reloadGuard={reloadGuard}
       stagedRouting={stagedRouting}
       holderOf={holderOf}

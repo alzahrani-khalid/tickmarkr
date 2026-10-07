@@ -1396,6 +1396,8 @@ export async function assembleFleetEditor(
     steeringOptionsFor,
     reviewAdvisories,
     reviewOverlay,
+    // B-KEYS r2 (D-1446): the editor's row memo keys on both overlay layers' bytes — previewCfg's own key
+    layerStamp: () => `${currentUserText()}\u0000${currentRepoOverlayText(cwd)}`,
     reloadGuard,
     stagedRouting,
     holderOf,

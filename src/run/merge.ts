@@ -97,9 +97,9 @@ export async function ensureIntegration(repo: string, branch: string, baseRef: s
   if (!existsSync(join(dir, ".git"))) {
     const exists = (await shGit(`git rev-parse --verify refs/heads/${shq(branch)}`, repo)).code === 0;
     if (exists) {
-      await shGitOk(`git worktree add ${shq(dir)} ${shq(branch)}`, repo);
+      await shGitOk(`git worktree add ${shq(dir)} ${shq(branch)}`, repo, { createsWorktree: "branch", rollback: { dir } });
     } else {
-      await shGitOk(`git worktree add -b ${shq(branch)} ${shq(dir)} ${shq(baseRef)}`, repo);
+      await shGitOk(`git worktree add -b ${shq(branch)} ${shq(dir)} ${shq(baseRef)}`, repo, { createsWorktree: "branch", rollback: { dir, branch: { name: branch } } });
     }
   }
   linkNodeModules(repo, dir);

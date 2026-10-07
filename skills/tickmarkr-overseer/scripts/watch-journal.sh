@@ -82,19 +82,21 @@ report() {
       done=$(bucket done "$line");     failed=$(bucket failed "$line")
       human=$(bucket human "$line");   blocked=$(bucket blocked "$line")
       pending=$(bucket pending "$line")
-      # GREEN IS A CONJUNCTION, AND THE SHORT FORM OF IT IS WRONG. "run-end plus tip verify" passes a run
-      # that ended `done=[T1,T3,T4] human=[T2]` — three delivered, one PARKED — and calling that green is
-      # how a park becomes invisible. Grade every clause here so the reader never has to remember to.
+      # NO RUN-END RECORD CERTIFIES GREEN. "run-end plus tip verify" passes a run that ended
+      # `done=[T1,T3,T4] human=[T2]` — three delivered, one PARKED — and even empty buckets leave the debt
+      # clause open: a waived review is still owed (D-660), and a `verify --record` discharge that lands
+      # AFTER run-end moves only CURRENT status. This row is history, so the best it can say is
+      # EXECUTION COMPLETE; green is read from CURRENT `tickmarkr status <runId>` at `outstanding 0`.
       if [ "$tv" != "failed" ] && [ -z "$failed$human$blocked$pending" ]; then
-        verdict="GREEN"
+        verdict="EXECUTION COMPLETE"
       else
         verdict="NOT GREEN"
       fi
       echo "RUN_END $run — $verdict (tipVerify=${tv:-unknown})"
       echo "  done=[${done}] failed=[${failed}] human=[${human}] blocked=[${blocked}] pending=[${pending}]"
-      [ "$verdict" = "GREEN" ] \
-        && echo "  all four buckets empty and tip verify is not failed — this run is green" \
-        || echo "  a non-empty bucket above is the reason; name it, never report this run as green"
+      [ "$verdict" = "EXECUTION COMPLETE" ] \
+        && echo "  execution buckets empty and tip verify is not failed — not yet green: read CURRENT \`tickmarkr status $run\`; only \`outstanding 0\` is green, \`outstanding N (...)\` and \`outstanding unknown\` are not, and this run-end record's own count is historical" \
+        || echo "  a non-empty bucket or a failed tip above is the reason; name it, never report this run as green"
       ;;
     task-human)
       echo "TASK_HUMAN $(field taskId "$line") — $run"

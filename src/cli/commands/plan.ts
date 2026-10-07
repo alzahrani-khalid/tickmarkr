@@ -11,7 +11,7 @@ import { DEFAULT_CONFIG, effectiveReviewPolicy, overlayPreferShapes, ROUTING_MOD
 import { batteryPriority, chainDepth, dispatchWaves, graphDefinitionHash, loadGraph, stateDirName } from "../../graph/graph.js";
 import { filesGlob } from "../../graph/files-glob.js";
 import { renderAcceptanceItem, type RunGraph, type Task, type TaskStatus } from "../../graph/schema.js";
-import { pendingDaemonApprovalActions, resolveRunMode } from "../../run/daemon.js";
+import { pendingDaemonApprovalActions, replayedReviewerDemotions, resolveRunMode } from "../../run/daemon.js";
 import { disallowedBy, excludedChannels, exclusionLine, observedSeat, routingEntrySeatLines } from "../../route/preference.js";
 import { decayWeight, HALF_LIFE_RUNS, staffLedEvidence } from "../../route/profile.js";
 import { resolvedFloor, route, RoutingError } from "../../route/router.js";
@@ -213,21 +213,19 @@ export async function plan(
         .filter((event) => event.event === "gate-result" && event.data.gate === "review" && typeof event.data.reviewer === "string")
         .map((event) => event.data.reviewer as string)
     : [];
-  // daemon.ts replayedReviewerExclusions: a journaled review-pool-demotion is excluded from every review
-  // pick of the resumed run this plan previews (reviewer role only).
-  const replayedReviewerExclusions = [...new Set((matchingEvents ?? [])
-    .filter((event) => event.event === "review-pool-demotion" && typeof event.data.reviewer === "string")
-    .map((event) => event.data.reviewer as string))];
-  const demotedReviewers = new Set(replayedReviewerExclusions);
+  // daemon.ts demotedReviewers: a journaled review-pool-demotion is a SOFT preference in the resumed run
+  // this plan previews (ranked last, never excluded; reviewer role only) — never a launch-caused one (v2.6.8 T1).
+  const demotedReviewers = replayedReviewerDemotions(matchingEvents ?? []);
   // daemon.ts demotedChannels: the resumed run's worker exclusions (journal replayExcludedChannels).
   const runJournal = matchingRunId ? Journal.open(cwd, matchingRunId) : undefined;
   const demotedWorkers = runJournal?.replayExcludedChannels() ?? new Set<string>();
-  // run-gates.ts retired (OBS-1025 add.2): seats with two no-verdicts this run are out of every pick, tallied
-  // as daemon.ts seeds reviewNoVerdicts — noVerdict rows only, and a checkout-proof timeout never strikes.
+  // run-gates.ts retired (OBS-1025 add.2): seats with two real no-verdicts this run are out of every pick,
+  // tallied as daemon.ts seeds reviewNoVerdicts — noVerdict rows only, and a launch failure (any
+  // launchCause, or none) never strikes (v2.6.8 T1).
   const noVerdicts = new Map<string, number>();
   for (const event of matchingEvents ?? []) {
     if (event.event !== "review-no-verdict" || event.data.noVerdict !== true || typeof event.data.reviewer !== "string") continue;
-    if (event.data.cause === "seat-launch-failed" && event.data.launchCause === "checkout-proof-timeout") continue;
+    if (event.data.cause === "seat-launch-failed") continue;
     noVerdicts.set(event.data.reviewer, (noVerdicts.get(event.data.reviewer) ?? 0) + 1);
   }
   const retiredReviewers = [...noVerdicts].filter(([, n]) => n >= 2).map(([seat]) => seat);
@@ -416,15 +414,15 @@ export async function plan(
     // Never dispatched, daemon.ts subjectAuthors is just the fresh author; its vendor stays off the review.
     const authors = [channelKey(author)];
     const authorVendors = carriedAuthorVendors(pools.review, authors);
-    // Production's inputs as the task's first review round sees them: excludeReviewers = daemon badReviewers =
-    // replayedReviewerExclusions. run-gates.ts:1303 floors on THIS task's journaled reviewers at their dispatched
-    // tiers (daemon taskReviewers) ∪ excludeReviewers, so a replayed exclusion RAISES the floor; :1305 picks
-    // with excludeReviewers ∪ retired. prefer only reorders (the seat count below passes none).
-    const priorReviewers = [...(matchingEvents ?? []).filter((e) => e.taskId === task.id && typeof e.data.reviewer === "string"
+    // Production's inputs as the task's first review round sees them: excludeReviewers = daemon badReviewers,
+    // empty at resume (a replayed demotion is soft). run-gates floors on THIS task's journaled reviewers at their
+    // dispatched tiers (daemon taskReviewers) ∪ excludeReviewers, and picks with excludeReviewers ∪ retired.
+    // prefer only reorders (the seat count below passes none).
+    const priorReviewers = (matchingEvents ?? []).filter((e) => e.taskId === task.id && typeof e.data.reviewer === "string"
       && ((e.event === "gate-result" && e.data.gate === "review") || e.event === "review-no-verdict"))
-      .map((e) => ({ reviewer: e.data.reviewer as string, tier: e.data.reviewerTier })), ...replayedReviewerExclusions];
+      .map((e) => ({ reviewer: e.data.reviewer as string, tier: e.data.reviewerTier }));
     const reviewFloor = gateReviewerFloor(task, cfg, author, pools.review, priorReviewers).floor;
-    const exclusions = [...replayedReviewerExclusions, ...retiredReviewers];
+    const exclusions = retiredReviewers;
     const reviewer = pickReviewer(
       author, pools.review, exclusions, cfg.review.prefer ?? [], reviewFloor,
       reviewHistory, (seat, count) => { rotationSeat = seat; rotationCount = count; }, demotedReviewers, authorVendors, authors,

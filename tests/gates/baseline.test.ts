@@ -137,7 +137,7 @@ test("test: a baseline-red file early-ending timing never supplies its green han
     expect(test.fileDurations).toContainEqual({ file: "tests/harvest.test.ts", durationMs: 217_543 });
     expect(test.longestFile).toEqual({ file: "tests/harvest.test.ts", durationMs: 217_543 }); // measurements unchanged
     const durations = classifiedFileDurations(test);
-    expect(fileHangBudgetMs("tests/docs.test.ts", durations, 1_000_000, test.longestFile)).toBe(652_629); // 3 × longest, not 217_543
+    expect(fileHangBudgetMs("tests/docs.test.ts", durations, 1_000_000, test.longestFile)).toBe(1_000_000); // the battery ceiling, not 217_543
     expect(fileHangBudgetMs("tests/harvest.test.ts", durations, 1_000_000, test.longestFile)).toBe(652_629); // green control: 3 × its own
     expect(diagnosticAdmission(persisted, ["tests/docs.test.ts"]).reason).toBe("diagnostic-unknown-cost");
   }
@@ -149,7 +149,7 @@ test("test: a baseline-red file early-ending timing never supplies its green han
   expect(diagnosticAdmission({ commands: { test: green } } as Baseline, ["tests/docs.test.ts"])).toMatchObject({ admitted: true, estimatedMs: 47_053 });
   // a RED legacy capture (no fileOutcomes): every file untimed and uncosted; a GREEN legacy capture is unchanged
   const legacy = (exitCode: number) => ({ exitCode, fingerprints: [], fileDurations: [{ file: "tests/docs.test.ts", durationMs: 47_053 }, { file: "tests/harvest.test.ts", durationMs: 217_543 }] });
-  expect(fileHangBudgetMs("tests/docs.test.ts", classifiedFileDurations(legacy(1)), 1_000_000)).toBe(652_629);
+  expect(fileHangBudgetMs("tests/docs.test.ts", classifiedFileDurations(legacy(1)), 1_000_000)).toBe(1_000_000);
   expect(diagnosticAdmission({ commands: { test: legacy(1) } } as unknown as Baseline, ["tests/docs.test.ts"]).reason).toBe("diagnostic-unknown-cost");
   expect(fileHangBudgetMs("tests/docs.test.ts", classifiedFileDurations(legacy(0)), 1_000_000)).toBe(217_543);
 });

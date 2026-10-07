@@ -37,7 +37,7 @@ import { executionSignal, remainingExecutionMs, withExecutionBudget, withoutExec
 import { repairSelectionDecision, repairSelectionEnabled } from "./repair-selection.js";
 import { failureDisposition, reserveInfrastructureRetry } from "./recovery.js";
 import { runEnvironment } from "./environment.js";
-import { changeRepresented, cleanupRunWorktrees, deriveForkCap, FORK_CAP_ENV, gitHead, linkNodeModules, npmDependencyInstallCommand, npmDependencyManifestChanged, PRESERVE_COMMIT_SUBJECT, PRESERVE_PRODUCER_TRAILER, preserveWorktree, type PreserveProducer, producerFields, removeWorktree, resolvedCapacity, runWithForkBudget, runWithVerificationBudget, type RunCapacity, sameCapacity, sameVerification, sh, shGit, SUITE_PARENT_ENV, verificationProtocol, WORKTREE_LAYOUT_CONTRACT, WORKTREES_DIR, worktreePath } from "./git.js";
+import { addDetachedWorktree, changeRepresented, cleanupRunWorktrees, deriveForkCap, FORK_CAP_ENV, gitHead, linkNodeModules, npmDependencyInstallCommand, npmDependencyManifestChanged, PRESERVE_COMMIT_SUBJECT, PRESERVE_PRODUCER_TRAILER, preserveWorktree, type PreserveProducer, producerFields, removeWorktree, resolvedCapacity, runWithForkBudget, runWithVerificationBudget, type RunCapacity, sameCapacity, sameVerification, sh, shGit, SUITE_PARENT_ENV, verificationProtocol, WORKTREE_LAYOUT_CONTRACT, WORKTREES_DIR, worktreePath } from "./git.js";
 import { MASK } from "./redact.js";
 import { runInteractiveSeed, type InteractiveSeedResult } from "./interactive-seed.js";
 import { classifyRepairDisposition, resolveScopeHints } from "./repair-disposition.js";
@@ -491,10 +491,25 @@ function classifyInfraResult(g: GateResult): void {
 // diagnostics (never-started files, a worker RPC timeout) that make such a red infrastructure-SHAPED.
 // Shape alone never parks anything: it only buys one isolated re-observation before a charge. A
 // fresh-fingerprint section masks digits to `#`, so both spellings of a number are read.
-/** C (E1): the one no-verdict that is the host's slowness, not the seat's — the same predicate run-gates
- * applies to its run-scoped tally, read here for the live task strike and the resume reconstruction. */
-const proofTimeoutNote = (data: Record<string, unknown>): boolean =>
-  data.cause === "seat-launch-failed" && data.launchCause === "checkout-proof-timeout";
+/** v2.6.8 T1: a seat that never LAUNCHED (any launchCause — checkout-proof-timeout, none, or other
+ * detail) is not a seat that failed to answer — the same predicate run-gates applies to its run-scoped
+ * tally, read here for the live task strike and the resume reconstruction. It never strikes. */
+const launchFailureNote = (data: Record<string, unknown>): boolean => data.cause === "seat-launch-failed";
+/** v2.6.8 T1: a journaled review-pool-demotion a launch failure caused. The pre-2.6.8 engine struck seats
+ * that never launched, so an older journal can carry a demotion whose trigger was a launch failure, or whose
+ * two-strike pair counted one beside a single real no-verdict that was not silent on its own. */
+const launchCausedDemotion = (data: Record<string, unknown>): boolean => {
+  if (launchFailureNote(data)) return true;
+  const silent = data.seatAuthoredBytes === 0 || data.cause === "silent" || data.cause === "launch-never-started";
+  return Array.isArray(data.causes) && !silent && data.causes.filter((cause) => cause !== "seat-launch-failed").length < 2;
+};
+/** OBS-1010 / v2.6.8 T1: the review seats a journal's demotions carry into a resumed run as a SOFT
+ * preference (ranked last, never excluded) — every review-pool-demotion except the launch-caused ones, which
+ * never demote a seat (live or replayed). plan.ts previews a resume with this same fold. */
+export function replayedReviewerDemotions(events: readonly JournalEvent[]): Set<string> {
+  return new Set(events.filter((event) => event.event === "review-pool-demotion" && typeof event.data.reviewer === "string"
+    && !launchCausedDemotion(event.data)).map((event) => event.data.reviewer as string));
+}
 /** C: the gate-fresh-forced reason that bounds the out-of-scope re-execution, one per journaled subject. */
 const OUTSIDE_SCOPE_RED = "no-commit-out-of-scope-red";
 const NAMED_FAILURE_FILE_RE = /^\s*(\S+\.(?:test|spec)\.[cm]?[jt]sx?)\s+>/gm;
@@ -2367,24 +2382,24 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
   process.on("SIGTERM", onTermination);
 
   journal = opts.resume ? Journal.open(repoRoot, runId, opts.narrate) : Journal.create(repoRoot, runId, opts.narrate);
-  const demotedReviewers = new Set(journal.read()
-    .filter((event) => event.event === "review-pool-demotion" && typeof event.data.reviewer === "string")
-    .map((event) => event.data.reviewer as string));
-  // OBS-1010: a demotion the JOURNAL carries into this session left the rotation for the run — a
-  // resumed daemon excludes that seat from every review pick (reviewer role only; the worker channel
-  // is untouched — channel-demotion is the worker fold, replayExcludedChannels). In-session demotions
-  // keep their soft ordering above so a still-live seat can be re-tried at the end of the rotation.
-  const replayedReviewerExclusions = opts.resume ? [...demotedReviewers] : [];
+  // OBS-1010 / v2.6.8 T1: a demotion the JOURNAL carries into this session is replayed as what it was
+  // live — a SOFT preference (reviewer role only; the worker channel is untouched — channel-demotion is
+  // the worker fold, replayExcludedChannels). The seat ranks last, even over prefer, and may still be
+  // re-tried at the end of the rotation; a resume never hardens one strike into an exclusion. Retirement
+  // is the only hard rule: two real no-verdict strikes (the tally below) put a seat out for the run,
+  // in-session and after resume alike, whatever prefer or history say. A launch-caused demotion an older
+  // engine journaled is not replayed at all — neither soft nor hard.
+  const demotedReviewers = replayedReviewerDemotions(journal.read());
   // OBS-1025 add.2 / OBS-1052 (Leg-2): the run-scoped no-verdict tally run-gates retires a seat from at two
   // strikes. execTask's badReviewers already excludes a seat after ONE strike within a task, so this map
   // is what bounds a seat that flakes once per task (or once per session) across the run. Seeded from the
   // journal's review-no-verdict rows — the same notes noteReviewEvent appends — so a resumed daemon keeps
   // the count; run-gates appends to it in place, exactly as it does demotedReviewers.
-  // C (E1): a checkout-proof timeout never struck the live tally (run-gates), so a resume never seeds one.
+  // v2.6.8 T1: a launch failure never struck the live tally (run-gates), so a resume never seeds one.
   const reviewNoVerdicts = new Map<string, string[]>();
   for (const event of journal.read()) {
     if (event.event !== "review-no-verdict" || event.data.noVerdict !== true || typeof event.data.reviewer !== "string") continue;
-    if (proofTimeoutNote(event.data)) continue;
+    if (launchFailureNote(event.data)) continue;
     reviewNoVerdicts.set(event.data.reviewer, [...(reviewNoVerdicts.get(event.data.reviewer) ?? []), String(event.data.cause)]);
   }
   const reviewHistory = journal.read()
@@ -2864,7 +2879,8 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         const pristine = mkdtempSync(join(parent, `baseline-recapture-${process.pid}-`));
         const staged = `${baselinePath}.${process.pid}.tmp`;
         try {
-          const added = await shGit(`git worktree add --detach ${shq(pristine)} ${shq(baseRef)}`, repoRoot);
+          // the detached worktree capability (see addDetachedWorktree); a commondir moved while it ran is refused
+          const added = await addDetachedWorktree(repoRoot, pristine, baseRef);
           if (added.code !== 0) throw new Error(`baseline recapture: journaled base ${baseRef} cannot be checked out: ${added.stderr.trim()}`);
           if (!linkNodeModules(repoRoot, pristine, { force: true })) throw new Error("baseline recapture: pristine node_modules link could not be provisioned");
           await initializeHost();
@@ -3482,15 +3498,19 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         assignment, rs?.attempts ?? 0, startMs, 0, 0, undefined, 0, "fresh", { cause: "bootstrap", channel: bootstrapExhausted });
       return;
     }
-    // Keep one live list: recovery retries must see exclusions added by onGate during the round.
-    const badReviewers: string[] = [...replayedReviewerExclusions];
-    // C (E1): a checkout-proof timeout is the host being slow, not the seat failing — it is excluded for
-    // the CURRENT round only (so an always-timeout pool still ends the round), never struck task-wide.
+    // Keep one live list: recovery retries must see exclusions added by onGate during the round. It starts
+    // empty on resume too: a replayed demotion is soft (demotedReviewers), retirement is the run tally.
+    const badReviewers: string[] = [];
+    // v2.6.8 T1: a seat that failed to launch (any launchCause) is excluded for the CURRENT round only —
+    // after its one bounded same-seat launch retry (run-gates), so an always-refusing pool still ends the
+    // round — and is never struck task-wide or run-wide: a later round may seat it again.
     let roundTimeouts: string[] = [];
-    const noteReviewEvent = (e: Extract<GateEvent, { phase: "note" }>) => {
+    const noteReviewEvent = (note: Extract<GateEvent, { phase: "note" }>) => {
+      // The same-seat launch retry is bounded per candidate: its row carries the commit it was spent on.
+      const e = note.name === "review-infra-retry" && gateSubject ? { ...note, payload: { ...note.payload, commit: gateSubject.commit } } : note;
       journal.append(e.name, t.id, e.payload);
       if (e.name === "review-no-verdict" && typeof e.payload.reviewer === "string") {
-        const strikes = proofTimeoutNote(e.payload) ? roundTimeouts : badReviewers;
+        const strikes = launchFailureNote(e.payload) ? roundTimeouts : badReviewers;
         if (!strikes.includes(e.payload.reviewer)) strikes.push(e.payload.reviewer);
       }
       // OBS-1196: a seat whose same-subject re-emission delivered a valid verdict was a delivery flake,
@@ -3501,7 +3521,8 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       }
     };
     // Keep the measured siblings, including a red judge, while replacing only a missing review.
-    // Every dispatched seat is excluded for this task, so the loop is bounded by the eligible pool.
+    // Every seat that returned no verdict is excluded for this task — a launch failure for this round only,
+    // after its one bounded relaunch — and a retired seat for the run, so the loop is bounded by the eligible pool.
     const runReviewRecovery = async (task: Task, ctx: GateContext, allowSelection = true) => {
       ctx.authorizeInfraRetry = cfg.executionPolicy?.boundedInfrastructure
         ? (subject, cause) => reserveInfrastructureRetry(journal.read(), task.id, subject, journal.append.bind(journal), cause) : undefined;
@@ -3526,28 +3547,80 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           && row.event === "phase-start" && row.data.phase === "gates").length,
       };
       roundTimeouts = [];
+      // v2.6.8 T1: the same-seat launch retries this candidate already spent, replayed from the journal so
+      // a recovery round, a recheck or a resume never re-grants one (and never turns one into a strike).
+      const launchRetried = () => journal.read().filter((row) => row.taskId === task.id && row.event === "review-infra-retry"
+        && row.data.sameSeat === true && row.data.commit === gateSubject?.commit && typeof row.data.reviewer === "string")
+        .map((row) => row.data.reviewer as string);
       // C: every gate-round boundary — a returned or a THROWN round — publishes the one row held behind
       // a still-pending sibling and forgets the pending set, before any park or task-failed row lands.
+      // v2.6.8 T1: a review result whose recovery pool is retired-only is classified BEFORE it is published
+      // (retiredOnly), and the round returns that same parked result, so the journal row and the result the
+      // park reads state one outcome — an infrastructure no-verdict, never a failed review.
       const gateRound = async (subject: Task) => {
+        const parked = new Map<GateResult, GateResult>();
         try {
-          return await runGates(subject, { ...ctx, excludeReviewers: [...badReviewers, ...roundTimeouts] });
+          const done = await runGates(subject, { ...ctx, excludeReviewers: [...badReviewers, ...roundTimeouts], launchRetried: launchRetried(),
+            onGate: async (e) => {
+              const park = e.phase === "end" && e.gate === "review" ? retiredOnly(e.result) : undefined;
+              if (park === undefined || e.phase !== "end") return ctx.onGate?.(e);
+              parked.set(e.result, park);
+              return ctx.onGate?.({ ...e, result: park });
+            } });
+          return { ...done, results: done.results.map((g) => parked.get(g) ?? g) };
         } finally {
           settleParallelRound();
         }
       };
-      const round = await gateRound(task);
-      let review = round.results.find((g) => g.gate === "review");
       // The recovery pick carries every preserved author, exactly as reviewGate's own pick does.
       const authors = ctx.carriedAuthors?.length ? [...ctx.carriedAuthors] : [channelKey(ctx.author)];
-      while (review?.meta?.noVerdict === true) {
-        // Recovery must honor the gate's floor, including the seats that just failed to
-        // return a verdict; a below-floor alternative cannot replace the infra result. This round's
-        // proof timeouts count too — runGates folds every excluded seat into its own floor.
-        const { floor } = gateReviewerFloor(task, ctx.cfg, ctx.author, ctx.channels,
-          [...(ctx.priorReviewers ?? []), ...badReviewers, ...roundTimeouts]);
-        const next = pickReviewer(ctx.author, ctx.channels, [...badReviewers, ...roundTimeouts], cfg.review.prefer ?? [],
-          floor, reviewHistory, undefined, demotedReviewers, carriedAuthorVendors(ctx.channels, authors), authors);
-        if (!next) break;
+      // Recovery must honor the gate's floor, including the seats that just failed to
+      // return a verdict; a below-floor alternative cannot replace the infra result. This round's
+      // launch failures count too — runGates folds every excluded seat into its own floor.
+      const pick = (exclude: string[]) => pickReviewer(ctx.author, ctx.channels, exclude, cfg.review.prefer ?? [],
+        gateReviewerFloor(task, ctx.cfg, ctx.author, ctx.channels, [...(ctx.priorReviewers ?? []), ...badReviewers, ...roundTimeouts]).floor,
+        reviewHistory, undefined, demotedReviewers, carriedAuthorVendors(ctx.channels, authors), authors);
+      // v2.6.8 T1: soft preference is not retirement. demotedReviewers — live or replayed on resume — only
+      // ranks a seat last, so a once-demoted seat stays seatable; a seat two REAL no-verdict strikes retired
+      // is out for the run, so every recovery pick excludes it outright — prefer and history can never
+      // resurrect it, and runGates would refuse it anyway. A launch failure is neither: it buys one bounded
+      // same-seat relaunch per candidate (launchRetried) and then leaves the seat out of THIS round only.
+      const retiredSeats = () => [...reviewNoVerdicts].filter(([, causes]) => causes.length >= 2).map(([seat]) => seat);
+      // The retired-only recovery park: when retirement is what empties the pool (the pick without the
+      // retired exclusion would seat a retired seat), record the seat the pool cannot seat and why, buy
+      // no dispatch, and park infrastructure naming it out for the run — never a soft-ranked pick that
+      // dispatches it again, never a gate-fail. The tally is seeded from the journal, so every resume
+      // or recheck replays this same row and park, whether its round dispatched a seat or found none.
+      // It is decided where the review result is published (gateRound): a round that found no eligible
+      // reviewer, or a no-verdict no recovery pick can replace — and once more after the round,
+      // should another task retire a seat in between. The parked result is the same no-verdict shape every
+      // review.ts no-verdict has: in memory `pass: false` (GateResult.pass is a boolean, and an unreviewed
+      // candidate fails closed — it never merges), `noVerdict` + `infra`; the gate-result row written for a
+      // noVerdict review below drops `pass` and adds `skipped`, so outcome readers, round budgets and
+      // failure counters read one infrastructure outcome, and the infra park — not the gate-fail one — is
+      // what the task gets.
+      const retiredOnly = (r: GateResult): GateResult | undefined => {
+        if (r.meta?.cannotSeat !== undefined || (r.meta?.noEligibleReviewer !== true && (r.meta?.noVerdict !== true
+          || pick([...badReviewers, ...roundTimeouts, ...retiredSeats()])))) return undefined;
+        const retired = retiredSeats();
+        const blocked = pick([...badReviewers, ...roundTimeouts].filter((seat) => !retired.includes(seat)));
+        if (!blocked || !retired.includes(channelKey(blocked))) return undefined;
+        const seat = channelKey(blocked);
+        const causes = reviewNoVerdicts.get(seat) ?? [];
+        journal.append("review-infra-retry", t.id, { reviewer: seat, cause: "retired", cannotSeat: true, causes });
+        const { noEligibleReviewer: _none, ...meta } = r.meta ?? {};
+        return { ...r, pass: false, meta: { cause: "retired", ...meta, noVerdict: true, cannotSeat: seat, infra: true, classification: "infra" },
+          details: `${r.details}\nreview recovery cannot seat ${seat}: two real no-verdicts (${causes.join(", ")}) retired it — it is out for the run, and no other eligible seat remains` };
+      };
+      const round = await gateRound(task);
+      let review = round.results.find((g) => g.gate === "review");
+      while (review?.meta?.noVerdict === true && review.meta.cannotSeat === undefined) {
+        const next = pick([...badReviewers, ...roundTimeouts, ...retiredSeats()]);
+        if (!next) {
+          const parked = retiredOnly(review);
+          if (parked) round.results = round.results.map((g) => g === review ? parked : g);
+          break;
+        }
         journal.append("review-infra-retry", t.id, { reviewer: channelKey(next), cause: review.meta.cause });
         const retried = await gateRound({ ...task, gates: ["review"] });
         const replacement = retried.results.find((g) => g.gate === "review");
@@ -3576,7 +3649,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           gate: "review", flaked: rr.flaked, retried: rr.retried,
           ...(g.meta?.unparseable === true ? { secondUnparseable: true } : {}),
         });
-        // C (E1): a seat re-routed after a checkout-proof timeout is excluded for this round only.
+        // v2.6.8 T1: a seat re-routed after a launch failure is excluded for this round only.
         if (!roundTimeouts.includes(rr.flaked)) badReviewers.push(rr.flaked);
       }
     };

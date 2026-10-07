@@ -123,7 +123,7 @@ class PaneReviewer extends FakeAdapter {
   override vendor = "fake-vb";
 }
 
-test("production runGates retires the reviewer after two omitted-flag launch failures while two explicit complete proof absences keep it eligible and both stay fail closed", async () => {
+test("production runGates keeps the reviewer after two omitted-flag launch failures and after two explicit complete proof absences, relaunching it once per round, while both stay fail closed", async () => {
   const dir = mkdtempSync(join(tmpdir(), "tickmarkr-proof-pages-"));
   const script = join(dir, "s.json");
   writeFileSync(script, JSON.stringify({ tasks: {} }));
@@ -171,9 +171,10 @@ test("production runGates retires the reviewer after two omitted-flag launch fai
   const absences = await rounds("explicit");
   for (const shape of ["no flags", "no limited", "no truncated"] as const) {
     const unread = await rounds(shape);
-    // Both pairs: the seat was created and refused each round — a no-verdict infra row, never a pass.
+    // Both pairs: the seat was created and refused each round, relaunched once (v2.6.8 T1) and refused
+    // again — a no-verdict infra row, never a pass.
     for (const [name, p, launchCause] of [["explicit", absences, "checkout-proof-timeout"], [shape, unread, undefined]] as const) {
-      expect(p.creates, name).toBe(2);
+      expect(p.creates, name).toBe(4);
       for (const review of p.two) {
         expect(review.pass, name).toBe(false);
         expect(review.meta, name).toMatchObject({ cause: "seat-launch-failed", noVerdict: true, infra: true, classification: "infra", reviewer: seatKey });
@@ -181,18 +182,17 @@ test("production runGates retires the reviewer after two omitted-flag launch fai
       }
       expect(p.third.pass, name).toBe(false);
     }
-    // Omitted flags: two ordinary launch failures strike twice and retire the seat; the third round has no one.
-    expect(unread.reviewNoVerdicts.get(seatKey), shape).toEqual(["seat-launch-failed", "seat-launch-failed"]);
-    expect(unread.demotedReviewers.has(seatKey), shape).toBe(true);
-    expect(unread.demotions.map((e) => e.phase === "note" && e.payload), shape)
-      .toEqual([{ reviewer: seatKey, cause: "seat-launch-failed", seatAuthoredBytes: 0, causes: ["seat-launch-failed", "seat-launch-failed"] }]);
-    expect(unread.thirdCreates, shape).toBe(0);
-    expect(unread.third.meta?.noEligibleReviewer, shape).toBe(true);
+    // Omitted flags: a launch failure of any kind never strikes (v2.6.8 T1) — the third round seats it again.
+    expect(unread.reviewNoVerdicts.get(seatKey), shape).toBeUndefined();
+    expect(unread.demotedReviewers.has(seatKey), shape).toBe(false);
+    expect(unread.demotions, shape).toEqual([]);
+    expect(unread.thirdCreates, shape).toBe(2);
+    expect(unread.third.meta, shape).toMatchObject({ cause: "seat-launch-failed", noVerdict: true, infra: true, reviewer: seatKey });
   }
   // Explicit complete absences: the host was slow, not the seat — no strike, still eligible, reseated and refused again.
   expect(absences.reviewNoVerdicts.get(seatKey)).toBeUndefined();
   expect(absences.demotedReviewers.has(seatKey)).toBe(false);
   expect(absences.demotions).toEqual([]);
-  expect(absences.thirdCreates).toBe(1);
+  expect(absences.thirdCreates).toBe(2);
   expect(absences.third.meta).toMatchObject({ cause: "seat-launch-failed", launchCause: "checkout-proof-timeout", noVerdict: true, infra: true, reviewer: seatKey });
 }, 180_000);

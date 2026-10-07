@@ -410,26 +410,27 @@ describe("C — each failed review round has its lawful exit (production daemon,
   }
   const reviewCfg = (seats: string[]) => `${PANE}review: { required: true, prefer: [${seats.join(", ")}], timeoutMs: 5000 }\n`;
 
-  test("runDaemon preserves checkout-proof-timeout eligibility live and after resume while an ordinary launch failure strikes in both paths and no-verdict never becomes a passing review", async () => {
-    // ---- live: a timed-out seat is seated again on the task's next round; an ordinary failure is not ----
+  test("runDaemon preserves launch-failure eligibility live and after resume for a checkout-proof timeout and an ordinary launch failure alike and no-verdict never becomes a passing review", async () => {
+    // ---- live: a seat that failed to launch (and on its one relaunch) is seated again on the task's next
+    // round — a launch failure of any kind never strikes (v2.6.8 T1) ----
     for (const [name, error] of [["timeout", proofTimeout], ["ordinary", () => new Error("pane create refused")]] as const) {
       const runId = `run-live-${name}`;
       const { repo, scriptPath } = setupRepo([T("T1")], { tasks: { T1: [work("l0"), work("l1", "fix.txt"), work("l2", "fix2.txt")] } }, reviewCfg(["seat-a", "seat-b"]));
       const a = new Seat(scriptPath, "seat-a");
       const b = new Seat(scriptPath, "seat-b", false); // round 1's replacement asks for changes: a second round is drawn
       let failures = 0;
-      const { driver } = launchDriver((seat) => seat === "seat-a" && failures++ === 0 ? error : undefined);
+      const { driver } = launchDriver((seat) => seat === "seat-a" && failures++ < 2 ? error : undefined);
       await runDaemon(repo, { adapters: [new Author(scriptPath), a, b], runId, driver });
       const rows = rowsOf(repo, runId);
       const reviewers = gateRows(rows, "review").map((row) => row.data.reviewer);
       expect(reviewers[0], name).toBe("seat-b:seat-b");
-      expect(of(rows, "review-no-verdict").map((row) => row.data), name).toMatchObject([{ reviewer: "seat-a:seat-a", cause: "seat-launch-failed",
-        ...(name === "timeout" ? { launchCause: "checkout-proof-timeout" } : {}) }]);
-      // the next round: the timed-out seat is eligible again; the struck seat stays out for the task
-      expect(reviewers[1], name).toBe(name === "timeout" ? "seat-a:seat-a" : "seat-b:seat-b");
+      const launchRow = { reviewer: "seat-a:seat-a", cause: "seat-launch-failed", ...(name === "timeout" ? { launchCause: "checkout-proof-timeout" } : {}) };
+      expect(of(rows, "review-no-verdict").map((row) => row.data), name).toMatchObject([launchRow, launchRow]);
+      // the next round: the seat that failed to launch is eligible again, whatever the launch cause
+      expect(reviewers[1], name).toBe("seat-a:seat-a");
       for (const row of gateRows(rows, "review").filter((r) => r.data.noVerdict === true)) expect(row.data.pass, name).toBeUndefined();
     }
-    // ---- after resume: the journal's timeout never seeds a strike, an ordinary failure seeds one ----
+    // ---- after resume: no launch failure in the journal seeds a strike ----
     for (const [name, error] of [["timeout", proofTimeout], ["ordinary", () => new Error("pane create refused")]] as const) {
       const runId = `run-resume-${name}`;
       const { repo, scriptPath } = setupRepo([T("T1")], { tasks: { T1: [work("r0")] } }, reviewCfg(["seat-a"]));
@@ -449,20 +450,11 @@ describe("C — each failed review round has its lawful exit (production daemon,
       await approve([runId, "T1", "--recheck", "--by", "op"], repo);
       const last = await runDaemon(repo, { adapters, runId, resume: true, driver });
       rows = rowsOf(repo, runId);
-      const demoted = of(rows, "review-pool-demotion").map((row) => row.data.reviewer);
-      if (name === "timeout") {
-        // never struck: the released seat is still seated and its real verdict lands
-        expect(demoted, name).toEqual([]);
-        expect(last.done, name).toEqual(["T1"]);
-        expect(gateRows(rows, "review").at(-1)!.data, name).toMatchObject({ pass: true, reviewer: "seat-a:seat-a" });
-        expect(delivered.get("seat-a"), name).toBe(1);
-      } else {
-        // struck live and on resume: two strikes retire the seat, and the release cannot seat it again
-        expect(demoted, name).toEqual(["seat-a:seat-a"]);
-        expect(last.done, name).toEqual([]);
-        expect(delivered.get("seat-a"), name).toBeUndefined();
-        expect(gateRows(rows, "review").at(-1)!.data, name).toMatchObject({ pass: false, noEligibleReviewer: true });
-      }
+      // never struck: the released seat is still seated and its real verdict lands
+      expect(of(rows, "review-pool-demotion"), name).toEqual([]);
+      expect(last.done, name).toEqual(["T1"]);
+      expect(gateRows(rows, "review").at(-1)!.data, name).toMatchObject({ pass: true, reviewer: "seat-a:seat-a" });
+      expect(delivered.get("seat-a"), name).toBe(1);
     }
   });
 

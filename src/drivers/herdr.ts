@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { declaredInputBoxForWorkerName, matchesEmptyInputBox, matchesInputBox, matchesOccupiedInputBox, missingInputStateDeclarations, shq, type InputBox } from "../adapters/types.js";
 import { consumePaneLaunchIntent, PANE_IDENTITY_ENV, paneIdentityLine } from "../brand.js";
-import { createWorktree, sh } from "../run/git.js";
+import { createWorktree, sh, shGit } from "../run/git.js";
 import { Journal, type JournalEvent } from "../run/journal.js";
 import { readSupervision, readWatchBoard, requestWatchBoardStop, reserveWatchBoard, stopWatchBoard, WATCH_OWNER_ENV } from "../run/supervision.js";
 import { canonicalWorktreePath } from "./orca.js";
@@ -557,7 +557,7 @@ export class HerdrDriver implements ExecutorDriver {
     if (typeof pane.cwd !== "string" || canonicalWorktreePath(pane.cwd) !== checkout) {
       throw new Error(`herdr adopt: pane ${pane.pane_id} labelled ${slot.name} sits in ${pane.cwd ?? "an unreported cwd"}, not the task checkout ${checkout} — foreign`);
     }
-    const top = await sh("git rev-parse --show-toplevel", checkout);
+    const top = await shGit("git rev-parse --show-toplevel", checkout);
     if (top.code !== 0 || canonicalWorktreePath(top.stdout.trim()) !== checkout) {
       throw new Error(`herdr adopt: ${checkout} is not its own git checkout — no checkout proof for ${slot.name}`);
     }

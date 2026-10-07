@@ -523,10 +523,10 @@ test("test: production beat status and legacy status preserve byte and mtime sna
   const repo = lifecycleRepo();
   await check(repo, "orchestrator", "s", 0, /^orchestrator ABSENT — no beat recorded$/);
   expect(existsSync(supervisionBeatPath(repo, "orchestrator"))).toBe(false);
-  // BUSY: the checked state, read without taking or touching the claim.
+  // BUSY: the checked state, read without taking or touching a live holder's claim.
   mkdirSync(join(repo, ".tickmarkr", "supervision"), { recursive: true });
-  writeFileSync(beatClaimPath(repo, "orchestrator"), JSON.stringify({ token: "t", pid: 4242 }) + "\n");
-  await check(repo, "orchestrator", "s", 0, /^orchestrator ABSENT — no beat recorded · BUSY \(claim held by pid 4242\)$/);
+  writeFileSync(beatClaimPath(repo, "orchestrator"), JSON.stringify({ token: "t", pid: process.pid }) + "\n");
+  await check(repo, "orchestrator", "s", 0, new RegExp(`^orchestrator ABSENT — no beat recorded · BUSY \\(claim held by pid ${process.pid}\\)$`));
   rmSync(beatClaimPath(repo, "orchestrator"));
   // DISARMED.
   standDownTier(repo, "orchestrator", "s");
@@ -568,7 +568,9 @@ test("test: production beat status and legacy status preserve byte and mtime sna
   // FOREIGN: an unowned legacy writer holds the tier.
   const legacy = lifecycleRepo();
   await beat(["overseer-context", "--seat", "w"], legacy);
-  await check(legacy, "overseer-context", undefined, 1, /^overseer-context MISMATCH — ARMED by an unowned writer \(seat w\)$/);
+  // A one-shot writer has exited, so its exit is the bare recorded-seat stand-down (no "stop pid N first").
+  await check(legacy, "overseer-context", undefined, 1,
+    /^overseer-context MISMATCH — ARMED by an unowned writer \(seat w\) — migrate the legacy writer: run `tickmarkr beat overseer-context --seat w --stand-down` and start again$/);
   // PID-REUSED.
   const reused = lifecycleRepo();
   mkdirSync(join(reused, ".tickmarkr", "supervision"), { recursive: true });

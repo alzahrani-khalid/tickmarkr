@@ -310,7 +310,7 @@ describe("v2.6.7 T1 candidate policy (production daemon, fake adapters, zero tok
 
   test("production runDaemon records the closed recovery table merge or infra outcome for complete rejected missing and genuinely cancelled candidate proof", async () => {
     // The first review seat fails to launch while acceptance is pending; acceptance APPROVES, the full proof
-    // passes and the second independent seat approves: the merge lands only after all three proofs.
+    // passes and the same seat's one bounded relaunch (v2.6.8 T1) approves: the merge lands only after all three proofs.
     {
       let failed = 0;
       const c = await candidate({ runId: "run-recover-complete", pane: true, replies: ["approve"], seatB: ["approve"],
@@ -325,7 +325,8 @@ describe("v2.6.7 T1 candidate policy (production daemon, fake adapters, zero tok
       ];
       expect(proofs.every((i) => i >= 0 && i < mergeAt)).toBe(true);
       expect(c.events.filter((e) => e.event === "review-no-verdict").map((e) => e.data.reviewer)).toEqual(["seat-a:seat-a"]);
-      expect(c.events.find((e) => e.event === "gate-result" && e.data.gate === "review" && e.data.pass === true)?.data.reviewer).toBe("seat-b:seat-b");
+      expect(c.events.find((e) => e.event === "gate-result" && e.data.gate === "review" && e.data.pass === true)?.data.reviewer).toBe("seat-a:seat-a");
+      expect(c.events.filter((e) => e.event === "review-infra-retry").map((e) => e.data)).toEqual([expect.objectContaining({ reviewer: "seat-a:seat-a", sameSeat: true })]);
     }
 
     // An ordinary no-verdict review beside a green full suite, with recovery absent: no merge.
@@ -358,23 +359,25 @@ describe("v2.6.7 T1 candidate policy (production daemon, fake adapters, zero tok
       expect(c.events.some((e) => e.event === "task-failed")).toBe(false);
     }
 
-    // runReviewRecovery on a subject a primed run proved full-green: both review seats fail to launch while the
-    // judge is held, then seat-a's second channel APPROVES review-only. Neither discharges a sibling's debt:
+    // runReviewRecovery on a subject a primed run proved full-green: both review seats fail to launch, each on
+    // its one same-seat relaunch too (v2.6.8 T1), while the judge is held, then seat-a's second channel APPROVES
+    // review-only. Neither discharges a sibling's debt:
     const launchFails = (refuseJudge: boolean) => (rows: () => JournalEvent[]) => {
       let reviewLaunches = 0;
-      return seatDriver((name) => role(name, "review") && reviewLaunches++ < 2, async (name) => {
+      return seatDriver((name) => role(name, "review") && reviewLaunches++ < 4, async (name) => {
         if (!role(name, "judge")) return;
-        await until(rows, (events) => events.filter((e) => e.event === "review-no-verdict").length >= 2, "both review launch failures");
+        await until(rows, (events) => events.filter((e) => e.event === "review-no-verdict").length >= 4, "every review launch failure");
         if (refuseJudge) throw new Error(`pane create refused for ${name}`);
       });
     };
     const recovered = (c: Awaited<ReturnType<typeof candidate>>, events: JournalEvent[], gate: string) => {
       expect(events.filter((e) => e.event === "review-no-verdict" && e.taskId === "T1").map((e) => e.data.cause))
-        .toEqual(["seat-launch-failed", "seat-launch-failed"]);
-      expect(events.filter((e) => e.event === "review-infra-retry" && e.taskId === "T1").map((e) => e.data.reviewer)).toEqual(["seat-a:seat-a-2"]);
+        .toEqual(["seat-launch-failed", "seat-launch-failed", "seat-launch-failed", "seat-launch-failed"]);
+      expect(events.filter((e) => e.event === "review-infra-retry" && e.taskId === "T1").map((e) => e.data.reviewer))
+        .toEqual(["seat-a:seat-a", "seat-b:seat-b", "seat-a:seat-a-2"]);
       const replacement = events.findIndex((e) => e.event === "gate-result" && e.taskId === "T1" && e.data.gate === "review"
         && e.data.pass === true && e.data.reviewer === "seat-a:seat-a-2");
-      expect(replacement).toBeGreaterThan(events.findIndex((e) => e.event === "review-infra-retry"));
+      expect(replacement).toBeGreaterThan(events.findLastIndex((e) => e.event === "review-infra-retry"));
       // the controlled sibling: a full green the primed run merged on, measured on this exact subject
       const green = c.primed.find((e) => e.event === "gate-result" && e.data.gate === "test" && e.data.pass === true);
       expect(merged(c.primed)).toBe(true);

@@ -1,6 +1,6 @@
 import type { CommandReceiptAttribution, ShellReceipt } from "./protocol.js";
 import { observeVerificationReceipt, observeVerificationSpawn, verificationJobEnvironment } from "./verification-job.js";
-import { executionSignal } from "./execution-budget.js";
+import { executionSignal, withoutExecutionBudget } from "./execution-budget.js";
 import { commandLeaseEnvironment, repositoryLeaseEnvironment, registerRepositoryChild, withCommandLease } from "./lease.js";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { execFile, execFileSync, spawn } from "node:child_process";
@@ -12,7 +12,7 @@ import { shq } from "../adapters/types.js";
 import { tickmarkrDir } from "../graph/graph.js";
 import { ROUTING_ENV_SEAMS } from "../route/router.js";
 import { titleEnvironment } from "./title-environment.js";
-import { assertGitTrust, protectedGitEnv, trustedCommonDir } from "./git-trust.js";
+import { assertGitTrust, GitTrustRefusal, ownGitPin, protectedGitEnv, trustedCommonDir, type DetachedAddCapability, type OwnGitCapability, type TrustedStoreCapability, type WorktreeRollback } from "./git-trust.js";
 
 export { ROUTING_ENV_SEAMS };
 
@@ -334,8 +334,21 @@ export interface ShellOptions {
   receiptAttribution?: (invocation: number) => CommandReceiptAttribution;
 }
 
-/** Shared command seam, including invocation-bound manifested runners. */
+/** Shared command seam, including invocation-bound manifested runners. A PAYLOAD entry: its children keep the
+ * operator's git config (hooks, fsmonitor) and get no checkout pin — ownership follows the entry, never `login`
+ * or the command text. tickmarkr's own git goes through shGit/shGitOk. */
 export function shell(cmd: string, cwd: string, timeoutMs: number, login = false, options: ShellOptions = {}): Promise<ShResult> {
+  return shellEntry(cmd, cwd, timeoutMs, login, options, undefined);
+}
+
+/**
+ * v2.6.8 T2: what an OWN-GIT caller declares at its call site — never inferred from the command text. Every own-git
+ * child in a linked checkout keeps the path pin and the ref-store pin; `createsWorktree` is the worktree capability the
+ * branch-creating call sites declare, and addDetachedWorktree is the detached one (see OwnGitCapability and ownGitPin).
+ */
+export type OwnGitOptions = OwnGitCapability;
+
+function shellEntry(cmd: string, cwd: string, timeoutMs: number, login: boolean, options: ShellOptions, ownGit: OwnGitOptions | DetachedAddCapability | TrustedStoreCapability | undefined): Promise<ShResult> {
   const inherited = executionSignal();
   const signal = inherited && options.signal ? AbortSignal.any([inherited, options.signal]) : inherited ?? options.signal;
   let attribution: CommandReceiptAttribution | undefined;
@@ -374,7 +387,7 @@ export function shell(cmd: string, cwd: string, timeoutMs: number, login = false
   };
   begin(1);
   checkAbort();
-  return withCommandLease(cmd, () => executeShell(cmd, cwd, timeoutMs, login, { ...options, signal }, { begin, emit, checkAbort }))
+  return withCommandLease(cmd, () => executeShell(cmd, cwd, timeoutMs, login, { ...options, signal }, { begin, emit, checkAbort }, ownGit))
     .catch((error: unknown) => {
       if (signal?.aborted) emit({ outcome: "cancelled", exitCode: null, signal: null });
       throw error;
@@ -387,15 +400,17 @@ interface ShellObservation {
   checkAbort: () => void;
 }
 
-function executeShell(cmd: string, cwd: string, timeoutMs: number, login: boolean, options: ShellOptions, observation: ShellObservation): Promise<ShResult> {
+function executeShell(cmd: string, cwd: string, timeoutMs: number, login: boolean, options: ShellOptions, observation: ShellObservation, ownGit: OwnGitOptions | DetachedAddCapability | TrustedStoreCapability | undefined): Promise<ShResult> {
   observation.checkAbort();
   // OBS-74: scrub tickmarkr's own routing env seams from every child — a daemon carrying
   // TICKMARKR_QUALITY leaked it into baseline/gate/tip-verify children, turning a dogfood
   // repo's route() tests red inside the gates. Scrub a copy at this one choke point so
   // children are hermetic by construction; the daemon's own process.env stays unchanged.
-  // v2.6.7 T4 (E1): git children run with core.fsmonitor=false and an inert hooksPath whatever the
-  // repository or inherited GIT_CONFIG_* say; every other parent, capability and explicit value survives.
-  const env = protectedGitEnv(verificationJobEnvironment(repositoryLeaseEnvironment(commandLeaseEnvironment(options.env ?? process.env))));
+  // v2.6.7 T4 (E1) / v2.6.8 T2: tickmarkr's OWN git children (shGit/shGitOk) run with core.fsmonitor=false and
+  // an inert hooksPath whatever the repository or inherited GIT_CONFIG_* say; payload children keep the
+  // operator's config. Every other parent, capability and explicit value survives.
+  const payloadEnv = verificationJobEnvironment(repositoryLeaseEnvironment(commandLeaseEnvironment(options.env ?? process.env)));
+  const env = ownGit ? protectedGitEnv(payloadEnv) : payloadEnv;
   for (const k of ROUTING_ENV_SEAMS) delete env[k];
   // A run freezes the operator override and cores at startup; admission can lower the round cap.
   env[FORK_CAP_ENV] = verificationBudget.getStore()
@@ -416,6 +431,8 @@ function executeShell(cmd: string, cwd: string, timeoutMs: number, login: boolea
   // under. `Number` of an unparseable export is NaN, which every reader treats as malformed and
   // therefore fails closed — the honest direction when the cap in play cannot be stated.
   const capacity: RunCapacity = { forkCap: Number(env[FORK_CAP_ENV]), cores: resolvedCapacity().cores };
+  // v2.6.8 T2: the pin's post-exit recheck for the attempt that actually ran its child, and its ref view's release.
+  let recheck: (() => void) | undefined, release: (() => void) | undefined, unview: ((text: string) => string) | undefined, store: string | undefined;
   const attempt = (): Promise<ShResult | SpawnRefusal> => new Promise((resolve) => {
     const startedAt = Date.now();
     // detached: bash gets its own process group so a timeout can kill the whole tree —
@@ -424,14 +441,20 @@ function executeShell(cmd: string, cwd: string, timeoutMs: number, login: boolea
     let p: ReturnType<typeof spawn>;
     // v2.6.7 T4: the trust check runs before EVERY spawn attempt (retries included) and caches nothing — a
     // seat can rewrite its gitdir's commondir/config.worktree between any two calls. A refusal names the file.
+    // v2.6.8 T2 (P3): an own-git attempt in a linked checkout also pins its child (config, objects and the ref store)
+    // to the authority that check derived, and its result is refused when commondir changed before the child exited;
+    // payloads get no pin. The command text never selects a pin.
+    let childEnv = env;
+    recheck = undefined; unview = undefined; store = undefined;
     try {
-      assertGitTrust(cwd);
+      const pin = ownGit ? ownGitPin(cwd, env, ownGit) : (assertGitTrust(cwd), undefined);
+      if (pin) ({ env: childEnv, recheck, release, unview, store } = pin);
     } catch (error) {
       observation.emit({ outcome: "spawn-failed", exitCode: null, signal: null, error: String(error) });
       throw error;
     }
     try {
-      p = (spawnChild ?? spawn)("bash", [login ? "-lc" : "-c", cmd], { cwd, env, stdio: ["ignore", "pipe", "pipe"], detached: true });
+      p = (spawnChild ?? spawn)("bash", [login ? "-lc" : "-c", cmd], { cwd, env: childEnv, stdio: ["ignore", "pipe", "pipe"], detached: true });
     } catch (error) {
       observation.emit({ outcome: "spawn-failed", exitCode: null, signal: null, error: String(error) });
       throw error;
@@ -566,8 +589,19 @@ function executeShell(cmd: string, cwd: string, timeoutMs: number, login: boolea
     for (let n = 1; ; n++) {
       if (n > 1) observation.begin(n);
       observation.checkAbort();
-      const r = await attempt();
-      if (!("refused" in r)) return r;
+      let r: ShResult | SpawnRefusal;
+      try { r = await attempt(); } finally { release?.(); release = undefined; }
+      if (!("refused" in r)) {
+        try { recheck?.(); } catch (error) {
+          // v2.6.8 T2: a raced worktree add already registered what it created in the trusted store; it is removed through
+          // the trusted common directory this attempt derived, even while the caller's commondir stays hostile and even
+          // when the execution budget expired meanwhile; a failed rollback rides on the refusal, never swallowed
+          const rollback = ownGit && "rollback" in ownGit ? ownGit.rollback : undefined;
+          if (rollback && store) await dropWorktree(store, rollback, timeoutMs).catch((failure: unknown) => { throw rollbackFailed(error, failure); });
+          throw error;
+        }
+        return unview ? { ...r, stdout: unview(r.stdout), stderr: unview(r.stderr) } : r;
+      }
       // Bounded, and the bound is what makes a persisting shortage a REPORTED failure rather than a
       // wedged daemon: past it the caller gets the refusal's own text under exit 127, as before.
       if (n >= SPAWN_ATTEMPT_LIMIT) {
@@ -583,8 +617,10 @@ export function sh(cmd: string, cwd: string, timeoutMs = DEFAULT_SHELL_TIMEOUT_M
 }
 
 // Git plumbing never needs an operator profile; skip login-shell startup and its side effects.
-export function shGit(cmd: string, cwd: string, timeoutMs = DEFAULT_SHELL_TIMEOUT_MS): Promise<ShResult> {
-  return shell(cmd, cwd, timeoutMs, false);
+// v2.6.8 T2: the explicit OWN-GIT entry — forced inert hooks/fsmonitor and, in a linked checkout, the trusted-path and
+// ref-store pin.
+export function shGit(cmd: string, cwd: string, timeoutMs = DEFAULT_SHELL_TIMEOUT_MS, own: OwnGitOptions = {}): Promise<ShResult> {
+  return shellEntry(cmd, cwd, timeoutMs, false, {}, own);
 }
 
 export async function shOk(cmd: string, cwd: string): Promise<string> {
@@ -593,10 +629,74 @@ export async function shOk(cmd: string, cwd: string): Promise<string> {
   return r.stdout;
 }
 
-export async function shGitOk(cmd: string, cwd: string): Promise<string> {
-  const r = await shGit(cmd, cwd);
+export async function shGitOk(cmd: string, cwd: string, own: OwnGitOptions = {}): Promise<string> {
+  const r = await shGit(cmd, cwd, DEFAULT_SHELL_TIMEOUT_MS, own);
   if (r.code !== 0) throw new Error(`command failed (${r.code}): ${cmd}\n${r.stderr || r.stdout}`);
   return r.stdout;
+}
+
+/**
+ * v2.6.8 T2: the DETACHED worktree capability, declared by calling it (the daemon's baseline recapture and standalone
+ * verify's base worktree). Under the ref-store pin git stubs a detached add's new HEAD as `ref: refs/heads/.invalid`
+ * and checks out nothing, and no own-git step ever runs unpinned instead: the commit-ish is resolved to an object id in
+ * `cwd`'s checkout (HEAD and branch names read the trusted store), the checkout is added `--no-checkout --detach` at
+ * that id (its ref store pinned to the trusted common directory, see DetachedAddCapability), and then — pinned to the
+ * NEW checkout's own authority — its HEAD is written as that id, git's `refs/heads/.invalid` stub ref is deleted and the
+ * checkout is populated.
+ * A step raced by a commondir change is refused by name before the next one runs, and what the add created is rolled
+ * back through the trusted common directory derived here once (dropWorktree), even while that commondir stays hostile.
+ */
+export async function addDetachedWorktree(cwd: string, dir: string, commitish: string, timeoutMs = DEFAULT_SHELL_TIMEOUT_MS): Promise<ShResult> {
+  // the authority this operation keeps, rollback included: derived once from the trusted layout, never a commondir
+  const store = trustedCommonDir(cwd);
+  const resolved = await shGit(`git rev-parse --verify --end-of-options ${shq(`${commitish}^{commit}`)}`, cwd, timeoutMs);
+  if (resolved.code !== 0) return resolved;
+  const oid = resolved.stdout.trim();
+  // under a ref payload git also resolves its new-HEAD stub into a shared refs/heads/.invalid; it is deleted again
+  const rollback: WorktreeRollback = { dir, branch: { name: ".invalid" } };
+  const added = await shellEntry(`git worktree add --no-checkout --detach ${shq(dir)} ${shq(oid)}`, cwd, timeoutMs, false, {}, { createsWorktree: "detached", rollback });
+  if (added.code !== 0) return added;
+  let repaired: ShResult;
+  try {
+    repaired = await shGit(`git update-ref --no-deref HEAD ${shq(oid)} && git update-ref -d refs/heads/.invalid && git reset -q --hard --no-recurse-submodules`, dir, timeoutMs);
+  } catch (error) { await dropWorktree(store, rollback, timeoutMs).catch((failure: unknown) => { throw rollbackFailed(error, failure); }); throw error; }
+  if (repaired.code !== 0) await dropWorktree(store, rollback, timeoutMs);
+  return repaired;
+}
+
+/** A failed rollback is never swallowed: it rides on the error the operation already throws (a refusal stays one). */
+function rollbackFailed(error: unknown, failure: unknown): Error {
+  const why = `; its rollback failed, so what it created may remain: ${failure instanceof Error ? failure.message : String(failure)}`;
+  return error instanceof GitTrustRefusal ? new GitTrustRefusal(error.path, `${error.detail}${why}`, { cause: failure })
+    : new AggregateError([error, failure], `${error instanceof Error ? error.message : String(error)}${why}`);
+}
+
+/**
+ * Removes a checkout `dir` and its registration — and, when named, a branch the add created (deleted) or moved
+ * (restored to `prior`) — through `store`, a trusted common directory derived from the layout (TrustedStoreCapability):
+ * nothing here reads the caller's checkout, so it completes while that checkout's commondir is hostile. Cleanup only, so
+ * it runs outside any execution budget (an expired one would refuse every step and leave what the add created), each
+ * step bounded by `timeoutMs`; every step is tried, and any that failed is thrown, never swallowed.
+ */
+async function dropWorktree(store: string, { dir, branch }: WorktreeRollback, timeoutMs = DEFAULT_SHELL_TIMEOUT_MS): Promise<void> {
+  const failed = await withoutExecutionBudget(async () => {
+    const run = async (cmd: string): Promise<string | undefined> => {
+      try {
+        const r = await shellEntry(cmd, store, timeoutMs, false, {}, { store });
+        return r.code === 0 ? undefined : `${cmd} (${r.code}): ${(r.stderr || r.stdout).trim()}`;
+      } catch (error) { return `${cmd}: ${String(error)}`; }
+    };
+    await run(`git worktree remove --force ${shq(dir)}`); // best-effort; the steps below decide
+    const steps = [`rm -rf ${shq(dir)}`, "git worktree prune"];
+    if (branch) {
+      const ref = shq(`refs/heads/${branch.name}`);
+      steps.push(branch.prior ? `git update-ref ${ref} ${shq(branch.prior)}` : `git update-ref -d ${ref}`);
+    }
+    const out: string[] = [];
+    for (const cmd of steps) { const f = await run(cmd); if (f) out.push(f); }
+    return out;
+  });
+  if (failed.length) throw new Error(`cleanup of ${dir} through ${store} failed: ${failed.join("; ")}`);
 }
 
 const NPM_DEPENDENCY_MANIFESTS = ["package.json", "package-lock.json", "npm-shrinkwrap.json"];
@@ -769,7 +869,10 @@ export async function createWorktree(repo: string, branch: string, baseRef: stri
   branch = await resolveTaskBranch(repo, branch);
   const dir = join(tickmarkrDir(repo), WORKTREES_DIR, sanitize(branch));
   if (existsSync(dir)) await removeWorktree(repo, dir);
-  await shGitOk(`git worktree add -B ${shq(branch)} ${shq(dir)} ${shq(baseRef)}`, repo);
+  // the worktree capability: a branch add, whose symbolic HEAD keeps the ref-store pin (see OwnGitCapability); a raced
+  // add is rolled back, its branch restored to the value read here or deleted when it is new
+  const prior = (await shGit(`git rev-parse --verify -q ${shq(`refs/heads/${branch}`)}`, repo)).stdout.trim() || undefined;
+  await shGitOk(`git worktree add -B ${shq(branch)} ${shq(dir)} ${shq(baseRef)}`, repo, { createsWorktree: "branch", rollback: { dir, branch: { name: branch, prior } } });
   linkNodeModules(repo, dir);
   return dir;
 }
@@ -988,10 +1091,10 @@ export async function changeRepresented(cwd: string, commit: string, dest = "HEA
   return tree.code === 0 && merged.stdout.split("\n")[0]!.trim() === tree.stdout.trim();
 }
 
+// v2.6.8 T2: through the trusted common directory derived once from `repo`'s layout, never `repo`'s mutable commondir,
+// so a checkout is removed even while that commondir stays hostile (see dropWorktree)
 export async function removeWorktree(repo: string, dir: string): Promise<void> {
-  await shGit(`git worktree remove --force ${shq(dir)}`, repo); // best-effort; stale dirs are re-added with -B
-  await shGit(`rm -rf ${shq(dir)}`, repo);
-  await shGit("git worktree prune", repo);
+  await dropWorktree(trustedCommonDir(repo), { dir });
 }
 
 export const REFS_PREFLIGHT_PREFIX = "refs/tickmarkr/preflight";

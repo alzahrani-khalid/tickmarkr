@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { existsSync, linkSync, mkdirSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmdirSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
@@ -85,18 +86,21 @@ export class OrcaError extends Error {
   readonly code?: string;
   readonly runtimeId?: string;
   readonly launchCause?: SeatLaunchCause;
+  /** v2.6.8 T1: the CLI was killed at the timeout it was handed — the one evidence that a deadline interrupted it. */
+  readonly timedOut?: boolean;
 
   constructor(
     readonly family: string,
     readonly reason: string,
     readonly raw: string,
-    opts: { code?: string; runtimeId?: string; launchCause?: SeatLaunchCause } = {},
+    opts: { code?: string; runtimeId?: string; launchCause?: SeatLaunchCause; timedOut?: boolean } = {},
   ) {
     super(`orca ${family} failed — ${reason}; raw response:\n${raw}`);
     this.name = "OrcaError";
     this.code = opts.code;
     this.runtimeId = opts.runtimeId;
     this.launchCause = opts.launchCause;
+    this.timedOut = opts.timedOut;
   }
 }
 
@@ -234,7 +238,9 @@ export const CHECKOUT_MARK = "TICKMARKR_CHECKOUT";
 // carries no whitespace or quotes, survives renderer wrapping (hex rows re-join losslessly), and is
 // either complete (length matches, terminator present) or nothing. A prefix of another checkout can
 // never decode to this one; `A` versus `A B`, `…--T1` versus `…--T10` are different frames.
-const CHECKOUT_FRAME_RE = /TICKMARKR_CHECKOUT (\d+):([0-9a-f]*)(;?)/g;
+// v2.6.8 T1: the header separator is optional — a terminal that wraps the frame AT it leaves the space
+// at a row edge, where joinWrapped trims it — so where the frame wraps never decides what it is.
+const CHECKOUT_FRAME_RE = /TICKMARKR_CHECKOUT ?(\d+):([0-9a-f]*)(;?)/g;
 const PROOF_PAGES = 16; // pages read from the oldest cursor before the proof is declared absent
 // E1: the ceiling for the wrapper shell's startup proof. A loaded host can print a review seat's proof
 // long after the old 2 s window closed (the window a healthy seat was retired on); a proof first
@@ -247,12 +253,15 @@ const CHECKOUT_PROOF_TIMEOUT_MS = 20_000;
 const MARK_TRACE = CHECKOUT_MARK.slice(0, CHECKOUT_MARK.indexOf("_") + 2);
 
 /** E1: the one typed launch cause a driver attaches to its launch failure. `checkout-proof-timeout`
- *  means the terminal printed NO proof frame by the ceiling — a slow host, not a misplaced seat. A
- *  foreign or malformed frame is placement evidence and carries no cause (never a timeout exemption). */
+ *  means the terminal printed NO proof frame by the ceiling — or (v2.6.8 T1) a read the ceiling
+ *  interrupted left the own frame's prefix unfinished — a slow host, not a misplaced seat. A complete
+ *  foreign frame, or a malformed one read whole (in a page landing late or at the ceiling too), is
+ *  placement evidence and carries no cause. */
 export type SeatLaunchCause = "checkout-proof-timeout";
 
-/** One read of a terminal's checkout proof; `seen` is its typed-timeout evidence (checkoutProven). */
-interface CheckoutProof { proven: boolean; reason: string; seen?: "absent" | "misplaced" | "unread" }
+/** One read of a terminal's checkout proof; `seen` is its typed-timeout evidence (checkoutProven).
+ *  `cut`: the ceiling cut the read with an incomplete frame in it — unread, and the typed timeout. */
+interface CheckoutProof { proven: boolean; reason: string; seen?: "absent" | "misplaced" | "unread" | "cut" }
 
 /** E1: placement evidence in text actually read — a complete frame naming another checkout, a cut
  *  frame, or a mark the frame grammar cannot parse (more mark traces than frames). It denies the
@@ -262,8 +271,111 @@ interface CheckoutProof { proven: boolean; reason: string; seen?: "absent" | "mi
 function misplacedProof(text: string, checkout: string): boolean {
   const { complete, incomplete } = checkoutFrames(text);
   const joined = joinWrapped(text);
+  const frames = [...joined.matchAll(CHECKOUT_FRAME_RE)];
   return incomplete || complete.some((c) => c !== checkout)
-    || joined.split(MARK_TRACE).length - 1 > [...joined.matchAll(CHECKOUT_FRAME_RE)].length;
+    || joined.split(MARK_TRACE).length - 1 > frames.length || danglingMarkRow(text, joined, frames);
+}
+
+/** v2.6.8 T1: a row that is only a mark prefix too short to carry MARK_TRACE (`T` … `TICKMARKR_`) — the
+ *  same partial frame ceilingCutFrame types as a cut — is placement evidence unless the rejoined text
+ *  continues it into the mark there, or it lies inside a frame a wrap split (`…CHECKOU` | `T` | ` 40:…;`).
+ *  ponytail: a long line whose last wrapped row is just `T` refuses too; fail-closed costs a relaunch. */
+function danglingMarkRow(text: string, joined: string, frames: RegExpMatchArray[]): boolean {
+  let at = 0;
+  for (const row of text.split("\n").map(joinWrapped)) {
+    const start = at;
+    at += row.length;
+    if (row.length === 0 || row.length >= MARK_TRACE.length || !MARK_TRACE.startsWith(row)) continue;
+    if (joined.startsWith(MARK_TRACE, start)) continue;
+    if (!frames.some((m) => m.index! < start && start < m.index! + m[0].length)) return true;
+  }
+  return false;
+}
+
+/** v2.6.8 T1: is `fragment` (rows rejoined) a strict prefix of the OWN proof frame `own` — the frame the
+ *  unread rows could still complete into the proof? The separator is optional exactly as in
+ *  CHECKOUT_FRAME_RE. A prefix no continuation can make the own frame (`TICKMARKR_CHECKOUT 1:ff`, a foreign
+ *  length or hex) is placement evidence whatever the unread rows hold — never a cut. */
+function framePrefix(fragment: string, own: string): boolean {
+  return fragment.length > 0 && [own, own.replace(" ", "")].some((frame) => fragment.length < frame.length && frame.startsWith(fragment));
+}
+
+/** v2.6.8 T1: the evidence that paging left a frame unread — the paged text ENDS in a strict prefix of
+ *  the own frame (cutFrameRow), and nothing read before it — the pages' reading of a position or the anchor's —
+ *  nor the anchor's rows past it, is placement evidence. A malformed marker read whole is never a prefix,
+ *  so it stays a placement refusal. A row that merely continues the cut frame (`TICKMARKR_CHECKOU`, then
+ *  `T`) is never taken for a new frame.
+ *  ponytail: the typed command's echo cut exactly after its `TICKMARKR` printf argument reads the same,
+ *  and so does a last row that merely reads `T`; either way the proof line is unread at the ceiling. */
+function ceilingCutFrame(pages: ProofSpan, tail: ProofSpan, checkout: string): boolean {
+  const k = cutFrameRow(pages.rows, checkoutProofLine(checkout));
+  if (k === undefined) return false;
+  // The anchor's rows past the pages' last position are the cut frame's continuation (`…CHECKOU` | `T` |
+  // ` 40:…;`), read after it; an anchor past a gap, or at an unknown position, stands alone and must read
+  // clean.
+  const beyond = tailBeyond(pages, tail), cut = pages.rows.slice(k);
+  const continued = beyond === undefined ? !misplacedProof(tail.rows.join("\n"), checkout)
+    : beyond.length === 0 || !misplacedProof([...cut, ...beyond].join("\n"), checkout);
+  if (!continued || misplacedProof(pages.rows.slice(0, k).join("\n"), checkout)) return false;
+  if (beyond === undefined) return true;
+  // An anchor sharing positions with the pages is a SECOND reading of those rows, read WHOLE before them:
+  // it is classified in place and whole — only the pages' own cut rows past it are dropped — so a foreign,
+  // malformed or unterminated mark the anchor read where a later page read harmless text or the cut frame
+  // is never forgotten, and a trailing prefix in the anchor's own reading never inherits the pages' cut.
+  const from = tail.at! - pages.at!, ownEnd = Math.max(0, from + tail.rows.length);
+  const anchored = [...pages.rows.slice(0, Math.max(0, from)), ...tail.rows, ...pages.rows.slice(ownEnd, Math.max(k, ownEnd))];
+  return !misplacedProof(anchored.join("\n"), checkout);
+}
+
+/** v2.6.8 T1: the row a trailing strict prefix of the own frame starts at, or undefined. A frame starts its own row
+ *  and the terminal may wrap it anywhere, so rows are rejoined first and the cut frame is the LONGEST run
+ *  of trailing rows that rejoins into a prefix; only the trailing frame-alphabet run can hold it. */
+function cutFrameRow(rows: string[], own: string): number | undefined {
+  const joinedRows = rows.map(joinWrapped), joined = joinedRows.join("");
+  let run = joined.length;
+  while (run > 0 && /[A-Z0-9a-f_ :]/.test(joined[run - 1]!)) run--;
+  for (let k = 0, at = 0; k < rows.length; at += joinedRows[k]!.length, k++) {
+    if (joinedRows[k] && at >= run && framePrefix(joined.slice(at), own)) return k;
+  }
+  return undefined;
+}
+
+/** v2.6.8 T1: rows read in ONE response, in order; `at` is the first row's scrollback line position when
+ *  the response's own cursors say it (line-indexed, C2), else undefined. A row is identified by its
+ *  position, never by its text; a row that is not a string is kept as UNREADABLE_ROW. */
+interface ProofSpan { rows: string[]; at?: number }
+/** A row the read returned but that is not text: kept in its position so it never joins its neighbours. */
+const UNREADABLE_ROW = "�";
+function linePosition(cursor: unknown): number | undefined {
+  return typeof cursor === "string" && /^\d+$/.test(cursor) ? Number(cursor) : undefined;
+}
+
+/** v2.6.8 T1: the anchor's rows past the pages, by ROW IDENTITY — scrollback position, never text: none when
+ *  the anchor lies inside the pages (the scrollback may have grown between the reads), the rest when it
+ *  overlaps or abuts their end, undefined when a gap separates them or either position is unknown. */
+function tailBeyond(pages: ProofSpan, tail: ProofSpan): string[] | undefined {
+  if (pages.at === undefined || tail.at === undefined) return undefined;
+  const end = pages.at + pages.rows.length;
+  if (tail.at > end || tail.at + tail.rows.length < pages.at) return undefined;
+  return tail.rows.slice(Math.max(0, end - tail.at));
+}
+
+/** v2.6.8 T1: the anchor read in place among the paged rows: the pages' rows before its position, every one
+ *  of its own rows, then the pages' rows after it. An anchor sharing or abutting no position with the
+ *  pages, or at an unknown one, stands alone (fail-closed). The pages' own reading is classified too. */
+function tailInContext(pages: ProofSpan, tail: ProofSpan): string {
+  if (tailBeyond(pages, tail) === undefined) return tail.rows.join("\n");
+  const from = tail.at! - pages.at!;
+  return [...pages.rows.slice(0, Math.max(0, from)), ...tail.rows, ...pages.rows.slice(Math.max(0, from + tail.rows.length))].join("\n");
+}
+
+/** v2.6.8 T1: the caller's live launch check, consulted by create at its actual submission — after the runtime
+ *  and worktree lookups it awaits, the last moment before a terminal is launched. A throwing guard withdraws
+ *  the launch (nothing is created) and its error is the launch failure. Async-scoped, so it reaches create
+ *  through every driver wrapper that forwards run. */
+const launchGuards = new AsyncLocalStorage<() => void>();
+export function withLaunchGuard<T>(guard: () => void, run: () => Promise<T>): Promise<T> {
+  return launchGuards.run(guard, run);
 }
 
 /** The exact bytes the create command prints as its first line. */
@@ -291,8 +403,8 @@ export function checkoutFrames(text: string): { complete: string[]; incomplete: 
  *  frame names anything else, and no frame is incomplete. Full-path equality after canonicalization —
  *  never a prefix, a substring, or a whitespace-terminated fragment. */
 export function provesCheckout(text: string, checkout: string): boolean {
-  const { complete, incomplete } = checkoutFrames(text);
-  return !incomplete && complete.includes(checkout) && complete.every((c) => c === checkout);
+  // v2.6.8 T1: a malformed mark the frame grammar cannot parse is placement evidence too (misplacedProof).
+  return checkoutFrames(text).complete.includes(checkout) && !misplacedProof(text, checkout);
 }
 
 /**
@@ -816,6 +928,7 @@ export class OrcaDriver implements ExecutorDriver {
         family,
         `orca CLI exited ${r.code}${r.timedOut ? " after timeout" : ""}`,
         raw,
+        r.timedOut === true ? { timedOut: true } : {},
       );
     }
     return parseEnvelope(family, r.stdout, raw);
@@ -963,6 +1076,7 @@ export class OrcaDriver implements ExecutorDriver {
     // into the checkout, because Orca cannot be asked to place a terminal in a path it does not
     // track (OBS-1004). Shell startup can swallow that prefix; prove it from scrollback below.
     const payload = `export ${FORK_CAP_ENV}=${shq(process.env[FORK_CAP_ENV] ?? resolvedForkCap())}; ${cmd}`;
+    launchGuards.getStore()?.(); // v2.6.8 T1: eligibility is re-read here, after every awaited lookup above
     const env = await this.call("create", [
       "terminal", "create", "--worktree", `path:${tracked}`, "--title", st.title, "--command", inCheckout(st.cwd, payload),
     ], this.cliCwd(st));
@@ -994,7 +1108,9 @@ export class OrcaDriver implements ExecutorDriver {
     let misplaced: CheckoutProof | undefined, unread: CheckoutProof | undefined;
     let proof = await this.checkoutProven(handle, st.cwd, this.cliCwd(st), env.runtimeId, deadline);
     for (;;) {
-      if (proof.proven) break;
+      // v2.6.8 T1: placement evidence is sticky — a later poll whose scrollback no longer shows the
+      // foreign, malformed or partial mark an earlier one read never turns it into proof.
+      if (proof.proven && misplaced === undefined) break;
       if (proof.seen === "misplaced") misplaced = proof;
       else if (proof.seen === "unread") unread = proof;
       const left = deadline - this.time.now();
@@ -1003,15 +1119,16 @@ export class OrcaDriver implements ExecutorDriver {
       if (this.time.now() >= deadline) break;
       proof = await this.checkoutProven(handle, st.cwd, this.cliCwd(st), env.runtimeId, deadline);
     }
-    if (!proof.proven) {
+    if (!proof.proven || misplaced !== undefined) {
       try {
         await this.closeTerminal({ ...st, handle, runtimeId: env.runtimeId });
       } catch { /* best effort under the answering runtime; the latch prevents another launch */ }
       // The typed timeout only when EVERY poll read its whole scrollback inside the ceiling and found no
-      // trace of the mark; one misplaced or unread poll anywhere in the window denies it.
+      // trace of the mark — or the ceiling cut the last one mid-frame; one misplaced or unread poll
+      // anywhere in the window denies it.
       const evidence = misplaced ?? unread ?? proof;
       throw this.latched("create", st, `terminal ${handle} does not prove checkout ${st.cwd} within ${CHECKOUT_PROOF_TIMEOUT_MS} ms (${evidence.reason})`,
-        env.raw, evidence.seen === "absent" ? "checkout-proof-timeout" : undefined);
+        env.raw, evidence.seen === "absent" || evidence.seen === "cut" ? "checkout-proof-timeout" : undefined);
     }
     st.handle = handle;
     // The handle is bound to the runtime identity that ANSWERED its create.
@@ -1135,12 +1252,14 @@ export class OrcaDriver implements ExecutorDriver {
    * the terminal record must name `handle` and `_meta.runtimeId` must be `runtimeId` — the runtime
    * that supplied the ownership listing — else another terminal's or another runtime's bytes were
    * answered and nothing is proven. Proven means provesCheckout: exact canonical full-path equality
-   * of a complete frame, no other checkout named, no incomplete frame.
+   * of a complete frame, no other checkout named, no incomplete frame or unparseable mark — in the pages
+   * or the anchor's tail (v2.6.8 T1).
    * E1: with a `deadline` (create's window) there is ONE absolute deadline: a read is issued only while
    * budget is left and is handed exactly that budget, and a page that still lands past it is late —
    * nothing late proves the checkout. `seen` is what the scrollback showed, for the typed timeout:
    * `misplaced` — a frame naming another checkout, a cut frame or an unparseable mark in anything read
-   * (the anchor's tail and every page included, even when paging stopped or a later read threw);
+   * (the anchor's tail and every page included, even when paging stopped, a later read threw or the page's
+   * own cursors were malformed — v2.6.8 T1; the tail read after the pages it overlaps, tailInContext);
    * `absent` — ONLY when every page down to the start of the scrollback was read before the ceiling
    * and none carries a trace of the mark; `unread` — every other exit: PROOF_PAGES reached, a limited
    * read with no (or the same) next cursor or a truncated anchor without one, a read that threw, a read
@@ -1156,16 +1275,22 @@ export class OrcaDriver implements ExecutorDriver {
     // F (D-832): a page read whose own metadata does not say how complete it is (classifyProofPage):
     // its bytes are evidence, but the scrollback it came from is not known to be read whole.
     let late = false, unknown = false;
-    const page = async (cursor?: string): Promise<{ term: Record<string, unknown>; text: string; kind: ReturnType<typeof classifyProofPage> } | undefined> => {
+    // v2.6.8 T1: `keep` takes every row a bound read returned, at its position, the moment it is read —
+    // BEFORE any row type, cursor or overlap validation can discard it: a bound page whose cursor metadata
+    // is malformed, or that carries a non-string row, is still evidence of every row it shows.
+    const page = async (keep: (span: ProofSpan) => void, cursor?: string): Promise<{ term: Record<string, unknown>; kind: ReturnType<typeof classifyProofPage> } | undefined> => {
       const budget = deadline === undefined ? undefined : deadline - this.time.now();
-      if (budget !== undefined && budget <= 0) return undefined; // no budget left: the read is never issued
+      if (budget !== undefined && budget <= 0) return undefined; // no budget left: the read is never issued (the anchor only)
       let env: OrcaEnvelope;
       try {
         env = await this.call("read", [
           "terminal", "read", "--terminal", handle, ...(cursor === undefined ? [] : ["--cursor", cursor]), "--limit", String(this.pageLines),
         ], from, budget);
       } catch (error) {
-        if (deadline === undefined || this.time.now() < deadline) throw error;
+        // v2.6.8 T1: only a read the ceiling actually INTERRUPTED — killed at the budget it was handed — is
+        // the cut. A read that failed for any other reason (a nonzero exit, unparseable output, an invocation
+        // exception) keeps its own failure at every arrival time, at or past the ceiling included.
+        if (deadline === undefined || !(error instanceof OrcaError && error.timedOut === true)) throw error;
         return undefined; // the read the ceiling cut off: unread
       }
       if (deadline !== undefined && this.time.now() > deadline) late = true;
@@ -1179,6 +1304,16 @@ export class OrcaDriver implements ExecutorDriver {
       // E1: only a well-formed page is read text. A tail that is missing, not an array or carries a
       // non-string row (tailText), or a cursor that is not a non-empty string is a malformed page: it
       // throws, so it is unread output — never filtered to an empty page that would read as an absent proof.
+      // v2.6.8 T1: the tail's rows are kept first — a non-string row as UNREADABLE_ROW in its place — so
+      // neither a malformed cursor nor a malformed row discards the foreign, malformed or partial mark the
+      // rest show: that evidence stays sticky for the whole create window. A cursor page's rows start at
+      // its cursor; the anchor's end at its nextCursor (an impossible or unknown position stays unknown).
+      if (Array.isArray(term.tail)) {
+        const rows = term.tail.map((row: unknown) => typeof row === "string" ? row : UNREADABLE_ROW);
+        const at = cursor === undefined ? (linePosition(term.nextCursor) ?? -1) - rows.length : linePosition(cursor);
+        keep({ rows, ...(at !== undefined && at >= 0 ? { at } : {}) });
+      }
+      this.tailText("read", term, env.raw);
       for (const key of ["oldestCursor", "nextCursor"]) {
         if (term[key] !== undefined && str(term[key]) === undefined) throw new OrcaError("read", `proof page ${key} is not a cursor`, env.raw);
       }
@@ -1186,50 +1321,72 @@ export class OrcaDriver implements ExecutorDriver {
       // live terminal's stream answers while its screen still paints — and a dead terminal's too. The
       // stream alone cannot tell them apart, so its empty tail is unread scrollback, never absence.
       if (isBlindStreamPage(term)) throw new OrcaError("read", "proof page is a blind stream page (status exited, empty tail): its scrollback is unread", env.raw);
-      const text = this.tailText("read", term, env.raw);
       // F: paging flags missing, not boolean or contradicted by the cursors leave the page's bytes read
       // but its completeness unknown — it ends paging, and the poll can never read as absent.
       const kind = classifyProofPage(term);
       if (kind === "unread") unknown = true;
-      return { term, text, kind };
+      return { term, kind };
     };
     // Every validated read is evidence, whatever stops the next one: the anchor's tail and the pages
     // read from the oldest cursor are inspected even when paging hits PROOF_PAGES or a read throws.
-    let tail = "", text = "";
-    const described = (why: string): CheckoutProof => {
-      const misplaced = checkout !== undefined && [text, tail].some((t) => misplacedProof(t, checkout));
-      const shown = [text, tail].map(checkoutFrames);
+    // v2.6.8 T1: ONE record of everything read — the anchor's rows and the pages' rows, each row once at
+    // its position. `pages` keeps a position only while every page starts where the rows before it end.
+    let tail: ProofSpan = { rows: [] }, pages: ProofSpan = { rows: [] }, pagedEnd: number | undefined;
+    const text = () => pages.rows.join("\n");
+    // `cut`: the ceiling stopped this read. A frame it left incomplete at the end of the paged text is
+    // the cut, not the terminal's misprint — unread, typed as the timeout — unless anything else read
+    // (a complete foreign frame, a malformed marker read whole) is placement evidence (ceilingCutFrame).
+    const described = (why: string, cut = false): CheckoutProof => {
+      const after = tailInContext(pages, tail);
+      const misplaced = checkout !== undefined && [text(), after].some((t) => misplacedProof(t, checkout));
+      const shown = [text(), after].map(checkoutFrames);
       const named = [...new Set(shown.flatMap((f) => f.complete))];
-      const flaw = shown.some((f) => f.incomplete) ? " and carries an incomplete proof frame"
-        : misplaced && named.length === 0 ? " and carries a malformed proof marker" : "";
+      const ceilingCut = cut && checkout !== undefined && ceilingCutFrame(pages, tail, checkout);
+      const flaw = ceilingCut ? " and carries a proof frame the ceiling cut off before it was read whole"
+        : shown.some((f) => f.incomplete) ? " and carries an incomplete proof frame"
+        : misplaced && named.every((c) => c === checkout) ? " and carries a malformed proof marker" : "";
       return {
         proven: false,
         reason: `${why}its scrollback ${named.length ? `names ${named.join(", ")}` : "names no checkout"}${flaw}`,
-        ...(misplaced ? { seen: "misplaced" as const } : {}),
+        ...(ceilingCut ? { seen: "cut" as const } : misplaced ? { seen: "misplaced" as const } : {}),
       };
     };
     try {
-      const first = await page();
+      const first = await page((read) => { tail = read; });
       if (first === undefined) return { proven: false, reason: "the ceiling cut off the proof read before any scrollback was read", seen: "unread" };
       const anchor = first.term;
-      tail = first.text;
       let cursor = str(anchor.oldestCursor);
       // why paging ended with scrollback still unread. Every exit is one of: complete (an anchor that
       // is the whole scrollback, or a page whose metadata says it is the last), whole frames found, a
       // page whose completeness is unknown (`unknown`, classifyProofPage), or one of these.
-      let stop: "cut" | "exhausted" | "stalled" | undefined;
+      // `spent`: a whole page landed exactly AT the ceiling, so no budget is left for the next read — paging
+      // ended with scrollback unread, but no read was cut.
+      let stop: "cut" | "spent" | "exhausted" | "stalled" | undefined;
       if (cursor === undefined) {
-        text = tail;
+        pages = tail; // the anchor is the whole read: the same rows, read once
         // A cursorless anchor that says it holds less than the scrollback leaves the rest unreadable.
         if (first.kind === "partial") stop = "stalled";
       }
       for (let n = 0; cursor !== undefined; n++) {
         if (n === PROOF_PAGES) { stop = "exhausted"; break; } // more scrollback than the bound: unread, not absent
-        const got = late ? undefined : await page(cursor);
-        if (got === undefined) { stop = "cut"; break; }
+        // v2.6.8 T1: lateness ends paging but never CUTS a read — a page returned whole, whether it landed
+        // past the ceiling (`late`) or exactly at it (`spent`: the next read is never issued), keeps its rows
+        // (an unterminated or malformed marker included) as placement evidence; only a read the ceiling
+        // actually INTERRUPTED below is `cut` (described's typed-timeout exemption).
+        if (late) break;
+        if (deadline !== undefined && this.time.now() >= deadline) { stop = "spent"; break; }
+        const got = await page((read) => {
+          // Pages join by POSITION, never by bytes: a page that does not start where the rows before it end — a
+          // gap, an overlap or an unknown position — is set apart by UNREADABLE_ROW, so no frame bridges rows
+          // it never read beside.
+          const contiguous = n === 0 || (pagedEnd !== undefined && read.at === pagedEnd);
+          pages = { rows: [...pages.rows, ...(contiguous ? [] : [UNREADABLE_ROW]), ...read.rows],
+            ...(n === 0 ? { at: read.at } : contiguous && pages.at !== undefined ? { at: pages.at } : {}) };
+          pagedEnd = read.at === undefined ? undefined : read.at + read.rows.length;
+        }, cursor);
+        if (got === undefined) { stop = "cut"; break; } // issued with budget left, interrupted by the ceiling
         const term = got.term;
-        text += `${got.text}\n`;
-        const frames = checkoutFrames(text);
+        const frames = checkoutFrames(text());
         if (frames.complete.length > 0 && !frames.incomplete) break; // whole frames, nothing dangling
         if (got.kind === "complete") break; // the last page: the scrollback was read to its end
         const next = str(term.nextCursor);
@@ -1246,27 +1403,32 @@ export class OrcaDriver implements ExecutorDriver {
         if (term.limited !== true || !advancing) { stop = "stalled"; break; }
         cursor = next;
       }
-      const frames = checkoutFrames(text);
       // Reconcile has no task-checkout path after a daemon restart, but the proof itself remains
       // an ownership record: exactly one complete, unambiguous checkout frame can only have been
       // written by tickmarkr's create command.  Slot recovery additionally requires its exact path.
-      // A stalled read proves only what it read, as before; a cut or exhausted one proves nothing.
-      const proven = stop !== "cut" && stop !== "exhausted" && (checkout === undefined
-        ? !frames.incomplete && frames.complete.length > 0 && new Set(frames.complete).size === 1
-        : provesCheckout(text, checkout));
+      // A stalled read proves only what it read, as before; a cut, spent or exhausted one proves nothing.
+      // v2.6.8 T1: proof is classified over EVERYTHING read — the pages and the anchor's tail, which
+      // may hold rows paging stopped short of. A foreign, incomplete or malformed mark in either
+      // (misplacedProof) contradicts the proof: refused, never accepted beside a matching frame.
+      const own = checkout ?? checkoutFrames(text()).complete[0];
+      const proven = (stop === undefined || stop === "stalled") && own !== undefined
+        && provesCheckout(text(), own) && !misplacedProof(tailInContext(pages, tail), own);
       if (proven && !late) return { proven: true, reason: "" };
       const why = `${late ? "read past the ceiling, " : ""}${stop === "cut" ? "the ceiling cut off paging, "
+        : stop === "spent" ? "a page landed at the ceiling with scrollback unread, "
         : stop === "exhausted" ? `paging stopped at ${PROOF_PAGES} pages with scrollback unread, `
         : stop === "stalled" ? "a limited read gave no next cursor with scrollback unread, " : ""}${
         unknown ? "a page carried missing, non-boolean or contradictory paging metadata, " : ""}`;
-      const read = described(why);
+      // Only a read the ceiling actually cut short leaves a frame unread; a page that landed late or at the
+      // ceiling was still returned whole, so a prefix it ends in is a misprint read whole, never the typed timeout.
+      const read = described(why, stop === "cut");
       // F: absent only when every page read said, explicitly and consistently, how complete it was.
       return { ...read, seen: read.seen ?? (stop || late || unknown ? "unread" : "absent") };
     } catch (error) {
       // A read that failed midway keeps what was already read as evidence; what it could not read is
       // unread output — never an absent proof.
       const read = described(""), failed = error instanceof Error ? error.message : String(error);
-      return { ...read, reason: tail || text ? `${read.reason}; then a read failed — ${failed}` : failed, seen: read.seen ?? "unread" };
+      return { ...read, reason: tail.rows.length + pages.rows.length > 0 ? `${read.reason}; then a read failed — ${failed}` : failed, seen: read.seen ?? "unread" };
     }
   }
 

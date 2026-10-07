@@ -59,9 +59,9 @@ test("Leg-2 (OBS-1052): a seat with no verdict on rounds 1 and 2 is absent from 
   expect(t3Review.map((e) => [e.data.reviewer, e.data.reviewRetry])).toEqual([["seat-b:seat-b", undefined]]);
 }, 90_000);
 
-// T14 (OBS-1150) reverses this test's v2.5.9 ending: a later engagement without a reason no longer
-// inherits nothing — every earlier reason is a standing ruling and rides on, oldest first.
-test("test: the daemon passes every standing approval reason oldest first into the released attempt's review rounds, reviewer failovers and its no worker recheck brief, and a later engagement without a reason still carries them, so a scan after the current dispatch that loses a reason fails", async () => {
+// v2.6.8 T7 reverses T14's review half (OBS-1150): every reason stays a standing ruling for the repair
+// worker, and none of them reaches a reviewer — the review grades the diff, never the operator's reason.
+test("test: the daemon keeps every approval reason out of the released attempt's review rounds, reviewer failovers, its no worker recheck brief and a later engagement's rounds, so a reason reaching any review brief fails", async () => {
   const { repo, fake, scriptPath } = setupRepo(
     [T("T1", { ...pin, humanGate: true, files: ["t1.txt"], gates: ["build", "test", "lint", "evidence", "scope", "review"] })],
     { tasks: { T1: [
@@ -77,7 +77,7 @@ test("test: the daemon passes every standing approval reason oldest first into t
   let green = false;
   let steadyRounds = 0;
   // Move the tip after the daemon captures its gated commit. A green first review then
-  // forces another round of the SAME dispatch, which must retain the bound reason.
+  // forces another round of the SAME dispatch, which must still carry no reason.
   class MovingTipDriver extends SubprocessDriver {
     taskTree = "";
     moved = false;
@@ -121,9 +121,9 @@ test("test: the daemon passes every standing approval reason oldest first into t
   expect(briefs.map((b) => b.seat)).toEqual(["seat-a", "seat-b", "seat-c", "seat-c"]);
   expect(journal().read().filter((e) => e.event === "tip-moved")).toHaveLength(1);
   for (const brief of briefs) {
-    expect(brief.dispatches).toBe(1); // The binding survives its dispatch row landing.
-    expect(brief.text).toContain(`## Operator context\n`);
-    expect(brief.text).toContain(reason);
+    expect(brief.dispatches).toBe(1);
+    expect(brief.text).not.toContain(`## Operator context`);
+    expect(brief.text).not.toContain(reason);
     expect(brief.text).not.toContain("Superseded operator reason");
   }
   expect(journal().read().filter((e) => e.event === "review-no-verdict")).toHaveLength(2);
@@ -137,7 +137,8 @@ test("test: the daemon passes every standing approval reason oldest first into t
   expect(recheckRows.filter((e) => ["task-dispatch", "worker-launch"].includes(e.event))).toEqual([]);
   expect(briefs.length).toBeGreaterThan(recheckBriefStart);
   for (const brief of briefs.slice(recheckBriefStart)) {
-    expect(brief.text).toContain(`- ${reason}\n- ${recheckReason}\n`);
+    expect(brief.text).not.toContain(reason);
+    expect(brief.text).not.toContain(recheckReason);
   }
   green = true;
   const laterStart = briefs.length;
@@ -146,10 +147,10 @@ test("test: the daemon passes every standing approval reason oldest first into t
   expect(briefs.length).toBeGreaterThan(laterStart);
   for (const brief of briefs.slice(laterStart)) {
     expect(brief.dispatches).toBe(2);
-    expect(brief.text).toContain(`## Operator context\nContext only: this never substitutes for an acceptance criterion or closes a prior material.\n- ${reason}\n- ${recheckReason}\n`);
-    expect(brief.text).not.toContain("Superseded operator reason");
+    expect(brief.text).not.toContain(`## Operator context`);
+    for (const ruling of [reason, recheckReason, "Superseded operator reason"]) expect(brief.text).not.toContain(ruling);
   }
-  // Saved briefs must carry the same context as the actual adapter delivery.
+  // Saved briefs must match the actual adapter delivery.
   const saved = journal().read().filter((e) => e.event === "gate-result" && e.data.gate === "review" && e.data.briefPath);
   expect(saved.length).toBeGreaterThanOrEqual(3);
   for (const row of saved) {
@@ -159,8 +160,9 @@ test("test: the daemon passes every standing approval reason oldest first into t
 }, 90_000);
 
 // OBS-1150: an approval reason is a standing ruling on the task. Ruling A is spent by no launch, and a
-// waive's gate-satisfied boilerplate neither joins the rulings nor retires one.
-test("test: production worker and review briefs retain A before B after an intervening launch across resume versus ignoring gate-satisfied boilerplate, so losing the standing A ruling fails", async () => {
+// waive's gate-satisfied boilerplate neither joins the rulings nor retires one. v2.6.8 T7: the rulings
+// are the worker's; no review brief carries them.
+test("test: production worker briefs retain A before B after an intervening launch across resume while review briefs carry neither, versus ignoring gate-satisfied boilerplate, so losing the standing A ruling fails", async () => {
   const red = "test ! -f red.txt || { echo 'AssertionError: expected red.txt to be absent'; exit 1; }";
   const { repo, fake, scriptPath } = setupRepo(
     [T("T1", { ...pin, humanGate: true, files: ["t1.txt", "red.txt"], gates: ["build", "test", "lint", "evidence", "scope", "review"] })],
@@ -194,7 +196,6 @@ test("test: production worker and review briefs retain A before B after an inter
   const journal = () => Journal.open(repo, runId);
   const resume = () => runDaemon(repo, { adapters, runId, resume: true });
   const [A, B, W] = ["Ruling A: keep the explicit selection.", "Ruling B: t1.txt must read three.", "Gate satisfied: operator accepts the red test."];
-  const operatorContext = (brief: string) => brief.slice(brief.indexOf("## Operator context\n"), brief.indexOf("\n\n## Diff"));
   const inOrder = (brief: string, ...rows: string[]) => rows.map((row) => brief.indexOf(row)).every((at, i, all) => at >= 0 && (i === 0 || at > all[i - 1]!));
 
   expect((await runDaemon(repo, { adapters, runId })).human).toEqual(["T1"]);
@@ -218,12 +219,11 @@ test("test: production worker and review briefs retain A before B after an inter
     .toEqual([undefined, "review-upheld", "gate-satisfied"]);
   // one under A alone, one each reviewing launches 2 and 3 before their full jobs, one after the waive released the red test
   expect(reviewBriefs).toHaveLength(4);
-  expect(operatorContext(reviewBriefs[0]!)).toContain(`- ${A}`);
-  expect(operatorContext(reviewBriefs[0]!)).not.toContain(B);
-  for (const brief of reviewBriefs.slice(1)) {
-    expect(operatorContext(brief)).toBe(`## Operator context\nContext only: this never substitutes for an acceptance criterion or closes a prior material.\n- ${A}\n- ${B}`);
+  for (const brief of reviewBriefs) {
+    expect(brief).not.toContain("## Operator context");
+    for (const ruling of [A, B]) expect(brief).not.toContain(ruling);
   }
-  // The next worker would read the same standing rulings; the waive's reason is in neither brief.
+  // The next worker would read the same standing rulings; the waive's reason is in no brief.
   expect(journaledFailureBrief(journal().read(), "T1")).toEqual([`approval: ${A}`, `approval: ${B}`]);
   for (const brief of [...workerBriefs, ...reviewBriefs]) expect(brief).not.toContain(W);
 }, 180_000);

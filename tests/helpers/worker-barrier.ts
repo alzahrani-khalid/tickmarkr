@@ -4,10 +4,12 @@
 // approval — and remembers which event released it, so the assertion can prove the ordering was
 // event-driven rather than lucky. A barrier never released within its bound exits the worker with a
 // named failure, so a missed release costs one bounded attempt, never a hung suite.
-import { existsSync, writeFileSync } from "node:fs";
+import { existsSync, writeFileSync, writeSync } from "node:fs";
 import { join } from "node:path";
 import { shq } from "../../src/adapters/types.js";
-import { runDaemon } from "../../src/run/daemon.js";
+import { SubprocessDriver } from "../../src/drivers/subprocess.js";
+import type { ExecutorDriver, Slot } from "../../src/drivers/types.js";
+import { runDaemon, type RunSummary } from "../../src/run/daemon.js";
 import { Journal, type JournalEvent } from "../../src/run/journal.js";
 import { COMMIT, makeTestTempDir, setupRepo, T } from "./tmprepo.js";
 
@@ -91,7 +93,11 @@ export function releaseAll(...barriers: WorkerBarrier[]): void {
 export function heldAfterRelease(rows: JournalEvent[], b: WorkerBarrier, held: string, event: string, releasedBy: string): string[] {
   const out: string[] = [];
   const on = b.releasedOn;
-  if (on?.event !== event || on.taskId !== releasedBy) out.push(`${b.name} released by ${on ? `${on.event} ${on.taskId}` : "hand or never"}, not ${event} ${releasedBy}`);
+  if (on?.event !== event || on.taskId !== releasedBy) {
+    // A file written with no journal row is a hand release; a missing file was never released.
+    const how = on ? `${on.event} ${on.taskId ?? ""}`.trim() : b.released ? "hand" : "never";
+    out.push(`${b.name} released by ${how}, not ${event} ${releasedBy}`);
+  }
   const released = releaseIndex(rows, b);
   const result = rows.findLastIndex((e) => e.event === "worker-result" && e.taskId === held);
   if (released < 0 || result <= released) out.push(`${held} worker-result row ${result} is not after ${b.name}'s release row ${released}`);
@@ -186,7 +192,7 @@ export function conflictPair(runId: string, first: string, held: string) {
       ...(rows.some((e) => e.event === "consult-verdict" && e.taskId === held && e.data.action === "human") ? [] : [`${runId}: no human consult verdict for ${held}`]),
     ];
   };
-  return { repo, ...pair, violations };
+  return { repo, fake, ...pair, violations };
 }
 
 /**
@@ -202,4 +208,360 @@ export async function fixtureViolations(mode: "pair" | "hang", runId: string, fi
   const launched: Narrate = (e) => { if (e.event === "worker-launch") process.stdout.write(`\nLAUNCHED ${e.taskId}\n`); };
   await runDaemon(repo, { adapters: [fake], runId, narrate: launched });
   return [`${runId}: the hang fixture settled on its own — its worker was never cut at the bound`];
+}
+
+// SHIP decision: NO-SHIP product cure. v2.6.8 T6 delivers the owned diagnostic only. The unidentified
+// HYG-09 stall still waits in src/run; naming it here is not a claim that the wait is fixed.
+/** Documented diagnostic deadline. Omitted input uses this. Zero, negative, non-integer and non-finite refuse. */
+export const DIAGNOSTIC_DEADLINE_MS = 60_000;
+
+export function diagnosticDeadlineMs(ms?: number): number {
+  if (ms === undefined) return DIAGNOSTIC_DEADLINE_MS;
+  if (typeof ms !== "number" || !Number.isInteger(ms) || ms <= 0) throw new Error(`diagnostic deadline refuses ${String(ms)}`);
+  return ms;
+}
+
+const emit = (line: string) => { writeSync(1, `\n${line}\n`); };
+type Id = "T1" | "T2";
+const otherId = (id: Id): Id => (id === "T1" ? "T2" : "T1");
+
+export interface BarrierRecord {
+  name: string;
+  released: boolean;
+  releasedOn: JournalEvent | null;
+}
+export const barrierRecord = (b: WorkerBarrier): BarrierRecord => ({ name: b.name, released: b.released, releasedOn: b.releasedOn ?? null });
+export function asBarrier(r: BarrierRecord): WorkerBarrier {
+  return {
+    name: r.name, path: "", hold: "",
+    get released() { return r.released; },
+    get releasedOn() { return r.releasedOn ?? undefined; },
+    release() {},
+  };
+}
+
+export interface OrderingProof {
+  repo: string;
+  runId: string;
+  scenario: string;
+  fixture: "hyg09" | "partial" | "resume" | "keep";
+  first: Id;
+  held: Id;
+  deadlineMs: number;
+  hand: boolean;
+  barriers: BarrierRecord[];
+  done: string[];
+  human: string[];
+  firstClose: string | null;
+  workerSlot: Record<string, string | null>;
+  closeCount: Record<string, number>;
+  violations: string[];
+}
+
+/** Release / close / merge oracle for one retained journal. Empty when the member holds. */
+export function orderingOracle(proof: OrderingProof, rows: JournalEvent[]): string[] {
+  const { runId, first, held } = proof;
+  const out: string[] = [];
+  const sawLaunch = (id: string) => rows.some((e) => e.event === "worker-launch" && e.taskId === id);
+  if (proof.fixture === "hyg09") {
+    const b = asBarrier(proof.barriers[0]!);
+    out.push(...heldAfterRelease(rows, b, held, "task-done", first).map((v) => `${runId}: ${v}`));
+    if ([...proof.done].sort().join() !== "T1,T2") out.push(`${runId}: done [${proof.done}], expected [T1,T2]`);
+    if (proof.firstClose !== proof.workerSlot[first]) out.push(`${runId}: first close ${proof.firstClose} is not ${first}'s slot ${proof.workerSlot[first]}`);
+    for (const id of ["T1", "T2"] as const) {
+      if (proof.closeCount[id] !== 1) out.push(`${runId}: ${id} closes ${proof.closeCount[id] ?? 0}`);
+      if (!rows.some((e) => e.event === "task-done" && e.taskId === id)) out.push(`${runId}: journal missing task-done ${id}`);
+      if (!sawLaunch(id)) out.push(`${runId}: journal missing worker-launch ${id}`);
+    }
+    return out;
+  }
+  const ready = asBarrier(proof.barriers[0]!);
+  const loser = asBarrier(proof.barriers[1]!);
+  out.push(...heldAfterRelease(rows, ready, first, "worker-launch", held).map((v) => `${runId}: ${v}`));
+  out.push(...heldAfterRelease(rows, loser, held, "merge", first).map((v) => `${runId}: ${v}`));
+  if (proof.done.join() !== first) out.push(`${runId}: done [${proof.done}], expected [${first}]`);
+  if (proof.human.join() !== held) out.push(`${runId}: human [${proof.human}], expected [${held}]`);
+  const merges = rows.filter((e) => e.event === "merge").map((e) => e.taskId);
+  if (merges.join() !== first) out.push(`${runId}: merges [${merges}], expected [${first}]`);
+  const at = (event: string, taskId: string) => rows.findIndex((e) => e.event === event && e.taskId === taskId);
+  const mergeAt = at("merge", first);
+  if (!(mergeAt >= 0 && mergeAt < at("merge-conflict", held))) out.push(`${runId}: no ${held} merge-conflict after ${first}'s merge`);
+  if (!rows.some((e) => e.event === "consult-verdict" && e.taskId === held && e.data.action === "human")) out.push(`${runId}: no human consult verdict for ${held}`);
+  if (!rows.some((e) => e.event === "task-human" && e.taskId === held)) out.push(`${runId}: journal missing task-human ${held}`);
+  if (!rows.some((e) => e.event === "task-done" && e.taskId === first)) out.push(`${runId}: journal missing task-done ${first}`);
+  if (!sawLaunch(first) || !sawLaunch(held)) out.push(`${runId}: journal missing a worker-launch`);
+  return out;
+}
+
+export interface ScenarioWatch {
+  /** Stop the unref'd timer and return. Never waits for it. True when it already fired. */
+  cancel(): boolean;
+  note(event: JournalEvent): void;
+}
+
+/**
+ * Unref'd watchdog beside one scenario. On expiry it prints the run, the scenario, each task's last
+ * rows and every barrier state, then the expiry line. Normal completion calls cancel and moves on.
+ */
+export function watchScenario(o: {
+  ms?: number;
+  armOn?: { event: string; taskId?: string };
+  runId: string;
+  scenario: string;
+  tasks: readonly string[];
+  barriers: readonly WorkerBarrier[];
+  readRows: () => JournalEvent[];
+  onExpire?: (diagnostic: string) => void;
+}): ScenarioWatch {
+  const ms = diagnosticDeadlineMs(o.ms);
+  let fired = false;
+  let stopped = false;
+  let armed = !o.armOn;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let ceiling: ReturnType<typeof setTimeout> | undefined;
+  const fire = () => {
+    if (fired || stopped) return;
+    fired = true;
+    let rows: JournalEvent[] = [];
+    try { rows = o.readRows(); } catch { /* the print still names the barriers and the missing rows */ }
+    const lines = [
+      `DIAGNOSTIC run=${o.runId} scenario=${o.scenario} deadline=${ms}`,
+      ...o.barriers.map((b) => {
+        const on = b.releasedOn ? ` on ${b.releasedOn.event} ${b.releasedOn.taskId ?? ""}`.trimEnd() : "";
+        return `barrier ${b.name} ${b.released ? "released" : "held"}${on}`;
+      }),
+      ...o.tasks.flatMap((id) => {
+        const launch = rows.findLast((e) => e.event === "worker-launch" && e.taskId === id);
+        return [
+          `task ${id} last: ${lastRows(rows, id).join(" | ") || "(none)"}`,
+          launch ? `worker-launch ${id} ${JSON.stringify(launch.data).slice(0, 160)}` : `worker-launch ${id} absent`,
+        ];
+      }),
+    ];
+    const diagnostic = lines.join("\n");
+    writeSync(1, `\n${diagnostic}\nDIAGNOSTIC_EXPIRED run=${o.runId} scenario=${o.scenario}\n`);
+    o.onExpire?.(diagnostic);
+  };
+  const arm = () => {
+    if (stopped || fired || armed) return;
+    armed = true;
+    if (ceiling) clearTimeout(ceiling);
+    timer = setTimeout(fire, ms);
+    timer.unref();
+  };
+  if (o.armOn) {
+    ceiling = setTimeout(fire, DIAGNOSTIC_DEADLINE_MS);
+    ceiling.unref();
+  } else {
+    timer = setTimeout(fire, ms);
+    timer.unref();
+  }
+  return {
+    cancel() {
+      stopped = true;
+      if (timer) clearTimeout(timer);
+      if (ceiling) clearTimeout(ceiling);
+      return fired;
+    },
+    note(event) {
+      if (!o.armOn || event.event !== o.armOn.event) return;
+      if (o.armOn.taskId !== undefined && event.taskId !== o.armOn.taskId) return;
+      arm();
+    },
+  };
+}
+
+export const ORDERING_MEMBERS = [
+  { fixture: "hyg09", first: "T1" },
+  { fixture: "hyg09", first: "T2" },
+  { fixture: "partial", first: "T1" },
+  { fixture: "partial", first: "T2" },
+  { fixture: "resume", first: "T1" },
+  { fixture: "resume", first: "T2" },
+  { fixture: "keep", first: "T1" },
+  { fixture: "keep", first: "T2" },
+] as const satisfies ReadonlyArray<{ fixture: OrderingProof["fixture"]; first: Id }>;
+
+export type OrderingMember = { fixture: OrderingProof["fixture"]; first: Id; hand?: boolean; diagnosticMs?: number };
+export type FixtureChildSpec =
+  | ({ kind: "ordering" } & OrderingMember)
+  | { kind: "healthy" }
+  | { kind: "never-released"; diagnosticMs: number }
+  | { kind: "hold-after-human" };
+
+function closeProof(ops: { kind: string; name: string }[]): Pick<OrderingProof, "firstClose" | "workerSlot" | "closeCount"> {
+  const worker = (id: string) => ops.find((op) => op.kind === "slot" && op.name.includes(`${id}-worker-fake-a0-`))?.name ?? null;
+  const workerSlot = { T1: worker("T1"), T2: worker("T2") };
+  const closeCount: Record<string, number> = {};
+  for (const id of ["T1", "T2"]) {
+    const name = workerSlot[id as Id];
+    closeCount[id] = name ? ops.filter((op) => op.kind === "close" && op.name === name).length : 0;
+  }
+  return {
+    firstClose: ops.find((op) => op.kind === "close" && /-worker-fake-a0-/.test(op.name))?.name ?? null,
+    workerSlot, closeCount,
+  };
+}
+
+function orderedDriver(): { driver: ExecutorDriver; ops: { kind: string; name: string }[] } {
+  const inner = new SubprocessDriver();
+  const ops: { kind: string; name: string }[] = [];
+  return {
+    ops,
+    driver: {
+      id: "ordered", interactive: false,
+      status: inner.status.bind(inner), run: inner.run.bind(inner), waitOutput: inner.waitOutput.bind(inner),
+      waitAgentStatus: inner.waitAgentStatus.bind(inner), read: inner.read.bind(inner), notify: inner.notify.bind(inner),
+      worktree: inner.worktree.bind(inner),
+      async slot(cwd: string, name: string) { ops.push({ kind: "slot", name }); return inner.slot(cwd, name); },
+      async close(s: Slot) { ops.push({ kind: "close", name: s.name }); return inner.close(s); },
+    },
+  };
+}
+
+/** Run production runDaemon under the watchdog, then leave the journal and the proof on disk. */
+async function watchedDaemon(o: {
+  repo: string; runId: string; scenario: string; fixture: OrderingProof["fixture"]; first: Id; held: Id;
+  deadlineMs: number; hand: boolean; barriers: WorkerBarrier[];
+  /** Slot/close log mutated by the driver while `run` is in flight. Read after the run returns. */
+  closeOps?: { kind: string; name: string }[];
+  run: (narrate: Narrate) => Promise<RunSummary>;
+}): Promise<void> {
+  let expiredText = "";
+  let resolveExpired = () => {};
+  const expired = new Promise<void>((resolve) => { resolveExpired = resolve; });
+  const watch = watchScenario({
+    ms: o.deadlineMs, runId: o.runId, scenario: o.scenario, tasks: ["T1", "T2"], barriers: o.barriers,
+    readRows: () => { try { return Journal.open(o.repo, o.runId).read(); } catch { return []; } },
+    onExpire: (text) => { expiredText = text; resolveExpired(); },
+  });
+  let summary: RunSummary | undefined;
+  let error: string | undefined;
+  try {
+    const raced = await Promise.race([
+      o.run((e) => watch.note(e)).then((s) => ({ kind: "done" as const, s })),
+      expired.then(() => ({ kind: "expired" as const })),
+    ]);
+    if (raced.kind === "done") summary = raced.s;
+  } catch (e) {
+    error = e instanceof Error ? (e.stack ?? e.message) : String(e);
+  }
+  const fired = watch.cancel();
+  if (!fired) emit(`WATCHDOG_CANCELLED run=${o.runId} scenario=${o.scenario}`);
+  const barriers = o.barriers.map(barrierRecord);
+  releaseAll(...o.barriers);
+  let rows: JournalEvent[] = [];
+  try { rows = Journal.open(o.repo, o.runId).read(); } catch (e) { error ??= e instanceof Error ? e.message : String(e); }
+  const proof: OrderingProof = {
+    repo: o.repo, runId: o.runId, scenario: o.scenario, fixture: o.fixture, first: o.first, held: o.held,
+    deadlineMs: o.deadlineMs, hand: o.hand, barriers,
+    done: summary?.done ?? [], human: summary?.human ?? [],
+    ...(o.closeOps ? closeProof(o.closeOps) : { firstClose: null, workerSlot: { T1: null, T2: null }, closeCount: {} }),
+    violations: [],
+  };
+  proof.violations = [
+    ...(error ? [`${o.runId}: ${error}`] : []),
+    ...(fired ? [`${o.runId}: diagnostic deadline ${o.deadlineMs} ms exhausted — ${expiredText.slice(0, 500)}`] : []),
+    ...orderingOracle(proof, rows),
+  ];
+  const proofPath = join(o.repo, ".tickmarkr", "runs", o.runId, "ordering-proof.json");
+  try {
+    writeFileSync(proofPath, JSON.stringify(proof));
+  } catch (e) {
+    const detail = e instanceof Error ? e.message : String(e);
+    emit(`OUTCOME ${JSON.stringify({ repo: o.repo, runId: o.runId, error: detail })}`);
+    return;
+  }
+  emit(`OUTCOME ${JSON.stringify({ repo: o.repo, runId: o.runId, proofPath })}`);
+}
+
+async function runHyg(member: OrderingMember, scenario: string): Promise<void> {
+  const first = member.first;
+  const held = otherId(first);
+  const runId = `run-owned-${scenario}`;
+  const deadlineMs = diagnosticDeadlineMs(member.diagnosticMs);
+  const barrier = workerBarrier(`${runId}-${held}`);
+  if (member.hand) barrier.release();
+  const { repo, fake } = setupRepo([T("T1"), T("T2")], { tasks: {
+    [first]: [{ shell: `echo ${first} > ${first}.txt && ${COMMIT} ${first}`, result: { ok: true, summary: first } }],
+    [held]: [{ shell: `${barrier.hold} && echo ${held} > ${held}.txt && ${COMMIT} ${held}`, result: { ok: true, summary: held } }],
+  } }, "visibility:\n  keepPanes: run\n");
+  const { driver, ops } = orderedDriver();
+  await watchedDaemon({
+    repo, runId, scenario, fixture: "hyg09", first, held, deadlineMs, hand: member.hand === true,
+    barriers: [barrier], closeOps: ops,
+    run: (note) => runDaemon(repo, {
+      adapters: [fake], runId, driver, concurrency: 2,
+      narrate: member.hand ? note : releaseOn(barrier, "task-done", first, note),
+    }),
+  });
+}
+
+async function runConflict(member: OrderingMember, scenario: string): Promise<void> {
+  const first = member.first;
+  const held = otherId(first);
+  const runId = `run-owned-${scenario}`;
+  const deadlineMs = diagnosticDeadlineMs(member.diagnosticMs);
+  const pair = conflictPair(runId, first, held);
+  if (member.hand) releaseAll(pair.ready, pair.loser);
+  await watchedDaemon({
+    repo: pair.repo, runId, scenario, fixture: member.fixture, first, held, deadlineMs, hand: member.hand === true,
+    barriers: [pair.ready, pair.loser],
+    run: (note) => runDaemon(pair.repo, { adapters: [pair.fake], runId, narrate: member.hand ? note : pair.narrate(note) }),
+  });
+}
+
+async function neverReleased(diagnosticMs: number): Promise<void> {
+  const deadlineMs = diagnosticDeadlineMs(diagnosticMs);
+  const runId = "run-never-released";
+  const scenario = "never-released";
+  const ready = workerBarrier(`${runId}-ready`);
+  const loser = workerBarrier(`${runId}-loser`);
+  const { repo, fake } = setupRepo([T("T1"), T("T2")], { tasks: {
+    T1: [{ shell: `${ready.hold} && echo T1 > T1.txt && ${COMMIT} T1`, result: { ok: true, summary: "T1" } }],
+    T2: [{ shell: `${loser.hold} && echo T2 > T2.txt && ${COMMIT} T2`, result: { ok: true, summary: "T2" } }],
+  } });
+  emit(`REPO ${repo}`);
+  const watch = watchScenario({
+    ms: deadlineMs, armOn: { event: "worker-launch", taskId: "T1" },
+    runId, scenario, tasks: ["T1", "T2"], barriers: [ready, loser],
+    readRows: () => { try { return Journal.open(repo, runId).read(); } catch { return []; } },
+  });
+  await runDaemon(repo, { adapters: [fake], runId, concurrency: 2, narrate: (e) => watch.note(e) });
+  watch.cancel();
+}
+
+async function holdAfterHuman(): Promise<void> {
+  const runId = "run-hold-human";
+  const scenario = "hold-after-human";
+  const pair = conflictPair(runId, "T1", "T2");
+  const post = workerBarrier(`${runId}-post`);
+  emit(`REPO ${pair.repo}`);
+  emit(`JOURNAL ${join(pair.repo, ".tickmarkr", "runs", runId, "journal.jsonl")}`);
+  for (const barrier of [pair.ready, pair.loser, post]) emit(`BARRIER ${barrier.path}`);
+  const watch = watchScenario({
+    runId, scenario, tasks: ["T1", "T2"], barriers: [pair.ready, pair.loser, post],
+    readRows: () => { try { return Journal.open(pair.repo, runId).read(); } catch { return []; } },
+  });
+  void runDaemon(pair.repo, {
+    adapters: [pair.fake], runId,
+    narrate: pair.narrate((e) => {
+      watch.note(e);
+      if (e.event !== "task-human") return;
+      watch.cancel();
+      emit(`WATCHDOG_CANCELLED run=${runId} scenario=${scenario}`);
+      emit(`TASK-HUMAN ${e.taskId ?? ""}`);
+    }),
+  }).catch(() => {});
+  await new Promise(() => {});
+}
+
+/** Owned-child entry: production runDaemon for one diagnostic-table scenario. Parking modes never return. */
+export async function fixtureChild(spec: FixtureChildSpec): Promise<void> {
+  if (spec.kind === "never-released") return neverReleased(spec.diagnosticMs);
+  if (spec.kind === "hold-after-human") return holdAfterHuman();
+  if (spec.kind === "healthy") return runHyg({ fixture: "hyg09", first: "T1" }, "healthy-ordered");
+  const scenario = spec.hand ? `${spec.fixture}-${spec.first}-hand` : `${spec.fixture}-${spec.first}`;
+  if (spec.fixture === "hyg09") return runHyg(spec, scenario);
+  return runConflict(spec, scenario);
 }

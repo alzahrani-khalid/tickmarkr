@@ -14,7 +14,7 @@ import type { GateResult } from "../../gates/types.js";
 import { getTask, loadGraph } from "../../graph/graph.js";
 import { GATE_NAMES, type AcceptanceItem, type GateName, type Task } from "../../graph/schema.js";
 import { executionSignal } from "../../run/execution-budget.js";
-import { linkNodeModules, removeWorktree, shGit, shGitOk } from "../../run/git.js";
+import { addDetachedWorktree, linkNodeModules, removeWorktree, shGit, shGitOk } from "../../run/git.js";
 import { foldOwedChecks, integrationMapped, owedCriteria, Journal, OWED_DISCHARGE_EVENT, type OwedCheck, type OwedFold } from "../../run/journal.js";
 import { withRepositoryLease } from "../../run/lease.js";
 import { isPidLive } from "../../run/lock.js";
@@ -415,7 +415,8 @@ export async function verify(argv: string[], cwd = process.cwd(), options: { evi
     }
     const baseDir = mkdtempSync(join(stateDir, `base-${mergeBase.slice(0, 12)}-${process.pid}-`));
     try {
-      await shGitOk(`git worktree add --detach '${baseDir}' '${mergeBase}'`, cwd);
+      const added = await addDetachedWorktree(cwd, baseDir, mergeBase);
+      if (added.code !== 0) throw new Error(`command failed (${added.code}): git worktree add --detach '${baseDir}' '${mergeBase}'\n${added.stderr || added.stdout}`);
       linkNodeModules(cwd, baseDir, { force: true });
       const baseline = await captureBaseline(baseDir, subset);
       if (baseline.refusal) return baseline;

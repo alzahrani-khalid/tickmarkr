@@ -39,10 +39,18 @@ test("lease probe", async () => {
     appendFileSync(resolve(env.PROBE_RENDEZVOUS, env.PROBE_NAME), "");
     log({ event: "rendezvous", met: await until(() => env.PROBE_PARTNERS.split(",").every(p => existsSync(resolve(env.PROBE_RENDEZVOUS, p))), 30000) });
   }
+  // A nested mutation runner's environment: filtered as a manifested gate child filters it.
+  const child = { ...env, PROBE_NAME: env.PROBE_NESTED };
+  for (const key of ["VITEST", "TEST", "VITEST_WORKER_ID", "VITEST_POOL_ID", "${COMMAND_LEASE_TOKEN_ENV}", "PROBE_NESTED", "PROBE_HOLD", "PROBE_HOLD_MS", "PROBE_SLEEPER", "PROBE_GONE", "PROBE_CANCEL_NESTED", "PROBE_LEAK_NESTED"]) delete child[key];
+  if (env.PROBE_LEAK_NESTED) {
+    // A nested runner this test leaves running: once it has reentered the lease and started its own body
+    // (its start row), this test ends while it holds until the file appears, outliving this fork.
+    const leaked = spawn(process.execPath, [env.PROBE_VITEST, "run", "--configLoader", "runner", "${PROBE}"],
+      { env: { ...child, PROBE_NAME: "leaked", PROBE_HOLD: env.PROBE_LEAK_NESTED }, stdio: "ignore" });
+    leaked.unref();
+    log({ event: "leaked", child: leaked.pid, met: await until(() => readFileSync(env.PROBE_LOG, "utf8").includes('"name":"leaked"'), 60000) });
+  }
   if (env.PROBE_NESTED) {
-    // A nested mutation runner: the environment filtered as a manifested gate child filters it.
-    const child = { ...env, PROBE_NAME: env.PROBE_NESTED };
-    for (const key of ["VITEST", "TEST", "VITEST_WORKER_ID", "VITEST_POOL_ID", "${COMMAND_LEASE_TOKEN_ENV}", "PROBE_NESTED", "PROBE_HOLD", "PROBE_HOLD_MS", "PROBE_SLEEPER", "PROBE_GONE", "PROBE_CANCEL_NESTED"]) delete child[key];
     const nested = spawn(process.execPath, [env.PROBE_VITEST, "run", "--configLoader", "runner", "${PROBE}"], { env: child, stdio: ["ignore", "pipe", "pipe"] });
     let output = "";
     nested.stdout.on("data", d => { output += d; });
@@ -62,6 +70,10 @@ test("lease probe", async () => {
 `;
 
 type Row = { event: string; name: string; pid: number; at: number; token?: string | null; lease?: string | null; code?: unknown; output?: string; met?: boolean; child?: number; survivors?: string[] };
+const running = (pid: number): boolean => {
+  try { return !execFileSync("ps", ["-o", "stat=", "-p", String(pid)], { encoding: "utf8" }).trim().startsWith("Z"); }
+  catch { return false; }
+};
 const rows = (log: string): Row[] => existsSync(log) ? readFileSync(log, "utf8").trim().split("\n").filter(Boolean).map(l => JSON.parse(l) as Row) : [];
 const until = async (ready: () => boolean, ms: number, what: string) => {
   const end = Date.now() + ms;
@@ -120,13 +132,17 @@ const passed = async (r: Runner) => { const code = await r.exit; expect(code, r.
 
 test("configured Vitest preserves its shutdown order and retains the repository reservation until the public close hook observes that workers have ceased", async () => {
   const events: string[] = [];
-  let workerLive = true;
+  // A tooling child (an esbuild service) lives below the main process before global setup and after
+  // the forks are gone; the fork itself is born only after setup and ceases during pool shutdown.
+  const tooling = `999997 ${process.pid} S Mon Oct  5 00:00:00 2026\n`;
+  const fork = `999999 ${process.pid} S Mon Oct  5 00:00:01 2026\n`;
+  let workerLive = false;
   let closing!: () => Promise<void>;
   const pool = { close: vi.fn() };
   const runner = { pool, onClose: vi.fn((callback: () => Promise<void>) => { closing = callback; }) };
   const project = { vitest: runner } as unknown as TestProject;
   vi.spyOn(childProcesses, "spawnSync").mockImplementation(() => ({
-    status: 0, stdout: workerLive ? `999999 ${process.pid} S\n` : "", stderr: "", pid: 999998,
+    status: 0, stdout: tooling + (workerLive ? fork : ""), stderr: "", pid: 999998,
     output: [], signal: null,
   }));
   vi.spyOn(lease, "repositoryLeasePath").mockResolvedValue(join(root, "unused.lease"));
@@ -136,6 +152,7 @@ test("configured Vitest preserves its shutdown order and retains the repository 
   });
   const first = await vitestLease(project);
   const last = await vitestLease(project);
+  workerLive = true;
   let teardown: Promise<void> | undefined;
   await first!();
   try {
@@ -156,6 +173,45 @@ test("configured Vitest preserves its shutdown order and retains the repository 
   } finally {
     workerLive = false;
     await (teardown ?? closing());
+    vi.restoreAllMocks();
+  }
+});
+
+// D-1300 r1 (verify c1): the tooling snapshot is taken once, before the first owned fork. A later project's
+// global setup may run while an earlier project's fork is alive; that fork is workload and close still waits for it.
+test("a first project's fork alive during a second project's global setup is still awaited at close instead of passing for tooling", async () => {
+  const events: string[] = [];
+  const tooling = `999997 ${process.pid} S Mon Oct  5 00:00:00 2026\n`;
+  const fork = `999999 ${process.pid} S Mon Oct  5 00:00:01 2026\n`;
+  let workerLive = false;
+  let closing!: () => Promise<void>;
+  const runner = { pool: { close: vi.fn() }, onClose: vi.fn((callback: () => Promise<void>) => { closing = callback; }) };
+  const project = { vitest: runner } as unknown as TestProject;
+  const census = vi.spyOn(childProcesses, "spawnSync").mockImplementation(() => ({
+    status: 0, stdout: tooling + (workerLive ? fork : ""), stderr: "", pid: 999998, output: [], signal: null,
+  }));
+  vi.spyOn(lease, "repositoryLeasePath").mockResolvedValue(join(root, "unused.lease"));
+  vi.spyOn(lease, "withRepositoryLease").mockImplementation(async (_cwd, run) => {
+    events.push("reserved");
+    try { return await run(); } finally { events.push("released"); }
+  });
+  const first = await vitestLease(project);
+  workerLive = true; // the first project's fork is running when the second project sets up
+  const second = await vitestLease(project);
+  await first!();
+  await second!();
+  const teardown = closing();
+  try {
+    // The hook censuses while it waits: three further censuses with the fork alive and no release is the observed hold.
+    const polled = census.mock.calls.length;
+    await until(() => census.mock.calls.length >= polled + 3, 5_000, "the close hook to keep censusing the live fork");
+    expect(events).toEqual(["reserved"]);
+    workerLive = false;
+    await teardown;
+    expect(events).toEqual(["reserved", "released"]);
+  } finally {
+    workerLive = false;
+    await teardown;
     vi.restoreAllMocks();
   }
 });
@@ -299,6 +355,85 @@ test("test: gate and nested mutation children reenter only a live identity-bound
   expect(process.env[REPOSITORY_LEASE_TOKEN_ENV]).toBe(outer);
   expect(existsSync(path)).toBe(false);
 }, 240_000);
+
+// D-1300: the close hook waited until EVERY descendant was gone, and Vite's esbuild service (a child the
+// main process keeps for its whole life) made every close pay the full 10 s deadline, nested runs included.
+test("close releases the lease after the owned forks exit without waiting out the deadline on the runner's own long-lived tooling child", async () => {
+  const log = join(makeTestTempDir("lease-log-"), "rows.jsonl");
+  const repo = fixtureRepo();
+  const path = await repositoryLeasePath(repo);
+  const r = vitest(repo, "prompt", log);
+  await until(() => rows(log).some(row => row.name === "prompt" && row.event === "end"), 60_000, `the probe to finish:\n${r.out()}`);
+  const mine = rows(log).filter(row => row.name === "prompt");
+  await until(() => !existsSync(path), 30_000, `the lease release:\n${r.out()}`);
+  const released = Date.now();
+  expect(running(mine[0]!.pid), "the fork that ran the probe is gone before the release").toBe(false);
+  await passed(r);
+  // The defect pays the whole 10 s deadline; a release within 5 s (pool shutdown, two ps censuses and the
+  // lease layer's own reap) proves the tooling child was not awaited. Observed at 50 ms polling.
+  const waited = released - mine.find(row => row.event === "end")!.at;
+  expect(waited, `${waited} ms from the probe's end to the lease release`).toBeLessThan(5_000);
+}, 120_000);
+
+test("a nested runner still running at close holds the lease until it exits", async () => {
+  const log = join(makeTestTempDir("lease-log-"), "rows.jsonl");
+  const repo = fixtureRepo();
+  const path = await repositoryLeasePath(repo);
+  const release = join(makeTestTempDir("lease-leak-"), "release");
+  const outer = vitest(repo, "leaker", log, { PROBE_LEAK_NESTED: release });
+  // The probe records the leaked coordinator's pid only once it has seen that runner admitted (its start row).
+  await until(() => rows(log).some(row => row.name === "leaker" && row.event === "leaked"), 60_000, "the leaked nested runner to be admitted");
+  const token = rows(log).find(row => row.name === "leaker" && row.event === "start")!.token!;
+  const leaked = rows(log).find(row => row.name === "leaker" && row.event === "leaked")!;
+  const coordinator = leaked.child!;
+  expect(leaked.met).toBe(true);
+  expect(rows(log).find(row => row.name === "leaked" && row.event === "start")).toMatchObject({ token, lease: token });
+  // Overlap with close, observed on the record itself: `ownerReleased` is written only after the outer close hook
+  // has entered, seen its forks gone and released its hold, and the lease layer's release then found the nested
+  // token carrier still alive past its reap deadline — so it retained the generation instead of removing it. The
+  // nested runner alone now holds it, still before its own body-end event.
+  await until(() => readHolder(path)?.ownerReleased === true, 60_000, "the outer close hook to release its hold onto a live nested runner");
+  expect(outer.out()).toContain("Duration");
+  expect(readHolder(path)?.token).toBe(token);
+  expect(running(coordinator)).toBe(true);
+  expect(rows(log).some(row => row.name === "leaked" && row.event === "end")).toBe(false);
+  const next = vitest(worktree(repo, "next"), "next", log);
+  await until(() => next.out().includes(WAITING), 60_000, "next to queue behind the nested runner's generation");
+  expect(readHolder(path)?.token).toBe(token);
+  expect(running(coordinator)).toBe(true);
+  expect(rows(log).some(row => row.name === "next" && row.event === "start")).toBe(false);
+  writeFileSync(release, "");
+  // The nested body ends first; its runner lives on through its own shutdown, and the generation changes hands
+  // only once that coordinator has exited — never between body end and process exit.
+  await until(() => rows(log).some(row => row.name === "leaked" && row.event === "end"), 60_000, "the nested body to end");
+  expect(readHolder(path)?.token).toBe(token);
+  await until(() => readHolder(path)?.token !== token, 60_000, "the generation to change hands");
+  expect(running(coordinator), "the nested coordinator at the moment the generation changed hands").toBe(false);
+  await passed(next);
+  await outer.exit;
+  const started = rows(log).find(row => row.name === "next" && row.event === "start")!;
+  expect(started.token).not.toBe(token);
+  expect(started.lease).toBe(started.token);
+  expect(existsSync(path)).toBe(false);
+}, 120_000);
+
+test("cancellation stops every owned fork and nested runner before the lease is released", async () => {
+  const log = join(makeTestTempDir("lease-log-"), "rows.jsonl");
+  const repo = fixtureRepo();
+  const path = await repositoryLeasePath(repo);
+  const release = join(makeTestTempDir("lease-cancel-"), "release");
+  const holder = vitest(repo, "holder", log, { PROBE_NESTED: "nested", PROBE_HOLD: release, PROBE_SLEEPER: "1", PROBE_CANCEL_NESTED: release });
+  await until(() => rows(log).some(row => row.name === "active-nested" && row.event === "sleeper"), 60_000, `the active nested runner's child:\n${holder.out()}`);
+  const owned = [...new Set(rows(log).filter(row => row.name === "holder" || row.name === "active-nested")
+    .flatMap(row => [row.pid, ...(row.child ? [row.child] : [])]))];
+  expect(owned.length).toBeGreaterThanOrEqual(4); // the holder's fork and sleeper, the nested runner's fork and sleeper
+  expect(owned.filter(running)).toEqual(owned);
+  holder.child.kill("SIGTERM");
+  await until(() => !existsSync(path), 30_000, "the cancelled holder to release its lease");
+  expect(owned.filter(running), "owned processes alive at the moment of release").toEqual([]);
+  await holder.exit;
+  expect(rows(log).some(row => (row.name === "holder" || row.name === "active-nested") && row.event === "end")).toBe(false);
+}, 120_000);
 
 // C-9(i) (D-670, verify of the D-644 lease fix): a ps census that threw after the tree was frozen skipped
 // the SIGKILL, so SIGSTOPped forks outlived a reclaimed lease.

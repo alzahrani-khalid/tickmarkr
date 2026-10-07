@@ -1,4 +1,5 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import { spawnSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -381,8 +382,8 @@ export function verifyManifestReport(opts: {
 export const FILE_HANG_SLACK = 3;
 export const DEFAULT_FILE_HANG_BUDGET_MS = 60_000;
 /**
- * No file is a hang before this much active time, whatever its baseline says (the battery ceiling still wins below it). A fast
- * suite's per-file timings are a few ms, so 3 × longest killed a new or slower file that would have passed, or a scheduling gap, as an infra hang.
+ * No measured-green file is a hang before this much active time, whatever its baseline says (the battery ceiling still wins
+ * below it). A fast suite's per-file timings are a few ms, so 3 × its own killed a slower file that would have passed.
  */
 export const MIN_FILE_HANG_BUDGET_MS = 10_000;
 let hangBudgetFloorMs = MIN_FILE_HANG_BUDGET_MS;
@@ -391,17 +392,20 @@ export const setHangBudgetFloorForTests = (ms: number): void => { hangBudgetFloo
 export const resetHangBudgetFloorForTests = (): void => { hangBudgetFloorMs = MIN_FILE_HANG_BUDGET_MS; };
 
 const usable = (n: number | undefined): n is number => n !== undefined && Number.isFinite(n) && n > 0;
+/** v2.6.8 P4 (prospectively superseding v2.5.5's "untimed = 3 × longest"): only the file's OWN usable green duration K
+ * buys measured slack, max(3 × K, L) with L the longest usable entry (red included) or legacy longestFile. An untimed,
+ * baseline-red or legacy longest-only file has no measure of its runtime and gets the finite battery ceiling. */
 export function fileHangBudgetMs(file: string, baselineDurations?: readonly BaselineFileDuration[] | null,
   ceilingMs = DEFAULT_FILE_HANG_BUDGET_MS, longestFile?: BaselineFileDuration | null): number {
   const ceiling = usable(ceilingMs) ? ceilingMs : DEFAULT_FILE_HANG_BUDGET_MS;
   const timings = baselineDurations?.filter((d) => usable(d.durationMs)) ?? [];
-  const longest = Math.max(0, ...timings.map((d) => d.durationMs), usable(longestFile?.durationMs) ? longestFile.durationMs : 0);
-  if (!longest) return ceiling;
   // A file that was RED in the baseline ended early there: its duration is no measure of its green runtime. The
   // failure is read from EVERY entry, before the usable-duration filter can drop a 0 ms or non-finite red one.
   const red = baselineDurations?.some((d) => d.file === file && d.failed) ?? false;
   const known = red ? undefined : timings.find((d) => d.file === file)?.durationMs;
-  return Math.min(ceiling, known === undefined ? FILE_HANG_SLACK * longest : Math.max(FILE_HANG_SLACK * known, longest));
+  if (known === undefined) return ceiling;
+  const longest = Math.max(...timings.map((d) => d.durationMs), usable(longestFile?.durationMs) ? longestFile.durationMs : 0);
+  return Math.min(ceiling, Math.max(FILE_HANG_SLACK * known, longest));
 }
 
 /**
@@ -439,9 +443,48 @@ export function classifyPollGap(prev: { wall: number; mono: number }, now: { wal
   if (monoMs > pollMs + CLOCK_JUMP_SLACK_MS) return { kind: "unknown", ...gap, subtractedMs: 0 };
   return undefined;
 }
-/** The detected suspend a file started at `startedAt` sat through. */
-const suspendedSince = (interruptions: readonly HostInterruption[], startedAt: number): number =>
-  interruptions.reduce((sum, i) => sum + Math.min(i.subtractedMs, Math.max(0, i.to - Math.max(i.from, startedAt))), 0);
+/**
+ * v2.6.8 P4: an overdue poll on Darwin asks the kernel when it last slept and woke (`sysctl -n kern.sleeptime
+ * kern.waketime`), synchronously and bounded, before that poll's hang decision; the segment's overlap with the gap is
+ * credited as `host-suspend`. Unreadable evidence is unknown and credits 0. NAMED RESIDUAL: the kernel keeps only the
+ * MOST RECENT segment, so a gap holding several sleeps or maintenance DarkWakes credits only the last one — that
+ * under-credit fails closed: the file can still be killed as a hang, as on 2.6.7.
+ */
+export interface SleepSegment { sleep: number; wake: number }
+export interface SleepEvidence {
+  platform: () => NodeJS.Platform;
+  /** The synchronous OS-command boundary (spawnSync's shape). */
+  command: (file: string, args: string[], opts: { encoding: "utf8"; timeout: number; maxBuffer: number; killSignal: "SIGKILL" }) =>
+    { status: number | null; signal: NodeJS.Signals | null; stdout?: string; stderr?: string; error?: Error };
+  /** Replaces the default sysctl reader; production supplies none. */
+  reader?: () => SleepSegment | undefined;
+}
+const systemSleepEvidence: SleepEvidence = { platform: () => process.platform, command: (file, args, opts) => spawnSync(file, args, opts) };
+let sleepEvidence = systemSleepEvidence;
+export const setSleepEvidenceForTests = (evidence: Partial<SleepEvidence>): void => { sleepEvidence = { ...systemSleepEvidence, ...evidence }; };
+export const resetSleepEvidenceForTests = (): void => { sleepEvidence = systemSleepEvidence; };
+const SYSCTL_TIMEOUT_MS = 1_000, SYSCTL_MAX_BYTES = 4_096;
+const SYSCTL_STAMP = /^\{ sec = (\d{1,15}), usec = (\d{1,6}) \} [A-Z][a-z]{2} [A-Z][a-z]{2} +\d{1,2} \d{2}:\d{2}:\d{2} \d{4}$/;
+/** Lazy: runs only from an overdue poll, never at import. A timeout or overrun of 1000 ms, a signal, nonzero exit, more
+ * than 4096 combined output bytes, or a truncated, unparseable or reversed pair is unknown. spawnSync SIGKILLs the child
+ * at either bound and joins it: a child ignoring SIGTERM cannot hold the poll, so hang enforcement still runs. */
+function readDarwinSleepSegment(): SleepSegment | undefined {
+  const startedMs = hangClocks.mono();
+  const r = sleepEvidence.command("sysctl", ["-n", "kern.sleeptime", "kern.waketime"], { encoding: "utf8", timeout: SYSCTL_TIMEOUT_MS, maxBuffer: SYSCTL_MAX_BYTES, killSignal: "SIGKILL" });
+  const out = r.stdout ?? "", err = r.stderr ?? "";
+  if (hangClocks.mono() - startedMs >= SYSCTL_TIMEOUT_MS || r.error || r.signal || r.status !== 0
+    || Buffer.byteLength(out) + Buffer.byteLength(err) > SYSCTL_MAX_BYTES) return undefined;
+  const [sleep, wake, ...rest] = out.replace(/\n$/, "").split("\n").map((line) => SYSCTL_STAMP.exec(line))
+    .map((m) => m ? Number(m[1]) * 1000 + Number(m[2]) / 1000 : NaN);
+  return !rest.length && sleep! < wake! ? { sleep: sleep!, wake: wake! } : undefined;
+}
+/** One overdue gap's evidence: its wall-over-monotonic offset and its overlap [sleep, wake] with the kernel segment. */
+interface SuspendCredit { from: number; to: number; offsetMs: number; sleep: number; wake: number }
+/** Per gap, a file started at `startedAt` is credited the larger of the offset it sat through and its own overlap with
+ * the kernel segment: the same suspend is never counted twice, and nothing before the file started is credited. */
+const suspendedSince = (credits: readonly SuspendCredit[], startedAt: number): number =>
+  credits.reduce((sum, c) => sum + Math.max(Math.min(c.offsetMs, Math.max(0, c.to - Math.max(c.from, startedAt))),
+    Math.max(0, c.wake - Math.max(c.sleep, startedAt))), 0);
 
 // The daemon journals each interruption where it ran (task gate, tip verify); no sink, no journal row.
 const interruptionSink = new AsyncLocalStorage<(interruption: HostInterruption) => void>();
@@ -495,13 +538,28 @@ export function runManifestedTest(
   let hangWallMs: number | undefined;
   let poll: ReturnType<typeof setInterval> | undefined;
   const interruptions: HostInterruption[] = [];
+  const credits: SuspendCredit[] = [];
+  let creditedUntil = -Infinity;
   const sink = interruptionSink.getStore();
   let last = { wall: hangClocks.wall(), mono: hangClocks.mono() };
   const checkHang = (atCeiling = false) => {
     const at = { wall: hangClocks.wall(), mono: hangClocks.mono() };
-    const gap = classifyPollGap(last, at, pollMs);
+    let gap = classifyPollGap(last, at, pollMs);
     last = at;
-    if (gap) { interruptions.push(gap); sink?.(gap); }
+    if (gap) {
+      let os: SleepSegment | undefined;
+      if (sleepEvidence.platform() === "darwin") {
+        try { os = (sleepEvidence.reader ?? readDarwinSleepSegment)(); } catch { os = undefined; }
+        last = { wall: hangClocks.wall(), mono: hangClocks.mono() }; // the bounded read itself is no poll gap
+      }
+      // Clipped to this gap and past any segment already credited, so a repeated pair never credits twice.
+      const sleep = Math.max(os?.sleep ?? Infinity, gap.from, creditedUntil), wake = Math.min(os?.wake ?? -Infinity, gap.to);
+      const osMs = wake > sleep ? wake - sleep : 0;
+      if (osMs) creditedUntil = wake;
+      credits.push({ from: gap.from, to: gap.to, offsetMs: gap.subtractedMs, ...(osMs ? { sleep, wake } : { sleep: 0, wake: 0 }) });
+      if (osMs > gap.subtractedMs) gap = { ...gap, kind: "host-suspend", subtractedMs: osMs };
+      interruptions.push(gap); sink?.(gap);
+    }
     const report = readTestReport(opts.reportPath);
     if (!report || report.nonce !== opts.nonce) return;
     for (const file of opts.manifest) {
@@ -509,7 +567,7 @@ export function runManifestedTest(
       if (startedAt === undefined || file in report.completed) continue;
       const budget = Math.min(overallCeilingMs, Math.max(hangBudgetFloorMs, fileHangBudgetMs(file, opts.baselineDurations, overallCeilingMs, opts.longestFile)));
       const wallMs = at.wall - startedAt;
-      const activeMs = wallMs - suspendedSince(interruptions, startedAt);
+      const activeMs = wallMs - suspendedSince(credits, startedAt);
       if (activeMs >= budget || (atCeiling && budget === overallCeilingMs)) {
         killedFile = file;
         hangBudgetMs = budget;

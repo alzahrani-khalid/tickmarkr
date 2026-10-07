@@ -564,13 +564,18 @@ describe("beat start", () => {
     expect(bytes(beatClaimPath(repo, "overseer"))).toContain("held");
     rmSync(beatClaimPath(repo, "overseer"));
 
-    // OWN-DEAD -> refused with a request for the owned stop; nothing relaunched.
+    // OWN-DEAD -> the same seat's start retires the dead generation (nothing signalled) and launches a new one.
     process.kill(first.pid, "SIGKILL");
     await until(() => !alive(first.pid));
     const dead = await run(repo, ["start", "overseer", "--seat", "a:b"]);
-    expect(dead).toMatchObject({ code: 1, out: expect.stringContaining("beat stop overseer --seat a:b") });
-    expect(owner(repo, "overseer")).toEqual(first);
+    expect(dead).toMatchObject({ code: 0, out: expect.stringContaining(`overseer recovered dead generation ${first.generation} (recorded pid ${first.pid} is gone)`) });
+    expect(dead.out).toContain("ARMED as a:b");
+    const second = owner(repo, "overseer");
+    spawned.push({ pid: second.pid } as ChildProcess);
+    expect(second.generation).not.toBe(first.generation);
     // old-seat stale record / new seat: refusal, then checked old-owner cleanup, then new-owner read-back
+    process.kill(second.pid, "SIGKILL");
+    await until(() => !alive(second.pid));
     expect((await run(repo, ["start", "overseer", "--seat", "new"])).code).toBe(1);
     expect((await run(repo, ["stop", "overseer", "--seat", "a:b"])).code).toBe(0);
     // DISARMED -> launch/read-back for the new seat.
@@ -716,7 +721,10 @@ describe("beat start", () => {
     const blindChild = spawned.at(-1)!;
     await until(() => blindChild.exitCode !== null || blindChild.signalCode !== null, SUPERVISION_BEAT_MS + 10_000);
     expect(blindChild.signalCode).toBeNull();
-    expect(await run(identityFails, ["status", "overseer"])).toMatchObject({ code: 1, out: expect.stringContaining("UNREADABLE — generation") });
+    // No launch holds the claim and no process is recorded: status reports the abandoned launch and the stop that retires it.
+    expect(await run(identityFails, ["status", "overseer"])).toMatchObject({ code: 1, out: expect.stringContaining("its launch was abandoned; run `tickmarkr beat stop overseer --seat s`") });
+    expect(await run(identityFails, ["stop", "overseer", "--seat", "s"])).toMatchObject({ code: 0, out: expect.stringContaining("abandoned launch cleaned up, nothing signalled") });
+    expect(existsSync(beatOwnerPath(identityFails, "overseer"))).toBe(false);
 
     // A child whose identity changes after it was proven is not signalled either: the refusal retains it.
     const changes = mkRepo();
@@ -895,7 +903,8 @@ describe("beat stop", () => {
       .toMatchObject({ code: 1, out: expect.stringContaining("UNREADABLE") });
     expect(alive(blindChild.pid!)).toBe(true);
     put(beatClaimPath(blindRepo, "overseer"), JSON.stringify({ token: "held", pid: 1 }) + "\n");
-    expect(await run(blindRepo, ["stop", "overseer", "--seat", "s"], watched())).toMatchObject({ code: 1, out: expect.stringContaining("BUSY") });
+    // A live holder (pid 1) is waited out for the whole finite policy, then refused BUSY — never reclaimed.
+    expect(await run(blindRepo, ["stop", "overseer", "--seat", "s"], watched({ sleep: async () => {} }))).toMatchObject({ code: 1, out: expect.stringContaining("still held after 20 attempts") });
     expect(alive(blindChild.pid!)).toBe(true);
     expect(kills.filter(([pid]) => pid === process.pid || pid === foreignChild.pid || pid === blindChild.pid)).toEqual([]);
 
@@ -1115,7 +1124,7 @@ describe("beat loop", () => {
     const legacy = mkRepo();
     put(beatClaimPath(legacy, "orchestrator"), JSON.stringify({ token: "held", pid: 1 }) + "\n");
     for (const argv of [[], ["--new-arm"], ["--loop"], ["--stand-down"]]) {
-      expect(await run(legacy, ["orchestrator", "--seat", "s", ...argv])).toMatchObject({ code: 1, out: expect.stringContaining("BUSY") });
+      expect(await run(legacy, ["orchestrator", "--seat", "s", ...argv], deps({ sleep: async () => {} }))).toMatchObject({ code: 1, out: expect.stringContaining("BUSY") });
     }
     expect(existsSync(supervisionArmPath(legacy, "orchestrator"))).toBe(false);
     expect(existsSync(supervisionBeatPath(legacy, "orchestrator"))).toBe(false);
@@ -1167,7 +1176,7 @@ describe("beat loop", () => {
     expect((await run(seatBound, ["overseer", "--seat", "s", "--stand-down"], deps({ env }))).code).toBe(0);
     const ownedMarker = bytes(supervisionStandDownPath(seatBound, "overseer"));
     expect((await run(seatBound, ["overseer", "--seat", "other", "--stand-down"], deps({ env }))).code).toBe(1);
-    expect((await run(seatBound, ["overseer", "--seat", "other", "--stand-down"])).code).toBe(1); // no generation: BUSY
+    expect((await run(seatBound, ["overseer", "--seat", "other", "--stand-down"], deps({ sleep: async () => {} }))).code).toBe(1); // no generation: BUSY
     rmSync(beatClaimPath(seatBound, "overseer"));
     expect(await run(seatBound, ["overseer", "--seat", "other", "--stand-down"])).toMatchObject({ code: 1, out: expect.stringContaining("owned by a detached beat") });
     expect(bytes(supervisionStandDownPath(seatBound, "overseer"))).toBe(ownedMarker);

@@ -9,7 +9,7 @@ import { DEFAULT_CONFIG } from "../../src/config/config.js";
 import { captureBaseline, compareToBaseline, type Baseline, type BaselineCommand } from "../../src/gates/baseline.js";
 import { runGates, testCommandForFiles } from "../../src/gates/run-gates.js";
 import type { GateResult } from "../../src/gates/types.js";
-import { discoverTestManifest, evaluateManifestedTest, fileHangBudgetMs, isVitestTestCommand, MIN_FILE_HANG_BUDGET_MS, readTestReport, resetHangBudgetFloorForTests, resetHangClocksForTests, setHangBudgetFloorForTests, setHangClocksForTests, singleForkRetryCommand, verifyManifestReport } from "../../src/gates/test-manifest.js";
+import { discoverTestManifest, evaluateManifestedTest, fileHangBudgetMs, isVitestTestCommand, MIN_FILE_HANG_BUDGET_MS, readTestReport, resetHangBudgetFloorForTests, resetHangClocksForTests, resetSleepEvidenceForTests, setHangBudgetFloorForTests, setHangClocksForTests, setSleepEvidenceForTests, singleForkRetryCommand, verifyManifestReport } from "../../src/gates/test-manifest.js";
 import { TEST_REPORTER_SOURCE } from "../../src/gates/test-reporter.js";
 import { preserveWorktree, shGitOk, VERIFICATION_PROTOCOL } from "../../src/run/git.js";
 import { SubprocessDriver } from "../../src/drivers/subprocess.js";
@@ -281,10 +281,10 @@ test("through runGates a round whose diff is covered by a selected screen passes
   executed(broken, "selected-full", bad, "vitest run --globals");
 }, 90_000);
 
-test("a file that was RED in the baseline is budgeted as untimed at three times the longest usable duration, even beside a green per-project measurement of the same file, while a green file keeps the larger of three times its own duration and the longest, so a fixed slow file is never killed at a budget sized by its early-ending red run", () => {
+test("a file that was RED in the baseline is budgeted as untimed at the finite battery ceiling, even beside a green per-project measurement of the same file, while a green file keeps the larger of three times its own duration and the longest, so a fixed slow file is never killed at a budget sized by its early-ending red run", () => {
   const timings = [{ file: "tests/red.test.ts", durationMs: 47, failed: true as const }, { file: "tests/red.test.ts", durationMs: 6 },
     { file: "tests/green.test.ts", durationMs: 40 }, { file: "tests/longest.test.ts", durationMs: 100 }];
-  expect(fileHangBudgetMs("tests/red.test.ts", timings, 10_000)).toBe(300); // was max(3 × 47, 100) = 141
+  expect(fileHangBudgetMs("tests/red.test.ts", timings, 10_000)).toBe(10_000); // was max(3 × 47, 100) = 141, then 3 × longest = 300
   expect(fileHangBudgetMs("tests/red.test.ts", timings, 200)).toBe(200); // still capped by the battery ceiling
   expect(fileHangBudgetMs("tests/green.test.ts", timings, 10_000)).toBe(120);
   expect(fileHangBudgetMs("tests/longest.test.ts", timings, 10_000)).toBe(300);
@@ -292,25 +292,25 @@ test("a file that was RED in the baseline is budgeted as untimed at three times 
   for (const durationMs of [0, -1, NaN, Infinity]) {
     const redEntry = { file: "tests/a.test.ts", durationMs, failed: true as const }, green = { file: "tests/a.test.ts", durationMs: 6 };
     for (const order of [[redEntry, green], [green, redEntry]]) {
-      expect({ durationMs, budget: fileHangBudgetMs("tests/a.test.ts", [...order, { file: "tests/b.test.ts", durationMs: 100 }], 1_000) }).toEqual({ durationMs, budget: 300 });
+      expect({ durationMs, budget: fileHangBudgetMs("tests/a.test.ts", [...order, { file: "tests/b.test.ts", durationMs: 100 }], 1_000) }).toEqual({ durationMs, budget: 1_000 });
     }
   }
 });
 
-test("through runGates a fixture baseline with known per-file durations yields for each timed file the larger of three times its duration and the longest usable duration capped at the battery ceiling, three times the longest usable for an untimed file, and the positive battery ceiling when nothing usable was timed, including a baseline whose observations are all zero and a legacy baseline keeping only a zero longestFile, each budgeting at the ceiling rather than terminating at once, a stand-in runner resolved as the worktree's vitest that writes a file's started record and never completes it is killed at that file's budget with an infra hang result naming the file and the budget and the runner's process group gone, the same kill names the file when its budget equals the battery ceiling, and the same runner completing that file with a failed test is a work result, so a budget derived from the gate under test, a zero or non-finite duration used as a timing, a hang left to the battery ceiling, a hang reported as a regression, or an untimed file killed at zero fails", async () => {
+test("through runGates a fixture baseline with known per-file durations yields for each timed file the larger of three times its duration and the longest usable duration capped at the battery ceiling, and the positive battery ceiling for an untimed file, a legacy longest-only baseline and when nothing usable was timed, including a baseline whose observations are all zero and a legacy baseline keeping only a zero longestFile, each budgeting at the ceiling rather than terminating at once, a stand-in runner resolved as the worktree's vitest that writes a file's started record and never completes it is killed at that file's budget with an infra hang result naming the file and the budget and the runner's process group gone, the same kill names the file when its budget equals the battery ceiling, and the same runner completing that file with a failed test is a work result, so a budget derived from the gate under test, a zero or non-finite duration used as a timing, a hang left to the battery ceiling, a hang reported as a regression, or an untimed file killed at zero fails", async () => {
   setHangBudgetFloorForTests(0); onTestFinished(resetHangBudgetFloorForTests); // the derived budget's own kill mechanics
   const timings = [{file:"tests/a.test.ts",durationMs:40},{file:"tests/b.test.ts",durationMs:100},{file:"zero",durationMs:0},{file:"nan",durationMs:NaN},{file:"inf",durationMs:Infinity}];
   expect(fileHangBudgetMs("tests/a.test.ts",timings,1000)).toBe(120);
   expect(fileHangBudgetMs("tests/b.test.ts",timings,200)).toBe(200);
-  expect(fileHangBudgetMs("missing",timings,1000)).toBe(300);
-  expect(fileHangBudgetMs("zero",timings,1000)).toBe(300);
-  expect(fileHangBudgetMs("nan",timings,1000)).toBe(300);
-  expect(fileHangBudgetMs("inf",timings,1000)).toBe(300);
+  expect(fileHangBudgetMs("missing",timings,1000)).toBe(1000);
+  expect(fileHangBudgetMs("zero",timings,1000)).toBe(1000);
+  expect(fileHangBudgetMs("nan",timings,1000)).toBe(1000);
+  expect(fileHangBudgetMs("inf",timings,1000)).toBe(1000);
   const cases: Array<[string, Partial<BaselineCommand>, number]> = [
     ["timed",{fileDurations:timings,ceilingMs:LISTING_ALLOWANCE_MS},120],
     ["longest-wins",{fileDurations:[{file:"tests/a.test.ts",durationMs:10},{file:"b",durationMs:180}],ceilingMs:LISTING_ALLOWANCE_MS},180],
-    ["untimed",{fileDurations:[{file:"b",durationMs:60}],ceilingMs:LISTING_ALLOWANCE_MS},180],
-    ["legacy",{longestFile:{file:"tests/a.test.ts",durationMs:60},ceilingMs:LISTING_ALLOWANCE_MS},180],
+    ["untimed",{fileDurations:[{file:"b",durationMs:60}],ceilingMs:5000},5000],
+    ["legacy",{longestFile:{file:"tests/a.test.ts",durationMs:60},ceilingMs:5000},5000],
     ["none",{ceilingMs:5000},5000],
     ["zero",{fileDurations:[{file:"tests/a.test.ts",durationMs:0}],ceilingMs:5000},5000],
     ["legacy-zero",{longestFile:{file:"a",durationMs:0},ceilingMs:5000},5000],
@@ -337,7 +337,7 @@ test("through runGates a fixture baseline with known per-file durations yields f
   expect(captured.commands.test.fileDurations).toEqual([{file:"tests/a.test.ts",durationMs:0},{file:"tests/b.test.ts",durationMs:12},{file:"tests/c.test.ts",durationMs:2000}]);
 }, 90_000);
 
-test("test: a fast baseline's millisecond file timings no longer yield a millisecond hang budget — a new 400 ms test file passes the real runner under the 10000 ms hang-budget floor, while the same round with the floor removed kills it as an infra hang at three times the longest timing", async () => {
+test("test: a fast baseline's millisecond file timings no longer yield a millisecond hang budget — a 400 ms test file timed at 100 ms passes the real runner under the 10000 ms hang-budget floor, while the same round with the floor removed kills it as an infra hang at three times its own timing", async () => {
   expect(MIN_FILE_HANG_BUDGET_MS).toBe(10_000);
   for (const floor of [true, false]) {
     if (!floor) { setHangBudgetFloorForTests(0); onTestFinished(resetHangBudgetFloorForTests); }
@@ -345,9 +345,10 @@ test("test: a fast baseline's millisecond file timings no longer yield a millise
     writeFileSync(join(f.repo, "tests/c.test.ts"), 'test("slow but lawful", async () => { await new Promise((r) => setTimeout(r, 400)); expect(1).toBe(1); });\n');
     commit(f.repo);
     // The baseline files are trivial; timed at 100 ms they get a 300 ms budget without the floor and finish
-    // far inside it even under load, so only the new 400 ms file can overrun it (D-1281: at 1 ms
-    // a 3 ms budget let a loaded baseline file overrun first).
-    const row = await round(f, "vitest run --globals", { fileDurations: [{ file: "tests/a.test.ts", durationMs: 100 }, { file: "tests/b.test.ts", durationMs: 100 }], ceilingMs: LISTING_ALLOWANCE_MS });
+    // far inside it even under load, so only the 400 ms file can overrun it (D-1281: at 1 ms
+    // a 3 ms budget let a loaded baseline file overrun first). v2.6.8 T3: an untimed file now runs to the
+    // battery ceiling, so the slow file carries its own (stale) 100 ms green measurement.
+    const row = await round(f, "vitest run --globals", { fileDurations: [{ file: "tests/a.test.ts", durationMs: 100 }, { file: "tests/b.test.ts", durationMs: 100 }, { file: "tests/c.test.ts", durationMs: 100 }], ceilingMs: LISTING_ALLOWANCE_MS });
     if (floor) expect({ pass: row.pass, kind: row.meta?.kind }, row.details).toEqual({ pass: true, kind: undefined });
     else expect(row.meta, row.details).toMatchObject({ classification: "infra", kind: "hang", file: "tests/c.test.ts", hangBudgetMs: 300 });
   }
@@ -1196,6 +1197,8 @@ test("test: production task/tip gates classify a 156-second wall-only jump as in
     mono: () => performance.now() + (existsSync(started) ? monoMs : 0),
   });
   const cmd = "vitest run --globals";
+  // The wall-only control never consults the host's kernel sleep record (tests/gates/untimed-sleep-budget.test.ts owns that table).
+  setSleepEvidenceForTests({ platform: () => "linux" });
   try {
     for (const surface of ["task", "tip"] as const) {
       const outcome = async (f: Fixture) => {
@@ -1248,7 +1251,7 @@ test("test: production task/tip gates classify a 156-second wall-only jump as in
       }
       resetHangClocksForTests();
     }
-  } finally { resetHangClocksForTests(); }
+  } finally { resetHangClocksForTests(); resetSleepEvidenceForTests(); }
 }, 90_000);
 
 test("production manifest discovery completes a barrier-delayed listing within the 60000 ms fixture allowance while an injected never-completing listing released by execution-signal cancellation rejects with partial diagnostics and evidence receipts after cleanup inside an enclosing test timeout of at least 180000 ms", async () => {

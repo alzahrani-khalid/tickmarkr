@@ -184,16 +184,19 @@ describe("semantic seat delivery (production daemon, fake adapters, zero tokens)
       expect(taskRows(rows, "task-dispatch")).toHaveLength(1);
       expect(rows.filter((row) => row.event === "task-failed")).toEqual([]);
     }
-    // Reviewer: the first seat cannot launch; the next seat reviews and the task merges.
+    // Reviewer: the first seat cannot launch, nor on its one same-seat relaunch (v2.6.8 T1); the next seat
+    // reviews and the task merges.
     {
       const { repo, scriptPath } = setupRepo([T("T1")], { tasks: { T1: [work("f0")] } },
         PANE + "review: { required: true, prefer: [seat-a, seat-b], timeoutMs: 5000 }\n");
-      const { driver } = seatDriver((name) => role(name, "review", 0));
+      const { driver } = seatDriver((name) => role(name, "review", 0) || role(name, "review", 1));
       const seats = [new Reviewer(scriptPath, "seat-a", ["approve"]), new Reviewer(scriptPath, "seat-b", ["approve"])];
       const s = await runDaemon(repo, { adapters: [new Author(scriptPath), ...seats], runId: "run-review-reroute", driver });
       expect(s.done).toEqual(["T1"]);
       const rows = rowsOf(repo, "run-review-reroute");
-      expect(taskRows(rows, "review-no-verdict").map((row) => row.data)).toEqual([expect.objectContaining({ reviewer: "seat-a:seat-a", cause: "seat-launch-failed" })]);
+      expect(taskRows(rows, "review-no-verdict").map((row) => row.data)).toEqual([
+        expect.objectContaining({ reviewer: "seat-a:seat-a", cause: "seat-launch-failed" }), expect.objectContaining({ reviewer: "seat-a:seat-a", cause: "seat-launch-failed" })]);
+      expect(taskRows(rows, "review-infra-retry").map((row) => row.data)).toEqual([expect.objectContaining({ reviewer: "seat-a:seat-a", sameSeat: true })]);
       expect(taskRows(rows, "gate-result").filter((row) => row.data.gate === "review").at(-1)?.data).toMatchObject({ pass: true, reviewer: "seat-b:seat-b" });
       expect(taskRows(rows, "task-dispatch")).toHaveLength(1);
       expect(rows.filter((row) => row.event === "task-failed")).toEqual([]);

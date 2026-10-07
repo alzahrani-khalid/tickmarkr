@@ -4,7 +4,8 @@
 // unrelated repository keeps its own lease. vitest.config.ts registers this module as globalSetup:
 // Vitest runs it in the main process before the first fork is spawned (the fork environment is built
 // after global setup), so the exported token reaches every fork and every nested runner they start,
-// and its close hook releases the lease only after the runner's children have completed.
+// and its close hook releases the lease only after the runner's owned workloads — the forks and
+// whatever they started — have completed, never waiting out its deadline on the runner's own tooling.
 // Bounds: this is cooperation between configured entries, not enforcement over arbitrary shells or
 // foreign runner configurations; a dead holder is reclaimed only once its token-bound tree ceases.
 import { execFileSync, spawnSync } from "node:child_process";
@@ -21,18 +22,21 @@ export const isListingInvocation = (argv: readonly string[] = process.argv): boo
 
 const sleepSync = (ms: number) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 
-/** Every live (non-zombie) process below this one, from one `ps` snapshot that leaves out `ps` itself. */
-function descendants(): number[] {
-  const ps = spawnSync("ps", ["-A", "-o", "pid=,ppid=,stat="], { encoding: "utf8" });
+/** Every live (non-zombie) process below this one, from one `ps` snapshot that leaves out `ps` itself.
+ * `identity` is pid plus birth time, so a reused pid never passes for the process it replaced. */
+type Descendant = { pid: number; identity: string };
+function descendants(): Descendant[] {
+  const ps = spawnSync("ps", ["-A", "-o", "pid=,ppid=,stat=,lstart="], { encoding: "utf8" });
   if (ps.status !== 0) throw ps.error ?? new Error(`ps exited ${ps.status}`);
-  const children = new Map<number, number[]>();
+  const children = new Map<number, Descendant[]>();
   for (const line of ps.stdout.split("\n")) {
-    const [pid, ppid, stat = "Z"] = line.trim().split(/\s+/);
-    if (stat.startsWith("Z") || Number(pid) === ps.pid) continue;
-    children.set(Number(ppid), [...children.get(Number(ppid)) ?? [], Number(pid)]);
+    const row = /^\s*(\d+)\s+(\d+)\s+(\S+)\s*(.*)$/.exec(line);
+    if (!row || row[3]!.startsWith("Z") || Number(row[1]) === ps.pid) continue;
+    const ppid = Number(row[2]);
+    children.set(ppid, [...children.get(ppid) ?? [], { pid: Number(row[1]), identity: `${row[1]}:${row[4]!.trim()}` }]);
   }
-  const found: number[] = [];
-  for (let queue = [process.pid]; queue.length;) for (const pid of children.get(queue.shift()!) ?? []) { found.push(pid); queue.push(pid); }
+  const found: Descendant[] = [];
+  for (let queue = [process.pid]; queue.length;) for (const child of children.get(queue.shift()!) ?? []) { found.push(child); queue.push(child.pid); }
   return found;
 }
 const signal = (pid: number, sig: NodeJS.Signals) => { try { process.kill(pid, sig); } catch { /* already gone */ } };
@@ -47,8 +51,8 @@ const running = (pid: number): boolean => {
 export function stopOwnedRunners(deadlineMs = 10_000): boolean {
   const owned = new Set<number>();
   try {
-    for (let fresh = descendants(); fresh.some((pid) => !owned.has(pid)); fresh = descendants()) {
-      for (const pid of fresh) if (!owned.has(pid)) { signal(pid, "SIGSTOP"); owned.add(pid); }
+    for (let fresh = descendants(); fresh.some(({ pid }) => !owned.has(pid)); fresh = descendants()) {
+      for (const { pid } of fresh) if (!owned.has(pid)) { signal(pid, "SIGSTOP"); owned.add(pid); }
     }
   } finally {
     // C-9(i) (D-670): a census that throws after a SIGSTOP must not leave frozen processes behind.
@@ -62,15 +66,20 @@ export function stopOwnedRunners(deadlineMs = 10_000): boolean {
 
 /** Vitest closes its pool after global teardown. Let that normal shutdown reap the workers
  * before repository cleanup signals any residual children. The public close hook is awaited
- * alongside pool shutdown, so waiting here cannot hold up the pool's own close operation. */
-async function awaitRunnerShutdown(deadlineMs = 10_000): Promise<void> {
+ * alongside pool shutdown, so waiting here cannot hold up the pool's own close operation.
+ * Only the owned workloads are awaited: the forks and everything beneath them. A child the main
+ * process keeps for its own lifetime (Vite's esbuild service, measured as the sole survivor at
+ * every close) is `tooling` — it was already below this process before the first fork — and
+ * waiting on it would only pay the full deadline at every close, nested runs included (D-1300). */
+async function awaitRunnerShutdown(tooling: ReadonlySet<string>, deadlineMs = 10_000): Promise<void> {
   const end = Date.now() + deadlineMs;
-  while (descendants().length && Date.now() < end) await new Promise(resolve => setTimeout(resolve, 20));
+  const workload = () => descendants().some(({ identity }) => !tooling.has(identity));
+  while (workload() && Date.now() < end) await new Promise(resolve => setTimeout(resolve, 20));
 }
 
 // Vitest runs globalSetup once per project in this one process; the first call holds, the rest share it.
 const HELD = Symbol.for("tickmarkr.vitest-lease");
-type Held = { users: number; release: () => void; done: Promise<unknown> };
+type Held = { users: number; release: () => void; done: Promise<unknown>; tooling: Set<string> };
 const registry = globalThis as { [HELD]?: Held };
 
 export default async function vitestLease(project: TestProject): Promise<(() => Promise<void>) | undefined> {
@@ -102,10 +111,16 @@ export default async function vitestLease(project: TestProject): Promise<(() => 
       if (gone && holder?.pid === process.pid && holder.token === token) rmSync(path, { force: true });
     };
     process.prependOnceListener("exit", onExit);
-    held = registry[HELD] = { users: 0, release: () => { process.off("exit", onExit); release(); }, done };
+    held = registry[HELD] = { users: 0, release: () => { process.off("exit", onExit); release(); }, done, tooling: new Set() };
+    // The first project's global setup runs here, in the main process, before the first owned fork: whatever
+    // already lives below this process is the runner's own tooling, structurally — not an owned workload,
+    // whatever its argv says. Captured ONCE: a later project's setup may find an earlier project's fork or
+    // nested runner alive, and that is workload. An unreadable census leaves the set empty, so close waits
+    // for every child as before.
+    try { for (const { identity } of descendants()) held.tooling.add(identity); } catch { /* ps unreadable */ }
     const own = held;
     project.vitest.onClose(async () => {
-      await awaitRunnerShutdown();
+      await awaitRunnerShutdown(own.tooling);
       own.release();
       await own.done;
     });

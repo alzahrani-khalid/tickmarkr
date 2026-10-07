@@ -10,7 +10,8 @@ import { type Effort, GATE_NAMES, type GateName, type Task } from "../graph/sche
 import { acceptanceGate, type JudgedCriterion } from "./acceptance.js";
 import { type Baseline, type RetryOptions, type GateEvidenceOptions, classifiedFileDurations, compareToBaseline, effectiveCeilingMs, waitForCalmWindow, calmWindowReady } from "./baseline.js";
 import { evidenceGate } from "./evidence.js";
-import { captureLlmOutput, type GateVia } from "./llm.js";
+import { captureLlmOutput, type GateVia, SeatLaunchError } from "./llm.js";
+import { withLaunchGuard } from "../drivers/orca.js";
 import type { Slot } from "../drivers/types.js";
 import { disallowedBy, observedSeat } from "../route/preference.js";
 import { marginalCostRank } from "../route/router.js";
@@ -191,9 +192,14 @@ export interface GateContext {
   /** OBS-1151: this task's earlier parsed judgments, newest first (the journal's, so they survive resume). */
   priorJudgments?: readonly PriorJudgment[];
   excludeReviewers?: string[]; // v1.1: reviewer channels that produced garbage for this task (failover)
+  // v2.6.8 T1: a SOFT preference only — a demoted seat ranks last and stays seatable (live or replayed on resume).
   demotedReviewers?: Set<string>;
-  // OBS-1025 add.2: run-scoped no-verdict causes per reviewer seat; a seat at two leaves the rotation for the run.
+  // OBS-1025 add.2 / v2.6.8 T1: run-scoped REAL no-verdict causes per reviewer seat (a launch failure never
+  // enters it); a seat at two is RETIRED for the run — a hard exclusion read live at every pick, never soft.
   reviewNoVerdicts?: Map<string, string[]>;
+  /** v2.6.8 T1: review seats whose one same-seat launch retry this candidate already spent (the daemon
+   * replays them from the journal), so a resume or recheck never re-grants it by forgetting. */
+  launchRetried?: readonly string[];
   // OBS-1055: this round is an operator recheck — it re-MEASURES, so a cached RED verdict is discarded
   // and the gate re-runs (a cached green is not what the recheck questions and may replay).
   recheck?: boolean;
@@ -1388,26 +1394,64 @@ export async function runGates(
     // seat spends two invocations, and one blended span cannot tell a slow reviewer from two.
     // A pick that found NO eligible seat dispatched nothing, so it contributes no invocation.
     const invocations: LlmDispatchSpan[] = [];
+    const retiredNow = () => [...(ctx.reviewNoVerdicts ?? [])].filter(([, causes]) => causes.length >= 2).map(([seat]) => seat);
+    // v2.6.8 T1: retirement is live through the LAUNCH, not only the pick. reviewGate awaits its diff read
+    // after it picks, and a pane seat awaits its slot, so another task can retire the picked seat inside
+    // either await. The seat is named when its command is built and checked against the live tally there and
+    // again as its pane is bound (onSlot runs inside llm.ts's launch guard, which closes that pane unrun), and
+    // a driver that still awaits lookups before it submits the terminal (Orca's runtime probe and worktree
+    // lookup) re-reads it at that submission (withLaunchGuard): a retired seat is never launched, and dispatch
+    // picks again under the live exclusions (atPick) — the next eligible seat, or none. Bounded: each
+    // withdrawal is a seat newly retired, and the pool is finite.
+    let launching: { seat?: string; withdrawn?: boolean } = {};
+    const refuseRetired = () => {
+      if (launching.seat === undefined || !retiredNow().includes(launching.seat)) return;
+      launching.withdrawn = true;
+      throw new SeatLaunchError(launching.seat, new Error("retired for the run before it launched"));
+    };
+    const reviewVia: GateVia | undefined = via && { ...via, onSlot: (slot) => { via.onSlot?.(slot); refuseRetired(); } };
+    const guarded = (adapter: WorkerAdapter): WorkerAdapter => new Proxy(adapter, {
+      get(target, property) {
+        if (property === "headlessCommand") {
+          return (promptFile: string, model: string, effort?: Effort): string => {
+            launching.seat = channelKey({ adapter: target.id, model });
+            refuseRetired();
+            return target.headlessCommand(promptFile, model, effort);
+          };
+        }
+        const value: unknown = Reflect.get(target, property, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
     // Dispatch is PROVEN, never inferred: captureLlmOutput records one output per runLlm return, so an
     // empty capture means reviewGate returned before asking anyone — a policy skip, a pre-dispatch diff
     // cap, or no eligible seat. Reading `noEligibleReviewer` alone missed the first two and invented
     // an "unknown" span for each.
     const dispatch = async (run: (adapters: WorkerAdapter[]) => Promise<GateResult>): Promise<GateResult> => {
-      const captured = await captureLlmDispatches(ctx.adapters, run);
-      invocations.push(...captured.invocations);
-      const rv = captured.value;
+      const withdrawn: string[] = [];
+      let picked: GateResult;
+      for (;;) {
+        launching = {};
+        const captured = await withLaunchGuard(refuseRetired, () => captureLlmDispatches(ctx.adapters.map(guarded), run));
+        invocations.push(...captured.invocations);
+        picked = captured.value;
+        if (cancelled || !launching.withdrawn) break;
+        withdrawn.push(launching.seat!);
+      }
+      const rv = withdrawn.length === 0 ? picked : { ...picked, details: `${withdrawn.map((seat) =>
+        `review dispatch withdrawn: ${seat} was retired for the run (two real no-verdicts) after it was picked, before it launched; picked again`).join("\n")}\n${picked.details}` };
       if (cancelled) return rv; // a cancelled seat's non-answer says nothing about the seat
       if (rv.meta?.noVerdict === true || rv.meta?.unparseable === true) {
         await ctx.onGate?.({ phase: "note", gate: "review", name: "review-no-verdict", payload: { ...rv.meta }, result: rv });
-        if (typeof rv.meta.reviewer === "string") {
+        // v2.6.8 T1: a seat that never LAUNCHED (any launchCause, checkout-proof-timeout or none) said
+        // nothing about the work or about itself: no run-scoped strike and no soft demotion. It gets one
+        // bounded same-seat launch retry below and is excluded for the rest of THIS round only.
+        if (typeof rv.meta.reviewer === "string" && rv.meta.cause !== "seat-launch-failed") {
           const reviewer = rv.meta.reviewer;
           const cause = String(rv.meta.cause);
-          // E1: a checkout-proof timeout is the host being slow to print the seat's proof, not the seat
-          // failing. It is still a no-verdict re-routed away from for THIS round, but it never strikes the
-          // run-scoped tally; every other launch failure (foreign or malformed proof included) does.
-          const proofTimeout = cause === "seat-launch-failed" && rv.meta.launchCause === "checkout-proof-timeout";
-          // OBS-1025 add.2: the run-scoped tally; two no-verdicts retire the seat for the rest of the run.
-          const causes = rv.meta.noVerdict === true && ctx.reviewNoVerdicts && !proofTimeout
+          // OBS-1025 add.2: the run-scoped tally of REAL no-verdicts (silent, truncated, closure-mismatch,
+          // no nonce …); two of them retire the seat for the run — a hard exclusion, never a soft ranking.
+          const causes = rv.meta.noVerdict === true && ctx.reviewNoVerdicts
             ? [...(ctx.reviewNoVerdicts.get(reviewer) ?? []), cause] : undefined;
           if (causes) ctx.reviewNoVerdicts!.set(reviewer, causes);
           // OBS-1039: a seat below the byte floor at the beat is silent — demoted like a zero-byte seat.
@@ -1422,15 +1466,34 @@ export async function runGates(
       }
       return rv;
     };
-    // OBS-1025 add.2: seats with two no-verdicts this run are out of the rotation for every pick below.
-    const retired = [...(ctx.reviewNoVerdicts ?? [])].filter(([, causes]) => causes.length >= 2).map(([seat]) => seat);
+    // OBS-1025 add.2: seats with two REAL no-verdicts this run (launch failures never strike) are RETIRED:
+    // out of every pick below for the rest of the run, and a resumed daemon re-seeds the tally from the
+    // journal. demotedReviewers is only a soft preference, live or replayed on resume — it ranks a seat
+    // last and never excludes or retires it; history or prefer can never resurrect a retired seat.
+    // The tally is shared across the run's tasks, so it is read LIVE at every pick — after every awaited
+    // notification and inside reviewGate after its promotion reads (atPick), since another task can retire a
+    // seat inside any await: a seat retired while this round's dispatch, note or read is pending is out of
+    // the initial pick, the launch retry, the re-emission and the re-route alike — and one retired after its
+    // pick is refused at launch (dispatch, above).
+    const retired = retiredNow();
+    // reviewGate awaits its promotion path reads BEFORE it picks, and another task can retire a seat inside
+    // that await too. So the exclusions every reviewGate call is handed are a live view: each read — the pick's
+    // included — answers from `fixed` plus the tally as it stands at that read, never a copy taken before.
+    // ponytail: a read-through Proxy because review.ts takes a plain list; a live-exclusion parameter there retires it.
+    const atPick = (fixed: readonly string[]): string[] => new Proxy<string[]>([], {
+      get: (_target, prop) => {
+        const now = [...new Set([...fixed, ...retiredNow()])];
+        const value: unknown = Reflect.get(now, prop);
+        return typeof value === "function" ? value.bind(now) : value;
+      },
+    });
     // RF-1: THIS task's prior reviewers — earlier rounds' seats plus the seats that produced garbage for
     // it (excludeReviewers names only dispatched seats). Kept apart from the eligibility exclusions the
     // retry below adds for a flaked seat's whole adapter: those sibling channels never reviewed.
     const priorReviewers = [...(ctx.priorReviewers ?? []), ...(ctx.excludeReviewers ?? [])];
     const carriedAuthors = ctx.carriedAuthors ?? [];
     let exclusions = [...(ctx.excludeReviewers ?? []), ...retired];
-    let rv = await dispatch((adapters) => reviewGate(task, ctx.worktree, ctx.baseRef, ctx.author, ctx.channels, adapters, ctx.cfg, via, exclusions, ctx.artifactDir, ctx.reviewHistory, ctx.demotedReviewers, ctx.carriedFindings, priorReviewers, carriedAuthors, ctx.operatorContext));
+    let rv = await dispatch((adapters) => reviewGate(task, ctx.worktree, ctx.baseRef, ctx.author, ctx.channels, adapters, ctx.cfg, reviewVia, atPick(exclusions), ctx.artifactDir, ctx.reviewHistory, ctx.demotedReviewers, ctx.carriedFindings, priorReviewers, carriedAuthors, ctx.operatorContext));
     // OBS-193/574: an unparseable review verdict retries the REVIEW, preferring a different adapter. Only
     // a single-adapter eligible pool may fall back to another channel on the flaked adapter. The flaked
     // verdict never enters results; an exhausted pool preserves its cause.
@@ -1442,21 +1505,55 @@ export async function runGates(
     let hop = 0;
     // OBS-1196: seats already re-asked after a malformed verdict — once per seat, so never unbounded.
     const reemitted = new Set<string>();
+    // v2.6.8 T1: seats already relaunched after a launch failure — once per seat per candidate (the
+    // daemon replays the spent ones), so a launch retry is bounded and never a second malformed allowance.
+    const launchRetried = new Set(ctx.launchRetried ?? []);
     while (!cancelled && (rv.meta?.unparseable === true || rv.meta?.noVerdict === true) && typeof rv.meta.reviewer === "string") {
       hop++;
       const flaked = rv.meta.reviewer;
-      const retryVia = via
-        ? { ...via, nameFor: (role: "judge" | "review", adapter: string) => via!.nameFor(role, adapter) + `-r${hop}` }
+      const retryVia = reviewVia
+        ? { ...reviewVia, nameFor: (role: "judge" | "review", adapter: string) => reviewVia.nameFor(role, adapter) + `-r${hop}` }
         : undefined;
+      // v2.6.8 T1: bounded same-seat launch retry. A seat that could not launch is launched ONCE more
+      // (fresh launch identity, fresh nonce, same subject) before any other seat is picked, journaled as
+      // the review-infra-retry naming that seat; its verdict decides. A second refusal re-routes below. A
+      // seat two real no-verdicts retired — before the note, while it was awaited, or during the relaunch's
+      // own promotion read (atPick) — is never relaunched: the withdrawn retry is said in the round's
+      // details, and the re-route below excludes the seat.
+      if (rv.meta.cause === "seat-launch-failed" && !launchRetried.has(flaked) && !retiredNow().includes(flaked)) {
+        launchRetried.add(flaked);
+        await ctx.onGate?.({ phase: "note", gate: "review", name: "review-infra-retry", payload: { reviewer: flaked, cause: "seat-launch-failed",
+          sameSeat: true, ...(rv.meta.launchCause ? { launchCause: rv.meta.launchCause } : {}) }, result: rv });
+        const others = ctx.channels.map(channelKey).filter((key) => key !== flaked);
+        const again = retiredNow().includes(flaked) ? undefined : await dispatch((adapters) => reviewGate(
+          task, ctx.worktree, ctx.baseRef, ctx.author, ctx.channels, adapters, ctx.cfg,
+          retryVia, atPick(others), ctx.artifactDir, ctx.reviewHistory, ctx.demotedReviewers, ctx.carriedFindings, retryPrior, carriedAuthors, ctx.operatorContext,
+        ));
+        if (again && again.meta?.noEligibleReviewer !== true) {
+          // The relaunch that completes a malformed verdict's re-emission (the re-emission was what failed to
+          // launch) publishes that delivery, so the seat is a delivery flake again, not a bad reviewer.
+          const reemission = (rv.meta.reviewReemission as { reviewer?: unknown } | undefined)?.reviewer === flaked;
+          if (reemission && again.meta?.unparseable !== true && again.meta?.noVerdict !== true) {
+            await ctx.onGate?.({ phase: "note", gate: "review", name: "review-reemission", payload: { reviewer: flaked, cause: "malformed-verdict",
+              delivered: true, launchRetry: true }, result: again });
+          }
+          routes.push(`review launch retry (same seat, fresh launch): ${flaked} failed to launch; launched once more`);
+          rv = { ...again, details: `${routes.join("\n")}\n${again.details}`, meta: { ...again.meta, reviewLaunchRetry: { reviewer: flaked } } };
+          continue;
+        }
+        if (retiredNow().includes(flaked)) {
+          routes.push(`review launch retry withdrawn: ${flaked} was retired for the run (two real no-verdicts) while its relaunch was pending`);
+        }
+      }
       // OBS-1196: a malformed (unparseable) verdict is a delivery defect of THIS seat, not a reason to drop it. Ask the
       // same seat once more on the same subject; reviewGate mints a fresh nonce, so only a new, whole,
       // nonce-bound verdict can answer — the malformed bytes are never salvaged into one.
-      if (rv.meta.cause === "malformed-verdict" && rv.meta.closureInvalid !== true && !reemitted.has(flaked)) {
+      if (rv.meta.cause === "malformed-verdict" && rv.meta.closureInvalid !== true && !reemitted.has(flaked) && !retiredNow().includes(flaked)) {
         reemitted.add(flaked);
         const others = ctx.channels.map(channelKey).filter((key) => key !== flaked);
         const again = await dispatch((adapters) => reviewGate(
           task, ctx.worktree, ctx.baseRef, ctx.author, ctx.channels, adapters, ctx.cfg,
-          retryVia, others, ctx.artifactDir, ctx.reviewHistory, ctx.demotedReviewers, ctx.carriedFindings, retryPrior, carriedAuthors, ctx.operatorContext,
+          retryVia, atPick(others), ctx.artifactDir, ctx.reviewHistory, ctx.demotedReviewers, ctx.carriedFindings, retryPrior, carriedAuthors, ctx.operatorContext,
         ));
         if (again.meta?.noEligibleReviewer !== true) {
           await ctx.onGate?.({ phase: "note", gate: "review", name: "review-reemission", payload: { reviewer: flaked, cause: "malformed-verdict",
@@ -1464,6 +1561,9 @@ export async function runGates(
           routes.push(`review re-emission (same seat, fresh nonce): ${flaked} produced a malformed verdict; asked once more`);
           rv = { ...again, details: `${routes.join("\n")}\n${again.details}`, meta: { ...again.meta, reviewReemission: { reviewer: flaked } } };
           continue;
+        }
+        if (retiredNow().includes(flaked)) {
+          routes.push(`review re-emission withdrawn: ${flaked} was retired for the run (two real no-verdicts) while its re-emission was pending`);
         }
       }
       const emptyOutput = rv.meta.cause === "empty-output";
@@ -1480,6 +1580,7 @@ export async function runGates(
       // and the prior reviewers' tiers, the flaked seat's own included, so a retry never drops a tier.
       retryPrior = [...retryPrior, flaked];
       const retryFloor = gateReviewerFloor(task, ctx.cfg, ctx.author, ctx.channels, retryPrior).floor;
+      exclusions = [...new Set([...exclusions, ...retiredNow()])];
       const crossAdapter = pickReviewer(
         ctx.author, ctx.channels, [...exclusions, ...adapterExclusions],
         ctx.cfg.review.prefer ?? [], retryFloor, undefined, undefined, undefined, carriedAuthorVendors(ctx.channels, carriedAuthors),
@@ -1488,14 +1589,15 @@ export async function runGates(
       exclusions = [...exclusions, ...(crossAdapter ? adapterExclusions : [flaked])];
       const second = await dispatch((adapters) => reviewGate(
         task, ctx.worktree, ctx.baseRef, ctx.author, ctx.channels, adapters, ctx.cfg,
-        retryVia, exclusions, ctx.artifactDir, ctx.reviewHistory, ctx.demotedReviewers, ctx.carriedFindings, retryPrior, carriedAuthors, ctx.operatorContext,
+        retryVia, atPick(exclusions), ctx.artifactDir, ctx.reviewHistory, ctx.demotedReviewers, ctx.carriedFindings, retryPrior, carriedAuthors, ctx.operatorContext,
       ));
       if (second.meta?.noEligibleReviewer !== true) {
         const retried = typeof second.meta?.reviewer === "string" ? second.meta.reviewer : "none";
         const route = exclusion === "adapter"
           ? `different-adapter retry; excluded flaked adapter ${flakedAdapter}`
           : `same-adapter fallback; excluded flaked channel ${flaked}`;
-        const produced = emptyOutput ? "EMPTY output" : rv.meta.cause === "closure-mismatch" ? "a verdict closing no carried fingerprint" : "no parseable verdict";
+        const produced = emptyOutput ? "EMPTY output" : rv.meta.cause === "closure-mismatch" ? "a verdict closing no carried fingerprint"
+          : rv.meta.cause === "seat-launch-failed" ? "no verdict (it failed to launch)" : "no parseable verdict";
         // `details` is lifted onto the journal's gate-result row; meta.reviewRetry is not. Keep every
         // re-route visible in the result text a reader actually opens, including on a red retry.
         routes.push(`review re-route (${route}): ${flaked} produced ${produced}; replaced by ${retried}`);

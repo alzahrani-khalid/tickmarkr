@@ -10,6 +10,7 @@ import {
   publishStandDown,
   readSupervisionArm,
   resolveSupervisionRoot,
+  supervisionStatus,
   type SupervisionArm,
   type SupervisionTier,
 } from "../../run/supervision.js";
@@ -19,8 +20,11 @@ import {
   defaultBeatDeps,
   startBeat,
   stopBeat,
+  supervised,
+  unclaimed,
   withLegacyClaim,
   type BeatLifecycleDeps,
+  type ClaimGuard,
   type LegacyRecheck,
 } from "../../run/beat-lifecycle.js";
 
@@ -64,10 +68,26 @@ export async function beat(
   const repoRoot = resolveSupervisionRoot(cwd);
   if (verb === "start") return startBeat(repoRoot, tier, seat, deps);
   if (verb === "stop") return stopBeat(repoRoot, tier, seat, deps);
+  // Every legacy writer reclaims a claim whose recorded pids are all confirmed dead (a writer killed inside its claimed
+  // tick), recovers what a killed taker or writer left (its removal lock or pid-named lock entry, act marker, stage
+  // directory) and retires a dead or abandoned generation recorded for its seat (stood down, owner removed, nothing
+  // signalled); each such notice leads the final result or refusal, so a recovery is never reported as a plain write.
+  const notices: string[] = [];
+  const told = (message: string) => [...notices, message].join("\n");
+  try {
+    return told(await legacyWrite(repoRoot, tier, seat, values, deps, (notice) => { notices.push(notice); }));
+  } catch (error) {
+    throw notices.length > 0 && error instanceof Error ? new Error(told(error.message)) : error;
+  }
+}
+
+async function legacyWrite(
+  repoRoot: string, tier: SupervisionTier, seat: string, values: ParsedBeat["values"], deps: BeatLifecycleDeps, noticed: (notice: string) => void,
+): Promise<string> {
   const generation = deps.env[BEAT_GENERATION_ENV]?.trim() || undefined;
-  const writer = (settled = false, arm?: SupervisionArm) => ({ generation, seat, settled, arm, deps });
+  const writer = (settled = false, arm?: SupervisionArm) => ({ generation, seat, settled, arm, deps, noticed });
   if (values["stand-down"]) {
-    return withLegacyClaim(repoRoot, tier, writer(), (recheck) => { recheck(); return standDownTier(repoRoot, tier, seat); });
+    return withLegacyClaim(repoRoot, tier, writer(), (recheck, held) => { recheck(); return standDownTier(repoRoot, tier, seat, held); });
   }
   const loop = values.loop === true;
   const armId = values["arm-id"];
@@ -82,11 +102,18 @@ export async function beat(
   // arm id + epoch) is on record; every other writer only while no detached beat owns the tier. `created` marks
   // the arm this same claim just published: an owned re-arm rebinds the owner record to it — only while that arm
   // and the owner checked before it are still the ones on disk — and is checked again as that new generation
-  // before its beat. A running loop carries its arm into every check. A claim someone else holds refuses with
-  // no bytes changed.
-  const tick = (recheck: LegacyRecheck, arm?: SupervisionArm, created = false) => {
+  // before its beat. A running loop carries its arm into every check. Each supervision write (arm, beat, marker)
+  // is staged and committed record by record, each rename one claimed act under `held` (supervised): inside it this
+  // same ownership check runs again, every record must still be what the write was staged from, and the claim is
+  // verified last — a claim lost, or an owner or arm replaced, before a commit lands nothing further. A claim someone
+  // else holds is waited out under the ONE finite policy (BEAT_CLAIM_WAIT: 20 attempts 250 ms apart, shared with
+  // stop), then refuses BUSY with no bytes changed — unless every pid it records is confirmed dead, when it is
+  // reclaimed with a notice.
+  const tick = (recheck: LegacyRecheck, held: ClaimGuard, arm?: SupervisionArm, created = false) => {
     recheck(arm, created);
-    if (beatSupervision(repoRoot, tier, seat, observe(arm), { arm, armId, loop })) return;
+    // The fence travels with the beat: a stand-down that landed while this beat was committed still dominates it.
+    if (supervised(repoRoot, tier, held, (root) => beatSupervision(root, tier, seat, observe(arm), { arm, armId, loop })) &&
+      supervisionStatus(repoRoot, tier).state !== "DISARMED") return;
     const current = arm && readSupervisionArm(repoRoot, tier);
     if (arm && (current?.armId !== arm.armId || current.armEpoch !== arm.armEpoch)) {
       throw new Error(`${tier} superseded — a newer arm replaced this loop's arm ${arm.armId}; exiting`);
@@ -94,20 +121,19 @@ export async function beat(
     throw new Error(`${tier} DISARMED — stood down; use --new-arm to resume beating`);
   };
   if (values["new-arm"] || loop) {
-    const arm = await withLegacyClaim(repoRoot, tier, writer(), (recheck) => {
+    const arm = await withLegacyClaim(repoRoot, tier, writer(), (recheck, held) => {
       recheck();
-      const created = newSupervisionArm(repoRoot, tier, armId);
-      tick(recheck, created, true);
+      const created = supervised(repoRoot, tier, held, (root) => newSupervisionArm(root, tier, armId));
+      tick(recheck, held, created, true);
       return created;
     });
-    // ponytail: a running loop outlasts a brief claim holder (a repeat start, a status-side stop) for ~5 s of
-    // retries, then refuses nonzero; a per-tick deadline if holders ever legitimately run longer.
-    const waits = { tries: 20, sleep: deps.sleep };
+    // ponytail: every tick outlasts a brief claim holder (a repeat start, a stop) for ~5 s of retries, then
+    // refuses nonzero; a per-tick deadline if holders ever legitimately run longer.
     while (loop) {
       await deps.sleep(SUPERVISION_BEAT_MS);
-      await withLegacyClaim(repoRoot, tier, writer(true, arm), (recheck) => tick(recheck, arm), waits);
+      await withLegacyClaim(repoRoot, tier, writer(true, arm), (recheck, held) => tick(recheck, held, arm));
     }
-  } else await withLegacyClaim(repoRoot, tier, writer(), (recheck) => tick(recheck));
+  } else await withLegacyClaim(repoRoot, tier, writer(), (recheck, held) => tick(recheck, held));
   return `${tier} ARMED as ${seat} — beat again every ${SUPERVISION_BEAT_MS / 1_000}s; the tier reads STALE ${SUPERVISION_STALE_MS / 1_000}s after the last beat`;
 }
 
@@ -165,9 +191,9 @@ function percentage(raw: string | undefined, name: "--pct" | "--threshold-pct"):
   return value;
 }
 
-/** Record an explicit hand-off: the tier reads DISARMED, a stood-down tier, not a dead one. */
-export function standDownTier(repoRoot: string, tier: SupervisionTier, seat: string): string {
-  publishStandDown(repoRoot, tier, seat);
+/** Record an explicit hand-off: the tier reads DISARMED, a stood-down tier, not a dead one. `held`: the writer's claimed-act guard. */
+export function standDownTier(repoRoot: string, tier: SupervisionTier, seat: string, held: ClaimGuard = unclaimed): string {
+  supervised(repoRoot, tier, held, (root) => publishStandDown(root, tier, seat));
   return `${tier} DISARMED — ${seat} handed off; status reads it stood down, not dead`;
 }
 

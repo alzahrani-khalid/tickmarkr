@@ -13,13 +13,6 @@ const commitAsProbe = (p: CodexCommitProbe) => {
   execFileSync("git", ["add", "--", p.control], { cwd: p.worktree });
   execFileSync("git", ["-c", "user.name=t", "-c", "user.email=t@t.invalid", "commit", "-q", "--no-gpg-sign", "-m", `tickmarkr-probe ${p.token}`], { cwd: p.worktree });
 };
-// v2.6.7 T4: a protected shell (the gate battery's) hands its suite GIT_CONFIG_PARAMETERS forcing an inert
-// core.hooksPath; the hook-planted foreign-lock fixtures need real hooks, so they run with it cleared.
-const withRealHooks = async <T>(fn: () => Promise<T>): Promise<T> => {
-  const prior = process.env.GIT_CONFIG_PARAMETERS;
-  delete process.env.GIT_CONFIG_PARAMETERS;
-  try { return await fn(); } finally { if (prior !== undefined) process.env.GIT_CONFIG_PARAMETERS = prior; }
-};
 const probeBranches = (repo: string) => execFileSync("git", ["for-each-ref", "--format=%(refname:short)", "refs/heads/tickmarkr-probe-*"], { cwd: repo, encoding: "utf8" }).trim();
 
 test("doctor removes its probe lock and fixture worktree after allowed denied or cancelled probes while preserving a pre-existing foreign lock", async () => {
@@ -57,7 +50,7 @@ test("doctor removes its probe lock and fixture worktree after allowed denied or
   const repo = makeRepo({ "keep.txt": "x" });
   writeFileSync(join(repo, ".git", "hooks", "post-checkout"), '#!/bin/sh\nprintf foreign > "$(git rev-parse --absolute-git-dir)/index.lock"\n', { mode: 0o755 });
   let called = false;
-  const result = await withRealHooks(() => probeCodexCommit(repo, async () => { called = true; return ""; }));
+  const result = await probeCodexCommit(repo, async () => { called = true; return ""; });
   expect(result).toEqual({ status: "unknown", detail: "a foreign index.lock already holds the fixture worktree" });
   expect(called).toBe(false);
   const [name] = readdirSync(join(repo, ".git", "worktrees"));
@@ -81,7 +74,7 @@ test("doctor removes its probe lock and fixture worktree after allowed denied or
   const failing = makeRepo({ "keep.txt": "x" });
   writeFileSync(join(failing, ".git", "hooks", "post-checkout"), '#!/bin/sh\nprintf foreign > "$(git rev-parse --absolute-git-dir)/index.lock"\nexit 1\n', { mode: 0o755 });
   called = false;
-  const failed = await withRealHooks(() => probeCodexCommit(failing, async () => { called = true; return ""; }));
+  const failed = await probeCodexCommit(failing, async () => { called = true; return ""; });
   expect(failed.status).toBe("unknown");
   expect(called).toBe(false);
   const [left] = readdirSync(join(failing, ".git", "worktrees"));

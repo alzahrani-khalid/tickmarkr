@@ -1397,27 +1397,55 @@ routing: { deny: { workers: { adapters: [${(opts.deniedWorkers ?? ["rv", "rc"]).
       const resumed = await scenario({ "rev-a": "frontier", "rev-mid": "mid" }, {}, [[event, { gate: "review", reviewer: "rv:rev-a", reviewerTier: "frontier" }]]);
       expect(resumed).toContain("  ! T1: exactly one eligible cross-vendor review seat remains — identity rev-a via rv:rev-a; one flake or demotion leaves no reviewer");
     }
-    // a review-pool-demotion journaled by T0's review leaves the rotation for the run (daemon
-    // replayedReviewerExclusions), so for never-dispatched T1 of two frontier identities exactly one stays
-    // eligible and the plan's reviewer is never the demoted seat
+    // v2.6.8 T1: a review-pool-demotion journaled by T0's review is only a SOFT preference in the resumed run
+    // (daemon demotedReviewers, never an exclusion), so for never-dispatched T1 of two frontier identities both
+    // stay eligible and the demoted seat ranks last — even over prefer
     const dispatchedT0: [string, Record<string, unknown>, string] = ["task-dispatch", { attempt: 0, assignment: { adapter: "aw", model: "author-1" } }, "T0"];
-    const demoted = await scenario({ "rev-a": "frontier", "rev-b": "frontier" }, {}, [dispatchedT0, ["review-pool-demotion", { gate: "review", reviewer: "rv:rev-b", reviewerTier: "frontier" }, "T0"]]);
-    expect(demoted).toContain("  ! T1: exactly one eligible cross-vendor review seat remains — identity rev-a via rv:rev-a; one flake or demotion leaves no reviewer");
+    const demoted = await scenario({ "rev-a": "frontier", "rev-b": "frontier" }, {}, [dispatchedT0, ["review-pool-demotion", { gate: "review", reviewer: "rv:rev-b", reviewerTier: "frontier" }, "T0"]], {}, { prefer: ["rv:rev-b"] });
+    expect(demoted).not.toContain("exactly one eligible cross-vendor review seat");
     expect(demoted).toContain("    review: rv:rev-a");
     expect(demoted).not.toContain("review: rv:rev-b");
-    // D-858 parity, one regression per production input (run-gates.ts:1299-1305, daemon.ts excludeReviewers):
-    // (1) floor = this task's reviewers ∪ excludeReviewers — a replayed demoted frontier seat lifts the mid
-    // author's floor, so for never-dispatched T1 of a mid and a frontier seat only the frontier one stays eligible
+    // D-858 parity, one regression per production input (run-gates floor and pick, daemon.ts excludeReviewers):
+    // (1) floor = this task's reviewers ∪ excludeReviewers — excludeReviewers starts empty at resume, so a replayed
+    // demoted frontier seat never lifts the mid author's floor: the mid seat stays eligible beside both frontier ones
     const mixed = await scenario({ "rev-a": "frontier", "rev-b": "frontier", "rev-mid": "mid" }, {}, [dispatchedT0, ["review-pool-demotion", { gate: "review", reviewer: "rv:rev-b" }, "T0"]]);
-    expect(mixed).toContain("  ! T1: exactly one eligible cross-vendor review seat remains — identity rev-a via rv:rev-a; one flake or demotion leaves no reviewer");
-    expect(mixed).toContain("    review: rv:rev-a");
-    // (2) retired: a seat with two no-verdicts anywhere in this run leaves every pick; a checkout-proof timeout never strikes
+    expect(mixed).not.toContain("exactly one eligible cross-vendor review seat");
+    expect(mixed).not.toContain("review: rv:rev-b");
+    // (2) retired: a seat with two real no-verdicts anywhere in this run leaves every pick; a launch failure never strikes
     const strike = (cause: Record<string, unknown>): [string, Record<string, unknown>, string] => ["review-no-verdict", { reviewer: "rv:rev-b", noVerdict: true, ...cause }, "T0"];
     const retired = await scenario({ "rev-a": "frontier", "rev-b": "frontier" }, {}, [strike({ cause: "silent" }), strike({ cause: "truncated" })]);
     expect(retired).toContain("  ! T1: exactly one eligible cross-vendor review seat remains — identity rev-a via rv:rev-a; one flake or demotion leaves no reviewer");
     expect(retired).not.toContain("review: rv:rev-b");
     const timedOut = await scenario({ "rev-a": "frontier", "rev-b": "frontier" }, {}, [strike({ cause: "silent" }), strike({ cause: "seat-launch-failed", launchCause: "checkout-proof-timeout" })]);
     expect(timedOut).not.toContain("exactly one eligible cross-vendor review seat");
+    // v2.6.8 T1: exactly the daemon's tally — a launch failure with no launchCause or any other detail never strikes either
+    for (const launch of [{}, { launchCause: "runtime-busy" }]) {
+      const launched = await scenario({ "rev-a": "frontier", "rev-b": "frontier" }, {}, [strike({ cause: "silent" }), strike({ cause: "seat-launch-failed", ...launch })]);
+      expect(launched).not.toContain("exactly one eligible cross-vendor review seat");
+    }
+    // v2.6.8 T1: the base engine's launch-caused demotion — its trigger a launch failure, or its pair counting one
+    // beside a single non-silent real no-verdict — is never replayed, so prefer seats it in the matching run's
+    // preview; a real one-strike no-verdict demotion (silent) is replayed soft: still eligible, ranked last over prefer
+    const demotion = (data: Record<string, unknown>): [string, Record<string, unknown>, string] => ["review-pool-demotion", { reviewer: "rv:rev-b", seatAuthoredBytes: 0, ...data }, "T0"];
+    const launch = strike({ cause: "seat-launch-failed" });
+    for (const journal of [
+      [launch, launch, demotion({ cause: "seat-launch-failed", causes: ["seat-launch-failed", "seat-launch-failed"] })],
+      [strike({ cause: "truncated" }), launch, demotion({ cause: "seat-launch-failed", causes: ["truncated", "seat-launch-failed"] })],
+      [launch, strike({ cause: "truncated" }), demotion({ cause: "truncated", seatAuthoredBytes: 12, causes: ["seat-launch-failed", "truncated"] })],
+    ]) {
+      const kept = await scenario({ "rev-a": "frontier", "rev-b": "frontier" }, {}, [dispatchedT0, ...journal], {}, { prefer: ["rv:rev-b"] });
+      expect(kept).toContain("    review: rv:rev-b");
+      expect(kept).not.toContain("exactly one eligible cross-vendor review seat");
+    }
+    for (const journal of [
+      [strike({ cause: "silent" }), demotion({ cause: "silent" })],
+      [launch, strike({ cause: "truncated" }), demotion({ cause: "truncated", causes: ["seat-launch-failed", "truncated"] })],
+    ]) {
+      const soft = await scenario({ "rev-a": "frontier", "rev-b": "frontier" }, {}, [dispatchedT0, ...journal], {}, { prefer: ["rv:rev-b"] });
+      expect(soft).not.toContain("exactly one eligible cross-vendor review seat");
+      expect(soft).toContain("    review: rv:rev-a");
+      expect(soft).not.toContain("review: rv:rev-b");
+    }
     // (5) prefer only reorders: it moves the previewed seat, never the count
     const preferred = await scenario({ "rev-a": "frontier", "rev-b": "frontier" }, {}, [], {}, { prefer: ["rv:rev-b"] });
     expect(preferred).toContain("    review: rv:rev-b");

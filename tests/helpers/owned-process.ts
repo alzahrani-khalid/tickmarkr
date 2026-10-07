@@ -153,6 +153,12 @@ export async function teardownTree(root: ChildProcess, o: {
 export async function runOwned(cmd: string, args: readonly string[], o: {
   cwd?: string; env?: NodeJS.ProcessEnv; ms?: number; armOn?: RegExp; armCeilingMs?: number;
   settleOn?: RegExp; signal?: AbortSignal; ps?: PsTable; boundMs?: number;
+  /**
+   * Census fault injection only. These pids are appended to the survivor list AFTER the real tree
+   * is killed and awaited. Omitted means the census is unchanged. This is not a reap-policy change:
+   * the injected pid is not signalled and not treated as owned.
+   */
+  injectSurvivors?: readonly number[];
 } = {}): Promise<OwnedRun> {
   let out = "";
   let err = "";
@@ -212,7 +218,11 @@ export async function runOwned(cmd: string, args: readonly string[], o: {
   // every recorded holder of the pipes is dead now, so the tail of the output drains within a moment
   await Promise.race([closed, sleep(2_000)]);
   const unresolved = [trackFailure, torn.unresolved].filter(Boolean).join("; ");
-  return { why, pid: child.pid, exitCode: child.exitCode, signal: child.signalCode, out, err, ...torn, ...(unresolved ? { unresolved } : {}) };
+  return {
+    why, pid: child.pid, exitCode: child.exitCode, signal: child.signalCode, out, err, ...torn,
+    survivors: [...torn.survivors, ...(o.injectSurvivors ?? [])],
+    ...(unresolved ? { unresolved } : {}),
+  };
 }
 
 /** Every reason an owned run is not a clean completion: a cut, a cancellation, unproven or leaked ownership. */
@@ -223,4 +233,35 @@ export function ownedFailures(run: OwnedRun, label: string): string[] {
     ...(run.unresolved ? [`${label}: ownership unresolved — ${run.unresolved}`] : []),
     ...(run.survivors.length ? [`${label}: owned processes outlived teardown: ${run.survivors.join(",")}`] : []),
   ];
+}
+
+/** One parent row per owned fixture. A rejection becomes a red row; it does not drop the others. */
+export interface DiagnosticLedger {
+  name: string;
+  ok: boolean;
+  pid: number | undefined;
+  cause: string;
+  tail: string;
+  survivors: number[];
+}
+
+export async function diagnosticLedgers(jobs: readonly { name: string; run: () => Promise<OwnedRun> }[]): Promise<DiagnosticLedger[]> {
+  const settled = await Promise.allSettled(jobs.map(async (job) => ({ name: job.name, run: await job.run() })));
+  return settled.map((entry, i) => {
+    const name = jobs[i]!.name;
+    if (entry.status === "rejected") {
+      const cause = `rejected: ${message(entry.reason)}`;
+      return { name, ok: false, pid: undefined, cause, tail: cause, survivors: [] };
+    }
+    const run = entry.value.run;
+    const fails = ownedFailures(run, name);
+    return {
+      name,
+      ok: fails.length === 0 && run.exitCode === 0,
+      pid: run.pid,
+      cause: fails.join("; "),
+      tail: `${run.out}${run.err}`.slice(-4_000),
+      survivors: run.survivors,
+    };
+  });
 }
