@@ -240,12 +240,11 @@ const NO_BACKGROUND_GIT = "'gc.auto=0' 'maintenance.auto=false'";
 
 const PROBE_REF = "refs/tickmarkr/ref-pin-probe", PROBE_TARGET = "refs/tickmarkr/ref-pin-honoured";
 /**
- * Proves, before the child spawns, that the git its PATH resolves honours GIT_REFERENCE_BACKEND: a fresh probe
- * repository whose own refs lack PROBE_REF, pinned to a fresh store that holds it as a symbolic ref. A git that ignores
- * the pin reads the probe repository's own refs and is refused here by name — never run unpinned with the post-exit
- * recheck as its only guard. Nothing is cached: each attempt probes again.
+ * Whether, before the child spawns, the git its PATH resolves honours GIT_REFERENCE_BACKEND (git >= 2.54): a fresh
+ * probe repository whose own refs lack PROBE_REF, pinned to a fresh store that holds it as a symbolic ref. A git that
+ * ignores the pin reads the probe repository's own refs. Nothing is cached: each attempt probes again.
  */
-function assertRefStorePinHonoured(env: NodeJS.ProcessEnv): void {
+function refStorePinHonoured(env: NodeJS.ProcessEnv): boolean {
   const dir = mkdtempSync(join(tmpdir(), "tickmarkr-ref-pin-"));
   try {
     const repo = join(dir, "repo"), store = join(dir, "store");
@@ -258,10 +257,16 @@ function assertRefStorePinHonoured(env: NodeJS.ProcessEnv): void {
     try {
       read = execFileSync("git", ["symbolic-ref", PROBE_REF], { cwd: dir, env: probe, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 15_000 }).trim();
     } catch { /* refused below */ }
-    if (read !== PROBE_TARGET) {
-      throw new GitTrustRefusal("git", "the git on this PATH does not honour GIT_REFERENCE_BACKEND, so tickmarkr's own git cannot pin its ref store; refused instead of running unpinned");
-    }
+    return read === PROBE_TARGET;
   } finally { rmSync(dir, { recursive: true, force: true }); }
+}
+
+let warnedRefStorePin = false;
+/** Said once per process: the fallback below is a weaker guard, and the operator should know why and what lifts it. */
+function warnRefStorePinUnavailable(): void {
+  if (warnedRefStorePin) return;
+  warnedRefStorePin = true;
+  console.error("tickmarkr: the git on this PATH does not honour GIT_REFERENCE_BACKEND (needs git 2.54 or newer), so tickmarkr's own git in linked checkouts runs without its ref-store pin — path pins and the post-exit commondir recheck only, the 2.6.7 guard; upgrade git for the full pin");
 }
 
 /**
@@ -273,8 +278,8 @@ function assertRefStorePinHonoured(env: NodeJS.ProcessEnv): void {
  * descendant) is followed for neither config, hooks, info/, objects nor refs: HEAD, branches, status and diffs read
  * the real repository and every ref write lands in the trusted store, whatever an inherited GIT_CONFIG_* or ref backend
  * says; a commondir REMOVED after it cannot move the main checkout's branch. Before such a child spawns, the git it
- * would run must prove it honours that pin (assertRefStorePinHonoured). Nothing here reads the command, and no caller
- * leaves any pin. `recheck` (after the child exits) fails closed on ANY change to commondir since the check: the result
+ * would run must prove it honours that pin (refStorePinHonoured); one that cannot (git < 2.54) runs without it, below.
+ * Nothing here reads the command, and no caller leaves any pin. `recheck` (after the child exits) fails closed on ANY change to commondir since the check: the result
  * of that child is never returned. An ordinary checkout or a non-repository gets no pin.
  * NAMED RESIDUAL: git still reads $GIT_DIR/config.worktree when the trusted common config already enables
  * extensions.worktreeConfig, so a config.worktree planted AFTER this check is not closed.
@@ -290,15 +295,24 @@ export function ownGitPin(cwd: string, env: NodeJS.ProcessEnv, capability: OwnGi
   // GIT_REF_STORAGE_FORMAT only chooses a NEW repository's format; an inherited one is never a store this child follows
   delete child.GIT_REF_STORAGE_FORMAT;
   assertFilesRefStore(common);
-  assertRefStorePinHonoured(child);
-  const view = createsWorktree === "detached" ? { uri: `files://${common}`, release: () => {}, unview: (text: string) => text } : refStoreView(common);
-  child.GIT_REFERENCE_BACKEND = view.uri;
   const commondir = join(gitdir, "commondir");
-  return { env: child, store: common, release: view.release, unview: view.unview, recheck: () => {
+  const recheck = () => {
     if (stampOf(commondir) !== stamp) {
       throw new GitTrustRefusal(commondir, "changed while tickmarkr's own git ran in this checkout, so that result is refused");
     }
-  } };
+  };
+  // D-1484: a git older than 2.54 cannot take the ref-store pin. Refusing it would refuse tickmarkr's own git in every
+  // linked checkout on most installed gits, and a hostile git binary ignores every pin anyway; so it runs with the
+  // path pins and the post-exit recheck (the 2.6.7 guard). NAMED RESIDUAL there: refs still resolve through the
+  // commondir file, so a rewrite between check and exit can reach the hostile store before the recheck refuses.
+  if (!refStorePinHonoured(child)) {
+    delete child.GIT_REFERENCE_BACKEND;
+    warnRefStorePinUnavailable();
+    return { env: child, store: common, release: () => {}, unview: (text: string) => text, recheck };
+  }
+  const view = createsWorktree === "detached" ? { uri: `files://${common}`, release: () => {}, unview: (text: string) => text } : refStoreView(common);
+  child.GIT_REFERENCE_BACKEND = view.uri;
+  return { env: child, store: common, release: view.release, unview: view.unview, recheck };
 }
 
 /** The inert hooks directory every protected git child receives (no hook can exist beneath it). */

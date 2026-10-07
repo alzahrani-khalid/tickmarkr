@@ -676,26 +676,37 @@ setInterval(() => { const go = dir + '/go-' + n; if (!fs.existsSync(go)) return;
       expect(read(f.hostileFs) + read(f.hostileExt), why).toBe("");
     }
 
-    // a git that does not honour the ref-store pin (it drops GIT_REFERENCE_BACKEND) is refused BEFORE any child spawns,
-    // naming the missing capability — never run unpinned on the post-exit recheck alone; the host git and, where
-    // installed, Apple Git at /usr/bin/git honour it and read the real HEAD across the rewrite
+    // a git that does not honour the ref-store pin (it drops GIT_REFERENCE_BACKEND, as every git before 2.54 does) still
+    // runs — refusing it would refuse own git in every linked checkout on most installed gits (D-1484) — with the path
+    // pins and no ref-store pin, after one warning naming git 2.54, and its result across the rewrite is still refused
+    // by the post-exit recheck; a git that honours it (2.54+) reads the real HEAD across the rewrite
     const hostGit = execFileSync("sh", ["-c", "command -v git"], { encoding: "utf8", env: rawEnv() }).trim();
     const fakeBin = makeTestTempDir("child-env-fakegit-");
     writeFileSync(join(fakeBin, "git"), `#!/bin/sh\nunset GIT_REFERENCE_BACKEND\nexec '${hostGit}' "$@"\n`, { mode: 0o755 });
-    armed = { gitdir: f.gitdir, worktree: f.worktree, hostileCommon: f.hostileCommon, rewrite: directRewrite };
     vi.stubEnv("PATH", `${fakeBin}:${process.env.PATH}`);
+    const warned = vi.spyOn(console, "error").mockImplementation(() => {});
+    armed = undefined; // untouched metadata: own git works on such a git and reads the real HEAD
+    expect((await gitHead(f.linked)).trim(), "a git that drops the ref-store pin, no rewrite").toBe(realHead);
+    armed = { gitdir: f.gitdir, worktree: f.worktree, hostileCommon: f.hostileCommon, rewrite: directRewrite };
     seen.length = 0;
-    for (const run of [() => shGitOk("git rev-parse HEAD", f.linked), () => shGit(`git update-ref refs/tickmarkr/ignoring ${f.base}`, f.linked)]) {
-      await expect(run()).rejects.toMatchObject({ name: "GitTrustRefusal", message: expect.stringContaining("does not honour GIT_REFERENCE_BACKEND") });
-    }
-    expect(seen).toEqual([]);
+    await refusedAfter(f, () => shGitOk("git rev-parse HEAD", f.linked), "a git that drops the ref-store pin");
+    expect(seen).toHaveLength(1);
+    expect(pinOf(seen[0]!.env)).toEqual({ GIT_DIR: f.gitdir, GIT_COMMON_DIR: f.common, GIT_WORK_TREE: f.worktree,
+      GIT_REFERENCE_BACKEND: undefined, GIT_REF_STORAGE_FORMAT: undefined });
+    expect(warned.mock.calls.flat().join("\n")).toContain("needs git 2.54 or newer");
+    warned.mockRestore();
     vi.unstubAllEnvs();
-    expect(() => git(f.repo, "rev-parse", "--verify", "-q", "refs/tickmarkr/ignoring")).toThrow();
+    // the version decides the expectation independently of the production probe: Apple Git on macOS 26 predates 2.54
+    const honours = (bin: string) => {
+      const [major = 0, minor = 0] = (/(\d+)\.(\d+)/.exec(execFileSync(bin, ["--version"], { encoding: "utf8" })) ?? []).slice(1).map(Number);
+      return major > 2 || (major === 2 && minor >= 54);
+    };
     for (const bin of [hostGit, "/usr/bin/git"].filter(b => existsSync(b))) {
       const dir = makeTestTempDir("child-env-realgit-");
       symlinkSync(bin, join(dir, "git"));
       vi.stubEnv("PATH", `${dir}:${process.env.PATH}`);
-      expect((await refusedAfter(f, () => gitHead(f.linked), bin)).trim(), bin).toBe(realHead);
+      const out = (await refusedAfter(f, () => gitHead(f.linked), bin)).trim();
+      if (honours(bin)) expect(out, bin).toBe(realHead);
       vi.unstubAllEnvs();
     }
     armed = undefined;
