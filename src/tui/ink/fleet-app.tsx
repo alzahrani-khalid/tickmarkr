@@ -250,6 +250,20 @@ type Overlay =
   | { kind: "lift"; id: string; covering: Covering }
   | { kind: "review"; review: DiffReview; scroll: number };
 
+/**
+ * Space picks exactly as Enter does in every single-select overlay (operator field report 2026-10-08,
+ * "can't choose here space key doesn't select" — the reach picker even OPENS on Space). Space keeps its
+ * own meaning only where it has one: the multi-select chains (candidates, prefer) toggle on it, the text
+ * stages (add-model, the classify note) type it, and the review diff confirms only on `y`. The lift
+ * listing is a confirm, not a pick: it clears a deny entry for every channel that entry covers, so only
+ * Enter lifts — a stray Space there does nothing.
+ */
+const spacePicks = (overlay: Overlay): boolean =>
+  overlay.kind === "classify"
+    ? overlay.stage !== "note"
+    : overlay.kind === "presets" || overlay.kind === "assign" || overlay.kind === "poolmode"
+      || overlay.kind === "judge" || overlay.kind === "reach";
+
 type SeatChannel = { adapter: string; model: string; identity?: string };
 /** a deny entry that reaches this row other than by its own adapter:model key, with every
  * displayed channel it covers; `shared` ⇒ never a row edit, only the lift control */
@@ -1371,6 +1385,7 @@ export function FleetApp({
     };
 
     if (overlay) {
+      const pick = key.return || (input === " " && spacePicks(overlay));
       if (overlay.kind === "presets") {
         const rowCount = modeOptions.length + (overlay.home ? 1 : 0);
         if (key.escape) {
@@ -1395,7 +1410,7 @@ export function FleetApp({
           bump();
           return;
         }
-        if (key.return) {
+        if (pick) {
           if (overlay.home && overlay.at === modeOptions.length) {
             setOverlay(null); // custom → the browser IS the full editor
             return;
@@ -1445,8 +1460,10 @@ export function FleetApp({
           finish({ kind: "discard" });
           return;
         }
+        // the review screen holds every staged edit by definition — `q` takes the same two presses
+        // as every other screen, never one keystroke to lose the session (`n` is the explicit discard)
         if (input === "q") {
-          finish({ kind: "quit" });
+          guardedQuit(armed);
           return;
         }
         if (input === "y") {
@@ -1478,7 +1495,7 @@ export function FleetApp({
             bump();
             return;
           }
-          if (key.return) {
+          if (pick) {
             const channel = CHANNELS[overlay.channelAt];
             ui.channelByAdapter[overlay.adapter] = channel;
             // OBS-508: a bulk stage waiting on the one first-touch channel answer resumes here.
@@ -1506,7 +1523,7 @@ export function FleetApp({
             bump();
             return;
           }
-          if (key.return) {
+          if (pick) {
             // OBS-508: keep the suggested band → the evidence note arrives pre-typed; override the
             // band → the note starts empty (the suggestion argues for a DIFFERENT tier).
             const chosen = TIERS[overlay.tierAt];
@@ -1591,7 +1608,7 @@ export function FleetApp({
           bump();
           return;
         }
-        if (key.return && rows[overlay.at]) {
+        if (pick && rows[overlay.at]) {
           const shape = rows[overlay.at].id;
           ui.map = { ...ui.map, [shape]: { pin: { via: overlay.adapter, model: overlay.model } } };
           setOverlay(null);
@@ -1689,7 +1706,7 @@ export function FleetApp({
           bump();
           return;
         }
-        if (key.return) {
+        if (pick) {
           const { shape, chain } = overlay.picker;
           // a pool is the shape's WHOLE declaration: pin and prefer leave with it (schema
           // exclusivity — pin+pool and pool+prefer both fail config load)
@@ -1767,7 +1784,7 @@ export function FleetApp({
           bump();
           return;
         }
-        if (key.return) {
+        if (pick) {
           const choice = REACH_CHOICES[overlay.at].id;
           setOverlay(null);
           applyReach(overlay.target, choice);
@@ -1806,7 +1823,8 @@ export function FleetApp({
         bump();
         return;
       }
-      if (key.return && rows[overlay.at]) {
+      // Space picks too (spacePicks): a judge picker that swallowed it read as "can't choose"
+      if (pick && rows[overlay.at]) {
         // single-select: one seat or back to the config default — never a chain
         const picked = rows[overlay.at];
         ui.judgeSeat = picked === judgeKeepRow ? null : picked;
@@ -2661,7 +2679,7 @@ export function FleetApp({
     const selectedSeat = ui.judgeSeat ?? judgeKeepRow;
     return (
       <OverlayPanel title="pick · judge" width={bodyW}>
-        <Text dimColor>one seat judges acceptance criteria — failover stays runtime (GATE-09)</Text>
+        <Text dimColor wrap="truncate">{clip("Space or Enter picks · Esc keeps · one seat judges acceptance criteria — failover stays runtime (GATE-09)", bodyW - 4)}</Text>
         <SearchRow filter={ui.filter} active />
         {above > 0 && <ElisionMark count={above} side="above" />}
         {visible.map((label, index) => (

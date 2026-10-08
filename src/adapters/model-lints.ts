@@ -593,25 +593,29 @@ function storedRetirement(record: unknown, model: string): ModelRetirement | nul
   return typeof n.successor === "string" && MODEL_ID_RE.test(n.successor) ? { retiresAt: n.retiresAt, successor: n.successor } : undefined;
 }
 
-// Configured AND listed models only — a configured id the CLI stopped listing already carries the
-// tombstone advisory. The CLI's notice is quoted as-is: its successor is the CLI's upgrade target, never
-// a tier or benchmark claim, and no model name or visibility is read as one. Advisory: routing unchanged.
-function retirementLints(id: string, listedConfigured: string[], record: unknown, nowMs: number): string[] {
+// Configured models the CLI lists, plus configured models it stopped listing that still carry a dated
+// notice (the CLI hides a model before retiring it); any other unlisted id carries the bare tombstone
+// advisory instead. The CLI's notice is quoted as-is: its successor is the CLI's upgrade target, never
+// a tier or benchmark claim, and no model name or visibility is read as one. The notice never changes routing;
+// the CLI's hide does (D-1526), so a hidden id's lint says it is not routed instead of "routing unchanged".
+function retirementLints(id: string, configured: string[], listed: readonly string[], hiddenIds: readonly string[], record: unknown, nowMs: number): string[] {
   const lints: string[] = [];
   const unknown: string[] = [];
-  for (const model of listedConfigured) {
+  for (const model of configured) {
     const notice = storedRetirement(record, model);
     if (notice === undefined) {
       unknown.push(model);
       continue;
     }
     if (!notice) continue; // listed with no notice: known clean
+    const hidden = listed.includes(model) ? "" : " (the CLI no longer lists it)";
+    const routing = hiddenIds.includes(model) && !listed.includes(model) ? "not routed while the CLI hides it" : "routing unchanged";
     const successor = notice.successor
       ? `successor ${notice.successor} (named by the CLI — not a tier claim; classify it per benchmark policy)`
       : "no successor named";
     lints.push(nowMs >= Date.parse(notice.retiresAt)
-      ? `${id}: ${model} retired ${notice.retiresAt} per the CLI's notice; ${successor} — tombstone it (${model}: null overlay) or verify the id (advisory — routing unchanged)`
-      : `${id}: ${model} retires ${notice.retiresAt} per the CLI's notice; ${successor} — tombstone it (${model}: null overlay) before then (advisory — routing unchanged)`);
+      ? `${id}: ${model} retired ${notice.retiresAt} per the CLI's notice${hidden}; ${successor} — tombstone it (${model}: null overlay) or verify the id (advisory — ${routing})`
+      : `${id}: ${model} retires ${notice.retiresAt} per the CLI's notice${hidden}; ${successor} — tombstone it (${model}: null overlay) before then (advisory — ${routing})`);
   }
   if (unknown.length) {
     const why = record && typeof record === "object"
@@ -656,17 +660,23 @@ export function modelLints(
     }
     const h = health[id];
     const detected = h?.models ?? []; // MANDATORY default: pre-v1.5 files lack a populated models array
+    const configured = Object.keys(cfg.tiers[id]?.models ?? {});
+    // a configured id the CLI stopped listing but still carries a dated notice for gets the dated lint, not the bare one
+    const noticed = (model: string) => !!adapter.listModelsRetirements && !!storedRetirement(h?.modelRetirements, model);
     if (detected.length === 0) {
       if (h?.installed) lints.push(`${id}: no detection data — run tickmarkr doctor`);
+      // D-1526: a cache holding only hidden rows lists nothing, yet its dated notices are still the CLI's word
+      if (adapter.listModelsRetirements) lints.push(...retirementLints(id, configured.filter(noticed), detected, h?.modelsHidden ?? [], h?.modelRetirements, nowMs));
       continue; // no data to diff or age
     }
-    const configured = Object.keys(cfg.tiers[id]?.models ?? {});
     for (const model of configured) {
-      if (!detected.includes(model)) {
+      if (!detected.includes(model) && !noticed(model)) {
         lints.push(`${id}: tiers lists ${model} — CLI no longer reports it; tombstone it (${model}: null overlay) or verify the id`);
       }
     }
-    if (adapter.listModelsRetirements) lints.push(...retirementLints(id, configured.filter((m) => detected.includes(m)), h?.modelRetirements, nowMs));
+    if (adapter.listModelsRetirements) {
+      lints.push(...retirementLints(id, configured.filter((m) => detected.includes(m) || noticed(m)), detected, h?.modelsHidden ?? [], h?.modelRetirements, nowMs));
+    }
     const extra = collapseUnclassified(detected, new Set(configured));
     if (extra.length) {
       const shown = extra.slice(0, cap).map((row) => row.model).join(", ");

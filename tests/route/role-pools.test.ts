@@ -118,9 +118,9 @@ const runDir = () => mkdtempSync(join(tmpdir(), "tickmarkr-role-consult-"));
 
 describe("v1.87 T2 role-scoped channel pools", () => {
   test("test: a channel denied only under deny.workers fills the review seat while the worker pool excludes it, proven through the daemon's role-scoped pools rather than the bare predicate", () => {
-    const cfg = repoWithOverlay("routing:\n  deny:\n    workers:\n      models: [codex:gpt-5.5]\n");
+    const cfg = repoWithOverlay("routing:\n  deny:\n    workers:\n      models: [codex:gpt-6-sol]\n");
     const pools = rolePools(cfg, adapters, health());
-    const target = { adapter: "codex", model: "gpt-5.5" };
+    const target = { adapter: "codex", model: "gpt-6-sol" };
 
     // the pools disagree, which is the whole point: dispatch is benched, verification is not
     expect(pools.worker).not.toContainEqual(expect.objectContaining(target));
@@ -128,11 +128,11 @@ describe("v1.87 T2 role-scoped channel pools", () => {
 
     // and the denied channel really does FILL the review seat when picked out of the review pool
     const reviewAuthor: Assignment = { adapter: "claude-code", model: "fable", channel: "sub", tier: "frontier" };
-    const seat = pickReviewer(reviewAuthor, pools.review, [], ["codex:gpt-5.5"]);
-    expect(channelKey(seat!)).toBe("codex:gpt-5.5");
+    const seat = pickReviewer(reviewAuthor, pools.review, [], ["codex:gpt-6-sol"]);
+    expect(channelKey(seat!)).toBe("codex:gpt-6-sol");
     // the same pick over the WORKER pool can never land there — the channel isn't in it
-    const fromWorkerPool = pickReviewer(reviewAuthor, pools.worker, [], ["codex:gpt-5.5"]);
-    expect(fromWorkerPool && channelKey(fromWorkerPool)).not.toBe("codex:gpt-5.5");
+    const fromWorkerPool = pickReviewer(reviewAuthor, pools.worker, [], ["codex:gpt-6-sol"]);
+    expect(fromWorkerPool && channelKey(fromWorkerPool)).not.toBe("codex:gpt-6-sol");
 
     // proven through the DAEMON's pools: it builds them once and hands each seat its own
     const daemon = SRC("run/daemon.ts");

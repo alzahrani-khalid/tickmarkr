@@ -126,12 +126,16 @@ function modelListValidated(h: AuthHealth | undefined): boolean {
 }
 
 export function invalidConfiguredModels(cfg: TickmarkrConfig, adapterId: string, h: AuthHealth | undefined): string[] {
-  if (!modelListValidated(h)) return [];
-  const listed = new Set(h!.models);
   const configured = Object.keys(cfg.tiers[adapterId]?.models ?? {});
+  // v2.6.9 (queue row 64, D-1526): an id the CLI's own list marks hidden is positive evidence it stopped offering
+  // it — out whatever the overlap below. The fail-open that follows covers only ids with no such evidence.
+  const hidden = new Set(h?.modelsHidden ?? []);
+  const hiddenConfigured = configured.filter((m) => hidden.has(m) && !(h?.models ?? []).includes(m));
+  if (!modelListValidated(h)) return hiddenConfigured;
+  const listed = new Set(h!.models);
   // Fail open until the CLI list intersects at least one configured model — proves the list is authoritative
   // for this adapter's tier namespace (MODEL-04: unrelated detected ids must not invalidate routing).
-  if (!configured.some((m) => listed.has(m))) return [];
+  if (!configured.some((m) => listed.has(m))) return hiddenConfigured;
   return configured.filter((m) => !listed.has(m));
 }
 

@@ -110,13 +110,13 @@ describe("FLEET-06/07 preference oracles (V-3..V-8)", () => {
     const { repo, globalDir } = repoWithOverlay("routing:\n  deny:\n    models: [something-else]\n");
     const cfg = loadConfig(repo, { globalDir });
     const channels = discoverChannels(cfg, adapters, health);
-    const t = mkTask("implement", { routingHints: { pin: { via: "codex", model: "gpt-5.5" } } });
-    expect(route(t, cfg, channels).assignment).toMatchObject({ adapter: "codex", model: "gpt-5.5" });
+    const t = mkTask("implement", { routingHints: { pin: { via: "codex", model: "gpt-6-sol" } } });
+    expect(route(t, cfg, channels).assignment).toMatchObject({ adapter: "codex", model: "gpt-6-sol" });
 
     const { repo: repo2, globalDir: g2 } = repoWithOverlay("routing:\n  allow:\n    adapters: [codex]\n");
     const cfg2 = loadConfig(repo2, { globalDir: g2 });
     const channels2 = discoverChannels(cfg2, adapters, health);
-    expect(route(t, cfg2, channels2).assignment).toMatchObject({ adapter: "codex", model: "gpt-5.5" });
+    expect(route(t, cfg2, channels2).assignment).toMatchObject({ adapter: "codex", model: "gpt-6-sol" });
   });
 
   test("V-8: empty allow fail-closed — discovery empty, route names routing.allow", () => {

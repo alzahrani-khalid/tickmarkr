@@ -1323,8 +1323,8 @@ describe("tickmarkr fleet", () => {
       OPEN_STEER + KEYS.q,
       OPEN_STEER + KEYS.f + "\x03",
       KEYS.m + KEYS.escape + KEYS.q,
-      // q on the review overlay itself quits without writing
-      REACH_WORKERS + KEYS.w + KEYS.q,
+      // q on the review overlay itself quits without writing — two presses, it holds staged edits
+      REACH_WORKERS + KEYS.w + KEYS.q + KEYS.q,
     ];
     for (const bytes of cases) {
       const { repo, adapter } = setup();
@@ -2217,6 +2217,81 @@ review:
     expect(all).toContain("(keep default)  claude-code:fable"); // the picker names the resolved default
     expect(all).toContain("judge:"); // the confirmed diff carries the judge block
     expect(parsedOverlay(repo).judge).toEqual({ adapter: "fake", model: "fake-1" });
+  });
+
+  // operator field report 2026-10-08: "can't choose here space key doesn't select" — Space picks like Enter
+  test("Space picks a judge seat exactly as Enter does", async () => {
+    const { repo, adapter } = setup();
+    queueAnswers("y");
+    const io = makeIO();
+    const bytes = OPEN_STEER + KEYS.down + KEYS.down + KEYS.f + KEYS.down + KEYS.space + KEYS.w;
+    const out = await drive(repo, adapter, io.io, bytes, ["--global-dir", userDirOf(repo)]);
+    expect(out).toMatch(/^fleet: wrote /);
+    expect(strip(io.writes.join(""))).toContain("Space or Enter picks");
+    expect(parsedOverlay(repo).judge).toEqual({ adapter: "fake", model: "fake-1" });
+  });
+
+  // the same report, one rule (spacePicks): Space picks in every single-select overlay
+  test("Space picks in the reach picker it opens on, exactly as Enter does", async () => {
+    const { repo, adapter } = setup();
+    const { io, writes } = makeIO();
+    // Space opens the picker, Space picks out-workers; Space opens it again, Space picks in → nothing staged
+    const out = await drive(repo, adapter, io, KEYS.space + KEYS.down + KEYS.space + KEYS.space + KEYS.space + KEYS.q);
+    expect(out).toBe("fleet: quit without writing");
+    const frames = writes.map(strip);
+    const outWorkers = frames.findIndex((f) => f.includes(`${GLYPHS.attention} fake/fake-1`));
+    expect(outWorkers).toBeGreaterThan(0);
+    expect(frames.slice(outWorkers + 1).some((f) => f.includes(`${GLYPHS.toggleActive} fake/fake-1`))).toBe(true);
+  });
+
+  test("Space picks the tier in the classify flow while the note stage still types it", async () => {
+    const { repo, adapter } = setup();
+    queueAnswers("y");
+    const io = makeIO();
+    const out = await drive(repo, adapter, io.io, KEYS.down + KEYS.t + KEYS.down + KEYS.space + "AA Index 54, SWE-bench Pro 62%" + KEYS.enter + KEYS.w);
+    expect(out).toMatch(/^fleet: wrote /);
+    const overlay = readFileSync(overlayFile(repo), "utf8");
+    expect(overlay).toContain("fake-2: mid");
+    expect(overlay).toContain("AA Index 54, SWE-bench Pro 62%");
+  });
+
+  test("Space picks a routing-mode preset exactly as Enter does", async () => {
+    const { repo, adapter } = setup();
+    queueAnswers("y");
+    const out = await drive(repo, adapter, makeIO().io, KEYS.m + KEYS.down + KEYS.space + KEYS.w);
+    expect(out).toMatch(/^fleet: wrote /);
+    expect(readFileSync(overlayFile(repo), "utf8")).toContain("mode: staff-led");
+  });
+
+  test("Space picks in the assign and poolmode pickers exactly as Enter does", async () => {
+    const cases: Array<[string, (pick: string) => string]> = [
+      // Enter on an in-fleet model row opens assign; the pick pins the model to the first shape
+      ["assign", (pick) => KEYS.enter + pick + KEYS.w],
+      // Space chains a candidate, Enter applies the chain into poolmode; the pick commits the mode
+      ["poolmode", (pick) => TO_DOCS + KEYS.p + KEYS.space + KEYS.enter + pick + KEYS.w],
+    ];
+    for (const [name, bytes] of cases) {
+      const written: string[] = [];
+      for (const pick of [KEYS.enter, KEYS.space]) {
+        const { repo, adapter } = setup();
+        queueAnswers("y");
+        const out = await drive(repo, adapter, makeIO().io, bytes(pick));
+        expect(out, `${name} via ${pick === KEYS.space ? "Space" : "Enter"}`).toMatch(/^fleet: wrote /);
+        written.push(JSON.stringify(parsedOverlay(repo).routing.map));
+      }
+      expect(written[1], name).toBe(written[0]);
+    }
+  });
+
+  test("q on the review screen asks again before it discards staged edits", async () => {
+    const { repo, adapter } = setup();
+    const before = readFileSync(overlayFile(repo), "utf8");
+    const { io, writes } = makeIO();
+    // Space is not a review key: it neither confirms the write nor quits
+    const out = await drive(repo, adapter, io, REACH_WORKERS + KEYS.w + KEYS.space + KEYS.q + KEYS.q);
+    expect(out).toBe("fleet: quit without writing");
+    expect(strip(writes.join(""))).toContain("press again to discard and quit");
+    expect(readFileSync(overlayFile(repo), "utf8")).toBe(before);
   });
 
   // ── viewport windowing: "can't choose models for omp" (operator field report, 218-model list) ──

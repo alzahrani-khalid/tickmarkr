@@ -420,6 +420,26 @@ test("test: the two new screens are titled by name and no frame in this task car
   }
 });
 
+test("Space picks the channel in the classify flow exactly as Enter does while add-model still types it", async () => {
+  const classified = [];
+  for (const pick of [KEYS.enter, KEYS.space]) {
+    const run = await driveInk(
+      [{ adapter: "nova", rows: [{ model: "detected-model" }] }],
+      KEYS.t + pick + pick + "manual evidence" + KEYS.enter + KEYS.w,
+    );
+    expect(run.reviewed?.classifications).toHaveLength(1);
+    classified.push(run.reviewed!.classifications[0]);
+  }
+  expect(classified[1]).toEqual(classified[0]);
+  const typed = await driveInk(
+    [{ adapter: "nova", rows: [] }],
+    SCOPE_FIRST_ADAPTER + KEYS.n + "bad" + KEYS.space + "model" + KEYS.enter + KEYS.escape + KEYS.q,
+  );
+  // the Space landed in the id field (an id with a space fails the charset check) — it never picked
+  expect(stripAnsi(typed.writes.join(""))).toContain("model id must match");
+  expect(typed.reviewed).toBeUndefined();
+});
+
 test("no classification the operator made is lost between the keystroke and the reloaded config", async () => {
   const repo = makeRepo({ "keep.txt": "x" });
   const globalDir = mkdtempSync(join(tmpdir(), "tickmarkr-t16-global-"));

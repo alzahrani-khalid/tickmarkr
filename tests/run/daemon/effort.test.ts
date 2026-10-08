@@ -62,7 +62,7 @@ const interactiveDriver = (): ExecutorDriver => {
 
 const SEATS = {
   "claude-code": { real: claudeCode, high: "opus", plain: "sonnet", flag: "--effort 'high'", marker: "--effort" },
-  codex: { real: codex, high: "gpt-5.6-sol", plain: "gpt-5.5", flag: "-c 'model_reasoning_effort=high'", marker: "model_reasoning_effort" },
+  codex: { real: codex, high: "gpt-5.6-sol", plain: "gpt-6-sol", flag: "-c 'model_reasoning_effort=high'", marker: "model_reasoning_effort" },
 } as const;
 
 // T1 rides the seat configured high, T2 the seat with no effort. A resumed run fails its first attempt

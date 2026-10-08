@@ -78,6 +78,8 @@ function privateClass(path: string, publicExact: ReadonlySet<string> = PUBLIC_EX
   // a dev-only exclusion takes its tests with it: this file's whole subject is
   // scripts/verify-export.sh, which the export excludes, so shipping it is an ENOENT (OBS-862).
   if (path === "tests/scripts/verify-export.test.ts") return "test for an excluded dev-only script";
+  // the private analysis library (docs/analysis) takes its check script and test with it
+  if (path === "tests/docs/analysis-library.test.ts") return "test for the private analysis library";
   if (path === "docs/codebase/CONCERNS.md") return "private concerns page";
   if (path.startsWith("docs/analysis/") || path.startsWith("docs/superpowers/")) return "operational diary docs";
   return undefined;
@@ -355,6 +357,9 @@ describe("export boundary — fail-closed dual-context allowlist manifest", () =
       "scripts/export-public.sh",
       "scripts/verify-export.sh",
       "tests/scripts/verify-export.test.ts",
+      "scripts/check-analysis.mjs",
+      "scripts/atlas.mjs",
+      "tests/docs/analysis-library.test.ts",
       "scripts/measure-trailer-width.mjs",
       "unclassified-new-top-level.md",
     ];

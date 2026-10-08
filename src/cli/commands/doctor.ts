@@ -673,6 +673,8 @@ export async function doctor(
       // an unreadable source leaves the field absent, which every reader treats as unknown.
       const retirements = a.listModelsRetirements?.();
       if (retirements) health[a.id].modelRetirements = retirements;
+      const hidden = a.listModelsHidden?.(); // v2.6.9 (D-1526): the CLI's hidden flag, read by routing
+      if (hidden) health[a.id].modelsHidden = hidden;
     } catch { /* fail open: leave models as-is, doctor stays healthy */ }
   }
   // A free Kimi auth failure or failed earned-green turn must not spend more probes. Every other

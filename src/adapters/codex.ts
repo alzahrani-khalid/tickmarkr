@@ -51,22 +51,28 @@ function codexSessionDayDirs(sessions: string, sinceMs: number): string[] {
 // Fails OPEN to { models: [] } on missing/corrupt cache. Version drift observed (installed CLI
 // 0.143.0 vs cache client_version 0.144.0, 2026-07-10) — hence the defensive try/catch and no shape
 // assumptions. CODEX_HOME is codex's own relocation env. fetchedAt is the honest codex knowledge age.
-// v2.6.4 T2 (B1a): each listed entry's `upgrade` is the CLI's own retirement notice (0.159.0 cache,
-// 2026-09-29: gpt-5.5 → {model: gpt-5.6-sol, retirement_at: 2026-10-14T19:00:00Z}; every other listed
-// id carries upgrade: null). null records known clean; a malformed or absent `upgrade` records nothing,
-// so that id stays unknown. An unreadable cache returns no retirements at all (unknown, never clean).
-export function readCodexModelsCache(path?: string): { models: string[]; fetchedAt?: string; retirements?: Record<string, ModelRetirement | null> } {
+// v2.6.4 T2 (B1a): each entry's `upgrade` is the CLI's own retirement notice; its successor is whatever
+// that notice names — never a fixed id in this file. A listed row with upgrade: null records known clean;
+// a malformed or absent `upgrade` records nothing, so that id stays unknown. v2.6.9 (queue row 64): the CLI
+// HIDES a model before it retires it (0.162.0, 2026-10-08: gpt-5.5 visibility "hide" with a dated
+// upgrade), so a valid dated notice is read from hidden rows too; a hidden row still never lists, and a
+// hidden row without a dated notice records nothing (delisted is not known clean). `hidden` names every
+// visibility "hide" row (D-1526: routing evidence). An unreadable cache returns neither (unknown, never clean).
+export function readCodexModelsCache(path?: string): { models: string[]; fetchedAt?: string; retirements?: Record<string, ModelRetirement | null>; hidden?: string[] } {
   const p = path ?? join(process.env.CODEX_HOME || join(homedir(), ".codex"), "models_cache.json");
   try {
     const d = JSON.parse(readFileSync(p, "utf8"));
-    const listed = (d.models ?? [])
-      .filter((m: any) => m?.visibility === "list" && typeof m.slug === "string" && m.slug.length > 0 && MODEL_ID_RE.test(m.slug));
+    const rows = (d.models ?? [])
+      .filter((m: any) => typeof m?.slug === "string" && m.slug.length > 0 && MODEL_ID_RE.test(m.slug));
+    const listed = rows.filter((m: any) => m.visibility === "list");
     const retirements: Record<string, ModelRetirement | null> = {};
-    for (const m of listed) {
+    for (const m of rows) {
       const notice = codexRetirement(m.upgrade);
-      if (notice !== undefined) retirements[m.slug] = notice;
+      if (notice === undefined || (notice === null && m.visibility !== "list")) continue;
+      retirements[m.slug] = notice;
     }
-    return { models: listed.map((m: any) => m.slug as string), fetchedAt: typeof d.fetched_at === "string" ? d.fetched_at : undefined, retirements };
+    const hidden = rows.filter((m: any) => m.visibility === "hide").map((m: any) => m.slug as string);
+    return { models: listed.map((m: any) => m.slug as string), fetchedAt: typeof d.fetched_at === "string" ? d.fetched_at : undefined, retirements, hidden };
   } catch {
     return { models: [] };
   }
@@ -300,6 +306,8 @@ export const codex: WorkerAdapter = {
   listModelsFetchedAt: () => readCodexModelsCache().fetchedAt,
   // v2.6.4 T2 (B1a): the cache's per-model retirement notices, persisted beside models in doctor.json.
   listModelsRetirements: () => readCodexModelsCache().retirements,
+  // v2.6.9 (D-1526): the ids the cache marks hidden, persisted beside models as routing evidence.
+  listModelsHidden: () => readCodexModelsCache().hidden,
   collectUsage(cwd: string, sinceMs: number): TokenUsage | undefined {
     try {
       const real = realpathSync(cwd);

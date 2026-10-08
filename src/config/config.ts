@@ -615,20 +615,21 @@ export const DEFAULT_CONFIG: TickmarkrConfig = {
     // astra=frontier and luna=cheap follow the provider's own descriptions in the local cache (read
     // 2026-09-29: "Frontier intelligence for the most demanding work" / "Fast and affordable model for
     // easier tasks"); sol=frontier keeps the shipped workhorse-family mapping (gpt-5.6-sol above) by
-    // continuity. Learned routing or an overlay may retier on evidence. gpt-5.5 stays seeded until its
-    // CLI-announced retirement (2026-10-14T19:00:00Z → gpt-5.6-sol); gpt-5.6-sol is not retiring.
-    // Windows: the same snapshot lists context_window=272000 for all seven — the budget the CLI launches
+    // continuity. Learned routing or an overlay may retier on evidence. v2.6.9 (queue row 64): gpt-5.5 left
+    // the seed — the CLI hides it and announces its retirement (2026-10-14T19:00:00Z); its successor is
+    // whatever the CLI's notice names (doctor quotes it), never a fixed id here.
+    // Windows: the same snapshot lists context_window=272000 for the six still seeded — the budget the CLI launches
     // with, and the authority for these seeds. The API's published 1,050,000 is a different surface and is
     // not contradicted. A later cache listing more ids (gpt-6.1-sol) does not widen this sealed set.
     codex: {
       vendor: "openai", channel: "sub",
       models: {
         "gpt-6-astra": "frontier", "gpt-6-sol": "frontier", "gpt-6-luna": "cheap",
-        "gpt-5.6-sol": "frontier", "gpt-5.5": "frontier", "gpt-5.6-terra": "mid", "gpt-5.6-luna": "cheap",
+        "gpt-5.6-sol": "frontier", "gpt-5.6-terra": "mid", "gpt-5.6-luna": "cheap",
       },
       windows: {
         "gpt-6-astra": 272_000, "gpt-6-sol": 272_000, "gpt-6-luna": 272_000,
-        "gpt-5.6-sol": 272_000, "gpt-5.5": 272_000, "gpt-5.6-terra": 272_000, "gpt-5.6-luna": 272_000,
+        "gpt-5.6-sol": 272_000, "gpt-5.6-terra": 272_000, "gpt-5.6-luna": 272_000,
       },
     },
     // grok-4.5 (xAI, released 2026-07-08) → mid: AA Intelligence 54 (#4), Terminal-Bench 2.1 83.3%

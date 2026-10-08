@@ -133,7 +133,7 @@ describe("readCodexModelsCache (codex-cli 0.143.0 cache, verified 2026-07-10)", 
     expect(readCodexModelsCache(p).models).toEqual(["gpt-5.5"]);
   });
 
-  test("B1a: listed upgrade notices keep date and successor; null is known clean; absent, malformed or hidden records nothing", () => {
+  test("B1a: upgrade notices keep date and successor; null is known clean; absent or malformed records nothing; a hidden row never lists", () => {
     const retirement_at = "2026-10-14T19:00:00Z";
     const r = readCodexModelsCache(writeCache({
       models: [
@@ -151,6 +151,8 @@ describe("readCodexModelsCache (codex-cli 0.143.0 cache, verified 2026-07-10)", 
       "gpt-5.5": { retiresAt: retirement_at, successor: "gpt-5.6-sol" },
       "gpt-5.6-sol": null,
       "gpt-5.3": { retiresAt: retirement_at },
+      // v2.6.9: the CLI hides a model before it retires it — the dated notice survives the hide
+      "gpt-reserve": { retiresAt: retirement_at, successor: "gpt-5.6-sol" },
     });
     const dir = mkdtempSync(join(tmpdir(), "tickmarkr-codexhome-"));
     writeFileSync(join(dir, "models_cache.json"), JSON.stringify({ models: [{ slug: "gpt-5.6-sol", visibility: "list", upgrade: null }] }));
@@ -162,6 +164,53 @@ describe("readCodexModelsCache (codex-cli 0.143.0 cache, verified 2026-07-10)", 
       if (prev === undefined) delete process.env.CODEX_HOME;
       else process.env.CODEX_HOME = prev;
     }
+  });
+
+  // v2.6.9 (queue row 64), phase-0 brief A: the closed cache-entry table, one owned row each. A hidden row
+  // contributes only a dated notice (R3, R9) — it never lists and never records known clean (R4).
+  const at = "2026-10-14T19:00:00Z";
+  test.each<[string, Array<Record<string, unknown>>, string[], Record<string, unknown>]>([
+    ["R1 a listed row with a null upgrade is listed and known clean",
+      [{ slug: "cx-1", visibility: "list", upgrade: null }], ["cx-1"], { "cx-1": null }],
+    ["R2 a listed row with a dated upgrade and successor is listed with that notice",
+      [{ slug: "cx-2", visibility: "list", upgrade: { model: "cx-next", retirement_at: at } }], ["cx-2"], { "cx-2": { retiresAt: at, successor: "cx-next" } }],
+    ["R3 a hidden row with a dated upgrade and successor is not listed but keeps that notice",
+      [{ slug: "cx-3", visibility: "hide", upgrade: { model: "cx-next", retirement_at: at } }], [], { "cx-3": { retiresAt: at, successor: "cx-next" } }],
+    ["R4 a hidden row with a null upgrade is not listed and records no notice",
+      [{ slug: "cx-4", visibility: "hide", upgrade: null }], [], {}],
+    ["R5 an upgrade naming a model without a date records no notice",
+      [{ slug: "cx-5l", visibility: "list", upgrade: { model: "cx-next" } }, { slug: "cx-5h", visibility: "hide", upgrade: { model: "cx-next" } }], ["cx-5l"], {}],
+    ["R6 an upgrade whose retirement date does not parse records no notice",
+      [{ slug: "cx-6l", visibility: "list", upgrade: { model: "cx-next", retirement_at: "soon" } }, { slug: "cx-6h", visibility: "hide", upgrade: { model: "cx-next", retirement_at: "soon" } }], ["cx-6l"], {}],
+    ["R7 a successor that fails the model id check records no notice",
+      [{ slug: "cx-7l", visibility: "list", upgrade: { model: "bad;rm", retirement_at: at } }, { slug: "cx-7h", visibility: "hide", upgrade: { model: "bad;rm", retirement_at: at } }], ["cx-7l"], {}],
+    ["R8 a row whose slug is missing or fails the model id check is neither listed nor noticed",
+      [{ visibility: "list", upgrade: { model: "cx-next", retirement_at: at } }, { slug: "", visibility: "hide", upgrade: { model: "cx-next", retirement_at: at } }, { slug: "bad slug;rm", visibility: "list", upgrade: null }], [], {}],
+    ["R9 a dated upgrade without a successor records the date alone on a listed or hidden row",
+      [{ slug: "cx-9l", visibility: "list", upgrade: { retirement_at: at } }, { slug: "cx-9h", visibility: "hide", upgrade: { retirement_at: at } }], ["cx-9l"], { "cx-9l": { retiresAt: at }, "cx-9h": { retiresAt: at } }],
+    ["R10 a row with no upgrade key records no notice",
+      [{ slug: "cx-10l", visibility: "list" }, { slug: "cx-10h", visibility: "hide" }], ["cx-10l"], {}],
+  ])("codex cache reader row %s", (_row, models, listed, retirements) => {
+    const r = readCodexModelsCache(writeCache({ models }));
+    expect(r.models).toEqual(listed);
+    expect(r.retirements).toEqual(retirements);
+  });
+
+  test("codex cache reader reports every id the CLI marks hidden, whatever its notice, and never a listed, unknown-visibility or invalid-slug row", () => {
+    // v2.6.9 D-1526: hidden-ness is the CLI's own flag, recorded beside the listing as routing evidence
+    const r = readCodexModelsCache(writeCache({
+      models: [
+        { slug: "cx-h1", visibility: "hide", upgrade: { model: "cx-next", retirement_at: at } },
+        { slug: "cx-h2", visibility: "hide", upgrade: null },
+        { slug: "cx-h3", visibility: "hide" },
+        { slug: "cx-l", visibility: "list", upgrade: null },
+        { slug: "cx-u", visibility: "experimental" },
+        { slug: "bad slug;rm", visibility: "hide" },
+        { visibility: "hide" },
+      ],
+    }));
+    expect(r.models).toEqual(["cx-l"]);
+    expect(r.hidden).toEqual(["cx-h1", "cx-h2", "cx-h3"]);
   });
 
   test("WR-01/MODEL-05: adapter surfaces the cache's own fetched_at (via CODEX_HOME) for honest staleness", () => {

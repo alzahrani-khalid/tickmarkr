@@ -8,6 +8,16 @@ import {
 } from "../../src/adapters/model-windows.js";
 import { DEFAULT_CONFIG } from "../../src/config/config.js";
 
+test("default config seeds the six other codex models and windows but no gpt-5.5 tier or window versus a seeded retiring model or a dropped codex seed set", () => {
+  // the CLI hides gpt-5.5 and retires it 2026-10-14T19:00:00Z (queue row 64) — the shipped seed must not offer it
+  const six = ["gpt-5.6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-6-astra", "gpt-6-luna", "gpt-6-sol"];
+  expect(Object.keys(DEFAULT_CONFIG.tiers.codex?.models ?? {}).sort()).toEqual(six);
+  expect(Object.keys(DEFAULT_CONFIG.tiers.codex?.windows ?? {}).sort()).toEqual(six);
+  const cited = CITED_MODEL_WINDOWS.map((claim) => claim.modelId);
+  expect(cited).not.toContain("gpt-5.5");
+  expect(six.filter((id) => !cited.includes(id))).toEqual([]);
+});
+
 const VALID_CLAIMS = [
   {
     modelId: "vendor/model-a",
@@ -33,9 +43,9 @@ describe("cited model-window claims", () => {
       expect(() => loadModelWindowClaims(fixture), shape).toThrow();
     }
 
-    // v2.6.4 T3 (D-717): the seven Codex rows cite the installed CLI's own models_cache.json snapshot, which
-    // has no public URL; every other row still cites a web page.
-    const codexCliCacheRows = new Set(["gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.5", "gpt-5.6-terra", "gpt-5.6-luna"]);
+    // v2.6.4 T3 (D-717): the Codex rows cite the installed CLI's own models_cache.json snapshot, which has no
+    // public URL; every other row still cites a web page. (gpt-5.5 left the seed in v2.6.9.)
+    const codexCliCacheRows = new Set(["gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]);
     const loaded = loadModelWindowClaims(CITED_MODEL_WINDOWS);
     for (const claim of loaded) {
       expect(claim.modelId).not.toHaveLength(0);

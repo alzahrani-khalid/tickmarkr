@@ -2,6 +2,43 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v2.6.9 — three hand fixes ahead of a retirement date
+
+**v2.6.9** is a patch of three small fixes, released before codex retires `gpt-5.5` on 2026-10-14T19:00Z. Each was
+made by hand and proven by its own `tickmarkr verify`: build, lint, evidence, scope, executed acceptance with one test
+per row of its closed case table, cross-vendor review (`codex:gpt-6-astra`, OpenAI, reviewing Claude-authored work,
+approved all three) and the full suite. No `tickmarkr run` was used and no speed improvement is claimed. The queue
+that was planned as 2.6.9 moves to 2.6.10 unchanged.
+
+- **Doctor reads codex's retirement notice for a model the CLI hides, and routing honours the hide (affected:
+  ≤ 2.6.8).** Codex hides a model before it retires it, and the cache reader dropped hidden rows before reading their
+  notice, so a configured `gpt-5.5` got only "CLI no longer reports it" — no date, no successor. A dated notice is now
+  read from hidden rows too, and doctor prints "retires <date> per the CLI's notice (the CLI no longer lists it);
+  successor <id>" (or "retired …" after the date) in place of that line, also when the cache lists nothing at all. A
+  hidden row is never listed and never recorded as known clean; an undated, malformed or missing notice records
+  nothing. **Routing:** tickmarkr already stopped routing a configured model the CLI does not list, but only while the
+  CLI listed at least one other configured model. Doctor now also records which models the CLI explicitly hides, and
+  routing leaves a hidden configured model out even when no configured model is listed. A model with no such evidence —
+  including every model in a doctor record written before 2.6.9, until the next `tickmarkr doctor` — keeps the old
+  behaviour. This exclusion has no Fleet override yet (retirement-date routing and its override are planned work).
+  `gpt-5.5` leaves the default codex seed and its context window, and the comments no longer name a fixed successor.
+  Without `gpt-5.5` the default frontier pool is one model smaller. **Visible effect:** with the shipped defaults, an
+  unpinned frontier pick (such as a `migration` task) is spread by a task-keyed rotation over one fewer channel, so a
+  given task can land on a different frontier model than under 2.6.8 — the repository's own fixed-task case moved from
+  `cursor-agent:claude-fable-5-1` to `codex:gpt-6-sol`. Pin the shape in your overlay if you need a fixed pick. If your
+  own overlay classifies `gpt-5.5`, tombstone it (`gpt-5.5: null`).
+- **Fleet: Space picks in every single-select picker (affected: ≤ 2.6.8).** In the presets, classify (channel and
+  tier steps), assign, pool-mode, reach and judge pickers, Space now picks exactly as Enter does. Multi-select pickers
+  (candidates, prefer) still toggle on Space, the add-model and classify-note fields still type it, and a lift still
+  confirms only on Enter. On the review screen `q` with staged edits now asks a second time before discarding them, as
+  `q` does on every other screen; `n` stays the explicit discard.
+- **A bad models.dev payload no longer makes the catalog cache unreadable (affected: ≤ 2.6.8).** `tickmarkr doctor
+  --refresh-catalog` (and the seven-day refresh guard) kept the fetched models.dev payload before checking it. When
+  that payload was invalid and another leg (Artificial Analysis or LiveBench) updated in the same refresh, the cache was
+  written with it, every later read fell back to the vendored catalog, and the refresh still reported the other leg
+  updated. The payload is now checked first: the cached models.dev data stays byte-identical, the other leg still
+  merges, and models.dev is reported failed.
+
 ## v2.6.8 — promises kept
 
 **v2.6.8** scopes git hardening and proof ownership to tickmarkr's own work, fixes test budgets and review launches, repairs beat recovery, and makes review briefs and skills truthful. It answers the seven 2.6.7 promises below; **P6 is not delivered**, and P5 has a changed promise. Both runs used the **installed 2.6.7 engine at concurrency 2**. Run `run-20261006-034217-0000000000000290`: **2 of 8 merged (T3, T6), closed partial, 7.46 h**; its run-end tip test failed, then a fresh deterministic verify passed the same tree and the failure was classified as a non-reproduced flake. Run `run-20261006-151757-0000000000000311`: **5 of 6 merged (T1, T2, T5, T7, T8), T4 parked, closed partial, 9 h 19 m** (559 m 48 s), with **31 recorded worker dispatches** (T1 7, T2 4, T4 12, T5 5, T7 2, T8 1). Tip build/test/lint passed fresh on `e574c7c14001`; outstanding checks were known and 0. **Neither run was green; no runtime improvement is claimed.** No task was waived in either run. Distinct cross-vendor reviewers returning verdicts: three in run 1 — `codex:gpt-6-astra` and `codex:gpt-6.1-sol` (OpenAI) reviewed Claude-authored T1–T5; `claude-code:fable` (Anthropic) reviewed Grok-authored T6. Run 2 had two (`codex:gpt-6-astra`, `codex:gpt-6.1-sol`, both OpenAI reviewing Anthropic-authored work). `qwen:qwen3.8-max` returned no verdict.

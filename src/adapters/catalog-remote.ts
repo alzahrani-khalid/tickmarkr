@@ -635,8 +635,11 @@ export async function refreshCatalogCommand(opts: RefreshCatalogOptions): Promis
   let modelsDev: unknown = current.catalog.modelsDev;
   let modelsDevUpdated = false;
   try {
-    modelsDev = await fetchCatalog(fetcher, MODELS_DEV_CATALOG_URL, {}, timeoutMs, (r) => r.json());
-    if (!validModelsDevCatalog(modelsDev)) throw new Error("models.dev catalog schema is invalid");
+    // v2.6.9 (queue row 97): validate before the payload replaces the spine — an invalid payload left in
+    // modelsDev would be written beside an updated sibling leg and make the whole cache unreadable.
+    const fetched = await fetchCatalog(fetcher, MODELS_DEV_CATALOG_URL, {}, timeoutMs, (r) => r.json());
+    if (!validModelsDevCatalog(fetched)) throw new Error("models.dev catalog schema is invalid");
+    modelsDev = fetched;
     modelsDevUpdated = true;
     legAt.modelsDev = stamp;
     legs.push({ leg: "models.dev", status: "updated", detail: "fetched", retry: "next retry after this leg is stale" });

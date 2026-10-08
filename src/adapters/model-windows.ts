@@ -58,7 +58,6 @@ const VENDORED_MODEL_WINDOW_CLAIMS = [
   { modelId: "gpt-6-sol", window: 272_000, source: CODEX_CLI_CACHE_SOURCE, readDate: CODEX_CLI_CACHE_READ_DATE },
   { modelId: "gpt-6-luna", window: 272_000, source: CODEX_CLI_CACHE_SOURCE, readDate: CODEX_CLI_CACHE_READ_DATE },
   { modelId: "gpt-5.6-sol", window: 272_000, source: CODEX_CLI_CACHE_SOURCE, readDate: CODEX_CLI_CACHE_READ_DATE },
-  { modelId: "gpt-5.5", window: 272_000, source: CODEX_CLI_CACHE_SOURCE, readDate: CODEX_CLI_CACHE_READ_DATE },
   { modelId: "gpt-5.6-terra", window: 272_000, source: CODEX_CLI_CACHE_SOURCE, readDate: CODEX_CLI_CACHE_READ_DATE },
   { modelId: "gpt-5.6-luna", window: 272_000, source: CODEX_CLI_CACHE_SOURCE, readDate: CODEX_CLI_CACHE_READ_DATE },
   { modelId: "composer-2.5", window: 200_000, source: CURSOR_SOURCE, readDate: READ_DATE },

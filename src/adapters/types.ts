@@ -36,8 +36,9 @@ export interface BillingChannel { adapter: string; vendor: string; model: string
 export const MODEL_PROBE_ERRORS = ["EMFILE", "EAGAIN", "ENFILE", "ENOMEM", "ENOSPC"] as const;
 export type ModelProbeError = typeof MODEL_PROBE_ERRORS[number];
 export interface ModelAuth { authed: boolean; reason?: string; probeError?: ModelProbeError; probedAt: string; identity?: string }
-// v2.6.4 T2 (B1a): a LISTED model's retirement notice, copied verbatim from the CLI's own cache —
-// never inferred from a model name. `successor` is the CLI's named upgrade target, not a tier claim.
+// v2.6.4 T2 (B1a): a model's retirement notice — a listed row's, or (v2.6.9) a hidden row's dated one —
+// copied verbatim from the CLI's own cache, never inferred from a model name. `successor` is the CLI's
+// named upgrade target, not a tier claim.
 export interface ModelRetirement { retiresAt: string; successor?: string }
 export interface AuthHealth {
   installed: boolean; authed: boolean; version?: string; models: string[]; note?: string;
@@ -53,9 +54,14 @@ export interface AuthHealth {
   modelAuth?: Record<string, ModelAuth>;
   modelIdentities?: Record<string, string>;
   // v2.6.4 T2 (B1a): per listed model — null = listed with NO retirement notice (known clean), a record
-  // = the CLI's notice. A missing key is unknown (the CLI's notice was absent or malformed); the whole
+  // = the CLI's notice; v2.6.9 also records a hidden row's dated notice (never null for a hidden row, D-1526).
+  // A missing key is unknown (the CLI's notice was absent or malformed); the whole
   // field missing is unknown too (pre-2.6.4 doctor.json, unreadable cache). Advisory: routing never reads it.
   modelRetirements?: Record<string, ModelRetirement | null>;
+  // v2.6.9 (queue row 64, D-1526): ids the CLI's own list marks hidden (codex visibility "hide") — positive
+  // evidence it stopped offering them. Routing excludes a configured id found here whatever the listed/configured
+  // overlap; MODEL-04's fail-open still covers ids with no such evidence. Missing = unknown (older doctor.json).
+  modelsHidden?: string[];
   // v2.6.5 T3 → v2.6.6 T9 (K): Codex record only — doctor's worker-grant probe (codex-commit-check.ts), the
   // closed table below. Absent or outside the table = unknown (pre-2.6.5 doctor.json, stubbed adapter).
   // escape is a BLOCKING security warning in doctor and plan for every Codex role; routing never reads it.
@@ -433,6 +439,9 @@ export interface WorkerAdapter {
   // v2.6.4 T2 (B1a): cache-backed adapters that also carry the CLI's retirement notices (codex). Called
   // ONLY by doctor, beside listModels. undefined = no readable source → doctor.json records unknown.
   listModelsRetirements?(): Record<string, ModelRetirement | null> | undefined;
+  // v2.6.9 (D-1526): the ids the same source marks hidden. Called ONLY by doctor, beside listModels.
+  // undefined = no readable source → doctor.json records unknown.
+  listModelsHidden?(): string[] | undefined;
   // SPEND-01: harness-emitted structured usage ONLY, read POST-HOC from the CLI's own cwd-keyed store
   // (session JSONL / structured artifact the harness wrote). NEVER the pane transcript (driver.read —
   // v1.4 self-reference class) and NEVER the parsed trailer (TEL-01 best-liar class).

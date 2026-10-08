@@ -58,7 +58,6 @@ model status:
     gpt-6-sol     frontier unauthed: headless probe unavailable (2026-07-15)  denied=—  prefer=implement#1
     gpt-6-luna    cheap    unauthed: headless probe unavailable (2026-07-15)  denied=—  prefer=implement#1
     gpt-5.6-sol   frontier unauthed: headless probe unavailable (2026-07-15)  denied=—  prefer=implement#1
-    gpt-5.5       frontier unauthed: headless probe unavailable (2026-07-15)  denied=—  prefer=implement#1
     gpt-5.6-terra mid      unauthed: headless probe unavailable (2026-07-15)  denied=—  prefer=implement#1
     gpt-5.6-luna  cheap    unauthed: headless probe unavailable (2026-07-15)  denied=—  prefer=implement#1
   cursor-agent
@@ -1027,5 +1026,35 @@ describe("B1a retirement notices survive the doctor.json round trip", () => {
     expect(legacy).toContain(`codex: retirement unknown for ${configured.join(", ")} — doctor record carries no CLI retirement notices; rerun tickmarkr doctor`);
     expect(legacy.some((l) => /codex: gpt-5\.5 retir/.test(l))).toBe(false);
     expect(configured).toContain("gpt-5.6-sol");
+  });
+
+  test("doctor records the ids the codex CLI hides so routing read back from doctor.json keeps a hidden configured model out even when no configured id is listed", async () => {
+    // D-1526: the CLI hides gpt-5.5 and lists only an unconfigured successor — the listed/configured overlap is empty
+    const repo = makeRepo({ "keep.txt": "x" });
+    mkdirSync(join(repo, ".tickmarkr"), { recursive: true });
+    writeFileSync(join(repo, ".tickmarkr", "config.yaml"), "tiers:\n  codex:\n    models:\n      gpt-5.5: frontier\n");
+    const home = mkdtempSync(join(tmpdir(), "tickmarkr-hidden-reload-"));
+    writeFileSync(join(home, "models_cache.json"), JSON.stringify({ fetched_at: "2026-10-08T00:00:00Z", models: [
+      { slug: "gpt-5.5", visibility: "hide", upgrade: { model: "gpt-6.1-sol", retirement_at: "2026-10-14T19:00:00Z" } },
+      { slug: "gpt-6.1-sol", visibility: "list", upgrade: null },
+    ] }));
+    const candidates = vi.spyOn(registry, "detectCandidateClis").mockReturnValue([]);
+    vi.stubEnv("CODEX_HOME", home);
+    try {
+      await doctor(["--"], repo, [cacheCodex], { banner: false, now: () => NOW });
+    } finally {
+      vi.unstubAllEnvs();
+      candidates.mockRestore();
+    }
+    const reloaded = readDoctor(repo)!;
+    expect(reloaded.codex.models).toEqual(["gpt-6.1-sol"]);
+    expect(reloaded.codex.modelsHidden).toEqual(["gpt-5.5"]);
+    // an older probe still says both answered — the recorded hidden flag is what keeps gpt-5.5 out
+    const probed = { authed: true, probedAt: "2026-10-01T00:00:00.000Z" };
+    const health = { codex: { ...reloaded.codex, modelAuth: { "gpt-5.5": probed, "gpt-6-sol": probed } } };
+    const cfg = loadConfig(repo, { globalDir: mkdtempSync(join(tmpdir(), "tickmarkr-hidden-reload-g-")) });
+    const routable = discoverChannels(cfg, [cacheCodex], health).map((c) => c.model);
+    expect(routable).not.toContain("gpt-5.5");
+    expect(routable).toContain("gpt-6-sol");
   });
 });

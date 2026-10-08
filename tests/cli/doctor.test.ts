@@ -1332,10 +1332,11 @@ describe("B1a codex retirement notices (doctor)", () => {
     expect(clean).not.toContain("retirement unknown");
     expect(clean).not.toContain("tiers lists gpt-5.5");
 
-    // hidden: the notice rides on a hidden entry, so the existing missing-listing advisory speaks instead
+    // hidden: v2.6.9 (queue row 64) — the CLI hides a model before retiring it, so the dated notice on the hidden
+    // entry speaks in place of the bare missing-listing advisory
     const hidden = await doctorAt(repo, codexHome(repo, (slug) => (slug === "gpt-5.5" ? { visibility: "hide", upgrade: NOTICE } : {})), "2026-10-01T00:00:00.000Z");
-    expect(hidden).toContain("codex: tiers lists gpt-5.5 — CLI no longer reports it; tombstone it (gpt-5.5: null overlay) or verify the id");
-    expect(hidden).not.toMatch(/gpt-5\.5 retir/);
+    expect(hidden).toContain("codex: gpt-5.5 retires 2026-10-14T19:00:00Z per the CLI's notice (the CLI no longer lists it); successor gpt-5.6-sol");
+    expect(hidden).not.toContain("tiers lists gpt-5.5");
     expect(hidden).not.toContain("retirement unknown");
 
     // a malformed notice on a listed id is unknown for that id — never clean, never a guessed date

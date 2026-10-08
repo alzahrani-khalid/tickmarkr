@@ -48,6 +48,143 @@ const installed = (models: string[], modelsDetectedAt?: string): AuthHealth => (
 const daysAgo = (n: number) => new Date(Date.now() - n * 86400000).toISOString();
 
 describe("modelLints — both-direction staleness lints", () => {
+  // v2.6.9 (queue row 64), phase-0 brief A. The codex adapter reads a fixture models_cache.json (HOME and
+  // CODEX_HOME both point at the fixture dir) and the health record is built as doctor builds it.
+  const codexHealthAsDoctor = async (models: Array<Record<string, unknown>>): Promise<Record<string, AuthHealth>> => {
+    const home = mkdtempSync(join(tmpdir(), "tickmarkr-ml-codexhome-"));
+    writeFileSync(join(home, "models_cache.json"), JSON.stringify({ fetched_at: "2026-10-08T00:00:00Z", models }));
+    vi.stubEnv("HOME", home);
+    vi.stubEnv("CODEX_HOME", home);
+    try {
+      const codexAdapter = adapters.find((a) => a.id === "codex")!;
+      const models = await codexAdapter.listModels!();
+      // as doctor's MODEL-02 loop: the detection time only for a non-empty listing; notices and hidden ids beside it
+      const h = installed(models, models.length ? (codexAdapter.listModelsFetchedAt?.() ?? new Date().toISOString()) : undefined);
+      const retirements = codexAdapter.listModelsRetirements?.();
+      const hidden = codexAdapter.listModelsHidden?.();
+      return { codex: { ...h, ...(retirements ? { modelRetirements: retirements } : {}), ...(hidden ? { modelsHidden: hidden } : {}) } };
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  };
+  const codexConfigured = (models: string[]) => {
+    const { globalDir } = emptyRepo();
+    const repo = mkdtempSync(join(tmpdir(), "tickmarkr-ml-codexcfg-"));
+    mkdirSync(join(repo, ".tickmarkr"), { recursive: true });
+    writeFileSync(join(repo, ".tickmarkr", "config.yaml"), `tiers:\n  codex:\n    models:\n${models.map((m) => `      ${m}: frontier\n`).join("")}`);
+    return loadConfig(repo, { globalDir });
+  };
+  const at = "2026-10-14T19:00:00Z";
+  const beforeAt = "2026-10-08T12:00:00Z";
+  const afterAt = "2026-10-15T00:00:00Z";
+  const named = "(named by the CLI — not a tier claim; classify it per benchmark policy)";
+  // [row, the configured model's cache row (a listed anchor always rides beside it), now, every lint naming the model]
+  test.each<[string, Record<string, unknown>, string, string[]]>([
+    ["L1 a listed model with a known clean notice prints no lint",
+      { visibility: "list", upgrade: null }, beforeAt, []],
+    ["L2 a listed model retiring in the future prints its date and successor",
+      { visibility: "list", upgrade: { model: "cx-next", retirement_at: at } }, beforeAt,
+      [`codex: cx-old retires ${at} per the CLI's notice; successor cx-next ${named} — tombstone it (cx-old: null overlay) before then (advisory — routing unchanged)`]],
+    ["L3 a listed model past its date prints retired with its successor",
+      { visibility: "list", upgrade: { model: "cx-next", retirement_at: at } }, afterAt,
+      [`codex: cx-old retired ${at} per the CLI's notice; successor cx-next ${named} — tombstone it (cx-old: null overlay) or verify the id (advisory — routing unchanged)`]],
+    ["L4 a hidden model retiring in the future prints its date and successor instead of the no-longer-reports line",
+      { visibility: "hide", upgrade: { model: "cx-next", retirement_at: at } }, beforeAt,
+      [`codex: cx-old retires ${at} per the CLI's notice (the CLI no longer lists it); successor cx-next ${named} — tombstone it (cx-old: null overlay) before then (advisory — not routed while the CLI hides it)`]],
+    ["L5 a hidden model past its date prints retired with its successor instead of the no-longer-reports line",
+      { visibility: "hide", upgrade: { model: "cx-next", retirement_at: at } }, afterAt,
+      [`codex: cx-old retired ${at} per the CLI's notice (the CLI no longer lists it); successor cx-next ${named} — tombstone it (cx-old: null overlay) or verify the id (advisory — not routed while the CLI hides it)`]],
+    ["L6 a hidden model without a notice keeps the no-longer-reports line",
+      { visibility: "hide", upgrade: null }, beforeAt,
+      ["codex: tiers lists cx-old — CLI no longer reports it; tombstone it (cx-old: null overlay) or verify the id"]],
+    ["L7 a listed model with an unreadable notice prints retirement unknown",
+      { visibility: "list", upgrade: { model: "cx-next", retirement_at: "soon" } }, beforeAt,
+      ["codex: retirement unknown for cx-old — the CLI's notice is absent or unreadable"]],
+    ["L8 a dated notice without a successor says no successor named",
+      { visibility: "list", upgrade: { retirement_at: at } }, beforeAt,
+      [`codex: cx-old retires ${at} per the CLI's notice; no successor named — tombstone it (cx-old: null overlay) before then (advisory — routing unchanged)`]],
+  ])("codex retirement lint row %s", async (_row, row, now, expected) => {
+    const health = await codexHealthAsDoctor([{ slug: "cx-old", ...row }, { slug: "cx-anchor", visibility: "list", upgrade: null }]);
+    const lints = modelLints(codexConfigured(["cx-old"]), health, adapters, { now: new Date(now) });
+    expect(lints.filter((l) => l.includes("cx-old"))).toEqual(expected);
+  });
+
+  // D-1526: a cache holding only hidden rows lists nothing — doctor still owes the CLI's dated notice
+  test.each<[string, Record<string, unknown>, string, string[]]>([
+    ["H1 a hidden model retiring in the future prints its date and successor",
+      { upgrade: { model: "cx-next", retirement_at: at } }, beforeAt,
+      [`codex: cx-old retires ${at} per the CLI's notice (the CLI no longer lists it); successor cx-next ${named} — tombstone it (cx-old: null overlay) before then (advisory — not routed while the CLI hides it)`]],
+    ["H2 a hidden model past its date prints retired with its successor",
+      { upgrade: { model: "cx-next", retirement_at: at } }, afterAt,
+      [`codex: cx-old retired ${at} per the CLI's notice (the CLI no longer lists it); successor cx-next ${named} — tombstone it (cx-old: null overlay) or verify the id (advisory — not routed while the CLI hides it)`]],
+    ["H3 a dated notice without a successor says no successor named",
+      { upgrade: { retirement_at: at } }, beforeAt,
+      [`codex: cx-old retires ${at} per the CLI's notice (the CLI no longer lists it); no successor named — tombstone it (cx-old: null overlay) before then (advisory — not routed while the CLI hides it)`]],
+    ["H4 a hidden model without a notice prints no retirement line",
+      { upgrade: null }, beforeAt, []],
+  ])("codex retirement lint with nothing listed row %s", async (_row, row, now, expected) => {
+    const health = await codexHealthAsDoctor([{ slug: "cx-old", visibility: "hide", ...row }]);
+    const lints = modelLints(codexConfigured(["cx-old"]), health, adapters, { now: new Date(now) });
+    expect(lints).toContain("codex: no detection data — run tickmarkr doctor");
+    expect(lints.filter((l) => l.includes("cx-old"))).toEqual(expected);
+  });
+
+  test("a configured codex model the CLI hides is not offered to routing even before its retirement date versus a hidden model left routable", async () => {
+    // the overlapping case (the CLI lists another configured id, registry.ts invalidConfiguredModels); the
+    // hidden-only and successor-only listings are rows G1–G5, and MODEL-04's fail-open for an id with no hidden
+    // evidence is G6/G7 (D-1526)
+    const health = await codexHealthAsDoctor([
+      { slug: "gpt-5.5", visibility: "hide", upgrade: { model: "gpt-6.1-sol", retirement_at: at } },
+      { slug: "gpt-6-sol", visibility: "list", upgrade: null },
+    ]);
+    // worst case: an older probe still says gpt-5.5 answered — the CLI's own listing is what keeps it out
+    const probed = { authed: true, probedAt: "2026-10-01T00:00:00.000Z" };
+    const withProbes = { codex: { ...health.codex, modelAuth: { "gpt-5.5": probed, "gpt-6-sol": probed } } };
+    const routable = discoverChannels(codexConfigured(["gpt-5.5"]), adapters, withProbes).filter((c) => c.adapter === "codex").map((c) => c.model);
+    expect(routable).toContain("gpt-6-sol");
+    expect(routable).not.toContain("gpt-5.5");
+  });
+
+  // D-1526: a configured id the CLI's list marks hidden is out of routing whatever the listed/configured overlap;
+  // an id with no such evidence keeps MODEL-04's fail-open. [row, cache rows, gpt-5.5 routable?]
+  test.each<[string, Array<Record<string, unknown>>, boolean]>([
+    ["G1 a cache that lists nothing keeps a configured model it hides with a dated notice out of routing",
+      [{ slug: "gpt-5.5", visibility: "hide", upgrade: { model: "gpt-6.1-sol", retirement_at: at } }], false],
+    ["G2 a cache that lists nothing keeps a configured model it hides with an expired notice out of routing",
+      [{ slug: "gpt-5.5", visibility: "hide", upgrade: { model: "gpt-6.1-sol", retirement_at: "2026-01-01T00:00:00Z" } }], false],
+    ["G3 a cache that lists nothing keeps a configured model it hides with a notice naming no successor out of routing",
+      [{ slug: "gpt-5.5", visibility: "hide", upgrade: { retirement_at: at } }], false],
+    ["G4 a cache that lists nothing keeps a configured model it hides without a notice out of routing",
+      [{ slug: "gpt-5.5", visibility: "hide", upgrade: null }], false],
+    ["G5 a cache listing only an unconfigured successor keeps the configured model it hides out of routing",
+      [{ slug: "gpt-5.5", visibility: "hide", upgrade: { model: "gpt-6.1-sol", retirement_at: at } }, { slug: "gpt-6.1-sol", visibility: "list", upgrade: null }], false],
+    ["G6 a configured model the cache neither lists nor hides stays routable when the listing shares no configured id",
+      [{ slug: "gpt-6.1-sol", visibility: "list", upgrade: null }], true],
+  ])("codex hidden-model routing row %s", async (_row, models, routable) => {
+    const health = await codexHealthAsDoctor(models);
+    // worst case: an older probe still says both answered — only the CLI's own flags decide
+    const probed = { authed: true, probedAt: "2026-10-01T00:00:00.000Z" };
+    const withProbes = { codex: { ...health.codex, modelAuth: { "gpt-5.5": probed, "gpt-6-sol": probed } } };
+    const channels = discoverChannels(codexConfigured(["gpt-5.5"]), adapters, withProbes).filter((c) => c.adapter === "codex").map((c) => c.model);
+    expect(channels.includes("gpt-5.5")).toBe(routable);
+    // the seeded gpt-6-sol carries no hidden evidence in any row, so MODEL-04's fail-open keeps it routable
+    expect(channels).toContain("gpt-6-sol");
+  });
+
+  test("codex hidden-model routing row G7 a doctor record without the hidden field keeps the fail-open for a model the CLI hid", async () => {
+    // a doctor.json written before 2.6.9 has no modelsHidden: no hidden evidence, so MODEL-04's fail-open is unchanged
+    const { modelsHidden: _dropped, ...legacy } = (await codexHealthAsDoctor([
+      { slug: "gpt-5.5", visibility: "hide", upgrade: null },
+      { slug: "gpt-6.1-sol", visibility: "list", upgrade: null },
+    ])).codex;
+    expect(_dropped).toEqual(["gpt-5.5"]);
+    const probed = { authed: true, probedAt: "2026-10-01T00:00:00.000Z" };
+    const channels = discoverChannels(codexConfigured(["gpt-5.5"]), adapters, { codex: { ...legacy, modelAuth: { "gpt-5.5": probed, "gpt-6-sol": probed } } })
+      .filter((c) => c.adapter === "codex").map((c) => c.model);
+    expect(channels).toContain("gpt-5.5");
+    expect(channels).toContain("gpt-6-sol");
+  });
+
   test("tombstone direction: configured id CLI no longer reports (live glm-5.2 proof)", () => {
     // Phase 23: stale seed reconstructed via overlay (DEFAULT was reseeded to zai-coding-plan/glm-5.2 in MODEL-09).
     const health = { opencode: installed(["zai-coding-plan/glm-5.2", "opencode/big-pickle"]) };
@@ -57,21 +194,21 @@ describe("modelLints — both-direction staleness lints", () => {
     );
   });
 
-  test("unconfigured direction: reports N models not in tiers, per-id diff (gpt-5.5 configured+detected → no lint)", () => {
+  test("unconfigured direction: reports N models not in tiers, per-id diff (gpt-6-sol configured+detected → no lint)", () => {
     // B1a: the listed configured ids carry the CLI's known-clean notice (upgrade: null) — a record without the
-    // field would rightly render "retirement unknown" naming gpt-5.5, which is not this diff's subject.
+    // field would rightly render "retirement unknown" naming gpt-6-sol, which is not this diff's subject.
     const health = {
       codex: {
-        ...installed(["gpt-5.6-sol", "gpt-5.5", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex-spark"]),
-        modelRetirements: { "gpt-5.6-sol": null, "gpt-5.5": null, "gpt-5.6-terra": null, "gpt-5.6-luna": null },
+        ...installed(["gpt-5.6-sol", "gpt-6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex-spark"]),
+        modelRetirements: { "gpt-5.6-sol": null, "gpt-6-sol": null, "gpt-5.6-terra": null, "gpt-5.6-luna": null },
       },
     };
     const lints = modelLints(cfg(), health, adapters);
     expect(lints).toContain(
       "codex: reports 3 model(s) not in tiers (gpt-5.4, gpt-5.4-mini, gpt-5.3-codex-spark) — classify before routing (benchmark policy)",
     );
-    // gpt-5.5 is configured AND detected — the diff is per-id, so no tombstone/unconfigured lint mentions it
-    expect(lints.some((l) => l.includes("gpt-5.5"))).toBe(false);
+    // gpt-6-sol is configured AND detected — the diff is per-id, so no tombstone/unconfigured lint mentions it
+    expect(lints.some((l) => l.includes("gpt-6-sol"))).toBe(false);
   });
 
   test("capping: 193 unconfigured ids → exactly one lint, 5 ids then +N more", () => {
@@ -258,7 +395,7 @@ describe("suggestOverlay — paste-ready drift fragment", () => {
   });
 
   test("quiet when clean: detected === configured → \"\"; no-list-surface & empty detection contribute nothing", () => {
-    const clean = { codex: installed(["gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.5", "gpt-5.6-terra", "gpt-5.6-luna"], AT) };
+    const clean = { codex: installed(["gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"], AT) };
     expect(suggestOverlay(cfg(), clean, adapters)).toBe("");
     // claude-code has no listModels; opencode installed but empty detection → both skipped, mirroring modelLints guards
     expect(suggestOverlay(cfg(), { "claude-code": installed([]), opencode: installed([]) }, adapters)).toBe("");
@@ -703,7 +840,7 @@ describe("v1.54 T3 prefer-entry dead-steering sweep", () => {
 
   test("prefer entries matching installed channels yield no lint", () => {
     const c = cfg();
-    c.routing.map.implement = { prefer: ["codex:gpt-5.5"] };
+    c.routing.map.implement = { prefer: ["codex:gpt-6-sol"] };
     c.review.prefer = ["codex", "claude-code:sonnet"];
     c.consult.prefer = ["claude-code:fable"];
     expect(preferEntryLints(c, health(), new Set(["implement"]))).toEqual([]);
@@ -785,7 +922,7 @@ describe("contextWindowLints — v1.47 T3", () => {
   test("every model carrying a tier in the seed config also carries a declared window, proven member by member over the installed fleet — a claude-code fixture, a codex fixture, a cursor-agent fixture, an opencode fixture, a pi fixture, a grok fixture and a kimi fixture", () => {
     const installedFleet = {
       "claude-code": ["fable", "opus", "sonnet", "haiku"],
-      codex: ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.5", "gpt-5.6-terra", "gpt-5.6-luna"],
+      codex: ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"],
       "cursor-agent": ["composer-2.5", "composer-2.5-fast", "claude-fable-5-1", "gemini-3.8-flash"],
       opencode: ["zai-coding-plan/glm-5.2"],
       pi: ["zai/glm-5.2", "zai/glm-5.3", "zai/glm-5.3-flash"],
@@ -961,9 +1098,10 @@ describe("contextWindowLints — v1.47 T3", () => {
     }
   });
 
-  // v2.6.4 T3 (D-717): the installed codex CLI's models_cache.json snapshot budgets 272000 for all seven.
-  test("loadConfig discovery uses 272000 for each of the seven declared Codex seeds and accepts an explicit smaller operator window but refuses a 1050000 independent-table disagreement", () => {
-    const seeds = ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.5", "gpt-5.6-terra", "gpt-5.6-luna"];
+  // v2.6.4 T3 (D-717): the installed codex CLI's models_cache.json snapshot budgets 272000 for every seeded id
+  // (six since v2.6.9 — gpt-5.5 left the seed when the CLI hid it and dated its retirement).
+  test("loadConfig discovery uses 272000 for each declared Codex seed and accepts an explicit smaller operator window but refuses a 1050000 independent-table disagreement", () => {
+    const seeds = ["gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"];
     const loaded = cfg();
     const health = { codex: { ...installed([]), modelAuth: Object.fromEntries(seeds.map((m) => [m, { authed: true, probedAt: "2026-09-29T16:09:00.000Z" }])) } };
     const discovered = discoverChannels(loaded, adapters, health).filter((c) => c.adapter === "codex").map((c) => c.model);

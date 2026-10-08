@@ -81,8 +81,8 @@ describe("ROUTE-05 defaults shape→channel matrix", () => {
     ["chore", { adapter: "claude-code", model: "haiku" }],
     ["ui", { adapter: "claude-code", model: "sonnet" }],
     ["refactor", { adapter: "claude-code", model: "sonnet" }],
-    // Frontier spread rotates across the current seeded frontier pool.
-    ["migration", { adapter: "cursor-agent", model: "claude-fable-5-1" }],
+    // Frontier spread rotates across the current seeded frontier pool (v2.6.9: one member fewer without gpt-5.5).
+    ["migration", { adapter: "codex", model: "gpt-6-sol" }],
   ];
 
   test.each(cases)("%s → %o", (shape, expected) => {
@@ -101,12 +101,11 @@ describe("ROUTE-04 reseeded DEFAULT_CONFIG tiers", () => {
       "gpt-6-sol": "frontier",
       "gpt-6-luna": "cheap",
       "gpt-5.6-sol": "frontier",
-      "gpt-5.5": "frontier",
       "gpt-5.6-terra": "mid",
       "gpt-5.6-luna": "cheap",
     });
     // insertion order is the same-tier tiebreak (channelsFromConfig preserves Object.entries order), so pin it
-    expect(Object.keys(cfg.tiers.codex.models)).toEqual(["gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.5", "gpt-5.6-terra", "gpt-5.6-luna"]);
+    expect(Object.keys(cfg.tiers.codex.models)).toEqual(["gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"]);
     expect("gpt-5.4" in cfg.tiers.codex.models).toBe(false);
     expect("gpt-5.4-mini" in cfg.tiers.codex.models).toBe(false);
   });
@@ -217,7 +216,7 @@ describe("FLEET-06 parity baseline (V-1/V-2) — pinned pre-implementation", () 
     ["ui", { adapter: "claude-code", model: "sonnet", channel: "sub", tier: "mid" }, "floor mid (config floors), marginal-cost auto (cheapest sufficient tier)"],
     ["refactor", { adapter: "claude-code", model: "sonnet", channel: "sub", tier: "mid" }, "floor mid (config floors), marginal-cost auto (cheapest sufficient tier)"],
     // Frontier spread rotates across the current seeded frontier pool.
-    ["migration", { adapter: "cursor-agent", model: "claude-fable-5-1", channel: "sub", tier: "frontier" }, "floor frontier (config floors), marginal-cost auto (via frontier spread)"],
+    ["migration", { adapter: "codex", model: "gpt-6-sol", channel: "sub", tier: "frontier" }, "floor frontier (config floors), marginal-cost auto (via frontier spread)"],
   ];
 
   test.each(matrixCases)("V-2 route-matrix parity: %s", (shape, assignment, provenance) => {
@@ -257,11 +256,11 @@ describe("v1.58 frontier spread × v1.51 integrity floors", () => {
 describe("v2.6.4 T3 ruled Codex seeds through plan", () => {
   const ROSTER = [
     ["gpt-6-astra", "frontier"], ["gpt-6-sol", "frontier"], ["gpt-6-luna", "cheap"],
-    ["gpt-5.6-sol", "frontier"], ["gpt-5.5", "frontier"], ["gpt-5.6-terra", "mid"], ["gpt-5.6-luna", "cheap"],
+    ["gpt-5.6-sol", "frontier"], ["gpt-5.6-terra", "mid"], ["gpt-5.6-luna", "cheap"],
   ] as const;
   const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
-  test("plan using loadConfig defaults with isolated empty user and repo overlays preserves the ordered Codex roster gpt-6-astra frontier gpt-6-sol frontier gpt-6-luna cheap gpt-5.6-sol frontier gpt-5.5 frontier gpt-5.6-terra mid gpt-5.6-luna cheap; its production channels match all seven literal tiers and plan admits eligible seeds but refuses a denied seed or gpt-6-luna at a frontier floor", async () => {
+  test("plan using loadConfig defaults with isolated empty user and repo overlays preserves the ordered Codex roster gpt-6-astra frontier gpt-6-sol frontier gpt-6-luna cheap gpt-5.6-sol frontier gpt-5.6-terra mid gpt-5.6-luna cheap; its production channels match all six literal tiers and plan admits eligible seeds but refuses a denied seed or gpt-6-luna at a frontier floor", async () => {
     const prevXdg = process.env.XDG_CONFIG_HOME;
     // plan resolves the user layer through globalConfigDir(): point it at a fresh empty dir
     const userDir = mkdtempSync(join(tmpdir(), "tickmarkr-b1b-user-"));

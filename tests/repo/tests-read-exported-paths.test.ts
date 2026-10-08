@@ -64,6 +64,9 @@ const EXPECTED_EXCLUDED_PATHS = [
   "scripts/export-public.sh",
   "scripts/verify-export.sh",
   "tests/scripts/verify-export.test.ts",
+  "scripts/check-analysis.mjs",
+  "scripts/atlas.mjs",
+  "tests/docs/analysis-library.test.ts",
   ".github/workflows/ci.yml",
   "**/*.local.*",
 ];

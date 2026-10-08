@@ -1,4 +1,4 @@
-tickmarkr plan — dry run (19 channels available)
+tickmarkr plan — dry run (18 channels available)
 mode: risk-based (default) · explore on
 driver: auto → subprocess (HERDR_ENV unset)
 harness: /opt/tickmarkr/lib/node_modules/tickmarkr/dist/cli/index.js (unresolved location)
@@ -7,7 +7,7 @@ alias identity unknown: claude-code:fable, opus, sonnet, haiku — doctor persis
 
   T1     chore      c2  → claude-code:haiku [sub/cheap] — floor cheap (config floors), marginal-cost auto (cheapest sufficient tier)
     judge: claude-code:fable
-    review: codex:gpt-6-astra (seat 1 of 14 — rotation applies at run time) — reviewPolicy full
+    review: codex:gpt-6-astra (seat 1 of 13 — rotation applies at run time) — reviewPolicy full
     chain: depth 0 · wave 1 at concurrency 3
     floor cheap ← mode risk-based
 

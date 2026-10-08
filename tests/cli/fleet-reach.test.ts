@@ -898,6 +898,16 @@ test("test: Enter on a greyed picker row whose covering entry is its only exclus
   expect(overlayOf(d.repo)).toBe(d.overlay);
 });
 
+test("Space never confirms a lift because the lift listing ignores it and only Enter clears the covering deny entry", async () => {
+  const { repo, globalDir, overlay } = policyRepo(["fake-1", "fake-2"], ["  deny:", "    workers:", "      models: [r1]"], { "fake-1": "r1", "fake-2": "r1" });
+  // a single q quits only when nothing is staged — a Space that lifted would leave the browser armed instead
+  const ignored = await browse(repo, globalDir, "l" + KEYS.space + "\x1b" + KEYS.q, 200);
+  expect(ignored.out).toBe("fleet: quit without writing");
+  expect(ignored.frames.some((f) => f.includes("lift · routing.deny.workers.models (r1)"))).toBe(true);
+  expect(detailOf(ignored.frames, "lift: cleared r1")).toBeUndefined();
+  expect(overlayOf(repo)).toBe(overlay);
+});
+
 test("test: a lifted channel appears in the review overlay as a routing deny edit exactly like a reach choice, so a lift that bypasses the review funnel fails", async () => {
   const { repo, globalDir } = policyRepo(["fake-1", "fake-2"], ["  deny:", "    workers:", "      models: [fake:fake-2]"]);
   const { out, frames } = await browse(repo, globalDir, OPEN_IMPLEMENT_PICKER + KEYS.down + "\r" + "\x1b" + "w" + "y");

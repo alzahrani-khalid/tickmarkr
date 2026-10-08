@@ -668,6 +668,48 @@ test("test: a refresh whose models.dev leg fails and whose LiveBench leg succeed
   ]));
 });
 
+// v2.6.9 (queue row 97), phase-0 brief C: a models.dev payload is validated before it replaces the cached
+// spine — the closed models.dev outcome × sibling-leg table, one owned row each, through doctor.
+const invalidModelsDev = () => response({ anthropic: { id: "anthropic", models: {} } });
+const freshModelsDev = catalogFixture([{ id: "fresh-1", input: 1, output: 2, context: 100_000 }]).modelsDev;
+const seedRefreshCache = (repo: string, oldAt: string): string => {
+  writeCache(repo, {
+    ...fakeCatalog(oldAt),
+    liveBench: { tableDate: "old", categories: LIVEBENCH_CATEGORIES, rows: [{ model: "old", javascript: 1 }] },
+    legFetchedAt: { modelsDev: oldAt, liveBench: oldAt },
+  });
+  return readFileSync(catalogCachePath(repo), "utf8");
+};
+const cachedModelsDev = (repo: string): string =>
+  JSON.stringify((JSON.parse(readFileSync(catalogCachePath(repo), "utf8")) as CatalogCache).modelsDev);
+
+// [row, models.dev route, sibling routes, spine after, LiveBench after, cache file rewritten?, models.dev leg]
+test.each<[string, () => StubResponse, Parameters<typeof routedFetcher>[0], "new" | "old", "new" | "old", boolean, "updated" | "failed"]>([
+  ["C1 a valid models.dev payload replaces the cached spine and reports models.dev updated",
+    () => response(freshModelsDev), {}, "new", "new", true, "updated"],
+  ["C2 an invalid models.dev payload beside an updated LiveBench leg keeps the cached models.dev spine byte-identical and reports models.dev failed versus an overwritten cache that reads back as vendored",
+    invalidModelsDev, {}, "old", "new", true, "failed"],
+  ["C3 an invalid models.dev payload with no other leg updated leaves the cache file untouched",
+    invalidModelsDev, { table: () => response("", 500) }, "old", "old", false, "failed"],
+  ["C4 a models.dev fetch that throws beside an updated LiveBench leg keeps the cached spine and merges the LiveBench leg",
+    () => { throw new Error("offline"); }, {}, "old", "new", true, "failed"],
+])("doctor refresh-catalog row %s", async (_row, modelsDev, siblings, spine, liveBench, rewritten, leg) => {
+  const repo = makeRepo({ "keep.txt": "x" });
+  const oldAt = "2026-09-01T00:00:00.000Z";
+  const now = () => new Date("2026-09-20T00:00:00.000Z");
+  const before = seedRefreshCache(repo, oldAt);
+  const spineBefore = cachedModelsDev(repo);
+  vi.stubEnv("ARTIFICIAL_ANALYSIS_API_KEY", ""); // the operator's shell exports a real key; AA stays skipped
+  const out = await doctor(["--refresh-catalog"], repo, [], { catalogFetcher: routedFetcher({ ...siblings, modelsDev }), catalogNow: now });
+  expect(out).toContain(`models.dev ${leg} (`);
+  expect(readFileSync(catalogCachePath(repo), "utf8") !== before).toBe(rewritten);
+  expect(cachedModelsDev(repo)).toBe(spine === "new" ? JSON.stringify(freshModelsDev) : spineBefore);
+  const read = readCachedCatalog(repo, { now });
+  expect(read.source).toBe("cache");
+  expect((read.catalog.liveBench as { tableDate?: string } | undefined)?.tableDate).toBe(liveBench === "new" ? LIVEBENCH_TABLE_DATE : "old");
+  expect(read.catalog.legFetchedAt?.modelsDev).toBe(spine === "new" ? now().toISOString() : oldAt);
+});
+
 test("a partial refresh cannot launder the vendored models.dev snapshot into cached evidence or tier suggestions", async () => {
   const repo = makeRepo({ "keep.txt": "x" });
   mkdirSync(join(repo, ".tickmarkr"), { recursive: true });

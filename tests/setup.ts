@@ -20,6 +20,12 @@ for (const k of [QUALITY_ENV, NO_EXPLORE_ENV]) delete process.env[k];
 // was not that config). Tests that need a host set it explicitly inside the test.
 for (const k of ["TERM_PROGRAM", "ORCA_TERMINAL_HANDLE", "HERDR_ENV"]) delete process.env[k];
 
+// D-1522 (2026-10-08): the same leak class for a CATALOG KEY. The operator's shell exports a real
+// ARTIFICIAL_ANALYSIS_API_KEY, so every catalog refresh under test grew an Artificial Analysis leg — two fleet
+// tests red at the gate, green in a shell without the key — and the real key reached test fetchers. Tests that
+// need a key set one with vi.stubEnv.
+delete process.env.ARTIFICIAL_ANALYSIS_API_KEY;
+
 // D-1196 (v2.6.7 close): the same leak class for a tickmarkr HARNESS. When tickmarkr >= 2.6.7 runs this
 // suite as a gate, every child shell carries its verification-job token (descendant reaping) and T4's
 // forced git config, so this suite's own nested jobs adopted the outer token and its hook tests never saw

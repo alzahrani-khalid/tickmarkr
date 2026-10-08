@@ -1,9 +1,10 @@
-import { execSync } from "node:child_process";
-import { readFileSync, readdirSync } from "node:fs";
+import { execFileSync, execSync } from "node:child_process";
+import { mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join, relative } from "node:path";
 import { describe, expect, test } from "vitest";
 import * as brandModule from "../../src/brand.js";
 import { BANNER, PLAIN_BANNER } from "../../src/brand.js";
+import { makeRepo } from "../helpers/tmprepo.js";
 
 const REPO = join(import.meta.dirname, "../..");
 const README = join(REPO, "README.md");
@@ -27,17 +28,14 @@ function readmeHeroBlock(md: string): string {
 // reasoning as the pre-existing `.planning` exemption.
 const SKIP_DIRS = new Set([".git", "node_modules", "dist", ".tickmarkr", ".planning", ".overseer", "fixtures"]);
 
+// Only what git carries — tracked, or untracked and not ignored (D-1522 add.1): a git-ignored cache such as
+// graft/'s session store can hold a copy of the art without being a home for it.
 function listFiles(dir: string): string[] {
-  const out: string[] = [];
-  for (const ent of readdirSync(dir, { withFileTypes: true })) {
-    if (ent.isDirectory()) {
-      if (SKIP_DIRS.has(ent.name)) continue;
-      out.push(...listFiles(join(dir, ent.name)));
-    } else if (ent.isFile()) {
-      out.push(join(dir, ent.name));
-    }
-  }
-  return out;
+  return execFileSync("git", ["ls-files", "-z", "--cached", "--others", "--exclude-standard"], { cwd: dir, encoding: "utf8" })
+    .split("\0")
+    .filter((path) => path && !path.split("/").some((segment) => SKIP_DIRS.has(segment)))
+    .map((path) => join(dir, path))
+    .filter((path) => statSync(path, { throwIfNoEntry: false })?.isFile());
 }
 
 function markHomes(planted: Readonly<Record<string, string>> = {}): string[] {
@@ -87,5 +85,14 @@ describe("T4 README hero is the ASCII-identical logo", () => {
     expect(() => assertPermittedMarkHomes({ "planted-third-file.txt": PLAIN_MARK! })).toThrowError(
       /mark art duplicated outside brand\.ts\/README\.md/,
     );
+  });
+
+  test("the mark scan lists only files git carries, so a copy in a git-ignored cache is never a third home while an untracked unignored copy still is", () => {
+    // D-1522 add.1: graft's ignored session cache held copies of the art and redded the scan in the operator's tree
+    const repo = makeRepo({ ".gitignore": "/cache/\n", "tracked.txt": "x" });
+    mkdirSync(join(repo, "cache"), { recursive: true });
+    writeFileSync(join(repo, "cache", "session.json"), PLAIN_MARK!);
+    writeFileSync(join(repo, "loose.txt"), PLAIN_MARK!);
+    expect(listFiles(repo).map((path) => relative(repo, path)).sort()).toEqual([".gitignore", "loose.txt", "tracked.txt"]);
   });
 });
