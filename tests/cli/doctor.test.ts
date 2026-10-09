@@ -18,6 +18,7 @@ import { plan as planCommand } from "../../src/cli/commands/plan.js";
 import { run as runCommand } from "../../src/cli/commands/run.js";
 import { resume } from "../../src/cli/commands/resume.js";
 import { loadConfig } from "../../src/config/config.js";
+import * as orcaDriver from "../../src/drivers/orca.js";
 import { graphDefinitionHash, loadGraph } from "../../src/graph/graph.js";
 import { route } from "../../src/route/router.js";
 import { gitHead } from "../../src/run/git.js";
@@ -162,6 +163,13 @@ const withOverlay = (repo: string, yaml: string) => {
 beforeEach(() => {
   vi.stubGlobal("fetch", vi.fn(async () => { throw new Error("catalog fetch unavailable in test"); }));
   vi.spyOn(registry, "detectCandidateClis").mockReturnValue([]);
+  // Queue row 102 (D-1626): the same for the two environment rows no test here reads. Unstubbed, every doctor()
+  // ran a login-shell lookup of tickmarkr and tkr plus a full-CLI `version` per install found (the self-shadow row,
+  // pinned in doctor-runner-ignore.test.ts), and `orca status --json` against the developer's LIVE Orca, also via
+  // ORCA_CLI_COMMAND (the orca row, pinned in doctor-orca.test.ts). Only doctor.ts's imported bindings are
+  // replaced: registry's internal resolution (probeVersionShell, binaryShadowWarnings — OBS-117 below) stays real.
+  vi.spyOn(registry, "resolveShellBinary").mockReturnValue({ all: [] });
+  vi.spyOn(orcaDriver, "resolveOrcaCliBinary").mockReturnValue(undefined);
 });
 
 afterEach(() => {

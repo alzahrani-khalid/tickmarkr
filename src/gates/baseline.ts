@@ -11,7 +11,7 @@ import { dependencyLinkRefusal, DEFAULT_SHELL_TIMEOUT_MS, describeCapacity, type
 import { executionSignal } from "../run/execution-budget.js";
 import type { GateOutcome } from "../run/outcome.js";
 import type { GateResult } from "./types.js";
-import { isVitestTestCommand, manifestFileCount } from "./test-manifest.js";
+import { isVitestTestCommand, manifestChildEnv, manifestFileCount } from "./test-manifest.js";
 
 /**
  * T7: the capacity a gate's own command ran under rides the RESULT, beside the verdict it explains,
@@ -842,7 +842,11 @@ export async function captureBaseline(cwd: string, commands: Record<string, stri
       continue;
     }
     const evidence = beginGateEvidence(cwd, name, cmd, opts.evidence);
-    const r = await sh(cmd, cwd, CAPTURE_CEILING_MS, { env: opts.evidence?.env, onReceipt: receipt => { evidence.observe(receipt); opts.onReceipt?.(receipt); } });
+    // Queue row 104 (D-1644): a manifested test command is captured under the test gate's own runner environment
+    // (node_modules/.bin first), so a bare repo-local runner resolves here exactly as it does in the gate — built on the
+    // caller's own evidence environment when it supplies one (D-1659), never in place of it.
+    const env = (name === "test" || name === "tipTest") && isVitestTestCommand(cmd, cwd) ? manifestChildEnv(cwd, opts.evidence?.env) : opts.evidence?.env;
+    const r = await sh(cmd, cwd, CAPTURE_CEILING_MS, { env, onReceipt: receipt => { evidence.observe(receipt); opts.onReceipt?.(receipt); } });
     (base.evidenceReceipts ??= {})[name] = evidence.finish(r.stdout, r.stderr);
     // ponytail: strip the executing cwd so repo-root capture and worktree compare fingerprint identically; /private-vs-/tmp symlink variance is out of scope
     // ponytail: a capture that was itself killed records the ceiling as its "measurement", which

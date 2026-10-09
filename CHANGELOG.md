@@ -2,6 +2,25 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v2.7.2 — a test baseline is captured with the runner the test gate uses
+
+**v2.7.2** ships one product fix. It was made by hand and proven by its own `tickmarkr verify`: build, lint, evidence,
+scope, executed acceptance, cross-vendor review (`codex:gpt-6-astra`, OpenAI, reviewing Claude-authored work) and the
+full suite. No `tickmarkr run` was used.
+
+- **A test baseline is captured with the same runner environment the test gate uses (affected: ≤ 2.7.1).** The test gate
+  ran a manifested test command with the worktree's `node_modules/.bin` first on `PATH`; the baseline capture ran the
+  same command with the inherited `PATH`. A test command that names a repo-local runner bare (`vitest run`, not
+  `npm test`) therefore resolved in the gate but was missing in the capture whenever tickmarkr itself was started
+  without `node_modules/.bin` on its `PATH`. The baseline came out unmeasured: tests that already failed on the base
+  were billed to the task as regressions instead of being forgiven, and the single diagnostic run a test-red repair may
+  get before the full suite was never admitted. The capture of a manifested test command, and of the tip-verify test
+  command, now uses the test gate's own runner environment, built on the environment the caller supplies, so supplied
+  evidence variables still reach it. Build, lint and commands that are not manifested keep the inherited environment.
+- **Internal, no behavior change.** Two checks inside the run daemon are now exported unchanged, so their case tables
+  run in-process: whether a red lies outside the task's scope, and what one isolated rerun of a timeout-shaped red says.
+  `doctor`'s tests no longer reach the developer's own Orca or installed `tickmarkr`.
+
 ## v2.7.1 — probes, paths and the dead-worker check stop misreading what they cannot see
 
 **v2.7.1** ships seven product fixes. Each was made by hand and proven by its own `tickmarkr verify`: build, lint,

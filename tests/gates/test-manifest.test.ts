@@ -118,8 +118,10 @@ else process.exit(mode === 'contradiction' || mode === 'runner-red' || mode === 
  * The ceiling is one production parameter shared by listing and run, so fixtures hand it this allowance
  * and let the per-file timings alone discriminate a hang. */
 const LISTING_ALLOWANCE_MS = 60_000;
-/** Longer than the fixture ceiling the recorded listing died at. */
-const SLOW_LISTING_MS = 3_200;
+/** Queue row 102 (D-1626): over five times the largest hang budget it is set against (180 ms), so a listing charged
+ * as hang time still reds. The former 3200 ms (past the 3000 ms fixture ceiling the recorded listing died at) only
+ * added waiting: listings now get the separate LISTING_ALLOWANCE_MS. */
+const SLOW_LISTING_MS = 1_000;
 /** A stand-in runner whose listing is slow: held on a barrier file, delayed by a fixed time, or never
  * completing after flushing a partial diagnostic. Its run branch starts tests/a.test.ts and either
  * completes the suite ("released") or never completes that file ("hang"). */
@@ -316,12 +318,25 @@ test("through runGates a fixture baseline with known per-file durations yields f
     ["legacy-zero",{longestFile:{file:"a",durationMs:0},ceilingMs:5000},5000],
     ["equal",{fileDurations:[{file:"tests/a.test.ts",durationMs:5000}],ceilingMs:5000},5000],
   ];
+  // Queue row 102 (D-1626): a hang whose budget IS the battery ceiling waits that whole ceiling on real clocks.
+  // `equal` keeps the real 5000 ms wait: it alone pins the ceiling timer's kill (atCeiling). The other ceiling rows
+  // jump both hang clocks past the budget once the run's receipt exists (the OBS-953 pattern below): one overdue
+  // poll, recorded unknown with nothing subtracted, so the poll kills at the same derived budget without the wait.
+  onTestFinished(() => { resetHangClocksForTests(); resetSleepEvidenceForTests(); });
   for (const [name, timing, budget] of cases) {
     const f = fixture(false); fault(f,name,"hang");
     expect(existsSync(receipt(f,name))).toBe(false);
+    const jumped = budget === timing.ceilingMs && name !== "equal";
+    if (jumped) {
+      const shift = () => existsSync(receipt(f,name)) ? budget + 1_000 : 0;
+      setHangClocksForTests({ wall: () => Date.now() + shift(), mono: () => performance.now() + shift() });
+      setSleepEvidenceForTests({ platform: () => "linux" }); // a jump is no host sleep: the kernel's record is not read
+    }
     const row = await round(f,"vitest run --globals",timing);
+    resetHangClocksForTests(); resetSleepEvidenceForTests();
     executed(f,name,row,"vitest run --globals");
     expect(row.meta, row.details).toMatchObject({classification:"infra",kind:"hang",file:"tests/a.test.ts",hangBudgetMs:budget});
+    if (jumped) expect(row.meta?.interruptions).toContainEqual(expect.objectContaining({ kind: "unknown", subtractedMs: 0 }));
     expect(row.details).toContain(String(budget));
     expect(() => process.kill(-(row.meta!.pid as number),0)).toThrow(/ESRCH/);
   }
@@ -1263,7 +1278,7 @@ test("production manifest discovery completes a barrier-delayed listing within t
     dir: f.artifacts, nonce: randomBytes(8).toString("hex"), env, overallCeilingMs: LISTING_ALLOWANCE_MS, evidence: { artifactDir: f.artifacts },
   });
 
-  // Held past the ceiling the recorded listing died at, then released: discovery waits and completes.
+  // Held SLOW_LISTING_MS on a barrier, then released: discovery waits and completes inside the allowance.
   const delayed = fixture(false);
   const barrier = join(delayed.artifacts, "release");
   const delayedListing = slowListing(delayed, { barrier });
@@ -1327,7 +1342,7 @@ test("production manifest evaluation still distinguishes injected 120 ms and 180
     const over = { ...timing, ceilingMs: LISTING_ALLOWANCE_MS };
     expect(fileHangBudgetMs("tests/a.test.ts", over.fileDurations, over.ceilingMs)).toBe(budget);
 
-    // The listing alone takes longer than the whole hang budget many times over, and is not a hang.
+    // The listing alone takes over five times the whole hang budget, and is not a hang.
     const hung = fixture(false);
     const hungListing = slowListing(hung, { delayMs: SLOW_LISTING_MS }, "hang");
     const startedAt = Date.now();

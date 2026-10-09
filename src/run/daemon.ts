@@ -523,7 +523,7 @@ const RUNNER_CERTIFICATE_RE = /runner-level diagnostic: never-started ([^;\s]+);
  * every failure), POSITIVELY certified complete by its runner, uncontradicted by the files its own text
  * names, and wholly outside a declared files[]. Empty files[] is unrestricted and never qualifies;
  * every other shape keeps its replay. */
-function outsideScopeRed(t: Task, taskId: string, data: Record<string, unknown>, commit: string): boolean {
+export function outsideScopeRed(t: Task, taskId: string, data: Record<string, unknown>, commit: string): boolean {
   if (!t.files.length || data.gate !== "test" || data.pass !== false || data.skipped === true || data.commit !== commit
     // a failed producer — an infra row, a dirty-tree refusal, a recovery the runner could not finish —
     // never attributes anything, whatever files it lists
@@ -569,6 +569,21 @@ const observedSelection = (g: GateResult): string[] | undefined => {
  * captured stdout is text, not attribution. Headline lexing is for runners without a reporter. */
 const rerunFailingFiles = (g: GateResult): string[] =>
   metaFiles(g.meta?.manifest) ? [...new Set(metaFiles(g.meta?.failingFiles) ?? [])].sort() : attributedFailingFiles(g);
+/** OBS-1106 residual, D-607: what ONE isolated rerun of a timeout-shaped red's attributed `files` says about that
+ * red. Lifted unchanged out of adjudicateInfraShapedRed (queue row 102) so its closed outcome table runs on this
+ * function in-process. Pure: it reads only its arguments; the caller classifies the rerun first. */
+export function reobservationOutcome(files: readonly string[], rerun: GateResult): { outcome: "reproduced" | "passed" | "ambiguous"; selection: string[] | undefined } {
+  // Reproduced only by failure evidence the rerun ATTRIBUTES to one of exactly these files, from an
+  // OBSERVED selection that was exactly these files (D-607): a path merely printed in output, a
+  // positional filter that also collected another file, or a runner that ignored the file
+  // arguments and reported no manifest of its selection, says nothing about the original red.
+  const failing = rerunFailingFiles(rerun);
+  const selection = observedSelection(rerun);
+  const isolated = selection !== undefined && selection.length === files.length
+    && files.every((file) => selection!.includes(file)) && failing.every((file) => files.includes(file));
+  const outcome = rerun.pass ? "passed" : isolated && !isInfraResult(rerun) && failing.length ? "reproduced" : "ambiguous";
+  return { outcome, selection };
+}
 
 // v1.85 T3: the gates whose failure IS a deterministic measurement — a machine re-ran a command over a
 // tree and printed the same bytes. Those are the failures the fingerprint cap governs (the ruling names
@@ -3162,15 +3177,9 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         rerun = await withCommandContext(t.id, () => reobserveTestFiles(wt, commands.test!, baseline, files, journal.dir))
           .catch((error: unknown): GateResult => ({ gate: "test", pass: false, details: `infra: rerun failed: ${error instanceof Error ? error.message : String(error)}`, meta: { infra: true } }));
         classifyInfraResult(rerun);
-        // Reproduced only by failure evidence the rerun ATTRIBUTES to one of exactly these files, from an
-        // OBSERVED selection that was exactly these files (D-607): a path merely printed in output, a
-        // positional filter that also collected another file, or a runner that ignored the file
-        // arguments and reported no manifest of its selection, says nothing about the original red.
-        const failing = rerunFailingFiles(rerun);
-        selection = observedSelection(rerun);
-        const isolated = selection !== undefined && selection.length === files.length
-          && files.every((file) => selection!.includes(file)) && failing.every((file) => files.includes(file));
-        outcome = rerun.pass ? "passed" : isolated && !isInfraResult(rerun) && failing.length ? "reproduced" : "ambiguous";
+        const judged = reobservationOutcome(files, rerun);
+        outcome = judged.outcome;
+        selection = judged.selection;
       }
       journal.append("gate-reobserved", t.id, {
         gate: "test", attempt, commit: subject, fingerprint, ...(observation ? { observation } : {}), files, outcome,

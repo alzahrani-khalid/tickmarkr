@@ -13,12 +13,13 @@ import { approve, newestPark, permittedDecisionVerbs } from "../../../src/cli/co
 import { SubprocessDriver } from "../../../src/drivers/subprocess.js";
 import type { Slot } from "../../../src/drivers/types.js";
 import type { Tier } from "../../../src/config/config.js";
-import type { GateName, GateResult, Task } from "../../../src/graph/schema.js";
+import { validateGraph, type GateName, type GateResult, type Task } from "../../../src/graph/schema.js";
 import { extractPromptNonce } from "../../../src/gates/llm.js";
 import * as gateRunner from "../../../src/gates/run-gates.js";
 import type { GateContext } from "../../../src/gates/run-gates.js";
-import { runDaemon } from "../../../src/run/daemon.js";
+import { outsideScopeRed, runDaemon } from "../../../src/run/daemon.js";
 import { identicalGateFailures, Journal, normalizeGateFailure, recordedTaskFailureKind, type JournalEvent } from "../../../src/run/journal.js";
+import { failureDisposition } from "../../../src/run/recovery.js";
 import { authedModels, COMMIT, setupRepo, T } from "../../helpers/tmprepo.js";
 
 afterEach(() => vi.restoreAllMocks());
@@ -117,6 +118,64 @@ function settledBefore(rows: JournalEvent[], terminal: string) {
   return gateRows(rows, "review");
 }
 
+// ---- an unchanged cached test red, by its attribution: shared by the daemon test and the pure table ------
+const OUTSIDE = "tests/outside.test.ts";
+const INSIDE = "src/inside.test.ts";
+const ASSERTION = "AssertionError: expected one to be two";
+/** The runner certificate the vitest manifest path appends to a red's details (test-manifest.ts): its
+ * never-started and reporter-error counts, then each runner-level diagnostic line. */
+const certificate = (counts: string, ...diagnostics: string[]) =>
+  ["", `classification: regression; runner-level diagnostic: ${counts}; runner vitest`, ...diagnostics].join("\n");
+const CLEAN = certificate("never-started 0; reporter errors 0");
+const complete = (failingFiles: unknown[]) => ({ classification: "regression", failingFiles, fullSuite: true });
+const attributedTask = (files: string[] | undefined) =>
+  T("T1", { gates: ["build", "test", "lint", "evidence", "scope"], ...(files ? { files } : {}) });
+/** Every other attribution keeps the replay: [name, files[], the file the red's own text names, the reporter's
+ * meta, the appended certificate (CLEAN when absent)]. That includes a complete-looking outside list whose runner
+ * certificate does not prove it complete: an in-scope collection failure has no module record, so it lives only
+ * in the certificate (D-854). */
+const CONTROLS: Array<[string, string[] | undefined, string, Record<string, unknown>, string?]> = [
+  ["collection-failure", ["src/**"], OUTSIDE, complete([OUTSIDE]),
+    certificate("never-started 0; reporter errors 1", `${INSIDE}: Failed to load url ./missing.js (resolved id: ./missing.js)`)],
+  ["reporter-errors-unknown", ["src/**"], OUTSIDE, complete([OUTSIDE]), certificate("never-started 0; reporter errors unknown")],
+  ["never-started", ["src/**"], OUTSIDE, complete([OUTSIDE]), certificate("never-started 2; reporter errors 0")],
+  ["no-certificate", ["src/**"], OUTSIDE, complete([OUTSIDE]), ""],
+  ["in-scope", ["src/**"], INSIDE, complete([INSIDE])],
+  ["mixed", ["src/**"], OUTSIDE, complete([OUTSIDE, INSIDE])],
+  ["empty", ["src/**"], OUTSIDE, complete([])],
+  ["unknown", ["src/**"], OUTSIDE, { classification: undefined, failingFiles: [OUTSIDE] }],
+  ["incomplete", ["src/**"], OUTSIDE, { classification: "regression", failingFiles: [OUTSIDE], selectedTests: ["tests/other.test.ts"], selectionDecision: undefined }],
+  ["contradictory", ["src/**"], INSIDE, complete([OUTSIDE])],
+  ["failed-producer", ["src/**"], OUTSIDE, { ...complete([OUTSIDE]), recoveryBlocked: "the isolated rerun could not be scheduled" }],
+  ["unrestricted", undefined, OUTSIDE, complete([OUTSIDE])],
+];
+/** Queue row 102 (D-1626): the six attributions the sealed criterion names (spec v2.6.5 T5) keep their runDaemon
+ * proof; the other six live only in the pure table, which also re-proves these six on the predicate. */
+const THROUGH_DAEMON = new Set(["in-scope", "mixed", "empty", "unknown", "contradictory", "failed-producer"]);
+
+describe("C — the out-of-scope predicate's closed attribution table (pure, zero tokens)", () => {
+  /** A control's original red as journalGateResult writes the row the daemon hands outsideScopeRed: each meta key
+   * the reporter stamped (an undefined one writes no key), the disposition stamped from that meta, and the gate's
+   * text — the FAIL line naming `named`, then the certificate. The gate reframes that line as its headline and
+   * fingerprint, which name the same one file; the predicate reads nothing else of the text. */
+  const SUBJECT = "a".repeat(40);
+  const journaledRed = (named: string, meta: Record<string, unknown>, report = CLEAN) => ({
+    gate: "test", pass: false, commit: SUBJECT, details: ` FAIL  ${named} > reads one\n${ASSERTION}${report}`,
+    disposition: failureDisposition({ pass: false, meta }),
+    ...Object.fromEntries(Object.entries(meta).filter(([, value]) => value !== undefined)),
+  });
+  const task = (files: string[] | undefined) =>
+    validateGraph({ version: 1, spec: { source: "prd", paths: ["p"], hash: "h" }, tasks: [attributedTask(files)] }).tasks[0]!;
+
+  test("outsideScopeRed keeps the replay for every control attribution the daemon journals and admits the complete certified red wholly outside a declared files list", () => {
+    // the daemon test's re-executed trigger, built the same way: each control differs from it only by its own inputs
+    expect(outsideScopeRed(task(["src/**"]), "T1", journaledRed(OUTSIDE, complete([OUTSIDE])), SUBJECT)).toBe(true);
+    for (const [name, files, named, meta, report] of CONTROLS) {
+      expect(outsideScopeRed(task(files), "T1", journaledRed(named, meta, report), SUBJECT), name).toBe(false);
+    }
+  });
+});
+
 describe("C — each failed review round has its lawful exit (production daemon, zero tokens)", { timeout: 600_000 }, () => {
   test("runDaemon publishes every held parallel row (zero or one) at both fresh/resumed recovery sites; zero held publishers create no row; one flushes once; pending siblings clear before the terminal row; the closed table is no-eligible refusal→gate-fail (pass:false review row; production approve offers waive/uphold/recheck) / seatless review→infra / exhausted recovery→infra (production approve offers approve/recheck) / thrown sibling→existing task-failed (resume --retry-failed); exercise cancelled-sibling permutations within these rows", async () => {
     // cancelled sibling: the review ends first and is HELD behind an acceptance that never ends (one held);
@@ -212,24 +271,16 @@ describe("C — each failed review round has its lawful exit (production daemon,
   });
 
   // ---- an unchanged cached test red, by its attribution ------------------------------------------------
-  const OUTSIDE = "tests/outside.test.ts";
-  const INSIDE = "src/inside.test.ts";
   /** The worker lands src/a.txt, then a repair that lands nothing. The red names `named` in its own text;
    * `meta` is the reporter's attribution, stamped on the result before the daemon's onGate sees it. */
-  const ASSERTION = "AssertionError: expected one to be two";
   const attributedRepo = (files: string[] | undefined, named: string, failure = ASSERTION) => setupRepo(
-    [T("T1", { gates: ["build", "test", "lint", "evidence", "scope"], ...(files ? { files } : {}) })],
+    [attributedTask(files)],
     { consult: { action: "human", notes: "operator decides" },
       tasks: { T1: [{ shell: `mkdir -p src && echo a0 > src/a.txt && ${COMMIT} a0`, result: { ok: true, summary: "a0" } },
         nothing("r1"), nothing("r2"), nothing("r3")] } },
     stringify({ gates: { build: "true", lint: "true",
       test: `[ ! -f src/a.txt ] || { echo ' FAIL  ${named} > reads one'; echo '${failure}'; exit 1; }` } }),
   );
-  /** The runner certificate the vitest manifest path appends to a red's details (test-manifest.ts): its
-   * never-started and reporter-error counts, then each runner-level diagnostic line. */
-  const certificate = (counts: string, ...diagnostics: string[]) =>
-    ["", `classification: regression; runner-level diagnostic: ${counts}; runner vitest`, ...diagnostics].join("\n");
-  const CLEAN = certificate("never-started 0; reporter errors 0");
   const attribute = (meta: Record<string, unknown>, report = CLEAN) => {
     const original = gateRunner.runGates;
     return vi.spyOn(gateRunner, "runGates").mockImplementation((task, ctx) => original(task, {
@@ -243,7 +294,6 @@ describe("C — each failed review round has its lawful exit (production daemon,
       },
     }));
   };
-  const complete = (failingFiles: unknown[]) => ({ classification: "regression", failingFiles, fullSuite: true });
   const forcedOutside = (rows: JournalEvent[]) => of(rows, "gate-fresh-forced").filter((row) => row.data.reason === "no-commit-out-of-scope-red");
 
   test("runDaemon reexecutes one unchanged cached test red with complete attributed failures wholly outside files while in-scope mixed empty unknown contradictory or failed-producer attribution remains fail-closed and a fresh outside-scope red parks without cap-funded work or another replay on the same subject", async () => {
@@ -343,25 +393,10 @@ describe("C — each failed review round has its lawful exit (production daemon,
       }
       expect(verbs(rows), point).toEqual(["waive", "recheck"]);
     }
-    // ---- every other attribution keeps the replay: the copy is restated, nothing is re-executed. That
-    // includes a complete-looking outside list whose runner certificate does not prove it complete: an
-    // in-scope collection failure has no module record, so it lives only in the certificate (D-854) ----
-    const controls: Array<[string, string[] | undefined, string, Record<string, unknown>, string?]> = [
-      ["collection-failure", ["src/**"], OUTSIDE, complete([OUTSIDE]),
-        certificate("never-started 0; reporter errors 1", `${INSIDE}: Failed to load url ./missing.js (resolved id: ./missing.js)`)],
-      ["reporter-errors-unknown", ["src/**"], OUTSIDE, complete([OUTSIDE]), certificate("never-started 0; reporter errors unknown")],
-      ["never-started", ["src/**"], OUTSIDE, complete([OUTSIDE]), certificate("never-started 2; reporter errors 0")],
-      ["no-certificate", ["src/**"], OUTSIDE, complete([OUTSIDE]), ""],
-      ["in-scope", ["src/**"], INSIDE, complete([INSIDE])],
-      ["mixed", ["src/**"], OUTSIDE, complete([OUTSIDE, INSIDE])],
-      ["empty", ["src/**"], OUTSIDE, complete([])],
-      ["unknown", ["src/**"], OUTSIDE, { classification: undefined, failingFiles: [OUTSIDE] }],
-      ["incomplete", ["src/**"], OUTSIDE, { classification: "regression", failingFiles: [OUTSIDE], selectedTests: ["tests/other.test.ts"], selectionDecision: undefined }],
-      ["contradictory", ["src/**"], INSIDE, complete([OUTSIDE])],
-      ["failed-producer", ["src/**"], OUTSIDE, { ...complete([OUTSIDE]), recoveryBlocked: "the isolated rerun could not be scheduled" }],
-      ["unrestricted", undefined, OUTSIDE, complete([OUTSIDE])],
-    ];
-    for (const [name, files, named, meta, report] of controls) {
+    // ---- every other attribution keeps the replay: the copy is restated, nothing is re-executed. Queue row
+    // 102 (D-1626): the six attributions this title names run through the production daemon here; the whole
+    // closed table, D-854's certificate shapes included, is pinned on outsideScopeRed by the pure table ----
+    for (const [name, files, named, meta, report] of CONTROLS.filter(([control]) => THROUGH_DAEMON.has(control))) {
       const runId = `run-outside-control-${name}`;
       const { repo, fake } = attributedRepo(files, named);
       attribute(meta, report);

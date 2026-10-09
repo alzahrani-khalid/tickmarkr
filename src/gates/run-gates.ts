@@ -17,12 +17,12 @@ import { disallowedBy, observedSeat } from "../route/preference.js";
 import { marginalCostRank } from "../route/router.js";
 import { carriedAuthorVendors, gateReviewerFloor, pickReviewer, type PriorReviewer, reviewGate } from "./review.js";
 import { scopeGate } from "./scope.js";
-import { discoverTestManifest, evaluateManifestedTest, isVitestTestCommand, VITEST_CACHE_ENV, worktreeVitestCache } from "./test-manifest.js";
+import { discoverTestManifest, evaluateManifestedTest, isVitestTestCommand, manifestChildEnv } from "./test-manifest.js";
 import { RUNNER_INFRA_DIAGNOSTIC_RE, timeoutShaped } from "./timeout-shaped.js";
 import type { GateResult } from "./types.js";
 import { executionSignal } from "../run/execution-budget.js";
 import { failureDisposition, type VerificationRetryCause } from "../run/recovery.js";
-import { dependencyLinkRefusal, FORK_CAP_ENV, preserveWorktree, type PreserveProducer, producerFields, readCapacity, ROUTING_ENV_SEAMS, shGit, resolvedCapacity, sameCapacity, SUITE_PARENT_ENV, verificationProtocol } from "../run/git.js";
+import { dependencyLinkRefusal, preserveWorktree, type PreserveProducer, producerFields, readCapacity, shGit, resolvedCapacity, sameCapacity, verificationProtocol } from "../run/git.js";
 import { type StructuredFinding, type JudgeInvocationEvidence, withJudgeInvocationEvidence } from "../run/journal.js";
 import {
   computeVerificationIdentity,
@@ -418,10 +418,7 @@ export function diagnosticAdmission(baseline: Baseline, selected: readonly strin
  * discovery receives (test-manifest.ts manifestEnvironment), so it compares with the one a verdict
  * certified. Undefined when the runner cannot list — an unlisted manifest certifies nothing. */
 async function listFullManifest(cmd: string, worktree: string): Promise<string[] | undefined> {
-  const env: NodeJS.ProcessEnv = { ...process.env, PATH: `${join(worktree, "node_modules/.bin")}:${process.env.PATH ?? ""}`,
-    [VITEST_CACHE_ENV]: worktreeVitestCache(worktree),
-    [FORK_CAP_ENV]: String(resolvedCapacity().forkCap), [SUITE_PARENT_ENV]: String(process.pid) };
-  for (const key of [...ROUTING_ENV_SEAMS, "VITEST", "TEST", "VITEST_WORKER_ID", "VITEST_POOL_ID"]) delete env[key];
+  const env = manifestChildEnv(worktree);
   const dir = mkdtempSync(join(tmpdir(), "tickmarkr-full-manifest-"));
   try {
     return (await discoverTestManifest(cmd, worktree, { dir, nonce: randomUUID(), env })).files;

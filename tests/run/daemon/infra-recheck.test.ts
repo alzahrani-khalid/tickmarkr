@@ -14,11 +14,11 @@ import { loadConfig } from "../../../src/config/config.js";
 import { SubprocessDriver } from "../../../src/drivers/subprocess.js";
 import { graphDefinitionHash, loadGraph } from "../../../src/graph/graph.js";
 import * as gateRunner from "../../../src/gates/run-gates.js";
-import { runDaemon } from "../../../src/run/daemon.js";
+import { reobservationOutcome, runDaemon } from "../../../src/run/daemon.js";
 import { gitHead, shGit, shGitOk, verificationProtocol } from "../../../src/run/git.js";
 import { Journal, repairReachSinceApproval, repairsSinceApproval, type JournalEvent } from "../../../src/run/journal.js";
 import { ensureIntegration, integrationBranch } from "../../../src/run/merge.js";
-import { COMMIT, makeTestTempDir, setupRepo, T } from "../../helpers/tmprepo.js";
+import { COMMIT, makeRepo, makeTestTempDir, setupRepo, T } from "../../helpers/tmprepo.js";
 
 const rows = (repo: string, runId: string) => Journal.open(repo, runId).read();
 const afterResume = (all: JournalEvent[]): JournalEvent[] => all.slice(all.map((e) => e.event).lastIndexOf("run-resume") + 1);
@@ -330,6 +330,15 @@ describe("OBS-1106 — infra-shaped reds are re-observed before a charge", () =>
 
   test("test: the production daemon charges only a reproduced assertion after one isolated rerun of attributed timeout or wall-budget failures accompanied by never-started or worker-RPC diagnostics, versus parking a pass or ambiguous rerun under the unresolved original red", async () => {
     const WALL = "echo 'AssertionError: expected 1180 to be less than 1000'";
+    // Queue row 102 (D-1626): every row's outcome is proven on reobservationOutcome, the function the daemon's
+    // adjudication reads its outcome from; a stdout row still runs its rerun command once through the real
+    // reobserveTestFiles over a checkout holding the attributed file. The production daemon runs ONE row of each
+    // outcome class (a passed park, an ambiguous park, a reproduced charge), pinning how it acts on each.
+    const DAEMON_ROWS = new Set(["run-reobserve-pass", "run-reobserve-no-manifest-never-started", "run-reobserve-manifest-isolated-wall"]);
+    const daemonOutcomes: string[] = [];
+    const checkout = makeRepo({ ".gitignore": ".tickmarkr/\n", [SLOW]: "// the attributed failing file\n" });
+    const scripts = makeTestTempDir("tickmarkr-reobserve-table-");
+    const tableBaseline = { commands: { test: { exitCode: 0, fingerprints: [] } } };
     // ---- a pass or an ambiguous rerun parks under the unresolved original red, charging nothing -----
     for (const [runId, diagnostic, shape, rerun, outcome] of [
       ["run-reobserve-pass", WORKER_RPC, TIMEOUT, "exit 0", "passed"],
@@ -351,6 +360,15 @@ describe("OBS-1106 — infra-shaped reds are re-observed before a charge", () =>
       ["run-reobserve-substring", NEVER_STARTED, TIMEOUT,
         `echo 'stdout | see ${SLOW} for the fixture'; echo 'AssertionError: expected 1 to be 2'; exit 1`, "ambiguous"],
     ] as const) {
+      const script = join(scripts, `${runId}.sh`);
+      const log = join(scripts, `${runId}.log`);
+      writeFileSync(script, `echo "rerun $*" >> ${JSON.stringify(log)}\n${rerun}\n`);
+      const observed = await gateRunner.reobserveTestFiles(checkout, `sh ${script}`, tableBaseline, [SLOW]);
+      // one execution of exactly the attributed file — an infra rerun never buys the bounded infra retry
+      expect(readFileSync(log, "utf8").split("\n").filter(Boolean), `outcome table: ${runId}`).toEqual([`rerun ${SLOW}`]);
+      expect(reobservationOutcome([SLOW], observed).outcome, `outcome table: ${runId}`).toBe(outcome);
+      if (!DAEMON_ROWS.has(runId)) continue;
+      daemonOutcomes.push(outcome);
       const { repo, fake, reruns } = repoWith(diagnostic, shape, rerun);
       const summary = await runDaemon(repo, { adapters: [fake], runId });
       vi.restoreAllMocks();
@@ -385,10 +403,16 @@ describe("OBS-1106 — infra-shaped reds are re-observed before a charge", () =>
       ["run-reobserve-manifest-stdout-fail-line", NEVER_STARTED, TIMEOUT, [SLOW], [], "ambiguous"],
       ["run-reobserve-no-selection-evidence", WORKER_RPC, TIMEOUT, undefined, [SLOW], "ambiguous"],
     ] as const) {
-      const { repo, fake } = repoWith(diagnostic, shape, "exit 0");
-      const reobserve = vi.spyOn(gateRunner, "reobserveTestFiles").mockResolvedValue({ gate: "test", pass: false,
+      const reobserved = () => ({ gate: "test", pass: false,
         details: `test report names failing fingerprint(s):\nFAIL ${SLOW} > slow\nAssertionError: expected 1 to be 2`,
         meta: { classification: "regression", failingTests: [`${SLOW} > slow`], failingFiles: [...failingFiles], ...(manifest ? { manifest: [...manifest] } : {}) } });
+      const judged = reobservationOutcome([SLOW], reobserved());
+      expect(judged.outcome, `outcome table: ${runId}`).toBe(outcome);
+      expect(judged.selection, `outcome table: ${runId}`).toEqual(manifest ? [...manifest].sort() : undefined);
+      if (!DAEMON_ROWS.has(runId)) continue;
+      daemonOutcomes.push(outcome);
+      const { repo, fake } = repoWith(diagnostic, shape, "exit 0");
+      const reobserve = vi.spyOn(gateRunner, "reobserveTestFiles").mockResolvedValue(reobserved());
       const summary = await runDaemon(repo, { adapters: [fake], runId });
       expect(reobserve.mock.calls[0]!.slice(3, 4), runId).toEqual([[SLOW]]);
       vi.restoreAllMocks();
@@ -406,6 +430,13 @@ describe("OBS-1106 — infra-shaped reds are re-observed before a charge", () =>
         expect(of(round, "task-human").at(-1)!.data.kind, runId).toBe("infra");
       }
     }
+    // The !isInfraResult clause (queue row 102 adds this row; none pinned it): the manifest-isolated red above, attributed
+    // to exactly the file, but classified infra (a hang kill) is never a reproduction.
+    const infraIsolated = { gate: "test" as const, pass: false, details: `FAIL ${SLOW} > slow\nAssertionError: expected 1 to be 2`,
+      meta: { classification: "infra", kind: "hang", failingTests: [`${SLOW} > slow`], failingFiles: [SLOW], manifest: [SLOW] } };
+    expect(reobservationOutcome([SLOW], infraIsolated).outcome, "outcome table: isolated infra red").toBe("ambiguous");
+    // the production daemon ran one row of every outcome class the title names
+    expect([...daemonOutcomes].sort(), "daemon rows").toEqual(["ambiguous", "passed", "reproduced"]);
   }, 600_000);
 
   // A process that dies after the red is persisted leaves a cached copy for the resume to find. Whether

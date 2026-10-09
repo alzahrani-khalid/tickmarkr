@@ -622,14 +622,26 @@ export interface ManifestGateOutcome {
  * `npm_config_ignore_scripts` from the environment over every npmrc); the verdict records it so a
  * verdict measured with `pretest` hooks is never compared to one without. */
 function manifestEnvironment(cwd: string): { env: NodeJS.ProcessEnv; verification: ReturnType<typeof verificationProtocol> } {
-  const env: NodeJS.ProcessEnv = { ...process.env, PATH: `${join(cwd, "node_modules/.bin")}:${process.env.PATH ?? ""}`,
+  const env = manifestBaseEnv(cwd);
+  return { env: scrubbedManifestEnv(env), verification: verificationProtocol(env, cwd) };
+}
+
+function manifestBaseEnv(cwd: string, base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  return { ...base, PATH: `${join(cwd, "node_modules/.bin")}:${base.PATH ?? ""}`,
     [VITEST_CACHE_ENV]: worktreeVitestCache(cwd),
     [FORK_CAP_ENV]: String(resolvedCapacity().forkCap), [SUITE_PARENT_ENV]: String(process.pid) };
-  const verification = verificationProtocol(env, cwd);
-  for (const key of ROUTING_ENV_SEAMS) delete env[key];
-  // A gate can itself be tested under Vitest. Do not give the child the outer worker identity.
-  for (const key of Object.keys(env)) if (["VITEST", "TEST", "VITEST_WORKER_ID", "VITEST_POOL_ID"].includes(key)) delete (env as NodeJS.ProcessEnv)[key];
-  return { env, verification };
+}
+
+// A gate can itself be tested under Vitest. Do not give the child the outer worker identity.
+const OUTER_RUNNER_KEYS = new Set<string>([...ROUTING_ENV_SEAMS, "VITEST", "TEST", "VITEST_WORKER_ID", "VITEST_POOL_ID"]);
+const scrubbedManifestEnv = (env: NodeJS.ProcessEnv): NodeJS.ProcessEnv =>
+  Object.fromEntries(Object.entries(env).filter(([key]) => !OUTER_RUNNER_KEYS.has(key)));
+
+/** Queue row 104 (D-1644): THE child environment of a manifested test command — its listing and run here, the full
+ * manifest re-listing (run-gates.ts) and its baseline capture (baseline.ts) — so every one resolves the same runner. */
+export function manifestChildEnv(cwd: string, base?: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  // built on `base` when a caller supplies its own environment (captureBaseline's evidence env), else on process.env
+  return scrubbedManifestEnv(manifestBaseEnv(cwd, base));
 }
 
 export interface DiscoveredManifest { files: string[]; listing: string; separator: string; listingExit: number | undefined; listingStdout: string; evidenceReceipt: GateEvidenceReceipt; evidenceReceipts: GateEvidenceReceipt[] }
