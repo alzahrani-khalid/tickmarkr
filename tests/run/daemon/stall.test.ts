@@ -800,10 +800,13 @@ describe("T1 stall detection (OBS-262/263, fake adapter, zero tokens)", () => {
   // its pane was visibly printing. The kill now reads the tracker's raw row-growth clock: rows
   // advancing is output growth, suppressed or not.
   test("a metered non-nudgeable worker streaming rows under a flat token counter is never fast-killed", async () => {
-    setDeadChannelFastKillMsForTests(300); // kill seam far below the 6s window: the old composition kills in ~1s
+    // Queue row 111: the kill's measured silence spans a whole daemon slice — about twenty git commands between two pane
+    // reads — so a 300 ms seam read this streaming worker as silent on a loaded runner. A 10 s seam inside a 12 s window
+    // tolerates that, and the old composition (the kill clocked off lastProgressAt alone) still kills at ~10.2s.
+    setDeadChannelFastKillMsForTests(10_000);
     setRowRearmTokenFlatMsForTests(200); // seam for the 15m flat-token cap: suppression engages mid-test
     try {
-      const { repo, fake } = setupRepo([T("T1", { timeoutMinutes: 0.1 })], STALLED); // the 6s window owns the conclusion
+      const { repo, fake } = setupRepo([T("T1", { timeoutMinutes: 0.2 })], STALLED); // the 12s window owns the conclusion
       fake.contextUsage = () => ({ tokens: 500 }); // metered — and permanently FLAT (the sticky counter)
       let reads = 0;
       const driver = idriver({

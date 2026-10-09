@@ -10,7 +10,8 @@ import { SubprocessDriver } from "../../src/drivers/subprocess.js";
 import { HerdrDriver } from "../../src/drivers/herdr.js";
 import type { ExecutorDriver } from "../../src/drivers/types.js";
 import {
-  NUDGEABLE_ADAPTERS, resetNudgeTimingForTests, runDaemon, setNudgeTimingForTests, WORKER_NUDGE_MESSAGE,
+  NUDGEABLE_ADAPTERS, resetAttemptHardTimeoutMsForTests, resetNudgeTimingForTests, runDaemon,
+  setAttemptHardTimeoutMsForTests, setNudgeTimingForTests, WORKER_NUDGE_MESSAGE,
 } from "../../src/run/daemon.js";
 import { Journal } from "../../src/run/journal.js";
 import { makeTestTempDir, setupRepo, T } from "../helpers/tmprepo.js";
@@ -56,6 +57,7 @@ afterEach(() => {
   resetHarvestCpuFlatMsForTests();
   NUDGEABLE_ADAPTERS.delete("fake");
   resetNudgeTimingForTests();
+  resetAttemptHardTimeoutMsForTests();
 });
 
 describe("worker liveness nudge (OBS-201, zero-token)", () => {
@@ -89,6 +91,9 @@ describe("worker liveness nudge (OBS-201, zero-token)", () => {
   test("an undeliverable nudge is journaled and falls back to today's page-plus-window behavior", async () => {
     NUDGEABLE_ADAPTERS.add("fake");
     setNudgeTimingForTests(0, 500);
+    // Queue row 102: the failed nudge holds the window (stall:nudge), so the attempt ends at its hard ceiling —
+    // pinned to the window's own length: the page, then one window.
+    setAttemptHardTimeoutMsForTests(6_000);
     const notifies: string[] = [];
     const { repo, fake } = setupRepo([T("T1", { timeoutMinutes: 0.1 })], STALLED_SCRIPT);
     const driver = idriver({
@@ -108,7 +113,7 @@ describe("worker liveness nudge (OBS-201, zero-token)", () => {
     setNudgeTimingForTests(0, 500); // allowlist NOT extended: "fake" stays outside
     const nudges: string[] = [];
     const notifies: string[] = [];
-    const { repo, fake } = setupRepo([T("T1", { timeoutMinutes: 0.1 })], STALLED_SCRIPT);
+    const { repo, fake } = setupRepo([T("T1", { timeoutMinutes: 0.05 })], STALLED_SCRIPT);
     const driver = idriver({
       read: async () => "working-on-it",
       nudge: async () => { nudges.push("x"); return true; },

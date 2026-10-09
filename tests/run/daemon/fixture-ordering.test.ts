@@ -68,10 +68,10 @@ describe("fixture ordering by events (fake adapter, zero tokens)", () => {
     }
 
     // The three retry.test.ts conflict fixtures (run-wt-partial, run-wt-resume, run-wt-keep) share one
-    // merge order: the released worker merges, the held worker meets the conflict — in BOTH arrivals.
-    for (const fixture of ["partial", "resume", "keep"]) {
-      for (const first of ORDERS) await expectConflictOrder(`run-order-wt-${fixture}-${first}`, first);
-    }
+    // merge order: the released worker merges, the held worker meets the conflict — in BOTH arrivals. Their
+    // merge phase is byte-identical (the same shells on the same barrier pair; they differ only after the
+    // merge, which retry.test.ts pins), so one run per arrival proves it for all three (queue row 102).
+    for (const first of ORDERS) await expectConflictOrder(`run-order-wt-${first}`, first);
   }, 240_000);
 
   test("test: the production daemon admits an approval while its sibling is barrier-held then resolves the same-base conflict pair under either arrival order, so a missed approval or a conflict that never occurs fails", async () => {

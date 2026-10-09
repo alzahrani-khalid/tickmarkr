@@ -276,19 +276,18 @@ describe("v2.6.7 T1 candidate policy (production daemon, fake adapters, zero tok
       ]);
     }
 
-    // Above either bound, unknown timing, or admissible timing measured under a different or malformed
-    // capacity: the diagnostic is skipped — semantics precede the one full job.
+    // Above either bound, unknown timing, or admissible timing measured under a different capacity: the
+    // diagnostic is skipped — semantics precede the one full job. Queue row 102 (D-1626): the daemon keeps the
+    // above-bound half of each boundary pair, one unknown-cost candidate whose NaN reaches the gate as null
+    // through baseline.json, and the capacity plumbing. 0 ms, negative and absent timing and a malformed
+    // capacity are pinned on diagnosticAdmission and through runGates in tests/gates/repair-selection.test.ts.
     const admissible = { "tests/a.test.ts": 10, "tests/b.test.ts": 5, "tests/hidden.test.ts": 85 };
     for (const [runId, durations, reason, capacity] of [
       ["run-order-ratio", { "tests/a.test.ts": 16, "tests/b.test.ts": 4, "tests/hidden.test.ts": 80 }, "diagnostic-cost-ratio"],
       ["run-order-estimate", { "tests/a.test.ts": 60_001, "tests/b.test.ts": 40_000, "tests/hidden.test.ts": 400_000 }, "diagnostic-cost-estimate"],
-      ["run-order-unknown", undefined, "diagnostic-unknown-cost"],
-      // 0 ms, negative and NaN (journaled as null) timing on the selected file is unknown cost, not a free screen
-      ["run-order-zero", { "tests/a.test.ts": 0, "tests/b.test.ts": 5, "tests/hidden.test.ts": 95 }, "diagnostic-unknown-cost"],
-      ["run-order-negative", { "tests/a.test.ts": -10, "tests/b.test.ts": 5, "tests/hidden.test.ts": 105 }, "diagnostic-unknown-cost"],
+      // NaN (journaled as null) timing on the selected file is unknown cost, not a free screen
       ["run-order-nan", { "tests/a.test.ts": NaN, "tests/b.test.ts": 5, "tests/hidden.test.ts": 95 }, "diagnostic-unknown-cost"],
       ["run-order-capacity", admissible, "diagnostic-capacity-mismatch", { forkCap: 997, cores: 1 }],
-      ["run-order-capacity-malformed", admissible, "diagnostic-capacity-mismatch", { forkCap: 0 }],
     ] as const) {
       const c = await candidate({ runId, seed: [ATTRIBUTED_RED], ...(durations ? { durations } : {}), ...(capacity ? { capacity } : {}) });
       expect(c.summary.done).toEqual(["T1"]);

@@ -37,8 +37,12 @@ async function scenario(options: Scenario = {}) {
   const realNow = Date.now.bind(Date);
   let elapsed = 0;
   vi.spyOn(Date, "now").mockImplementation(() => realNow() + elapsed);
-  // Nudge redelivery spends two real seconds as well as this fixture's accelerated polls.
-  daemon.setAttemptHardTimeoutMsForTests(options.nudge ? 8_000 : 3_600);
+  // Queue row 114: this clock is real time PLUS fixture time, so real time a starved runner loses counts toward the
+  // ceiling while a trailer arrives on fixture time. A scenario with a painting worker — T1 under trailerAt, every T2
+  // sibling, a dirtyRetry retry (read() below) — must never meet its ceiling first (30 s); so must a nudge scenario,
+  // whose redelivery spends two real seconds as well as this fixture's accelerated polls. One that paints nothing ends
+  // at its ceiling (3.6 s), which lost real time only brings forward.
+  daemon.setAttemptHardTimeoutMsForTests(options.trailerAt !== undefined || options.sibling || options.dirtyRetry || options.nudge ? 30_000 : 3_600);
   daemon.setQuotaBannerSilentMsForTests(100);
   daemon.setDeadChannelFastKillMsForTests(100_000);
   stall.setHarvestCpuFlatMsForTests(1);

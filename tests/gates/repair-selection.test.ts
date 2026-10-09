@@ -166,6 +166,37 @@ describe("repair selection preserves complete candidate verification", () => {
 const timed = (baseline: Baseline, durations: Record<string, number>): Baseline => ({ ...baseline, commands: { ...baseline.commands,
   test: { ...baseline.commands.test!, fileDurations: Object.entries(durations).map(([file, durationMs]) => ({ file, durationMs })) } } });
 
+// Queue row 102 (D-1626): a node protocol peer for the instances below whose pinned defect lives in runGates, not in
+// the runner. `node vitest.mjs` takes the same manifest path as real Vitest (test-manifest.ts isVitestTestCommand and
+// its runner check), and the peer speaks that protocol: `list` prints the collected files as JSON, and a run writes its
+// invocation-bound report only to the gate's own --outputFile, never to an outer gate's inherited TICKMARKR_TEST_REPORT.
+// Like Vitest it collects every tests/*.test.ts on disk (ignored ones included, narrowed by positional filters) and
+// evaluates vitest.config.mjs on every command. It stands in for the fixtures' two test bodies: tests/a.test.ts writes
+// `armed` once arm.flag exists; tests/hidden.test.ts writes an ignored test once generate.flag exists — the same
+// tests/generated.test.ts each run, or a new file per run when the flag reads "fresh".
+const PROTOCOL_PEER = String.raw`
+import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { resolve } from "node:path";
+import { pathToFileURL } from "node:url";
+if (existsSync("vitest.config.mjs")) await import(pathToFileURL(resolve("vitest.config.mjs")).href);
+const args = process.argv.slice(2);
+const filter = args.filter((a) => a.endsWith(".test.ts"));
+const files = readdirSync("tests").filter((f) => f.endsWith(".test.ts")).map((f) => "tests/" + f)
+  .filter((f) => !filter.length || filter.some((x) => x.endsWith(f)));
+if (args[0] === "list") process.stdout.write(JSON.stringify(files.map((file) => ({ file: resolve(file) }))));
+else {
+  if (files.includes("tests/a.test.ts") && existsSync("arm.flag")) writeFileSync("armed", "");
+  if (files.includes("tests/hidden.test.ts") && existsSync("generate.flag")) writeFileSync(readFileSync("generate.flag", "utf8") === "fresh"
+    ? "tests/generated-" + process.hrtime.bigint() + ".test.ts" : "tests/generated.test.ts", "// generated\n");
+  const out = args.find((a) => a.startsWith("--outputFile="));
+  const now = Date.now();
+  if (out) writeFileSync(out.slice("--outputFile=".length), JSON.stringify({ nonce: process.env.TICKMARKR_TEST_NONCE, requested: files,
+    started: Object.fromEntries(files.map((f) => [f, now])),
+    completed: Object.fromEntries(files.map((f) => [f, { at: now + 1, status: "passed", tests: { passed: 1, failed: 0, skipped: 0 } }])),
+    certificate: { at: now + 2, exitCode: 0, errors: 0 } }));
+}
+`;
+
 test("runGates admits the attributed diagnostic at ratio 0.15 and estimate 60000 ms versus one full invocation above either bound or on unknown timing and uses a qualified full-green hit before any diagnostic, so a selected-only hit authorizing merge fails", async () => {
   // Harness-measured baseline timing at both admission boundaries: the diagnostic runs, then the full job.
   for (const [durations, costRatio, estimatedMs] of [
@@ -220,16 +251,18 @@ test("runGates admits the attributed diagnostic at ratio 0.15 and estimate 60000
   // A manifested runner: a full green qualifies only for the manifest it certified. An ignored
   // generated test the runner now collects moves no tree or environment identity, so the hit no
   // longer answers — its one timed file is the whole suite (over the ratio bound), and a fresh full suite certifies the larger manifest.
+  // Queue row 102 (D-1626): real Vitest only where its collection of the ignored generated test IS the premise
+  // (generated); the unchanged-manifest reuse control runs the node protocol peer above on the same manifest path.
   for (const generated of [false, true]) {
-    const repo = makeRepo({
+    const repo = makeRepo({ ...(generated ? {} : { "vitest.mjs": PROTOCOL_PEER }),
       ".gitignore": "node_modules/\ntests/generated.test.ts\n",
       "src/a.ts": "export const a = 1;\n",
       "tests/a.test.ts": 'import { a } from "../src/a"; test("alpha", () => expect(a).toBeGreaterThan(0));\n',
       "package.json": JSON.stringify({ type: "module", scripts: { test: "vitest run --globals" } }),
     });
-    symlinkSync(join(process.cwd(), "node_modules"), join(repo, "node_modules"), "dir");
+    if (generated) symlinkSync(join(process.cwd(), "node_modules"), join(repo, "node_modules"), "dir");
     const baseRef = git(repo, "rev-parse", "HEAD");
-    const commands = { test: "vitest run --globals" };
+    const commands = { test: generated ? "vitest run --globals" : "node vitest.mjs run --globals" };
     // a trivial file can measure 0 ms (unknown cost); pin its timing so the ratio bound is what decides
     const baseline = timed(await captureBaseline(repo, commands), { "tests/a.test.ts": 5 });
     writeFileSync(join(repo, "src/a.ts"), "export const a = 2;\n");
@@ -402,7 +435,10 @@ test("a diagnosed, in-battery or test-only full job whose own command creates an
     // tests/hidden.test.ts is outside the diagnostic's selection; once flagged, every full job writes an ignored
     // test the runner collects — the same file (a rerun's discovery then holds it), or a new one each time.
     const target = fresh ? "`tests/generated-${process.hrtime.bigint()}.test.ts`" : '"tests/generated.test.ts"';
-    const repo = makeRepo({
+    // Queue row 102 (D-1626): real Vitest for the first combination only — its collection of the ignored test the run
+    // itself wrote IS the premise; the other five pin runGates' freshness sites on the node protocol peer above.
+    const real = diagnosed && !fresh;
+    const repo = makeRepo({ ...(real ? {} : { "vitest.mjs": PROTOCOL_PEER }),
       ".gitignore": "node_modules/\ngenerate.flag\ntests/generated*.test.ts\n",
       "src/a.ts": "export const a = 1;\n",
       "tests/a.test.ts": 'import { a } from "../src/a"; test("alpha", () => expect(a).toBeGreaterThan(0));\n',
@@ -410,13 +446,13 @@ test("a diagnosed, in-battery or test-only full job whose own command creates an
         + `  if (existsSync("generate.flag")) writeFileSync(${target}, 'test("generated", () => expect(1).toBe(1));\\n');\n});\n`,
       "package.json": JSON.stringify({ type: "module", scripts: { test: "vitest run --globals" } }),
     });
-    symlinkSync(join(process.cwd(), "node_modules"), join(repo, "node_modules"), "dir");
+    if (real) symlinkSync(join(process.cwd(), "node_modules"), join(repo, "node_modules"), "dir");
     const baseRef = git(repo, "rev-parse", "HEAD");
-    const commands = { test: "vitest run --globals" };
+    const commands = { test: real ? "vitest run --globals" : "node vitest.mjs run --globals" };
     const baseline = timed(await captureBaseline(repo, commands), { "tests/a.test.ts": 5, "tests/hidden.test.ts": 95 });
     writeFileSync(join(repo, "src/a.ts"), "export const a = 2;\n");
     commit(repo);
-    writeFileSync(join(repo, "generate.flag"), "");
+    writeFileSync(join(repo, "generate.flag"), fresh ? "fresh" : ""); // queue row 102: the peer's mode (Vitest's hidden test bakes it in)
     const task = validateGraph({ version: 1, spec: { source: "native", paths: ["spec.md"], hash: "stale" }, tasks: [{ id: "T1", title: "s",
       goal: "s", shape: "implement", complexity: 3, files: ["**"], acceptance: ["done"],
       gates: ["build", "test", "lint", "evidence", "scope", ...(semantic ? ["acceptance"] : [])] }] }).tasks[0];

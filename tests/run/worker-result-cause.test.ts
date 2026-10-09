@@ -99,17 +99,18 @@ describe("worker-result cause journaling (v1.46 T1, zero tokens)", () => {
   }, 30_000);
 
   test("a stall reap journals cause stall-timeout", async () => {
+    // Queue row 102: a 3 s window, not a 1 minute one — a slice is min(30 s, window / 2), so the minute cost 60–90 s.
+    // The real SubprocessDriver stays: it is what this row adds over the scripted-driver cause test below.
     const { repo, fake } = setupRepo(
-      [T("T1")],
+      [T("T1", { timeoutMinutes: 0.05 })],
       { tasks: { T1: [{ shell: "sleep 999" }] }, consult: { action: "human", notes: "stop" } },
-      "taskTimeoutMinutes: 1\n",
     );
     await runDaemon(repo, { adapters: [fake], runId: "run-stall", driver: idriver() });
     const wr = Journal.open(repo, "run-stall").read().find((e) => e.event === "worker-result");
     expect(wr?.data.cause).toBe("stall-timeout");
     // T5: the dispatch banner is a one-time pane-output burst; if it lands after the detector's first
     // read it legitimately resets inactivity detection by one poll slice — the budget must cover it.
-  }, 150_000);
+  }, 60_000);
 
   test("a finished worker with an unparseable trailer journals cause malformed-trailer", async () => {
     const { repo, scriptPath } = setupRepo(

@@ -76,7 +76,7 @@ function terminal() {
     off() { return output; },
     removeListener() { return output; },
   };
-  return { input, output: output as unknown as NodeJS.WriteStream, writes };
+  return { input, output: output as unknown as NodeJS.WriteStream, writes, drained: () => !pumping };
 }
 
 const strip = (s: string) => s.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "");
@@ -1344,7 +1344,7 @@ async function t5Session(user: string, served: Record<string, string[]>, identit
     modelAuth: Object.fromEntries(models.map((m) => [m, { authed: true, probedAt: at, ...(identities[`${id}:${m}`] ? { identity: identities[`${id}:${m}`] } : {}) }])),
   }])));
   const health = registry.readDoctor(repo)!;
-  const { input, output, writes } = terminal();
+  const { input, output, writes, drained } = terminal();
   const assembled = await assembleFleetEditor(repo, adapters, { input, output, debug: true } as FleetIO, { globalDir });
   if ("unavailable" in assembled) throw new Error(assembled.unavailable);
   let review: FleetOverlayReview | undefined;
@@ -1358,12 +1358,13 @@ async function t5Session(user: string, served: Record<string, string[]>, identit
   const { runFleetInkEditor } = await import("../../src/tui/ink/fleet-app.js");
   const done = runFleetInkEditor(assembled.props);
   const frame = () => strip(writes.findLast((chunk) => strip(chunk).includes("tickmarkr fleet")) ?? "");
-  // the terminal pumps one key per turn: settled once no frame has landed for 150 consecutive turns
+  // the terminal pumps one key per turn: settled once its pump has drained and no frame has landed for 10
+  // consecutive turns since (queue row 102: a fixed 150-turn quiet window per key cost ~45 s)
   const settle = async () => {
-    for (let idle = 0, turns = 0; idle < 150 && turns < 30_000; turns++) {
+    for (let idle = 0, turns = 0; idle < 10 && turns < 30_000; turns++) {
       const count = writes.length;
       await new Promise((resolve) => setTimeout(resolve, 2));
-      idle = writes.length === count ? idle + 1 : 0;
+      idle = writes.length === count && drained() ? idle + 1 : 0;
     }
   };
   const key = async (bytes: string) => {

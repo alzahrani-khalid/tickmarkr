@@ -759,7 +759,8 @@ describe("harvest: finished work is gated, never redispatched (OBS-264)", () => 
     // never concluded by the triad; it keeps the no-redispatch half of OBS-264 through the tail.
     // Both seams are pinned SHORT on purpose: that removes "the window was too long" as an
     // explanation, so a probe that trusted its own zero would conclude this worker within seconds.
-    await withSeams(300, 200, async () => {
+    setAttemptHardTimeoutMsForTests(9_000);
+    try { await withSeams(300, 200, async () => {
       const { repo, scriptPath } = setupRepo([T("T1", { timeoutMinutes: 0.15 })], {
         consult: { action: "human", notes: "stalled" },
         tasks: { T1: [{ shell: "unused — the seed launch is the dispatch" }] },
@@ -804,12 +805,13 @@ describe("harvest: finished work is gated, never redispatched (OBS-264)", () => 
       const unmeasurable = evs.filter((e) => e.event === "worker-harvest-unmeasurable" && e.taskId === "T1");
       expect(unmeasurable).toHaveLength(1); // once per attempt, not once per slice
       expect(unmeasurable[0]!.data.reason).toContain("interactive-seed");
-      // and the other half of OBS-264 still holds on this path: the window expiry gates the commits
+      // and the other half of OBS-264 still holds on this path: the attempt's end (its hard ceiling — the CPU leg
+      // is held unmeasurable, so the window cannot conclude) gates the commits
       // the seeded worker landed instead of buying a fresh worker to re-produce them
       expect(evs.filter((e) => e.event === "worker-result-harvested" && e.taskId === "T1")).toHaveLength(1);
       expect(evs.filter((e) => e.event === "task-dispatch" && e.taskId === "T1")).toHaveLength(1);
-      expect(s.done).toEqual(["T1"]); // and the window expiry still gates the work it landed
-    });
+      expect(s.done).toEqual(["T1"]); // and the attempt's end, its pinned hard ceiling, still gates the work it landed
+    }); } finally { resetAttemptHardTimeoutMsForTests(); }
   }, 120_000);
 
   test("a headless worker that committed and went quiet is harvested without riding out its window", async () => {
@@ -905,7 +907,8 @@ describe("harvest: finished work is gated, never redispatched (OBS-264)", () => 
     writeBashEnvFixture(bashEnv, 'ps() { printf x >> "$TICKMARKR_TEST_PS_CALLS"; return 1; }\n');
     const prior = { bashEnv: process.env.BASH_ENV, calls: process.env.TICKMARKR_TEST_PS_CALLS };
 
-    await withSeams(200, 200, async () => {
+    setAttemptHardTimeoutMsForTests(9_000);
+    try { await withSeams(200, 200, async () => {
       // commits, then stays alive and silent for the whole 9s window — the accountant's own
       // population, and the one it must not keep forking through
       const { repo, fake } = setupRepo([T("T1", { timeoutMinutes: 0.15 })], {
@@ -929,14 +932,15 @@ describe("harvest: finished work is gated, never redispatched (OBS-264)", () => 
       expect(calls).toBeLessThanOrEqual(25); // bounded by the cap, NOT by the 9s window
       const evs = evsOf(repo, "run-harvest-ps-denied");
       // it fails open exactly as before: nothing is concluded on an unreadable snapshot, the gap is
-      // named once, and the window expiry still gates the work the worker landed
+      // named once, and the attempt's end — its pinned hard ceiling, since the unmeasurable CPU leg holds the
+      // window — still gates the work the worker landed
       expect(evs.filter((e) => e.event === "worker-harvest" && e.taskId === "T1")).toHaveLength(0);
       const unmeasurable = evs.filter((e) => e.event === "worker-harvest-unmeasurable" && e.taskId === "T1");
       expect(unmeasurable).toHaveLength(1);
       expect(evs.filter((e) => e.event === "worker-result-harvested" && e.taskId === "T1")).toHaveLength(1);
       expect(evs.filter((e) => e.event === "task-dispatch" && e.taskId === "T1")).toHaveLength(1);
       expect(s.done).toEqual(["T1"]);
-    });
+    }); } finally { resetAttemptHardTimeoutMsForTests(); }
   }, 120_000);
 
   // ── the harvest's precedence over every sibling guard in the wait loop ───────────────────────
@@ -1026,21 +1030,24 @@ describe("harvest: finished work is gated, never redispatched (OBS-264)", () => 
   // both holds — `(!nudgePending || nudgeFailed)` — so this pane was concluded 2.2 s after
   // `worker-nudge-failed` and the delivery failure was itself the trigger, on precisely the
   // population that has no input box to accept a nudge. Now both holds stand, so the pane rides its
-  // OWN rolling window and the no-trailer tail harvests the same commits off the same worktree:
-  // still harvested, still never condemned, but by the window rather than by the failure. The
-  // window is sized so that riding all of it is the cheap outcome and not a test timeout.
+  // OWN attempt to its end — the held nudge keeps the window from concluding, so that end is the hard ceiling,
+  // pinned here at 6.5 s, just past the 6 s window (queue row 102) — and the no-trailer tail harvests the same
+  // commits off the same worktree: still harvested, still never condemned, but by the attempt's end rather than by
+  // the failure.
   test("an unreachable pane holding commits is harvested rather than condemned by failed delivery, and its work still gated", async () => {
-    const fixture = (id: string) => setupRepo([T("T1", { timeoutMinutes: 0.1 })], { // 6s window, ridden in full
+    const fixture = (id: string) => setupRepo([T("T1", { timeoutMinutes: 0.1 })], { // 6s window, held to the 6.5s ceiling
       consult: { action: "human", notes: "an unreachable pane must never reach a consult" },
       tasks: { T1: [{ shell: `echo ${id} > u.txt && ${COMMIT} u` }] },
     });
-    await withSeams(300, 200, async () => {
+    setAttemptHardTimeoutMsForTests(6_500);
+    try { await withSeams(300, 200, async () => {
       NUDGEABLE_ADAPTERS.add("fake");
       setNudgeTimingForTests(300, 400);
       setDeadChannelFastKillMsForTests(1_500); // kill window well inside the 6s: an unheld kill fires at ~1.5s
       try {
-        // 1) the delivery fails, so neither hold lifts: no kill, no triad harvest, the window owns
-        //    the conclusion — and the committed tree is still what goes to gates.
+        // 1) the delivery fails, so neither hold lifts: no kill, no triad harvest, and the held nudge keeps the
+        //    window from concluding, so the pinned hard ceiling ends the attempt — and the committed tree is
+        //    still what goes to gates.
         const killed = fixture("unreachable");
         const restoreProbe = await cpuProbeFallback(killed.repo, "run-harvest-unreachable", "flat");
         let s: Awaited<ReturnType<typeof runDaemon>>;
@@ -1059,7 +1066,7 @@ describe("harvest: finished work is gated, never redispatched (OBS-264)", () => 
         expect(evs.filter((e) => e.event === "worker-nudge-failed" && e.taskId === "T1")).toHaveLength(1);
         expect(evs.filter((e) => e.event === "worker-dead" && e.taskId === "T1")).toHaveLength(0);
         expect(evs.filter((e) => e.event === "worker-harvest" && e.taskId === "T1")).toHaveLength(0);
-        expect(waited).toBeGreaterThanOrEqual(6_000); // the rolling window was ridden, not short-circuited
+        expect(waited).toBeGreaterThanOrEqual(6_000); // ridden to the hard ceiling past the 6s window, not short-circuited
         // the conclusion is still not a redispatch: the same worktree went to gates
         expect(evs.filter((e) => e.event === "worker-result-harvested" && e.taskId === "T1")).toHaveLength(1);
         expect(evs.filter((e) => e.event === "task-dispatch" && e.taskId === "T1")).toHaveLength(1);
@@ -1088,13 +1095,13 @@ describe("harvest: finished work is gated, never redispatched (OBS-264)", () => 
         expect(freeEvs.filter((e) => e.event === "worker-nudge-failed" && e.taskId === "T1")).toHaveLength(0);
         expect(freeEvs.filter((e) => e.event === "worker-harvest" && e.taskId === "T1")).toHaveLength(1);
         expect(freeEvs.filter((e) => e.event === "worker-dead" && e.taskId === "T1")).toHaveLength(0);
-        expect(freeWaited).toBeLessThan(6_000); // concluded by the triad, not by the window
+        expect(freeWaited).toBeLessThan(6_000); // concluded by the triad, not by the hard ceiling
       } finally {
         NUDGEABLE_ADAPTERS.delete("fake");
         resetNudgeTimingForTests();
         resetDeadChannelFastKillMsForTests();
       }
-    });
+    }); } finally { resetAttemptHardTimeoutMsForTests(); }
   }, 120_000);
 
   // Member: the noTrailerStreak accounting (OBS-57). A harvested attempt is a no-trailer window —

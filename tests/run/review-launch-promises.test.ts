@@ -12,7 +12,7 @@ import { describe, expect, test } from "vitest";
 import { FakeAdapter } from "../../src/adapters/fake.js";
 import { shq, type BillingChannel } from "../../src/adapters/types.js";
 import { approve } from "../../src/cli/commands/approve.js";
-import { CHECKOUT_MARK, checkoutProofLine, OrcaDriver, OrcaUnavailableError } from "../../src/drivers/orca.js";
+import { canonicalWorktreePath, CHECKOUT_MARK, checkoutProofLine, OrcaDriver, OrcaUnavailableError } from "../../src/drivers/orca.js";
 import { SubprocessDriver } from "../../src/drivers/subprocess.js";
 import { formatOwnedName, type Slot } from "../../src/drivers/types.js";
 import { captureBaseline } from "../../src/gates/baseline.js";
@@ -227,7 +227,10 @@ describe("review-seat launch never retires a seat (production, zero tokens)", { 
   });
 
   test("production OrcaDriver create types a ceiling-cut frame checkout-proof-timeout at every wrap offset and refuses malformed anchor evidence versus a complete foreign placement refusal or an accepted decoy proof", async () => {
-    const checkout = realpathSync(makeRepo({ "base.txt": "base\n" }));
+    // Queue row 102: a FIXED path, never the host TMPDIR. The sweep below is exhaustive over every wrap of the proof
+    // line, so its cost grows with the square of the path length (36 s of blocked event loop at 89 bytes). The fake
+    // Orca only tracks the path; nothing is created there (tests/drivers/orca-placement.test.ts does the same).
+    const checkout = canonicalWorktreePath("/tmp/tickmarkr-review-launch-proof");
     /** One production create over `checkout`: `readMs` (150) proof reads honoring their budgets over 2-row pages, the
      *  startup proof withheld; `seed` is what the terminal shows from create, `arrive` lands at `atMs`.
      *  `cutAt`: the cursor of the page read the ceiling cut — the rows read before it are [0, cutAt).
@@ -300,6 +303,8 @@ describe("review-seat launch never retires a seat (production, zero tokens)", { 
     const miss = (what: string, r: Awaited<ReturnType<typeof launch>>) =>
       missed.push(`${what}: cutAt ${r.cutAt}, ${(r.error as OrcaUnavailableError)?.launchCause ?? "no cause"}: ${(r.error as Error)?.message}`);
     for (const at of layouts) {
+      // every await in a launch resolves without I/O: yield once per layout so the worker's RPC is answered
+      await new Promise<void>((resolve) => setImmediate(resolve));
       const read = at.length, lead = leads[read]!;
       const r = await late(lead, at);
       if (!typedCut(r, lead + read)) miss(`wrap ${at.join(",")} cut after ${read} row(s)`, r);
@@ -315,6 +320,8 @@ describe("review-seat launch never retires a seat (production, zero tokens)", { 
     // malformed refusal because of where the terminal wrapped it.
     const refused: string[] = [];
     for (const at of layouts) {
+      // every await in a launch resolves without I/O: yield once per layout so the worker's RPC is answered
+      await new Promise<void>((resolve) => setImmediate(resolve));
       for (const lead of [13, 14]) {
         const rows = (trail: number) => (proof: string) => [...split(proof, at), ...banner(trail, 90)];
         for (const [how, seated] of [

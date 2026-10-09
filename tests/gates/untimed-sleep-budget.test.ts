@@ -1,6 +1,6 @@
 import { execFileSync, spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, expect, test } from "vitest";
 import { DEFAULT_CONFIG } from "../../src/config/config.js";
@@ -40,7 +40,16 @@ beforeEach(() => {
 });
 afterEach(() => { resetHangClocksForTests(); resetSleepEvidenceForTests(); });
 
-function fixture(startedAt: number) {
+/**
+ * Queue row 102 (D-1626): ONE repository per test, built by its first drive, instead of a fresh one per drive; no row
+ * varies the repository. Each drive still writes its own runner (start stamp, marks) and artifacts, and starts with no
+ * `.tickmarkr` state dir, as a fresh repository did: the task verdict cache keys on a baseline identity that ignores
+ * every duration and ceiling field, so a green kept there would answer the next row without running it.
+ */
+let shared: { repo: string; base: string } | undefined;
+beforeEach(() => { shared = undefined; });
+
+function sharedRepo(): { repo: string; base: string } {
   const repo = makeRepo({
     ".gitignore": "node_modules/\n",
     "src/a.ts": "export const a = 1;\n",
@@ -50,9 +59,16 @@ function fixture(startedAt: number) {
   const base = git(repo, "rev-parse", "HEAD");
   writeFileSync(join(repo, "src/a.ts"), "export const a = 2;\n");
   git(repo, "add", "-A"); git(repo, "commit", "--no-gpg-sign", "-m", "change");
+  mkdirSync(join(repo, "node_modules/.bin"), { recursive: true });
+  return { repo, base };
+}
+
+function fixture(startedAt: number) {
+  if (!shared) shared = sharedRepo();
+  const { repo, base } = shared;
+  rmSync(join(repo, ".tickmarkr"), { recursive: true, force: true });
   // Outside the worktree: the gate refuses a tree its test command left dirty.
   const mark = join(makeTestTempDir("untimed-sleep-marks-"), randomBytes(4).toString("hex"));
-  mkdirSync(join(repo, "node_modules/.bin"), { recursive: true });
   writeFileSync(join(repo, "node_modules/.bin/vitest"), `#!/usr/bin/env node
 const fs = require('fs'), path = require('path');
 const files = [${JSON.stringify(FILE)}], mark = ${JSON.stringify(mark)}, started = ${startedAt};

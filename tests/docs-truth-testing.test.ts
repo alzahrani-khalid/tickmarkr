@@ -399,37 +399,52 @@ describe.skipIf(!existsSync(codebaseDocs))("docs-truth-testing", () => {
       }
 
       const cited = new Set([...TESTING_CITED_FILES, ...DESIGN_CITED_FILES]);
-      for (const [index, addedDir] of dirs.entries()) {
-        const removalDirs = [...dirs.slice(index + 1), ...dirs.slice(0, index)];
-        const removedRelative = removalDirs
-          .flatMap((dir) => readdirSync(join(scratch, "tests", dir))
-            .filter((file) => file.endsWith(".test.ts"))
-            .map((file) => `tests/${dir}/${file}`))
-          .find((file) => !cited.has(file));
-        expect(removedRelative, `removable test file outside tests/${addedDir}`).toBeTruthy();
-
-        const addedRelative = `tests/${addedDir}/zz-doc-truth-count-probe.test.ts`;
-        const addedPath = join(scratch, addedRelative);
-        const removedPath = join(scratch, removedRelative!);
-        const removedSource = readFileSync(removedPath, "utf8");
+      const testFiles = (dir: string) => readdirSync(join(scratch, "tests", dir)).filter((file) => file.endsWith(".test.ts"));
+      const base = new Map(dirs.map((dir) => [dir, testFiles(dir).length]));
+      // Queue row 102, D-1626: two children, each moving EVERY member by a DISTINCT delta — member i gains i + 1
+      // probes in the first, 2(n − i) in the second, which also removes one uncited test file from every member
+      // that has one. A uniform shift would hide a cross-wired count (one member read against another's).
+      const children = [
+        dirs.map((dir, index) => ({ dir, added: index + 1, removed: [] as string[] })),
+        dirs.map((dir, index) => ({
+          dir,
+          added: 2 * (dirs.length - index),
+          removed: testFiles(dir).map((file) => `tests/${dir}/${file}`).filter((file) => !cited.has(file)).slice(0, 1),
+        })),
+      ];
+      expect(children[1]!.filter(({ removed }) => removed.length > 0).length, "members holding a removable test file")
+        .toBeGreaterThanOrEqual(2); // so every member's addition has a removal from another member beside it
+      for (const [child, members] of children.entries()) {
+        const addedPaths: string[] = [];
+        const removedSources = new Map<string, string>();
         try {
-          writeFileSync(
-            addedPath,
-            'import { test } from "vitest";\ntest.skip("temporary test-count perturbation probe", () => {});\n'
-          );
-          unlinkSync(removedPath);
+          for (const { dir, added, removed } of members) {
+            for (let probe = 0; probe < added; probe++) {
+              const addedPath = join(scratch, "tests", dir, `zz-doc-truth-count-probe-${probe}.test.ts`);
+              writeFileSync(addedPath, 'import { test } from "vitest";\ntest.skip("temporary test-count perturbation probe", () => {});\n');
+              addedPaths.push(addedPath);
+            }
+            for (const file of removed) {
+              removedSources.set(file, readFileSync(join(scratch, file), "utf8"));
+              unlinkSync(join(scratch, file));
+            }
+          }
+          const deltas = members.map(({ dir, added, removed }) => ({ dir, delta: added - removed.length }));
+          expect(new Set(deltas.map(({ delta }) => delta)).size, `child ${child + 1}: every member moves by its own delta`)
+            .toBe(deltas.length);
+          for (const { dir, delta } of deltas) {
+            expect(testFiles(dir).length, `child ${child + 1}: tests/${dir} moved by ${delta}`).toBe(base.get(dir)! + delta);
+          }
           const result = await runScratchTests(scratch, [
             "tests/docs-truth-testing.test.ts",
             "tests/repo/release-docs.test.ts",
           ]);
-          expect(
-            result.status,
-            `count perturbation ${addedRelative} added and ${removedRelative} removed\n${childOutput(result)}`
-          ).toBe(0);
+          const moved = deltas.map(({ dir, delta }) => `tests/${dir} ${delta > 0 ? "+" : ""}${delta}`).join(", ");
+          expect(result.status, `count perturbation child ${child + 1} (${moved})\n${childOutput(result)}`).toBe(0);
           await new Promise<void>((resolve) => setTimeout(resolve, 0));
         } finally {
-          rmSync(addedPath, { force: true });
-          writeFileSync(removedPath, removedSource);
+          for (const addedPath of addedPaths) rmSync(addedPath, { force: true });
+          for (const [file, source] of removedSources) writeFileSync(join(scratch, file), source);
         }
       }
     } finally {
