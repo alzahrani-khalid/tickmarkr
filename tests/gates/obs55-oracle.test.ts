@@ -1,4 +1,4 @@
-import { execFile, execFileSync, execSync } from "node:child_process";
+import { execFile, execSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -184,15 +184,18 @@ function fixtureArgs(root: string, file: string): string[] {
   return ["--globals", "--configLoader", "runner", "--root", root, file];
 }
 
-function listFixture(root: string, file: string, pattern?: string): ListedTest[] {
+// Q72s / queue row 8 (D-1547): every Vitest child this file starts is ASYNC. A synchronous one blocks this worker's event
+// loop, and the whole-repository listing below measured 70.6 s under load — past birpc's 60 s timeout, so an in-flight
+// onTaskUpdate rejected ("Timeout calling onTaskUpdate") and the run lost its single-fork projects to a retry.
+async function listFixture(root: string, file: string, pattern?: string): Promise<ListedTest[]> {
   const args = ["list", ...fixtureArgs(root, file), "--json"];
   if (pattern !== undefined) args.push("-t", pattern);
-  return parsedJson<ListedTest[]>(execFileSync(vitestBin, args, { encoding: "utf8" }), "[");
+  return parsedJson<ListedTest[]>((await promisify(execFile)(vitestBin, args, { encoding: "utf8" })).stdout, "[");
 }
 
-function runUnanchored(root: string, file: string, criterion: string): { listed: ListedTest[]; passed: number } {
-  const listed = listFixture(root, file, criterion);
-  const output = execFileSync(
+async function runUnanchored(root: string, file: string, criterion: string): Promise<{ listed: ListedTest[]; passed: number }> {
+  const listed = await listFixture(root, file, criterion);
+  const { stdout: output } = await promisify(execFile)(
     vitestBin,
     ["run", ...fixtureArgs(root, file), "-t", criterion, "--reporter=json"],
     { encoding: "utf8" },
@@ -234,14 +237,16 @@ t6AcceptanceTest(
     const criterion = "test: criterion";
     const fixtures = [writeFixture(`${criterion} extra`), writeFixture(criterion)];
     try {
-      const listedNames = fixtures.map(({ root, file }) => {
-        const listed = listFixture(root, file);
+      const listedNames: string[] = [];
+      for (const { root, file } of fixtures) {
+        const listed = await listFixture(root, file);
         expect(listed).toHaveLength(1);
-        return runnerVisibleName(listed[0]!.name);
-      });
+        listedNames.push(runnerVisibleName(listed[0]!.name));
+      }
       expect(listedNames).toEqual([`${criterion} extra`, criterion]);
 
-      const old = fixtures.map(({ root, file }) => runUnanchored(root, file, criterion));
+      const old: Awaited<ReturnType<typeof runUnanchored>>[] = [];
+      for (const { root, file } of fixtures) old.push(await runUnanchored(root, file, criterion));
       expect(old.map((result) => result.listed.length)).toEqual([1, 1]);
       expect(old.map((result) => result.passed)).toEqual([1, 1]);
 
@@ -326,8 +331,8 @@ function projectArgs(root: string, config: string): string[] {
   return ["--configLoader", "runner", "--root", root, "--config", config];
 }
 
-function listProjects(root: string, config: string): ListedTest[] {
-  const output = execFileSync(vitestBin, ["list", ...projectArgs(root, config), "--json"], { encoding: "utf8" });
+async function listProjects(root: string, config: string): Promise<ListedTest[]> {
+  const { stdout: output } = await promisify(execFile)(vitestBin, ["list", ...projectArgs(root, config), "--json"], { encoding: "utf8" });
   return parsedJson<ListedTest[]>(output, "[");
 }
 
@@ -335,14 +340,12 @@ function projectTestCommand(root: string, config: string): string {
   return `${shq(vitestBin)} run --configLoader runner --root ${shq(root)} --config ${shq(config)}`;
 }
 
-function listRepositoryAllProjects(): ListedTest[] {
-  return parsedJson<ListedTest[]>(
-    execFileSync(vitestBin, ["list", "--configLoader", "runner", "--json"], {
-      encoding: "utf8",
-      maxBuffer: 256 * 1024 * 1024,
-    }),
-    "[",
-  );
+async function listRepositoryAllProjects(): Promise<ListedTest[]> {
+  const { stdout } = await promisify(execFile)(vitestBin, ["list", "--configLoader", "runner", "--json"], {
+    encoding: "utf8",
+    maxBuffer: 256 * 1024 * 1024,
+  });
+  return parsedJson<ListedTest[]>(stdout, "[");
 }
 
 // The projects the acceptance corpus oracle requires a listing to name. Under the CI guard
@@ -381,7 +384,7 @@ test("test: a real Vitest listing under the production configuration names every
 
 t6AcceptanceTest(
   `enumerate every spec path from the corpus filesystem, require each path to yield parsed acceptance items or a named parse failure, then match those items against Vitest's JSON listing from every configured project; include one bad spec and one test outside suite so an omitted path or project cannot pass`,
-  () => {
+  async () => {
     const root = mkdtempSync(join(tmpdir(), "tickmarkr-t6-corpus-"));
     const corpus = join(root, "corpus");
     const shippedRoot = join(repoRoot, "specs");
@@ -390,7 +393,7 @@ t6AcceptanceTest(
       writePath(join(corpus, "shipped", relative), readFileSync(source, "utf8"));
     }
 
-    const listed = listRepositoryAllProjects();
+    const listed = await listRepositoryAllProjects();
     expect(new Set(listed.map((entry) => entry.projectName)))
       .toEqual(new Set(ORACLE_PROJECTS[currentListingMode()]));
     const outsideTest = listed.find((entry) => entry.projectName !== "suite")!;
@@ -480,7 +483,7 @@ t6AcceptanceTest(
     // This array is populated by t6AcceptanceTest itself as tests are registered; it is not a second
     // transcription of the six criteria. The repository listing proves those registrations are real.
     expect(t6AcceptanceTitles).toHaveLength(6);
-    const repositoryListed = listRepositoryAllProjects();
+    const repositoryListed = await listRepositoryAllProjects();
     for (const title of t6AcceptanceTitles) {
       expect(repositoryListed.filter((entry) => runnerVisibleName(entry.name) === title)).toHaveLength(1);
     }
@@ -491,7 +494,7 @@ t6AcceptanceTest(
       outside: t6AcceptanceTitles.slice(split),
     });
     try {
-      const listed = listProjects(fixture.root, fixture.config);
+      const listed = await listProjects(fixture.root, fixture.config);
       expect(new Set(listed.map((entry) => entry.projectName))).toEqual(new Set(["suite", "outside"]));
       const collected = new Map(t6AcceptanceTitles.map((title) => [
         title,
@@ -509,7 +512,7 @@ t6AcceptanceTest(
 
       const mutated = t6AcceptanceTitles[0]!;
       writePath(fixture.fileByTitle.get(mutated)!, fixtureSource(`${mutated} suffix`));
-      const relisted = listProjects(fixture.root, fixture.config);
+      const relisted = await listProjects(fixture.root, fixture.config);
       expect(relisted.filter((entry) => runnerVisibleName(entry.name) === mutated)).toHaveLength(0);
       expect(relisted.filter((entry) => runnerVisibleName(entry.name) === `${mutated} suffix`)).toHaveLength(1);
 
@@ -537,7 +540,7 @@ t6AcceptanceTest(
     try {
       const results = [];
       for (const entry of cases) {
-        const listed = listFixture(entry.fixture.root, entry.fixture.file);
+        const listed = await listFixture(entry.fixture.root, entry.fixture.file);
         expect(listed).toHaveLength(1);
         results.push(await runAcceptanceGate(entry.fixture.root, entry.fixture.file, entry.criterion));
       }
@@ -555,7 +558,7 @@ t6AcceptanceTest(
     const fixtures = [writeFixture("inner", ["outer"]), writeFixture("inner", ["outer", "middle"])];
     try {
       for (const { root, file } of fixtures) {
-        const listed = listFixture(root, file);
+        const listed = await listFixture(root, file);
         expect(listed).toHaveLength(1);
         const fullName = runnerVisibleName(listed[0]!.name);
         expect(fullName).not.toBe("inner");

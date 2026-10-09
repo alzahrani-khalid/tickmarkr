@@ -2,13 +2,43 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v2.7.0 — the run daemon stops freezing while it counts live test suites
+
+**v2.7.0** ships one product fix and two test-suite repairs. Each was made by hand and proven by its own `tickmarkr
+verify`: build, lint, evidence, scope, executed acceptance, cross-vendor review (`codex:gpt-6-astra`, OpenAI, reviewing
+Claude-authored work) and the full suite. The product fix's acceptance runs one test per row of its closed case table.
+No `tickmarkr run` was used and no speed improvement is claimed.
+
+- **The run daemon no longer blocks its event loop while it counts live test suites (affected: ≤ 2.6.9).** Before each
+  gate command, and when a run resumes or starts without a host timing reference, the daemon waits while another test
+  suite is live in the repository. To find one it asked every runner-looking process outside its own tree for its
+  working directory and its inherited `TICKMARKR_SUITE_PARENT` marker, one synchronous `lsof` and one synchronous `ps`
+  per process. On a busy host those calls chained into one continuous block that held the daemon's event loop: 44 s
+  measured in a test that runs the production daemon in-process, near vitest's 60 s worker RPC bound. The census now
+  reads `/proc` where it exists, else asks every process at once: one asynchronous `lsof` and one `ps` per snapshot,
+  plus one `lsof` for suite parents not already asked. Per process it answers what the per-process probes answered,
+  failures included: a probe that times out, is killed or cannot start answers nothing even if it printed rows first,
+  and a process id `lsof` or `ps` cannot take never joins the shared list, so it cannot erase the other processes'
+  answers. Two bounded residuals remain: a process whose working directory sits on a hung network mount can time out the
+  whole probe, and a `ps` output above 16 MiB answers nothing. Both undercount, which only lets two suites overlap;
+  every gate still runs and fails closed.
+- **Suite health (tests only; nothing the package ships changes).**
+  - Full suites were losing their single-fork projects to vitest's "Timeout calling onTaskUpdate", so test gates paid a
+    single-fork retry (all 8 in the 2.6.8 runs). The cause was `tests/gates/obs55-oracle.test.ts`, which listed a whole
+    repository's tests with a synchronous child and held its worker 70.5 s, past the 60 s worker RPC bound. Its vitest
+    children are asynchronous now: the proving verify's full suite passed on its first invocation with no single-fork
+    retry, and two instrumented full runs showed zero worker RPC timeouts.
+  - The `tests/setup.ts` containment for an installed ≤ 2.6.7 harness is gone: it removed that harness's
+    verification-job token and its forced git config from the suite's environment. From 2.6.8 that config reaches only
+    tickmarkr's own git children and a nested job ignores a foreign token, so the suite no longer needs it.
+
 ## v2.6.9 — three hand fixes ahead of a retirement date
 
 **v2.6.9** is a patch of three small fixes, released before codex retires `gpt-5.5` on 2026-10-14T19:00Z. Each was
 made by hand and proven by its own `tickmarkr verify`: build, lint, evidence, scope, executed acceptance with one test
 per row of its closed case table, cross-vendor review (`codex:gpt-6-astra`, OpenAI, reviewing Claude-authored work,
 approved all three) and the full suite. No `tickmarkr run` was used and no speed improvement is claimed. The queue
-that was planned as 2.6.9 moves to 2.6.10 unchanged.
+that was planned as 2.6.9 moves to 2.7.0 unchanged (the operator set the next version to 2.7.0 after this entry was cut).
 
 - **Doctor reads codex's retirement notice for a model the CLI hides, and routing honours the hide (affected:
   ≤ 2.6.8).** Codex hides a model before it retires it, and the cache reader dropped hidden rows before reading their

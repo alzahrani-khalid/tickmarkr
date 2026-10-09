@@ -6,7 +6,8 @@ import { readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs"
 import { join } from "node:path";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { codex } from "../../../src/adapters/codex.js";
-import { countLiveSuites, resetLiveSuiteCountForTests, resetSuiteWaitCeilingForTests, runDaemon, setLiveSuiteCountForTests, setSuiteWaitCeilingForTests, SUITE_POLL_MS } from "../../../src/run/daemon.js";
+import { batchedProcessProbes } from "../../../src/run/suite-census.js";
+import { countLiveSuites, liveSuiteCount, resetLiveSuiteCountForTests, resetSuiteWaitCeilingForTests, runDaemon, setLiveSuiteCountForTests, setSuiteWaitCeilingForTests, SUITE_POLL_MS } from "../../../src/run/daemon.js";
 import { FORK_CAP_ENV, resetSpawnForTests, setSpawnForTests, shell, SUITE_PARENT_ENV } from "../../../src/run/git.js";
 import { COMMAND_LEASE_TOKEN_ENV, CommandLeases, runWithCommandLease } from "../../../src/run/lease.js";
 import { shq } from "../../../src/adapters/types.js";
@@ -303,3 +304,109 @@ test("test: with task A held in review by a stalled reviewer and task B entering
     } finally { writeFileSync(release, "go"); startB(); resetSpawnForTests(); resetLiveSuiteCountForTests(); }
   }
 }, 180_000); // C-15: three daemon runs; a loaded coverage run missed 60 s
+
+// Queue row 103 (D-1553): the production census answers every runner-looking pid in one batched async probe. Pids
+// above any pid_max, so /proc never answers and every probe reaches the batched exec on every host.
+const censusPid = (n: number) => 900_000_000 + n;
+
+test("the live-suite census answers every candidate with one lsof and one ps per snapshot and one more lsof for unseen suite parents versus one probe per process", async () => {
+  const pids = Array.from({ length: 30 }, (_, i) => censusPid(i + 1));
+  const parent = censusPid(99);
+  const calls: string[] = [];
+  const probes = await batchedProcessProbes(pids, async (file, args) => {
+    calls.push(`${file} ${args.join(" ")}`);
+    if (file === "lsof") return args[2] === pids.join(",") ? `p${pids[0]}\nfcwd\nn${tmpdir()}\n` : "";
+    return `${pids[1]} node node_modules/vitest/vitest.mjs run ${SUITE_PARENT_ENV}=${parent}\n`;
+  });
+  expect(calls).toEqual([
+    `lsof -a -p ${pids.join(",")} -d cwd -Fn`,
+    `ps eww -p ${pids.join(",")} -o pid=,command=`,
+    `lsof -a -p ${parent} -d cwd -Fn`,
+  ]);
+  expect(probes.cwd(pids[0]!)).toBe(realpathSync(tmpdir()));
+  expect(probes.suiteParent(pids[1]!)).toBe(parent);
+  expect(probes.cwd(pids[2]!)).toBeUndefined();
+  expect(probes.suiteParent(pids[2]!)).toBeUndefined();
+});
+
+test.each([
+  ["a runner whose cwd is in the repository", 1, 1],
+  ["a runner elsewhere whose suite-parent marker names this daemon", 2, 1],
+  ["a runner elsewhere whose suite parent's cwd is in the repository", 3, 1],
+  ["a runner elsewhere with no suite-parent marker", 4, 0],
+  ["a runner that exited before the probe answered", 5, 0],
+  ["a runner below this daemon", 6, 1],
+] as const)("the batched live-suite census counts %s as the per-process probes did", async (_row, n, expected) => {
+  const repo = realpathSync(makeTestTempDir("tickmarkr-census-repo-"));
+  const elsewhere = realpathSync(makeTestTempDir("tickmarkr-census-elsewhere-"));
+  const daemonPid = 7000;
+  const pid = censusPid(n);
+  const parent = censusPid(199);
+  const snapshot = `${pid} ${n === 6 ? daemonPid : 1} S node node_modules/vitest/vitest.mjs run`;
+  const cwd: Record<number, string> = { [censusPid(1)]: repo, [censusPid(2)]: elsewhere, [censusPid(3)]: elsewhere, [censusPid(4)]: elsewhere, [censusPid(6)]: elsewhere, [parent]: repo };
+  const marker: Record<number, number> = { [censusPid(2)]: daemonPid, [censusPid(3)]: parent };
+  const probes = await batchedProcessProbes([pid], async (file, args) => {
+    const asked = args[2]!.split(",").map(Number);
+    return file === "lsof"
+      ? asked.filter((p) => cwd[p]).map((p) => `p${p}\nfcwd\nn${cwd[p]}`).join("\n")
+      : asked.filter((p) => marker[p]).map((p) => `${p} node vitest.mjs run ${SUITE_PARENT_ENV}=${marker[p]}`).join("\n");
+  });
+  const perProcess = countLiveSuites(snapshot, repo, daemonPid, (p) => cwd[p], (p) => marker[p]);
+  expect(countLiveSuites(snapshot, repo, daemonPid, probes.cwd, probes.suiteParent)).toBe(expected);
+  expect(perProcess).toBe(expected);
+});
+
+test("the production census keeps the daemon's event loop turning while lsof and ps answer slowly versus a synchronous probe per process that holds it", async () => {
+  resetLiveSuiteCountForTests();
+  const bin = makeTestTempDir("tickmarkr-census-bin-");
+  const log = join(bin, "calls.log");
+  const runners = [1, 2, 3, 4, 5].map((n) => censusPid(200 + n));
+  // the snapshot lists five runners outside the repository; every probe answers nothing after 400 ms
+  writeFileSync(join(bin, "ps"), `#!/bin/sh\necho "ps $*" >> ${shq(log)}\nif [ "$1" = "-Aww" ]; then\n${runners.map((p) => `  echo "${p} 1 S node node_modules/vitest/vitest.mjs run"`).join("\n")}\n  exit 0\nfi\nsleep 0.4\n`, { mode: 0o755 });
+  writeFileSync(join(bin, "lsof"), `#!/bin/sh\necho "lsof $*" >> ${shq(log)}\nsleep 0.4\n`, { mode: 0o755 });
+  const repo = realpathSync(makeTestTempDir("tickmarkr-census-repo-"));
+  vi.stubEnv("PATH", `${bin}:${process.env.PATH}`);
+  let ticks = 0;
+  const timer = setInterval(() => { ticks++; }, 20);
+  const started = Date.now();
+  try {
+    expect(await liveSuiteCount(repo)).toBe(0);
+  } finally {
+    clearInterval(timer);
+    vi.unstubAllEnvs();
+  }
+  const elapsed = Date.now() - started;
+  const calls = readFileSync(log, "utf8").trim().split("\n");
+  expect(calls.filter((call) => call.startsWith("lsof "))).toHaveLength(1);
+  expect(calls.filter((call) => call.startsWith("ps eww "))).toHaveLength(1);
+  // a synchronous lsof + ps per process holds the loop ~4 s with no tick; the batched async probe lets it turn
+  expect(ticks).toBeGreaterThanOrEqual(Math.floor(elapsed / 40));
+});
+
+// D-1558: the /proc branch reads ONE NUL-delimited environment entry and requires its WHOLE value to be digits — the
+// base's rule (7c8009772 daemon.ts:1418-1423); the ps-eww branch keeps the base's whitespace rule. Injected readers.
+test.each([
+  ["E1 a DESCRIPTION value that merely contains the marker text", [`DESCRIPTION=run ${SUITE_PARENT_ENV}=7000 now`], 0],
+  ["E2 a DESCRIPTION holding another marker ahead of the real entry", [`DESCRIPTION=x ${SUITE_PARENT_ENV}=8000`, `${SUITE_PARENT_ENV}=7000`], 1],
+  ["E3 a real marker whose value is not wholly digits", [`${SUITE_PARENT_ENV}=7000 junk`], 0],
+] as const)("the census reads a /proc environment %s as the base's per-process probe did", async (_row, entries, expected) => {
+  const repo = realpathSync(makeTestTempDir("tickmarkr-census-env-"));
+  const elsewhere = realpathSync(makeTestTempDir("tickmarkr-census-env-elsewhere-"));
+  const pid = censusPid(300);
+  const probes = await batchedProcessProbes([pid], async (file) => file === "lsof" ? `p${pid}\nfcwd\nn${elsewhere}\n` : "", {
+    cwd: () => { throw new Error("no /proc cwd"); },
+    environ: () => [...entries, "PATH=/usr/bin"].join("\0"),
+  });
+  expect(countLiveSuites(`${pid} 1 S node node_modules/vitest/vitest.mjs run`, repo, 7000, probes.cwd, probes.suiteParent)).toBe(expected);
+});
+
+test("the census reads a ps eww environment line with the base's whitespace rule unchanged", async () => {
+  const pid = censusPid(301);
+  const probes = await batchedProcessProbes([pid], async (file) =>
+    file === "ps" ? `${pid} node node_modules/vitest/vitest.mjs run DESCRIPTION=x ${SUITE_PARENT_ENV}=7000 HOME=/h\n` : "", {
+    cwd: () => { throw new Error("no /proc"); },
+    environ: () => { throw new Error("no /proc"); },
+  });
+  expect(probes.suiteParent(pid)).toBe(7000);
+});
+

@@ -9,6 +9,7 @@ import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, posix, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+import { batchedProcessProbes, runnerPids } from "./suite-census.js";
 import { stringify } from "yaml";
 import { BOOTSTRAP_FAILURE_RE, classifyDeadChannel, classifyTransientCapacity, trailerPattern, writePrompt } from "../adapters/prompt.js";
 import { allAdapters, getAdapter, probeAll, readDoctor, rolePools } from "../adapters/registry.js";
@@ -1402,36 +1403,6 @@ interface ProcessRow { pid: number; ppid: number; command: string }
 
 type SuitePidProbe = (pid: number) => number | undefined;
 
-function processCwd(pid: number): string | undefined {
-  try { return realpathSync(readlinkSync(`/proc/${pid}/cwd`)); } catch { /* Darwin has no /proc */ }
-  try {
-    const out = execFileSync("lsof", ["-a", "-p", String(pid), "-d", "cwd", "-Fn"], {
-      encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 5_000,
-    });
-    const path = out.split("\n").find((line) => line.startsWith("n"))?.slice(1);
-    return path ? realpathSync(path) : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-function processSuiteParent(pid: number): number | undefined {
-  try {
-    const env = readFileSync(`/proc/${pid}/environ`, "utf8").split("\0");
-    const value = env.find((entry) => entry.startsWith(`${SUITE_PARENT_ENV}=`))?.slice(SUITE_PARENT_ENV.length + 1);
-    return value && /^\d+$/.test(value) ? Number(value) : undefined;
-  } catch { /* Darwin has no /proc process environments */ }
-  try {
-    const out = execFileSync("ps", ["eww", "-p", String(pid), "-o", "command="], {
-      encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 5_000,
-    });
-    const value = new RegExp(`(?:^|\\s)${SUITE_PARENT_ENV}=(\\d+)(?:\\s|$)`).exec(out)?.[1];
-    return value ? Number(value) : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
 const pathAtOrBelow = (root: string, candidate: string): boolean => {
   const rel = relative(root, candidate);
   return rel === "" || (rel !== ".." && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
@@ -1439,13 +1410,13 @@ const pathAtOrBelow = (root: string, candidate: string): boolean => {
 
 /** Count full-suite roots in one process-table snapshot. The probes are arguments so the ownership
  * rules remain testable on hosts that forbid process inspection; production supplies cwd and the
- * inherited TICKMARKR_SUITE_PARENT marker from the process itself. */
+ * inherited TICKMARKR_SUITE_PARENT marker from one batched async probe (suite-census.ts, queue row 103). */
 export function countLiveSuites(
   snapshot: string,
   repoRoot: string,
-  daemonPid = process.pid,
-  cwdForPid: (pid: number) => string | undefined = processCwd,
-  suiteParentForPid: SuitePidProbe = processSuiteParent,
+  daemonPid: number,
+  cwdForPid: (pid: number) => string | undefined,
+  suiteParentForPid: SuitePidProbe,
 ): number {
   const rows: ProcessRow[] = [];
   for (const line of snapshot.split("\n")) {
@@ -1501,7 +1472,10 @@ export const resetLiveSuiteCountForTests = (): void => { liveSuiteCountForTests 
 export async function liveSuiteCount(repoRoot: string): Promise<number> {
   if (liveSuiteCountForTests) return liveSuiteCountForTests(repoRoot);
   const snapshot = await shGit("ps -Aww -o pid=,ppid=,state=,command=", repoRoot, 15_000);
-  return snapshot.code === 0 ? countLiveSuites(snapshot.stdout, repoRoot) : 0;
+  if (snapshot.code !== 0) return 0;
+  // row 103: one batched async probe per snapshot — a synchronous lsof/ps per pid held this loop 44–46 s
+  const probes = await batchedProcessProbes(runnerPids(snapshot.stdout));
+  return countLiveSuites(snapshot.stdout, repoRoot, process.pid, probes.cwd, probes.suiteParent);
 }
 
 const OBSERVE_CHUNK_BYTES = 64 * 1024;

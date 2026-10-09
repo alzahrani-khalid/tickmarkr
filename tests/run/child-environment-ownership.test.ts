@@ -3,8 +3,8 @@
 // hooks/fsmonitor and, in a linked checkout, a GIT_DIR/GIT_COMMON_DIR/GIT_WORK_TREE pin AND, by default, the ref store,
 // re-derived per attempt; only a caller declaring the detached worktree capability leaves the ref-store pin — the
 // command text never selects a pin).
-// Every oracle row supplies the inherited operator config / foreign token ITSELF; tests/setup.ts's D-1196
-// containment only shields this suite from an installed <= 2.6.7 harness and never supplies a positive here.
+// Every oracle row supplies the inherited operator config / foreign token ITSELF. (tests/setup.ts's D-1196
+// containment for an installed <= 2.6.7 harness was removed in 2.7.0, queue row 12; it never supplied a positive.)
 // Slowest-runner note: deadlines below bound fixture setup/cleanup; readiness is a file/exit event, never a delay.
 import { execFileSync, spawn, spawnSync, type SpawnOptions, type SpawnSyncReturns } from "node:child_process";
 import { EventEmitter } from "node:events";
