@@ -13,7 +13,7 @@ import { batchedProcessProbes, runnerPids } from "./suite-census.js";
 import { stringify } from "yaml";
 import { BOOTSTRAP_FAILURE_RE, classifyDeadChannel, classifyTransientCapacity, trailerPattern, writePrompt } from "../adapters/prompt.js";
 import { allAdapters, getAdapter, probeAll, readDoctor, rolePools } from "../adapters/registry.js";
-import { type Assignment, SettledTrailerTracker, addUsage, CAPACITY_RE, channelKey, matchesInputBox, matchesTrustDialog, QUOTA_RE, type TokenUsage, type WorkerAdapter, type WorkerResult } from "../adapters/types.js";
+import { type Assignment, SettledTrailerTracker, addUsage, CAPACITY_RE, channelKey, matchesInputBox, matchesTrustDialog, quotaSignal, type TokenUsage, type WorkerAdapter, type WorkerResult } from "../adapters/types.js";
 import { bannerShell, paneDispatchCommand } from "../brand.js";
 import { collateralHits, type ScopeCollateralVerdict } from "../compile/collateral.js";
 import {
@@ -106,7 +106,7 @@ export interface DispatchObservation {
 export function heldWorkerTransport(driver: ExecutorDriver, slot: Slot, dispatchId: string,
   held: (data: Record<string, unknown>) => void,
   sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
-): Pick<ExecutorDriver, "run" | "read" | "status" | "waitOutput" | "waitAgentStatus"> {
+): Pick<ExecutorDriver, "run" | "read" | "status" | "waitOutput" | "waitAgentStatus" | "transportState"> {
   const delays = [250, 500, 1_000];
   const probe = async <T>(operation: string, call: () => Promise<T>): Promise<T> => {
     for (let retry = 0; ; retry++) {
@@ -124,6 +124,8 @@ export function heldWorkerTransport(driver: ExecutorDriver, slot: Slot, dispatch
     status: (s) => probe("status", () => driver.status(s)),
     waitOutput: (s, p, ms, o) => probe("waitOutput", () => driver.waitOutput(s, p, ms, o)),
     waitAgentStatus: (s, st, ms) => probe("waitAgentStatus", () => driver.waitAgentStatus(s, st, ms)),
+    // row 108: forwarded only when the driver answers; absent stays absent, so the park reads it as unknown
+    ...(driver.transportState ? { transportState: (s: Slot) => probe("transportState", () => driver.transportState!(s)) } : {}),
     run: async (s, command) => {
       const observer = driver as ExecutorDriver & {
         observeDispatch?: (slot: Slot, command: string, dispatchId: string) => Promise<DispatchObservation | undefined>;
@@ -800,7 +802,7 @@ export function resetNudgeTimingForTests(): void {
 }
 
 // T1 (OBS-263): in-loop quota-banner classification — the banner IS output, so the empty-output
-// rules can never catch it and the post-loop QUOTA_RE check only runs after the full window. Two
+// rules can never catch it and the post-loop quota check only runs after the full window. Two
 // consecutive matching slices plus this much monotonic-tracker silence classify (a worker whose
 // diff merely quotes "rate limit" keeps working undisturbed).
 const QUOTA_BANNER_SILENT_MS = 3 * 60_000;
@@ -5419,6 +5421,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           let rowSaturationHeld = false; // journaled once per attempt when the kill stands down
           let cpuHeld = false; // likewise for the CPU leg's stand-down (OBS-548)
           let paneReadHeld = false;
+          let transportHeldNoted = false; // row 108: an open transport is journaled once per attempt
           let paneStatusHeld = false;
           const hardDeadline = attemptStart + (attemptHardTimeoutMs ?? stallWindowMs * 4);
           await armCpuLeg(true);
@@ -5561,7 +5564,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
             // and concludes the attempt the same way — only its post-loop outcome differs (bounded
             // requeue on this seat, then same-floor failover, never demotion). Quota wins a tie.
             const bannerRows = stallSnapshotBannerRows(paneText);
-            const quotaBanner = QUOTA_RE.exec(bannerRows);
+            const quotaBanner = quotaSignal(bannerRows);
             const bannerMatch = quotaBanner ?? CAPACITY_RE.exec(bannerRows);
             if (bannerMatch) quotaStreak++;
             else quotaStreak = 0;
@@ -5580,7 +5583,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
               // no `output =` here: the post-loop no-trailer tail re-reads the pane anyway, so an
               // assignment would only split the classification read from the verdict read.
               quotaBannerKilled = true;
-              journal.append("quota-banner", t.id, { slot: slot.name, attempt, silentMs: sliceNow - lastProgressAt, matched: quotaBanner[0], excerpt: quotaBanner.input, regex: QUOTA_RE.source });
+              journal.append("quota-banner", t.id, { slot: slot.name, attempt, silentMs: sliceNow - lastProgressAt, matched: quotaBanner[0], excerpt: quotaBanner.input, regex: quotaBanner.source });
               break;
             }
             // T1 (OBS-262): the `paged` latch is deleted — status is sampled EVERY slice (and
@@ -5713,10 +5716,39 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
             const confirmedProcessTree = worktreeDelta === "unchanged"
               ? await observeWorkerProcessTree(dispatchScript, wt)
               : "unmeasurable";
+            // Queue row 108 (D-1619): the transport's own CLOSED fact. A subprocess 'exit' precedes its stdio 'close', so a
+            // just-finished worker can look gone — no pane bytes, no process, an unchanged worktree — with its trailer still
+            // in flight. Not closed, or a driver with no answer, never parks: the rolling timeout continues, as for every
+            // other unproven leg. Pane drivers answer closed (their closure is the pane gone, already required above).
+            // ORDER MATTERS: the closed fact is read FIRST, then the pane once more. Closed means every byte is already in
+            // the read surface, so an empty read AFTER it proves the worker wrote nothing; the earlier empty reads may
+            // predate the close and are not that proof (the stale-empty race this row's own test caught).
+            const transport = confirmedProcessTree === "empty" ? await workerTransport.transportState?.(slot) : undefined;
+            let drainedEmpty = false;
+            if (transport?.closed === true) {
+              try {
+                const drained = await workerTransport.read(slot, PANE_READ_ROWS);
+                drainedEmpty = drained.trim().length === 0;
+                if (!drainedEmpty) {
+                  everHadOutput = true;
+                  if (stallProgress.observe({ paneText: drained, contextTokens })) lastProgressAt = Date.now();
+                }
+              } catch (error) {
+                if (error instanceof HeldProbeExhausted) throw error;
+              }
+            }
             const deathCertain = paneAbsent
               && processTree === "empty"
               && confirmedProcessTree === "empty"
-              && worktreeDelta === "unchanged";
+              && worktreeDelta === "unchanged"
+              && transport?.closed === true
+              && drainedEmpty;
+            if (confirmedProcessTree === "empty" && transport?.closed !== true && !transportHeldNoted) {
+              transportHeldNoted = true;
+              noteWorkerLiveness("worker-dead-held", {
+                slot: slot.name, attempt, reason: transport ? "transport-open" : "transport-unknown", ...(transport ? { transport } : {}),
+              });
+            }
             if (deathCertain) {
               const preservation = await preserveDeadWorker(wt, taskBase);
               if (!preservation.ref) {
@@ -5730,7 +5762,8 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
               deadWorkerPark = { ref, reason };
               journal.append("worktree-preserved", t.id, { ref, ...producerFields(producerNow()) });
               noteWorkerLiveness("worker-dead-held", {
-                slot: slot.name, attempt, reason: "unambiguous-worker-death", ref,
+                // row 108 legibility: the transport's closed state, byte count and exit code/signal (a kill shows its signal)
+                slot: slot.name, attempt, reason: "unambiguous-worker-death", ref, transport,
               });
               break;
             }
@@ -6267,7 +6300,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       // this repository's own fixture prose. The matched bytes and their stream offset ride the
       // row so a false positive is legible from the record alone.
       const quotaMatch = (interactive ? !workerFinished : exitCode !== 0)
-        ? QUOTA_RE.exec(stallSnapshotBannerRows(output))
+        ? quotaSignal(stallSnapshotBannerRows(output))
         : null;
       // OBS-1161: transient capacity reads the SAME tail under the same guards — a live idle banner
       // and a no-trailer capacity exit classify identically — through the parse-boundary rule that a

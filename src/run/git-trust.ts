@@ -254,7 +254,10 @@ export type RefStorePinProbe = { pin: "honoured" | "ignored" } | { pin: "unknown
 export function refStorePinProbeFailure(error: unknown): RefStorePinProbe {
   const ran = error as { status?: number | null; signal?: string | null; code?: string } | null;
   if (typeof ran?.status === "number" && !ran.signal && !ran.code) return { pin: "ignored" };
-  const cause = ran?.code === "ETIMEDOUT" ? "timed out after 15 s" : ran?.signal ? `killed by ${ran.signal}` : `failed with ${ran?.code ?? "an unknown error"}`;
+  // Queue row 107: the code names the cause before the signal — Node kills an overflowing child with SIGTERM and sets
+  // ENOBUFS, and "killed by SIGTERM" would hide why; a self-inflicted kill carries no code, so it still reads "killed by".
+  const cause = ran?.code === "ETIMEDOUT" ? "timed out after 15 s" : ran?.code ? `failed with ${ran.code}`
+    : ran?.signal ? `killed by ${ran.signal}` : "failed with an unknown error";
   return { pin: "unknown", cause };
 }
 function refStorePinProbe(env: NodeJS.ProcessEnv): RefStorePinProbe {

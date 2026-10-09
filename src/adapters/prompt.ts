@@ -144,7 +144,7 @@ export function parseWorkerResult(raw: string, nonce: string): ClassifiedWorkerR
 export type DeadChannelReason = "auth-required" | "setup-required" | "provider-outage" | "timeout";
 
 // Signatures anchor distinctive CLI-error phrasing — never bare fragments or bare status-code
-// numbers (the QUOTA_RE Pitfall-3 lesson): these run only over no-trailer output, but a stalled
+// numbers (the quota classifier's Pitfall-3 lesson): these run only over no-trailer output, but a stalled
 // worker's harvested pane can still contain ordinary work text. E1: the recorded refresh failure
 // ("access token could not be refreshed") is auth-required — classified, never re-probed or relaunched.
 const AUTH_RE = /not logged in|please (?:log ?in|sign in)|please run [^\n]{0,30}log ?in|authentication[ _](?:required|failed|error)|invalid (?:api key|credentials)|api key (?:is )?(?:not set|missing|invalid|required)|credentials? (?:have )?expired|401 unauthorized|access token could not be refreshed/i;

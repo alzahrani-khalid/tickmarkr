@@ -554,7 +554,7 @@ export function promptFitsArgv(promptFile: string, platform: string = process.pl
 // on ordinary billing/wallet task output the harness edits (research Pitfall 3, 2026-07-10).
 // OBS-1161: transient provider capacity ("Selected model is at capacity") is NOT quota — the seat
 // comes back within minutes, so it takes bounded same-seat backoff before a same-floor failover and
-// never permanent demotion. Kept apart from QUOTA_RE so permanent quota policy stays untouched, and
+// never permanent demotion. Kept apart from quotaSignal so permanent quota policy stays untouched, and
 // anchored on the full phrase (the Pitfall-3 lesson: a bare "capacity" fires on ordinary work text).
 // A banner is the CLI speaking, so the phrase must OPEN its row — after at most an error glyph
 // (codex paints "■ Selected model is at capacity. …") or an "error:" label. Anything else in front —
@@ -563,7 +563,27 @@ export function promptFitsArgv(promptFile: string, platform: string = process.pl
 // opens a row with the bare phrase inside the banner tail; widen the glyph set only from a captured frame.
 export const CAPACITY_RE = /^[ \t■⚠✗✘×!]*(?:(?:stream )?error:[ \t]*)?(?:(?:selected |the )?model is (?:currently |temporarily )?at capacity|(?:provider|service|server) is (?:currently )?at capacity)/im;
 
-export const QUOTA_RE = /rate.?limit|quota|usage limit|out of credits|insufficient credit|insufficient balance or no resource|\b429\b/i;
+// Queue row 106 (D-1597): a bare 429 is never a quota signal. Every bare 429 in the captured corpus was a line number
+// or a count — `429:` in a diff listing failed a pinned codex worker over 41 985 bytes before EOF (OBS-926) — and the
+// one real 429 banner also carries a phrase and a labelled status. Quota is a PHRASE, or a 429 the output LABELS.
+export const QUOTA_PHRASE_RE = /rate.?limit|quota|usage limit|out of credits|insufficient credit|insufficient balance or no resource|too many requests/i;
+// A whole-token status label (row 20, D-1581): no letter of any script, combining mark, digit or underscore before it;
+// compound labels enumerated. Its \p{} classes need the "u" flag, kept on the regexes that use it — under "iu" case
+// folding maps ſ → s and K → k, so it never reaches the phrases above (D-1582). Shared with the model probe.
+export const STATUS_LABEL =
+  String.raw`(?<![\p{L}\p{M}\p{N}_])(?:http[_-]?status(?:[_-]?code)?|error[_-]?code|HTTP(?:\/\d(?:\.\d)?)?|status(?:[\s_-]*code)?|code|error)["']?\s*[:=]?\s*["']?`;
+export const LABELLED_429_RE = new RegExp(String.raw`${STATUS_LABEL}\b429\b(?![.,]\d)`, "iu");
+export type QuotaSignal = RegExpExecArray & { readonly source: string };
+/**
+ * The LEFTMOST quota signal in `text` — a phrase or a labelled 429 — with the source of the regex that matched (the
+ * quota-banner record names it, so a false positive stays legible from the record alone), or null. A phrase and a
+ * label never start at the same index (phrase initials r q u o i t, label initials h e s c); a tie would go to the phrase.
+ */
+export function quotaSignal(text: string): QuotaSignal | null {
+  const phrase = QUOTA_PHRASE_RE.exec(text), label = LABELLED_429_RE.exec(text);
+  const [match, re] = phrase && (!label || phrase.index <= label.index) ? [phrase, QUOTA_PHRASE_RE] : label ? [label, LABELLED_429_RE] : [null, null];
+  return match && re ? Object.assign(match, { source: re.source }) : null;
+}
 
 // v1.5 MODEL-01: charset gate for detected model ids (research Pitfall 4, verified 2026-07-10).
 // Ids come from CLI stdout / another program's JSON (models_cache.json) and are echoed into

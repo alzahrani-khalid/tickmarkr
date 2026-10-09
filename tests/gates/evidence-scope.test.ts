@@ -66,6 +66,40 @@ describe("scopeGate", () => {
     expect((await scopeGate(repo, base, [], noResult)).pass).toBe(true);
   });
 
+  // Queue row 71: every fixture sets core.quotePath true, git's default, so a host config that turns quoting off cannot
+  // hide the defect. An accented and an Arabic name: one Latin-script, one not.
+  test("a changed non-ASCII path matches files[] verbatim, so an accented or Arabic file name in scope passes", async () => {
+    const repo = makeRepo({ "a.txt": "x" });
+    execSync("git config core.quotePath true", { cwd: repo });
+    const base = await gitHead(repo);
+    commitFile(repo, "docs/caf\u00e9.md", "x\n");
+    commitFile(repo, "docs/\u0645\u0644\u0641.md", "y\n");
+    const r = await scopeGate(repo, base, ["docs/caf\u00e9.md", "docs/\u0645\u0644\u0641.md"], noResult);
+    expect(r.pass, r.details).toBe(true);
+  });
+
+  // Bait for the two tempting wrong fixes: core.quotePath=false alone still C-quotes a tab, and keeping trim() on the -z
+  // output strips the leading space of " lead.md", which sorts first.
+  test("a changed path holding a tab or a leading space matches files[] verbatim", async () => {
+    const repo = makeRepo({ "a.txt": "x" });
+    execSync("git config core.quotePath true", { cwd: repo });
+    const base = await gitHead(repo);
+    commitFile(repo, " lead.md", "x\n");
+    commitFile(repo, "docs/tab\tname.md", "y\n");
+    const r = await scopeGate(repo, base, [" lead.md", "docs/tab\tname.md"], noResult);
+    expect(r.pass, r.details).toBe(true);
+  });
+
+  test("an out-of-scope non-ASCII path is named verbatim, never C-quoted", async () => {
+    const repo = makeRepo({ "a.txt": "x" });
+    execSync("git config core.quotePath true", { cwd: repo });
+    const base = await gitHead(repo);
+    commitFile(repo, "docs/caf\u00e9.md", "x\n");
+    const r = await scopeGate(repo, base, ["a.txt"], noResult);
+    expect(r.pass).toBe(false);
+    expect(r.details.split("\n")).toContain("docs/caf\u00e9.md");
+  });
+
   test("HARD-08: liar worker — a deviation naming no path does not excuse out-of-scope edits", async () => {
     const repo = makeRepo({ "src/auth/a.ts": "x", "README.md": "r" });
     const base = await gitHead(repo);

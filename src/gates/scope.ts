@@ -40,7 +40,9 @@ export async function scopeGate(
 ): Promise<GateResult> {
   if (!files.length) return { gate: "scope", pass: true, details: "no file scope declared — unrestricted" };
   const baseRef = await scopeDiffBase(worktree, integrationTip);
-  const changed = (await shGitOk(`git diff --name-only '${baseRef}..HEAD'`, worktree)).trim().split("\n").filter(Boolean);
+  // Queue row 71: without -z git C-quotes a non-ASCII path (`"docs/caf\303\251.md"`), which no files[] entry can ever
+  // match; -z prints every path verbatim, NUL-terminated (no trim: a name may begin or end with a space).
+  const changed = (await shGitOk(`git diff --name-only -z '${baseRef}..HEAD'`, worktree)).split("\0").filter(Boolean);
   const inScope = filesGlob(files); // the ONE files[] matcher — src/graph/files-glob.ts (Q120s)
   const offenders = changed.filter((f) => !inScope(f));
   if (!offenders.length) return { gate: "scope", pass: true, details: `all ${changed.length} changed files in scope` };

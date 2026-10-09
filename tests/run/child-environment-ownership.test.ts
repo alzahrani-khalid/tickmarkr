@@ -1276,6 +1276,7 @@ test.each([
   ["T7 a status with a signal never answered", { status: 0, signal: "SIGKILL" }, { pin: "unknown", cause: "killed by SIGKILL" }],
   ["T8 a bare error never answered", {}, { pin: "unknown", cause: "failed with an unknown error" }],
   ["T9 a clean exit whose output overflowed the buffer never answered", { status: 0, signal: null, code: "ENOBUFS" }, { pin: "unknown", cause: "failed with ENOBUFS" }],
+  ["T10 an overflow Node killed is named by its code", { status: null, signal: "SIGTERM", code: "ENOBUFS" }, { pin: "unknown", cause: "failed with ENOBUFS" }],
 ] as const)("the ref-store pin probe reads a thrown probe %s", (_row, error, expected) => {
   expect(refStorePinProbeFailure({ ...error, stdout: "refs/tickmarkr/ref-pin-honoured\n" })).toEqual(expected);
 });
@@ -1291,6 +1292,12 @@ const thrownBy = (file: string, args: string[], options: { maxBuffer?: number } 
 test("the ref-store pin probe reads a real non-zero exit as ignored", () => {
   expect(refStorePinProbeFailure(thrownBy("sh", ["-c", "exit 1"]))).toEqual({ pin: "ignored" });
 });
+// Queue row 107: a 1 MiB write into a 64-byte cap blocks on the full pipe, so Node's overflow kill always lands — the
+// shape is {status null, SIGTERM, ENOBUFS} (50 of 50 measured) — and the refusal must name ENOBUFS, not the kill.
+test("the ref-store pin probe names a real killed overflow by its error code", () => {
+  expect(refStorePinProbeFailure(thrownBy("sh", ["-c", "head -c 1048576 /dev/zero"], { maxBuffer: 64 }))).toEqual({ pin: "unknown", cause: "failed with ENOBUFS" });
+});
+
 test("the ref-store pin probe reads a real output overflow as unknown", () => {
   expect(refStorePinProbeFailure(thrownBy("sh", ["-c", "trap '' TERM; head -c 4096 /dev/zero"], { maxBuffer: 64 }))).toMatchObject({ pin: "unknown" });
 });

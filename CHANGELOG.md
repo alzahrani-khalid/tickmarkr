@@ -2,11 +2,13 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
-## v2.7.1 — two probes stop reading an answer they never got
+## v2.7.1 — probes, paths and the dead-worker check stop misreading what they cannot see
 
-**v2.7.1** ships two product fixes. Each was made by hand and proven by its own `tickmarkr verify`: build, lint,
+**v2.7.1** ships seven product fixes. Each was made by hand and proven by its own `tickmarkr verify`: build, lint,
 evidence, scope, executed acceptance with one test per row of its closed case table, cross-vendor review
-(`codex:gpt-6-astra`, OpenAI, reviewing Claude-authored work) and the full suite. No `tickmarkr run` was used.
+(`codex:gpt-6-astra`, OpenAI, reviewing Claude-authored work) and the full suite. No `tickmarkr run` was used. 2.7.1 was
+first cut with two of these fixes; its public CI went red when the dead-worker check parked a test worker (the check is
+hardened below), so it was never published, and it ships now with all seven.
 
 - **A model probe no longer reads a bare number as an auth failure (affected: ≤ 2.7.0).** Doctor's per-model probe
   failed any output holding a bare number from 400 to 499, so qwen's healthy telemetry `"totalGenerationDurationMs":438`
@@ -16,8 +18,30 @@ evidence, scope, executed acceptance with one test per row of its closed case ta
   `zipCode` or `éstatus` before a number is no label — and the auth-word checks (`unauthorized`, `forbidden`, …) are
   unchanged. The probe's quota reading drops the bare `429` the same way. The change only narrows: no probe output that
   2.7.0 read as healthy fails now (checked over about 487 000 generated outputs), with one declared exception — a "Too
-  Many Requests" sentence fails as a quota error even without a number, so an unlabelled `429 Too Many Requests` keeps
-  failing. Contract change: a probe that prints a bare `401` and exits 0 is no longer a failure.
+  Many Requests" sentence fails as a quota error even without a number. Contract change: a probe that prints a bare
+  `401` and exits 0 is no longer a failure.
+- **A bare 429 no longer fails a task over to another model (affected: ≤ 2.7.0).** The daemon's quota-banner and stall
+  readers read any bare `429` as a quota signal, so a worker whose final output held line numbers (`427 428 429 430`) or
+  a diff listing (`429:`) was switched to another model for a quota it never hit. A quota signal is now a quota phrase
+  or a `429` the output labels as a status (`HTTP 429`, `status code 429`, `"statusCode":429`, `Error: 429`); the
+  leftmost one wins, and the quota-banner record names the pattern that matched. The model probe and the daemon now
+  share one phrase list and one label grammar. Declared: "too many requests" is a quota phrase in the daemon too, with
+  or without a number.
+- **A worker that has just finished is no longer parked as dead (affected: ≤ 2.7.0).** The dead-worker check parked a
+  worker when its pane, its process tree and its worktree all showed nothing — but a subprocess exits before its output
+  stream closes, so a worker that had just finished could look gone while its result was still in flight. A worker is
+  now parked as dead only when its transport confirms the stream is closed and a read taken after that is still empty;
+  each driver answers for itself, and the herdr and orca panes, whose closure is the pane being gone, behave exactly as
+  before. The park records the transport's state, so a worker that really was killed shows its signal.
+- **Non-ASCII, tab- or space-holding file names are matched and read verbatim (affected: ≤ 2.7.0).** The scope gate read
+  `git diff --name-only` without `-z`, so git's quoted form of an accented or Arabic file name (`"docs/caf\303\251.md"`)
+  could never match `files[]` — the gate failed it on every attempt, whatever the spec declared — and compile warned
+  that a tracked non-ASCII context file was missing from the worker's checkout. Path listings that feed a match now use
+  `-z`. Patch text is decoded once, correctly: the acceptance judge's citable changed lines and the artifact manifest
+  share one decoder for git's quoting (octal bytes decoded as UTF-8, git's tab after a space-holding name dropped
+  exactly, a `diff --git` header read only the way git itself reads it), so a judge citing `docs/café.md` matches the
+  changed file; before, the manifest decoded such a name with literal backslashes and the judge's list held the quoted
+  form.
 - **A git that never answered the ref-store pin probe is no longer taken for an old git (affected: ≤ 2.7.0).** Before
   tickmarkr runs its own git in a linked checkout, it probes whether the git on PATH honours `GIT_REFERENCE_BACKEND`
   (git ≥ 2.54); one that does not runs under a weaker guard, with a warning naming git 2.54. Every failure of that probe
@@ -26,7 +50,8 @@ evidence, scope, executed acceptance with one test per row of its closed case ta
   pre-2.54 git exits non-zero and keeps the weaker guard and its warning. A probe that timed out, was killed, could not
   start or overflowed its output buffer is asked once more, and a second non-answer refuses own git by name ("could not
   tell whether this git honours the ref-store pin: the probe (git symbolic-ref refs/tickmarkr/ref-pin-probe) did not
-  complete twice (<cause>)") instead of running it without the pin.
+  complete twice (<cause>)") instead of running it without the pin; the cause names an error code before a signal, so an
+  overflow Node killed reads "failed with ENOBUFS".
 
 ## v2.7.0 — the run daemon stops freezing while it counts live test suites
 

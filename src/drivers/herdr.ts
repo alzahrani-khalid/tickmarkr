@@ -9,7 +9,7 @@ import { Journal, type JournalEvent } from "../run/journal.js";
 import { readSupervision, readWatchBoard, requestWatchBoardStop, reserveWatchBoard, stopWatchBoard, WATCH_OWNER_ENV } from "../run/supervision.js";
 import { canonicalWorktreePath } from "./orca.js";
 import { herdrSealShellPrefix } from "./subprocess.js";
-import { canonicalizeLegacyName, formatOwnedName, panesToClose, parseOwnedName, type ExecutorDriver, type FocusTarget, type FocusResult, type NotifyOpts, type OwnedName, type PanesToCloseOpts, type Slot, type SlotOpts } from "./types.js";
+import { canonicalizeLegacyName, formatOwnedName, panesToClose, parseOwnedName, type ExecutorDriver, type FocusTarget, type TransportState, type FocusResult, type NotifyOpts, type OwnedName, type PanesToCloseOpts, type Slot, type SlotOpts } from "./types.js";
 
 // VIS-09 P43-03: adopted safety floor from 43-MEASUREMENT.md (narrowest safe 53 → floor 108).
 export const TRAILER_SAFE_FLOOR_COLS = 108;
@@ -1247,6 +1247,12 @@ export class HerdrDriver implements ExecutorDriver {
     } catch {
       return "unknown";
     }
+  }
+
+  // Queue row 108: a pane's transport closes when the pane is gone, which the dead-worker park already requires
+  // (an empty read), so the answer is closed — parity with the park before row 108, never a new hold.
+  async transportState(_slot: Slot): Promise<TransportState> {
+    return { closed: true };
   }
 
   async read(slot: Slot, lines: number): Promise<string> {

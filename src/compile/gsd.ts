@@ -333,14 +333,15 @@ export function compileGsd(src: string, root?: string): RunGraph {
   // snapshot; classifyContextPath remains the single authority for missing, untracked, and glob refs.
   const gitDir = dirname(files[0]);
   const top = spawnSync("git", ["-C", gitDir, "rev-parse", "--show-toplevel"], { encoding: "utf8", maxBuffer: 1 << 28 });
-  const tree = spawnSync("git", ["-C", gitDir, "ls-tree", "--full-tree", "-r", "--name-only", "HEAD"], { encoding: "utf8", maxBuffer: 1 << 28 });
+  // -z (queue row 71): without it a non-ASCII path is C-quoted and a tracked ref reads as untracked
+  const tree = spawnSync("git", ["-C", gitDir, "ls-tree", "--full-tree", "-r", "--name-only", "-z", "HEAD"], { encoding: "utf8", maxBuffer: 1 << 28 });
   const repoRoot = typeof top.stdout === "string" ? top.stdout.trim() : "";
   // `root` is the repository whose worktrees will consume these refs. A source nested inside some
   // unrelated repository (as with vendored fixtures) must not be judged against that outer tree.
   const authoritative = root === undefined
     || (top.status === 0 && repoRoot !== "" && realpathSync(root) === realpathSync(repoRoot));
   if (top.status === 0 && tree.status === 0 && repoRoot && typeof tree.stdout === "string" && authoritative) {
-    const tracked = new Set(tree.stdout.split("\n").filter(Boolean));
+    const tracked = new Set(tree.stdout.split("\0").filter(Boolean));
     const unreachable: string[] = [];
     for (const [i, t] of tasks.entries()) {
       for (const entry of compiled[i].refs) {

@@ -17,7 +17,7 @@ import {
 } from "./catalog.js";
 import {
   type AuthHealth, type BillingChannel, channelKey, channelsFromConfig, type ModelAuth,
-  modelAuthed, MODEL_ID_RE, MODEL_PROBE_ERRORS, type ModelProbeError, shq, type WorkerAdapter,
+  modelAuthed, MODEL_ID_RE, MODEL_PROBE_ERRORS, type ModelProbeError, QUOTA_PHRASE_RE, shq, STATUS_LABEL, type WorkerAdapter,
 } from "./types.js";
 
 // Compatibility projection for callers/tests that only need shipped advisory names. The literal
@@ -457,17 +457,13 @@ const MODEL_PROBE_TIMEOUT_MS = 60000;
 // label only NARROWS the base's bare-4xx match (both `\b`s and the no-decimal/grouping tail stay), so nothing the
 // base read as authed fails here; the base's digit-before guard is implied by the `\b` after a label. The word
 // branches are unchanged.
-const STATUS_LABEL =
-  String.raw`(?<![\p{L}\p{M}\p{N}_])(?:http[_-]?status(?:[_-]?code)?|error[_-]?code|HTTP(?:\/\d(?:\.\d)?)?|status(?:[\s_-]*code)?|code|error)["']?\s*[:=]?\s*["']?`;
 // The labelled 4xx needs the `u` flag (\p{…} in STATUS_LABEL). The auth-word branches keep the base's bytes and its
 // "i" flag: under "iu" case folding maps ſ (U+017F) → s and K (U+212A) → k, so `unauthoriſed` would read as a failure
 // the base never read (D-1582).
 const LABELLED_4XX_RE = new RegExp(String.raw`${STATUS_LABEL}\b4\d\d\b(?![.,]\d)`, "iu");
 const AUTH_WORDS_RE = /\bauth(?:entication|orization)?\s+(?:error|failed|failure|denied)|unauthori[sz]ed|forbidden|access denied|credit(?:s)?\s+(?:exhausted|error|denied)/i;
-// The probe's quota reading, same rule: QUOTA_RE's bare `\b429\b` (types.ts) reads `"durationMs":429` as a quota
-// failure too, so the probe drops it — a labelled 429 is a labelled 4xx above, and an unlabelled `429 Too Many
-// Requests` keeps failing on its phrase. The daemon's banner and stall readers keep QUOTA_RE (queue row 106).
-const PROBE_QUOTA_RE = /rate.?limit|quota|usage limit|out of credits|insufficient credit|insufficient balance or no resource|too many requests/i;
+// The probe's quota reading is the shared QUOTA_PHRASE_RE (types.ts, queue row 106): a labelled 429 is a labelled 4xx
+// above, and an unlabelled `429 Too Many Requests` keeps failing on its phrase.
 
 const PROBE_REASON_CAP = 240;
 
@@ -505,7 +501,7 @@ function probeFailure(
   const output = `${stderr}\n${stdout}`.trim().replace(/\s+/g, " ");
   // OBS-72: TAIL, not head — the error lands at the END of CLI output; a head slice stores only the
   // startup banner and hid the real "Not inside a trusted directory" failure for a day.
-  return code !== 0 || PROBE_QUOTA_RE.test(output) || LABELLED_4XX_RE.test(output) || AUTH_WORDS_RE.test(output)
+  return code !== 0 || QUOTA_PHRASE_RE.test(output) || LABELLED_4XX_RE.test(output) || AUTH_WORDS_RE.test(output)
     ? reasonTail(output) || `probe exited ${code}`
     : undefined;
 }

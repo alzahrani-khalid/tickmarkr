@@ -896,6 +896,25 @@ describe("context: oracle is the tree, not the index", () => {
     expect(warn.mock.calls.map((c) => String(c[0])).filter((m) => m.includes("OBS-170"))).toHaveLength(0);
   });
 
+  // Queue row 71: core.quotePath true (git's default) is set so a host config cannot hide a C-quoted tracked set.
+  test("a committed non-ASCII context file is reachable and silent", () => {
+    const repo = mkdtempSync(join(tmpdir(), "tickmarkr-tree-"));
+    git(repo, "init -q");
+    git(repo, "config user.email t@t.t");
+    git(repo, "config user.name t");
+    git(repo, "config core.quotePath true");
+    writeFileSync(join(repo, "caf\u00e9.md"), "committed");
+    writeFileSync(join(repo, "\u0645\u0644\u0641.md"), "committed");
+    git(repo, "add -A");
+    git(repo, "commit -qm base");
+
+    const spec = join(repo, "spec.md");
+    writeFileSync(spec, "<!-- tickmarkr:spec -->\n## T1: Committed\n- context: caf\u00e9.md, \u0645\u0644\u0641.md\n- acceptance:\n  - ok\n");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    compileSource(spec, "native");
+    expect(warn.mock.calls.map((c) => String(c[0])).filter((m) => m.includes("OBS-170"))).toHaveLength(0);
+  });
+
   test("an absent context path fails compile and names the repair", () => {
     const repo = mkdtempSync(join(tmpdir(), "tickmarkr-tree-"));
     git(repo, "init -q");

@@ -39,7 +39,7 @@ needs (OBS-136/140 interface), and the OBS-930 launch shape that produced the pa
   by the footer row, which is what the matcher anchors on — a bare `› ` fingerprint would read every
   echoed turn as an occupied editor (the claude-submitted-echo class).
 - `• You have 2 usage limit resets available. Run /usage to use one.` sits in the frame's tail: the
-  `QUOTA_CHROME_RE` allowlist in `src/run/stall.ts` already filters that exact line before `QUOTA_RE`
+  `QUOTA_CHROME_RE` allowlist in `src/run/stall.ts` already filters that exact line before `quotaSignal`
   runs (`stallSnapshotBannerRows`), so an idle codex TUI never reads as a quota banner.
 - `• Model changed to gpt-5.6-luna medium` (transcript, row 3): codex 0.153.4 MIGRATED the requested
   `--model gpt-5.4-mini` to `gpt-5.6-luna` (`[notice.model_migrations]` in the operator's

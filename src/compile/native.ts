@@ -27,10 +27,11 @@ function trackedAtHead(dir: string): { root: string; tracked: Set<string> } | un
   // --full-tree is load-bearing: without it `ls-tree` scopes to the CWD's subtree and prints paths
   // relative to it, so a spec in specs/ would see only specs/-relative names and misjudge every
   // path outside it. Caught only by a fixture whose spec is NOT at the repo root.
-  const r = git("ls-tree", "--full-tree", "-r", "--name-only", "HEAD");
+  // -z (queue row 71): without it a non-ASCII path is C-quoted and a tracked file reads as untracked
+  const r = git("ls-tree", "--full-tree", "-r", "--name-only", "-z", "HEAD");
   // not a repo, or no commits yet — fail open, so non-repo fixtures and fresh inits stay silent
   if (top.status !== 0 || r.status !== 0 || typeof r.stdout !== "string") return undefined;
-  return { root: top.stdout.trim(), tracked: new Set(r.stdout.split("\n").filter(Boolean)) };
+  return { root: top.stdout.trim(), tracked: new Set(r.stdout.split("\0").filter(Boolean)) };
 }
 
 const GLOB_CHARS = /[*?{[]/;

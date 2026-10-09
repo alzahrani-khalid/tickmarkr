@@ -8,7 +8,7 @@ import {
   matchesInputBox,
   matchesOccupiedInputBox,
   missingInputStateDeclarations,
-  QUOTA_RE,
+  quotaSignal,
 } from "../../src/adapters/types.js";
 import { stallSnapshotBannerRows } from "../../src/run/stall.js";
 
@@ -62,10 +62,10 @@ describe("codex input box (OBS-930 / OBS-136)", () => {
 
   test("test: the idle codex TUI's banner rows carry the 'usage limit resets available' chrome yet never read as a quota banner whereas a real limit line in the same tail does", () => {
     expect(IDLE_TEXT).toMatch(/usage limit resets available/);
-    expect(QUOTA_RE.test(stallSnapshotBannerRows(IDLE_TEXT))).toBe(false);
-    expect(QUOTA_RE.test(stallSnapshotBannerRows(TRANSCRIPT))).toBe(false);
+    expect(quotaSignal(stallSnapshotBannerRows(IDLE_TEXT))).toBeNull();
+    expect(quotaSignal(stallSnapshotBannerRows(TRANSCRIPT))).toBeNull();
     // control: the filter removes only the known chrome line, never a real banner beside it
     const throttled = IDLE_TEXT.replace("• PONG", "• You've hit your usage limit. Try again at 4pm.");
-    expect(QUOTA_RE.test(stallSnapshotBannerRows(throttled))).toBe(true);
+    expect(quotaSignal(stallSnapshotBannerRows(throttled))).not.toBeNull();
   });
 });

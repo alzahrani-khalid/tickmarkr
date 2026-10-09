@@ -515,7 +515,7 @@ export function stallSnapshotTail(text: string, rows: number = QUOTA_BANNER_TAIL
 
 // T1 review (chrome-blind-matcher class, OBS-152/155): the tail of a RENDERED TUI frame is not
 // "what the pane printed last" — its bottom rows are fixed composer/welcome chrome. Codex pins
-// "• You have 3 usage limit resets available." there, so a raw-tail QUOTA_RE match fires on every
+// "• You have 3 usage limit resets available." there, so a raw-tail quota match fires on every
 // frame of a wedged pane (verified against all 8 frames of tests/fixtures/codex-mcp-spinner) and
 // would fail a live worker over mid-work. Filter the KNOWN chrome instead of everything on screen
 // at some anchor: a novelty baseline cannot distinguish "chrome that was already there" from "a

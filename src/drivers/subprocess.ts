@@ -1,7 +1,7 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { shq } from "../adapters/types.js";
 import { createWorktree, FORK_CAP_ENV, resolvedForkCap } from "../run/git.js";
-import type { ExecutorDriver, NotifyOpts, Slot } from "./types.js";
+import type { ExecutorDriver, NotifyOpts, Slot, TransportState } from "./types.js";
 
 // HARD-03: cap retained worker output so a chatty worker can't grow tickmarkr's heap unbounded.
 // 2MB is safe against BOTH consumers: the largest read() call site asks for 1000 lines
@@ -43,7 +43,9 @@ export function herdrSealShellPrefix(env: NodeJS.ProcessEnv = process.env): stri
     HERDR_CONTROL_VARS.map((k) => `unset ${k}`).join("; ") + "; ";
 }
 
-interface SlotState { buf: string; proc?: ChildProcess; exited: boolean }
+/** Queue row 108 (D-1622): ONE invocation's own stream state, written only by that invocation's process listeners. */
+interface Invocation { closed: boolean; exitCode: number | null; signal: string | null }
+interface SlotState { buf: string; proc?: ChildProcess; exited: boolean; invocation?: Invocation }
 
 export class SubprocessDriver implements ExecutorDriver {
   id = "subprocess";
@@ -83,6 +85,15 @@ export class SubprocessDriver implements ExecutorDriver {
     p.stderr.on("data", (d) => (s.buf = (s.buf + d).slice(-MAX_BUF)));
     p.on("close", () => (s.exited = true));
     p.on("error", (e) => { s.buf = (s.buf + `\n[tickmarkr subprocess error] ${e}\n`).slice(-MAX_BUF); s.exited = true; });
+    // Queue row 108 (D-1622): THIS run's transport state. The slot's `exited` outlives an invocation (a reused slot) and
+    // an 'error' sets it before stdio closes, so it is not the fact. This object is fresh per run and written only by
+    // THIS process's listeners: a previous worker's late close lands on its own state, never on the current one. Only
+    // stdio 'close' closes it — or a spawn that never started (no pid), which has nothing to drain.
+    const invocation: Invocation = { closed: false, exitCode: null, signal: null };
+    s.invocation = invocation;
+    p.on("exit", (code, signal) => { invocation.exitCode = code; invocation.signal = signal; });
+    p.on("close", () => { invocation.closed = true; });
+    p.on("error", () => { if (p.pid === undefined) invocation.closed = true; });
   }
 
   async waitOutput(slot: Slot, pattern: string, timeoutMs: number, opts?: { regex?: boolean }): Promise<boolean> {
@@ -110,6 +121,12 @@ export class SubprocessDriver implements ExecutorDriver {
 
   async status(_slot: Slot): Promise<string> {
     return "unknown"; // no screen to scrape; never reports blocked
+  }
+
+  async transportState(slot: Slot): Promise<TransportState> {
+    const s = this.state(slot);
+    const run = s.invocation;
+    return { closed: run?.closed ?? false, bytes: Buffer.byteLength(s.buf), exitCode: run?.exitCode ?? null, signal: run?.signal ?? null };
   }
 
   async read(slot: Slot, lines: number): Promise<string> {

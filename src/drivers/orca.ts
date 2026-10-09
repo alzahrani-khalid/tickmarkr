@@ -8,7 +8,7 @@ import { Journal, type JournalEvent, parseRunId } from "../run/journal.js";
 import { stateDirName } from "../graph/graph.js";
 import { readWatchBoard, requestWatchBoardStop, stopWatchBoard, supervisionPresencePath, WATCH_OWNER_ENV, type WatchBoardOwner } from "../run/supervision.js";
 import { MAX_BUF } from "./subprocess.js";
-import { formatOwnedName, panesToClose, parseOwnedName, type ExecutorDriver, type FocusTarget, type FocusResult, type NotifyOpts, type Slot, type SlotOpts } from "./types.js";
+import { formatOwnedName, panesToClose, parseOwnedName, type ExecutorDriver, type FocusTarget, type TransportState, type FocusResult, type NotifyOpts, type Slot, type SlotOpts } from "./types.js";
 
 // Orca (onorca.dev) as a third execution surface beside herdr and subprocess. tickmarkr keeps
 // worktrees, routing, gates, journal and merges; orca supplies visible terminals only. Everything
@@ -1638,6 +1638,12 @@ export class OrcaDriver implements ExecutorDriver {
 
   /** A single UNPAGED tail read — exactly what the caller asked for and nothing more. Markers split
    *  across cursor pages are not reassembled here; that is waitOutput's job. */
+  // Queue row 108: a pane's transport closes when the pane is gone, which the dead-worker park already requires
+  // (an empty read), so the answer is closed — parity with the park before row 108, never a new hold.
+  async transportState(_slot: Slot): Promise<TransportState> {
+    return { closed: true };
+  }
+
   async read(slot: Slot, lines: number): Promise<string> {
     if (!Number.isInteger(lines) || lines <= 0) throw new OrcaError("read", `invalid line limit ${lines}`, "");
     const st = this.state(slot);

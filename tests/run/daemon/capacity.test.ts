@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { FakeAdapter } from "../../../src/adapters/fake.js";
 import { NO_TRAILER_SUMMARY, UNPARSEABLE_TRAILER_SUMMARY } from "../../../src/adapters/prompt.js";
-import { CAPACITY_RE, channelKey, QUOTA_RE, type Assignment, type AuthHealth, type BillingChannel } from "../../../src/adapters/types.js";
+import { CAPACITY_RE, channelKey, quotaSignal, type Assignment, type AuthHealth, type BillingChannel } from "../../../src/adapters/types.js";
 import { SubprocessDriver } from "../../../src/drivers/subprocess.js";
 import { type Slot } from "../../../src/drivers/types.js";
 import { graphDefinitionHash, loadGraph, saveGraph, tickmarkrDir } from "../../../src/graph/graph.js";
@@ -78,7 +78,7 @@ describe("OBS-1161: transient capacity waits briefly then fails over within the 
   afterEach(() => { resetQuotaBannerSilentMsForTests(); resetCapacityBackoffMsForTests(); });
 
   test("test: the production daemon classifies a live idle capacity banner equivalently to a no-trailer capacity exit for bounded backoff before same-floor failover, so full-stall waiting or permanent quota demotion fails", async () => {
-    expect(QUOTA_RE.test(BANNER)).toBe(false); // the whole hazard: today neither classifier owns this line
+    expect(quotaSignal(BANNER)).toBeNull(); // the whole hazard: today neither classifier owns this line
     expect(CAPACITY_RE.test(BANNER)).toBe(true);
     // live idle banner in a 5m window: finishing inside the test timeout proves the window was not waited out
     const live = setupRepo([T("T1", { timeoutMinutes: 5 })], { tasks: { T1: [okStep("T1", "recovered")] }, consult: RETRY });

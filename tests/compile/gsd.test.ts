@@ -1,6 +1,7 @@
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import { execSync } from "node:child_process";
 import { filesGlob } from "../../src/graph/files-glob.js";
 import { describe, expect, test, vi } from "vitest";
 import { CompileError } from "../../src/compile/common.js";
@@ -154,6 +155,21 @@ describe("GSD context-ref reachability parity", () => {
     expect(warn.mock.calls.map(([message]) => String(message))).toContainEqual(
       expect.stringContaining(`git add -f ${ref} && git commit`),
     );
+    warn.mockRestore();
+  });
+
+  // Queue row 71: core.quotePath true (git's default) is set so a host config cannot hide a C-quoted tracked tree.
+  test("a gsd plan citing a committed non-ASCII ref compiles silently", () => {
+    const ref = "docs/caf\u00e9-context.md";
+    const { repo, phase } = repositoryPhase("28-non-ascii-ref", ref);
+    execSync("git config core.quotePath true", { cwd: repo });
+    mkdirSync(join(repo, "docs"));
+    writeFileSync(join(repo, ref), "tracked context\n");
+    execSync("git add -A && git commit -qm ref --no-gpg-sign", { cwd: repo });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    expect(() => compileGsd(phase, repo)).not.toThrow();
+    expect(warn).not.toHaveBeenCalled();
     warn.mockRestore();
   });
 

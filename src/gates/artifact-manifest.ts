@@ -4,6 +4,8 @@
  * registered producer and repeats that producer's current provenance exactly.
  */
 
+import { diffSidePath, gitHeaderPaths, unquoteGitPath } from "./git-paths.js";
+
 export type CaptureProducerProvenance = {
   readonly source: string;
   readonly entrypoint: string;
@@ -271,8 +273,7 @@ function deletedPath(section: string): string | null {
   if (!/^deleted file mode /m.test(section)) return null;
   const oldPath = /^--- (.+)$/m.exec(section)?.[1]
     ?? /^Binary files (.+) and \/dev\/null differ$/m.exec(section)?.[1];
-  if (!oldPath || oldPath === "/dev/null") return null;
-  return unquoteGitPath(oldPath).replace(/^a\//, "");
+  return oldPath ? diffSidePath(oldPath) : null;
 }
 
 /**
@@ -287,26 +288,6 @@ export function reviewableLogicDiff(diff: string): string {
     if (!path || isProtectedEvidence(path)) return section;
     return `deleted file: ${path}\n`;
   }).join("");
-}
-
-function unquoteGitPath(raw: string): string {
-  const value = raw.trim();
-  if (!value.startsWith('"') || !value.endsWith('"')) return value;
-  try {
-    return JSON.parse(value) as string;
-  } catch {
-    return value.slice(1, -1);
-  }
-}
-
-function diffSidePath(raw: string): string | null {
-  const value = unquoteGitPath(raw);
-  if (value === "/dev/null") return null;
-  return value.replace(/^[ab]\//, "");
-}
-
-function gitHeaderTokens(raw: string): string[] {
-  return raw.match(/"(?:\\.|[^"\\])*"|\S+/g) ?? [];
 }
 
 type ParsedSection = {
@@ -341,10 +322,7 @@ function sectionPaths(section: string, parsed: ParsedSection | null): string[] {
     return [...new Set([renamedFrom, renamedTo].filter((path): path is string => path !== undefined).map(unquoteGitPath))];
   }
   const header = /^diff --git (.+)$/m.exec(section)?.[1];
-  if (!header) return [];
-  const tokens = gitHeaderTokens(header);
-  if (tokens.length !== 2) return [];
-  return [...new Set(tokens.map(diffSidePath).filter((path): path is string => path !== null))];
+  return header ? gitHeaderPaths(header) : [];
 }
 
 function hunkPayload(body: readonly string[], sign: "+" | "-"): string {

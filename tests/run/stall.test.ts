@@ -2,7 +2,7 @@ import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import { filterLlmTranscript, normalizeStallSnapshot, PANE_READ_ROWS, stallSnapshotBannerRows, stallSnapshotTail, StallProgressTracker } from "../../src/run/stall.js";
-import { QUOTA_RE } from "../../src/adapters/types.js";
+import { quotaSignal } from "../../src/adapters/types.js";
 
 // OBS-82 fixture: consecutive HerdrDriver.read(slot, 1000) snapshots of a live wedged codex pane
 // (see tests/fixtures/codex-mcp-spinner/README.md for capture provenance). Loaded sorted so the
@@ -128,19 +128,19 @@ describe("stall progress tracker", () => {
 
   // T1 review (chrome-blind-matcher class): the tail of a rendered TUI frame ends in fixed chrome,
   // not the newest transcript line. Codex pins "• You have 3 usage limit resets available." there —
-  // QUOTA_RE matches the raw tail of ALL EIGHT captured frames of this wedged-MCP pane, so a raw-tail
+  // the quota signal matches the raw tail of ALL EIGHT captured frames of this wedged-MCP pane, so a raw-tail
   // classifier would fail the canonical stall over as quota exhaustion. The classifier filters that
   // KNOWN chrome by identity (resets AVAILABLE is the opposite of exhaustion), never by novelty
   // against an anchor — see the launch-throttle proof below for what novelty exculpates.
-  test("the captured wedged codex pane matches QUOTA_RE on raw tail rows but never once the known chrome is filtered", () => {
+  test("the captured wedged codex pane gives a quota signal on raw tail rows but never once the known chrome is filtered", () => {
     expect(frames.length).toBeGreaterThanOrEqual(8); // the full capture, not a sample
     for (const frame of frames) {
-      expect(QUOTA_RE.test(stallSnapshotTail(frame))).toBe(true); // the chrome really is in every tail …
-      expect(QUOTA_RE.test(stallSnapshotBannerRows(frame))).toBe(false); // … and identity-filtering removes exactly it
+      expect(quotaSignal(stallSnapshotTail(frame))).not.toBeNull(); // the chrome really is in every tail …
+      expect(quotaSignal(stallSnapshotBannerRows(frame))).toBeNull(); // … and identity-filtering removes exactly it
     }
     // a live banner appended anywhere in the tail still classifies
     const live = `${frames[0]!}\nclaude ai usage limit reached for this model\nresets at 5pm`;
-    expect(QUOTA_RE.test(stallSnapshotBannerRows(live))).toBe(true);
+    expect(quotaSignal(stallSnapshotBannerRows(live))).not.toBeNull();
   });
 
   // T1 review (material): WHY the filter is by identity, never novelty against an anchor frame.
@@ -150,10 +150,10 @@ describe("stall progress tracker", () => {
   // human under the baseline). Identity-filtered rows classify a banner whenever it arrived.
   test("a quota banner present from the very first frame still classifies — the launch-throttle case a novelty baseline exculpated", () => {
     const throttledAtLaunch = "claude ai usage limit reached for this model\nresets at 5pm";
-    expect(QUOTA_RE.test(stallSnapshotBannerRows(throttledAtLaunch))).toBe(true);
+    expect(quotaSignal(stallSnapshotBannerRows(throttledAtLaunch))).not.toBeNull();
     // … including when the banner shares the tail with pinned codex chrome
     const withChrome = `${throttledAtLaunch}\n• You have 3 usage limit resets available. Run /usage to use one.`;
-    expect(QUOTA_RE.test(stallSnapshotBannerRows(withChrome))).toBe(true);
+    expect(quotaSignal(stallSnapshotBannerRows(withChrome))).not.toBeNull();
   });
 
   test("a token DECREASE re-anchors the flat-clock — a compacting worker's row growth keeps re-arming", () => {

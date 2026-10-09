@@ -202,6 +202,9 @@ export interface SlotPlacement {
   hostPlatform?: string;
 }
 
+/** Queue row 108: a worker transport's own account of its output stream (ExecutorDriver.transportState). */
+export interface TransportState { closed: boolean; bytes?: number; exitCode?: number | null; signal?: string | null }
+
 export interface ExecutorDriver {
   id: string;
   // v1.2: can this driver host a live TUI the operator can watch and answer? (herdr yes, subprocess no)
@@ -225,6 +228,12 @@ export interface ExecutorDriver {
   // live agent status of the slot's pane ("blocked" pages the operator); "unknown" when undetectable
   status(slot: Slot): Promise<string>;
   read(slot: Slot, lines: number): Promise<string>;
+  // Queue row 108 (D-1619): what this slot's worker transport can attest about its output stream. `closed` means every
+  // byte the worker wrote has reached `read` — a dead-worker park requires it, because a subprocess 'exit' precedes its
+  // stdio 'close' and a just-finished worker can look gone with its trailer still in flight. Pane drivers answer
+  // closed: their closure IS the pane being gone, which the park already requires. A driver without this answer is
+  // unknown, and unknown never parks. The other fields are evidence the park journals (C3: a kill shows its signal).
+  transportState?(slot: Slot): Promise<TransportState>;
   // v1.22 T5 / OBS-19: send a raw keystroke into the pane's foreground TUI (e.g. Enter to accept
   // cursor's "Workspace Trust Required"). Optional — subprocess has no TUI dialogs; herdr implements
   // via `pane send-keys`. The daemon auto-answers a fingerprint-matched trust dialog once per slot

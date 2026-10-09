@@ -7,7 +7,7 @@ import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { fileURLToPath } from "node:url";
 import { describe, expect, test } from "vitest";
-import { QUOTA_RE, shq } from "../../../src/adapters/types.js";
+import { quotaSignal, shq } from "../../../src/adapters/types.js";
 import { SubprocessDriver } from "../../../src/drivers/subprocess.js";
 import { runDaemon } from "../../../src/run/daemon.js";
 import { shOk } from "../../../src/run/git.js";
@@ -109,7 +109,10 @@ describe("fixture ordering by events (fake adapter, zero tokens)", () => {
   test("test: the production daemon Q-1 fixture delivers both distinct task commits in either merge order under delayed release or consult completion versus a one-task terminal summary, so diagnostics must expose the last five rows on a missing commit", async () => {
     const fixture = (name: string) => fileURLToPath(new URL(`../../fixtures/quota/${name}`, import.meta.url));
     const dump = (name: string) => `cat ${shq(fixture(name))}; exit 1`;
-    for (const f of ["run3522-T2-a0.out", "run3522-T2-a2.out"]) expect(QUOTA_RE.test(readFileSync(fixture(f), "utf8"))).toBe(true);
+    // queue row 106 (D-1597, declared contract change): a2 still carries a quota PHRASE in its body — the hazard; a0's only
+    // former match was a bare `429:` line number, which is no quota signal at all now.
+    expect(quotaSignal(readFileSync(fixture("run3522-T2-a2.out"), "utf8"))).not.toBeNull();
+    expect(quotaSignal(readFileSync(fixture("run3522-T2-a0.out"), "utf8"))).toBeNull();
     const ok = (id: Id) => `echo ok > ${id}.txt && ${COMMIT} ${id}`;
     let witness: { first: Id; held: Id; schedule: Q1Schedule; barrier: WorkerBarrier; rows: JournalEvent[]; tree: string } | undefined;
     for (const schedule of Q1_SCHEDULES) {

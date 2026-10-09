@@ -244,6 +244,8 @@ describe("T1 stall detection (OBS-262/263, fake adapter, zero tokens)", () => {
       run: inner.run.bind(inner),
       waitOutput: async () => { await new Promise((r) => setTimeout(r, 50)); return false; },
       waitAgentStatus: inner.waitAgentStatus.bind(inner),
+      // row 108: the wrapped subprocess's own closed fact; a double without it is unknown, and unknown never parks
+      transportState: inner.transportState.bind(inner),
       read: async () => "working-on-it",
       notify: inner.notify.bind(inner),
       close: inner.close.bind(inner),

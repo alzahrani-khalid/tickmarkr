@@ -12,7 +12,7 @@ import { kimi } from "../../src/adapters/kimi.js";
 import { opencode } from "../../src/adapters/opencode.js";
 import { pi } from "../../src/adapters/pi.js";
 import { parseWorkerResult } from "../../src/adapters/prompt.js";
-import { QUOTA_RE } from "../../src/adapters/types.js";
+import { quotaSignal } from "../../src/adapters/types.js";
 import { allAdapters, discoverChannels, getAdapter, readDoctor, writeDoctor } from "../../src/adapters/registry.js";
 import { validateGraph } from "../../src/graph/schema.js";
 import { authedModels } from "../helpers/tmprepo.js";
@@ -162,13 +162,13 @@ describe("real adapters", () => {
     expect(seed).toContain("do exactly what it says");
   });
 
-  test("QUOTA_RE matches the ZAI coding-plan exhaustion text, not unrelated failures", () => {
+  test("the quota signal matches the ZAI coding-plan exhaustion text, not unrelated failures", () => {
     // research Pitfall 3: ZAI surfaces "Insufficient balance…", which "insufficient credit" missed
-    expect(QUOTA_RE.test("Insufficient balance or no resource package. Please recharge.")).toBe(true);
-    expect(QUOTA_RE.test("build failed")).toBe(false);
+    expect(quotaSignal("Insufficient balance or no resource package. Please recharge.")).not.toBeNull();
+    expect(quotaSignal("build failed")).toBeNull();
     // WR-01: the bare two-word fragment appears in ordinary billing/wallet task output the harness
     // edits — it must NOT read as quota exhaustion (would silently fail over an eligible channel).
-    expect(QUOTA_RE.test("if (wallet.balance < amount) throw new Error('insufficient balance')")).toBe(false);
+    expect(quotaSignal("if (wallet.balance < amount) throw new Error('insufficient balance')")).toBeNull();
   });
 
   test("channels come from cfg.tiers; probe of a nonexistent binary reports uninstalled", async () => {

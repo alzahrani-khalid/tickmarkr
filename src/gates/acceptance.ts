@@ -11,6 +11,7 @@ import { appendAnchoredReview, COMPLETION_FAKING_CHECKLIST, extractVerdictJson, 
 import type { GateResult } from "./types.js";
 import { classifyVerdictCause } from "./verdict-cause.js";
 import { reviewableLogicDiff } from "./artifact-manifest.js";
+import { diffSidePath } from "./git-paths.js";
 import { classifyFailureOutput } from "./baseline.js";
 
 // Fable F4: acceptance judge shares review's 900s timeout — 300s default killed frontier judges on cap-sized diffs.
@@ -315,8 +316,9 @@ function oracleExecutionFailure(label: string, code: number, stdout: string, std
 // holds: a citation outside every hunk, or to an untouched file, still fails (matching the documented
 // "outside every changed hunk → rejected" contract in acceptance.test.ts).
 // ponytail: assumes git's default a/ b/ prefixes (fetchTaskDiff uses plain `git diff`); revisit if a
-// caller passes a --no-prefix diff.
-function changedLinesByFile(diff: string): Map<string, Set<number>> {
+// caller passes a --no-prefix diff. Queue row 71b: a +++ side is decoded by the shared git-paths reader (git's
+// C-quoting and the tab that ends a space-holding name), so a non-ASCII file's lines are citable by its real name.
+export function changedLinesByFile(diff: string): Map<string, Set<number>> {
   const byFile = new Map<string, Set<number>>();
   let path: string | null = null;
   let newLine = 0;
@@ -325,8 +327,7 @@ function changedLinesByFile(diff: string): Map<string, Set<number>> {
     if (raw.startsWith("diff --git")) { inHunk = false; path = null; continue; }
     if (!inHunk && raw.startsWith("--- ")) continue;
     if (!inHunk && raw.startsWith("+++ ")) {
-      const p = raw.slice(4).trim();
-      path = p === "/dev/null" ? null : p.replace(/^[ab]\//, "");
+      path = diffSidePath(raw.slice(4));
       continue;
     }
     const hunk = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(raw);

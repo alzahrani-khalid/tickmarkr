@@ -5,7 +5,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, test } from "vitest";
-import { QUOTA_RE, shq } from "../../src/adapters/types.js";
+import { quotaSignal, shq } from "../../src/adapters/types.js";
 import { runDaemon } from "../../src/run/daemon.js";
 import { Journal } from "../../src/run/journal.js";
 import { COMMIT, setupRepo, T } from "../helpers/tmprepo.js";
@@ -21,8 +21,10 @@ const events = (repo: string, runId: string) => Journal.open(repo, runId).read()
 
 describe("Q-1 quota failover", () => {
   test("the two verbatim run 3522 streams under tests fixtures quota exiting nonzero fail over neither task while a stream whose final rows carry a rate-limit body does, and the failover row names the matched bytes and their offset, so a quota test over the whole stream that fails over on a diff line number 41985 bytes before the end fails", async () => {
-    // the negatives match QUOTA_RE somewhere in the body — that is the whole hazard
-    for (const f of ["run3522-T2-a0.out", "run3522-T2-a2.out"]) expect(QUOTA_RE.test(readFileSync(fixture(f), "utf8"))).toBe(true);
+    // queue row 106 (D-1597, declared contract change): a2 still carries a quota PHRASE in its body — the hazard; a0's only
+    // former match was a bare `429:` line number, which is no quota signal at all now.
+    expect(quotaSignal(readFileSync(fixture("run3522-T2-a2.out"), "utf8"))).not.toBeNull();
+    expect(quotaSignal(readFileSync(fixture("run3522-T2-a0.out"), "utf8"))).toBeNull();
     const { repo, fake } = setupRepo(
       [T("T1"), T("T2")],
       { tasks: { T1: [{ shell: dump("run3522-T2-a0.out") }, okStep("T1")], T2: [{ shell: dump("run3522-T2-a2.out") }, okStep("T2")] }, consult: RETRY },
@@ -39,12 +41,22 @@ describe("Q-1 quota failover", () => {
     const d = row!.data as { from: string; to: string | null; matched: string; offset: number; stream: string; streamBytes: number };
     expect(d.to).not.toBeNull();
     expect(d.to).not.toBe(d.from);
-    expect(d.matched).toMatch(QUOTA_RE);
+    expect(quotaSignal(d.matched)).not.toBeNull();
     // the offset is a byte offset into the journaled stream file — the record alone locates the bytes
     const stream = readFileSync(join(Journal.open(pos.repo, "run-q1-pos").dir, d.stream));
     expect(stream.subarray(d.offset, d.offset + Buffer.byteLength(d.matched)).toString()).toBe(d.matched);
     expect(stream.length).toBe(d.streamBytes);
     expect(d.streamBytes - d.offset).toBeLessThan(400); // the match sits in the final rows, never 41985 bytes up
+  });
+
+  // Queue row 106 (D-1597): the user-facing harm, through the production path. A no-trailer exit whose final rows hold
+  // a bare line-number 429 — the run3522 / nudge-echo shape, inside the 12 banner rows the reader keeps — failed the
+  // task over for a quota it never hit (OBS-926's shape); it now fails over for none.
+  test("a nonzero exit whose final rows hold only a bare line-number 429 never fails a task over for quota", async () => {
+    const { repo, fake } = setupRepo([T("T1")], { tasks: { T1: [{ shell: "printf '427\\n428\\n429\\n430\\n'; exit 1" }, OK_STEP] }, consult: RETRY });
+    const s = await runDaemon(repo, { adapters: [fake], runId: "run-q1-line" });
+    expect(s.done).toEqual(["T1"]);
+    expect(events(repo, "run-q1-line").filter((e) => e.event === "quota-failover" || e.event === "quota-banner")).toEqual([]);
   });
 
   test("a task pinned to its channel whose nonzero exit carries a rate-limit tail without a channel-attributed error stays on the pin with a journaled refusal naming it, while the same tail on an unpinned task fails over, so a pin left on a quota match alone fails", async () => {
@@ -61,7 +73,7 @@ describe("Q-1 quota failover", () => {
     const refusal = evs.find((e) => e.event === "quota-failover-refused");
     expect(refusal).toBeDefined();
     expect((refusal!.data as { pin: string; matched: string }).pin).toBe("fake:fake-1");
-    expect((refusal!.data as { matched: string }).matched).toMatch(QUOTA_RE);
+    expect(quotaSignal((refusal!.data as { matched: string }).matched)).not.toBeNull();
     const dispatches = evs.filter((e) => e.event === "task-dispatch");
     expect(dispatches.length).toBeGreaterThanOrEqual(2);
     for (const e of dispatches) expect(channelOf(e)).toBe("fake:fake-1");
