@@ -2,6 +2,32 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v2.7.1 — two probes stop reading an answer they never got
+
+**v2.7.1** ships two product fixes. Each was made by hand and proven by its own `tickmarkr verify`: build, lint,
+evidence, scope, executed acceptance with one test per row of its closed case table, cross-vendor review
+(`codex:gpt-6-astra`, OpenAI, reviewing Claude-authored work) and the full suite. No `tickmarkr run` was used.
+
+- **A model probe no longer reads a bare number as an auth failure (affected: ≤ 2.7.0).** Doctor's per-model probe
+  failed any output holding a bare number from 400 to 499, so qwen's healthy telemetry `"totalGenerationDurationMs":438`
+  marked a working model unauthorized and dropped its channel. A 4xx now counts only where the output labels it as a
+  status: `HTTP 401`, `HTTP/1.1 403`, `status 401`, `status code 401`, `"statusCode":401`, `"httpStatus":401`,
+  `httpStatusCode: 403`, `errorCode: 401`, `code: 403`, `Error: 401`. A label counts only as a whole word — `unicode`,
+  `zipCode` or `éstatus` before a number is no label — and the auth-word checks (`unauthorized`, `forbidden`, …) are
+  unchanged. The probe's quota reading drops the bare `429` the same way. The change only narrows: no probe output that
+  2.7.0 read as healthy fails now (checked over about 487 000 generated outputs), with one declared exception — a "Too
+  Many Requests" sentence fails as a quota error even without a number, so an unlabelled `429 Too Many Requests` keeps
+  failing. Contract change: a probe that prints a bare `401` and exits 0 is no longer a failure.
+- **A git that never answered the ref-store pin probe is no longer taken for an old git (affected: ≤ 2.7.0).** Before
+  tickmarkr runs its own git in a linked checkout, it probes whether the git on PATH honours `GIT_REFERENCE_BACKEND`
+  (git ≥ 2.54); one that does not runs under a weaker guard, with a warning naming git 2.54. Every failure of that probe
+  was read as "too old", so a spawn error (`EAGAIN`, `EMFILE`) or a timeout under load silently weakened tickmarkr's own
+  git and blamed the git version. Now only a git that ran to completion and whose answer was read counts as too old — a
+  pre-2.54 git exits non-zero and keeps the weaker guard and its warning. A probe that timed out, was killed, could not
+  start or overflowed its output buffer is asked once more, and a second non-answer refuses own git by name ("could not
+  tell whether this git honours the ref-store pin: the probe (git symbolic-ref refs/tickmarkr/ref-pin-probe) did not
+  complete twice (<cause>)") instead of running it without the pin.
+
 ## v2.7.0 — the run daemon stops freezing while it counts live test suites
 
 **v2.7.0** ships one product fix and two test-suite repairs. Each was made by hand and proven by its own `tickmarkr

@@ -16,7 +16,7 @@ import * as registry from "../../src/adapters/registry.js";
 import { discoverChannels, flagDriftWarnings, missingDeclaredFlags, modelAuthExclusions, probeAll, probeModels, readDoctor, writeDoctor } from "../../src/adapters/registry.js";
 import { modelLints } from "../../src/adapters/model-lints.js";
 import { DEFAULT_CONFIG, loadConfig } from "../../src/config/config.js";
-import { modelAuthed, type WorkerAdapter } from "../../src/adapters/types.js";
+import { modelAuthed, shq, type WorkerAdapter } from "../../src/adapters/types.js";
 import { doctor } from "../../src/cli/commands/doctor.js";
 import { makeRepo } from "../helpers/tmprepo.js";
 
@@ -139,7 +139,7 @@ describe("model auth probes", () => {
   // codex:gpt-5.6-sol probe (replies "OK", exit 0) was marked unauthed: the bare 4xx alternative matched
   // "485" inside the token footer "tokens used 26,485". Any comma-grouped number whose last group starts
   // with 4 hit this — a fleet-wide dice roll, not a sol defect. If this string is ever classified as an
-  // auth failure again, the digit-group guard in AUTH_FAILURE_RE has regressed.
+  // auth failure again, the digit-group guard in LABELLED_4XX_RE has regressed.
   const SOL_TOKEN_FOOTER = "SessionStart hook: SessionStart hook: SessionStart Completed hook: SessionStart Completed hook: SessionStart Completed hook: UserPromptSubmit hook: UserPromptSubmit Completed codex OK hook: Stop hook: Stop Completed tokens used 26,485 OK";
 
   test("reads a comma-grouped token footer as healthy but a bare 4xx code as an auth failure (OBS-150)", async () => {
@@ -563,7 +563,7 @@ describe("model auth probes", () => {
     expect(modelAuthed(readDoctor(repo)?.fake, "fake-1", true)).toBe(true);
   });
 
-  // v1.27 T2: bare "auth" substrings are not failures; exit 0 so only AUTH_FAILURE_RE can mark unauthed.
+  // v1.27 T2: bare "auth" substrings are not failures; exit 0 so only LABELLED_4XX_RE / AUTH_WORDS_RE can mark unauthed.
   test("benign auth substrings do not produce a failure verdict", async () => {
     const repo = mkdtempSync(join(tmpdir(), "tickmarkr-auth-benign-"));
     const script = join(repo, "fake.json");
@@ -591,18 +591,69 @@ describe("model auth probes", () => {
     }
   });
 
+  // Queue row 20 (D-1148 (1)): the closed probe-output table — exit 0 unless the row says otherwise; healthy = authed.
+  test.each([
+    ["P1 a healthy reply whose telemetry carries a 4xx-looking duration stays authed", `OK {"type":"result","totalGenerationDurationMs":438,"durationMs":429}`, 0, true],
+    ["P2 a comma-grouped token footer stays authed", "OK tokens used 26,485", 0, true],
+    ["P3 a bare 4xx with no status label stays authed", "OK 401", 0, true],
+    ["P4 an HTTP/1.1 status line with a 4xx fails", "HTTP/1.1 403", 0, false],
+    ["P5 a status code phrase with a 4xx fails", "Request failed with status code 401", 0, false],
+    ["P6 a JSON status field with a 4xx fails", `{"error":{"status":401,"message":"invalid api key"}}`, 0, false],
+    ["P7 an error label with a 4xx fails", "API Error: 401 bad credentials", 0, false],
+    ["P8 an HTTP 429 fails", "HTTP 429", 0, false],
+    ["P9 a rate-limit sentence fails as quota", "rate limit exceeded, retry later", 0, false],
+    ["P10 a nonzero exit fails whatever it printed", "OK", 1, false],
+    ["P11 a JSON statusCode field with a 4xx fails", `{"statusCode":403}`, 0, false],
+    ["P12 a code label with a 4xx fails", "code: 403", 0, false],
+    ["P13 an unlabelled 429 Too Many Requests still fails on its phrase", "429 Too Many Requests", 0, false],
+    ["P14 a too-many-requests sentence without a number fails as quota", "Too Many Requests, slow down", 0, false],
+    ["P15 a label glued to a 4xx-looking number stays authed", "status401", 0, true],
+    ["P16 a labelled number longer than three digits stays authed", "status 4010", 0, true],
+    ["P17 a labelled 4xx with a decimal tail stays authed", "status 401.5", 0, true],
+    ["P18 a labelled 4xx with a digit-group tail stays authed", "status 401,000", 0, true],
+    ["P19 a camel-case httpStatus field with a 4xx fails", `{"httpStatus":401}`, 0, false],
+    ["P20 an errorCode label with a 4xx fails", "errorCode: 401", 0, false],
+    ["P21 a snake-case http_status label with a 4xx fails", "http_status=403", 0, false],
+    ["P22 a 4xx after code inside the word unicode stays authed", `OK {"unicode":401}`, 0, true],
+    ["P23 a 4xx after code inside the word barcode stays authed", `OK {"barcode":438}`, 0, true],
+    ["P24 a 4xx after error inside the word standardError stays authed", `OK {"standardError":401}`, 0, true],
+    ["P25 a 4xx after code inside the word zipCode stays authed", "OK zipCode: 401", 0, true],
+    ["P26 a 4xx after code inside the token foo_code stays authed", "OK foo_code=401", 0, true],
+    ["P27 an AWS httpStatusCode field with a 4xx fails", `{"$metadata":{"httpStatusCode":403}}`, 0, false],
+    ["P28 a 4xx after status run into an accented letter stays authed", "OK \u00e9status:401", 0, true],
+    ["P29 a 4xx after status run into a combining accent stays authed", "OK e\u0301status:401", 0, true],
+    ["P30 a 4xx after code run into an Arabic-Indic digit stays authed", "OK \u0663code:401", 0, true],
+    ["P31 a 4xx after error run into a Greek letter stays authed", "OK \u03a9error: 401", 0, true],
+    ["P32 a status label after a typographic quote with a 4xx fails", "\u201cstatus: 401\u201d", 0, false],
+    ["P33 a code label after an em dash with a 4xx fails", "\u2014code: 403", 0, false],
+    ["P34 unauthorised spelled with a long s stays authed as at the base", "unauthori\u017fed", 0, true],
+    ["P35 access denied spelled with a long s stays authed as at the base", "acce\u017fs denied", 0, true],
+    ["P36 credits exhausted spelled with long s stays authed as at the base", "credit\u017f exhau\u017fted", 0, true],
+  ] as const)("the model probe classifies output row %s", async (_row, output, exit, authed) => {
+    const repo = mkdtempSync(join(tmpdir(), "tickmarkr-probe-table-"));
+    const script = join(repo, "fake.json");
+    writeFileSync(script, JSON.stringify({ tasks: {} }));
+    const fake = new FakeAdapter(script);
+    vi.spyOn(fake, "headlessCommand").mockImplementation(() => `printf '%s' ${shq(output)}; exit ${exit}`);
+    const cfg = structuredClone(DEFAULT_CONFIG);
+    cfg.tiers.fake = { vendor: "fake", channel: "sub", models: { "fake-row": "mid" } };
+    const health = await probeAll([fake]);
+    await probeModels(cfg, repo, [fake], health);
+    expect(health.fake.modelAuth?.["fake-row"]?.authed).toBe(authed);
+  });
+
   test("conclusive auth-failure strings still produce failure verdicts", async () => {
     const repo = mkdtempSync(join(tmpdir(), "tickmarkr-auth-fail-"));
     const script = join(repo, "fake.json");
     writeFileSync(script, JSON.stringify({ tasks: {} }));
     const fake = new FakeAdapter(script);
     const failing: Record<string, string> = {
-      "code-401": "401",
+      "code-401": "Error: 401",
       unauthorized: "unauthorized",
       "authn-failed": "authentication failed",
       "credit-out": "credit exhausted",
     };
-    // exit 0: only AUTH_FAILURE_RE (not nonzero exit) may mark unauthed
+    // exit 0: only LABELLED_4XX_RE / AUTH_WORDS_RE (not nonzero exit) may mark unauthed
     vi.spyOn(fake, "headlessCommand").mockImplementation((_prompt, model) =>
       `printf ${JSON.stringify(failing[model] ?? "OK")}`);
     const cfg = structuredClone(DEFAULT_CONFIG);

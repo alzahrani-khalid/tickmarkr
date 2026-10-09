@@ -243,8 +243,21 @@ const PROBE_REF = "refs/tickmarkr/ref-pin-probe", PROBE_TARGET = "refs/tickmarkr
  * Whether, before the child spawns, the git its PATH resolves honours GIT_REFERENCE_BACKEND (git >= 2.54): a fresh
  * probe repository whose own refs lack PROBE_REF, pinned to a fresh store that holds it as a symbolic ref. A git that
  * ignores the pin reads the probe repository's own refs. Nothing is cached: each attempt probes again.
+ * Queue row 21: only a git that RAN TO COMPLETION and answered something else has shown it ignores the pin. A spawn
+ * error (EAGAIN, EMFILE, ENOENT), a timeout or a kill is no answer at all — "unknown", never "git < 2.54".
  */
-function refStorePinHonoured(env: NodeJS.ProcessEnv): boolean {
+export type RefStorePinProbe = { pin: "honoured" | "ignored" } | { pin: "unknown"; cause: string };
+/** A probe git that threw: "ignored" only when it ran to completion and exited non-zero (a numeric exit status, no
+ * signal, no error code); anything else never gave an answer that was read — a timeout, a kill, a spawn failure, or
+ * ENOBUFS (status 0 with its output over the buffer cap) — and the cause is named for the refusal (queue row 21's
+ * closed table, D-1563). */
+export function refStorePinProbeFailure(error: unknown): RefStorePinProbe {
+  const ran = error as { status?: number | null; signal?: string | null; code?: string } | null;
+  if (typeof ran?.status === "number" && !ran.signal && !ran.code) return { pin: "ignored" };
+  const cause = ran?.code === "ETIMEDOUT" ? "timed out after 15 s" : ran?.signal ? `killed by ${ran.signal}` : `failed with ${ran?.code ?? "an unknown error"}`;
+  return { pin: "unknown", cause };
+}
+function refStorePinProbe(env: NodeJS.ProcessEnv): RefStorePinProbe {
   const dir = mkdtempSync(join(tmpdir(), "tickmarkr-ref-pin-"));
   try {
     const repo = join(dir, "repo"), store = join(dir, "store");
@@ -253,11 +266,13 @@ function refStorePinHonoured(env: NodeJS.ProcessEnv): boolean {
     writeFileSync(join(store, PROBE_REF), `ref: ${PROBE_TARGET}\n`);
     const probe: NodeJS.ProcessEnv = { ...env, GIT_DIR: repo, GIT_REFERENCE_BACKEND: `files://${store}` };
     for (const k of ["GIT_COMMON_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES"]) delete probe[k];
-    let read = "";
+    let read: string;
     try {
       read = execFileSync("git", ["symbolic-ref", PROBE_REF], { cwd: dir, env: probe, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 15_000 }).trim();
-    } catch { /* refused below */ }
-    return read === PROBE_TARGET;
+    } catch (error) {
+      return refStorePinProbeFailure(error);
+    }
+    return { pin: read === PROBE_TARGET ? "honoured" : "ignored" };
   } finally { rmSync(dir, { recursive: true, force: true }); }
 }
 
@@ -278,7 +293,8 @@ function warnRefStorePinUnavailable(): void {
  * descendant) is followed for neither config, hooks, info/, objects nor refs: HEAD, branches, status and diffs read
  * the real repository and every ref write lands in the trusted store, whatever an inherited GIT_CONFIG_* or ref backend
  * says; a commondir REMOVED after it cannot move the main checkout's branch. Before such a child spawns, the git it
- * would run must prove it honours that pin (refStorePinHonoured); one that cannot (git < 2.54) runs without it, below.
+ * would run must prove it honours that pin (refStorePinProbe); one that cannot (git < 2.54) runs without it, below, and
+ * one whose probe never answers twice is refused (queue row 21).
  * Nothing here reads the command, and no caller leaves any pin. `recheck` (after the child exits) fails closed on ANY change to commondir since the check: the result
  * of that child is never returned. An ordinary checkout or a non-repository gets no pin.
  * NAMED RESIDUAL: git still reads $GIT_DIR/config.worktree when the trusted common config already enables
@@ -305,7 +321,15 @@ export function ownGitPin(cwd: string, env: NodeJS.ProcessEnv, capability: OwnGi
   // linked checkout on most installed gits, and a hostile git binary ignores every pin anyway; so it runs with the
   // path pins and the post-exit recheck (the 2.6.7 guard). NAMED RESIDUAL there: refs still resolve through the
   // commondir file, so a rewrite between check and exit can reach the hostile store before the recheck refuses.
-  if (!refStorePinHonoured(child)) {
+  // Queue row 21: a probe that never answered is asked once more; a second non-answer refuses, because dropping to
+  // the weaker guard on a spawn error or timeout under load would silently weaken own git and blame the git version.
+  let pin = refStorePinProbe(child);
+  if (pin.pin === "unknown") pin = refStorePinProbe(child);
+  if (pin.pin === "unknown") {
+    // infra, not a verdict: the ref-store pin probe never answered — name the probe and its cause
+    throw new GitTrustRefusal(common, `could not tell whether this git honours the ref-store pin: the probe (git symbolic-ref ${PROBE_REF}) did not complete twice (${pin.cause}), so tickmarkr's own git does not run here without it`);
+  }
+  if (pin.pin === "ignored") {
     delete child.GIT_REFERENCE_BACKEND;
     warnRefStorePinUnavailable();
     return { env: child, store: common, release: () => {}, unview: (text: string) => text, recheck };

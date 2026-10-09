@@ -32,7 +32,7 @@ import { executionSignal, withExecutionBudget, type ExecutionBudgetEvent } from 
 import { addDetachedWorktree, createWorktree, gitHead, preserveWorktree, removeWorktree, resetSpawnForTests, setSpawnForTests, sh, shell, shGit, shGitOk, shOk, WORKTREES_DIR } from "../../src/run/git.js";
 import { Journal } from "../../src/run/journal.js";
 import { releaseRunLock } from "../../src/run/lock.js";
-import { GitTrustRefusal, INERT_HOOKS_PATH } from "../../src/run/git-trust.js";
+import { GitTrustRefusal, INERT_HOOKS_PATH, refStorePinProbeFailure } from "../../src/run/git-trust.js";
 import { COMMAND_LEASE_TOKEN_ENV, repositoryLeasePath, withRepositoryLease } from "../../src/run/lease.js";
 import { ensureIntegration, mergeTask } from "../../src/run/merge.js";
 import { VERIFICATION_JOB_TOKEN_ENV, withVerificationJob, type VerificationJobReport } from "../../src/run/verification-job.js";
@@ -1262,4 +1262,67 @@ setInterval(() => { const go = dir + '/go-' + n; if (!fs.existsSync(go)) return;
     persistErrors.mockRestore();
     expect(git(f.linked, "rev-parse", "HEAD")).toBe(linkedHead);
   }, 600_000);
+});
+
+// Queue row 21's closed table (D-1563): how a probe git that threw is read. D-1564 bait: every row also
+// carries the honoured answer on stdout, so a classifier that read a thrown probe's output would answer "honoured".
+test.each([
+  ["T1 git exited non-zero is ignored", { status: 128, signal: null }, { pin: "ignored" }],
+  ["T2 git exited 1 is ignored", { status: 1, signal: null }, { pin: "ignored" }],
+  ["T3 a timeout never answered", { status: null, signal: "SIGTERM", code: "ETIMEDOUT" }, { pin: "unknown", cause: "timed out after 15 s" }],
+  ["T4 a kill never answered", { status: null, signal: "SIGKILL" }, { pin: "unknown", cause: "killed by SIGKILL" }],
+  ["T5 a spawn error EAGAIN never answered", { status: null, signal: null, code: "EAGAIN" }, { pin: "unknown", cause: "failed with EAGAIN" }],
+  ["T6 a spawn error ENOENT never answered", { status: null, signal: null, code: "ENOENT" }, { pin: "unknown", cause: "failed with ENOENT" }],
+  ["T7 a status with a signal never answered", { status: 0, signal: "SIGKILL" }, { pin: "unknown", cause: "killed by SIGKILL" }],
+  ["T8 a bare error never answered", {}, { pin: "unknown", cause: "failed with an unknown error" }],
+  ["T9 a clean exit whose output overflowed the buffer never answered", { status: 0, signal: null, code: "ENOBUFS" }, { pin: "unknown", cause: "failed with ENOBUFS" }],
+] as const)("the ref-store pin probe reads a thrown probe %s", (_row, error, expected) => {
+  expect(refStorePinProbeFailure({ ...error, stdout: "refs/tickmarkr/ref-pin-honoured\n" })).toEqual(expected);
+});
+
+// D-1584: the "no error code" premise rests on Node's error SHAPE, and T1–T9 are synthetic. These two throw REAL errors
+// and assert only the outcome: a real non-zero exit (no code) stays "ignored"; a real output overflow is "unknown". The
+// overflow child ignores SIGTERM (`trap '' TERM`, inherited by head) so Node's overflow kill cannot land and the shape is
+// always the one a mutant without the code check misreads — status 0, no signal, ENOBUFS (200 of 200 measured).
+const thrownBy = (file: string, args: string[], options: { maxBuffer?: number } = {}): unknown => {
+  try { execFileSync(file, args, { stdio: ["ignore", "pipe", "pipe"], ...options }); } catch (error) { return error; }
+  throw new Error("expected the child to throw");
+};
+test("the ref-store pin probe reads a real non-zero exit as ignored", () => {
+  expect(refStorePinProbeFailure(thrownBy("sh", ["-c", "exit 1"]))).toEqual({ pin: "ignored" });
+});
+test("the ref-store pin probe reads a real output overflow as unknown", () => {
+  expect(refStorePinProbeFailure(thrownBy("sh", ["-c", "trap '' TERM; head -c 4096 /dev/zero"], { maxBuffer: 64 }))).toMatchObject({ pin: "unknown" });
+});
+
+// Queue row 21: the ref-store pin probe reads only a git that ran to completion as unsupported. A fake git prints the
+// honoured answer and then kills its own probe (`symbolic-ref refs/tickmarkr/ref-pin-probe`) while a counter allows
+// (D-1564 bait: a killed probe's buffered answer is never read); every other git call is the host git.
+test("a ref-store pin probe that never answered is asked once more and two non-answers refuse own git instead of silently dropping to the weaker guard", async () => {
+  const f = linkedFixture();
+  const realHead = git(f.linked, "rev-parse", "HEAD");
+  const hostGit = execFileSync("sh", ["-c", "command -v git"], { encoding: "utf8", env: rawEnv() }).trim();
+  const fakeBin = makeTestTempDir("child-env-killgit-");
+  const kills = join(fakeBin, "kills"), probes = join(fakeBin, "probes");
+  writeFileSync(join(fakeBin, "git"), [
+    "#!/bin/sh",
+    'if [ "$1" = symbolic-ref ] && [ "$2" = refs/tickmarkr/ref-pin-probe ]; then',
+    `  echo probe >> '${probes}'`,
+    `  n=$(cat '${kills}'); if [ "$n" -gt 0 ]; then echo $((n - 1)) > '${kills}'; echo refs/tickmarkr/ref-pin-honoured; kill -KILL $$; fi`,
+    "fi",
+    `exec '${hostGit}' "$@"`, "",
+  ].join("\n"), { mode: 0o755 });
+  vi.stubEnv("PATH", `${fakeBin}:${process.env.PATH}`);
+  try {
+    // one killed probe: asked again, and own git runs on the second answer (honoured or ignored by this host's git)
+    writeFileSync(kills, "1"); writeFileSync(probes, "");
+    expect((await gitHead(f.linked)).trim()).toBe(realHead);
+    expect(readFileSync(probes, "utf8").trim().split("\n")).toHaveLength(2);
+    // two killed probes: refused by name (the refusal throws before the weaker guard's git-version warning)
+    writeFileSync(kills, "2"); writeFileSync(probes, "");
+    await expect(gitHead(f.linked)).rejects.toThrow(/could not tell whether this git honours the ref-store pin: the probe \(git symbolic-ref refs\/tickmarkr\/ref-pin-probe\) did not complete twice \(killed by SIGKILL\)/);
+    expect(readFileSync(probes, "utf8").trim().split("\n")).toHaveLength(2);
+  } finally {
+    vi.unstubAllEnvs();
+  }
 });
