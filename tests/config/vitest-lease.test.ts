@@ -231,7 +231,14 @@ test("test: repository-configured worker/reviewer/gate Vitest serializes same-re
   const repo = fixtureRepo();
   const seats = ["worker", "reviewer", "gate"] as const;
   const trees = { worker: repo, reviewer: worktree(repo, "reviewer"), gate: worktree(repo, "gate") };
-  const same = seats.map(name => vitest(trees[name], name, log, { PROBE_HOLD_MS: "1500" }));
+  // Row 105: whoever takes the lease first holds it on a release file, written only once the other two have REPORTED
+  // waiting, so "the others waited" is forced by the lease rather than timed. A lease that never serializes never
+  // prints WAITING, and the bounded wait below fails.
+  const release = join(makeTestTempDir("lease-release-"), "release");
+  const same = seats.map(name => vitest(trees[name], name, log, { PROBE_HOLD: release }));
+  await until(() => same.filter(r => r.out().includes(WAITING)).length >= 2, 60_000,
+    `two runners to report waiting behind the holder:\n${same.map(r => r.out()).join("\n---\n")}`);
+  writeFileSync(release, "");
   await Promise.all(same.map(passed));
   const spans = seats.map(name => {
     const mine = rows(log).filter(row => row.name === name);

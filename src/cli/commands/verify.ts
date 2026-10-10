@@ -7,7 +7,7 @@ import { allAdapters, probeAll, readDoctor, rolePools, writeDoctor } from "../..
 import { channelKey, type Assignment, type AuthHealth, type BillingChannel, type WorkerAdapter } from "../../adapters/types.js";
 import { loadConfig, type TickmarkrConfig } from "../../config/config.js";
 import { captureBaseline, detectGateCommands, staleFileCountCommands, type Baseline, type GateEvidenceOptions } from "../../gates/baseline.js";
-import { getVerdictStore, runnerInputsHash, type StoredVerdictRecord } from "../../gates/cache.js";
+import { getVerdictStore, lockfileKeyBytes, runnerInputsHash, type StoredVerdictRecord } from "../../gates/cache.js";
 import { modelProvider } from "../../gates/review.js";
 import { runGates } from "../../gates/run-gates.js";
 import type { GateResult } from "../../gates/types.js";
@@ -100,7 +100,7 @@ export function baselineCachePath(cwd: string, baseSha: string, commands: Record
   const lockParts: Array<string | Buffer> = [];
   for (const file of LOCKFILES) {
     const path = join(cwd, file);
-    lockParts.push(file, existsSync(path) ? readFileSync(path) : "<absent>");
+    lockParts.push(file, existsSync(path) ? lockfileKeyBytes(file, readFileSync(path)) : "<absent>");
   }
   const commandParts = Object.entries(commands).sort(([a], [b]) => a.localeCompare(b)).map(([name, command]) => `${name}\0${command}\0`);
   return join(realpathSync(tmpdir()), "tickmarkr-verify", "cache",

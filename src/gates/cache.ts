@@ -30,6 +30,25 @@ export const LOCKFILES = [
   "bun.lockb",
 ] as const;
 
+// Queue row 122: a version-only bump rewrites an npm v2/v3 lockfile's root `version` and `packages[""].version` and nothing
+// a dependency resolves from, so those two fields leave the key; every other byte keys as written. Other lockfile kinds, a
+// v1 or unversioned npm lockfile, and an unparseable one key on their raw bytes, which can only miss, never falsely hit.
+export function lockfileKeyBytes(file: string, bytes: Buffer): Buffer | string {
+  if (file !== "package-lock.json" && file !== "npm-shrinkwrap.json") return bytes;
+  let lock: unknown;
+  try { lock = JSON.parse(bytes.toString("utf8")); } catch { return bytes; }
+  if (!lock || typeof lock !== "object" || Array.isArray(lock)) return bytes;
+  const { version: _version, ...rest } = lock as Record<string, unknown>;
+  if (rest.lockfileVersion !== 2 && rest.lockfileVersion !== 3) return bytes;
+  const packages = rest.packages as Record<string, unknown> | undefined;
+  const own = packages?.[""];
+  if (own && typeof own === "object" && !Array.isArray(own)) {
+    const { version: _ownVersion, ...ownRest } = own as Record<string, unknown>;
+    rest.packages = { ...packages, "": ownRest };
+  }
+  return canonicalJson(rest);
+}
+
 export function lockfileHash(worktree: string): string {
   const hash = createHash("sha256");
   let found = false;
@@ -38,7 +57,7 @@ export function lockfileHash(worktree: string): string {
     if (existsSync(p)) {
       found = true;
       try {
-        hash.update(file).update("\0").update(readFileSync(p)).update("\0");
+        hash.update(file).update("\0").update(lockfileKeyBytes(file, readFileSync(p))).update("\0");
       } catch {
         hash.update(file).update("\0unreadable\0");
       }

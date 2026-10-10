@@ -2,6 +2,23 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v2.7.4 — a version bump keeps `tickmarkr verify`'s cached test baseline
+
+**v2.7.4** ships one product fix. It was made by hand and proven by its own `tickmarkr verify`: build, lint, evidence,
+scope, executed acceptance, cross-vendor review (`codex:gpt-6-astra`, OpenAI, reviewing Claude-authored work) and the
+full suite. No `tickmarkr run` was used.
+
+- **A version-only bump keeps `tickmarkr verify`'s cached test baseline (affected: 2.3.0 – 2.7.3).** The standalone
+  verify caches the baseline it captures at the merge-base, keyed in part on the lockfile, and the gate verdict cache
+  keys on the lockfile too. Both hashed the lockfile's raw bytes. So releasing a version, which rewrites
+  `package-lock.json`'s own `version` and `packages[""].version` and nothing a dependency resolves from, invalidated a
+  baseline that was still exact, and the next verify ran a full extra suite at the base before the candidate's. For an
+  npm lockfile (lockfileVersion 2 or 3, `package-lock.json` or `npm-shrinkwrap.json`), those two fields now leave the
+  key. Every dependency's version, `resolved` URL and integrity still key, as does each `name`. A v1 or unversioned
+  npm lockfile, any other package manager's lockfile, and an unparseable one still key on their raw bytes, so they can
+  only miss, never falsely hit. Upgrading to 2.7.4 changes the key format once, so the first verify after the upgrade
+  captures one fresh baseline.
+
 ## v2.7.3 — process-table reads stop running git on the daemon's event loop
 
 **v2.7.3** ships one product fix. It was made by hand and proven by its own `tickmarkr verify`: build, lint, evidence,
