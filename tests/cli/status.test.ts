@@ -900,3 +900,31 @@ test("a newer gate non-verdict retires awaiting merge until a full passing verdi
   }
   expect(await status([], repo)).toContain("phase awaiting merge phase");
 });
+
+test("a fatal run-end leads the default status board with its crash phase and error before any completion fraction or verify state, and never reads outstanding 0; a normal run-end's lead is unchanged", async () => {
+  const g = boardGraph([{ id: "T1", title: "First", goal: "Work T1." }, { id: "T2", title: "Second", goal: "Work T2.", status: "pending", deps: ["T1"] }]);
+  const crashed = (runId: string, end: Record<string, unknown>) => {
+    const repo = mkRepo();
+    saveGraph(repo, g);
+    seedJournal(repo, runId, [startFor(g), { ts: new Date().toISOString(), event: "run-end", data: end }]);
+    return repo;
+  };
+  // the records recordFatalRunEnd writes: a merge crash with the dispatched T2 re-pended, and a setup crash with every bucket empty
+  for (const [runId, end, cause] of [
+    ["run-merge-crash", { done: ["T1"], failed: [], human: [], blocked: [], pending: ["T2"], phase: "merge", fatal: true, error: "merge lock lost" }, "merge failed: merge lock lost"],
+    ["run-setup-crash", { done: [], failed: [], human: [], blocked: [], pending: [], phase: "setup", fatal: true, error: "integration branch refused" }, "setup failed: integration branch refused"],
+  ] as const) {
+    const out = await status([runId], crashed(runId, end));
+    const [finished, , needsYou] = out.split("\n");
+    expect(finished, runId).toMatch(new RegExp(`^finished run crashed — ${cause} · \\d/2 (tasks )?done · tip `, "u"));
+    expect(needsYou, runId).toContain(`needs you: outstanding unknown · 0 parked · 0 failed · unknown: fatal run-end — ${cause}`);
+    expect(out, runId).not.toContain("outstanding 0");
+  }
+
+  // control: a normal all-done run-end names no crash and reads outstanding 0
+  const normal = crashed("run-normal", { done: ["T1", "T2"], failed: [], human: [], blocked: [], pending: [], tipVerify: "passed" });
+  const out = await status(["run-normal"], normal);
+  expect(out.split("\n")[0]).toMatch(/^finished \d\/2 (tasks )?done · tip /u);
+  expect(out).not.toContain("run crashed");
+  expect(out.split("\n")[2]).toBe("needs you: outstanding 0 · 0 parked · 0 failed");
+});

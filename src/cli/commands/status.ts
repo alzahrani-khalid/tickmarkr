@@ -30,10 +30,12 @@ import {
   isQualityFailureParkKind,
   parseRunId,
   preservedRefsByTask,
+  fatalRunEndCause,
   recordedTaskFailureKind,
   runHasEnded,
   type TaskPhase,
   upheldFeedbackByTask,
+  visibleControls,
 } from "../../run/journal.js";
 import { isPidLive, runLockRunId, runStatusLine } from "../../run/lock.js";
 import { normalizeGateOutcome, type GateOutcomeKind } from "../../run/outcome.js";
@@ -792,10 +794,11 @@ const terminalFailureCause = (events: JournalEvent[]): string | undefined => {
   for (let i = events.length - 1; i >= 0; i--) {
     const e = events[i]!;
     if (e.event !== "run-end" || typeof e.data.error !== "string") continue;
-    const phase = typeof e.data.phase === "string" && e.data.phase.trim()
-      ? `${e.data.phase.trim()} failed`
+    // the recorded error is data: its terminal controls print escaped, never executed (the journal keeps them)
+    const phase = typeof e.data.phase === "string" && visibleControls(e.data.phase)
+      ? `${visibleControls(e.data.phase)} failed`
       : "run failed";
-    return `${phase}: ${e.data.error.replace(/\s+/g, " ").trim()}`;
+    return `${phase}: ${visibleControls(e.data.error)}`;
   }
   return undefined;
 };
@@ -1647,8 +1650,10 @@ const oneLine = (cwd: string, namedRunId?: string): string => {
   // CG1: the lead's facts in one line — lineage first pass, the wall window, and what needs you from
   // the CURRENT fold, so a discharge after run-end moves this line too.
   const { events } = record;
+  // A fatal run-end leads right after the run id: no completion fraction or verify state reads first.
+  const crash = fatalRunEndCause(events);
   return sanitizeTaskText([
-    record.runId, ...claims, firstPassText(endToEndFirstPass(events)), wallText(events), needsYouText(events, currentOwed(events, cwd)),
+    record.runId, ...(crash ? [`run crashed — ${crash}`] : []), ...claims, firstPassText(endToEndFirstPass(events)), wallText(events), needsYouText(events, currentOwed(events, cwd)),
   ].join(" · "));
 };
 

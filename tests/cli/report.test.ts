@@ -7,6 +7,7 @@ import { status } from "../../src/cli/commands/status.js";
 import { graphDefinitionHash, saveGraph, tickmarkrDir } from "../../src/graph/graph.js";
 import { validateGraph } from "../../src/graph/schema.js";
 import { cellWidth } from "../../src/tui/cockpit/width.js";
+import { recordFatalRunEnd } from "../../src/run/daemon.js";
 import { Journal, type JournalEvent } from "../../src/run/journal.js";
 import { wallBudget, WALL_PRIORITY } from "../../src/run/wall-budget.js";
 import { makeRepo } from "../helpers/tmprepo.js";
@@ -477,6 +478,29 @@ describe("CG1 current owed-check fold on every consumer surface", () => {
     for (const [surface, out] of Object.entries(await surfaces(legacy.repo, "run-cg1-legacy"))) {
       expect(out, surface).toContain("outstanding unknown");
       expect(out, surface).not.toMatch(/outstanding \d/u);
+    }
+  });
+});
+
+// D-1756: a fatal record's error is data. The text report and the markdown record print every C0, DEL
+// and C1 control in it as a visible escape, so a reviewer's 7-bit or 8-bit OSC/CSI/ST payload never
+// reaches the terminal and the reader still sees it was there; a plain error prints unchanged.
+describe("a fatal error's terminal controls print as visible escapes in the report", () => {
+  test.each([
+    ["plain", "merge lock lost", "merge lock lost"],
+    ["7-bit OSC/CSI", "\x1b]0;GREEN\x07\x1b[2J\x1b[Hlock lost", "\\x1b]0;GREEN\\x07\\x1b[2J\\x1b[Hlock lost"],
+    ["8-bit OSC/ST/CSI", "\x9d0;GREEN\x9c\x9b2J\x9bHlock lost", "\\u009d0;GREEN\\u009c\\u009b2J\\u009bHlock lost"],
+    ["carriage return and DEL", "lock\r\x7flost\tnow", "lock\\x0d\\x7flost now"],
+  ])("%s: the text report and the markdown record of a production fatal record name the crash with its controls escaped", async (_, raw, shown) => {
+    const repo = makeRepo({ "keep.txt": "x\n" });
+    const j = Journal.create(repo, "run-fatal");
+    j.append("run-start", undefined, { runId: "run-fatal" });
+    recordFatalRunEnd(j, "run-fatal", "b", new Error(raw), undefined, "merge");
+    expect(j.read().at(-1)!.data.error).toBe(raw); // the journal keeps the raw bytes
+    for (const out of [await report(["run-fatal"], repo), await report(["run-fatal", "--md"], repo)]) {
+      expect(out).toContain(`run crashed — merge failed: ${shown}`);
+      expect(out).toContain(`unknown: fatal run-end — merge failed: ${shown}`);
+      expect(out).not.toMatch(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/u);
     }
   });
 });

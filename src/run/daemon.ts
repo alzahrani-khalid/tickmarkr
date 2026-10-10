@@ -2017,14 +2017,19 @@ export function recordFatalRunEnd(
   } catch (readErr) {
     console.error(`tickmarkr ${runId}: journal read failed while recording the fatal run-end (${readErr instanceof Error ? readErr.message : String(readErr)}) — original error: ${original}`);
   }
+  // A crash can land mid-dispatch. Resume re-pends every dispatched-but-unfinished task, so a running or
+  // gated task is bucketed as the pending task resume will make it — pending, or blocked under a parked
+  // dependency — and no task falls outside the five buckets every reader knows.
+  const repended = graph && { ...graph, tasks: graph.tasks.map((t) =>
+    t.status === "running" || t.status === "gated" ? { ...t, status: "pending" as const } : t) };
   const record = {
     runId,
     branch,
     done: graph?.tasks.filter((t) => t.status === "done").map((t) => t.id) ?? [],
     failed: graph?.tasks.filter((t) => t.status === "failed").map((t) => t.id) ?? [],
     human: graph?.tasks.filter((t) => t.status === "human").map((t) => t.id) ?? [],
-    blocked: graph ? blockedTasks(graph).map((t) => t.id) : [],
-    pending: graph ? pendingTasks(graph).map((t) => t.id) : [],
+    blocked: repended ? blockedTasks(repended).map((t) => t.id) : [],
+    pending: repended ? pendingTasks(repended).map((t) => t.id) : [],
     phase,
     fatal: true,
     error: original,

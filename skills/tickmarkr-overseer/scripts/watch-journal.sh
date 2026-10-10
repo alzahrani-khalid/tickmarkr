@@ -70,6 +70,18 @@ since_arm() { tail -n +$((base + 1)) "$1" 2>/dev/null; }
 
 field() { printf '%s' "$2" | sed -n "s/.*\"$1\":\"\([^\"]*\)\".*/\1/p" | head -1; }
 bucket() { printf '%s' "$2" | sed -n "s/.*\"$1\":\[\([^]]*\)\].*/\1/p" | head -1; }
+# A row's data string value DECODED by JSON.parse (an escaped `\"` never cuts a quoted ref in a git error
+# short), printed on one line as the product's own crash reason is (visibleControls): every C0 control
+# but tab and newline, DEL and every C1 control prints as its visible escape (`\x1b`, `\u009b`), so a
+# recorded 7-bit or 8-bit OSC/CSI/ST never reaches the terminal; tabs and line breaks collapse to a space.
+jstr() {
+  printf '%s' "$2" | node -e '
+    let v; try { const row = JSON.parse(require("fs").readFileSync(0, "utf8")); v = (row.data ?? row)[process.argv[1]]; } catch {}
+    if (typeof v === "string") process.stdout.write(v.replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, (c) => {
+      const h = c.charCodeAt(0).toString(16);
+      return c < "\x80" ? "\\x" + h.padStart(2, "0") : "\\u" + h.padStart(4, "0");
+    }).replace(/\s+/g, " ").trim());' "$1" 2>/dev/null
+}
 
 report() {
   # $3 is the row's physical journal line: with its ts it is the token a decision binds to (OBS-1178)
@@ -77,8 +89,13 @@ report() {
   ev=$(field event "$line")
   case "$ev" in
     run-end)
-      local tv done failed human blocked pending verdict
+      local tv done failed human blocked pending verdict fatal=""
       tv=$(field tipVerify "$line")
+      # A FATAL run-end is a crash, never green — even with every bucket empty (its tasks never finished).
+      case "$line" in *'"fatal":true'*)
+        local err; err=$(jstr error "$line")
+        fatal="$(jstr phase "$line") failed: ${err:0:160}" ;;
+      esac
       done=$(bucket done "$line");     failed=$(bucket failed "$line")
       human=$(bucket human "$line");   blocked=$(bucket blocked "$line")
       pending=$(bucket pending "$line")
@@ -87,16 +104,20 @@ report() {
       # clause open: a waived review is still owed (D-660), and a `verify --record` discharge that lands
       # AFTER run-end moves only CURRENT status. This row is history, so the best it can say is
       # EXECUTION COMPLETE; green is read from CURRENT `tickmarkr status <runId>` at `outstanding 0`.
-      if [ "$tv" != "failed" ] && [ -z "$failed$human$blocked$pending" ]; then
+      if [ -z "$fatal" ] && [ "$tv" != "failed" ] && [ -z "$failed$human$blocked$pending" ]; then
         verdict="EXECUTION COMPLETE"
       else
         verdict="NOT GREEN"
       fi
-      echo "RUN_END $run — $verdict (tipVerify=${tv:-unknown})"
+      echo "RUN_END $run — $verdict (${fatal:+fatal: $fatal; }tipVerify=${tv:-unknown})"
       echo "  done=[${done}] failed=[${failed}] human=[${human}] blocked=[${blocked}] pending=[${pending}]"
-      [ "$verdict" = "EXECUTION COMPLETE" ] \
-        && echo "  execution buckets empty and tip verify is not failed — not yet green: read CURRENT \`tickmarkr status $run\`; only \`outstanding 0\` is green, \`outstanding N (...)\` and \`outstanding unknown\` are not, and this run-end record's own count is historical" \
-        || echo "  a non-empty bucket or a failed tip above is the reason; name it, never report this run as green"
+      if [ -n "$fatal" ]; then
+        echo "  the run CRASHED ($fatal) — a fatal run-end is never green; its debt reads unknown until the run is resumed, and from then on the resumed engagement owns it"
+      elif [ "$verdict" = "EXECUTION COMPLETE" ]; then
+        echo "  execution buckets empty and tip verify is not failed — not yet green: read CURRENT \`tickmarkr status $run\`; only \`outstanding 0\` is green, \`outstanding N (...)\` and \`outstanding unknown\` are not, and this run-end record's own count is historical"
+      else
+        echo "  a non-empty bucket or a failed tip above is the reason; name it, never report this run as green"
+      fi
       ;;
     task-human)
       echo "TASK_HUMAN $(field taskId "$line") — $run"

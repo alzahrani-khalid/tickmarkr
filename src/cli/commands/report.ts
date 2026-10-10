@@ -20,7 +20,7 @@ import {
 } from "../../report/operator-record.js";
 import { cellsOf, cellSummary } from "../../route/profile.js";
 import {
-  effectiveEvents, foldOwedChecks, Journal, loadRoutingProfile, OWED_DISCHARGE_EVENT, type JournalEvent, type OwedFold, type TelemetryRow,
+  effectiveEvents, fatalRunEndCause, foldOwedChecks, Journal, loadRoutingProfile, OWED_DISCHARGE_EVENT, type JournalEvent, type OwedFold, type TelemetryRow,
 } from "../../run/journal.js";
 import {
   baselineProvenanceOf, fingerprintsOf, forgivenFingerprints, forgivenGateRow, formatBaselineProvenance, formatFingerprints,
@@ -262,8 +262,10 @@ const timeLead = (events: readonly JournalEvent[]): string => {
  * comparability or supersession note); the rest is folded here from the journal and the current fold.
  */
 export function leadLines(events: readonly JournalEvent[], owed: OwedFold, finished: { tally: string; tip: string; notes?: string[] }): [string, string, string] {
+  // A fatal run-end leads with its crash: no tally after it may read as a finished run.
+  const crash = fatalRunEndCause(events);
   return [
-    `finished ${[finished.tally, finished.tip, firstPassText(endToEndFirstPass(events)), ...(finished.notes ?? [])].join(" · ")}`,
+    `finished ${[...(crash ? [`run crashed — ${crash}`] : []), finished.tally, finished.tip, firstPassText(endToEndFirstPass(events)), ...(finished.notes ?? [])].join(" · ")}`,
     timeLead(events),
     needsYouText(events, owed),
   ];

@@ -15,15 +15,23 @@
 #                    never hours; 900 is a generous default for a 7-task spec)
 #   <overseer-pane>  the pane that must hear about it (herdr pane id), e.g. wZ:p18S
 #   [poll-s]         poll interval, default 15
-# exit 0 LAUNCH_OK (lock seen; prints its contents) · exit 3 LAUNCH_OVERDUE (delivered) · exit 64 usage
+# exit 0 LAUNCH_OK (a lock held by a LIVE pid; prints its contents) · exit 3 LAUNCH_OVERDUE (delivered) · exit 64 usage
+#
+# A lock is a launch only while its holder lives: a lock left by a crashed daemon (dead pid, or no pid
+# at all) is stale, proves nothing about the new GO, and the watch keeps waiting for a live holder.
+# `ps -p` answers for another user's process too, so EPERM never reads as death (lock.ts isPidLive).
 set -u
 LOCK="${1:-}"; DEADLINE="${2:-}"; PANE="${3:-}"; POLL="${4:-15}"
 [ -n "$LOCK" ] && [ -n "$DEADLINE" ] && [ -n "$PANE" ] || { echo "usage: watch-launch.sh <lock-path> <deadline-s> <overseer-pane> [poll-s]" >&2; exit 64; }
 start=$(date +%s)
 while :; do
   if [ -f "$LOCK" ]; then
-    printf 'LAUNCH_OK %s %s\n' "$(date -u +%H:%M:%SZ)" "$(cat "$LOCK" 2>/dev/null | tr -d '\n')"
-    exit 0
+    body=$(tr -d '\n' < "$LOCK" 2>/dev/null)
+    pid=$(printf '%s' "$body" | sed -n 's/.*"pid":\([0-9][0-9]*\).*/\1/p')
+    if [ -n "$pid" ] && ps -p "$pid" >/dev/null 2>&1; then
+      printf 'LAUNCH_OK %s %s\n' "$(date -u +%H:%M:%SZ)" "$body"
+      exit 0
+    fi
   fi
   now=$(date +%s)
   if [ $((now - start)) -ge "$DEADLINE" ]; then

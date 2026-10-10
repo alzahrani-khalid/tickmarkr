@@ -2,6 +2,22 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v2.7.6 — a crashed run never reads as complete
+
+**v2.7.6** ships one product fix, made through `tickmarkr run` from a "gates fail closed" spec. The fix passed all
+seven gates, including cross-vendor review and the full suite, and the integration tip verify. Its defect was confirmed by an executed probe that
+failed on 2.7.5 before any fix was written. The spec's other three fixes (baseline forgiveness, judge evidence, kill text beside
+a forgiven failure) did not close in this run and are carried to the next version.
+
+- **A crashed run never reads as complete (affected: 2.5.8 – 2.7.5).** A fatal run-end used to leave a task that was running
+  or in its gates in no bucket, so an empty-looking record could pass the green rule. Every unfinished task is now recorded as
+  the pending task a resume will make it (pending, or blocked behind a parked dependency). `tickmarkr status` (default and
+  `--oneline`) and `tickmarkr report` (text and `--md`) lead with the crash phase and error, and fold the owed checks as
+  `outstanding unknown` until the run is resumed, never `outstanding 0`. A crash error's terminal control characters (C0, DEL,
+  C1) print as visible escapes, so error text cannot rewrite the terminal. The overseer skill's journal watcher prints NOT GREEN
+  for a fatal run-end, and its launch watcher waits past a lock whose holder has died. The green rule that `tickmarkr init`
+  writes now says the run-end must not be fatal.
+
 ## v2.7.5 — a lease wait kept alive by a killed run's leftover process names that process
 
 **v2.7.5** ships one product fix. It was made by hand and proven by its own `tickmarkr verify`: build, lint, evidence,

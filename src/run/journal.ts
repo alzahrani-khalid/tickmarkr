@@ -883,6 +883,18 @@ export function identicalGateFailures(events: JournalEvent[], taskId: string, ga
 const TERMINAL_CONTROL_RE = /\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?|\x1b\[[0-?]*[ -/]*[@-~]|\x1b[ -/]*[0-~]?|[\x00-\x08\x0b-\x1f\x7f]/g;
 export const readableExcerpt = (text: string): string => text.replace(TERMINAL_CONTROL_RE, "");
 
+/**
+ * One-line display text for a recorded crash: every C0 control but tab and newline, DEL and every C1
+ * control prints as its visible escape (`\x1b`, `\u009b`), so no 7-bit or 8-bit OSC/CSI/ST sequence
+ * reaches a terminal and the reader still sees the text carried one; tabs and line breaks collapse to
+ * one space. The journal row keeps the raw bytes.
+ */
+export const visibleControls = (text: string): string =>
+  text.replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/gu, (c) => {
+    const code = c.charCodeAt(0).toString(16);
+    return c < "\x80" ? `\\x${code.padStart(2, "0")}` : `\\u${code.padStart(4, "0")}`;
+  }).replace(/\s+/gu, " ").trim();
+
 /** What each funded repair's next battery actually reached. A repair spends its budget only
  * when that battery reaches one of the gates it was funded to fix; an earlier red is evidence that
  * this repair never got its funded turn, not a charge against the repair ladder. */
@@ -1490,6 +1502,26 @@ export function interruptedAttempt(events: JournalEvent[], taskId: string): Inte
 
 // Runs can end and later resume in the same journal. The newest lifecycle marker decides whether
 // an unresolved task is still recoverable by this live daemon or belongs to an ended run.
+/**
+ * The crash a FATAL run-end records, when it closes the newest engagement: `<phase> failed: <error>`.
+ * A later run-start or run-resume supersedes it; a normal run-end is no crash.
+ */
+export function fatalRunEndCause(events: readonly JournalEvent[]): string | undefined {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const e = events[i]!;
+    if (e.event === "run-start" || e.event === "run-resume") return undefined;
+    if (e.event !== "run-end") continue;
+    if (e.data.fatal !== true) return undefined;
+    // Display text only: terminal controls in a recorded error (OSC title, CSI clear) print escaped,
+    // never executed, and the journal row keeps the raw bytes.
+    const shown = (v: unknown) => typeof v === "string" ? visibleControls(v) : "";
+    const phase = shown(e.data.phase) || "run";
+    const error = shown(e.data.error);
+    return `${phase} failed: ${error || "unrecorded error"}`;
+  }
+  return undefined;
+}
+
 export function runHasEnded(events: JournalEvent[]): boolean {
   for (let i = events.length - 1; i >= 0; i--) {
     const event = events[i]!.event;
@@ -2117,7 +2149,9 @@ export class Journal {
           // C1: the terminal record carries the owed-check fold as of this append, revalidated from
           // each discharge's artifact — a reopened journal re-reduces, it never copies a prior total.
           // Canonical (validated) rows are strict and keep their schema; the live producer is the tuple.
-          return decisionRow ? reduced : { ...reduced, owedChecks: foldOwedChecks(priorEvents, join(this.dir, "..", "..", "..")) };
+          // A fatal record folds over itself, so its own owedChecks already read unknown with the crash.
+          const folded = !decisionRow && data.fatal === true ? [...priorEvents, { ts: new Date().toISOString(), event, data }] : priorEvents;
+          return decisionRow ? reduced : { ...reduced, owedChecks: foldOwedChecks(folded, join(this.dir, "..", "..", "..")) };
         })()
       : event === "resume-restore" && rowTaskId && upheldFeedbackByTask(effectiveEvents(priorEvents)).has(rowTaskId)
         ? {
@@ -2877,11 +2911,15 @@ type GateRowFact = { gate?: unknown; pass?: unknown; meta?: { skipped?: unknown;
  * across folds; every artifact, hash, criteria and reviewer condition is still re-read on every fold.
  */
 export function foldOwedChecks(events: readonly JournalEvent[], cwd: string, memo?: OwedProofMemo): OwedFold {
+  let fold: OwedFold;
   try {
-    return foldOwedChecksOrThrow(events, cwd, memo);
+    fold = foldOwedChecksOrThrow(events, cwd, memo);
   } catch (error) {
-    return { known: false, debt: "unknown", outstanding: [], acceptedRisk: [], discharged: [], unknown: [{ reason: `owed-check fold failed: ${String(error).split("\n")[0]}` }] };
+    fold = { known: false, debt: "unknown", outstanding: [], acceptedRisk: [], discharged: [], unknown: [{ reason: `owed-check fold failed: ${String(error).split("\n")[0]}` }] };
   }
+  // A fatal run-end never finished its checks: its debt is unknown and the crash leads the reasons, never 0.
+  const fatal = fatalRunEndCause(events);
+  return fatal ? { ...fold, known: false, debt: "unknown", unknown: [{ reason: `fatal run-end — ${fatal}` }, ...fold.unknown] } : fold;
 }
 
 function foldOwedChecksOrThrow(events: readonly JournalEvent[], cwd: string, memo?: OwedProofMemo): OwedFold {

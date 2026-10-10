@@ -40,11 +40,13 @@ describe("watch-launch.sh (a GO has a deadline)", () => {
     const { bin, log } = fakeHerdr();
     const wt = mkdtempSync(join(tmpdir(), "watch-launch-wt-")); dirs.push(wt);
     const lock = join(wt, "graph.lock");
-    // spawnSync blocks the event loop, so the lock is written by a detached shell, not a timer.
-    spawnSync("sh", ["-c", `(sleep 1; printf '%s\\n' '{"pid":4242,"runId":"run-x"}' > "${lock}") >/dev/null 2>&1 &`]);
+    // spawnSync blocks the event loop, so the lock is written by a detached shell, not a timer. Its holder
+    // is this test process — live for the whole watch — since a dead holder's lock is stale, never a launch.
+    const holder = process.pid;
+    spawnSync("sh", ["-c", `(sleep 1; printf '%s\\n' '{"pid":${holder},"runId":"run-x"}' > "${lock}") >/dev/null 2>&1 &`]);
     const r = run([lock, "10", "wZ:pTEST", "1"], bin);
     expect(r.status).toBe(0);
-    expect(r.stdout).toMatch(/^LAUNCH_OK \d\d:\d\d:\d\dZ \{"pid":4242,"runId":"run-x"\}$/m);
+    expect(r.stdout).toMatch(new RegExp(`^LAUNCH_OK \\d\\d:\\d\\d:\\d\\dZ \\{"pid":${holder},"runId":"run-x"\\}$`, "m"));
     expect(existsSync(log)).toBe(false);
   }, 20_000);
 

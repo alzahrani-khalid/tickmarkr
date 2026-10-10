@@ -141,4 +141,43 @@ describe("compact one-line status form", () => {
       expect(line).not.toContain("verify failed");
     }
   });
+
+  test("a fatal run-end leads the one-line form with its crash phase and error right after the run id, before any completion fraction or verify state, and never reads outstanding 0; a normal run-end's line is unchanged", async () => {
+    journal.armedPath = "";
+    const start = (hash: string): JournalEvent => ({ ts: at(0), event: "run-start", data: { pid: process.pid, graphDefinitionHash: hash, commands: { test: "npm test" } } });
+    // the record recordFatalRunEnd writes: a merge crash with T1 done and the dispatched T2 re-pended
+    const midRun = mkRepo();
+    seed(midRun, "run-merge-crash", ["T1", "T2"], (hash) => [
+      start(hash),
+      ...landed("T1", 1),
+      { ts: at(4), event: "task-dispatch", taskId: "T2", data: { assignment: { adapter: "fake", model: "fake-1" }, attempt: 0, workerDispatchOrdinal: 0 } },
+      { ts: at(5), event: "run-end", data: { done: ["T1"], failed: [], human: [], blocked: [], pending: ["T2"], phase: "merge", fatal: true, error: "merge lock lost" } },
+    ]);
+    const crashed = await status(["--oneline"], midRun);
+    expect(crashed.startsWith("run-merge-crash · run crashed — merge failed: merge lock lost · 1/2 done · verify unrecorded · "), crashed).toBe(true);
+    expect(crashed).toContain("needs you: outstanding unknown");
+    expect(crashed).not.toContain("outstanding 0");
+
+    // a setup crash: every bucket empty, and still the crash leads and the debt is unknown
+    const setup = mkRepo();
+    seed(setup, "run-setup-crash", ["T1", "T2"], (hash) => [
+      start(hash),
+      { ts: at(1), event: "run-end", data: { done: [], failed: [], human: [], blocked: [], pending: [], phase: "setup", fatal: true, error: "integration branch refused" } },
+    ]);
+    const empty = await status(["--oneline"], setup);
+    expect(empty.startsWith("run-setup-crash · run crashed — setup failed: integration branch refused · 0/2 done · verify unrecorded · "), empty).toBe(true);
+    expect(empty).toContain("needs you: outstanding unknown");
+    expect(empty).not.toContain("outstanding 0");
+    expect(empty.split("\n")).toHaveLength(1);
+
+    // control: a normal all-done run-end names no crash and reads outstanding 0
+    const normal = mkRepo();
+    seed(normal, "run-normal", ["T1", "T2"], (hash) => [
+      start(hash),
+      ...landed("T1", 1),
+      ...landed("T2", 4),
+      { ts: at(7), event: "run-end", data: { done: ["T1", "T2"], failed: [], human: [], blocked: [], pending: [], tipVerify: "passed" } },
+    ]);
+    expect(await status(["--oneline"], normal)).toBe("run-normal · 2/2 done · verify passed · end-to-end first pass 2/2 · 7s wall · needs you: outstanding 0 · 0 parked · 0 failed");
+  });
 });
