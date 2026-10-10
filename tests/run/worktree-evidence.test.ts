@@ -36,7 +36,7 @@ function flatCpuProbe(): () => void {
   const bashEnv = join(dir, "bash-env");
   const calls = join(dir, "calls");
   writeFileSync(calls, "");
-  writeBashEnvFixture(bashEnv, "ps() { printf x >> \"$TICKMARKR_TEST_PS_CALLS\"; echo '1 1 0:00.00 unrelated-process'; }\n");
+  writeBashEnvFixture(bashEnv, "ps() { printf x >> \"$TICKMARKR_TEST_PS_CALLS\"; echo '1 1 1 0:00.00 unrelated-process'; }\n");
   const prior = { bashEnv: process.env.BASH_ENV, calls: process.env.TICKMARKR_TEST_PS_CALLS };
   process.env.BASH_ENV = bashEnv;
   process.env.TICKMARKR_TEST_PS_CALLS = calls;

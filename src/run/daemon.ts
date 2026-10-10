@@ -38,7 +38,7 @@ import { executionSignal, remainingExecutionMs, withExecutionBudget, withoutExec
 import { repairSelectionDecision, repairSelectionEnabled } from "./repair-selection.js";
 import { failureDisposition, reserveInfrastructureRetry } from "./recovery.js";
 import { runEnvironment } from "./environment.js";
-import { addDetachedWorktree, changeRepresented, cleanupRunWorktrees, deriveForkCap, FORK_CAP_ENV, gitHead, linkNodeModules, npmDependencyInstallCommand, npmDependencyManifestChanged, PRESERVE_COMMIT_SUBJECT, PRESERVE_PRODUCER_TRAILER, preserveWorktree, type PreserveProducer, producerFields, removeWorktree, resolvedCapacity, runWithForkBudget, runWithVerificationBudget, type RunCapacity, sameCapacity, sameVerification, sh, shGit, SUITE_PARENT_ENV, verificationProtocol, WORKTREE_LAYOUT_CONTRACT, WORKTREES_DIR, worktreePath } from "./git.js";
+import { addDetachedWorktree, changeRepresented, cleanupRunWorktrees, deriveForkCap, FORK_CAP_ENV, gitHead, linkNodeModules, npmDependencyInstallCommand, npmDependencyManifestChanged, PRESERVE_COMMIT_SUBJECT, PRESERVE_PRODUCER_TRAILER, preserveWorktree, type PreserveProducer, producerFields, removeWorktree, resolvedCapacity, runWithForkBudget, runWithVerificationBudget, type RunCapacity, sameCapacity, sameVerification, sh, shell, shGit, SUITE_PARENT_ENV, verificationProtocol, WORKTREE_LAYOUT_CONTRACT, WORKTREES_DIR, worktreePath } from "./git.js";
 import { MASK } from "./redact.js";
 import { runInteractiveSeed, type InteractiveSeedResult } from "./interactive-seed.js";
 import { classifyRepairDisposition, resolveScopeHints } from "./repair-disposition.js";
@@ -1394,8 +1394,9 @@ type WorkerProcessTree = "empty" | "running" | "unmeasurable";
 // OBS-737 needs. A readable process table with no marker root is measured empty; a failed or empty
 // table is unmeasurable. Descendants are closed over PPID because not every child retains the
 // dispatch-script marker in its own argv.
-async function observeWorkerProcessTree(marker: string, cwd: string): Promise<WorkerProcessTree> {
-  const snapshot = await shGit("ps -Awwo pid=,ppid=,command=", cwd, 15_000);
+export async function observeWorkerProcessTree(marker: string, cwd: string): Promise<WorkerProcessTree> {
+  // queue row 113: `ps` is not git, so the payload entry — the own-git entry's pin probes are two SYNC git spawns per call
+  const snapshot = await shell("ps -Awwo pid=,ppid=,command=", cwd, 15_000);
   if (snapshot.code !== 0) return "unmeasurable";
   const rows: { pid: string; ppid: string; command: string }[] = [];
   for (const line of snapshot.stdout.split("\n")) {
@@ -1488,7 +1489,8 @@ export const resetLiveSuiteCountForTests = (): void => { liveSuiteCountForTests 
  * a daemon invoked by vitest does not wait on its own test harness forever. */
 export async function liveSuiteCount(repoRoot: string): Promise<number> {
   if (liveSuiteCountForTests) return liveSuiteCountForTests(repoRoot);
-  const snapshot = await shGit("ps -Aww -o pid=,ppid=,state=,command=", repoRoot, 15_000);
+  // queue row 113: `ps` is not git, so the payload entry — the own-git entry's pin probes are two SYNC git spawns per call
+  const snapshot = await shell("ps -Aww -o pid=,ppid=,state=,command=", repoRoot, 15_000);
   if (snapshot.code !== 0) return 0;
   // row 103: one batched async probe per snapshot — a synchronous lsof/ps per pid held this loop 44–46 s
   const probes = await batchedProcessProbes(runnerPids(snapshot.stdout));

@@ -1,7 +1,7 @@
 import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { execFile } from "node:child_process";
 import { isAbsolute, relative, sep } from "node:path";
-import { activeShellIdentities, processIdentity, resolveActiveShellIdentities, shGit, SUITE_PARENT_ENV } from "./git.js";
+import { activeShellIdentities, processIdentity, resolveActiveShellIdentities, shell, SUITE_PARENT_ENV } from "./git.js";
 
 // OBS-82: normalize known presentation tokens before measuring transcript extent or filtering an
 // LLM-bound transcript. This remains a closed allowlist — ANSI/VT escapes, braille-range spinner
@@ -83,7 +83,8 @@ export function readOwnedProcessGroup(path: string): number | undefined {
 export async function reapOwnedProcessGroup(group: number | undefined, cwd: string, ownership?: WorkerReapOwnership): Promise<number[] | null> {
   if (ownership) return reapWorkerProcesses(group, cwd, ownership);
   if (group === undefined) return null;
-  const own = await shGit(`ps -o pgid= -p ${process.pid}`, cwd, 5_000);
+  // queue row 113: `ps` is not git, so the payload entry — the own-git entry's pin probes are two SYNC git spawns per call
+  const own = await shell(`ps -o pgid= -p ${process.pid}`, cwd, 5_000);
   // An in-process driver fixture (or a non-isolating host) can share the daemon's
   // group. It is not an owned worker group: let the driver's close retire that slot.
   if (own.code !== 0 || !/^\d+$/.test(own.stdout.trim()) || Number(own.stdout.trim()) === group) return null;
@@ -93,7 +94,7 @@ export async function reapOwnedProcessGroup(group: number | undefined, cwd: stri
   // SIGKILL delivery and process retirement are asynchronous. Bound the confirmation
   // grace, retaining names if a process is still present after it.
   for (let probe = 0; probe < 5; probe++) {
-    const snapshot = await shGit("ps -Awwo pid=,pgid=,stat=", cwd, 5_000);
+    const snapshot = await shell("ps -Awwo pid=,pgid=,stat=", cwd, 5_000);
     if (snapshot.code !== 0) return null;
     survivors = snapshot.stdout.split("\n").flatMap((line) => {
       const row = /^\s*(\d+)\s+(\d+)\s+(\S+)/.exec(line);
@@ -345,9 +346,9 @@ interface WorkerTreeCpuSnapshot {
 let linuxClockTickMs: Promise<number | undefined> | undefined;
 function linuxProcessCpuMs(pid: string, cwd: string): Promise<{ ms: number; resolutionMs: number } | undefined> {
   if (!existsSync("/proc/self/stat")) return Promise.resolve(undefined);
-  // shGit, not sh: the accountant samples at 100ms cadence and must not run the operator's login
-  // profile (nvm/pyenv/direnv side effects included) on every sample.
-  linuxClockTickMs ??= shGit("getconf CLK_TCK", cwd, 15_000).then((r) => {
+  // shell (login false), not sh: the accountant samples at 100ms cadence and must not run the operator's login
+  // profile (nvm/pyenv/direnv side effects included). Not shGit either: getconf is not git (queue row 113).
+  linuxClockTickMs ??= shell("getconf CLK_TCK", cwd, 15_000).then((r) => {
     const ticks = r.code === 0 ? Number(r.stdout.trim()) : Number.NaN;
     return Number.isFinite(ticks) && ticks > 0 ? 1_000 / ticks : undefined;
   });
@@ -370,11 +371,18 @@ function linuxProcessCpuMs(pid: string, cwd: string): Promise<{ ms: number; reso
 // finds that root and its descendants. An empty tree is measurable zero; a failed or unparseable
 // snapshot is undefined because missing evidence can never prove inactivity.
 async function workerTreeCpuSnapshot(marker: string, cwd: string, group?: number, identities?: Map<number, string>): Promise<WorkerTreeCpuSnapshot | undefined> {
-  const snapshot = await shGit("ps -Awwo pid=,ppid=,time=,command=", cwd, 15_000);
+  // queue row 113: `ps` is not git, so the payload entry — the own-git entry's pin probes are two SYNC git spawns per call
+  // ONE snapshot carries the group column too (it was a second `ps -Awwo pid=,pgid=` per sample).
+  const snapshot = await shell("ps -Awwo pid=,ppid=,pgid=,time=,command=", cwd, 15_000);
   if (snapshot.code !== 0) return undefined;
   const rows: { pid: string; ppid: string; cpuMs: number; frac: boolean; cmd: string }[] = [];
+  const grouped: string[] = [];
   for (const line of snapshot.stdout.split("\n")) {
-    const m = /^\s*(\d+)\s+(\d+)\s+(\S+)\s+(.*)$/.exec(line);
+    // Group membership reads EVERY row, as the separate group snapshot did; a CPU row also needs a parseable time.
+    const ids = /^\s*(\d+)\s+(\d+)\s+(\d+)(?:\s|$)/.exec(line);
+    if (!ids) continue;
+    if (group !== undefined && Number(ids[3]) === group) grouped.push(ids[1]!);
+    const m = /^\s*(\d+)\s+(\d+)\s+\d+\s+(\S+)\s+(.*)$/.exec(line);
     if (!m) continue;
     const cpu = parsePsCpu(m[3]!);
     if (cpu !== undefined) rows.push({ pid: m[1]!, ppid: m[2]!, cpuMs: cpu.ms, frac: cpu.frac, cmd: m[4]! });
@@ -383,14 +391,7 @@ async function workerTreeCpuSnapshot(marker: string, cwd: string, group?: number
   const tree = new Set(rows.filter((p) => p.cmd.includes(marker)).map((p) => p.pid));
   // CPU presentation matching is intentionally broader than authority to signal a process.
   const owned = new Set(rows.filter((p) => p.cmd === `bash ${marker}` || p.cmd === `/bin/bash ${marker}`).map((p) => p.pid));
-  if (group !== undefined) {
-    const groups = await shGit("ps -Awwo pid=,pgid=", cwd, 15_000);
-    if (groups.code !== 0) return undefined;
-    for (const line of groups.stdout.split("\n")) {
-      const row = /^\s*(\d+)\s+(\d+)\s*$/.exec(line);
-      if (row && Number(row[2]) === group) tree.add(row[1]!);
-    }
-  }
+  for (const pid of grouped) tree.add(pid);
   // ps output is not topologically ordered; relax the parent -> child closure until stable.
   for (let grew = true; grew;) {
     grew = false;

@@ -46,7 +46,7 @@ let priorBashEnv: string | undefined;
 beforeEach(() => {
   priorBashEnv = process.env.BASH_ENV;
   const path = join(makeTestTempDir("nudge-flat-cpu-"), "bash-env");
-  writeBashEnvFixture(path, "ps() { echo '1 1 0:00.00 unrelated-process'; }\n");
+  writeBashEnvFixture(path, "ps() { echo '1 1 1 0:00.00 unrelated-process'; }\n");
   process.env.BASH_ENV = path;
   setHarvestCpuFlatMsForTests(1);
 });

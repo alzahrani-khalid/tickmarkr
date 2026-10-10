@@ -191,13 +191,13 @@ test("test: a fake worker pane flat for the whole stall window over a flat workt
   // Exercise the real accountant too: the dispatch root has gone away, but one
   // reparented member of its recorded group continues to consume CPU.
   vi.restoreAllMocks();
-  const realSh = git.shGit;
+  const realShell = git.shell;
   let sample = 0;
-  vi.spyOn(git, "shGit").mockImplementation(async (cmd, cwd, timeout) => {
-    if (cmd === "ps -Awwo pid=,ppid=,time=,command=") return { code: 0, stderr: "", stdout:
-      `900001 1 0:00.${String(++sample).padStart(2, "0")} orphaned-tool\n900002 1 0:09.00 sibling-tool` };
-    if (cmd === "ps -Awwo pid=,pgid=") return { code: 0, stderr: "", stdout: "900001 81000\n900002 82000" };
-    return realSh(cmd, cwd, timeout);
+  vi.spyOn(git, "shell").mockImplementation(async (cmd, cwd, timeout, login, options) => {
+    // queue row 113: one snapshot carries pid, ppid, pgid, time and command
+    if (cmd === "ps -Awwo pid=,ppid=,pgid=,time=,command=") return { code: 0, stderr: "", stdout:
+      `900001 1 81000 0:00.${String(++sample).padStart(2, "0")} orphaned-tool\n900002 1 82000 0:09.00 sibling-tool` };
+    return realShell(cmd, cwd, timeout, login, options);
   });
   const accountant = new stall.WorkerTreeCpuAccountant("absent-dispatch-root", dirty.repo, () => 81_000);
   try {
@@ -246,10 +246,10 @@ test("test: a driver whose status probe throws a transport error once during the
   vi.restoreAllMocks();
   const groups = new Set([81_001, 81_002, 99_999]);
   const slots = new Set<Slot>([{ id: "81001", name: "T1", cwd: "/tmp" }, { id: "81002", name: "T2", cwd: "/tmp" }]);
-  const realSh = git.shGit;
-  vi.spyOn(git, "shGit").mockImplementation(async (cmd, cwd, timeout) => cmd.startsWith("ps ")
+  const realShell = git.shell;
+  vi.spyOn(git, "shell").mockImplementation(async (cmd, cwd, timeout, login, options) => cmd.startsWith("ps ")
     ? { code: 0, stdout: cmd.includes("-p ") ? "70000\n" : [...groups].map((g) => `${g} ${g} S`).join("\n"), stderr: "" }
-    : realSh(cmd, cwd, timeout));
+    : realShell(cmd, cwd, timeout, login, options));
   vi.spyOn(process, "kill").mockImplementation((pid) => { groups.delete(-pid); return true; });
   const actor = { close: async (slot: Slot) => { expect(await stall.reapOwnedProcessGroup(Number(slot.id), slot.cwd)).toEqual([]); } };
   await Promise.all([...slots].map((slot) => daemon.closeLiveSlot(slots, actor, slot)));

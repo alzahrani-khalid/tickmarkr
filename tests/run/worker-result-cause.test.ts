@@ -380,7 +380,7 @@ describe("a fast-kill death names the fast-kill (OBS-548)", () => {
   // unrelated row: the marker matches nothing, so the worker tree is empty and reads a flat zero.
   const flatCpuProbe = (): (() => void) => {
     const bashEnv = join(makeTestTempDir("tickmarkr-ps-flat-"), "bash-env");
-    writeBashEnvFixture(bashEnv, "ps() { echo '1 1 0:00.00 unrelated-process'; }\n");
+    writeBashEnvFixture(bashEnv, "ps() { echo '1 1 1 0:00.00 unrelated-process'; }\n");
     const prior = process.env.BASH_ENV;
     process.env.BASH_ENV = bashEnv;
     return () => {

@@ -17,9 +17,10 @@ import { COMMIT, makeTestTempDir, setupRepo, T } from "../../helpers/tmprepo.js"
 // A deterministic flat worker-tree CPU reading, installed by overriding `ps` for every shell the
 // daemon forks. Unconditional on purpose: the point is that the CPU leg answers the same on a host
 // whose `ps` works and on one that denies it, so a test can vary the leg it actually means to test.
+// The row has the sampler's columns: pid ppid pgid time command (queue row 113 merged its two snapshots).
 function flatCpuProbe(): () => void {
   const bashEnv = join(makeTestTempDir("tickmarkr-ps-flat-"), "bash-env");
-  writeBashEnvFixture(bashEnv, "ps() { echo '1 1 0:00.00 unrelated-process'; }\n");
+  writeBashEnvFixture(bashEnv, "ps() { echo '1 1 1 0:00.00 unrelated-process'; }\n");
   const prior = process.env.BASH_ENV;
   process.env.BASH_ENV = bashEnv;
   return () => {

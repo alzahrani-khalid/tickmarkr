@@ -2,6 +2,23 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v2.7.3 — process-table reads stop running git on the daemon's event loop
+
+**v2.7.3** ships one product fix. It was made by hand and proven by its own `tickmarkr verify`: build, lint, evidence,
+scope, executed acceptance, cross-vendor review (`codex:gpt-6-astra`, OpenAI, reviewing Claude-authored work) and the
+full suite. No `tickmarkr run` was used.
+
+- **Process-table reads no longer run git synchronously on the run daemon's event loop (affected: 2.6.8 – 2.7.2).**
+  The daemon reads the process table often: the per-worker CPU sampler about every 100 ms, a worker's process-tree
+  check, the live-suite census and a process-group reap. These `ps` reads went through tickmarkr's own-git shell
+  entry, and since 2.6.8 that entry, in a linked checkout (which every task worktree is), first runs two SYNCHRONOUS
+  git probes to pin the ref store. So each `ps` paid two blocking git spawns. In one daemon test, measured twice each
+  way, those were about 140 of the test's ~285 blocking git spawns, and the event loop sat blocked a median of 250–270
+  ms per worker slice; with the fix, about 65 ms (the daemon's own git commands keep their probes). The `ps` reads,
+  and the sampler's one-time Linux `getconf CLK_TCK`, now use the plain shell entry. That entry still runs the same
+  pre-spawn trust check and refuses the same hostile linked checkouts, by name, before any `ps` runs. The sampler also
+  takes one process snapshot per sample, where it took two when the worker's process group was recorded.
+
 ## v2.7.2 — a test baseline is captured with the runner the test gate uses
 
 **v2.7.2** ships one product fix. It was made by hand and proven by its own `tickmarkr verify`: build, lint, evidence,
