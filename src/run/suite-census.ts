@@ -57,7 +57,7 @@ export async function batchedProcessCwds(pids: readonly number[], exec: ProbeExe
 export function runnerPids(snapshot: string): number[] {
   const pids: number[] = [];
   for (const line of snapshot.split("\n")) {
-    const match = /^\s*(\d+)\s+(\d+)\s+(\S+)\s+(.*)$/.exec(line);
+    const match = /^\s*(\d+)\s+(\d+)\s+(\S+)\s+(.*)$/s.exec(line);
     if (match && !match[3]!.startsWith("Z") && isRunnerCommand(match[4]!)) pids.push(Number(match[1]));
   }
   return pids;
@@ -97,7 +97,7 @@ export async function batchedProcessProbes(pids: readonly number[], exec: ProbeE
     }
     if (rest.length === 0) return;
     for (const line of (await ask("ps", ["eww", "-p", rest.join(","), "-o", "pid=,command="])).split("\n")) {
-      const row = /^\s*(\d+)\s+(.*)$/.exec(line);
+      const row = /^\s*(\d+)\s+(.*)$/s.exec(line);
       const value = row ? parentIn(row[2]!) : undefined;
       if (row && value) parents.set(Number(row[1]), Number(value));
     }

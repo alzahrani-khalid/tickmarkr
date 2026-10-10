@@ -3,8 +3,9 @@ import { join } from "node:path";
 import { type RunGraph, validateGraph } from "../graph/schema.js";
 import { CompileError, inferShape, sha256 } from "./common.js";
 
-const TASK_RE = /^- \[( |x)\] (T\d+)\s*(\[P\])?\s*(.+)$/;
-const SUB_RE = /^\s+- (\w+):\s*(.+)$/;
+// Queue row 130: [^\r\n], never `.` (U+2028/U+2029 inside a line).
+const TASK_RE = /^- \[( |x)\] (T\d+)\s*(\[P\])?\s*([^\r\n]+)$/;
+const SUB_RE = /^\s+- (\w+):\s*([^\r\n]+)$/;
 
 interface Draft {
   id: string; title: string; parallel: boolean; done: boolean;

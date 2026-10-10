@@ -143,7 +143,8 @@ export const workerReapHost = {
       const lines = out.split("\n").filter((line) => line.trim());
       if (!lines.length || lines.length > 20_000) return undefined;
       for (const line of lines) {
-        const m = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(\S+)\s+(\S+\s+\S+\s+\d+\s+\S+\s+\d+)\s+(.*)$/.exec(line);
+        // Queue row 127: the s flag — ps prints an argv's U+2028/U+2029 raw, and `.` alone never matches them.
+        const m = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(\S+)\s+(\S+\s+\S+\s+\d+\s+\S+\s+\d+)\s+(.*)$/s.exec(line);
         if (!m) return undefined;
         if (m[5]!.startsWith("Z")) continue;
         const pid = Number(m[1]);
@@ -382,7 +383,7 @@ async function workerTreeCpuSnapshot(marker: string, cwd: string, group?: number
     const ids = /^\s*(\d+)\s+(\d+)\s+(\d+)(?:\s|$)/.exec(line);
     if (!ids) continue;
     if (group !== undefined && Number(ids[3]) === group) grouped.push(ids[1]!);
-    const m = /^\s*(\d+)\s+(\d+)\s+\d+\s+(\S+)\s+(.*)$/.exec(line);
+    const m = /^\s*(\d+)\s+(\d+)\s+\d+\s+(\S+)\s+(.*)$/s.exec(line);
     if (!m) continue;
     const cpu = parsePsCpu(m[3]!);
     if (cpu !== undefined) rows.push({ pid: m[1]!, ppid: m[2]!, cpuMs: cpu.ms, frac: cpu.frac, cmd: m[4]! });

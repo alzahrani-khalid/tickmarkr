@@ -316,7 +316,7 @@ export async function describeLeaseBlockers(pids: readonly number[]): Promise<Le
     try { execFile("ps", ["-o", "pid=,comm=", "-p", pids.join(",")], { encoding: "utf8", timeout: 5_000 }, (_error, stdout) => done(stdout ?? "")); }
     catch { done(""); }
   });
-  const executables = new Map(rows.split("\n").flatMap((line) => { const row = /^\s*(\d+)\s+(.*)$/.exec(line); return row ? [[Number(row[1]), row[2]!.trim()] as const] : []; }));
+  const executables = new Map(rows.split("\n").flatMap((line) => { const row = /^\s*(\d+)\s+(.*)$/s.exec(line); return row ? [[Number(row[1]), row[2]!.trim()] as const] : []; }));
   const cwds = await import("./suite-census.js").then(({ batchedProcessCwds }) => batchedProcessCwds(pids)).catch(() => undefined);
   return pids.map((pid) => {
     const cwd = cwds?.get(pid);
@@ -347,7 +347,7 @@ export async function protectedProcesses(holder: RepositoryLeaseHolder, tokenEnv
     return !leader || sameProcessBirth(processBirth(pid), holder.rootBirths?.[pid]);
   }));
   const parsed = lines.flatMap(line => {
-    const match = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(.*)$/.exec(line);
+    const match = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(.*)$/s.exec(line);
     return match ? [{ pid: Number(match[1]), parent: Number(match[2]), group: Number(match[3]), stat: match[4]!, command: match[5]! }] : [];
   });
   const parents = new Map(parsed.map(row => [row.pid, row.parent]));

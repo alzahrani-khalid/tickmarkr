@@ -121,7 +121,7 @@ export function readProcessIdentity(pid: number, host: IdentityHost = {}): Ident
   const ps = spawnSync("ps", ["-ww", "-o", "pgid=", "-o", "stat=", "-o", "lstart=", "-o", "command=", "-p", String(pid)], {
     encoding: "utf8", env: { ...process.env, LC_ALL: "C" },
   });
-  const row = /^\s*(\d+)\s+(\S+)\s+(\w{3} \w{3} [ \d]\d \d\d:\d\d:\d\d \d{4})\s+(.*\S)\s*$/.exec(ps.stdout ?? "");
+  const row = /^\s*(\d+)\s+(\S+)\s+(\w{3} \w{3} [ \d]\d \d\d:\d\d:\d\d \d{4})\s+(.*\S)\s*$/s.exec(ps.stdout ?? "");
   if (ps.status !== 0 || !row) return confirmedDead(pid) ? "DEAD" : "UNKNOWN";
   if (row[2].startsWith("Z")) return "DEAD";
   let cwd: string | undefined;

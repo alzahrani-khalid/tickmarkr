@@ -361,13 +361,14 @@ function compressLines(lines: number[]): string {
   return parts.join(", ");
 }
 
-const DIFF_SECTIONS = /(?=^diff --git )/m;
+// Queue rows 128/129: "\n"-only line semantics — the m flag would also split a line at U+2028/U+2029.
+const DIFF_SECTIONS = /(?<=^|\n)(?=diff --git )/;
 
 // the a-side path of a whole-file deletion section, or null if this section is not one.
 function deletedPath(section: string): string | null {
-  if (!/^deleted file mode /m.test(section)) return null;
-  const oldPath = /^--- (.+)$/m.exec(section)?.[1]
-    ?? /^Binary files (.+) and \/dev\/null differ$/m.exec(section)?.[1];
+  if (!/(?<=^|\n)deleted file mode /.test(section)) return null;
+  const oldPath = /(?<=^|\n)--- ([^\r\n]+)/.exec(section)?.[1]
+    ?? /(?<=^|\n)Binary files ([^\r\n]+) and \/dev\/null differ(?=[\r\n]|$)/.exec(section)?.[1];
   if (!oldPath || oldPath === "/dev/null") return null;
   const unquoted = oldPath.startsWith('"') && oldPath.endsWith('"') ? oldPath.slice(1, -1) : oldPath;
   return unquoted.replace(/^a\//, "");

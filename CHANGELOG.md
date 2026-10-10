@@ -2,6 +2,28 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v2.7.7 — an invisible line break can no longer hide code from the gates
+
+**v2.7.7** ships four product fixes for one class of defect. They were made by hand and proven by their own `tickmarkr verify`:
+build, lint, evidence, scope, executed acceptance, cross-vendor review and the full suite. No `tickmarkr run` was used.
+JavaScript treats the Unicode characters LINE SEPARATOR (U+2028) and PARAGRAPH SEPARATOR (U+2029) as line breaks in some
+patterns and not in others, and a worker, a file name or a pasted spec can carry them invisibly.
+
+- **A diff can no longer hide a file's code from the judge and the reviewer (affected: 1.74 – 2.7.6).** An added line
+  holding U+2028 followed by `deleted file mode` made the reviewable diff replace that file's whole section with
+  `deleted file: <path>`, so the acceptance judge, the cross-vendor reviewer and the diff cap never saw its code. A forged
+  capture receipt or section header worked the same way. Diff text is now split into lines at newlines only.
+- **A deleted file's name can no longer make an untouched file citable (affected: 1.74 – 2.7.6).** Deleting a file whose
+  name held a newline and a forged `+++`/`@@` block let a judge cite a line of a file the task never changed. A name that
+  tickmarkr writes back into the diff is now quoted the way git quotes it.
+- **A worker whose prompt holds U+2028 no longer parks every task as a stall (affected: 2.6.1 – 2.7.6).** The claude
+  worker passes its prompt as an argument, and one process-list row holding U+2028 made the cleanup census unreadable, so
+  every reap read "cleanup unknown" until that worker exited. Every process-list parser now reads such a row.
+- **A spec line holding U+2028 no longer loses or retypes its criterion (affected: every release through 2.7.6).** In a
+  native spec, an acceptance item holding one was glued onto the item before it as one plain judge criterion, so two
+  `test:` oracles compiled to a single LLM-judged line. In a PRD or Spec Kit file the item was dropped, and a heading
+  holding one refused the spec. Each item now compiles as written.
+
 ## v2.7.6 — a crashed run never reads as complete
 
 **v2.7.6** ships one product fix, made through `tickmarkr run` from a "gates fail closed" spec. The fix passed all

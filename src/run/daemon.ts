@@ -1400,7 +1400,7 @@ export async function observeWorkerProcessTree(marker: string, cwd: string): Pro
   if (snapshot.code !== 0) return "unmeasurable";
   const rows: { pid: string; ppid: string; command: string }[] = [];
   for (const line of snapshot.stdout.split("\n")) {
-    const match = /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(line);
+    const match = /^\s*(\d+)\s+(\d+)\s+(.*)$/s.exec(line);
     if (match) rows.push({ pid: match[1]!, ppid: match[2]!, command: match[3]! });
   }
   if (rows.length === 0) return "unmeasurable";
@@ -1438,7 +1438,7 @@ export function countLiveSuites(
 ): number {
   const rows: ProcessRow[] = [];
   for (const line of snapshot.split("\n")) {
-    const match = /^\s*(\d+)\s+(\d+)\s+(\S+)\s+(.*)$/.exec(line);
+    const match = /^\s*(\d+)\s+(\d+)\s+(\S+)\s+(.*)$/s.exec(line);
     if (match && !match[3]!.startsWith("Z")) {
       rows.push({ pid: Number(match[1]), ppid: Number(match[2]), command: match[4]! });
     }

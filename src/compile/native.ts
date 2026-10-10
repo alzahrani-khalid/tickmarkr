@@ -167,12 +167,14 @@ export const LEGACY_PREFIX = ["dro", "vr"].join("");
 export const TICKMARKR_NATIVE_MARKER = /^<!--\s*tickmarkr:spec(?:\s+v1)?\s*-->\s*$/m;
 export const NATIVE_MARKER = new RegExp(`^<!--\\s*(?:tickmarkr|${LEGACY_PREFIX}):spec(?:\\s+v1)?\\s*-->\\s*$`, "m");
 
-const HEAD_RE = /^## (T\d+):\s*(.+)$/;
-const FIELD_RE = /^- (\w+):\s*(.*)$/;
-const NESTED_RE = /^\s+- (.+)$/;
+// Queue row 130: the rest of a spec line is [^\r\n], never `.` — `.` misses U+2028/U+2029, and an acceptance item holding
+// one was glued onto its neighbour as a plain judge string, losing its own test: oracle (PRD and Spec Kit dropped it).
+const HEAD_RE = /^## (T\d+):\s*([^\r\n]+)$/;
+const FIELD_RE = /^- (\w+):\s*([^\r\n]*)$/;
+const NESTED_RE = /^\s+- ([^\r\n]+)$/;
 // v1.19: a typed acceptance oracle line — "command: ...", "test: ...", or "judge: ...". Anything
 // without one of these prefixes is a plain-string judge criterion (compat path, emits a warning).
-const ORACLE_RE = new RegExp(`^(${ORACLES.join("|")}):\\s*(.*)$`);
+const ORACLE_RE = new RegExp(`^(${ORACLES.join("|")}):\\s*([^\\r\\n]*)$`);
 const FIELDS = new Set(["goal", "shape", "deps", "files", "context", "complexity", "humangate", "pin", "floor", "gates", "acceptance", "timeout", "pins", "outofscope"]);
 
 interface Draft {
@@ -209,7 +211,7 @@ const PIN_GLOB_SEP = "| glob:";
 const LANDING_SEP = "| suite:";
 function parsePin(task: string, raw: string, index: number, pathSet: (value: string) => string[]): Pin {
   const bad = (detail: string): never => invalid(task, "pins", `item ${index + 1} (${JSON.stringify(raw)}) ${detail}`);
-  const typed = raw.match(/^(\w+):\s*(.*)$/);
+  const typed = raw.match(/^(\w+):\s*([^\r\n]*)$/);
   if (typed?.[1] === "fixture") {
     const paths = pathSet(typed[2]);
     if (!paths.length) bad("is a fixture pin missing its path set");
@@ -297,7 +299,7 @@ function testsAtHead(root: string): HeadTest[] {
   }
   const bodies = new Map<string, string[]>();
   for (const line of grep.stdout.split("\n")) {
-    const match = line.match(/^HEAD:(tests\/.*\.test\.ts):\d+:(.*)$/);
+    const match = line.match(/^HEAD:(tests\/[^\r\n]*\.test\.ts):\d+:([^\r\n]*)$/);
     if (!match) continue;
     const lines = bodies.get(match[1]) ?? [];
     lines.push(match[2]);
@@ -579,7 +581,7 @@ export function compileNative(file: string, options: { strict?: boolean } = {}):
     }
     const draft = drafts.at(-1);
     if (!draft) {
-      const base = line.match(/^base:\s*(.*)$/);
+      const base = line.match(/^base:\s*([^\r\n]*)$/);
       if (base) {
         const value = base[1].trim();
         if (!value) {

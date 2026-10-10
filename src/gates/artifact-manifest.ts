@@ -4,7 +4,7 @@
  * registered producer and repeats that producer's current provenance exactly.
  */
 
-import { diffSidePath, gitHeaderPaths, unquoteGitPath } from "./git-paths.js";
+import { diffSidePath, gitHeaderPaths, quoteGitPath, unquoteGitPath } from "./git-paths.js";
 
 export type CaptureProducerProvenance = {
   readonly source: string;
@@ -260,19 +260,23 @@ export function classifyArtifactPath(
   };
 }
 
-const SET_ASIDE_RECEIPT = /^set aside: regenerable capture (.+?) — \d+ bytes withheld\b/m;
+// Queue rows 128/129: patch text is split into lines at "\n" only. Under the m flag JS `^` and `$` also break at
+// U+2028/U+2029 (and `.` never matches them), so an added line holding one could forge a header line; these patterns
+// anchor on "\n" instead, and a name written back into the text is quoted (quoteGitPath) so it cannot end a line.
+const SET_ASIDE_RECEIPT = /(?<=^|\n)set aside: regenerable capture ([^\r\n]+?) — \d+ bytes withheld\b/;
 
 /** The path named by a citable capture receipt, or null when there is none. */
 export function setAsideReceiptPath(section: string): string | null {
-  return SET_ASIDE_RECEIPT.exec(section)?.[1] ?? null;
+  const path = SET_ASIDE_RECEIPT.exec(section)?.[1];
+  return path === undefined ? null : unquoteGitPath(path);
 }
 
-const DIFF_SECTIONS = /(?=^diff --git )/m;
+const DIFF_SECTIONS = /(?<=^|\n)(?=diff --git )/;
 
 function deletedPath(section: string): string | null {
-  if (!/^deleted file mode /m.test(section)) return null;
-  const oldPath = /^--- (.+)$/m.exec(section)?.[1]
-    ?? /^Binary files (.+) and \/dev\/null differ$/m.exec(section)?.[1];
+  if (!/(?<=^|\n)deleted file mode /.test(section)) return null;
+  const oldPath = /(?<=^|\n)--- ([^\r\n]+)/.exec(section)?.[1]
+    ?? /(?<=^|\n)Binary files ([^\r\n]+) and \/dev\/null differ(?=[\r\n]|$)/.exec(section)?.[1];
   return oldPath ? diffSidePath(oldPath) : null;
 }
 
@@ -286,7 +290,7 @@ export function reviewableLogicDiff(diff: string): string {
     if (setAsideReceiptPath(section)) return section;
     const path = deletedPath(section);
     if (!path || isProtectedEvidence(path)) return section;
-    return `deleted file: ${path}\n`;
+    return `deleted file: ${quoteGitPath(path)}\n`;
   }).join("");
 }
 
@@ -316,12 +320,12 @@ function parseContentSection(section: string): ParsedSection | null {
 
 function sectionPaths(section: string, parsed: ParsedSection | null): string[] {
   if (parsed) return [...new Set(parsed.sides.filter((path): path is string => path !== null))];
-  const renamedFrom = /^rename from (.+)$/m.exec(section)?.[1];
-  const renamedTo = /^rename to (.+)$/m.exec(section)?.[1];
+  const renamedFrom = /(?<=^|\n)rename from ([^\r\n]+)/.exec(section)?.[1];
+  const renamedTo = /(?<=^|\n)rename to ([^\r\n]+)/.exec(section)?.[1];
   if (renamedFrom || renamedTo) {
     return [...new Set([renamedFrom, renamedTo].filter((path): path is string => path !== undefined).map(unquoteGitPath))];
   }
-  const header = /^diff --git (.+)$/m.exec(section)?.[1];
+  const header = /(?<=^|\n)diff --git ([^\r\n]+)/.exec(section)?.[1];
   return header ? gitHeaderPaths(header) : [];
 }
 
@@ -398,7 +402,7 @@ export function measureArtifactDiff(
     };
   }
 
-  const rawSections = diff.split(/(?=^diff --git )/m);
+  const rawSections = diff.split(DIFF_SECTIONS);
   const kindOnly = kindOnlyPaths(rawSections);
   const rendered: string[] = [];
   const measurements: ArtifactDiffSection[] = [];
@@ -429,7 +433,7 @@ export function measureArtifactDiff(
     const withheld = parsed.lines.slice(parsed.minus).join("\n");
     const captureBytes = Buffer.byteLength(withheld, "utf8");
     const receiptPath = paths.at(-1)!;
-    const receipt = `set aside: regenerable capture ${receiptPath} — ${captureBytes} bytes withheld (producer ${producer.producer}; provenance ${producer.provenance.source}#${producer.provenance.entrypoint}@${producer.provenance.revision})`;
+    const receipt = `set aside: regenerable capture ${quoteGitPath(receiptPath)} — ${captureBytes} bytes withheld (producer ${producer.producer}; provenance ${producer.provenance.source}#${producer.provenance.entrypoint}@${producer.provenance.revision})`;
     const compact = `${parsed.lines.slice(0, parsed.minus).join("\n")}\n${receipt}\n`;
     rendered.push(compact);
     measurements.push({

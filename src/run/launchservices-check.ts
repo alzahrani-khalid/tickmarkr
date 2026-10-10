@@ -16,7 +16,7 @@ import type { AuthHealth, LaunchServicesRecord } from "../adapters/types.js";
 export const LAUNCHSERVICES_PROBE_CEILING_MS = 5_000;
 // lstart in the C locale: "Wed Sep 30 21:54:33 2026"; comm is the executable path on Darwin.
 const PS_ARGS = ["-A", "-o", "pid=,lstart=,comm="];
-const PS_LINE = /^\s*(\d+)\s+(\w{3}\s+\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\d{4})\s+(.+?)\s*$/;
+const PS_LINE = /^\s*(\d+)\s+(\w{3}\s+\w{3}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\d{4})\s+(.+?)\s*$/s;
 const MAX_PS_BYTES = 4 * 1024 * 1024;
 
 export interface LaunchServicesIdentity { pid: number; start: string }

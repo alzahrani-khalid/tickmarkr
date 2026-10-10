@@ -2,9 +2,10 @@ import { existsSync, readFileSync } from "node:fs";
 import { type RunGraph, validateGraph } from "../graph/schema.js";
 import { CompileError, inferShape, sha256 } from "./common.js";
 
-const HEAD_RE = /^## (T\d+):\s*(.+)$/;
-const FIELD_RE = /^- (\w+):\s*(.*)$/;
-const NESTED_RE = /^\s+- (.+)$/;
+// Queue row 130: [^\r\n], never `.` (U+2028/U+2029 inside a line).
+const HEAD_RE = /^## (T\d+):\s*([^\r\n]+)$/;
+const FIELD_RE = /^- (\w+):\s*([^\r\n]*)$/;
+const NESTED_RE = /^\s+- ([^\r\n]+)$/;
 
 export function compilePrd(file: string): RunGraph {
   if (!existsSync(file)) throw new CompileError(`no such PRD file: ${file}`);

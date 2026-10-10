@@ -24,6 +24,26 @@ export function unquoteGitPath(raw: string): string {
   return Buffer.from(bytes).toString("utf8");
 }
 
+const NAMED: Readonly<Record<number, string>> = Object.fromEntries(Object.entries(ESCAPES).map(([name, code]) => [code, name]));
+
+/**
+ * Queue rows 128/129: the inverse of unquoteGitPath, for a name tickmarkr writes back into patch text it parses again.
+ * A name holding a control character, U+2028/U+2029, a double quote or a backslash is C-quoted (those characters
+ * escaped, every other character kept), so no name can end a line; any other name is returned as is.
+ */
+export function quoteGitPath(path: string): string {
+  if (!/[\x00-\x1f\x7f"\\\u2028\u2029]/.test(path)) return path;
+  let quoted = "";
+  for (const ch of path) {
+    const code = ch.codePointAt(0)!;
+    if (NAMED[code] !== undefined) quoted += `\\${NAMED[code]}`;
+    else if (code < 0x20 || code === 0x7f || code === 0x2028 || code === 0x2029) {
+      quoted += [...Buffer.from(ch, "utf8")].map((byte) => `\\${byte.toString(8).padStart(3, "0")}`).join("");
+    } else quoted += ch;
+  }
+  return `"${quoted}"`;
+}
+
 /**
  * One side of a `--- ` / `+++ ` line, after its four-character marker: null for /dev/null, else the path without its
  * a/ or b/ prefix. git ends a side holding a space with ONE tab (quoted or not, measured on git 2.54) — exactly that tab
