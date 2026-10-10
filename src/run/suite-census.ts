@@ -27,6 +27,32 @@ const probeExec: ProbeExec = (file, args) => new Promise((resolve) => {
   }
 });
 
+// D-1567 batch poisoning: lsof and ps fail the WHOLE command for one -p member they cannot take (a marker of 22 digits
+// prints as 1e+21, 310 nines as Infinity; ps refuses one above int32), erasing every other pid's answer. The base probed
+// per pid, so such a pid lost only its own answer: it stays unanswered here and never joins a batch.
+const probeable = (pid: number) => Number.isSafeInteger(pid) && pid > 0 && pid <= 2_147_483_647;
+
+/** Each pid's working directory: /proc first, then ONE batched lsof for the rest; never rejects, and reads no process
+ * environment (the runner-lease wait names blockers through it, queue row 120). Answers land in `cwds`. */
+export async function batchedProcessCwds(pids: readonly number[], exec: ProbeExec = probeExec, proc: ProcReader = procReader,
+  cwds = new Map<number, string>()): Promise<Map<number, string>> {
+  const rest: number[] = [];
+  for (const pid of pids.filter(probeable)) {
+    try { cwds.set(pid, proc.cwd(pid)); } catch { rest.push(pid); } // Darwin has no /proc
+  }
+  if (rest.length === 0) return cwds;
+  let listing = "";
+  try { listing = await exec("lsof", ["-a", "-p", rest.join(","), "-d", "cwd", "-Fn"]); } catch { /* the census never rejects */ }
+  let pid: number | undefined;
+  for (const line of listing.split("\n")) {
+    if (line.startsWith("p")) pid = Number(line.slice(1));
+    else if (line.startsWith("n") && pid !== undefined) {
+      try { cwds.set(pid, realpathSync(line.slice(1))); } catch { /* the directory is gone */ }
+    }
+  }
+  return cwds;
+}
+
 /** The pids of every live (non-zombie) row of a `ps -o pid=,ppid=,state=,command=` snapshot whose command is a runner. */
 export function runnerPids(snapshot: string): number[] {
   const pids: number[] = [];
@@ -58,25 +84,7 @@ export async function batchedProcessProbes(pids: readonly number[], exec: ProbeE
   const cwds = new Map<number, string>();
   const parents = new Map<number, number>();
   const parentIn = (text: string) => new RegExp(`(?:^|\\s)${SUITE_PARENT_ENV}=(\\d+)(?:\\s|$)`).exec(text)?.[1];
-  // D-1567 batch poisoning: lsof and ps fail the WHOLE command for one -p member they cannot take (a marker of 22 digits
-  // prints as 1e+21, 310 nines as Infinity; ps refuses one above int32), erasing every other pid's answer. The base probed
-  // per pid, so such a pid lost only its own answer: it stays unanswered here and never joins a batch.
-  const probeable = (pid: number) => Number.isSafeInteger(pid) && pid > 0 && pid <= 2_147_483_647;
-
-  const probeCwds = async (wanted: readonly number[]) => {
-    const rest: number[] = [];
-    for (const pid of wanted.filter(probeable)) {
-      try { cwds.set(pid, proc.cwd(pid)); } catch { rest.push(pid); } // Darwin has no /proc
-    }
-    if (rest.length === 0) return;
-    let pid: number | undefined;
-    for (const line of (await ask("lsof", ["-a", "-p", rest.join(","), "-d", "cwd", "-Fn"])).split("\n")) {
-      if (line.startsWith("p")) pid = Number(line.slice(1));
-      else if (line.startsWith("n") && pid !== undefined) {
-        try { cwds.set(pid, realpathSync(line.slice(1))); } catch { /* the directory is gone */ }
-      }
-    }
-  };
+  const probeCwds = (wanted: readonly number[]) => batchedProcessCwds(wanted, ask, proc, cwds);
   const probeParents = async (wanted: readonly number[]) => {
     const rest: number[] = [];
     for (const pid of wanted.filter(probeable)) {

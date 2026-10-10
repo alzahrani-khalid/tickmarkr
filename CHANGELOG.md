@@ -2,6 +2,21 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v2.7.5 — a lease wait kept alive by a killed run's leftover process names that process
+
+**v2.7.5** ships one product fix. It was made by hand and proven by its own `tickmarkr verify`: build, lint, evidence,
+scope, executed acceptance, cross-vendor review (`codex:gpt-6-astra`, OpenAI, reviewing Claude-authored work) and the
+full suite. No `tickmarkr run` was used.
+
+- **A runner-lease wait kept alive by a leftover process names it (affected: 2.6.7 – 2.7.4).** Since 2.6.7 a lease is
+  never reclaimed while a process its run started still carries the lease token, which is right. But the wait named
+  only the run that took the lease (`verify: waiting for the repository's runner lease held by pid P in C`), and that
+  run had often already exited, so the next `tickmarkr verify` could wait silently behind a process nobody named. The
+  wait now names every such process by pid, executable and working directory. It prints none of a process's arguments
+  and none of its environment, because a command line can carry a token whose end no redaction can find. It names them
+  again if that set changes, a second wait queued in the same process names them too, and the message says they keep
+  the lease until they exit. A wait behind a live run reads as before.
+
 ## v2.7.4 — a version bump keeps `tickmarkr verify`'s cached test baseline
 
 **v2.7.4** ships one product fix. It was made by hand and proven by its own `tickmarkr verify`: build, lint, evidence,

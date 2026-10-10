@@ -16,7 +16,7 @@ import { GATE_NAMES, type AcceptanceItem, type GateName, type Task } from "../..
 import { executionSignal } from "../../run/execution-budget.js";
 import { addDetachedWorktree, linkNodeModules, removeWorktree, shGit, shGitOk } from "../../run/git.js";
 import { foldOwedChecks, integrationMapped, owedCriteria, Journal, OWED_DISCHARGE_EVENT, type OwedCheck, type OwedFold } from "../../run/journal.js";
-import { withRepositoryLease } from "../../run/lease.js";
+import { describeLeaseWait, withRepositoryLease } from "../../run/lease.js";
 import { isPidLive } from "../../run/lock.js";
 import { recordLaunchServices } from "../../run/launchservices-check.js";
 
@@ -511,9 +511,9 @@ export async function verify(argv: string[], cwd = process.cwd(), options: { evi
       return after ? rows.map((r) => ({ ...r, pass: false, details: `${refused(after)}\n${r.details}`, meta: { ...r.meta, subjectChanged: after } })) : rows;
     }, {
       signal: executionSignal(),
-      onWait: (holder) => {
-        console.error(`verify: waiting for the repository's runner lease held by pid ${holder.pid} in ${holder.cwd}`);
-        recordJournal?.append("suite-wait", values.task ?? "VERIFY", { holderPid: holder.pid, holderCwd: holder.cwd });
+      onWait: (holder, blockers) => {
+        console.error(`verify: waiting for the repository's runner lease ${describeLeaseWait(holder, blockers)}`);
+        recordJournal?.append("suite-wait", values.task ?? "VERIFY", { holderPid: holder.pid, holderCwd: holder.cwd, ...(blockers ? { blockers } : {}) });
       },
     });
     results = [...results, ...suite].sort((a, b) => GATE_NAMES.indexOf(a.gate as GateName) - GATE_NAMES.indexOf(b.gate as GateName));

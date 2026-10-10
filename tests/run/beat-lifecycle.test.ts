@@ -643,17 +643,22 @@ describe("beat start", () => {
 
     // 60000 ms overrun: a real beat that only reads back after the ceiling still refuses and rolls back.
     const overrun = mkRepo();
-    // A clock frozen at launch that reads 60001 ms later the moment the beat exists: that beat, written
-    // after launch, is still fresh (ARMED), so only the overrun clause stands between it and a reported start.
+    // A clock frozen at launch that reads 60001 ms later once the read-back has SEEN the beat: that beat,
+    // written after launch, is still fresh (ARMED), so only the overrun clause stands between it and a reported
+    // start. Queue row 123: the jump latches at the identity read, which checkOwnedGeneration makes before it reads
+    // the records, so a beat landing between the loop's records read and its deadline check cannot jump the clock
+    // under the loop (that raced into "no beat ... within 60000 ms", D-1717).
     let launchedAt: number | undefined;
+    let beatSeen = false;
     let unreadableExit = false;
     const lateKills: Array<[number, string]> = [];
     const late = deps({
       now: () => {
         launchedAt ??= Date.now();
-        return launchedAt + (existsSync(supervisionBeatPath(overrun, "overseer")) ? 60_001 : 0);
+        return launchedAt + (beatSeen ? 60_001 : 0);
       },
       identity: (pid) => {
+        beatSeen ||= existsSync(supervisionBeatPath(overrun, "overseer"));
         // Real identity inspection can lose cwd after ps observed a process that our SIGTERM is
         // retiring. That UNKNOWN must wait for confirmed death, not abandon the owned rollback.
         if (lateKills.length > 0 && !unreadableExit) { unreadableExit = true; return "UNKNOWN"; }

@@ -109,11 +109,15 @@ export interface RepositoryLeaseHolder {
   roots?: number[];
   rootBirths?: Record<string, string>;
 }
+/** Queue row 120: a live process keeping a dead or released holder's lease, as the wait names it: pid, executable and
+ * cwd. Its arguments and environment are never printed or read (`ps -o comm=`, the census's cwd-only probe). */
+export interface LeaseBlocker { pid: number; executable: string; cwd?: string }
 export interface RepositoryLeaseOptions {
   pollMs?: number;
   signal?: AbortSignal;
-  /** Called once per distinct holder the waiter is queued behind. */
-  onWait?: (holder: RepositoryLeaseHolder) => void;
+  /** Called once per distinct holder the waiter is queued behind, and again whenever the set of processes keeping a
+   * dead holder's lease changes; `blockers` names that set (queue row 120). */
+  onWait?: (holder: RepositoryLeaseHolder, blockers?: readonly LeaseBlocker[]) => void;
   /** The token a descendant inherited; defaults to REPOSITORY_LEASE_TOKEN_ENV. */
   inherited?: string;
   /** Manifest jobs bridge capabilities through explicit child environments, never process.env. */
@@ -289,15 +293,44 @@ const reclaimDeadLocked = (path: string, identity: string): boolean => {
 export const reclaimDead = async (path: string, identity: string, pollMs = 10): Promise<boolean> =>
   withMutationLock(path, pollMs, undefined, () => reclaimDeadLocked(path, identity));
 
-const inspectAndReserve = async (path: string, mine: RepositoryLeaseHolder): Promise<{ acquired: boolean; holder?: RepositoryLeaseHolder }> => {
+const inspectAndReserve = async (path: string, mine: RepositoryLeaseHolder): Promise<{ acquired: boolean; holder?: RepositoryLeaseHolder; blocking?: number[] }> => {
   let occupant = readOccupant(path);
-  if (occupant && (!occupant.holder || (!holderAlive(occupant.holder) && !(occupant.holder.protectOrphans && (await protectedProcesses(occupant.holder)).length)))) {
+  const dead = occupant?.holder !== undefined && !holderAlive(occupant.holder);
+  // A dead holder's protected tree is what keeps the lease; the waiter is told which processes those are (queue row 120).
+  const blocking = dead && occupant!.holder!.protectOrphans ? await protectedProcesses(occupant!.holder!) : [];
+  if (occupant && (!occupant.holder || (dead && !blocking.length))) {
     reclaimDeadLocked(path, occupant.identity);
     occupant = readOccupant(path);
   }
   if (!occupant && tryReserve(path, mine)) return { acquired: true };
-  return { acquired: false, holder: occupant?.holder };
+  return { acquired: false, holder: occupant?.holder, ...(blocking.length ? { blocking } : {}) };
 };
+
+/** Each blocker's pid, executable and working directory, and NO argument: `ps -o comm=` (a command line joins argv with
+ * spaces, so no redaction could tell where a secret value ends, D-1710). The cwd comes from the census's cwd-only probe
+ * (async, batched, never rejecting, no environment read; queue row 103: no synchronous lsof on a waiting loop), imported
+ * lazily because suite-census imports this module. Diagnostics only: an unreadable process reads "(executable
+ * unreadable)", and this never throws into the wait. */
+export async function describeLeaseBlockers(pids: readonly number[]): Promise<LeaseBlocker[]> {
+  const rows = await new Promise<string>((done) => {
+    try { execFile("ps", ["-o", "pid=,comm=", "-p", pids.join(",")], { encoding: "utf8", timeout: 5_000 }, (_error, stdout) => done(stdout ?? "")); }
+    catch { done(""); }
+  });
+  const executables = new Map(rows.split("\n").flatMap((line) => { const row = /^\s*(\d+)\s+(.*)$/.exec(line); return row ? [[Number(row[1]), row[2]!.trim()] as const] : []; }));
+  const cwds = await import("./suite-census.js").then(({ batchedProcessCwds }) => batchedProcessCwds(pids)).catch(() => undefined);
+  return pids.map((pid) => {
+    const cwd = cwds?.get(pid);
+    return { pid, executable: executables.get(pid) || "(executable unreadable)", ...(cwd ? { cwd } : {}) };
+  });
+}
+/** The wait's own words: the holder alone while it lives; once it has exited or released the lease, every process still
+ * keeping it. */
+export function describeLeaseWait(holder: RepositoryLeaseHolder, blockers?: readonly LeaseBlocker[]): string {
+  const held = `held by pid ${holder.pid} in ${holder.cwd}`;
+  if (!blockers?.length) return held;
+  const named = blockers.map((b) => `pid ${b.pid} ${b.executable}${b.cwd ? ` (cwd ${b.cwd})` : ""}`).join("; ");
+  return `${held}, which has exited or released it; ${blockers.length} process(es) it started still run and keep the lease until they exit: ${named}`;
+}
 
 // A durable capability is also a crash owner: census checks the exact generation's inherited
 // environment and recorded process groups, including live orphans reparented after owner death.
@@ -362,6 +395,8 @@ export function registerRepositoryChild(pid: number | undefined): void {
 export const withFreshCommandLease = <T>(command: string, run: () => Promise<T>): Promise<T> =>
   ownership.run({ token: "", active: false }, () => withCommandLease(command, run));
 const repositoryQueues = new Map<string, Set<symbol>>();
+/** Queue row 120: the queue head's last view of what keeps a dead holder's lease, so in-process followers name it too. */
+const repositoryBlocking = new Map<string, { token: string; blocking: readonly number[] }>();
 
 /** The standalone wrapper uses the same command-then-repository order when a scheduler exists.
  * Without one (CLI/global setup), this remains exactly the outer file reservation API. */
@@ -396,17 +431,26 @@ async function repositoryLease<T>(cwd: string, run: () => Promise<T>, opts: Repo
   const ticket = Symbol("repository job");
   queue.add(ticket);
   let waitingOn: string | undefined;
-  const waitOn = (holder: RepositoryLeaseHolder | undefined) => {
-    if (holder && holder.token !== waitingOn) { waitingOn = holder.token; opts.onWait?.(holder); }
+  const waitOn = async (holder: RepositoryLeaseHolder | undefined, blocking: readonly number[] = []) => {
+    const key = holder && `${holder.token}\0${[...blocking].sort((a, b) => a - b).join(",")}`;
+    if (holder && key !== waitingOn) {
+      waitingOn = key;
+      opts.onWait?.(holder, blocking.length ? await describeLeaseBlockers(blocking) : undefined);
+    }
   };
   try {
     for (;;) {
       opts.signal?.throwIfAborted();
       if (queue.values().next().value === ticket) {
         const attempt = await withMutationLock(path, pollMs, opts.signal, () => inspectAndReserve(path, mine));
-        if (attempt.acquired) break;
-        waitOn(attempt.holder);
-      } else waitOn(readHolder(path));
+        if (attempt.acquired) { repositoryBlocking.delete(path); break; }
+        if (attempt.holder) repositoryBlocking.set(path, { token: attempt.holder.token, blocking: attempt.blocking ?? [] });
+        await waitOn(attempt.holder, attempt.blocking);
+      } else {
+        const holder = readHolder(path);
+        const seen = repositoryBlocking.get(path);
+        await waitOn(holder, holder && seen?.token === holder.token ? seen.blocking : []);
+      }
       await new Promise(wake => setTimeout(wake, pollMs));
     }
     const exported = process.env[REPOSITORY_LEASE_TOKEN_ENV];
@@ -448,7 +492,7 @@ async function repositoryLease<T>(cwd: string, run: () => Promise<T>, opts: Repo
     }
   } finally {
     queue.delete(ticket);
-    if (!queue.size) repositoryQueues.delete(path);
+    if (!queue.size) { repositoryQueues.delete(path); repositoryBlocking.delete(path); }
     // A waiter removes no repository generation, including cancellation before acquisition.
   }
 }

@@ -35,7 +35,10 @@ test.each(["deadline", "census"] as const)("a release %s failure hands the owned
   // cleanup cannot signal it. Advance only the reap clock; no slow-runner wall deadline.
   vi.spyOn(childProcesses, "execFile").mockImplementation(((file: string, args: string[], _options: childProcesses.ExecFileOptions,
     done: (error: Error | null, stdout: string, stderr: string) => void) => {
-    expect(file).toBe("ps");
+    if (file !== "lsof") expect(file).toBe("ps");
+    // queue row 120: a wait behind the released holder names its live blocker through one env-free ps
+    if (args[0] === "-o" && args[1] === "pid=,comm=") { queueMicrotask(() => done(null, "900001 node orphan\n", "")); return { pid: 900003 } as childProcesses.ChildProcess; }
+    if (file === "lsof" || args.includes("-p")) { queueMicrotask(() => done(null, "", "")); return { pid: 900004 } as childProcesses.ChildProcess; } // its cwd/parent probes
     expect(args).toEqual(["eww", "-A", "-o", "pid=,ppid=,pgid=,stat=,command="]);
     if (fault === "deadline" && ++censuses === 2) now = 15_000;
     queueMicrotask(() => done(censusFails ? new Error("census unavailable") : null,

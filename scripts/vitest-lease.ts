@@ -11,7 +11,7 @@
 import { execFileSync, spawnSync } from "node:child_process";
 import { rmSync } from "node:fs";
 import { parseCLI, type TestProject } from "vitest/node";
-import { readHolder, REPOSITORY_LEASE_TOKEN_ENV, repositoryLeasePath, withRepositoryLease } from "../src/run/lease.js";
+import { describeLeaseWait, readHolder, REPOSITORY_LEASE_TOKEN_ENV, repositoryLeasePath, withRepositoryLease } from "../src/run/lease.js";
 
 /** `vitest list` (manifest discovery) collects and never executes a test body: it takes no lease, so a
  * listing issued while its own parent holds the lease can never block on it. The command is read the way
@@ -96,7 +96,7 @@ export default async function vitestLease(project: TestProject): Promise<(() => 
       acquired();
       return new Promise<void>((resolve) => { release = resolve; });
     }, {
-      onWait: (holder) => console.error(`tickmarkr: vitest waits for this repository's runner lease held by pid ${holder.pid} in ${holder.cwd}`),
+      onWait: (holder, blockers) => console.error(`tickmarkr: vitest waits for this repository's runner lease ${describeLeaseWait(holder, blockers)}`),
     });
     await Promise.race([holding, done]);
     // Cancellation: Vitest answers SIGINT/SIGTERM with process.exit() and never runs global teardown or

@@ -5,7 +5,7 @@ import type { ShellReceipt } from "./protocol.js";
 import type { GateEvidenceOptions } from "../gates/baseline.js";
 import { shGit } from "./git.js";
 import { executionSignal } from "./execution-budget.js";
-import { hasRepositoryLeaseOwnership, readHolder, REPOSITORY_LEASE_TOKEN_ENV, reentrantHolder, repositoryLeasePath, reapRepositoryChildren, withCommandLease, withFreshCommandLease, withRepositoryLease, type RepositoryLeaseHolder } from "./lease.js";
+import { hasRepositoryLeaseOwnership, readHolder, REPOSITORY_LEASE_TOKEN_ENV, reentrantHolder, repositoryLeasePath, reapRepositoryChildren, withCommandLease, withFreshCommandLease, withRepositoryLease, type LeaseBlocker, type RepositoryLeaseHolder } from "./lease.js";
 
 // closed job table: command admission precedes repository admission; the standalone wrapper
 // acquires that same scheduler reservation before its outer repository reservation. Both hold until the first pass and at most
@@ -41,7 +41,7 @@ export interface VerificationJobReport {
   releasedAt?: number;
   reservationReused?: boolean;
   reservation?: RepositoryLeaseHolder;
-  waitingOn?: RepositoryLeaseHolder;
+  waitingOn?: RepositoryLeaseHolder & { blockers?: readonly LeaseBlocker[] };
   state: "queued" | "running" | "completed" | "failed" | "cancelled";
   phases: VerificationPhase[];
 }
@@ -148,7 +148,7 @@ export async function withVerificationJob<T extends { pass: boolean; meta: Recor
         }
       }));
     }, { isolated: true, protectOrphans: true, independent: !!jobs.getStore(), signal, pollMs: 20,
-      onWait: holder => { report.waitingOn = { ...holder }; job.persist(); },
+      onWait: (holder, blockers) => { report.waitingOn = { ...holder, ...(blockers ? { blockers } : {}) }; job.persist(); },
       onAdmission: holder => { owner = holder; report.repositoryAdmittedAt = clock(); report.reservation = { ...holder }; job.persist(); },
       onRelease: () => { report.reapedAt ??= clock(); report.repositoryReleasedAt = clock(); job.persist(); } }));
     report.releasedAt = clock();
