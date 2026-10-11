@@ -2,6 +2,31 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v2.7.8 — public CI can no longer pass a missing job, a stray verdict line or an empty coverage floor
+
+**v2.7.8** comes from one `tickmarkr run` of six tasks (run-20261011-134758-…1074). Every task passed build, lint, evidence,
+scope, the executed acceptance judge, a cross-vendor review and the full suite, and the run's tip verify passed. The sixth
+task, the switch to sharded public CI, was reverted before this release (below). The only change to what npm ships is the
+overseer skill's CI grader; no `src/` file changed.
+
+- **The overseer skill's CI grader grades every job it expects, and reads each verdict only where it belongs (affected:
+  `skills/tickmarkr-overseer/scripts/grade-ci.sh`, 2.4.1 – 2.7.7).** It used to grade two named jobs and skip any other,
+  so an extra failing job graded GREEN, and it took the LAST count-oracle line anywhere in a job log, so a later line printed
+  by a test or another step could decide the grade. It now grades one closed inventory (serial `test` + `test-macos`, or
+  the twelve jobs of the sharded form): a missing, duplicated or unknown job reads UNREADABLE, and each verdict line is read
+  only from its own step, exactly once. A serial job also needs a GREEN coverage-floors line, so grading a CI run made by an
+  older workflow (which has no floors step) now reads UNREADABLE instead of GREEN. Exit codes are unchanged: 0 GREEN, 1 RED,
+  2 UNREADABLE, 3 INFRA_KILLED.
+- **Coverage floors fail closed (repository CI, queue row 118).** A per-folder floor whose glob matched no file, or only
+  files with no executable code, read 100 % and passed (istanbul scores 0 of 0 as 100). Both public CI jobs now recheck
+  every floor over their coverage summary, and such a floor is RED.
+- **Sharded public CI is built but not switched on (repository CI, queue row 6).** The repository carries the tooling for
+  four duration-balanced shards per OS: a shard planner over a committed duration table, a CI wrapper that holds each shard
+  to its planned file list as a set, a per-OS set oracle, and a command that compares a serial and a sharded run of one
+  commit. The parity run that gates the switch was not green: one macOS shard failed a timing-sensitive test that is
+  unchanged since 2.7.7. So the workflow switch was reverted before this release, and public CI stays serial until that test
+  is fixed and a parity run is green.
+
 ## v2.7.7 — an invisible line break can no longer hide code from the gates
 
 **v2.7.7** ships four product fixes for one class of defect. They were made by hand and proven by their own `tickmarkr verify`:

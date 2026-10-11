@@ -19,7 +19,8 @@ const files = ["tests/ordinary.test.ts", "tests/cockpit/sweep.test.ts", "tests/c
 function seed(repo: string) {
   cpSync(join(root, "src"), join(repo, "src"), { recursive: true });
   cpSync(join(root, "vitest.config.ts"), join(repo, "vitest.config.ts"));
-  cpSync(join(root, "scripts/vitest-lease.ts"), join(repo, "scripts/vitest-lease.ts")); // the config's globalSetup
+  // SHARED CONVENTION (v2.7.8): the whole scripts/ directory — the config's globalSetup and sequencer included
+  cpSync(join(root, "scripts"), join(repo, "scripts"), { recursive: true });
   writeFileSync(join(repo, ".gitignore"), readFileSync(join(root, ".gitignore"), "utf8") + "\nnode_modules\n");
   writeFileSync(join(repo, "package.json"), JSON.stringify({ type: "module" }));
   mkdirSync(join(repo, "tests"), { recursive: true });

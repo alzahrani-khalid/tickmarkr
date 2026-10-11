@@ -225,7 +225,7 @@ test("each live release encoding reaches its production path, including a worker
   expect(dispatches(afterApproval(events, "U"), "U")).toHaveLength(1);
   expect(readFileSync(join(Journal.open(repo, runId).dir, "prompts", "U-a0.md"), "utf8")).toContain("reviewer finding: fix the board");
   expect(dispatches(afterApproval(events, "C"), "C")[0]?.data.attempt).toBe(0);
-});
+}, 240_000); // queue row 131: ~8.7 s alone, >20 s under a full-suite load (2.7.8 verify:export) — the recheck-battery ceiling its neighbour carries
 
 test("test: the daemon's worker slot request carries the assignment's adapter id in its agent field so the orca driver's hook table applies to it whereas a slot request without the agent field fails", async () => {
   const { repo, fake } = setupRepo([T("T1")], { tasks: {

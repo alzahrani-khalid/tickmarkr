@@ -55,21 +55,28 @@ const block = (...payloads: string[]) =>
     "",
   ].join("\n");
 // gh renders a job log line as "<job>\t<step>\t<timestamp> <text>"
-const ghJobLog = (log: string) =>
-  log.split("\n").map((line) => `test\tRun coverage proof (parallel suite project)\t2026-09-25T20:33:15.0679633Z ${line}`).join("\n");
+const inStep = (step: string, log: string) =>
+  log.split("\n").map((line) => `test\t${step}\t2026-09-25T20:33:15.0679633Z ${line}`).join("\n");
+const ghJobLog = (log: string) => inStep("Run coverage proof (parallel suite project)", log);
+// v2.7.8 T4: a serial job's verdict lines count only from their declared steps, so each fixture job prints
+// its floors line and its count oracle there, after the Vitest steps
+const verdicts = (oracle = ORACLE) =>
+  inStep("Recheck coverage floors", "COVERAGE_FLOORS verdict=GREEN floors=6 failing=0") + "\n"
+  + inStep("Assert collected test-file count", oracle.trimEnd()) + "\n";
+const serialJob = (log: string, oracle = ORACLE) => ghJobLog(log) + "\n" + verdicts(oracle);
 
 const LOGS = {
   empty: undefined,
-  green: summary() + ORACLE,
-  unhandled: block("TypeError: boom", "TypeError: bang") + summary(2) + ORACLE,
-  rpc: block(RPC) + summary(1) + ORACLE,
-  "rpc-mixed": block(RPC, "TypeError: boom") + summary(2) + ORACLE,
-  "rpc-stray": `stderr | tests/x.test.ts > case\n${RPC}\n` + block("TypeError: boom") + summary(1) + ORACLE,
-  "rpc-shadow": block(`TypeError: boom\n${RPC}`) + summary(1) + ORACLE,
-  "rpc-prose": `stdout | tests/x.test.ts > case: Unhandled Error handler installed\n${RPC}\n` + block("TypeError: boom") + summary(1) + ORACLE,
-  "rpc-quoted": block('AssertionError: expected "Error: [vitest-worker]: Timeout calling \\"onTaskUpdate\\"" to be undefined') + summary(1) + ORACLE,
-  "rpc-forged": `stdout | tests/x.test.ts > case\n${banner("Unhandled Error")}\n${RPC}\n` + block("TypeError: boom") + summary(1) + ORACLE,
-  "rpc-styled": [
+  green: serialJob(summary()),
+  unhandled: serialJob(block("TypeError: boom", "TypeError: bang") + summary(2)),
+  rpc: serialJob(block(RPC) + summary(1)),
+  "rpc-mixed": serialJob(block(RPC, "TypeError: boom") + summary(2)),
+  "rpc-stray": serialJob(`stderr | tests/x.test.ts > case\n${RPC}\n` + block("TypeError: boom") + summary(1)),
+  "rpc-shadow": serialJob(block(`TypeError: boom\n${RPC}`) + summary(1)),
+  "rpc-prose": serialJob(`stdout | tests/x.test.ts > case: Unhandled Error handler installed\n${RPC}\n` + block("TypeError: boom") + summary(1)),
+  "rpc-quoted": serialJob(block('AssertionError: expected "Error: [vitest-worker]: Timeout calling \\"onTaskUpdate\\"" to be undefined') + summary(1)),
+  "rpc-forged": serialJob(`stdout | tests/x.test.ts > case\n${banner("Unhandled Error")}\n${RPC}\n` + block("TypeError: boom") + summary(1)),
+  "rpc-styled": serialJob([
     "^[[31m⎯⎯^[[39m^[[1m^[[41m Unhandled Errors ^[[49m^[[22m^[[31m⎯⎯^[[39m",
     "^[[31m^[[1m",
     "Vitest caught 1 unhandled error during the test run.",
@@ -84,7 +91,7 @@ const LOGS = {
     banner("Unhandled Error"),
     RPC,
     "",
-  ].join("\n"),
+  ].join("\n")),
 } as const;
 
 function fixture() {
@@ -227,7 +234,7 @@ describe("grade-ci.sh job-log controls", () => {
     for (const [name, log, status, green] of cases) {
       const ci = await wrap(log, status);
       // the job log CI produces for that raw outcome: the step's own exit annotation and conclusion
-      const job = ghJobLog(log + (status ? `##[error]Process completed with exit code ${status}.\n` : "")) + "\n" + ORACLE;
+      const job = serialJob(log + (status ? `##[error]Process completed with exit code ${status}.\n` : ""));
       const graded = await grade(10, job, "agree", status ? "failure" : "success");
       expect(ci.status === 0, `${name}: wrapper exit ${ci.status}\n${ci.stdout}`).toBe(green);
       if (!green && status !== 1) expect(ci.status, name).toBe(status);
@@ -238,7 +245,7 @@ describe("grade-ci.sh job-log controls", () => {
 
     // a cancelled job, or a failure no step exit explains, never grades GREEN
     for (const conclusion of ["cancelled", "failure"]) {
-      const graded = await grade(10, ghJobLog(summary()) + "\n" + ORACLE, "concl", conclusion);
+      const graded = await grade(10, serialJob(summary()), "concl", conclusion);
       expect(graded.status, conclusion).toBe(1);
       expect(graded.stdout, conclusion).toContain("test: RED");
     }
@@ -254,7 +261,7 @@ describe("grade-ci.sh job-log controls", () => {
     const ci = await wrap(rpcOnly, 1);
     expect(ci.status, ci.stdout).toBe(0);
     expect(ci.stdout).toContain("VITEST_LOG verdict=RPC_ONLY");
-    const job = ghJobLog(rpcOnly + "##[error]Process completed with exit code 1.\n") + "\n" + ORACLE;
+    const job = serialJob(rpcOnly + "##[error]Process completed with exit code 1.\n");
     const graded = await grade(10, job, "fingerprint", "failure");
     expect(graded.status, graded.stdout).toBe(0);
     expect(graded.stdout).toMatch(/^test: oracle=.* timedout=0 /m);
@@ -262,7 +269,7 @@ describe("grade-ci.sh job-log controls", () => {
     const real = " FAIL  tests/slow.test.ts > waits\nError: Test timed out in 5000ms.\n" + block(RPC)
       + summary(1, "1 failed | 7 passed | 2 skipped (10)", "1 failed | 39 passed | 3 skipped (43)");
     expect((await wrap(real, 1)).status).toBe(1);
-    expect((await grade(10, ghJobLog(real + "##[error]Process completed with exit code 1.\n") + "\n" + ORACLE, "real", "failure")).stdout)
+    expect((await grade(10, serialJob(real + "##[error]Process completed with exit code 1.\n"), "real", "failure")).stdout)
       .toMatch(/^test: oracle=.* timedout=1 .*\ntest: RED$/m);
   });
 
@@ -390,18 +397,18 @@ describe("grade-ci.sh job-log controls", () => {
       expect(graded.stdout, name).not.toMatch(/^test(-macos)?: INFRA_KILLED$/m);
     }
     // partial expected files through the grader: the classifier names it on the job line
-    const partial = await grade(10, ghJobLog(sevenRpcOnly) + "\nCOUNT_ORACLE RED expected=10 actual=7\n", "partial");
+    const partial = await grade(10, serialJob(sevenRpcOnly, "COUNT_ORACLE RED expected=10 actual=7"), "partial");
     expect(partial.status).toBe(1);
     expect(partial.stdout).toMatch(/^test: oracle=.* log=\[partial\] .*\ntest: RED$/m);
     // a never-started declared project through the grader: the coverage step's 10 complete, the single-fork
     // step's 6 of its 10 — built-cli never started — against the job's 20 tracked files
     const noBuiltCli = ghStep(COVERAGE, block(RPC) + summary(1, "10 passed (10)", "30 passed (30)"))
-      + ghStep(SINGLE_FORK, printedRecord + summary(0, "6 passed (6)", "18 passed (18)")) + "\nCOUNT_ORACLE RED expected=20 actual=16\n";
+      + ghStep(SINGLE_FORK, printedRecord + summary(0, "6 passed (6)", "18 passed (18)")) + verdicts("COUNT_ORACLE RED expected=20 actual=16");
     const neverStartedGrade = await grade(20, noBuiltCli, "never-started");
     expect(neverStartedGrade.status, neverStartedGrade.stdout).toBe(1);
     expect(neverStartedGrade.stdout).toMatch(/^test: oracle=.* log=\[partial\] .*\ntest: RED$/m);
     // mixed jobs: a red job dominates a killed one, an unreadable one stays unknown, a green one leaves the kill
-    const green = ghJobLog(summary()) + "\n" + ORACLE;
+    const green = serialJob(summary());
     expect((await grade(10, killed, "mixed-red", "failure", killedAfterFailure)).status).toBe(1);
     expect((await grade(10, killed, "mixed-unreadable", "failure", "")).status).toBe(2);
     const mixedGreen = await grade(10, killed, "mixed-green", "failure", green, "success");

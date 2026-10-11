@@ -1,5 +1,7 @@
 import { VITEST_CACHE_ENV, worktreeVitestCache } from "./src/gates/test-manifest.js";
+import { resolve } from "node:path";
 import { configDefaults, coverageConfigDefaults, defineConfig } from "vitest/config";
+import LptSequencer from "./scripts/ci/shard.js";
 import { DEFAULT_FORK_CAP } from "./src/run/git.js";
 
 // v1.22 T3 / OBS-17: seal herdr control-plane vars before workers fork so the suite never inherits
@@ -101,7 +103,16 @@ export const KEYS_LEDGER_TESTS = [
 
 export const VITEST_LEASE_HOOK = "./scripts/vitest-lease.ts";
 
-export const createVitestConfig = (forkCapValue: string | undefined, lean = leanCiGuard()) => defineConfig({
+// v2.7.8 T2: the CI record (FORMAT F2, scripts/ci/reporter.ts) is written only when TICKMARKR_CI_RECORD is set
+// at config load. It is read ONCE here and deleted before any fork is spawned, so forks and every nested
+// runner they start inherit no record variable and never write over this run's record.
+export const CI_RECORD_ENV = "TICKMARKR_CI_RECORD";
+export const CI_RECORD_REPORTER = "./scripts/ci/reporter.ts";
+const ciRecordValue = process.env[CI_RECORD_ENV];
+delete process.env[CI_RECORD_ENV];
+const ciRecordPath = ciRecordValue ? resolve(ciRecordValue) : undefined;
+
+export const createVitestConfig = (forkCapValue: string | undefined, lean = leanCiGuard(), record = ciRecordPath) => defineConfig({
   cacheDir: worktreeVitestCache(process.cwd(), process.env[VITEST_CACHE_ENV]),
   test: {
     setupFiles: ["tests/setup.ts"], // v1.51 T2: scrub leaked TICKMARKR_QUALITY/NO_EXPLORE (gate hermeticity)
@@ -109,6 +120,8 @@ export const createVitestConfig = (forkCapValue: string | undefined, lean = lean
     // (scripts/vitest-lease.ts); `vitest list` and a repository-less cwd take none.
     globalSetup: [VITEST_LEASE_HOOK],
     testTimeout: 20000,
+    // v2.7.8 T2: `--shard` plans by LPT over scripts/ci/durations.json; file order stays BaseSequencer's
+    sequence: { sequencer: LptSequencer },
     // The fork budget lives on the ROOT: vitest 3.2.7 builds one forks pool from the root config
     // (and VITEST_MAX_FORKS), so a project-level maxForks is never read — a bare local run fanned out
     // to ~cores-1 while `suite` claimed 6 (OBS-634 add, measured: 8 files, project cap 3, 8 live).
@@ -121,6 +134,8 @@ export const createVitestConfig = (forkCapValue: string | undefined, lean = lean
     // local runs keep full reporters. Env-only delta: run commands and the ci-platform pin
     // stay byte-stable.
     ...(lean ? { reporters: ["dot" as const] } : {}),
+    // v2.7.8 T2: the record reporter joins the reporters the run would otherwise use, never replaces them
+    ...(record ? { reporters: [lean ? "dot" as const : "default" as const, [CI_RECORD_REPORTER, { outputFile: record }] as const] } : {}),
     // Each project owns a Vite server; set its cacheDir explicitly as well as the root.
     // Leave test.cache untouched so --no-cache keeps disabling result persistence.
     projects: [

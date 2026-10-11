@@ -49,6 +49,14 @@ jobs:
           TICKMARKR_CI_LEAN_REPORTERS: "1"
           VITEST_MAX_FORKS: "1"
           TICKMARKR_SWEEP_TIMEOUT_MS: "900000"
+      # v2.7.8 T1 (queue row 118): vitest's threshold check reads istanbul percent(0,0) as 100, so a
+      # floor glob matching nothing passes silently. Recheck the json-summary the lean reporter
+      # wrote against the very thresholds object vitest.config.ts enforces; a glob that owns no
+      # entry, or only statement-free entries, reds here even when the coverage step stayed green.
+      - name: Recheck coverage floors
+        if: always()
+        shell: bash
+        run: npx tsx scripts/ci/cli.ts floors coverage/coverage-summary.json
       - name: Run single-fork projects (independent of the step above)
         if: always()
         shell: bash
@@ -81,6 +89,11 @@ jobs:
           TICKMARKR_CI_LEAN_REPORTERS: "1"
           VITEST_MAX_FORKS: "1"
           TICKMARKR_SWEEP_TIMEOUT_MS: "900000"
+      # Same recheck as ubuntu: the lane-equality test pins both jobs to the same steps.
+      - name: Recheck coverage floors
+        if: always()
+        shell: bash
+        run: npx tsx scripts/ci/cli.ts floors coverage/coverage-summary.json
       - name: Run single-fork projects (independent of the step above)
         if: always()
         shell: bash

@@ -2,8 +2,8 @@
 // (scripts/vitest-lease.ts), exercised through real Vitest processes over fixture repositories.
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import * as childProcesses from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { copyFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { dirname, join, relative } from "node:path";
 import { afterEach, expect, test, vi } from "vitest";
 import type { TestProject } from "vitest/node";
 import * as lease from "../../src/run/lease.js";
@@ -87,7 +87,10 @@ const until = async (ready: () => boolean, ms: number, what: string) => {
 function fixtureRepo(): string {
   const files: Record<string, string> = { "package.json": JSON.stringify({ type: "module" }), "tests/setup.ts": "", [PROBE]: PROBE_SOURCE,
     ".gitignore": "node_modules\nsrc\n.vitest-cache\n" };
-  for (const file of ["vitest.config.ts", "scripts/vitest-lease.ts"]) files[file] = readFileSync(join(root, file), "utf8");
+  // SHARED CONVENTION (v2.7.8): the whole scripts/ directory, so every config dependency is committed
+  const scripts = readdirSync(join(root, "scripts"), { recursive: true, withFileTypes: true }).filter(d => d.isFile())
+    .map(d => relative(root, join(d.parentPath, d.name)));
+  for (const file of ["vitest.config.ts", ...scripts]) files[file] = readFileSync(join(root, file), "utf8");
   const repo = makeRepo(files);
   linkDeps(repo);
   return repo;
@@ -281,7 +284,8 @@ test("test: repository-configured worker/reviewer/gate Vitest serializes same-re
 
   // A repository-less cwd runs the production configuration without any lease to take or export.
   const loose = makeTestTempDir("lease-loose-");
-  for (const file of ["vitest.config.ts", "scripts/vitest-lease.ts", "tests/setup.ts", PROBE, "package.json"]) {
+  cpSync(join(repo, "scripts"), join(loose, "scripts"), { recursive: true });
+  for (const file of ["vitest.config.ts", "tests/setup.ts", PROBE, "package.json"]) {
     mkdirSync(dirname(join(loose, file)), { recursive: true });
     copyFileSync(join(repo, file), join(loose, file));
   }

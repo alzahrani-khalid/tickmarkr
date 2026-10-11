@@ -163,11 +163,11 @@ test("test: a real Vitest invocation using the production Vitest configuration r
   const ordinary = "tests/config/ordinary-scheduling.test.ts";
   const forcedStall = "tests/e2e/forced-stall.e2e.test.ts";
   try {
-    for (const directory of ["src", "tests", "fixtures"]) {
+    // SHARED CONVENTION (v2.7.8): the whole scripts/ directory, so every config dependency is copied
+    for (const directory of ["src", "tests", "fixtures", "scripts"]) {
       cpSync(join(repoRoot, directory), join(scratch, directory), { recursive: true });
     }
-    mkdirSync(join(scratch, "scripts"));
-    for (const file of ["package.json", "tsconfig.json", "vitest.config.ts", "scripts/vitest-lease.ts"]) {
+    for (const file of ["package.json", "tsconfig.json", "vitest.config.ts"]) {
       copyFileSync(join(repoRoot, file), join(scratch, file));
     }
     symlinkSync(join(repoRoot, "node_modules"), join(scratch, "node_modules"), "dir");
@@ -316,8 +316,9 @@ const runPoolingFixtures = () => (poolingRuns ??= (async () => {
   const repoRoot = join(import.meta.dirname, "../..");
   const scratch = mkdtempSync(join(tmpdir(), "tickmarkr-pooling-"));
   try {
-    cpSync(join(repoRoot, "src"), join(scratch, "src"), { recursive: true });
-    for (const file of ["package.json", "tsconfig.json", "vitest.config.ts", "scripts/vitest-lease.ts", "tests/setup.ts", "tests/helpers/tmprepo.ts"]) {
+    // SHARED CONVENTION (v2.7.8): the whole scripts/ directory, so every config dependency is copied
+    for (const directory of ["src", "scripts"]) cpSync(join(repoRoot, directory), join(scratch, directory), { recursive: true });
+    for (const file of ["package.json", "tsconfig.json", "vitest.config.ts", "tests/setup.ts", "tests/helpers/tmprepo.ts"]) {
       mkdirSync(dirname(join(scratch, file)), { recursive: true });
       copyFileSync(join(repoRoot, file), join(scratch, file));
     }

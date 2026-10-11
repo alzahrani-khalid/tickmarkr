@@ -1,6 +1,6 @@
 {
   "name": "tickmarkr",
-  "version": "2.7.7",
+  "version": "2.7.8",
   "description": "Spec in, verified work out.",
   "type": "module",
   "license": "MIT",
@@ -94,6 +94,7 @@
         "skills/tickmarkr-auto/",
         "skills/tickmarkr-loop/",
         "skills/tickmarkr-overseer/",
+        "scripts/ci/",
         "src/",
         "tests/"
       ]
