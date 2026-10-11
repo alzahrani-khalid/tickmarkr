@@ -1,0 +1,120 @@
+# PARITY-ONLY (v2.7.8, D-1671 bar (d)) — DRAFT by OBSERVER-spec-278. Lives ONLY on the public mirror's
+# parity/v2.7.8 branch, never on main and never in the private tree. It is the base serial ci.public.yml plus
+# T1's floors recheck plus an upload of each job's records and coverage summary, so `cli.ts parity` can compare
+# it with the sharded run on the SAME pull-request merge SHA. Grade it with grade-ci.sh (serial inventory).
+# The public tree's CI — shipped by the export in place of the private ci.yml, which the export
+# excludes because its selftest job invokes the private export script that never ships.
+# Everything here runs against the checked-out tree on its own: no private files, no secrets,
+# no agent CLIs. No paths-ignore: documentation-only PRs get a conclusive check too.
+name: CI (parity serial)
+
+on:
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-parity-serial-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    # Runs ONLY in the public repo. This file is tracked privately (the export ships it),
+    # but in the private tree the manifest suite would correctly fail against .planning/
+    # and every private push would bill a second full CI run. After the launch rename the
+    # private repo is tickmarkr-dev, so the canonical name selects the public repo alone.
+    if: github.repository == 'alzahrani-khalid/tickmarkr'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: npm run lint
+      # Full-suite proof in TWO invocations (OBS-829, measured 2026-09-01/02 on four collapses): a
+      # host stall on the 2-core runner times out a parallel `suite` worker's onTaskUpdate rpc and
+      # vitest throws BEFORE dispatching the four single-fork projects, whose files then vanish
+      # unnamed and unfailed. Running those projects in their own `if: always()` invocation means a
+      # throw in `suite` cannot lose them, and the count oracle sums both logs against the tracked
+      # tree. OBS-156: serialize on the 2-core hosted runner. OBS-148 fixed release.yml only, so
+      # this job starved a different load-sensitive test on every release (v1.78 herdr READINESS,
+      # v1.79 daemon tip-verify artifact) while Release passed on the identical commit.
+      # OBS-1184: each Vitest step runs through run-ci-vitest.sh, which tees the log and keeps the
+      # command's own status unless the overseer skill's shared log classifier (the one the release
+      # grader uses) proves the complete RPC-timeout-only exception; the count oracle stays separate.
+      - name: Run coverage proof (parallel suite project)
+        shell: bash
+        run: bash scripts/run-ci-vitest.sh "$RUNNER_TEMP/tickmarkr-test-output.log" npm run test:coverage -- --project suite
+        env:
+          TICKMARKR_CI_LEAN_REPORTERS: "1"
+          VITEST_MAX_FORKS: "1"
+          TICKMARKR_SWEEP_TIMEOUT_MS: "900000"
+      - name: Recheck coverage floors
+        if: always()
+        run: npx tsx scripts/ci/cli.ts floors coverage/coverage-summary.json
+      - name: Run single-fork projects (independent of the step above)
+        if: always()
+        shell: bash
+        run: bash scripts/run-ci-vitest.sh "$RUNNER_TEMP/tickmarkr-test-output-singlefork.log" npx vitest run --project sync-heavy --project keys-ledger --project built-cli --project signal-reaper
+        env:
+          TICKMARKR_CI_LEAN_REPORTERS: "1"
+          VITEST_MAX_FORKS: "1"
+          TICKMARKR_SWEEP_TIMEOUT_MS: "900000"
+      - name: Assert collected test-file count
+        if: always()
+        run: sh scripts/assert-test-file-count.sh "$RUNNER_TEMP/tickmarkr-test-output.log" "$RUNNER_TEMP/tickmarkr-test-output-singlefork.log"
+      - name: Keep records for parity
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: parity-serial-ubuntu-latest
+          path: |
+            ${{ runner.temp }}/tickmarkr-test-output*.log
+            ${{ runner.temp }}/tickmarkr-test-output*.log.record.json
+            coverage/coverage-summary.json
+
+  test-macos:
+    if: github.repository == 'alzahrani-khalid/tickmarkr'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: npm run lint
+      # Same two-invocation proof and serialization as ubuntu (the lane-equality test pins it).
+      - name: Run coverage proof (parallel suite project)
+        shell: bash
+        run: bash scripts/run-ci-vitest.sh "$RUNNER_TEMP/tickmarkr-test-output.log" npm run test:coverage -- --project suite
+        env:
+          TICKMARKR_CI_LEAN_REPORTERS: "1"
+          VITEST_MAX_FORKS: "1"
+          TICKMARKR_SWEEP_TIMEOUT_MS: "900000"
+      - name: Recheck coverage floors
+        if: always()
+        run: npx tsx scripts/ci/cli.ts floors coverage/coverage-summary.json
+      - name: Run single-fork projects (independent of the step above)
+        if: always()
+        shell: bash
+        run: bash scripts/run-ci-vitest.sh "$RUNNER_TEMP/tickmarkr-test-output-singlefork.log" npx vitest run --project sync-heavy --project keys-ledger --project built-cli --project signal-reaper
+        env:
+          TICKMARKR_CI_LEAN_REPORTERS: "1"
+          VITEST_MAX_FORKS: "1"
+          TICKMARKR_SWEEP_TIMEOUT_MS: "900000"
+      - name: Assert collected test-file count
+        if: always()
+        run: sh scripts/assert-test-file-count.sh "$RUNNER_TEMP/tickmarkr-test-output.log" "$RUNNER_TEMP/tickmarkr-test-output-singlefork.log"
+      - name: Keep records for parity
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: parity-serial-macos-latest
+          path: |
+            ${{ runner.temp }}/tickmarkr-test-output*.log
+            ${{ runner.temp }}/tickmarkr-test-output*.log.record.json
+            coverage/coverage-summary.json
