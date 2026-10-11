@@ -1,5 +1,7 @@
 import { VITEST_CACHE_ENV, worktreeVitestCache } from "./src/gates/test-manifest.js";
+import { resolve } from "node:path";
 import { configDefaults, coverageConfigDefaults, defineConfig } from "vitest/config";
+import LptSequencer from "./scripts/ci/shard.js";
 import { DEFAULT_FORK_CAP } from "./src/run/git.js";
 
 // v1.22 T3 / OBS-17: seal herdr control-plane vars before workers fork so the suite never inherits
@@ -101,7 +103,26 @@ export const KEYS_LEDGER_TESTS = [
 
 export const VITEST_LEASE_HOOK = "./scripts/vitest-lease.ts";
 
-export const createVitestConfig = (forkCapValue: string | undefined, lean = leanCiGuard()) => defineConfig({
+// v2.7.8 T2: the CI record (FORMAT F2, scripts/ci/reporter.ts) is written only when TICKMARKR_CI_RECORD is set
+// at config load. It is read ONCE here and deleted before any fork is spawned, so forks and every nested
+// runner they start inherit no record variable and never write over this run's record.
+export const CI_RECORD_ENV = "TICKMARKR_CI_RECORD";
+export const CI_RECORD_REPORTER = "./scripts/ci/reporter.ts";
+const ciRecordValue = process.env[CI_RECORD_ENV];
+delete process.env[CI_RECORD_ENV];
+const ciRecordPath = ciRecordValue ? resolve(ciRecordValue) : undefined;
+
+// v2.7.8 T5: TICKMARKR_CI_COVERAGE_BLOB=<path> marks ONE shard of a coverage run, read once and deleted like the
+// record variable. It adds Vitest's blob reporter (the shard's results and coverage map go to <path>) and clears
+// the thresholds: a partial map checks no floor. The per-OS `vitest run --merge-reports=<dir> --coverage` over
+// every shard's blob checks them ONCE on the merged map. Vitest refuses to merge with a blob reporter configured,
+// so the variable leaked into the merge fails it rather than clearing its floors.
+export const CI_COVERAGE_BLOB_ENV = "TICKMARKR_CI_COVERAGE_BLOB";
+const ciBlobValue = process.env[CI_COVERAGE_BLOB_ENV];
+delete process.env[CI_COVERAGE_BLOB_ENV];
+const ciBlobPath = ciBlobValue ? resolve(ciBlobValue) : undefined;
+
+export const createVitestConfig = (forkCapValue: string | undefined, lean = leanCiGuard(), record = ciRecordPath, blob = ciBlobPath) => defineConfig({
   cacheDir: worktreeVitestCache(process.cwd(), process.env[VITEST_CACHE_ENV]),
   test: {
     setupFiles: ["tests/setup.ts"], // v1.51 T2: scrub leaked TICKMARKR_QUALITY/NO_EXPLORE (gate hermeticity)
@@ -109,6 +130,8 @@ export const createVitestConfig = (forkCapValue: string | undefined, lean = lean
     // (scripts/vitest-lease.ts); `vitest list` and a repository-less cwd take none.
     globalSetup: [VITEST_LEASE_HOOK],
     testTimeout: 20000,
+    // v2.7.8 T2: `--shard` plans by LPT over scripts/ci/durations.json; file order stays BaseSequencer's
+    sequence: { sequencer: LptSequencer },
     // The fork budget lives on the ROOT: vitest 3.2.7 builds one forks pool from the root config
     // (and VITEST_MAX_FORKS), so a project-level maxForks is never read — a bare local run fanned out
     // to ~cores-1 while `suite` claimed 6 (OBS-634 add, measured: 8 files, project cap 3, 8 live).
@@ -121,6 +144,14 @@ export const createVitestConfig = (forkCapValue: string | undefined, lean = lean
     // local runs keep full reporters. Env-only delta: run commands and the ci-platform pin
     // stay byte-stable.
     ...(lean ? { reporters: ["dot" as const] } : {}),
+    // v2.7.8 T2/T5: the record and blob reporters join the reporters the run would otherwise use, never replace them
+    ...(record || blob ? {
+      reporters: [
+        lean ? "dot" as const : "default" as const,
+        ...(record ? [[CI_RECORD_REPORTER, { outputFile: record }] as const] : []),
+        ...(blob ? [["blob", { outputFile: blob }] as const] : []),
+      ],
+    } : {}),
     // Each project owns a Vite server; set its cacheDir explicitly as well as the root.
     // Leave test.cache untouched so --no-cache keeps disabling result persistence.
     projects: [
@@ -209,6 +240,8 @@ export const createVitestConfig = (forkCapValue: string | undefined, lean = lean
         "src/drivers/**": { lines: 82, branches: 80 },  // measured 93.33 / 88.88 on 2026-07-10 (types.ts excluded)
         "src/cli/**": { lines: 85, branches: 75 },      // measured 94.82 / 81.52 on 2026-07-10 (post-backfill)
       },
+      // v2.7.8 T5: a shard's partial map checks no floor; the merge over every blob checks them once (above)
+      ...(blob ? { thresholds: undefined } : {}),
     },
   },
 });

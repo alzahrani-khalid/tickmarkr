@@ -2,7 +2,6 @@ import { createHash } from "node:crypto";
 import {
   copyFileSync,
   cpSync,
-  mkdirSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
@@ -556,16 +555,16 @@ type NamedTestResult = {
   readonly output: string;
 };
 
-const SANDBOX_DIRECTORIES = ["src", "tests", "fixtures"] as const;
-// scripts/vitest-lease.ts is the production config's globalSetup (the suite lease hook)
-const SANDBOX_FILES = ["package.json", "tsconfig.json", "vitest.config.ts", "scripts/vitest-lease.ts"] as const;
+// SHARED CONVENTION (v2.7.8): the whole scripts/ directory — the production config's globalSetup (the suite
+// lease hook), its shard sequencer and every later config dependency — copied and digested like src/
+const SANDBOX_DIRECTORIES = ["src", "tests", "fixtures", "scripts"] as const;
+const SANDBOX_FILES = ["package.json", "tsconfig.json", "vitest.config.ts"] as const;
 
 function makeBranchSandbox(): string {
   const sandbox = mkdtempSync(join(tmpdir(), "tickmarkr-branch-ledger-"));
   for (const directory of SANDBOX_DIRECTORIES) {
     cpSync(join(PROJECT_ROOT, directory), join(sandbox, directory), { recursive: true });
   }
-  mkdirSync(join(sandbox, "scripts"));
   for (const file of SANDBOX_FILES) {
     copyFileSync(join(PROJECT_ROOT, file), join(sandbox, file));
   }
@@ -2840,6 +2839,28 @@ describe("run row identity and empty-view invariants", () => {
 });
 
 describe("executed cockpit branch ledger", () => {
+  test("test: the keys ledger sandbox copies the whole scripts directory and its revision digest changes when a scripts/ci file changes versus a digest blind to scripts", async () => {
+    const files = (dir: string) => readdirSync(dir, { recursive: true, withFileTypes: true })
+      .filter((dirent) => dirent.isFile())
+      .map((dirent) => relative(dir, join(dirent.parentPath, dirent.name)))
+      .sort();
+    await withBranchSandbox(async (sandbox) => {
+      const projectScripts = files(join(PROJECT_ROOT, "scripts"));
+      expect(projectScripts).toEqual(expect.arrayContaining(["vitest-lease.ts", "ci/shard.ts", "ci/durations.json"]));
+      expect(files(join(sandbox, "scripts"))).toEqual(projectScripts);
+      for (const file of projectScripts) {
+        expect(readFileSync(join(sandbox, "scripts", file)), file).toEqual(readFileSync(join(PROJECT_ROOT, "scripts", file)));
+      }
+      const intact = sandboxRevision(sandbox);
+      const changed = join(sandbox, "scripts", "ci", "durations.json");
+      const original = readFileSync(changed);
+      writeFileSync(changed, Buffer.concat([original, Buffer.from(" ")]));
+      expect(sandboxRevision(sandbox)).not.toBe(intact);
+      writeFileSync(changed, original);
+      expect(sandboxRevision(sandbox)).toBe(intact);
+    });
+  }, 120_000);
+
   test("ledger sweep budgets follow the runtime ledger size", ({ task }) => {
     // Observe registered Vitest leaf timeouts, including both complete mutation sweeps.
     for (const title of [

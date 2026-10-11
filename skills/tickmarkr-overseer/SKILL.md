@@ -1601,9 +1601,12 @@ Create specialist seats using `orca terminal create --worktree path:<repo> --com
 
    - **GRADE PUBLIC CI FROM JOB LOGS AT RUN-END ONLY (law 48).** A badge is not the grade, and
      `gh run view --job --log` is empty while the run is in progress. At run-end execute
-     `scripts/grade-ci.sh <run-id> <expected-count> <tag>` and require GREEN from both jobs; its
-     UNREADABLE state is a hard stop, not a green default. Derive the expected glob pathspec count with
-     `git ls-files ':(glob)tests/**/*.test.ts'` (including the `.tsx` sibling where present), never a bare
+     `scripts/grade-ci.sh <run-id> <expected-count> <tag>` and require GREEN from every job of the
+     declared inventory it prints first — serial `test` and `test-macos`, or sharded, per OS, the four
+     `suite <os> k/4` shards, `single-fork <os>` and `aggregate <os>`; a missing, duplicated or unknown
+     job reads UNREADABLE, never a skip. Its UNREADABLE state is a hard stop, not a green default.
+     Derive the expected glob pathspec count with `git ls-files ':(glob)tests/**/*.test.ts'`
+     (including the `.tsx` sibling where present), never a bare
      `tests/**/*.test.ts`: bare `**` is not a git glob (law 49).
 
    - **RE-READ THE REGISTRY BEFORE RULING (law 51).** A successful Release run and the first

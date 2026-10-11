@@ -10,9 +10,9 @@
 // reject at any depth. Secret findings disclose pattern id, path, and occurrence count only —
 // never the matched text.
 import { execSync, spawnSync } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { afterAll, describe, expect, test } from "vitest";
 import { parse as parseYaml } from "yaml";
 
@@ -389,34 +389,117 @@ const workflowPaths = (c: Candidate): string[] => c.paths.filter((p) => p.starts
 const extractScriptRefs = (text: string): string[] => text.match(/\bscripts\/[\w./-]*\w/g) ?? [];
 const NOREPLY_IDENTITY = "53393181+alzahrani-khalid@users.noreply.github.com";
 
-// OBS-1184: every public-CI Vitest step runs through the wrapper that consults the overseer skill's
-// shared log classifier (the one grade-ci.sh uses), and the count oracle sums exactly the logs those
-// steps write. Returns the violations plus each wrapped command as "<job>: <command>".
+// OBS-1184 + v2.7.8 T5: every public-CI Vitest step runs through the wrapper that consults the overseer skill's
+// shared log classifier (the one grade-ci.sh uses). The sharded form is EXPANDED — every matrix row a job on its
+// own empty runner temp directory — and executed as data: each wrapped step writes its log, `<log>.record.json`
+// and its step's TICKMARKR_CI_COVERAGE_BLOB, each tagged with the job that wrote it; uploads store their
+// directory as an artifact; each aggregate's merge-multiple download flattens the artifacts its pattern selects
+// into one directory, and its merge and assert must read exactly its own OS's blobs and records. Returns the
+// violations plus each wrapped command as "<job>: <command>".
 const CI_WRAPPER = "scripts/run-ci-vitest.sh";
 const CI_CLASSIFIER = "skills/tickmarkr-overseer/scripts/classify-vitest-log.sh";
+type CiStep = { run?: string; uses?: string; env?: Record<string, string>; with?: Record<string, unknown> };
+type CiJob = { name?: string; strategy?: { matrix?: Record<string, unknown[]> }; steps?: CiStep[] };
+const filesUnder = (root: string): string[] =>
+  readdirSync(root, { recursive: true, withFileTypes: true }).filter((entry) => entry.isFile())
+    .map((entry) => join(entry.parentPath, entry.name).slice(root.length + 1)).sort();
+// shell words of an expanded command: whitespace outside double quotes splits, the quotes go
+const words = (command: string): string[] => [...command.matchAll(/(?:"[^"]*"|[^\s"])+/g)].map((match) => match[0].replace(/"/g, ""));
 function publicCiShape(workflow: string): { violations: string[]; wrapped: string[] } {
-  const jobs = (parseYaml(workflow) as { jobs?: Record<string, { steps?: { run?: string }[] }> }).jobs ?? {};
+  const jobs = (parseYaml(workflow) as { jobs?: Record<string, CiJob> }).jobs ?? {};
   const violations: string[] = [];
   const wrapped: string[] = [];
-  for (const [job, { steps = [] }] of Object.entries(jobs)) {
-    const logs: string[] = [];
-    let counted: string[] | undefined;
-    for (const run of steps.map((step) => (step.run ?? "").trim())) {
-      if (/\bvitest\b|\bnpm (?:run )?test\b/.test(run)) {
-        const m = /^bash scripts\/run-ci-vitest\.sh "([^"]+)" ([^\n]+)$/.exec(run);
-        if (m) {
-          logs.push(m[1]);
-          wrapped.push(`${job}: ${m[2]}`);
-        } else violations.push(`${job}: Vitest step bypasses the shared classifier: ${run}`);
+  const scratch = mkdtempSync(join(tmpdir(), "tickmarkr-ci-shape-"));
+  try {
+    const instances = Object.entries(jobs).flatMap(([id, job]) => {
+      let rows: Record<string, string>[] = [{}];
+      for (const [axis, values] of Object.entries(job.strategy?.matrix ?? {})) rows = rows.flatMap((row) => values.map((value) => ({ ...row, [axis]: String(value) })));
+      return rows.map((vars) => ({ id, job, vars }));
+    });
+    // test jobs first: an aggregate needs them, so it runs after every one of them
+    const downloads = (job: CiJob) => (job.steps ?? []).some((step) => String(step.uses ?? "").startsWith("actions/download-artifact"));
+    instances.sort((a, b) => Number(downloads(a.job)) - Number(downloads(b.job)));
+    const artifacts = new Map<string, { os: string; dir: string }>();
+    const written = new Map<string, Set<string>>(); // os -> every "<job>|<kind>" tag its test jobs wrote
+    for (const [n, { id, job, vars }] of instances.entries()) {
+      const temp = join(scratch, `runner-${n}`);
+      mkdirSync(temp); // an empty runner temp directory
+      const expand = (text: string) => text
+        .replace(/\$\{\{\s*runner\.temp\s*\}\}|\$RUNNER_TEMP/g, temp)
+        .replace(/\$\{\{\s*matrix\.(\w+)\s*\}\}/g, (_, key: string) => vars[key] ?? `<unknown matrix.${key}>`);
+      const name = expand(job.name ?? id);
+      const os = vars.os ?? "<no os>";
+      const tags = written.get(os) ?? new Set<string>();
+      written.set(os, tags);
+      const write = (path: string, kind: string) => {
+        if (existsSync(path)) violations.push(`${name}: ${kind} ${path.slice(temp.length + 1)} collides with ${readFileSync(path, "utf8")}`);
+        mkdirSync(dirname(path), { recursive: true });
+        writeFileSync(path, `${name}|${kind}`);
+        if (!downloads(job)) tags.add(`${name}|${kind}`);
+      };
+      const read = (dir: string) => (existsSync(dir) ? filesUnder(dir).map((file) => readFileSync(join(dir, file), "utf8")).sort() : []);
+      const own = (kind: string) => [...tags].filter((tag) => tag.endsWith(`|${kind}`)).sort();
+      let merged: { dir: string; record: string } | undefined;
+      for (const step of job.steps ?? []) {
+        const run = (step.run ?? "").trim();
+        const uses = String(step.uses ?? "");
+        if (/\bvitest\b|\bnpm (?:run )?test\b/.test(run)) {
+          const m = /^bash scripts\/run-ci-vitest\.sh ("[^"]+") ([^\n]+)$/.exec(run);
+          if (!m) {
+            violations.push(`${name}: Vitest step bypasses the shared wrapper: ${run}`);
+            continue;
+          }
+          wrapped.push(`${name}: ${expand(m[2]!)}`);
+          const [log] = words(expand(m[1]!));
+          const mergeDir = /--merge-reports=(\S+)/.exec(words(expand(m[2]!)).join(" "))?.[1];
+          if (mergeDir !== undefined) {
+            const blobs = read(mergeDir);
+            if (blobs.join("\n") !== own("blob").join("\n")) violations.push(`${name}: the merge reads [${blobs.join(", ")}], not this OS's blobs [${own("blob").join(", ")}]`);
+            merged = { dir: mergeDir, record: `${log}.record.json` };
+          }
+          write(log!, "log");
+          write(`${log}.record.json`, "record");
+          const blob = step.env?.TICKMARKR_CI_COVERAGE_BLOB;
+          if (blob !== undefined) write(expand(blob), "blob");
+        } else if (/\bscripts\/ci\/cli\.ts assert\b/.test(run)) {
+          const argv = words(expand(run));
+          const flag = (key: string) => argv[argv.indexOf(key) + 1];
+          const records = argv.slice(argv.indexOf("assert") + 1).filter((arg, i, all) => !arg.startsWith("--") && !all[i - 1]?.startsWith("--"))
+            .flatMap((arg) => (arg.includes("*")
+              ? (existsSync(dirname(arg)) ? readdirSync(dirname(arg)).filter((file) => new RegExp(`^${basename(arg).replace(/[.]/g, "\\.").replace(/\*/g, "[^/]*")}$`).test(file)).map((file) => join(dirname(arg), file)) : [])
+              : [arg]));
+          const seen = records.map((path) => (existsSync(path) ? readFileSync(path, "utf8") : `<absent ${path}>`)).sort();
+          if (seen.join("\n") !== own("record").join("\n")) violations.push(`${name}: the assert reads [${seen.join(", ")}], not this OS's records [${own("record").join(", ")}]`);
+          if (!merged || flag("--merge-record") !== merged.record || flag("--blobs") !== merged.dir) violations.push(`${name}: the assert does not read the merge's own record and blob directory`);
+        } else if (uses.startsWith("actions/upload-artifact")) {
+          const artifact = expand(String(step.with?.name ?? ""));
+          const path = expand(String(step.with?.path ?? "")).trim();
+          if (artifacts.has(artifact)) violations.push(`${name}: artifact ${artifact} collides`);
+          if (!path.includes("\n") && existsSync(path)) {
+            const dir = join(scratch, "artifacts", artifact);
+            cpSync(path, dir, { recursive: true });
+            artifacts.set(artifact, { os, dir });
+          }
+        } else if (uses.startsWith("actions/download-artifact")) {
+          const pattern = new RegExp(`^${expand(String(step.with?.pattern ?? "")).replace(/[.]/g, "\\.").replace(/\*/g, ".*")}$`);
+          const dest = expand(String(step.with?.path ?? ""));
+          if (step.with?.["merge-multiple"] !== true) violations.push(`${name}: the download does not merge its artifacts into one directory`);
+          const from = new Map<string, string>();
+          for (const [artifact, stored] of artifacts) {
+            if (!pattern.test(artifact)) continue;
+            if (stored.os !== os) violations.push(`${name}: downloads ${artifact} from another OS`);
+            for (const file of filesUnder(stored.dir)) {
+              if (from.has(file)) violations.push(`${name}: ${file} collides between ${from.get(file)} and ${artifact}`);
+              from.set(file, artifact);
+              mkdirSync(dirname(join(dest, file)), { recursive: true });
+              cpSync(join(stored.dir, file), join(dest, file));
+            }
+          }
+        }
       }
-      const count = /^sh scripts\/assert-test-file-count\.sh((?: "[^"]+")+)$/.exec(run);
-      if (count) counted = [...count[1].matchAll(/"([^"]+)"/g)].map((arg) => arg[1]);
     }
-    if (logs.length === 0) continue;
-    if (!counted) violations.push(`${job}: no count oracle step`);
-    else if ([...counted].sort().join("\n") !== [...logs].sort().join("\n")) {
-      violations.push(`${job}: count oracle reads [${counted.join(", ")}] but the Vitest steps write [${logs.join(", ")}]`);
-    }
+  } finally {
+    rmSync(scratch, { recursive: true, force: true });
   }
   if (wrapped.length === 0) violations.push("no wrapped Vitest step found");
   return { violations, wrapped };
@@ -450,25 +533,33 @@ describe("export workflow correctness — the exported CI stands alone", () => {
     }
   });
 
-  test("test: the exported public workflow runs its coverage and serial commands through the shared classifier and retains exact file counting, so an omitted classifier or one missing counted file fails", { timeout: 180_000 }, () => {
+  test("test: the exported sharded workflow runs every Vitest step through the shared wrapper and, expanded from an empty runner temp directory, writes per-shard log record and blob paths that never collide and that each same-OS aggregate's merge-multiple download, merge and assert read, so a bare Vitest step, a cross-OS pattern or a colliding filename fails", { timeout: 180_000 }, () => {
     const c = getCandidate();
     const wf = ".github/workflows/ci.public.yml";
-    for (const path of [wf, CI_WRAPPER, CI_CLASSIFIER, "scripts/assert-test-file-count.sh"]) expect(c.paths, path).toContain(path);
+    for (const path of [wf, CI_WRAPPER, CI_CLASSIFIER, "scripts/ci/cli.ts"]) expect(c.paths, path).toContain(path);
     const workflow = readFileSync(join(c.root, wf), "utf8");
     const { violations, wrapped } = publicCiShape(workflow);
     expect(violations).toEqual([]);
-    for (const job of ["test", "test-macos"]) {
-      expect(wrapped, job).toContain(`${job}: npm run test:coverage -- --project suite`);
-      expect(wrapped.filter((w) => w.startsWith(`${job}: npx vitest run `)), job).toHaveLength(1);
+    // per OS: four shards, the single-fork job and the aggregate's merge, every one wrapped
+    for (const os of ["ubuntu-latest", "macos-latest"]) {
+      const ofOs = wrapped.filter((w) => w.includes(` ${os}`));
+      expect(ofOs.filter((w) => /^suite .*--project suite --shard=[1-4]\/4$/.test(w)), os).toHaveLength(4);
+      expect(ofOs.filter((w) => w.startsWith(`single-fork ${os}: npx vitest run `)), os).toHaveLength(1);
+      expect(ofOs.filter((w) => w.startsWith(`aggregate ${os}: npx vitest run --merge-reports=`)), os).toHaveLength(1);
     }
 
-    // the guard reds the two regressions it exists for
-    const bare = workflow.replace(`bash ${CI_WRAPPER} "$RUNNER_TEMP/tickmarkr-test-output.log" `, "");
+    // the guard reds the three regressions it exists for
+    const bare = workflow.replace(`bash ${CI_WRAPPER} "$RUNNER_TEMP/ci/single-fork.log" `, "");
     expect(bare).not.toBe(workflow);
-    expect(publicCiShape(bare).violations.join("\n")).toMatch(/bypasses the shared classifier/);
-    const uncounted = workflow.replace(' "$RUNNER_TEMP/tickmarkr-test-output-singlefork.log"\n', "\n");
-    expect(uncounted).not.toBe(workflow);
-    expect(publicCiShape(uncounted).violations.join("\n")).toMatch(/count oracle reads/);
+    expect(publicCiShape(bare).violations.join("\n")).toMatch(/single-fork ubuntu-latest: Vitest step bypasses the shared wrapper/);
+    const crossOs = workflow.replace("pattern: ci-${{ matrix.os }}-*", "pattern: ci-*");
+    expect(crossOs).not.toBe(workflow);
+    expect(publicCiShape(crossOs).violations.join("\n")).toMatch(/aggregate ubuntu-latest: downloads ci-macos-latest-suite-1 from another OS/);
+    for (const [from, to] of [["suite-${{ matrix.shard }}.log", "suite.log"], ["blob-${{ matrix.shard }}.json", "blob.json"]]) {
+      const colliding = workflow.replace(from, to);
+      expect(colliding, from).not.toBe(workflow);
+      expect(publicCiShape(colliding).violations.join("\n"), from).toMatch(new RegExp(`aggregate ubuntu-latest: \\S*${to.replace(".", "\\.")}\\S* collides between ci-ubuntu-latest-suite-1 and ci-ubuntu-latest-suite-2`));
+    }
 
     // the exported wrapper reaches the exported classifier: a complete RPC-only exit 1 becomes 0, while
     // the same wrapper without the classifier beside it keeps the raw 1 (fail closed)

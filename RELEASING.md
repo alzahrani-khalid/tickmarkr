@@ -73,7 +73,8 @@ Per release:
    The captured proof must show the exported candidate complete `npm ci`, `npm run build`,
    **`npm run lint`**, and only then `npm test`, with a zero exit. A suite summary without the preceding
    lint block is not a release proof. Then export into the persistent mirror, review the commit, and
-   derive the count oracle `N` from its tracked tree using real glob semantics:
+   derive `N`, the tracked test-file count the set oracle expects, from its tracked tree using real glob
+   semantics:
 
    ```bash
    bash scripts/export-public.sh --onto /path/to/tickmarkr-public-mirror
@@ -85,24 +86,47 @@ Per release:
 
    A bare git pathspec such as `tests/**/*.test.ts` does not give `**` glob semantics; use `:(glob)` as
    above (or `git ls-files | grep`) or the expected count is false. Wait for the [`CI (public)`](.github/workflows/ci.public.yml) workflow run triggered by that exact mirror `main`
-   push to reach **run-end**. Its `test` and `test-macos` jobs run the parallel `suite` project under
-   coverage and the single-fork projects `ci.public.yml` runs by name independently, then count-assert the sum of both
-   collected test-file totals against `N`.
-4. At run-end, match the run's head SHA to the mirror's `HEAD`, then grade the two JOB LOGS — never the
-   badge and never an in-progress run — with the shipped tri-state grader:
+   push to reach **run-end**. The run is the **twelve-job sharded inventory**, per OS (`ubuntu-latest`
+   and `macos-latest`) six jobs, every one a release job (there is no quarantine lane; a red in any job is
+   a release red):
+   - four `suite <os> k/4` jobs, each one duration-balanced shard (`--shard=k/4`) of the parallel `suite`
+     project under coverage, planned by LPT over the committed `scripts/ci/durations.json` and held to that
+     plan as a set by `scripts/run-ci-vitest.sh`; each writes its log, its record and its coverage blob;
+   - one `single-fork <os>` job running the single-fork projects `ci.public.yml` runs by name, without
+     coverage;
+   - one `aggregate <os>` job that downloads only that OS's job artifacts, merges the four blobs (one
+     threshold check per OS, on the merged map), rechecks the coverage floors on the merged summary
+     (`scripts/ci/cli.ts floors`: a floor glob owning no file, or only statement-free files, is red), and
+     asserts the collected test-file SET (`scripts/ci/cli.ts assert`): each of the `N` tracked files exactly
+     once across that OS's job records, finished, on this HEAD; the merge record equal to the shards' union;
+     exactly `blob-1.json` to `blob-4.json` in the merged blob directory.
+
+   The shard plan reads the committed durations table, so a refresh is a data-only commit **between**
+   releases, never part of a release commit: after a release publishes, run
+   `npx tsx scripts/ci/cli.ts durations <record>...` over that release's graded `ci-<os>-suite-*` records,
+   redirect it into `scripts/ci/durations.json` (an unreadable record prints nothing and exits 2), commit
+   it alone, and let the next release's CI grade the new partition first.
+4. At run-end, match the run's head SHA to the mirror's `HEAD`, then grade the JOB LOGS of every job of
+   the twelve-job sharded inventory — never the badge and never an in-progress run — with the shipped
+   tri-state grader:
 
    ```bash
    bash skills/tickmarkr-overseer/scripts/grade-ci.sh <run-id> <N> v2.7.7
    ```
 
    `gh run view --job --log` can be empty while a run is in progress, so `UNREADABLE` (exit 2) is a hard
-   stop, not green. `GREEN` requires the expected `COUNT_ORACLE`, zero failed/timed-out tests, and the
-   matching collected total in both job logs; `RED` exits 1. This is the count-asserted full-suite proof
-   for the exported tree. It does not make the post-tag workflow rerun that suite or automatically bind
-   publication to the recorded pre-tag proof.
+   stop, not green. The grader first prints `INVENTORY form=sharded declared=12 observed=12`; a missing,
+   duplicated or unknown job name is `UNREADABLE`, never a skipped job. `GREEN` requires every one of the
+   twelve jobs GREEN: each shard and single-fork job concluding success with a log the shared classifier
+   reads clean (its wrapper already held the shard to its plan), and each aggregate with exactly one
+   `COVERAGE_FLOORS verdict=GREEN` from `Recheck coverage floors`, exactly one
+   `SET_ORACLE verdict=GREEN expected=N actual=N defects=0` from `Assert collected test-file set`, and its
+   `Merge coverage (one threshold check per OS)` step clean; `RED` exits 1. This is the set-asserted
+   full-suite proof for the exported tree. It does not make the post-tag workflow rerun that suite or
+   automatically bind publication to the recorded pre-tag proof.
 
-   Only after the grader returns GREEN for both jobs, tag the export commit in the **public** mirror and
-   push the tag:
+   Only after the grader returns GREEN for every job of the inventory, tag the export commit in the
+   **public** mirror and push the tag:
 
    ```bash
    git tag -a v2.7.7 -m "v2.7.7"

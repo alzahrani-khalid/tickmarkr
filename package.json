@@ -94,6 +94,7 @@
         "skills/tickmarkr-auto/",
         "skills/tickmarkr-loop/",
         "skills/tickmarkr-overseer/",
+        "scripts/ci/",
         "src/",
         "tests/"
       ]

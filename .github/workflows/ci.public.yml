@@ -15,13 +15,29 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test:
-    # Runs ONLY in the public repo. This file is tracked privately (the export ships it),
-    # but in the private tree the manifest suite would correctly fail against .planning/
-    # and every private push would bill a second full CI run. After the launch rename the
-    # private repo is tickmarkr-dev, so the canonical name selects the public repo alone.
+  # v2.7.8 T5 (queue row 6, D-1800): per OS, four duration-balanced `suite` shards under coverage, ONE job for
+  # the single-fork projects and ONE aggregate — twelve jobs, the closed inventory grade-ci.sh grades job by job
+  # (`suite <os> k/4`, `single-fork <os>`, `aggregate <os>`). OBS-829 (G2): the parallel `suite` project and the
+  # single-fork projects never share an invocation, so a worker rpc throw in one cannot lose the other's files.
+  # OBS-148/156 (G1): every Vitest step pins ONE fork on the 2-core hosted runner. OBS-1184: every Vitest step
+  # runs through run-ci-vitest.sh, which tees the log, writes `<log>.record.json` (FORMAT F2) and keeps the
+  # command's own status unless the shared classifier proves the complete RPC-timeout-only exception; a shard is
+  # held to its own LPT plan as a SET first (G5). fail-fast is off and nothing continues on error, so one red
+  # job hides no other and every red is a release red (no quarantine lane, D-1671).
+  #
+  # Runs ONLY in the public repo. This file is tracked privately (the export ships it), but in the
+  # private tree the manifest suite would correctly fail against .planning/ and every private push
+  # would bill a second full CI run. After the launch rename the private repo is tickmarkr-dev, so
+  # the canonical name selects the public repo alone.
+  suite:
     if: github.repository == 'alzahrani-khalid/tickmarkr'
-    runs-on: ubuntu-latest
+    name: suite ${{ matrix.os }} ${{ matrix.shard }}/4
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        shard: [1, 2, 3, 4]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -31,39 +47,32 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: npm run lint
-      # Full-suite proof in TWO invocations (OBS-829, measured 2026-09-01/02 on four collapses): a
-      # host stall on the 2-core runner times out a parallel `suite` worker's onTaskUpdate rpc and
-      # vitest throws BEFORE dispatching the four single-fork projects, whose files then vanish
-      # unnamed and unfailed. Running those projects in their own `if: always()` invocation means a
-      # throw in `suite` cannot lose them, and the count oracle sums both logs against the tracked
-      # tree. OBS-156: serialize on the 2-core hosted runner. OBS-148 fixed release.yml only, so
-      # this job starved a different load-sensitive test on every release (v1.78 herdr READINESS,
-      # v1.79 daemon tip-verify artifact) while Release passed on the identical commit.
-      # OBS-1184: each Vitest step runs through run-ci-vitest.sh, which tees the log and keeps the
-      # command's own status unless the overseer skill's shared log classifier (the one the release
-      # grader uses) proves the complete RPC-timeout-only exception; the count oracle stays separate.
-      - name: Run coverage proof (parallel suite project)
+      # A partial coverage run: TICKMARKR_CI_COVERAGE_BLOB (step-scoped, never on the merge) writes this shard's
+      # results and coverage map to its own blob and checks NO threshold; the aggregate checks the floors once.
+      - name: Run coverage shard (parallel suite project)
         shell: bash
-        run: bash scripts/run-ci-vitest.sh "$RUNNER_TEMP/tickmarkr-test-output.log" npm run test:coverage -- --project suite
+        run: bash scripts/run-ci-vitest.sh "$RUNNER_TEMP/ci/suite-${{ matrix.shard }}.log" npm run test:coverage -- --project suite --shard=${{ matrix.shard }}/4
         env:
           TICKMARKR_CI_LEAN_REPORTERS: "1"
           VITEST_MAX_FORKS: "1"
           TICKMARKR_SWEEP_TIMEOUT_MS: "900000"
-      - name: Run single-fork projects (independent of the step above)
+          TICKMARKR_CI_COVERAGE_BLOB: ${{ runner.temp }}/ci/blobs/blob-${{ matrix.shard }}.json
+      # the log, its record and the blob, named per shard so the aggregate's merge-multiple download never collides
+      - name: Keep the log, record and blob
         if: always()
-        shell: bash
-        run: bash scripts/run-ci-vitest.sh "$RUNNER_TEMP/tickmarkr-test-output-singlefork.log" npx vitest run --project sync-heavy --project keys-ledger --project built-cli --project signal-reaper
-        env:
-          TICKMARKR_CI_LEAN_REPORTERS: "1"
-          VITEST_MAX_FORKS: "1"
-          TICKMARKR_SWEEP_TIMEOUT_MS: "900000"
-      - name: Assert collected test-file count
-        if: always()
-        run: sh scripts/assert-test-file-count.sh "$RUNNER_TEMP/tickmarkr-test-output.log" "$RUNNER_TEMP/tickmarkr-test-output-singlefork.log"
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-${{ matrix.os }}-suite-${{ matrix.shard }}
+          path: ${{ runner.temp }}/ci/
 
-  test-macos:
+  single-fork:
     if: github.repository == 'alzahrani-khalid/tickmarkr'
-    runs-on: macos-latest
+    name: single-fork ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -73,22 +82,69 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: npm run lint
-      # Same two-invocation proof and serialization as ubuntu (the lane-equality test pins it).
-      - name: Run coverage proof (parallel suite project)
+      # no coverage, as at the base: coverage stays on the suite project
+      - name: Run single-fork projects
         shell: bash
-        run: bash scripts/run-ci-vitest.sh "$RUNNER_TEMP/tickmarkr-test-output.log" npm run test:coverage -- --project suite
+        run: bash scripts/run-ci-vitest.sh "$RUNNER_TEMP/ci/single-fork.log" npx vitest run --project sync-heavy --project keys-ledger --project built-cli --project signal-reaper
         env:
           TICKMARKR_CI_LEAN_REPORTERS: "1"
           VITEST_MAX_FORKS: "1"
           TICKMARKR_SWEEP_TIMEOUT_MS: "900000"
-      - name: Run single-fork projects (independent of the step above)
+      - name: Keep the log and record
         if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-${{ matrix.os }}-single-fork
+          path: ${{ runner.temp }}/ci/
+
+  aggregate:
+    needs: [suite, single-fork]
+    if: always() && github.repository == 'alzahrani-khalid/tickmarkr'
+    name: aggregate ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      # this OS's five artifacts only, flattened into one directory: ci/<job>.log(.record.json) and ci/blobs/blob-<k>.json
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: ci-${{ matrix.os }}-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/ci
+      # G4: ONE threshold check per OS, on the map merged from every shard's blob. The merge logs under merge/, so
+      # its own record (Vitest replays every blob's files through onTestRunEnd) stays outside the ci/*.record.json
+      # set below; it is checked against that set instead.
+      - name: Merge coverage (one threshold check per OS)
         shell: bash
-        run: bash scripts/run-ci-vitest.sh "$RUNNER_TEMP/tickmarkr-test-output-singlefork.log" npx vitest run --project sync-heavy --project keys-ledger --project built-cli --project signal-reaper
+        run: bash scripts/run-ci-vitest.sh "$RUNNER_TEMP/merge/merge.log" npx vitest run --merge-reports="$RUNNER_TEMP/ci/blobs" --coverage
         env:
           TICKMARKR_CI_LEAN_REPORTERS: "1"
           VITEST_MAX_FORKS: "1"
-          TICKMARKR_SWEEP_TIMEOUT_MS: "900000"
-      - name: Assert collected test-file count
+      # v2.7.8 T1 (queue row 118): a floor glob owning no entry, or only statement-free entries, reds here even
+      # when the merge's own threshold check stayed green
+      - name: Recheck coverage floors
         if: always()
-        run: sh scripts/assert-test-file-count.sh "$RUNNER_TEMP/tickmarkr-test-output.log" "$RUNNER_TEMP/tickmarkr-test-output-singlefork.log"
+        shell: bash
+        run: npx tsx scripts/ci/cli.ts floors coverage/coverage-summary.json
+      # G3: every tracked test file exactly once per OS across every job's record, finished, on this HEAD; the
+      # merge record equal to the shards' union; exactly blob-1..4.json in the merged blob directory
+      - name: Assert collected test-file set
+        if: always()
+        shell: bash
+        run: npx tsx scripts/ci/cli.ts assert --merge-record "$RUNNER_TEMP/merge/merge.log.record.json" --blobs "$RUNNER_TEMP/ci/blobs" "$RUNNER_TEMP"/ci/*.record.json
+      - name: Keep the merged summary, merge log and merge record
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: merge-${{ matrix.os }}
+          path: |
+            coverage/coverage-summary.json
+            ${{ runner.temp }}/merge/
