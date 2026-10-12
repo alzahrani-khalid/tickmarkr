@@ -3300,13 +3300,17 @@ describe("B2 Fleet saves machine model choices to the user overlay", () => {
       denyWorkersAdapters: props.initialDenyWorkersAdapters, denyWorkersModels: props.initialDenyWorkersModels,
       classifications: [], selectedMode: props.initialMode, map: props.initialMap, steering: props.initialSteering,
     };
+    const reviewAny = (state: Partial<Parameters<typeof props.reviewOverlay>[0]>) =>
+      props.reviewOverlay({ ...base, ...state });
     const reviewOf = (state: Partial<Parameters<typeof props.reviewOverlay>[0]>) => {
-      const staged = props.reviewOverlay({ ...base, ...state });
-      if (staged.kind !== "diff") throw new Error("the staged choice must stage a diff");
+      const staged = reviewAny(state);
+      if (staged.kind !== "diff") {
+        throw new Error(`the staged choice must stage a diff (${staged.kind}${staged.kind === "refused" ? `: ${staged.reason}` : ""})`);
+      }
       return staged;
     };
     const rowOf = (shape: string, map = props.initialMap) => props.shapeRows(props.initialMode, map, noDeny).find((row) => row.id === shape)!.label;
-    return { ...assembled, reviewOf, rowOf };
+    return { ...assembled, reviewOf, reviewAny, rowOf };
   };
   const taskOf = (shape: string) => TaskSchema.parse({ id: "T1", title: "t", goal: "g", shape, complexity: 3, acceptance: ["a"] });
   const routed = (repo: string, cfg: ReturnType<typeof loadConfig>, adapter: WorkerAdapter, shape: string) =>
@@ -3387,27 +3391,44 @@ describe("B2 Fleet saves machine model choices to the user overlay", () => {
     ].join("\n"), { fake: ["fake-1", "fake-2"], nova: ["nova-1"] });
     const projectBytes = readFileSync(project.repoPath, "utf8");
     const p2 = await b2Editor(project.repo, [fakeAdapter(project.repo), tiered(project.repo, "nova")], project.globalDir);
-    // the user picks staff-led and an implement prefer: the preview's floors come from the same candidate
-    // user bytes the loader resolves — the repo's risk-based still applies, so no floor moves here
-    const picked = { selectedMode: "staff-led" as const, map: { ...p2.props.initialMap, implement: { prefer: ["fake"] } } };
-    const choice = p2.reviewOf(picked);
-    const candidate = loadConfigWithMode(project.repo, { globalDir: project.globalDir, userOverlayText: choice.after });
+    // routing.mode is held here, so a staff-led pick lands in the repository overlay and its floors move.
+    // The implement prefer stays a user edit the repo pin shadows. Staging both needs two overlays.
     const current = loadConfigWithMode(project.repo, { globalDir: project.globalDir });
+    const modeOnly = p2.reviewOf({ selectedMode: "staff-led" });
+    expect(modeOnly.path).toBe(project.repoPath);
+    expect(parse(modeOnly.after).routing.mode).toBe("staff-led");
+    const modeLoaded = loadConfigWithMode(project.repo, { globalDir: project.globalDir, repoOverlayText: modeOnly.after });
+    expect(modeLoaded.mode.mode).toBe("staff-led");
+    expect(SHAPES.some((s) => modeLoaded.cfg.routing.floors[s] !== current.cfg.routing.floors[s])).toBe(true);
+    expect(p2.props.modePreview("staff-led", p2.props.initialMap, noDeny)).toEqual(expect.arrayContaining([
+      "  floors vs risk-based:",
+      "    implement: mid → cheap",
+      "    refactor: mid → cheap",
+    ]));
+    expect(p2.props.shapeRows("staff-led", p2.props.initialMap, noDeny))
+      .not.toEqual(p2.props.shapeRows("risk-based", p2.props.initialMap, noDeny));
+
+    const mapOnly = p2.reviewOf({ map: { ...p2.props.initialMap, implement: { prefer: ["fake"] } } });
+    expect(mapOnly.path).toBe(overlayFile(project.repo));
+    const candidate = loadConfigWithMode(project.repo, { globalDir: project.globalDir, userOverlayText: mapOnly.after });
     expect(candidate.mode.mode).toBe("risk-based");
-    expect(SHAPES.filter((s) => current.cfg.routing.floors[s] !== candidate.cfg.routing.floors[s])).toEqual([]);
-    expect(p2.props.modePreview("staff-led", picked.map, noDeny).slice(1)).toEqual(["  floors vs risk-based:", "    (no floor changes)"]);
-    // the shape rows' floor provenance comes from the same candidate: never "operator-pinned" by a shadowed mode
-    const shadowedRows = p2.props.shapeRows("staff-led", p2.props.initialMap, noDeny);
-    expect(shadowedRows.some((row) => row.label.includes("operator-pinned"))).toBe(false);
-    expect(shadowedRows).toEqual(p2.props.shapeRows("risk-based", p2.props.initialMap, noDeny));
-    // control: staff-led does move floors where no repo mode shadows it
-    const unshadowed = loadConfigWithMode(project.repo, { globalDir: project.globalDir, repoOverlayText: "routing:\n  mode: staff-led\n" });
-    expect(SHAPES.some((s) => unshadowed.cfg.routing.floors[s] !== current.cfg.routing.floors[s])).toBe(true);
-    // the repo pin replaces the whole implement slot, so the saved prefer is named shadowed, never applied
     expect(candidate.cfg.routing.map.implement).toEqual({ pin: { via: "fake", model: "fake-1" } });
-    for (const [key, value] of [["routing.map.implement.prefer", "absent"], ["routing.mode", "risk-based"]]) {
-      expect(choice.notes).toContain(`repo-shadowed: ${key} stays ${value} in this repository — ${project.repoPath} sets it above the user overlay`);
+    expect(mapOnly.notes).toContain(`repo-shadowed: routing.map.implement.prefer stays absent in this repository — ${project.repoPath} sets it above the user overlay`);
+    expect(mapOnly.notes?.some((note) => note.includes("routing.mode"))).toBe(false);
+
+    const mixed = p2.reviewAny({
+      selectedMode: "staff-led",
+      map: { ...p2.props.initialMap, implement: { prefer: ["fake"] } },
+    });
+    expect(mixed.kind).toBe("refused");
+    if (mixed.kind === "refused") {
+      expect(mixed.reason).toContain("mixed destinations");
+      expect(mixed.reason).toContain("routing.mode");
+      expect(mixed.reason).toContain(project.repoPath);
+      expect(mixed.reason).toContain(overlayFile(project.repo));
     }
+    expect(readFileSync(project.repoPath, "utf8")).toBe(projectBytes);
+    expect(readFileSync(overlayFile(project.repo), "utf8")).toBe(userBytes);
 
     // reclassifying the private adapter's model: the user bytes load only beside this repo's nova
     // vendor/channel, so every other repository would break — refused, user bytes untouched

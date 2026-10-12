@@ -403,7 +403,9 @@ describe("a resource-starved baseline capture is invalid even when the child exi
 
     expect(baseline.commands.test?.infra).toBeUndefined();
     expect(baseline.commands.test?.exitCode).toBe(1);
-    expect(baseline.commands.test?.fingerprints).toEqual(fingerprint(`${CAPTURED_FAILURE}\n${ASSERTION}\n`));
+    // S22: a v2 capture records one sorted identity per occurrence
+    expect(baseline.commands.test?.fingerprintVersion).toBe(2);
+    expect(baseline.commands.test?.fingerprints).toEqual([CAPTURED_FAILURE, ASSERTION].sort());
 
     const later = await gateOver([CAPTURED_FAILURE, ASSERTION], baseline);
     expect(later.pass).toBe(true);

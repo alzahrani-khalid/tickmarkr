@@ -4,6 +4,7 @@ import { shq } from "../adapters/types.js";
 import type { TickmarkrConfig } from "../config/config.js";
 import {
   type Baseline,
+  baselineEntryRefusal,
   type BaselineProvenance,
   beginGateEvidence,
   type GateEvidenceOptions,
@@ -401,7 +402,10 @@ export async function verifyIntegrationTip(
       });
       continue;
     }
-    const { failing, unreadable } = freshFailures(entry, stripped);
+    const verdict = freshFailures(entry, stripped);
+    const { failing, unreadable } = verdict;
+    // S22: a missing or unreadable entry forgives nothing; the red names it rather than a bare exit code.
+    const refusal = baselineEntryRefusal(gate, verdict);
     const deficit = fileCountDeficit(entry, stripped);
     const cause = deficit ? "infra" : classifyFreshRunnerOutput(entry, stripped, r.code);
     const greenTeardown = classifyRunnerOutput(stripped, r.code) === "green-teardown";
@@ -416,7 +420,7 @@ export async function verifyIntegrationTip(
     // fingerprintable yet OBS-42-exempt from rejecting, so `failing` comes back empty, `unreadable`
     // false and the cause reads "regression" — every other guard satisfied, and a real red forgiven
     // against a capture that never finished asking the question.
-    const baselineRed = entry !== undefined && entry.infra !== true && (entry.exitCode ?? 1) !== 0;
+    const baselineRed = verdict.baselineRed;
     // Battery parity on the infra rule too (T9): infrastructure-only output means the runner never
     // completed a suite — nothing was verified, so nothing is forgivable, however familiar its
     // fingerprints. Stricter-than-battery edge kept: unreadable output never forgives.
@@ -443,7 +447,9 @@ export async function verifyIntegrationTip(
           ? `exit ${r.code}; every failure is baseline-recorded, but that capture ran under `
             + `${describeCapacity(entry?.capacity)} and this verification ran under ${describeCapacity(r.capacity)} `
             + `— forgiveness across a changed capacity is not evidence`
-          : `exit ${r.code}`)),
+          : `exit ${r.code}`))
+        // S22: every red here names a missing or unreadable entry beside its own cause, deficit included
+        + (!pass && refusal ? `; ${refusal}` : ""),
       ...(forgiven && !deficit ? { forgiven: true, ...(baseline?.provenance ? { baselineProvenance: baseline.provenance } : {}) } : {}),
       ...(cause ? { cause } : {}),
       ...(pass ? {} : { artifact }),

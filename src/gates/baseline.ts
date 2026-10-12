@@ -51,21 +51,41 @@ const BENIGN_ENV_KEYS = ["HOME", "TMPDIR"] as const;
 
 const REDACTION_CATEGORIES = ["token", "assignment", "secretEnv", "benignEnv"] as const;
 
+/** Keep inherited, evidence, and inline values as separate pairs, including overridden values. */
+function gateEvidencePairs(env: NodeJS.ProcessEnv, command: string, inheritedEnv: NodeJS.ProcessEnv): [string, string][] {
+  const pairs = [...Object.entries(inheritedEnv), ...Object.entries(env)]
+    .filter((entry): entry is [string, string] => entry[1] !== undefined);
+  for (const match of command.matchAll(/(?:^|\s)([A-Za-z_][A-Za-z_0-9]*)=(?:'([^']*)'|"([^"$]*)"|([^\s;&|]+))/g)) {
+    pairs.push([match[1]!, match[2] ?? match[3] ?? match[4]!]);
+  }
+  return pairs;
+}
+
 /**
  * OBS-1139: every category scans the ORIGINAL text on its own; overlapping spans then merge into one
  * span counted once under its highest-priority member — token, assignment, secret environment, benign
  * HOME/TMPDIR — so precedence never depends on which match starts first. Counts only: never a value.
  */
-export function classifyGateOutput(text: string, env: NodeJS.ProcessEnv): { text: string; counts: RedactionCounts } {
-  // HOME/TMPDIR substitute by name at any length; "/" alone would rewrite every path separator.
-  const benign = BENIGN_ENV_KEYS.flatMap(key => { const value = env[key]; return value && value.length > 1 ? [{ value, label: `$${key}` }] : []; });
-  // Short operational values (0, true, vi, test) occur throughout ordinary diagnostics.
-  // Only secret-named keys justify redacting short values. A secret-named value that happens to equal
-  // HOME/TMPDIR stays a secret candidate: precedence decides the span, never candidate pruning.
-  const secrets = [...new Set(Object.entries(env)
-    .filter(([key, value]) => !!value && !(BENIGN_ENV_KEYS as readonly string[]).includes(key)
-      && (value.length >= 8 || /KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|AUTH/i.test(key)))
-    .map(([, value]) => value!))];
+export function classifyGateOutput(text: string, env: NodeJS.ProcessEnv, command = "", inheritedEnv: NodeJS.ProcessEnv = process.env): { text: string; counts: RedactionCounts } {
+  const benign: { value: string; label: string }[] = [];
+  const secrets = new Set<string>();
+  // Closed pair rule, first match wins: HOME/TMPDIR is benign when longer than one; empty is nothing;
+  // length >= 8 is secret; a secret name with a flag literal (0, 1, true, false, yes, no, on, off)
+  // or all ASCII digits is nothing; another short secret-named value is secret; other short values
+  // are nothing. Cost: short all-digit secrets and flag literals are no longer withheld. Span
+  // precedence still makes a secret equal to HOME/TMPDIR win over the benign location label.
+  for (const [name, value] of gateEvidencePairs(env, command, inheritedEnv)) {
+    if ((BENIGN_ENV_KEYS as readonly string[]).includes(name)) {
+      if (value.length > 1) benign.push({ value, label: `$${name}` });
+    } else if (!value) {
+      continue;
+    } else if (value.length >= 8) {
+      secrets.add(value);
+    } else if (/KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|AUTH/i.test(name)
+      && !/^(?:0|1|true|false|yes|no|on|off)$/i.test(value) && !/^[0-9]+$/.test(value)) {
+      secrets.add(value);
+    }
+  }
   const literal = (v: string) => v.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const tokens = String.raw`\b(?:sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9_]{16,}|github_pat_[A-Za-z0-9_]{16,}|AKIA[A-Z0-9]{16}|eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+)\b`;
   const assignments = String.raw`(?:authorization\s*:\s*bearer|(?:api[_-]?key|token|password|secret)\s*[:=])\s*[^\s"']+`;
@@ -75,7 +95,7 @@ export function classifyGateOutput(text: string, env: NodeJS.ProcessEnv): { text
     [...text.matchAll(new RegExp(source, "gi"))].map(m => ({ start: m.index, end: m.index + m[0].length, rank, label }));
   const spans = [
     ...scan(tokens, 0), ...scan(assignments, 1),
-    ...secrets.flatMap(v => scan(literal(v), 2)),
+    ...[...secrets].flatMap(v => scan(literal(v), 2)),
     ...benign.flatMap(b => scan(literal(b.value), 3, b.label)),
   ].sort((a, b) => a.start - b.start || b.end - a.end);
   const merged: typeof spans = [];
@@ -98,8 +118,8 @@ export function classifyGateOutput(text: string, env: NodeJS.ProcessEnv): { text
   return { text: out + text.slice(at), counts };
 }
 
-export function redactGateOutput(text: string, env: NodeJS.ProcessEnv): string {
-  return classifyGateOutput(text, env).text;
+export function redactGateOutput(text: string, env: NodeJS.ProcessEnv, command = ""): string {
+  return classifyGateOutput(text, env, command).text;
 }
 
 /** Material means bytes were withheld; a benign location substitution withholds nothing. */
@@ -128,10 +148,8 @@ export function beginGateEvidence(cwd: string, gate: string, command: string, op
     try { subjectCommit = execFileSync("git", ["rev-parse", "HEAD"], { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim(); } catch { /* unknown subject */ }
   }
   const root = opts.artifactDir ?? join(tmpdir(), "tickmarkr-gate-evidence", createHash("sha256").update(cwd).digest("hex"));
-  const env = { ...process.env, ...opts.env };
-  for (const match of command.matchAll(/(?:^|\s)[A-Za-z_][A-Za-z_0-9]*=(?:'([^']*)'|"([^"$]*)"|([^\s;&|]+))/g)) {
-    env[`assignment_${match.index}`] = match[1] ?? match[2] ?? match[3];
-  }
+  const inheritedEnv = { ...process.env };
+  const evidenceEnv = { ...opts.env };
   let observed: ShellReceipt | undefined;
   let pendingId: string | undefined;
   const history: GateEvidenceReceipt[] = [];
@@ -153,7 +171,7 @@ export function beginGateEvidence(cwd: string, gate: string, command: string, op
         exitCode: observed?.exitCode ?? null, signal: observed?.signal ?? null,
         timedOut: observed ? observed.outcome === "timed-out" : null,
       };
-      const classified = [classifyGateOutput(stdout, env), classifyGateOutput(stderr, env)];
+      const classified = [classifyGateOutput(stdout, evidenceEnv, command, inheritedEnv), classifyGateOutput(stderr, evidenceEnv, command, inheritedEnv)];
       const clean = classified.map(c => c.text);
       const counts: RedactionCounts = { token: 0, assignment: 0, secretEnv: 0, benignEnv: 0 };
       for (const c of classified) for (const k of Object.keys(counts) as (keyof RedactionCounts)[]) counts[k] += c.counts[k];
@@ -230,6 +248,11 @@ export interface BaselineCommand {
    */
   exitCode?: number;
   fingerprints: string[];
+  /**
+   * S22: `2` when captureBaseline wrote one table-T / layout-L fingerprint per occurrence. Absent on every
+   * earlier and every hand-built entry (LEGACY, compared exactly as 2.7.8 did); any other value is unreadable.
+   */
+  fingerprintVersion?: number;
   missingCommand?: boolean;
   /** Why a capture returned no verdict. */
   invalidCause?: "ceiling-kill" | "resource-exhaustion" | "infra";
@@ -590,6 +613,99 @@ export function fingerprint(output: string): string[] {
   return [...new Set(shaped.map(normalizeLine))];
 }
 
+// S22 table T (ANL-021): the ONLY whole-token shapes whose digits a v2 fingerprint canonicalizes, first
+// match wins. Every other token keeps its digits verbatim — TestParse1, TS2304, 1ms.js, my/no-1ms-timeout.
+const T4_PATH_POSITION_RE = /^(.*[^\d:])((?::\d+){1,2})$/;
+const T5_TSC_POSITION_RE = /^(.*)\((\d+),(\d+)\)$/;
+const TABLE_T: ReadonlyArray<readonly [RegExp, (m: RegExpExecArray) => string]> = [
+  [/^(?:\d+h)?(?:\d+m(?!s))?(?:\d*\.)?\d+(?:ns|ps|us|µs|μs|ms|s|m|h)$/, () => "<dur>"], // T1 duration
+  [/^[+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?%?$/, () => "#"], // T2 number
+  [/^\d+(?:[:.]\d+)+$/, (m) => m[0].replace(/\d+/g, "#")], // T3 position, clock, version
+  [T4_PATH_POSITION_RE, (m) => m[1]! + m[2]!.replace(/\d+/g, "#")], // T4 path with position
+  [T5_TSC_POSITION_RE, (m) => `${m[1]}(#,#)`], // T5 tsc position
+  [/^\d+\/\d+$/, () => "#/#"], // T6 ratio
+  [/^\d{4}-\d{2}-\d{2}(?:[T ]?\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?)?(?:Z|[+-]\d{2}:?\d{2})?$/, () => "<time>"], // T7 ISO date-time
+  [/^([A-Za-z_][\w.-]*)=([+-]?\d+(?:\.\d+)?)$/, (m) => `${m[1]}=#`], // T8 key=number
+  [/^0x[0-9a-fA-F]+$/, () => "0x#"], // T9 hex address
+];
+const canonical = (core: string, rows: typeof TABLE_T): string | undefined => {
+  for (const [re, to] of rows) {
+    const m = re.exec(core);
+    if (m) return to(m);
+  }
+  return undefined;
+};
+const canonicalToken = (token: string): string => {
+  const trail = /[,;:.!?]+$/.exec(token)?.[0] ?? "";
+  const rest = token.slice(0, token.length - trail.length);
+  const positioned = canonical(rest, [TABLE_T[4]!, TABLE_T[3]!]);
+  if (positioned !== undefined) return positioned + trail;
+  const lead = /^[([{"']/.exec(rest)?.[0] ?? "";
+  const close = /[)\]}"']+$/.exec(rest.slice(lead.length))?.[0] ?? "";
+  const core = rest.slice(lead.length, rest.length - close.length);
+  const out = canonical(core, TABLE_T);
+  return out === undefined ? token : lead + out + close + trail;
+};
+/** A v2 line: every whitespace token canonicalized by table T, joined with one space. */
+const normalizeV2 = (l: string): string => l.split(/\s+/).filter(Boolean).map(canonicalToken).join(" ");
+
+// S22 layout L: when a stylish header is PROVEN for an error row. A stream is keyed by its turbo-style
+// label (CONTENT keeps the runner's own indentation, unlike TURBO_PREFIX_RE); unlabelled output is one stream.
+const L_LABEL_RE = /^([\w@./-]+(?::[A-Za-z_][\w.-]*)+):(?: |$)/;
+const L_ROW_RE = /^\s+\d+:\d+\s+(?:error|warning)\s+\S/;
+const splitLabel = (l: string): { label: string; content: string } => {
+  const m = L_LABEL_RE.exec(l);
+  return m ? { label: m[1]!, content: l.slice(m[0].length) } : { label: "", content: l };
+};
+/** Line index → proven header of every ROW inside a BLOCK (a header plus the maximal run of rows after it). */
+function stylishHeaders(lines: string[]): Map<number, string> {
+  const streams = new Map<string, Array<{ index: number; content: string }>>();
+  lines.forEach((line, index) => {
+    const { label, content } = splitLabel(line);
+    const stream = streams.get(label) ?? [];
+    stream.push({ index, content });
+    streams.set(label, stream);
+  });
+  const headers = new Map<number, string>();
+  for (const stream of streams.values()) {
+    stream.forEach(({ content }, i) => {
+      const proven = /^\S/.test(content) && !L_ROW_RE.test(content) && !isFingerprintShaped(content)
+        && (i === 0 || stream[i - 1]!.content.trim() === "") && L_ROW_RE.test(stream[i + 1]?.content ?? "");
+      for (let j = i + 1; proven && j < stream.length && L_ROW_RE.test(stream[j]!.content); j++) headers.set(stream[j]!.index, content);
+    });
+  }
+  return headers;
+}
+
+interface Occurrence { id: string; line: string; unattributed?: true }
+
+/**
+ * S22: one identity per failure OCCURRENCE (never deduplicated), each kept beside the original line it came
+ * from. Same filters as `fingerprint`; a stylish error ROW is emitted once, as its layout-L tuple.
+ */
+function fingerprintOccurrences(output: string): Occurrence[] {
+  const all = withoutVitestEchoBlocks(output).map((l) => l.replace(ANSI_RE, ""));
+  const headers = stylishHeaders(all);
+  const occurrences: Occurrence[] = [];
+  let printed = false;
+  all.forEach((l, index) => {
+    if (PASS_LINE_RE.test(l) || OPERATOR_LINE_RE.test(l)) return;
+    printed ||= l.trim() !== "";
+    const stripped = stripTurboPrefix(l);
+    if (stripped !== undefined && OPERATOR_LINE_RE.test(stripped)) return; // OBS-888: operator prose under a turbo prefix
+    const { label, content } = splitLabel(l);
+    if (L_ROW_RE.test(content) && LINTER_ERROR_RE.test(content)) {
+      const header = headers.get(index) ?? null;
+      occurrences.push({ id: JSON.stringify(["stylish", label, header, normalizeV2(content)]), line: l, ...(header === null ? { unattributed: true as const } : {}) });
+      return;
+    }
+    if (isFingerprintShaped(l)) occurrences.push({ id: normalizeV2(l), line: l });
+    if (stripped !== undefined && !PASS_LINE_RE.test(stripped) && isFingerprintShaped(stripped)) occurrences.push({ id: normalizeV2(stripped), line: stripped });
+  });
+  if (!occurrences.length && printed) return [{ id: UNRECOGNIZED_FAILURE, line: UNRECOGNIZED_FAILURE }];
+  return occurrences;
+}
+
 // The diagnostic channel for a runner we cannot read: raw output lines, never fingerprints, never a
 // verdict. They exist so the operator sees SOMETHING when a green command turns red unrecognizably.
 const unrecognizedEvidence = (raw: string): string =>
@@ -604,25 +720,92 @@ const unrecognizedEvidence = (raw: string): string =>
 // on-disk baseline.json files stay comparable without recapture (compat invariant, CLAUDE.md)
 const renormalize = (fp: string) => normalizeLine(fp.replace(ANSI_RE, ""));
 
+/** Which reading of a baseline entry decided forgiveness (S22). Only `legacy` and `v2` carry a forgivable verdict. */
+export type BaselineEntryState = "missing" | "unreadable" | "legacy" | "v2" | "no-verdict";
+
+export interface FreshFailureVerdict {
+  /** Fresh failure identities, each once. */
+  failing: string[];
+  /** The output carried no recognizable failure shape at all. */
+  unreadable: boolean;
+  /** Baseline-recorded identities this output repeated, each once. */
+  forgiven: string[];
+  /** The ORIGINAL runner lines behind the fresh identities: classification, host-starved and diagnostics read these, never the keys. */
+  failingLines: string[];
+  state: BaselineEntryState;
+  /** Why an `unreadable` entry could not be read. */
+  why?: string;
+  /** The one shared forgiveness decision both readers extend: the entry recorded a red VERDICT. */
+  baselineRed: boolean;
+}
+
+const entryState = (entry: BaselineCommand | undefined): { state: BaselineEntryState; why?: string } => {
+  if (entry === undefined) return { state: "missing" };
+  if (entry === null || typeof entry !== "object") return { state: "unreadable", why: "entry is not an object" };
+  const version: unknown = entry.fingerprintVersion;
+  if (version !== undefined && version !== 2) return { state: "unreadable", why: `fingerprintVersion ${JSON.stringify(version)} is not 2` };
+  const fps: unknown = entry.fingerprints;
+  // ponytail: an absent list keeps 2.7.8's `?? []` for legacy entries; a present one must be all strings
+  if ((fps !== undefined || version === 2) && !(Array.isArray(fps) && fps.every((f) => typeof f === "string"))) {
+    return { state: "unreadable", why: "fingerprints is not an array of strings" };
+  }
+  if (entry.infra === true) return { state: "no-verdict" };
+  return { state: version === 2 ? "v2" : "legacy" };
+};
+
+/** The red reason a missing or unreadable entry owes in BOTH readers; undefined for every other state. */
+export function baselineEntryRefusal(gate: string, verdict: Pick<FreshFailureVerdict, "state" | "why">): string | undefined {
+  if (verdict.state === "missing") return `no baseline entry for ${gate}`;
+  if (verdict.state === "unreadable") return `baseline entry for ${gate} is unreadable (${verdict.why})`;
+  return undefined;
+}
+
+// OBS-42: diagnostic headings enrich fingerprints but cannot reject on their own.
+const rejects = (f: string) => !FAIL_ANCHOR_RE.test(f) || f.startsWith("FAIL ");
+
 /**
- * Q121s: the battery's forgiveness math, exported so tip-verify applies the IDENTICAL rule.
- * Returns the failure fingerprints of `raw` that are NOT in the baseline entry (fresh), and
- * whether the output carried no recognizable failure shape at all.
+ * Q121s / S22: the battery's forgiveness math, exported so tip verify applies the IDENTICAL rule, and
+ * the one place an entry's state is decided — each reader renders its reason, neither re-derives it.
+ *
+ * A LEGACY entry (no fingerprintVersion) compares exactly as 2.7.8 did: set membership over lines whose
+ * every digit run is masked. A v2 entry is a MULTISET under two closed grammars (ANL-021 S22):
+ * - table T: only whole tokens of a closed volatile shape (durations, numbers, positions, ratios, ISO
+ *   times, key=number, hex addresses) lose their digits; every other token keeps them. Declared cost: a
+ *   volatile token outside T stays verbatim, so its change reads fresh (a closed false red, not a defect).
+ * - layout L: a stylish error row is keyed by its stream label and the header layout L proves (blank or
+ *   nothing before it, rows right after it). Declared costs: a row outside every proven block is never
+ *   forgiven, and a header printed under a realpath variant of the cwd compares as a different header.
+ * f is fresh when the candidate repeats it more often than the capture recorded it.
  */
-export function freshFailures(entry: BaselineCommand | undefined, raw: string): { failing: string[]; unreadable: boolean; forgiven: string[] } {
+export function freshFailures(entry: BaselineCommand | undefined, raw: string): FreshFailureVerdict {
+  const { state, why } = entryState(entry);
+  const baselineRed = (state === "legacy" || state === "v2") && (entry!.exitCode ?? 1) !== 0;
+  if (state === "v2") {
+    const recorded = new Map<string, number>();
+    for (const f of entry!.fingerprints) recorded.set(f, (recorded.get(f) ?? 0) + 1);
+    const occurrences = fingerprintOccurrences(raw);
+    const seen = new Map<string, number>();
+    for (const o of occurrences) seen.set(o.id, (seen.get(o.id) ?? 0) + 1);
+    const isFresh = (o: Occurrence) => o.id !== UNRECOGNIZED_FAILURE && rejects(o.id)
+      && (o.unattributed === true || seen.get(o.id)! > (recorded.get(o.id) ?? 0));
+    const fresh = occurrences.filter(isFresh);
+    return {
+      failing: [...new Set(fresh.map((o) => o.id))],
+      unreadable: seen.has(UNRECOGNIZED_FAILURE),
+      forgiven: [...new Set(occurrences.filter((o) => o.unattributed !== true && seen.get(o.id)! <= (recorded.get(o.id) ?? 0)).map((o) => o.id))],
+      failingLines: fresh.map((o) => o.line),
+      state, baselineRed,
+    };
+  }
   // OBS-534 (T2): an infra-recorded entry is a KILL, not a verdict — whatever fingerprints it carries
   // came from output flushed before the kill, over a suite that never finished. Nothing there is
-  // "pre-existing", so it forgives nothing. The rule lives here rather than in either caller, so the
-  // battery and tip verify inherit it from the one helper they already share.
-  const known = new Set(entry?.infra === true ? [] : (entry?.fingerprints ?? []).map(renormalize));
-  // OBS-42: diagnostic headings enrich fingerprints but cannot invalidate legacy baselines.
+  // "pre-existing", so it forgives nothing; neither does a missing or unreadable entry.
+  const known = new Set(state === "legacy" ? (entry!.fingerprints ?? []).map(renormalize) : []);
   const current = fingerprint(raw);
-  const fresh = current.filter(
-    (f) => !known.has(f) && (!FAIL_ANCHOR_RE.test(f) || f.startsWith("FAIL ")),
-  );
+  const fresh = current.filter((f) => !known.has(f) && rejects(f) && f !== UNRECOGNIZED_FAILURE);
   // OBS-1123: the baseline-recorded half, named so a reader never has to infer it from the fresh half.
-  return { failing: fresh.filter((f) => f !== UNRECOGNIZED_FAILURE), unreadable: current.includes(UNRECOGNIZED_FAILURE),
-    forgiven: current.filter((f) => known.has(f)) };
+  return { failing: fresh, unreadable: current.includes(UNRECOGNIZED_FAILURE),
+    forgiven: current.filter((f) => known.has(f)), failingLines: fresh, state, ...(why ? { why } : {}), baselineRed };
 }
 export type PackageManager = "npm" | "pnpm" | "yarn" | "bun";
 
@@ -905,8 +1088,9 @@ export async function captureBaseline(cwd: string, commands: Record<string, stri
       exitCode: runnerVerdict === "green-teardown" ? 0 : r.code,
       ...(runnerVerdict === "green-teardown" ? { teardownFingerprint: true as const } : {}),
       // a command that exits 0 has no failures to fingerprint — recording any would be a lie the
-      // compare step then has to forgive
-      fingerprints: r.code === 0 || runnerVerdict === "green-teardown" ? [] : fingerprint(raw),
+      // compare step then has to forgive. S22: one v2 identity per occurrence, sorted.
+      fingerprints: r.code === 0 || runnerVerdict === "green-teardown" ? [] : fingerprintOccurrences(raw).map((o) => o.id).sort(),
+      fingerprintVersion: 2,
       missingCommand: missingConfiguredCommand(cmd, r),
       durationMs,
       ...fileTiming(raw, durationMs),
@@ -970,14 +1154,19 @@ export async function detectVacuousOracles(
 // drop a FAIL line that fingerprint-collides with baseline noise). No headline anchors → byte-identical
 // fallback to today's text (non-vitest runners lose nothing). RED-pinned by tests/gates/baseline.test.ts
 // "HYG-08: details headlines the failing test, not the noise".
-function headlineDetails(raw: string, fresh: string[]): { details: string; meta?: { failingTests: string[] } } {
+function headlineDetails(raw: string, fresh: string[], freshLines: string[]): { details: string; meta?: { failingTests: string[] } } {
   const headlines = raw
     .split("\n")
     .map((l) => l.replace(ANSI_RE, ""))
     .filter((l) => namesFailureEitherForm(l) || SUMMARY_FAIL_RE.test(l));
-  if (!headlines.length) return { details: `new failures vs baseline:\n${fresh.join("\n")}` };
+  // S22: the ORIGINAL runner lines behind v2 comparison keys are the diagnostic; the keys are secondary.
+  // A legacy entry's lines ARE its keys, so its details stay byte-identical.
+  const lines = [...new Set(freshLines)].join("\n");
+  const keys = `new failure fingerprints vs baseline (secondary):\n${fresh.join("\n")}`;
+  const same = lines === fresh.join("\n");
+  if (!headlines.length) return { details: same ? `new failures vs baseline:\n${lines}` : `new failures vs baseline:\n${lines}\n\n${keys}` };
   return {
-    details: `failing tests:\n${headlines.join("\n")}\n\nnew failure fingerprints vs baseline (secondary):\n${fresh.join("\n")}`,
+    details: `failing tests:\n${headlines.join("\n")}\n\n${same ? "" : `new failure lines vs baseline:\n${lines}\n\n`}${keys}`,
     meta: { failingTests: headlines.filter(namesFailureEitherForm) },
   };
 }
@@ -1011,6 +1200,8 @@ export async function compareToBaseline(
       continue;
     }
     const entry = baseline.commands[name];
+    const entryRead = entryState(entry);
+    const refusal = baselineEntryRefusal(name, entryRead);
     const ceilingMs = effectiveCeilingMs(entry);
     const evidence = beginGateEvidence(cwd, name, cmd, opts.evidence);
     let r: ShResult;
@@ -1040,6 +1231,12 @@ export async function compareToBaseline(
     let recoveryBlocked: string | undefined;
     const record = (g: GateResult): void => {
       g = { ...g, evidenceReceipt, evidenceReceipts: [...evidence.history, evidenceReceipt] };
+      // S22: every red that read this command's output names a missing or unreadable entry, once, beside
+      // its own cause (infra, deficit, fresh). A ceiling kill is read before the output and forgives
+      // nothing either way; the tip's kill clause is queue row 19's, so neither reader appends it there.
+      if (!g.pass && refusal && g.meta?.kind !== "ceiling-kill") {
+        g = { ...g, details: g.details.includes(refusal) ? g.details : `${g.details}\n\n${refusal}`, meta: { ...g.meta, baselineEntry: entryRead.state } };
+      }
       if (recoveryBlocked) g = { ...g, meta: { ...g.meta, recoveryBlocked } };
       const withReap = r.reapedGroup ? { ...g, meta: { ...g.meta, reapedGroup: true } } : g;
       const withReapError = r.reapError ? { ...withReap, meta: { ...withReap.meta, reapError: r.reapError } } : withReap;
@@ -1114,7 +1311,8 @@ export async function compareToBaseline(
     // below rather than reading as a verified green. Raise the ceiling by teaching isFailureShaped
     // that runner's position rule (leading verdict + identifier, or identifier + separator + trailing
     // verdict); loosening back to vocabulary re-opens OBS-278.
-    const { failing, unreadable, forgiven } = freshFailures(entry, raw);
+    const verdict = freshFailures(entry, raw);
+    const { failing, unreadable, forgiven, failingLines, baselineRed } = verdict;
     // OBS-1123: which baseline-recorded fingerprints this verdict carried, and the capture that
     // recorded them. Observational only — nothing below reads it to decide a verdict.
     const provenance = baseline.provenance ? { baselineProvenance: baseline.provenance } : {};
@@ -1139,7 +1337,7 @@ export async function compareToBaseline(
     // OBS-896: every fresh failure must be timeout-class, and the suite must take at least twice its
     // own baseline measurement. The first read buys one calm rerun here, never a worker repair.
     if (name === "test" && classification !== "infra" && failing.length && !rerunOf && !opts.infraRerun
-      && hostStarved(failing.join("\n"), r.durationMs ?? 0, entry?.durationMs)) {
+      && hostStarved(failingLines.join("\n"), r.durationMs ?? 0, entry?.durationMs)) {
       const waitedMs = await waitForCalmWindow(executionSignal());
       if (opts.authorizeRetry && !calmWindowReady()) {
         recoveryBlocked = "calm window unavailable within the existing wait ceiling";
@@ -1154,8 +1352,8 @@ export async function compareToBaseline(
       }
     }
     if (classification === "infra") {
-      const evidence = failing.length
-        ? failing.slice(0, 10).join("\n")
+      const evidence = failingLines.length
+        ? failingLines.slice(0, 10).join("\n")
         : unrecognizedEvidence(raw) || raw.trim().split("\n").slice(0, 10).join("\n");
       record({
         gate: name,
@@ -1168,15 +1366,17 @@ export async function compareToBaseline(
     // OBS-534 (T2): only a recorded VERDICT can be forgiven. A green baseline has no red to forgive,
     // and neither has a capture that was killed at its ceiling — it recorded a cause instead, so it
     // fails closed on the same branch rather than reading as "only pre-existing failures". Legacy
-    // entries with no exitCode keep the `?? 1` red default both readers share (merge.ts:131).
-    const baselineRed = entry?.infra !== true && (entry?.exitCode ?? 1) !== 0;
+    // entries with no exitCode keep the `?? 1` red default both readers share (freshFailures'
+    // baselineRed); S22: a missing or unreadable entry forgives nothing and says so.
     if (!failing.length && !baselineRed) {
       const recordedCause = entry?.invalidCause === "infra"
         ? "was invalidated by its recorded runner-infrastructure cause"
         : entry?.invalidCause === "resource-exhaustion" || entry?.invalidatingLines?.length
         ? `was invalidated by its recorded process/resource-exhaustion cause${entry.invalidatingLines?.[0] ? ` (${entry.invalidatingLines[0]})` : ""}`
         : "was killed at its ceiling";
-      const closed = entry?.infra === true
+      const closed = refusal
+        ? `exit ${r.code}; ${refusal} — nothing is forgiven, failing closed`
+        : entry?.infra === true
         ? `the baseline capture for this command ${recordedCause} and recorded no verdict, so nothing here is forgivable — it now exits ${r.code} with no recognizable failure lines — failing closed`
         : `command was green at baseline but now exits ${r.code} with no recognizable failure lines — failing closed`;
       const evidence = unrecognizedEvidence(raw);
@@ -1189,7 +1389,7 @@ export async function compareToBaseline(
       continue;
     }
     if (failing.length) {
-      const headlined = headlineDetails(raw, failing);
+      const headlined = headlineDetails(raw, failing, failingLines);
       // A fresh red beside baseline-recorded ones names both halves, so no reader shows the new one as forgiven.
       const meta = { ...headlined.meta, ...(classification ? { classification } : {}),
         ...(forgiven.length ? { freshFingerprints: failing, forgivenFingerprints: forgiven, ...provenance } : {}) };
@@ -1313,7 +1513,7 @@ export function fileCountDeficit(
 /** Both readers classify fresh evidence first, retaining the whole-output guard against infra forgiveness. */
 export function classifyFreshRunnerOutput(entry: BaselineCommand | undefined, raw: string, code: number): FailureClassification | undefined {
   if (classifyRunnerOutput(raw, code) === "green-teardown") return undefined;
-  const { failing } = freshFailures(entry, raw);
-  const verdict = classifyRunnerOutput(failing.length ? failing.join("\n") : raw, code);
+  const { failingLines } = freshFailures(entry, raw);
+  const verdict = classifyRunnerOutput(failingLines.length ? failingLines.join("\n") : raw, code);
   return verdict === "infra" || verdict === "regression" ? verdict : undefined;
 }

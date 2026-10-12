@@ -833,8 +833,8 @@ export async function evaluateManifestedTest(cmd: string, cwd: string, opts: {
         const evidenceRoot = opts.evidence?.artifactDir ?? dir;
         const stdoutPath = join(evidenceRoot, evidenceReceipt.stdout.path);
         const stderrPath = join(evidenceRoot, evidenceReceipt.stderr.path);
-        const stdoutTail = Buffer.from(redactGateOutput(invoked.stdout, env)).subarray(-16 * 1024);
-        const stderrTail = Buffer.from(redactGateOutput(invoked.stderr, env)).subarray(-16 * 1024);
+        const stdoutTail = Buffer.from(redactGateOutput(invoked.stdout, env, spawnedCommand)).subarray(-16 * 1024);
+        const stderrTail = Buffer.from(redactGateOutput(invoked.stderr, env, spawnedCommand)).subarray(-16 * 1024);
         const report = invoked.report?.nonce === nonce ? invoked.report : undefined;
         const neverStarted = report ? files.filter(file => !(file in report.started)).length : "unknown";
         const errors = report?.certificate?.errors;

@@ -2,6 +2,31 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v2.7.9 — gate evidence keeps its meaning: no redacted digits, no forgiven look-alikes, and Fleet edits that take effect
+
+**v2.7.9** comes from one `tickmarkr run` (run-20261012-004108-…1123). Three of its five tasks ship. Each passed build, lint,
+evidence, scope, the executed acceptance judge, a cross-vendor review and the full suite, and the run's tip verify passed. The other
+two (acceptance citations, queue row 23; kill text beside a forgiven exit, queue row 19) move to 2.8.0, where the citation rule
+ships together with typed rename and empty-file facts.
+
+- **Gate evidence no longer redacts every "1" (queue row 100).** Redaction treated the value of any secret-NAMED environment
+  variable as a secret, however short. Claude Code sets `CLAUDE_CODE_SDK_HAS_HOST_AUTH_REFRESH=1`, so under it every `1` in
+  diagnostics, receipts and nonce text became `[REDACTED]` (`1 failed | 10 passed` read `[REDACTED] failed | [REDACTED]0 passed`).
+  Flag values (`0`, `1`, `true`, `false`, `on`, `off`, …) and short all-digit values are no longer treated as secrets. An inline
+  command assignment keeps its variable name, so a short inline secret such as `API_TOKEN=ab12` is still withheld.
+- **Baseline forgiveness no longer forgives a new failure that looks like an old one (queue row 22).** A pre-existing failure now
+  forgives at most as many occurrences as the baseline recorded; digits inside identifiers are kept (`TestParse2` is not
+  `TestParse1`); a linter error is attributed to the file whose header it sits under, so the same rule in a new file is fresh; a
+  command with no baseline entry, or an unreadable one, forgives nothing and says why. Tip-verify diagnostics keep the original
+  runner lines beside the comparison keys. Baselines captured by earlier versions are compared exactly as before.
+- **A Fleet Steering, judge or mode edit lands where it takes effect (queue row 134).** `tickmarkr fleet` saved these edits to the
+  user overlay even when the repository overlay held the same key, and the repository layer wins, so the edit silently did nothing.
+  An edit now lands in the overlay that holds the key; clearing a repository-held review or consult preference writes an empty list
+  there, so the clear takes effect. A control beneath an aliased parent key, or one that a YAML merge key supplies, is refused
+  with its line named, and nothing is written; a merge source that YAML's first-wins rule shadows does not hold the control, so
+  that edit goes to the user overlay. An alias used as the control's own key is edited at the alias line, which can leave a
+  duplicate key in that mapping (queue row 146).
+
 ## v2.7.8 — public CI can no longer pass a missing job, a stray verdict line or an empty coverage floor
 
 **v2.7.8** comes from one `tickmarkr run` of six tasks (run-20261011-134758-…1074). Every task passed build, lint, evidence,

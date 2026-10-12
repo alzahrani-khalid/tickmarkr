@@ -46,17 +46,17 @@ describe("GATE-FIX-4 DEFECT 4 — turbo-prefixed per-test failures fingerprint",
     // the red NAMES the injected test — the runner's own raw FAIL line in the headline (HYG-08:
     // the × glyph twin is a fingerprintable shape but never headline material — the FAIL line is)…
     expect(r!.details).toContain("intake-backend:test:  FAIL tests/unit/auth.service.test.ts > GF4BE deliberate failure");
-    // …its normalized per-test fingerprint in the diff section…
-    expect(r!.details).toContain("FAIL tests/unit/auth.service.test.ts > GF#BE deliberate failure");
+    // …its normalized per-test fingerprint in the diff section (S22 v2: identifier digits kept)…
+    expect(r!.details).toContain("FAIL tests/unit/auth.service.test.ts > GF4BE deliberate failure");
     // …and the × glyph line as a second per-test discriminator among the fresh fingerprints
-    expect(r!.details).toContain("× GF#BE deliberate failure — probe only");
+    expect(r!.details).toContain("× GF4BE deliberate failure — probe only");
 
     // The fresh set is exactly the injected test's lines: the moved counts (2→3 failed) normalize
-    // identically under digit masking, and the package-level + pre-existing lines stay forgiven.
+    // identically under table T's number row, and the package-level + pre-existing lines stay forgiven.
     const { failing } = freshFailures(base.commands.test, HEAD_OUT);
     expect(failing.length).toBeGreaterThan(0);
-    expect(failing.every((f) => f.includes("GF#BE"))).toBe(true);
-    expect(failing).toContain("FAIL tests/unit/auth.service.test.ts > GF#BE deliberate failure");
+    expect(failing.every((f) => f.includes("GF4BE"))).toBe(true);
+    expect(failing).toContain("FAIL tests/unit/auth.service.test.ts > GF4BE deliberate failure");
   });
 
   test("recurrence stays forgiven: head byte-identical to baseline is green", async () => {

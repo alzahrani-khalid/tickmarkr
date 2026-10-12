@@ -1,4 +1,5 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { parseArgs } from "node:util";
@@ -167,6 +168,134 @@ const REPO_DESTINATION_NOTE = (path: string) =>
   `destination: the repository overlay ${path} holds this repository's routing.allow/deny membership, so the edit lands there — the file is tracked: Fleet never stages or commits it; commit it to share the change`;
 const FUTURE_LOADS_NOTE = "the save changes future config loads only — a tickmarkr run already in progress keeps the config it loaded";
 
+// Queue 134: routing.mode, review.prefer, consult.prefer and judge each follow the overlay that holds
+// them. A YAML merge holds one only when that merge supplies it — an unrelated sibling merge does not —
+// and the review refuses a write through a supplying merge (D-987). A scalar alias key is the name it
+// resolves to, at the alias's own line; a parent alias is refused because the writer cannot update
+// through it without replacing its siblings. A merge sequence is shallow and first-source-wins.
+// Membership stays on heldLine.
+const CONTROL_PATH = {
+  "routing.mode": ["routing", "mode"],
+  "review.prefer": ["review", "prefer"],
+  "consult.prefer": ["consult", "prefer"],
+  judge: ["judge"],
+} as const;
+type ControlName = keyof typeof CONTROL_PATH;
+const CONTROL_NAMES = new Set<string>(Object.keys(CONTROL_PATH));
+
+type ControlHold = { line: number; via: "declared" | "mask" | "merge" | "alias-parent"; shape?: string };
+const {
+  isAlias: yamlIsAlias,
+  isMap: yamlIsMap,
+  isNode: yamlIsNode,
+  isScalar: yamlIsScalar,
+  isSeq: yamlIsSeq,
+  parseDocument: yamlParseDocument,
+} = createRequire(import.meta.url)("yaml") as typeof import("yaml");
+type YamlDoc = ReturnType<typeof yamlParseDocument>;
+const controlHoldMemo = new Map<string, ControlHold | undefined>();
+
+const controlLineOf = (bytes: string, offset: number) => bytes.slice(0, offset).split("\n").length;
+const resolveYaml = (doc: YamlDoc, node: unknown): unknown =>
+  yamlIsAlias(node) ? node.resolve(doc) : node;
+// A plain scalar, or a scalar alias (`*modeKey` resolving to mode). The merge key `<<` is a symbol
+// and is not a name. Callers that report a line keep the key node's own range — the alias as written,
+// never the anchor it points at.
+const scalarKeyName = (doc: YamlDoc, key: unknown): string | undefined => {
+  const resolved = resolveYaml(doc, key);
+  if (!yamlIsScalar(resolved) || typeof resolved.value === "symbol" || resolved.value == null) return undefined;
+  return String(resolved.value);
+};
+const namedPair = (doc: YamlDoc, map: { items: ReadonlyArray<{ key: unknown; value: unknown }> }, name: string) =>
+  map.items.find((item) => scalarKeyName(doc, item.key) === name);
+const mergePair = (map: { items: ReadonlyArray<{ key: unknown; value: unknown }> }) =>
+  map.items.find((item) => yamlIsScalar(item.key) && typeof item.key.value === "symbol");
+const mergeShapeOf = (bytes: string, value: unknown): string => {
+  const range = yamlIsNode(value) ? value.range : null;
+  const text = range ? bytes.slice(range[0], range[1]).trim().replace(/\s+/g, " ") : "…";
+  return `<<: ${text}`;
+};
+const mergeSources = (doc: YamlDoc, value: unknown): unknown[] => {
+  const node = resolveYaml(doc, value);
+  return yamlIsSeq(node) ? node.items.map((item) => resolveYaml(doc, item)) : [node];
+};
+// YAML 1.1 merge: an explicit key wins over `<<`, and a sequence is shallow — the first source that
+// declares a key owns that key whole. A later source's prefer or mode does not survive an earlier
+// source that already declared the parent mapping. `seen` stops a merge that aliases itself.
+const definesKey = (doc: YamlDoc, node: unknown, key: string, seen: ReadonlySet<unknown>): boolean => {
+  const here = resolveYaml(doc, node);
+  if (!yamlIsMap(here) || seen.has(here)) return false;
+  if (namedPair(doc, here, key)) return true;
+  const merge = mergePair(here);
+  if (!merge) return false;
+  const next = new Set(seen);
+  next.add(here);
+  return mergeSources(doc, merge.value).some((source) => definesKey(doc, source, key, next));
+};
+const controlSupplied = (doc: YamlDoc, node: unknown, rest: readonly string[], seen: ReadonlySet<unknown> = new Set()): boolean => {
+  const here = resolveYaml(doc, node);
+  if (!yamlIsMap(here) || seen.has(here)) return false;
+  if (rest.length === 0) return true;
+  const [head, ...tail] = rest;
+  if (head === undefined) return false;
+  const pair = namedPair(doc, here, head);
+  if (pair) {
+    const value = resolveYaml(doc, pair.value);
+    if (yamlIsScalar(value) && value.value === null) return true;
+    if (tail.length === 0) return true;
+    const next = new Set(seen);
+    next.add(here);
+    return controlSupplied(doc, value, tail, next);
+  }
+  const merge = mergePair(here);
+  if (!merge) return false;
+  const next = new Set(seen);
+  next.add(here);
+  for (const source of mergeSources(doc, merge.value)) {
+    if (!definesKey(doc, source, head, next)) continue;
+    return controlSupplied(doc, source, rest, next);
+  }
+  return false;
+};
+/** The repository (or user) overlay holds a control at its own key, at a null mask at it or above, or at a
+ * merge key that supplies it. An explicit key wins over a sibling merge. Parse errors hold nothing. */
+function controlHold(bytes: string, path: readonly string[]): ControlHold | undefined {
+  const key = `${path.join(".")}\0${bytes}`;
+  if (controlHoldMemo.has(key)) return controlHoldMemo.get(key);
+  if (controlHoldMemo.size > 256) controlHoldMemo.clear();
+  const doc = yamlParseDocument(bytes);
+  const hold = doc.errors.length ? undefined : walkControl(doc, bytes, doc.contents, path);
+  controlHoldMemo.set(key, hold);
+  return hold;
+}
+function walkControl(
+  doc: YamlDoc,
+  bytes: string,
+  node: unknown,
+  rest: readonly string[],
+): ControlHold | undefined {
+  const here = resolveYaml(doc, node);
+  if (!yamlIsMap(here) || rest.length === 0) return undefined;
+  const [head, ...tail] = rest;
+  const pair = head === undefined ? undefined : namedPair(doc, here, head);
+  if (pair) {
+    const range = yamlIsNode(pair.key) ? pair.key.range : null;
+    if (!range) return undefined;
+    const line = controlLineOf(bytes, range[0]);
+    const value = resolveYaml(doc, pair.value);
+    if (yamlIsScalar(value) && value.value === null) {
+      return { line, via: yamlIsAlias(pair.key) && tail.length > 0 ? "alias-parent" : "mask" };
+    }
+    if (tail.length === 0) return { line, via: "declared" };
+    const nested = walkControl(doc, bytes, value, tail);
+    return nested && yamlIsAlias(pair.key) ? { line, via: "alias-parent" } : nested;
+  }
+  const merge = mergePair(here);
+  if (!merge || !yamlIsScalar(merge.key) || !merge.key.range) return undefined;
+  if (!controlSupplied(doc, here, rest)) return undefined;
+  return { line: controlLineOf(bytes, merge.key.range[0]), via: "merge", shape: mergeShapeOf(bytes, merge.value) };
+}
+
 const MODE_GLOSS: Record<RoutingMode, string> = {
   "partner-led": "every shape frontier · explore off",
   "risk-based": "risk-tiered default floors",
@@ -318,8 +447,10 @@ export async function assembleFleetEditor(
 > {
   const globalDir = opts.globalDir;
   // B2: the editor's choices are the operator's MACHINE choices — a save lands in the USER overlay,
-  // which every repository on this machine inherits. T10 (D-925/D-926): except a membership edit the
-  // repository overlay holds — it lands where it is effective (destinationEdits below).
+  // which every repository on this machine inherits. T10 (D-925/D-926): a membership edit and a
+  // routing.mode, review.prefer, consult.prefer or judge edit each land in the overlay that holds
+  // them (destinationEdits below) — the repository overlay when it declares the key or masks it
+  // with null at it or above, else the user overlay.
   const userPath = join(globalDir, "config.yaml");
   const repoPath = repoOverlayPath(cwd);
   const currentUserText = () => (existsSync(userPath) ? readFileSync(userPath, "utf8") : "");
@@ -671,10 +802,12 @@ export async function assembleFleetEditor(
   const home = homedir();
   const shown = (path: string) => (path.startsWith(`${home}/`) ? `~${path.slice(home.length)}` : path);
   const holderOf = (dotted: string): string | undefined => {
-    const path = dotted.split(".");
-    const repoLine = heldLine(currentRepoOverlayText(cwd), path);
+    const control = dotted in CONTROL_PATH ? CONTROL_PATH[dotted as ControlName] : undefined;
+    const lineIn = (text: string): number | undefined =>
+      control ? controlHold(text, control)?.line : heldLine(text, dotted.split("."));
+    const repoLine = lineIn(currentRepoOverlayText(cwd));
     if (repoLine !== undefined) return `${relative(cwd, repoPath)}:${repoLine}`;
-    const userLine = heldLine(currentUserText(), path);
+    const userLine = lineIn(currentUserText());
     return userLine === undefined ? undefined : `${shown(userPath)}:${userLine}`;
   };
   // the allow + flat-deny family is ONE coupled write (the allow form is
@@ -731,7 +864,13 @@ export async function assembleFleetEditor(
       edits.push({ name: "routing.map", destination: "user" });
     }
     if (JSON.stringify(initial.efforts ?? {}) !== JSON.stringify(staged.efforts ?? {})) edits.push({ name: "model efforts", destination: "user" });
-    return [...edits, ...controls.map((name) => ({ name, destination: "user" as const }))];
+    // a control lands where it is held. A merge that supplies it is still the repository (the review
+    // then refuses the write); review.prefer and consult.prefer are two edits, never one
+    const controlDestination = (name: string): Destination => {
+      if (!(name in CONTROL_PATH)) return "user";
+      return controlHold(currentRepoOverlayText(cwd), CONTROL_PATH[name as ControlName]) !== undefined ? "repo" : "user";
+    };
+    return [...edits, ...controls.map((name) => ({ name, destination: controlDestination(name) }))];
   };
   // ONE review confirms ONE destination; a batch needing both is refused before any write (no
   // multi-file transaction) and names what to save in separate sessions
@@ -924,8 +1063,8 @@ export async function assembleFleetEditor(
     if (unroutable) parts.push(`${unroutable} unroutable`);
     return `  mix: ${mix} — ${parts.join(" · ")}`;
   };
-  // B2: the floors the candidate user-layer bytes resolve to — the same config the routed mix ranks
-  // against, so a repo-declared mode that shadows the user's pick previews no floor change
+  // Floors come from the candidate the chosen destination would load. A routing.mode the repository
+  // holds is previewed there, so those floors move; an unheld mode is previewed in the user overlay.
   const floorPreview = (mode: RoutingMode, map: Record<string, MapEntry>, deny: StagedDeny, stage?: FleetStagedMetadata): string[] => {
     if (mode === rm.mode.mode) return [];
     const preview = previewCfg(mode, map, deny, stage);
@@ -940,9 +1079,9 @@ export async function assembleFleetEditor(
         : ["    (no floor changes)"]),
     ];
   };
-  // B2: `resolution` is the candidate user-layer bytes' own mode resolution — a repo-declared mode that
-  // shadows the user's pick keeps its provenance, never an operator pin the loader would not apply
-  // B2: `entry` is the slot the candidate's loader applies — a staged slot a repo declaration shadows
+  // `resolution` is the candidate destination's mode. A routing.mode the repository holds is written
+  // into that preview, so a changed mode pins the floors the loader will apply.
+  // `entry` is the slot the candidate's loader applies — a staged slot a repo declaration shadows
   // is no operator pin here; the repo's winning declaration keeps its provenance
   const whyDeclaration = (
     shape: Shape,
@@ -1287,9 +1426,9 @@ export async function assembleFleetEditor(
     // the diff and asks for confirmation, but owns neither filesystem access nor a writer.
     // B2: defaults/user/repo are re-read here, at review. T10: so is the destination.
     const modeChanged = state.selectedMode !== rm.mode.mode;
-    const steeringChanged = (["review", "consult"] as const).some(
-      (key) => JSON.stringify(state.steering[key]) !== JSON.stringify(initialSteering[key]),
-    );
+    const reviewChanged = JSON.stringify(state.steering.review) !== JSON.stringify(initialSteering.review);
+    const consultChanged = JSON.stringify(state.steering.consult) !== JSON.stringify(initialSteering.consult);
+    const steeringChanged = reviewChanged || consultChanged;
     const judgeSeat = state.judgeSeat;
     const judgeChanged = judgeSeat !== undefined
       && `${judgeSeat.adapter}:${judgeSeat.model}` !== initialJudge;
@@ -1297,11 +1436,14 @@ export async function assembleFleetEditor(
       pendingWrite = null;
       return { kind: "empty" };
     }
-    const chosen = chooseDestination(destinationEdits(staged, metadata.seeds, [
+    const controlNames = [
       ...(modeChanged ? ["routing.mode"] : []),
-      ...(steeringChanged ? ["review/consult prefer"] : []),
+      ...(reviewChanged ? ["review.prefer"] : []),
+      ...(consultChanged ? ["consult.prefer"] : []),
       ...(judgeChanged ? ["judge"] : []),
-    ]));
+    ];
+    const edits = destinationEdits(staged, metadata.seeds, controlNames);
+    const chosen = chooseDestination(edits);
     if (!chosen.ok) {
       pendingWrite = null;
       return { kind: "refused", reason: chosen.reason };
@@ -1309,6 +1451,39 @@ export async function assembleFleetEditor(
     const destination = chosen.destination;
     const user = currentUserText();
     const repo = currentRepoOverlayText(cwd);
+    // A merge that supplies a control or an alias used as its parent is a holder, but the writer
+    // cannot update through either key. Refuse before any bytes change, naming the key's own line.
+    if (destination === "repo") {
+      const refusals = edits.flatMap((edit) => {
+        if (!(edit.name in CONTROL_PATH)) return [];
+        const hold = controlHold(repo, CONTROL_PATH[edit.name as ControlName]);
+        if (hold?.via === "merge") {
+          const shape = hold.shape ?? "<<: …";
+          return [`${edit.name} takes keys through the YAML merge key \`${shape}\` at ${holderOf(edit.name)} — Fleet does not write through merge keys; inline the merged keys there by hand, then save again`];
+        }
+        if (hold?.via === "alias-parent") {
+          return [`${edit.name} takes keys through a YAML alias parent key at ${holderOf(edit.name)} — Fleet does not write through alias parent keys; replace that key with its scalar name, then save again`];
+        }
+        return [];
+      });
+      if (refusals.length) {
+        pendingWrite = null;
+        return { kind: "refused", reason: refusals.join("; ") };
+      }
+    }
+    // clearing a repository-held prefer writes an explicit empty sequence, so a lower user list cannot
+    // reappear. A user-held or unheld clear stays undefined and the writer deletes the key, as before.
+    const steeringEdited: typeof state.steering = { ...state.steering };
+    if (destination === "repo") {
+      for (const key of ["review", "consult"] as const) {
+        if (JSON.stringify(steeringEdited[key]) === JSON.stringify(initialSteering[key])) continue;
+        const chain = steeringEdited[key];
+        if (chain != null && chain.length > 0) continue;
+        const name = `${key}.prefer` as ControlName;
+        const hold = controlHold(repo, CONTROL_PATH[name]);
+        if (hold !== undefined && hold.via !== "merge") steeringEdited[key] = [];
+      }
+    }
     const before = destination === "repo" ? repo : user;
     const path = pathOf(destination);
     const lower = lowerLayers(destination);
@@ -1320,7 +1495,7 @@ export async function assembleFleetEditor(
         lowerOverrides: lowerOverrides[destination],
         ...(modeChanged ? { mode: state.selectedMode } : {}),
         ...(judgeChanged && judgeSeat ? { judge: judgeSeat } : {}),
-        steering: { initial: initialSteering, edited: state.steering },
+        steering: { initial: initialSteering, edited: steeringEdited },
       });
       after = renderFleetOverlayWrite(before, write); // T10 (D-987): a merge-key path refuses here
     } catch (error) {
@@ -1342,9 +1517,19 @@ export async function assembleFleetEditor(
     } catch {
       poolNotes = [];
     }
+    const controlEdits = edits.filter((edit) => CONTROL_NAMES.has(edit.name));
+    const controlNote = controlEdits.length === 0
+      ? undefined
+      : `destination: ${controlEdits.map((edit) => `${edit.name} at ${holderOf(edit.name)}`).join("; ")} — the file is tracked and Fleet never commits it`;
     const notes = [
-      // T10: the review names where the edit lands and what that file is
-      ...(destination === "repo" ? [REPO_DESTINATION_NOTE(repoPath)] : repoShadowNotes(before, after)),
+      // T10: a membership edit keeps the membership destination note. Every repository-destined
+      // control in the same batch is named beside it, path:line from holderOf, file tracked.
+      ...(destination === "repo"
+        ? [
+            ...(edits.some((edit) => !CONTROL_NAMES.has(edit.name)) ? [REPO_DESTINATION_NOTE(repoPath)] : []),
+            ...(controlNote ? [controlNote] : []),
+          ]
+        : repoShadowNotes(before, after)),
       FUTURE_LOADS_NOTE,
       ...(lower.ok ? [] : [`${lower.error} — y will be refused`]),
       ...poolNotes,

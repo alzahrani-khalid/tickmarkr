@@ -87,8 +87,10 @@ async function launch(line: string, bin: string, env: NodeJS.ProcessEnv): Promis
     "wait",
   ].join("\n")], { detached: true, stdio: "ignore", env: { ...env, PATH: `${bin}:${dirname(process.execPath)}:${env.PATH}` } });
   pids.push(launcher.pid!);
+  // queue row 136: the fixture's `>>` creates daemon.records before printf writes it, so a read can see an empty or
+  // part-written file; only newline-terminated records are complete, and the unterminated tail is dropped
   const records = () => existsSync(join(repo, "daemon.records"))
-    ? readFileSync(join(repo, "daemon.records"), "utf8").trim().split("\n").map((l) => JSON.parse(l) as Launch["records"][number]) : [];
+    ? readFileSync(join(repo, "daemon.records"), "utf8").split("\n").slice(0, -1).map((l) => JSON.parse(l) as Launch["records"][number]) : [];
   const hostCalls = () => existsSync(join(repo, "host.calls")) ? readFileSync(join(repo, "host.calls"), "utf8") : "";
   await until(() => existsSync(join(out, "ready")) && (records().length > 0 || hostCalls() !== ""));
   const control = Number(readFileSync(join(out, "control"), "utf8"));

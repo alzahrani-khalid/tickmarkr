@@ -672,7 +672,7 @@ describe("baseline forgiveness", () => {
     // the red baseline is READ, not shrugged at: the marker would erase the distinction between
     // "one test fails here" and "two do"
     expect(baseline.commands.test.fingerprints).not.toContain(UNRECOGNIZED_FAILURE);
-    expect(baseline.commands.test.fingerprints).toContain("✖ old failure (#.#ms)");
+    expect(baseline.commands.test.fingerprints).toContain("✖ old failure (<dur>)"); // S22 table T: a duration token
 
     // the same red run is still forgiven…
     expect((await compareToBaseline(repo, commands, baseline, ["test"]))[0]).toMatchObject({ pass: true });
@@ -682,7 +682,7 @@ describe("baseline forgiveness", () => {
     const r = (await compareToBaseline(repo, commands, baseline, ["test"]))[0];
     expect(r.pass).toBe(false);
     expect(r.details).toMatch(/✖ new failure \(/);
-    expect(r.details).toContain("✖ new failure (#.#ms)"); // the fresh fingerprint itself is reported
+    expect(r.details).toContain("✖ new failure (<dur>)"); // the fresh fingerprint itself is reported
     expect(r.meta?.failingTests?.some((l) => /✖ new failure \(/.test(l))).toBe(true);
   });
 
