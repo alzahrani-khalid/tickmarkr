@@ -14,11 +14,12 @@ ships together with typed rename and empty-file facts.
   diagnostics, receipts and nonce text became `[REDACTED]` (`1 failed | 10 passed` read `[REDACTED] failed | [REDACTED]0 passed`).
   Flag values (`0`, `1`, `true`, `false`, `on`, `off`, …) and short all-digit values are no longer treated as secrets. An inline
   command assignment keeps its variable name, so a short inline secret such as `API_TOKEN=ab12` is still withheld.
-- **Baseline forgiveness no longer forgives a new failure that looks like an old one (queue row 22).** A pre-existing failure now
-  forgives at most as many occurrences as the baseline recorded; digits inside identifiers are kept (`TestParse2` is not
-  `TestParse1`); a linter error is attributed to the file whose header it sits under, so the same rule in a new file is fresh; a
-  command with no baseline entry, or an unreadable one, forgives nothing and says why. Tip-verify diagnostics keep the original
-  runner lines beside the comparison keys. Baselines captured by earlier versions are compared exactly as before.
+- **Baseline forgiveness no longer forgives a new failure that looks like an old one (queue row 22).** A pre-existing failure
+  now forgives at most as many occurrences as the baseline recorded; digits inside identifiers are kept (`TestParse2` is not
+  `TestParse1`); a linter error is attributed to the file whose header it sits under, so the same rule in a new file is fresh;
+  a command with no baseline entry, or an unreadable one, forgives nothing and says why. Gate-battery diagnostics (and
+  `tickmarkr verify`) keep the original runner lines beside the comparison keys; tip verification names a missing or unreadable
+  baseline entry beside its exit code. Baselines captured by earlier versions are compared exactly as before.
 - **A Fleet Steering, judge or mode edit lands where it takes effect (queue row 134).** `tickmarkr fleet` saved these edits to the
   user overlay even when the repository overlay held the same key, and the repository layer wins, so the edit silently did nothing.
   An edit now lands in the overlay that holds the key; clearing a repository-held review or consult preference writes an empty list

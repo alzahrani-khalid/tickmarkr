@@ -308,14 +308,18 @@ test("through runGates a fixture baseline with known per-file durations yields f
   expect(fileHangBudgetMs("zero",timings,1000)).toBe(1000);
   expect(fileHangBudgetMs("nan",timings,1000)).toBe(1000);
   expect(fileHangBudgetMs("inf",timings,1000)).toBe(1000);
+  // Queue row 139: the jumped ceiling rows below get a ceiling their stand-in's started receipt always precedes. With a
+  // real 5000 ms ceiling, a slow macOS runner wrote the receipt after the ceiling timer had already killed the file, so
+  // no poll saw the jump and meta.interruptions was absent (release CI 38241686357, 2.7.8 parity run 38169618044).
+  const JUMP_CEILING_MS = 30_000;
   const cases: Array<[string, Partial<BaselineCommand>, number]> = [
     ["timed",{fileDurations:timings,ceilingMs:LISTING_ALLOWANCE_MS},120],
     ["longest-wins",{fileDurations:[{file:"tests/a.test.ts",durationMs:10},{file:"b",durationMs:180}],ceilingMs:LISTING_ALLOWANCE_MS},180],
-    ["untimed",{fileDurations:[{file:"b",durationMs:60}],ceilingMs:5000},5000],
-    ["legacy",{longestFile:{file:"tests/a.test.ts",durationMs:60},ceilingMs:5000},5000],
-    ["none",{ceilingMs:5000},5000],
-    ["zero",{fileDurations:[{file:"tests/a.test.ts",durationMs:0}],ceilingMs:5000},5000],
-    ["legacy-zero",{longestFile:{file:"a",durationMs:0},ceilingMs:5000},5000],
+    ["untimed",{fileDurations:[{file:"b",durationMs:60}],ceilingMs:JUMP_CEILING_MS},JUMP_CEILING_MS],
+    ["legacy",{longestFile:{file:"tests/a.test.ts",durationMs:60},ceilingMs:JUMP_CEILING_MS},JUMP_CEILING_MS],
+    ["none",{ceilingMs:JUMP_CEILING_MS},JUMP_CEILING_MS],
+    ["zero",{fileDurations:[{file:"tests/a.test.ts",durationMs:0}],ceilingMs:JUMP_CEILING_MS},JUMP_CEILING_MS],
+    ["legacy-zero",{longestFile:{file:"a",durationMs:0},ceilingMs:JUMP_CEILING_MS},JUMP_CEILING_MS],
     ["equal",{fileDurations:[{file:"tests/a.test.ts",durationMs:5000}],ceilingMs:5000},5000],
   ];
   // Queue row 102 (D-1626): a hang whose budget IS the battery ceiling waits that whole ceiling on real clocks.
