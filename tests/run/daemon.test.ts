@@ -654,6 +654,9 @@ describe("daemon integration (fake adapter, zero tokens)", () => {
       { judge: [
         { pass: true, criteria: [{ criterion: "c1", met: true, reason: "ok" }] },
         { pass: false, criteria: [{ criterion: "c1", met: false, reason: "force worker retry" }] },
+        // S23-P11 (D-1843): the re-gate's FAIL cites allowed.txt, whose blob the first PASS was stamped on (the tip
+        // moved inside that judge's call), so a distinct judge adjudicates the reversal — and agrees.
+        { pass: false, criteria: [{ criterion: "c1", met: false, reason: "adjudicator agrees: force worker retry" }] },
         { pass: true, criteria: [{ criterion: "c1", met: true, reason: "ok" }] },
       ], tasks: { T1: [
         { shell: `echo gated > allowed.txt && ${COMMIT} gated`, result: { ok: true, summary: "gated" } },

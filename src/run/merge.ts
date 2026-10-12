@@ -283,7 +283,9 @@ export async function verifyIntegrationTip(
     // Persistent reuse requires the run's durable journal. Without it there is no
     // recorded cycle provenance to reconcile with the caller's capacity checks.
     const hit = journalFound ? store.get(id) : undefined;
-    if (hit && id && hit.pass && !isInfraResult(hit)) {
+    // S19m4: a forgiven test green written before the tip read kill text never proves the suite completed.
+    const killTextUnread = gate === "test" && hit?.meta?.forgiven === true && hit.meta.killTextRead !== true;
+    if (hit && id && hit.pass && !isInfraResult(hit) && !killTextUnread) {
       results.push({
         gate,
         cmd,
@@ -402,7 +404,7 @@ export async function verifyIntegrationTip(
       });
       continue;
     }
-    const verdict = freshFailures(entry, stripped);
+    const verdict = freshFailures(entry, stripped, gate === "test");
     const { failing, unreadable } = verdict;
     // S22: a missing or unreadable entry forgives nothing; the red names it rather than a bare exit code.
     const refusal = baselineEntryRefusal(gate, verdict);
@@ -429,8 +431,12 @@ export async function verifyIntegrationTip(
     // often the previous session's — so a capture taken under a different resolved capacity forgives
     // nothing at the tip either. An absent capacity is a pre-T7 baseline and keeps today's verdict.
     const comparable = sameCapacity(entry?.capacity, r.capacity);
-    const forgiven = r.code !== 0 && baselineRed && failing.length === 0 && !unreadable && cause !== "infra"
+    const forgivable = r.code !== 0 && baselineRed && failing.length === 0 && !unreadable && cause !== "infra"
       && comparable;
+    // S19m4 (battery parity): kill text beside forgivable failures means the suite never completed — red, infra.
+    const killLine = forgivable && !greenTeardown && !deficit ? verdict.killLine : undefined;
+    const forgiven = forgivable && killLine === undefined;
+    const rowCause = killLine !== undefined ? "infra" : cause;
     const pass = !deficit && (r.code === 0 || greenTeardown || forgiven);
     if (!pass) writeTipLog(artifact, raw);
     const tipResult: TipVerifyResult = {
@@ -440,9 +446,11 @@ export async function verifyIntegrationTip(
       evidenceReceipt, evidenceReceipts,
       exitCode: r.code,
       fingerprints: r.code !== 0 && !greenTeardown ? fingerprint(stripped) : [],
-      details: `${cause === "infra" ? "infra; " : ""}${rerun ? `${rerun}: ` : ""}` + (deficit?.replace(/^infra; /, "") ?? (r.code === 0 ? "exit 0"
+      details: `${rowCause === "infra" ? "infra; " : ""}${rerun ? `${rerun}: ` : ""}` + (deficit?.replace(/^infra; /, "") ?? (r.code === 0 ? "exit 0"
         : greenTeardown ? `exit ${r.code} after a green suite summary; only the runner's teardown fingerprint followed it`
         : forgiven ? `exit ${r.code} but only baseline-recorded failures (forgiven vs baseline)`
+        : killLine !== undefined ? `exit ${r.code}; every failure is baseline-recorded, but the runner printed kill text — `
+          + `it never completed a suite, so nothing is forgiven: ${killLine}`
         : !comparable && baselineRed && failing.length === 0
           ? `exit ${r.code}; every failure is baseline-recorded, but that capture ran under `
             + `${describeCapacity(entry?.capacity)} and this verification ran under ${describeCapacity(r.capacity)} `
@@ -451,7 +459,7 @@ export async function verifyIntegrationTip(
         // S22: every red here names a missing or unreadable entry beside its own cause, deficit included
         + (!pass && refusal ? `; ${refusal}` : ""),
       ...(forgiven && !deficit ? { forgiven: true, ...(baseline?.provenance ? { baselineProvenance: baseline.provenance } : {}) } : {}),
-      ...(cause ? { cause } : {}),
+      ...(rowCause ? { cause: rowCause } : {}),
       ...(pass ? {} : { artifact }),
     };
     results.push(tipResult);
@@ -469,6 +477,7 @@ export async function verifyIntegrationTip(
     if (id && id.tree === completedTree && !isInfraResult(result)) {
       store.set(id, { ...result, meta: {
         fingerprints: result.fingerprints, forgiven: result.forgiven, baselineProvenance: result.baselineProvenance,
+        ...(result.forgiven && result.gate === "test" ? { killTextRead: true } : {}),
         reportPath: result.reportPath, spawnedCommand: result.spawnedCommand,
         artifact: result.artifact,
         evidenceReceipt: result.evidenceReceipt, evidenceReceipts: result.evidenceReceipts,

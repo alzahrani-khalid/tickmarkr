@@ -15,9 +15,9 @@ export type { CodexCommitStatus };
 // This probe runs `codex sandbox` — a local sandboxed shell, no model call, zero tokens — through `sh` at a
 // throwaway linked worktree of the repo, carrying the EXACT worker grant bytes (CODEX_GIT_GRANT, expanded by
 // that shell at that cwd; never a rebuilt twin). Inside it: an ordinary-file write (the positive control, so
-// "the sandbox never ran" can never read as "protected"), a real commit on a unique fixture branch (common/refs
-// and common/logs), and two unique NON-hook files — one in <common>/hooks, one in the common root — that the
-// grant must deny. Never a real hook or the real config. The closed table:
+// "the sandbox never ran" can never read as "protected"), a real commit on a unique fixture branch (its
+// slash-free name puts it in the refs/heads leaf: common/refs/heads and common/logs/refs/heads), and two unique
+// NON-hook files — one in <common>/hooks, one in the common root — that the grant must deny. Never a real hook or the real config. The closed table:
 //   allowed   — the branch commit landed (receipt, ref and reflog agree) and both hostile members were denied;
 //   protected — the commit was denied, the control was readable and both hostile members were denied;
 //   escape    — ANY hostile member holds this probe's token: a BLOCKING security warning for every Codex role;

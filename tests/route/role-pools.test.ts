@@ -52,7 +52,7 @@ function countingFake(verdicts: unknown[]): CountingFake {
   return new CountingFake(p);
 }
 
-const PASS_VERDICT = { pass: true, criteria: [{ criterion: "a", met: true, reason: "r", evidence: "+y" }] };
+const PASS_VERDICT = { pass: true, criteria: [{ criterion: "a", met: true, reason: "r", evidence: { path: "a.txt", line: 1 } }] };
 const JUDGE_GATES = ["build", "test", "lint", "evidence", "scope", "acceptance"];
 const author: Assignment = { adapter: "fake", model: "fake-1", channel: "sub", tier: "frontier" };
 const FAKE_TWO_CHANNELS: BillingChannel[] = [

@@ -93,13 +93,25 @@ function codexRetirement(upgrade: unknown): ModelRetirement | null | undefined {
 // worktree cwd, for Codex WORKERS only: v2.6.7 T4 (D-1046) — invoke() (the headless worker form, including
 // the interactive size fallback) and interactiveCommand carry it; headlessCommand, which judge, review,
 // consult and the model probe launch, carries no writable_roots at all (those seats never commit).
-// v2.6.6 T9 (K, D-912): the grant is exactly what a linked-worktree branch commit writes — the worktree's
-// own gitdir (only when it differs from the common dir), common/objects, common/refs, common/logs. The
-// shipped [common] grant (and D-910's [common, gitdir]) let a sandboxed seat write <common>/hooks and
-// <common>/config, which unsandboxed git later runs. No common-root fallback: an ordinary checkout gets
-// no gitdir root and its commit fails closed. packed-refs is not granted (packed-ref ops fail closed).
+// v2.6.6 T9 (K, D-912) → v2.8.0 T1 (rows 17/18, D-910): the grant is a LEAF of what a linked-worktree branch
+// commit writes, never the shared hooks/config (the shipped [common] and D-910's [common, gitdir] let a seat
+// write <common>/hooks and <common>/config, which unsandboxed git later runs) and never whole common/refs and
+// common/logs (which let a seat move main, any branch or tag, or the stash). The closed root table, in order:
+//   - the worktree's own gitdir, only when it differs from the common dir (an ordinary checkout gets none);
+//   - <common>/objects;
+//   - only when HEAD is a symbolic ref refs/heads/<B>: <common>/refs/heads/<D> and <common>/logs/refs/heads/<D>,
+//     <D> being <B> without its last slash-separated segment (refs/heads itself when <B> holds no slash);
+//     a detached HEAD gets no refs or reflog root.
+// A directory outside any repository, any failed git read, or any root holding a character of the closed
+// forbidden set (U+0000 to U+001F, U+007F DEL, the double quote, the backslash) yields the EMPTY array `[]`:
+// no git write root, so a commit fails closed — never a partial array, an escaped string or codex's
+// literal-string fallback. Every emitted root is therefore a TOML basic string that parses back to the exact
+// path (git's own trailing newline is stripped through a sentinel, never a path's). No common-root fallback;
+// packed-refs is not granted (packed-ref ops fail closed); stash, tags, notes and branches outside the leaf
+// are denied. Declared: sibling refs in the same leaf (other task branches, the run's integration branch
+// under the default prefix) stay writable until 2.8.1's integration identity.
 // doctor's probe (codex-commit-check.ts) executes these exact bytes; it never rebuilds the grant.
-export const CODEX_GIT_GRANT = `-c "sandbox_workspace_write.writable_roots=[$(tkr_common=$(git rev-parse --path-format=absolute --git-common-dir); tkr_gitdir=$(git rev-parse --absolute-git-dir); if [ "$tkr_gitdir" != "$tkr_common" ]; then printf '"%s",' "$tkr_gitdir"; fi; printf '"%s/objects","%s/refs","%s/logs"' "$tkr_common" "$tkr_common" "$tkr_common")]"`;
+export const CODEX_GIT_GRANT = `-c "sandbox_workspace_write.writable_roots=[$(tkr_common=$(git rev-parse --path-format=absolute --git-common-dir && echo /) && tkr_gitdir=$(git rev-parse --absolute-git-dir && echo /) && tkr_common=\${tkr_common%?/} && tkr_gitdir=\${tkr_gitdir%?/} && { tkr_head=$(git symbolic-ref -q HEAD); [ $? -le 1 ]; } && case $tkr_head in (refs/heads/*) tkr_leaf=\${tkr_head%/*};; (*) tkr_leaf=;; esac && [ "$(printf %s "$tkr_common$tkr_gitdir$tkr_leaf" | LC_ALL=C tr -d '\\0-\\37\\177"\\\\')" = "$tkr_common$tkr_gitdir$tkr_leaf" ] && { [ "$tkr_gitdir" = "$tkr_common" ] || printf '"%s",' "$tkr_gitdir"; } && printf '"%s/objects"' "$tkr_common" && { [ -z "$tkr_leaf" ] || printf ',"%s/%s","%s/logs/%s"' "$tkr_common" "$tkr_leaf" "$tkr_common" "$tkr_leaf"; })]"`;
 
 // OBS-125: codex 0.144.x gates enabled hooks behind PER-PROJECT-PATH hook trust — a NEW gate distinct
 // from the directory trust seedCodexTrust seeds. Every worker runs in a fresh ephemeral worktree, an

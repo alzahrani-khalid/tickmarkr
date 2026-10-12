@@ -258,7 +258,8 @@ describe("verdict-cause consumers", () => {
       meta: { unparseable: true },
     });
     expect(fabricated.result.details).toMatch(/evidence absent from the judged diff/i);
-    expect(fabricated.result.meta?.cause).toBeUndefined();
+    // S23: a parsed verdict rejected on its citation is a malformed verdict — a cause that names participation
+    expect(fabricated.result.meta?.cause).toBe("malformed-verdict");
 
     const unknownActionParse = consultModule.parseConsultVerdict(
       JSON.stringify({ nonce: "c011ca11", action: "dance" }),

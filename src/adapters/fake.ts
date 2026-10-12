@@ -20,6 +20,32 @@ export interface FakeScript {
   consult?: unknown;
 }
 
+/**
+ * S23: the first citation of the gate's nonce-framed index — from the LAST line exactly `CITABLE_LINES_BEGIN <nonce>`
+ * to the next line exactly `CITABLE_LINES_END <nonce>`. Every entry must be a JSON object with a string path and a
+ * non-empty array of non-negative safe-integer lines before any is used; otherwise (no block, no END, an empty or
+ * invalid entry anywhere) there is no citation. Never throws.
+ */
+function firstCitation(prompt: string, nonce: string): { path: string; line: number } | undefined {
+  if (!nonce) return undefined;
+  const lines = prompt.split("\n");
+  const begin = lines.lastIndexOf(`CITABLE_LINES_BEGIN ${nonce}`);
+  const end = begin < 0 ? -1 : lines.indexOf(`CITABLE_LINES_END ${nonce}`, begin + 1);
+  if (end < 0) return undefined;
+  const entries: Array<{ path: string; lines: number[] }> = [];
+  for (const line of lines.slice(begin + 1, end)) {
+    let entry: unknown;
+    try { entry = JSON.parse(line); } catch { return undefined; }
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) return undefined;
+    const { path, lines: cited } = entry as Record<string, unknown>;
+    if (typeof path !== "string" || !Array.isArray(cited) || cited.length === 0
+      || !cited.every((n) => Number.isSafeInteger(n) && (n as number) >= 0)) return undefined;
+    entries.push({ path, lines: cited as number[] });
+  }
+  const first = entries[0];
+  return first ? { path: first.path, line: first.lines[0]! } : undefined;
+}
+
 // ponytail: deterministic scripted adapter — the whole integration suite runs on it, zero tokens.
 export class FakeAdapter implements WorkerAdapter {
   id = "fake";
@@ -96,14 +122,16 @@ export class FakeAdapter implements WorkerAdapter {
           val = { ...verdict, criteria: items.map((criterion) => ({ criterion, met: true, reason: "scripted fake pass" })) };
         }
       }
+      // S23: a scripted row without evidence cites the first line of the first entry of the gate's own citable
+      // index — never a string. An invalid or unterminated index yields no evidence (the gate then fails closed).
       if (key === "judge" && isJudge && val && typeof val === "object" && !Array.isArray(val)) {
         const verdict = val as Record<string, unknown>;
-        const line = /```diff\n([\s\S]*?)```/.exec(prompt)?.[1].split("\n").find((candidate) => candidate.trim());
-        if (line && Array.isArray(verdict.criteria)) {
+        const evidence = firstCitation(prompt, nonce);
+        if (evidence && Array.isArray(verdict.criteria)) {
           val = {
             ...verdict,
             criteria: verdict.criteria.map((row) =>
-              row && typeof row === "object" && !("evidence" in row) ? { ...row, evidence: line } : row),
+              row && typeof row === "object" && !("evidence" in row) ? { ...row, evidence } : row),
           };
         }
       }
@@ -175,10 +203,12 @@ export class FakeAdapter implements WorkerAdapter {
 
   // the run nonce lives in the prompt writePrompt handed us; echo a matching trailer so
   // parseWorkerResult(output, nonce) succeeds exactly as before the nonce existed
+  // S23: the verdict nonce is the LAST whole `VERDICT_NONCE: <hex>` line — the gate writes its own after the goal,
+  // criteria and diff, so a nonce line quoted in any of them never binds.
   private nonceFor(promptFile: string): string {
     try {
       const prompt = readFileSync(promptFile, "utf8");
-      return /VERDICT_NONCE:\s*([0-9a-f]+)/i.exec(prompt)?.[1]
+      return prompt.split("\n").map((line) => /^VERDICT_NONCE: ([0-9a-f]+)$/.exec(line)?.[1]).filter(Boolean).at(-1)
         ?? /TICKMARKR_RESULT_([0-9a-z]+)/.exec(prompt)?.[1]
         ?? "";
     } catch {

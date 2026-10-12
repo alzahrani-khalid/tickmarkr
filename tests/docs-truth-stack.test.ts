@@ -215,9 +215,10 @@ describe.skipIf(!existsSync(codebaseDocs))("docs-truth-stack", () => {
 
   test("test: the integrations page names the Codex git grant and the doctor probe's closed table with escape as a blocking warning", () => {
     const block = codexDocBlock(readFileSync(join(codebaseDocs, "INTEGRATIONS.md"), "utf8"));
-    // v2.6.6 T9 (K): the grant is named, its roots listed, and the shipped common-root grant is gone
+    // v2.6.6 T9 (K): the grant is named, its roots listed, and the shipped common-root grant is gone;
+    // v2.8.0 T1: the roots are the refs/heads leaf pair, and the closed forbidden set yields []
     expect(block).toContain("`CODEX_GIT_GRANT`");
-    for (const root of ["`<common>/objects`", "`<common>/refs`", "`<common>/logs`"]) expect(block).toContain(root);
+    for (const root of ["`<common>/objects`", "`<common>/refs/heads/<D>`", "`<common>/logs/refs/heads/<D>`", "`[]`"]) expect(block).toContain(root);
     expect(block).not.toContain('writable_roots=[\\"$(git rev-parse --path-format=absolute --git-common-dir)\\"]');
     for (const status of ["`allowed`", "`protected`", "`escape`", "`unknown`"]) expect(block).toContain(status);
     expect(block).toContain("`escape` is a BLOCKING security warning");

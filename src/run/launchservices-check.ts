@@ -37,16 +37,18 @@ export function parsePsIdentity(stdout: string): LaunchServicesIdentity | null {
 }
 
 export type ProbeTimer = (fire: () => void, ms: number) => () => void;
-interface ProbeSeam { platform: NodeJS.Platform; spawn: typeof spawn; setTimer: ProbeTimer; signal?: AbortSignal }
+interface ProbeSeam { platform: NodeJS.Platform; spawn: typeof spawn; spawnTop?: typeof spawn; setTimer: ProbeTimer; signal?: AbortSignal }
 const production = (): ProbeSeam => ({
   platform: process.platform,
   spawn,
+  spawnTop: spawn,
   setTimer: (fire, ms) => { const t = setTimeout(fire, ms); return () => clearTimeout(t); },
 });
 // ponytail: default-off under the test runner (the catalogRefreshAllowed precedent) so an unowned doctor
 // test never takes a real host reading or changes its doctor.json bytes; tests opt in through the seam.
+// The legacy identity-only seam leaves spawnTop unset, so old /bin/ps fixtures never touch the host top.
 let seam: ProbeSeam | undefined;
-export const setLaunchServicesProbeForTests = (s: Partial<ProbeSeam>): void => { seam = { ...production(), ...s }; };
+export const setLaunchServicesProbeForTests = (s: Partial<ProbeSeam>): void => { seam = { ...production(), ...s, spawnTop: s.spawnTop }; };
 export const resetLaunchServicesProbeForTests = (): void => { seam = undefined; };
 const activeSeam = (): ProbeSeam | undefined => seam ?? (process.env.VITEST === "true" ? undefined : production());
 
@@ -88,6 +90,73 @@ export function observeLaunchServices(s: ProbeSeam = production()): Promise<Laun
   return s.platform === "darwin" ? readIdentity(s) : Promise.resolve({ status: "non-darwin" });
 }
 
+export const LAUNCHSERVICES_PORT_ADVISORY = 100_000;
+export const LAUNCHSERVICES_PORT_STOP = 200_000;
+const TOP_BYTES = 1024 * 1024;
+export type LaunchServicesPorts =
+  | { status: "skipped" | "non-darwin" }
+  | { status: "unknown"; pid?: number }
+  | { status: "read"; pid: number; count: number };
+
+/** Closed top format: PID COMMAND #PORTS, then the next non-empty row for this pid and launchservicesd. */
+export function parseTopPortCount(stdout: string, pid: number): number | null {
+  const lines = stdout.split(/\r?\n/);
+  const header = lines.findIndex((line) => line.trim().split(/\s+/).join(" ") === "PID COMMAND #PORTS");
+  if (header < 0) return null;
+  const row = lines.slice(header + 1).find((line) => line.trim() !== "");
+  if (!row) return null;
+  const tokens = row.trim().split(/\s+/);
+  if (tokens.length !== 3 || tokens[0] !== String(pid) || tokens[1] !== "launchservicesd" || !/^[0-9]+[+-]?$/.test(tokens[2]!)) return null;
+  const count = Number(tokens[2]!.replace(/[+-]$/, ""));
+  return Number.isSafeInteger(count) ? count : null;
+}
+
+// The captured macOS top layout is closed: only a matching three-token row after the exact header
+// yields a count. 100000 ports is a doctor advisory; 200000 stops standalone verify before gates.
+// Unknown (including an unreadable identity, malformed top output, or a killed child) never stops.
+function readPortCount(s: ProbeSeam, pid: number): Promise<LaunchServicesPorts> {
+  return new Promise((resolve) => {
+    const unknown = () => resolve({ status: "unknown", pid });
+    if (s.signal?.aborted) { unknown(); return; }
+    if (!s.spawnTop) { unknown(); return; }
+    let child: ReturnType<typeof spawn>;
+    try {
+      child = s.spawnTop("/usr/bin/top", ["-l", "1", "-stats", "pid,command,ports", "-pid", String(pid)],
+        { stdio: ["ignore", "pipe", "ignore"], env: { ...process.env, LC_ALL: "C" } });
+    } catch { unknown(); return; }
+    let out = "";
+    let bytes = 0;
+    let failed = false;
+    const retire = () => { if (!failed) { failed = true; child.kill("SIGKILL"); } };
+    const clear = s.setTimer(retire, LAUNCHSERVICES_PROBE_CEILING_MS);
+    s.signal?.addEventListener("abort", retire, { once: true });
+    child.stdout?.on("data", (chunk: Buffer) => {
+      if (failed) return;
+      bytes += chunk.length;
+      if (bytes > TOP_BYTES) { retire(); return; }
+      out += chunk.toString("utf8");
+    });
+    child.once("error", () => { failed = true; });
+    child.once("close", (code) => {
+      clear();
+      s.signal?.removeEventListener("abort", retire);
+      if (failed || code !== 0) return unknown();
+      const count = parseTopPortCount(out, pid);
+      return count === null ? unknown() : resolve({ status: "read", pid, count });
+    });
+  });
+}
+
+/** One identity read and, only for a readable Darwin identity, one bounded top child. */
+export async function probeLaunchServicesPorts(options: { requireTop?: boolean } = {}): Promise<{ observation?: LaunchServicesObservation; ports: LaunchServicesPorts }> {
+  const s = activeSeam();
+  if (!s || (options.requireTop && !s.spawnTop)) return { ports: { status: "skipped" } };
+  const observation = await observeLaunchServices(s);
+  if (observation.status === "non-darwin") return { observation, ports: { status: "non-darwin" } };
+  if (observation.status === "unreadable") return { observation, ports: { status: "unknown" } };
+  return { observation, ports: await readPortCount(s, observation.identity.pid) };
+}
+
 // doctor.json is never schema-validated: a malformed held record is no identity at all.
 const knownPrior = (prior: Partial<LaunchServicesRecord> | undefined): prior is LaunchServicesRecord =>
   typeof prior?.pid === "number" && typeof prior.start === "string";
@@ -119,12 +188,13 @@ export function classifyLaunchServices(prior: Partial<LaunchServicesRecord> | un
 
 /** Observe, classify against the first record of `prior`, and hold the result on the first record of `health`.
  *  Returns `health` itself when nothing changed, else a copy — the argument is never mutated. */
-export async function recordLaunchServices(prior: Record<string, AuthHealth> | null, health: Record<string, AuthHealth>): Promise<{
+export async function recordLaunchServices(prior: Record<string, AuthHealth> | null, health: Record<string, AuthHealth>, observation?: LaunchServicesObservation): Promise<{
   status: LaunchServicesStatus; health: Record<string, AuthHealth>; line?: string;
 }> {
   const held = prior ? Object.values(prior)[0]?.launchServices : undefined;
   const s = activeSeam();
-  const r = s ? classifyLaunchServices(held, await observeLaunchServices(s)) : { status: "skipped" as const, next: knownPrior(held) ? held : undefined };
+  const r = observation ? classifyLaunchServices(held, observation)
+    : s ? classifyLaunchServices(held, await observeLaunchServices(s)) : { status: "skipped" as const, next: knownPrior(held) ? held : undefined };
   const holder = Object.keys(health)[0];
   if (!holder || !r.next || JSON.stringify(health[holder]!.launchServices) === JSON.stringify(r.next)) return { ...r, health };
   return { ...r, health: { ...health, [holder]: { ...health[holder]!, launchServices: r.next } } };

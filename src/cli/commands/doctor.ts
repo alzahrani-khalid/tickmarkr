@@ -23,7 +23,7 @@ import { sh, type ShResult } from "../../run/git.js";
 import { auditNamedTestOracles, listVitestTests, type VitestListResult } from "../../gates/acceptance.js";
 import { readReviewNoVerdictHistory, reviewNoVerdictRows } from "../../run/journal.js";
 import { checkModelDiscovery } from "../../adapters/model-discovery-check.js";
-import { recordLaunchServices } from "../../run/launchservices-check.js";
+import { LAUNCHSERVICES_PORT_ADVISORY, probeLaunchServicesPorts, recordLaunchServices } from "../../run/launchservices-check.js";
 
 /** Where a newer `table_<date>.csv` is discovered — the deployed site builds filenames by
  *  concatenation and publishes no index, so the release listing is the only enumerable surface. */
@@ -739,7 +739,8 @@ export async function doctor(
   const discovery = await checkModelDiscovery({ cwd, cfg, adapters, health, catalog, resolved: resolvedIdentitySnapshot, mayRefresh: !opts.catalog && !catalogRefreshLine && catalogRefreshAllowed, fetcher: opts.catalogFetcher, now: opts.catalogNow });
   catalog = discovery.catalog;
   aliasDriftFindings.push(...discovery.findings);
-  const launchServices = await recordLaunchServices(readDoctor(cwd), health);
+  const portProbe = await probeLaunchServicesPorts();
+  const launchServices = await recordLaunchServices(readDoctor(cwd), health, portProbe.observation);
   writeDoctor(cwd, launchServices.health);
   const rows = adapters.map((a) => {
     const h = health[a.id];
@@ -749,6 +750,14 @@ export async function doctor(
     const healthy = h.installed && (a.id !== kimi.id || h.authed) && !(a.id === codex.id && h.codexCommit === "escape");
     return alignedStatusRow(healthy ? "pass" : "fail", a.id, state);
   });
+  const ports = portProbe.ports;
+  const portLine = ports.status === "non-darwin" ? "launchservicesd ports: not applicable"
+    : ports.status === "read" ? `launchservicesd pid ${ports.pid}: ${ports.count} ports`
+    : `launchservicesd pid ${ports.status === "unknown" ? ports.pid ?? "unknown" : "unknown"}: ports unknown`;
+  if (ports.status !== "skipped") {
+    rows.push(alignedStatusRow(ports.status === "read" && ports.count < LAUNCHSERVICES_PORT_ADVISORY || ports.status === "non-darwin"
+      ? "pass" : "warn", "launchservicesd", portLine));
+  }
   const reviewDemotions = recentReviewDemotions(cwd);
   if (reviewDemotions.length) {
     rows.push(legend("recent review-seat demotions:"));

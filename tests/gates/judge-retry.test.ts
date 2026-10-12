@@ -123,8 +123,8 @@ function traceOf(onGate?: (e: GateEvent) => void | Promise<void>) {
   return { trace, hook };
 }
 
-const PASS = { pass: true, criteria: [{ criterion: "c1", met: true, reason: "r", evidence: "+y" }] };
-const FAIL = { pass: false, criteria: [{ criterion: "c1", met: false, reason: "nope", evidence: "+y" }] };
+const PASS = { pass: true, criteria: [{ criterion: "c1", met: true, reason: "r", evidence: { path: "a.txt", line: 1 } }] };
+const FAIL = { pass: false, criteria: [{ criterion: "c1", met: false, reason: "nope", evidence: { path: "a.txt", line: 1 } }] };
 
 describe("GATE-09 judge-flake retry (run-gates level)", () => {
   test("test: the judge retry pool is the judge channels alone so a context whose review channels hold a denied judge seat never retries the judge on it and a context without judge channels retries on the configured judge channel whereas the shipped fallback that reads review channels as judges fails", async () => {
@@ -224,10 +224,11 @@ describe("GATE-09 judge-flake retry (run-gates level)", () => {
   });
 
   test("fabricated evidence counts as a judge flake: retried once on failover, parsed retry stands", async () => {
-    // v1.64: a verdict quoting evidence the judged diff doesn't contain is treated as unparseable —
+    // v1.64: a verdict citing evidence the judged diff doesn't contain is treated as unparseable —
     // the same meta.unparseable signal GATE-09 keys on, so the retry machinery needs no new wiring.
+    // S23: a citation of a file outside the diff (a string quote is malformed outright).
     const { repo, base } = repoWithCommit();
-    const fabricated = { pass: true, criteria: [{ criterion: "c1", met: true, reason: "r", evidence: "quote found in no diff anywhere" }] };
+    const fabricated = { pass: true, criteria: [{ criterion: "c1", met: true, reason: "r", evidence: { path: "nowhere.txt", line: 7 } }] };
     const fake = fakeWith({ judge: [fabricated, PASS] });
     const fakeB = fakeBWith({ judge: [PASS] });
     const { results } = await runGates(
@@ -262,7 +263,7 @@ describe("GATE-09 judge-flake retry (run-gates level)", () => {
     expect(acc[0].meta).toMatchObject({ judgeRetry: { flaked: "fake:fake-1", retried: "fake-b:fake-2" } });
   });
 
-  test("double-garbage fails closed exactly as today (SC-2)", async () => {
+  test("double-garbage fails closed as terminal infra, never a charged red (SC-2, S23-F11)", async () => {
     const { repo, base } = repoWithCommit();
     const fake = fakeWith({ judge: ["garbage one", "garbage two"] });
     const fakeB = fakeBWith({ judge: ["garbage b"] });
@@ -274,10 +275,12 @@ describe("GATE-09 judge-flake retry (run-gates level)", () => {
     expect(acc).toHaveLength(1);
     expect(acc[0].pass).toBe(false); // fail-closed intact: two garbage verdicts never become a pass
     expect(acc[0].details).toMatch(/unparseable — failing closed/); // today's fail-closed message unchanged
-    // the final result carries both channels + the unparseable flag (the retry also flaked)
+    // the final result carries both channels + the unparseable flag (the retry also flaked), and S23-F11: two
+    // seats delivering no readable verdict judged nothing about the diff — terminal infra, not a worker charge
     expect(acc[0].meta).toMatchObject({
       unparseable: true,
       judgeRetry: { flaked: "fake:fake-1", retried: "fake-b:fake-2" },
+      classification: "infra", infra: true, retryable: false,
     });
   });
 

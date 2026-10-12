@@ -373,7 +373,9 @@ test("the fable alias stamp reads claude-fable-5-1 with a dated comment and the 
     // CODEX_GIT_GRANT's minimal linked roots (gitdir only when distinct, common objects/refs/logs).
     // 2026-10-03 (v2.6.7 T4, D-1046): repinned when headlessCommand became grantless — judge, review,
     // consult and the model probe carry no writable_roots; workers keep the grant through invoke().
-    codex: "fe2d4c26f46dc83c3e9c31f8c3751dbbdec72f87ddbd305e1360df4c7b7782c1",
+    // 2026-10-12 (v2.8.0 T1, rows 17/18): repinned when CODEX_GIT_GRANT became the TOML-safe leaf
+    // (gitdir when distinct, common objects, the refs/heads/<D> ref and reflog pair; [] on refusal).
+    codex: "d1dc7f84e0868d73c043e1b0d00c17c15ec4b1caf28e9540dcac331cab3b2888",
     "cursor-agent": "b7ce2cbb18f5ccb2749739ffcc80c2d036b72193554189e4f07eff11ce16d8de",
     opencode: "15ce06482a58b5096642974bf4f9a1c3031b62b4aa4de46e6d8038f6cb94ad82",
     pi: "d8c6ab42a4052ee982ead3e119d02d4df8734429b36a129a9e926cf1c2f8c3b7",

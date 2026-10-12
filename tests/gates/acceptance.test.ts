@@ -163,7 +163,7 @@ describe("acceptanceGate", () => {
         criterion: "c1",
         met: false,
         reason: "hardcoded",
-        evidence: "module.exports = (n) =>",
+        evidence: { path: "greet.js", line: 1 },
       }],
     };
     const absent = await acceptanceGate(
@@ -255,7 +255,8 @@ describe("acceptanceGate", () => {
     const r = await acceptanceGate(task, repo, base, { adapter: fake, model: "fake-1" });
     expect(r.pass).toBe(false);
     expect(r.details).toMatch(/malformed verdict shape/i);
-    expect(r.meta?.unparseable).toBeUndefined();
+    // S23: a schema failure is a protocol failure — unparseable, so GATE-09 retries the judge, never a charged red
+    expect(r.meta).toMatchObject({ unparseable: true, cause: "malformed-verdict", judge: "fake:fake-1" });
   });
 
   test("verdict with more items than criteria fails closed even when all met=true", async () => {
@@ -533,7 +534,7 @@ test("parsed judge refusals never acquire infra metadata from credential-like pr
   const { repo, base } = repoWithDiff();
   const judge = fakeWithJudge({
     pass: false,
-    criteria: [{ criterion: "c1", met: false, reason, evidence: "module.exports = (n) =>" }],
+    criteria: [{ criterion: "c1", met: false, reason, evidence: { path: "greet.js", line: 1 } }],
   });
   const r = await acceptanceGate(task, repo, base, { adapter: judge, model: "fake-1" });
 
@@ -569,15 +570,15 @@ describe("acceptanceGate — adversarial judge rubric (v1.64)", () => {
     expect(capturedPrompt).toContain('"line"');
   });
 
-  test("a judge verdict quoting evidence present in the diff parses and its verdict stands", async () => {
+  test("a judge verdict citing a line the diff changed parses and its verdict stands", async () => {
     const { repo, base } = repoWithDiff();
-    // evidence is a verbatim slice of the committed change in repoWithDiff
-    const ok = fakeWithJudge({ pass: true, criteria: [{ criterion: "c1", met: true, reason: "greets by name", evidence: "module.exports = (n) =>" }] });
+    // S23: evidence cites line 1 of greet.js, the line repoWithDiff's committed change rewrites
+    const ok = fakeWithJudge({ pass: true, criteria: [{ criterion: "c1", met: true, reason: "greets by name", evidence: { path: "greet.js", line: 1 } }] });
     const r1 = await acceptanceGate(task, repo, base, { adapter: ok, model: "fake-1" });
     expect(r1).toMatchObject({ gate: "acceptance", pass: true });
     expect(r1.meta?.unparseable).toBeUndefined();
     // a failing verdict with genuine evidence stands too — the parsed verdict decides
-    const bad = fakeWithJudge({ pass: false, criteria: [{ criterion: "c1", met: false, reason: "hardcoded-result shortcut", evidence: "module.exports = (n) =>" }] });
+    const bad = fakeWithJudge({ pass: false, criteria: [{ criterion: "c1", met: false, reason: "hardcoded-result shortcut", evidence: { path: "greet.js", line: 1 } }] });
     const r2 = await acceptanceGate(task, repo, base, { adapter: bad, model: "fake-1" });
     expect(r2.pass).toBe(false);
     expect(r2.details).toContain("hardcoded-result");
@@ -594,10 +595,10 @@ describe("acceptanceGate — adversarial judge rubric (v1.64)", () => {
     const fake = fakeWithJudge({ pass: true, criteria: [{ criterion: "c1", met: true, reason: "ok", evidence: "untouched worktree text" }] });
     const r = await acceptanceGate(task, repo, base, { adapter: fake, model: "fake-1" });
     expect(r.pass).toBe(false);
-    expect(r.details).toMatch(/evidence absent from the judged diff/i);
-    expect(r.details).toContain("c1");
+    // S23: no option accepts a string — a quote is a malformed verdict whatever text it holds
+    expect(r.details).toMatch(/malformed verdict shape/i);
     // treated as unparseable: GATE-09 retries the judge on a failover channel off this meta
-    expect(r.meta).toMatchObject({ unparseable: true, judge: "fake:fake-1" });
+    expect(r.meta).toMatchObject({ unparseable: true, cause: "malformed-verdict", judge: "fake:fake-1" });
   });
 
   test("a judge verdict missing the evidence field entirely fails closed", async () => {
@@ -624,8 +625,8 @@ describe("acceptanceGate — adversarial judge rubric (v1.64)", () => {
 
   test("existing passing and failing judge verdict fixtures keep their outcomes under the extended schema", async () => {
     const { repo, base } = repoWithDiff();
-    // pre-v1.64 fixtures carry no evidence field — the fake seam quotes the diff for them, so the
-    // whole zero-token suite keeps its outcomes while real judges face the strict schema
+    // pre-v1.64 fixtures carry no evidence field — the fake seam cites the first entry of the gate's citable
+    // index for them (S23), so the whole zero-token suite keeps its outcomes while real judges face the strict schema
     const pass = await acceptanceGate(task, repo, base,
       { adapter: fakeWithJudge({ pass: true, criteria: [{ criterion: "c1", met: true, reason: "uses n" }] }), model: "fake-1" });
     expect(pass).toMatchObject({ gate: "acceptance", pass: true });
@@ -663,8 +664,8 @@ describe("acceptanceGate — evidence-addressed citation (v1.70)", () => {
     const r = await acceptanceGate(task, repo, base, { adapter: fake, model: "fake-1" });
     expect(r.pass).toBe(false);
     expect(r.details).toMatch(/evidence absent from the judged diff/i);
-    expect(r.details).toContain("c1");
-    expect(r.meta).toMatchObject({ unparseable: true });
+    // S23: constant diagnostics name no model value; the cause and the dispatched judge carry the identity
+    expect(r.meta).toMatchObject({ unparseable: true, cause: "malformed-verdict", judge: "fake:fake-1" });
   });
 
   test("a verdict citing a line outside every changed hunk of a file that was otherwise touched is rejected rather than accepted", async () => {
@@ -693,7 +694,8 @@ describe("acceptanceGate — evidence-addressed citation (v1.70)", () => {
     spy.mockRestore();
     expect(r.pass).toBe(false);
     expect(r.details).toMatch(/malformed verdict shape/i);
-    expect(r.meta?.unparseable).toBeUndefined();
+    // S23: the raw citation shape is checked before the schema — a protocol failure, not a charged red
+    expect(r.meta).toMatchObject({ unparseable: true, cause: "malformed-verdict", judge: "fake:fake-1" });
   });
 
   // OBS-129: a single-line modification (the T4/c2 shape — e.g. PRIOR_RELEASE_VERSION moving forward) where
@@ -716,14 +718,14 @@ describe("acceptanceGate — evidence-addressed citation (v1.70)", () => {
   });
 
   test("OBS-129: the judge prompt lists the citable new-file line numbers per changed file", async () => {
-    const { repo, base } = repoWithDiff(); // repoWithDiff rewrites greet.js line 1 → citable "greet.js: 1"
+    const { repo, base } = repoWithDiff(); // repoWithDiff rewrites greet.js line 1 → citable entry for greet.js line 1
     let capturedPrompt = "";
     const fake = fakeWithJudge({ pass: true, criteria: [{ criterion: "c1", met: true, reason: "ok" }] });
     const orig = fake.headlessCommand.bind(fake);
     fake.headlessCommand = (promptFile, model) => { capturedPrompt = readFileSync(promptFile, "utf8"); return orig(promptFile, model); };
     await acceptanceGate(task, repo, base, { adapter: fake, model: "fake-1" });
     expect(capturedPrompt).toMatch(/Citable evidence lines/i);
-    expect(capturedPrompt).toMatch(/greet\.js: 1\b/);
+    expect(capturedPrompt).toMatch(/\nCITABLE_LINES_BEGIN ([0-9a-f]{8})\n\{"path":"greet\.js","lines":\[1\]\}\nCITABLE_LINES_END \1\n/);
   });
 
   test("the judge context represents each deleted file as a file-level fact rather than its full deleted body", async () => {

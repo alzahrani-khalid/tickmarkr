@@ -746,7 +746,7 @@ describe("diff cap — v1.82 T1 regenerable capture boundary", () => {
   test("test: a change made only of set-aside captures produces a verdict a reader can parse, from evidence citing a location the change index knows", async () => {
     const { repo, base } = repoWithChange(everyCapture("before"), everyCapture("after"));
     const { prompt, result } = await judgeCiting(repo, base, FRAME_CAPTURE, 0);
-    expect(prompt).toContain(`- ${FRAME_CAPTURE}: 0`);
+    expect(prompt).toContain(`\n${JSON.stringify({ path: FRAME_CAPTURE, lines: [0] })}\n`);
     expect(result.pass).toBe(true);
     expect(result.meta?.unparseable).toBeUndefined();
     expect(result.details).toContain("c1");
@@ -758,7 +758,7 @@ describe("diff cap — v1.82 T1 regenerable capture boundary", () => {
     // exempt from the whole-file-removal collapse (clause 5), so its bytes reach the judge whole
     expect(prompt).toContain("│ frozen row 0 ");
     expect(prompt).not.toContain(`deleted file: ${ANCHOR}`);
-    expect(prompt).toContain(`- ${ANCHOR}: 0`);
+    expect(prompt).toContain(`\n${JSON.stringify({ path: ANCHOR, lines: [0] })}\n`);
     expect(result.pass).toBe(true);
     expect(result.meta?.unparseable).toBeUndefined();
   });
@@ -825,7 +825,7 @@ test("test: real-git capture-cap matrix changes a manifest member produced throu
   expect(accepted.pass).toBe(true);
   const judgePrompt = judgePrompts.join("");
   expect(judgePrompt.match(/set aside: regenerable capture/g)).toHaveLength(1);
-  expect(judgePrompt).toContain(`- ${capture.path}: 0`);
+  expect(judgePrompt).toContain(`\n${JSON.stringify({ path: capture.path, lines: [0] })}\n`);
   // CI renders this diff with ±3-byte variance BETWEEN invocations (observed flaky at 1.89.0:
   // green then +3 on a rerun of the same commit; never reproduced locally). The receipt's
   // exactness is pinned by its dedicated controlled-fixture test below; this cross-check exists

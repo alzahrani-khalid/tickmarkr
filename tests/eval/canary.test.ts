@@ -62,7 +62,7 @@ describe("held-out known-fail judge canary", () => {
           criterion: "c1",
           met: false,
           reason: "a.txt does not contain the required marker",
-          evidence: "+canary-wrong",
+          evidence: { path: "a.txt", line: 1 },
         },
       ],
     });
@@ -87,7 +87,7 @@ describe("held-out known-fail judge canary", () => {
           criterion: "c1",
           met: true,
           reason: "rubber-stamped",
-          evidence: "+canary-wrong",
+          evidence: { path: "a.txt", line: 1 },
         },
       ],
     });
@@ -131,7 +131,7 @@ describe("held-out known-fail judge canary", () => {
           criterion: "c1",
           met: false,
           reason: "the diff does not add the required canary-verified marker",
-          evidence: "+canary-wrong",
+          evidence: { path: "a.txt", line: 1 },
         },
       ],
     });

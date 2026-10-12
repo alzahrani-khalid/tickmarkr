@@ -2,6 +2,39 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v2.8.0 — acceptance cites what changed, a killed job is never forgiven, a codex worker writes only its branch directory, and doctor watches launchservicesd
+
+**v2.8.0** comes from one `tickmarkr run` (run-20261012-165954-…1148). All five of its tasks ship. Each passed build, lint,
+evidence, scope, the executed acceptance judge, a cross-vendor review and the full suite, and the run's tip verify passed. The
+integration-branch guard planned beside them (queue rows 17 and 154) moves to 2.8.1, which starts with an inventory of every place
+tickmarkr reads the integration branch.
+
+- **Acceptance evidence is a citation of a changed line (queue row 23).** The judge's evidence for a criterion must now be a
+  structured `{path, line}` citation of a line inside a changed hunk, or line 0 of a recorded operation fact. A quoted string, even
+  a verbatim changed line, is a malformed verdict. The gate gives the judge a nonce-framed JSON-lines index of every citable line,
+  and a judge that answers malformed twice (the primary and its one failover retry) parks the task as infrastructure instead of
+  charging the worker a failed attempt. Declared: a diff made only of ordinary deletions or binary adds and modifications has
+  nothing citable, so its acceptance gate parks.
+- **A pure rename, an empty new file and a mode-only change are citable (queue row 142).** These diffs have no changed hunk.
+  tickmarkr now reads them as typed facts from `git diff --raw -z -M` output, captured as bytes and parsed by a closed record
+  grammar, never from the patch text. A file name that is not valid UTF-8 records no fact. Copies, renames below 100% similarity,
+  type changes and binary adds and modifications record none either.
+- **A killed test job is never forgiven (queue row 19).** When a test gate's non-zero exit matches the baseline but the output also
+  holds a kill line (a SIGKILL or SIGTERM, signal 9 or 15, or exit code 137 or 143 line outside the runner's own echo blocks), the
+  gate is an infrastructure red, never cached green. A line npm or pnpm prints before running a script (`> …`) is not kill text. A
+  cached forgiven green written by an earlier version, which never read kill text, is refused and the job runs again; tip verify
+  applies the same rule.
+- **A codex worker's git write access is narrowed to its own branch directory (queue rows 17 and 18).** The writable roots
+  tickmarkr hands codex were the whole of the common `refs/` and `logs/`, so a worker could move `main`, tags or any branch. They
+  are now the worktree's git directory, the common objects, and the ref and reflog directory of the worker's own branch. A detached
+  HEAD gets no ref root, and a repository path holding a control character, DEL, a double quote or a backslash gets no git write
+  root at all, so every root is a valid TOML string. Declared until 2.8.1: other branches in the same directory, including the
+  run's integration branch under the default prefix, stay writable by a codex worker.
+- **`tickmarkr doctor` and `tickmarkr verify` read launchservicesd's Mach port count (queue row 101).** launchservicesd crashes
+  when its port space fills (about 268,000 ports), and every GUI app started before the respawn stops taking input. On macOS,
+  doctor now prints the count and flags it at 100,000 or more; a standalone `tickmarkr verify` prints the count and refuses to run
+  at 200,000 or more, naming the log-out remedy. A count it cannot read is reported as unknown and never stops anything.
+
 ## v2.7.9 — gate evidence keeps its meaning: no redacted digits, no forgiven look-alikes, and Fleet edits that take effect
 
 **v2.7.9** comes from one `tickmarkr run` (run-20261012-004108-…1123). Three of its five tasks ship. Each passed build, lint,

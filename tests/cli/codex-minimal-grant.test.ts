@@ -16,10 +16,10 @@ import { validateGraph } from "../../src/graph/schema.js";
 import { authedModels, makeRepo, makeTestTempDir } from "../helpers/tmprepo.js";
 
 // v2.6.6 T9 (K, D-912). The grants this task replaces, in the builders' own shell form: the shipped 2.6.5
-// common-root grant and D-910's rejected [common, gitdir]. LOGS_DENIED is the minimal grant minus common/logs.
+// common-root grant and D-910's rejected [common, gitdir]. LOGS_DENIED is the grant minus its reflog leaf (v2.8.0 T1).
 const SHIPPED = `-c "sandbox_workspace_write.writable_roots=[\\"$(git rev-parse --path-format=absolute --git-common-dir)\\"]"`;
 const D910 = `-c "sandbox_workspace_write.writable_roots=[\\"$(git rev-parse --path-format=absolute --git-common-dir)\\",\\"$(git rev-parse --absolute-git-dir)\\"]"`;
-const LOGS_DENIED = CODEX_GIT_GRANT.replace(`,"%s/logs"' "$tkr_common" "$tkr_common" "$tkr_common"`, `' "$tkr_common" "$tkr_common"`);
+const LOGS_DENIED = CODEX_GIT_GRANT.replace(`,"%s/%s","%s/logs/%s"' "$tkr_common" "$tkr_leaf" "$tkr_common" "$tkr_leaf"`, `,"%s/%s"' "$tkr_common" "$tkr_leaf"`);
 
 // A token-free stand-in for `codex` (no model, no network). The builders' launches only log argv. `codex
 // sandbox` models workspace-write explicitly: every path under the git common dir that no granted writable
@@ -87,9 +87,10 @@ test("both production Codex builders expand exactly the minimal linked grant ver
   writeFileSync(prompt, "fixture prompt");
   expect(LOGS_DENIED).not.toBe(CODEX_GIT_GRANT);
 
-  const objectsRefsLogs = [`${common}/objects`, `${common}/refs`, `${common}/logs`];
+  // v2.8.0 T1: both branches ("task", "main") hold no slash, so their leaf is refs/heads itself
+  const objectsRefsLogs = [`${common}/objects`, `${common}/refs/heads`, `${common}/logs/refs/heads`];
   const rows = [
-    // a linked worktree: its own gitdir (never the common root, never the worktrees parent) plus objects/refs/logs
+    // a linked worktree: its own gitdir (never the common root, never the worktrees parent) plus objects and the leaf pair
     { cwd: linked, minimal: [`${common}/worktrees/task`, ...objectsRefsLogs], d910: [common, `${common}/worktrees/task`] },
     // an ordinary checkout: gitdir IS the common dir, so no gitdir root at all (its commit fails closed)
     { cwd: repo, minimal: objectsRefsLogs, d910: [common, common] },
@@ -138,7 +139,7 @@ test("doctor worker-grant probe discriminates the allowed protected escape unkno
   expect(allowed.note).toBe("linked-worktree commit probe: commit allowed, shared hooks/config denied — the sandbox committed on its fixture branch and was denied both shared-metadata members");
   const roots = grantedRoots();
   expect(roots[0]).toMatch(new RegExp(`^${common}/worktrees/tickmarkr-probe-[0-9a-f-]{36}$`));
-  expect(roots.slice(1)).toEqual([`${common}/objects`, `${common}/refs`, `${common}/logs`]);
+  expect(roots.slice(1)).toEqual([`${common}/objects`, `${common}/refs/heads`, `${common}/logs/refs/heads`]);
   expect(snapshot()).toEqual(before);
 
   // escape: D-910's [common, gitdir] (and the shipped [common]) let the sandbox write both unique hostile
@@ -249,7 +250,7 @@ test("production Codex commands satisfy the closed role-access table G1 G3 versu
   writeFileSync(prompt, "fixture prompt");
   // an operator MCP server: suppression must reach invoke().command too
   writeFileSync(join(process.env.CODEX_HOME!, "config.toml"), "[mcp_servers.fixture-mcp]\ncommand = \"x\"\n");
-  const objectsRefsLogs = [`${common}/objects`, `${common}/refs`, `${common}/logs`];
+  const objectsRefsLogs = [`${common}/objects`, `${common}/refs/heads`, `${common}/logs/refs/heads`];
   const launch = (command: string, cwd: string): string[] => { execFileSync("sh", ["-c", command], { cwd }); return loggedArgv(); };
   const grants = (argv: string[]) => argv.filter((a) => a.includes("writable_roots"));
 

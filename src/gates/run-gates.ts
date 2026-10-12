@@ -8,7 +8,7 @@ import { type TickmarkrConfig, TIER_RANK } from "../config/config.js";
 import { getAdapter } from "../adapters/registry.js";
 import { type Effort, GATE_NAMES, type GateName, type Task } from "../graph/schema.js";
 import { acceptanceGate, type JudgedCriterion } from "./acceptance.js";
-import { type Baseline, type RetryOptions, type GateEvidenceOptions, classifiedFileDurations, compareToBaseline, effectiveCeilingMs, waitForCalmWindow, calmWindowReady } from "./baseline.js";
+import { type Baseline, type RetryOptions, type GateEvidenceOptions, classifiedFileDurations, compareToBaseline, effectiveCeilingMs, waitForCalmWindow, calmWindowReady, SIGNAL_EXIT_RE } from "./baseline.js";
 import { evidenceGate } from "./evidence.js";
 import { captureLlmOutput, type GateVia, SeatLaunchError } from "./llm.js";
 import { withLaunchGuard } from "../drivers/orca.js";
@@ -502,29 +502,35 @@ export async function reobserveTestFiles(worktree: string, testCmd: string, base
     : { ...r, pass: false, meta: { ...r.meta, classification: "infra", infra: true, retryable: false, recoveryRefused: true } };
 }
 
-const SIGNAL_EXIT_RE = /\b(?:SIGTERM|SIGKILL|signal\s+(?:9|15)|exit(?:s|ed|\s+code)?\s+(?:137|143))\b/i;
 const FAILURE_IDENTITY_RE = /\b(?:AssertionError|FAIL\s+\S|Tests?\s+\d+\s+failed|expected\s+.+\s+to\s+)\b/i;
 
 /** D1: apply the daemon's signal-only rider before either battery cache read or write. Its onGate
  * classification happens after persistence, too late to keep a scripted runner's non-verdict out.
  * Keep named failures as work verdicts and preserve details for failure-policy fingerprinting.
  * A baseline-forgiven "green" whose runner was signal-killed is the same non-verdict: a killed job
- * completed no suite, so forgiveness never publishes or caches it green. The authoritative termination
- * receipt decides, never the verdict text: a signal-terminated job is killed whatever its details say, and
- * a green stands only on a receipt showing a normal exit — a receiptless CACHED one (an older or planted
- * entry) is unavailable proof, so a fresh job measures instead. A fresh row is this invocation's own: every
- * production runner attaches its receipt, and the manifest path's verdict already requires a clean exit
+ * completed no suite. The termination receipt decides first: a signal-terminated job is killed whatever its
+ * details say, and a green stands only on a receipt showing a normal exit — a receiptless CACHED one (an
+ * older or planted entry) is unavailable proof, so a fresh job measures instead. A normal exit 1 can still
+ * be a kill (a wrapper reports its killed worker and exits 1), and a forgiven green's details never carry
+ * the runner's output, so this rider cannot see it: S19m4 — the shared forgiveness decision
+ * (baseline.ts freshFailures) reads kill text beside a forgiven pass itself, turns one into infra that is
+ * never cached, and marks the green it does publish `killTextRead`. A cached forgiven green without that
+ * marker was written by an engine that never read kill text, so it is refused here — a normal exit 1
+ * receipt included — and the job runs again. A fresh row is this invocation's own: every production
+ * runner attaches its receipt, and the manifest path's verdict already requires a clean exit
  * (test-manifest.ts verifyManifestReport). A no-command skip ran nothing and claims none. */
 function classifySignalOnlyTest(g: GateResult, cached = false): void {
   const termination = g.evidenceReceipt?.termination.kind;
   const exitCode = g.evidenceReceipt?.termination.exitCode;
   const killed = termination === "signal" || exitCode === 137 || exitCode === 143 || (!g.pass && SIGNAL_EXIT_RE.test(g.details));
-  const unproven = g.pass && g.meta?.skipped !== true && termination !== "exit" && (cached || termination !== undefined);
+  const killTextUnread = cached && Array.isArray(g.meta?.forgivenFingerprints) && g.meta.killTextRead !== true;
+  const unproven = g.pass && g.meta?.skipped !== true && (killTextUnread || termination !== "exit" && (cached || termination !== undefined));
   if (g.gate !== "test" || g.meta?.infra === true || !(killed || unproven)) return;
   const named = Array.isArray(g.meta?.failingTests) && g.meta.failingTests.length > 0;
   if (!g.pass && (named || FAILURE_IDENTITY_RE.test(g.details))) return;
   g.pass = false;
-  g.meta = { ...g.meta, classification: "infra", infra: true, retryable: false, kind: killed || termination ? "signal-exit" : "no-exit-receipt" };
+  g.meta = { ...g.meta, classification: "infra", infra: true, retryable: false,
+    kind: killed || (termination && termination !== "exit") ? "signal-exit" : termination ? "kill-text-unread" : "no-exit-receipt" };
 }
 
 /** OBS-1151: one parsed judgment as the journal keeps it — the judged commit, the seat, and per criterion
@@ -1345,7 +1351,7 @@ export async function runGates(
     // details. The v1.1 badReviewers precedent's TIMING can't transfer: its failover lands on the NEXT
     // worker attempt — exactly what this fix forbids; only its meta-carries-channel pattern is mirrored.
     // Straight-line single `if` — NO loop/counter/knob: exactly-once by construction (a knob is a
-    // fail-closed weakening vector); a second garbage verdict fails the gate closed exactly as today.
+    // fail-closed weakening vector); a second garbage verdict fails the gate closed as terminal infra (S23-F11).
     // T6: exclusion mirrors consult reroute semantics — the flaked channel's whole adapter is banned, not
     // just its exact channel key, so an outage window cannot re-select the vendor being routed around.
     // If no other adapter is live, the exclusion degrades to a channel-level reroute within the same
@@ -1378,8 +1384,11 @@ export async function runGates(
     }
     // OBS-1168(b): the re-routed seat could not launch either — no seat produced a verdict, so this is
     // an infra park over whatever the deterministic gates proved, never a charge against the worker.
-    if (a.meta?.cause === "seat-launch-failed") a = { ...a, meta: { ...a.meta, classification: "infra", infra: true, retryable: false } };
-    else if (!cancelled && Array.isArray(a.meta?.judgment)) a = await adjudicate(a);
+    // S23-F11: the same holds for a retry whose verdict is still unparseable: two seats delivered no readable
+    // verdict, which judges nothing about the worker's diff, so the row is terminal infra, never a charged red.
+    if (a.meta?.cause === "seat-launch-failed" || (a.meta?.judgeRetry !== undefined && a.meta.unparseable === true)) {
+      a = { ...a, meta: { ...a.meta, classification: "infra", infra: true, retryable: false } };
+    } else if (!cancelled && Array.isArray(a.meta?.judgment)) a = await adjudicate(a);
     // No dispatch, no key: a deterministic-oracle round writes no `invocations` field rather than an
     // empty array a reader could mistake for "measured, and it cost nothing".
     return { result: invocationSpans.length ? { ...a, meta: { ...a.meta, invocations: invocationSpans } } : a, invocations };

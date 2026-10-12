@@ -65,10 +65,10 @@ describe("GATE-09 judge-flake attribution (daemon level, fake adapter, zero toke
     expect(accIdx).toBeGreaterThan(jrIdx);
   });
 
-  test("double-garbage judge: worker escalates exactly as today — fail-closed intact (daemon SC-2)", async () => {
-    // Two garbage verdicts fail the gate closed; the daemon escalates the worker (the retry did NOT
-    // manufacture a pass). This is today's semantics, preserved. Each worker attempt re-runs gates, so
-    // multiple acceptance gate-results appear — the pin is that NONE of them is a pass.
+  test("double-garbage judge: parks infra without charging the worker — fail-closed intact (daemon SC-2, S23-F11)", async () => {
+    // Two garbage verdicts fail the gate closed (the retry did NOT manufacture a pass). S23-F11: two seats that
+    // delivered no readable verdict judged nothing about the diff, so the row is terminal infra and the daemon
+    // parks it on the first attempt — no gate failure is charged and the worker is never escalated.
     const { repo, fake } = setupRepo(
       [T("T1", { complexity: 8 })],
       {
@@ -78,9 +78,13 @@ describe("GATE-09 judge-flake attribution (daemon level, fake adapter, zero toke
       },
     );
     const s = await runDaemon(repo, { adapters: [fake], runId: "run-g09-double" });
-    // the double-garbage acceptance fail eventually parks via the ladder (consult → human)
+    // the double-garbage acceptance fail parks infra directly — never via the ladder (consult → human)
     expect(s.human).toEqual(["T1"]);
     const evs = Journal.open(repo, "run-g09-double").read();
+    expect(evs.filter((e) => e.event === "task-dispatch" && e.taskId === "T1")).toHaveLength(1);
+    expect(evs.filter((e) => e.event === "escalation" || e.event === "consult")).toHaveLength(0);
+    expect(evs.filter((e) => e.event === "task-human" && e.taskId === "T1").at(-1)?.data.kind).toBe("infra");
+    expect(Journal.open(repo, "run-g09-double").readTelemetry().find((r) => r.taskId === "T1")).toMatchObject({ parkKind: "infra", gateFails: 0 });
     // EVERY acceptance gate-result is pass:false — fail-closed, no garbage²→pass path, at any attempt
     const acc = evs.filter((e) => e.event === "gate-result" && (e.data as { gate?: string }).gate === "acceptance");
     expect(acc.length).toBeGreaterThanOrEqual(1);

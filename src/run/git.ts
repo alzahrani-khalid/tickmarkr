@@ -285,6 +285,8 @@ export interface ShResult {
   durationMs?: number;
   /** T7: the capacity THIS child ran under, stamped where its environment was built (see `shell`). */
   capacity?: RunCapacity;
+  /** Queue row 142: stdout exactly as the child wrote it, present only when the own-git caller asked for bytes. */
+  stdoutBytes?: Buffer;
 }
 
 /**
@@ -332,6 +334,8 @@ export interface ShellOptions {
   onReceipt?: (receipt: ShellReceipt) => void;
   /** Called once per invocation (1-based), including each pre-spawn retry. */
   receiptAttribution?: (invocation: number) => CommandReceiptAttribution;
+  /** Queue row 142: also keep stdout as raw bytes (ShResult.stdoutBytes); only shGit's byte readers opt in. */
+  bytes?: boolean;
 }
 
 /** Shared command seam, including invocation-bound manifested runners. A PAYLOAD entry: its children keep the
@@ -460,6 +464,7 @@ function executeShell(cmd: string, cwd: string, timeoutMs: number, login: boolea
       throw error;
     }
     let stdout = "", stderr = "";
+    const stdoutChunks: Buffer[] = [];
     const stdoutDecoder = new StringDecoder("utf8");
     const stderrDecoder = new StringDecoder("utf8");
     let timedOut = false, reapedGroup = false, done = false, started = false, outputSeen = false;
@@ -492,6 +497,7 @@ function executeShell(cmd: string, cwd: string, timeoutMs: number, login: boolea
         timedOut,
         durationMs: Date.now() - startedAt,
         capacity,
+        ...(options.bytes ? { stdoutBytes: Buffer.concat(stdoutChunks) } : {}),
         ...(reapedGroup ? { reapedGroup: true } : {}),
         ...(reapError ? { reapError } : {}),
       });
@@ -541,6 +547,7 @@ function executeShell(cmd: string, cwd: string, timeoutMs: number, login: boolea
     // still decides whether a chunk-local decoder exposes the defect in any particular run.
     p.stdout!.on("data", (d) => {
       if (d.length > 0) outputSeen = true;
+      if (options.bytes) stdoutChunks.push(d);
       stdout += stdoutDecoder.write(d);
     });
     p.stderr!.on("data", (d) => {
@@ -618,9 +625,9 @@ export function sh(cmd: string, cwd: string, timeoutMs = DEFAULT_SHELL_TIMEOUT_M
 
 // Git plumbing never needs an operator profile; skip login-shell startup and its side effects.
 // v2.6.8 T2: the explicit OWN-GIT entry — forced inert hooks/fsmonitor and, in a linked checkout, the trusted-path and
-// ref-store pin.
-export function shGit(cmd: string, cwd: string, timeoutMs = DEFAULT_SHELL_TIMEOUT_MS, own: OwnGitOptions = {}): Promise<ShResult> {
-  return shellEntry(cmd, cwd, timeoutMs, false, {}, own);
+// ref-store pin. Queue row 142: `bytes` is the one opt-in raw-stdout capture; every other caller's output is unchanged.
+export function shGit(cmd: string, cwd: string, timeoutMs = DEFAULT_SHELL_TIMEOUT_MS, own: OwnGitOptions = {}, options: Pick<ShellOptions, "bytes"> = {}): Promise<ShResult> {
+  return shellEntry(cmd, cwd, timeoutMs, false, options, own);
 }
 
 export async function shOk(cmd: string, cwd: string): Promise<string> {

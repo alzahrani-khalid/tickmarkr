@@ -18,7 +18,7 @@ import { addDetachedWorktree, linkNodeModules, removeWorktree, shGit, shGitOk } 
 import { foldOwedChecks, integrationMapped, owedCriteria, Journal, OWED_DISCHARGE_EVENT, type OwedCheck, type OwedFold } from "../../run/journal.js";
 import { describeLeaseWait, withRepositoryLease } from "../../run/lease.js";
 import { isPidLive } from "../../run/lock.js";
-import { recordLaunchServices } from "../../run/launchservices-check.js";
+import { LAUNCHSERVICES_PORT_STOP, probeLaunchServicesPorts, recordLaunchServices } from "../../run/launchservices-check.js";
 
 /**
  * tickmarkr verify — the gate battery as a standalone command (OPERATING-MODEL-2026-08-11 item 3).
@@ -195,6 +195,15 @@ export async function verify(argv: string[], cwd = process.cwd(), options: { evi
     },
     allowPositionals: false,
   });
+
+  const portProbe = await probeLaunchServicesPorts({ requireTop: true });
+  const ports = portProbe.ports;
+  if (ports.status === "read" || ports.status === "unknown") {
+    console.error(`verify: ports ${ports.status === "read" ? ports.count : "unknown"}`);
+  }
+  if (ports.status === "read" && ports.count >= LAUNCHSERVICES_PORT_STOP) {
+    return { out: `verify refused: launchservicesd has ${ports.count} ports (threshold ${LAUNCHSERVICES_PORT_STOP}); log out or restart to reset launchservicesd before verifying`, code: 1 };
+  }
 
   const stateRoot = await verifyStateRoot(cwd);
   const fileRoot = (file: typeof STATE_FILES[number]) =>

@@ -483,6 +483,18 @@ const namesRegression = (l: string) => (isFailureShaped(l) || ERROR_CLASS_RE.tes
 // classifyFailureOutput's ERROR_CLASS_RE/namesFailure vetoes still decide mixed lines.
 const isFingerprintShaped = (l: string) => isFailureShaped(l) || INFRA_RE.test(l);
 
+/** D1's signal vocabulary, one copy for the gate battery and the tip (the daemon keeps its own). */
+export const SIGNAL_EXIT_RE = /\b(?:SIGTERM|SIGKILL|signal\s+(?:9|15)|exit(?:s|ed|\s+code)?\s+(?:137|143))\b/i;
+/**
+ * S19m4: the first kill line of in-memory runner output — outside Vitest echo blocks, ANSI-stripped,
+ * read in its turbo-stripped form: it names a signal exit, is not failure-shaped, is neither a pass nor an
+ * operator line, and is not a script echo (`> ` — npm and pnpm print one before every script they run,
+ * nested ones included, and the echo is the command text, never kill text).
+ */
+const firstKillLine = (output: string): string | undefined => withoutVitestEchoBlocks(output)
+  .map((l) => { const clean = l.replace(ANSI_RE, ""); return stripTurboPrefix(clean) ?? clean; })
+  .find((l) => SIGNAL_EXIT_RE.test(l) && !isFingerprintShaped(l) && !PASS_LINE_RE.test(l) && !OPERATOR_LINE_RE.test(l) && !l.startsWith("> "));
+
 export type FailureClassification = "regression" | "infra";
 
 /**
@@ -737,6 +749,8 @@ export interface FreshFailureVerdict {
   why?: string;
   /** The one shared forgiveness decision both readers extend: the entry recorded a red VERDICT. */
   baselineRed: boolean;
+  /** S19m4: the first kill line, when the caller read kill text (the test gate alone). A forgiven red beside one is infra. */
+  killLine?: string;
 }
 
 const entryState = (entry: BaselineCommand | undefined): { state: BaselineEntryState; why?: string } => {
@@ -777,7 +791,10 @@ const rejects = (f: string) => !FAIL_ANCHOR_RE.test(f) || f.startsWith("FAIL ");
  *   forgiven, and a header printed under a realpath variant of the cwd compares as a different header.
  * f is fresh when the candidate repeats it more often than the capture recorded it.
  */
-export function freshFailures(entry: BaselineCommand | undefined, raw: string): FreshFailureVerdict {
+export function freshFailures(entry: BaselineCommand | undefined, raw: string, readKillText = false): FreshFailureVerdict {
+  // S19m4: kill text is read here, before table T, from the in-memory output — never the redacted tail.
+  const killLine = readKillText ? firstKillLine(raw) : undefined;
+  const kill = killLine !== undefined ? { killLine } : {};
   const { state, why } = entryState(entry);
   const baselineRed = (state === "legacy" || state === "v2") && (entry!.exitCode ?? 1) !== 0;
   if (state === "v2") {
@@ -794,7 +811,7 @@ export function freshFailures(entry: BaselineCommand | undefined, raw: string): 
       unreadable: seen.has(UNRECOGNIZED_FAILURE),
       forgiven: [...new Set(occurrences.filter((o) => o.unattributed !== true && seen.get(o.id)! <= (recorded.get(o.id) ?? 0)).map((o) => o.id))],
       failingLines: fresh.map((o) => o.line),
-      state, baselineRed,
+      state, baselineRed, ...kill,
     };
   }
   // OBS-534 (T2): an infra-recorded entry is a KILL, not a verdict — whatever fingerprints it carries
@@ -805,7 +822,7 @@ export function freshFailures(entry: BaselineCommand | undefined, raw: string): 
   const fresh = current.filter((f) => !known.has(f) && rejects(f) && f !== UNRECOGNIZED_FAILURE);
   // OBS-1123: the baseline-recorded half, named so a reader never has to infer it from the fresh half.
   return { failing: fresh, unreadable: current.includes(UNRECOGNIZED_FAILURE),
-    forgiven: current.filter((f) => known.has(f)), failingLines: fresh, state, ...(why ? { why } : {}), baselineRed };
+    forgiven: current.filter((f) => known.has(f)), failingLines: fresh, state, ...(why ? { why } : {}), baselineRed, ...kill };
 }
 export type PackageManager = "npm" | "pnpm" | "yarn" | "bun";
 
@@ -1311,8 +1328,8 @@ export async function compareToBaseline(
     // below rather than reading as a verified green. Raise the ceiling by teaching isFailureShaped
     // that runner's position rule (leading verdict + identifier, or identifier + separator + trailing
     // verdict); loosening back to vocabulary re-opens OBS-278.
-    const verdict = freshFailures(entry, raw);
-    const { failing, unreadable, forgiven, failingLines, baselineRed } = verdict;
+    const verdict = freshFailures(entry, raw, name === "test");
+    const { failing, unreadable, forgiven, failingLines, baselineRed, killLine } = verdict;
     // OBS-1123: which baseline-recorded fingerprints this verdict carried, and the capture that
     // recorded them. Observational only — nothing below reads it to decide a verdict.
     const provenance = baseline.provenance ? { baselineProvenance: baseline.provenance } : {};
@@ -1412,13 +1429,24 @@ export async function compareToBaseline(
       });
       continue;
     }
+    // S19m4: a killed test runner completed no suite, so its familiar failures are no verdict to forgive.
+    if (killLine !== undefined) {
+      record({
+        gate: name,
+        pass: false,
+        details: `infra; exit ${r.code}; every failure is recorded in the baseline, but the runner printed kill text — `
+          + `it never completed a suite, so nothing is forgiven: ${killLine}`,
+        meta: { classification: "infra", infra: true, retryable: false, kind: "signal-exit", forgivenFingerprints: forgiven, ...provenance },
+      });
+      continue;
+    }
     record({
       gate: name,
       pass: true,
       details: `exit ${r.code} but only pre-existing failures (forgiven)${
         unreadable ? " — no failure shape recognized in this output, so a new failure from this runner is invisible to the baseline gate" : ""
       }`,
-      meta: { ...(classification ? { classification } : {}), forgivenFingerprints: forgiven, ...provenance },
+      meta: { ...(classification ? { classification } : {}), forgivenFingerprints: forgiven, ...provenance, ...(name === "test" ? { killTextRead: true } : {}) },
     });
   }
   return results;
