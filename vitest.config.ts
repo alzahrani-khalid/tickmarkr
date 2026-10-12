@@ -120,6 +120,12 @@ export const createVitestConfig = (forkCapValue: string | undefined, lean = lean
     // (scripts/vitest-lease.ts); `vitest list` and a repository-less cwd take none.
     globalSetup: [VITEST_LEASE_HOOK],
     testTimeout: 20000,
+    // Queue row 148, a LOCAL remedy: the shipped CI classifier reads a raw "Test timed out in Nms." in captured
+    // test output as a timed-out test, and daemon tests print the baseline gate's raw failure lines in their
+    // notifications. A user's suite that prints such a line still reds under that classifier. Drop only those
+    // console entries; Vitest still reports a real timeout itself. DELETE this filter when row 148 ships
+    // (CI graded from a machine reporter, per invocation).
+    onConsoleLog: (log) => (/(Test|Hook) timed out in [0-9]+ ?ms/.test(log) ? false : undefined),
     // v2.7.8 T2: `--shard` plans by LPT over scripts/ci/durations.json; file order stays BaseSequencer's
     sequence: { sequencer: LptSequencer },
     // The fork budget lives on the ROOT: vitest 3.2.7 builds one forks pool from the root config
