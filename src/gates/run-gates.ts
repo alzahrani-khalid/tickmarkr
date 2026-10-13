@@ -22,7 +22,7 @@ import { RUNNER_INFRA_DIAGNOSTIC_RE, timeoutShaped } from "./timeout-shaped.js";
 import type { GateResult } from "./types.js";
 import { executionSignal } from "../run/execution-budget.js";
 import { failureDisposition, type VerificationRetryCause } from "../run/recovery.js";
-import { dependencyLinkRefusal, preserveWorktree, type PreserveProducer, producerFields, readCapacity, shGit, resolvedCapacity, sameCapacity, verificationProtocol } from "../run/git.js";
+import { dependencyLinkRefusal, preserveWorktree, type PreserveProducer, producerFields, readCapacity, reflogWitness, shGit, resolvedCapacity, sameCapacity, verificationProtocol } from "../run/git.js";
 import { type StructuredFinding, type JudgeInvocationEvidence, withJudgeInvocationEvidence } from "../run/journal.js";
 import {
   computeVerificationIdentity,
@@ -582,6 +582,47 @@ export async function judgeContradictions(
     }
   }
   return found;
+}
+
+/** ANL-023 §7.4: an adjudication subject's change of state, closed. */
+type AdjudicationSubjectLeg = "moved" | "restored" | "witness" | "unreadable";
+interface SubjectWitness { ref?: string; logs: string[] }
+const SUBJECT_LEG_TEXT: Record<AdjudicationSubjectLeg, string> = {
+  moved: "moved", restored: "moved and restored", witness: "could not be witnessed", unreadable: "is unreadable",
+};
+
+/** ANL-023 §7.4 S0, read-only: HEAD's symbolic state and its reflog W(HEAD) — plus, when attached, its branch's
+ * W(R) — each valid for the sampled `commit`. A move made inside the checkout writes both logs, a branch move from
+ * another worktree only the branch's, a same-commit retarget only HEAD's, so both are kept. */
+async function openSubjectWitness(dir: string, commit: string): Promise<SubjectWitness | { leg: "witness" | "unreadable" }> {
+  const sym = await shGit("git symbolic-ref -q HEAD", dir);
+  if (sym.code !== 0 && sym.code !== 1) return { leg: "unreadable" };
+  const ref = sym.code === 0 ? sym.stdout.trim() : undefined;
+  const logs: string[] = [];
+  for (const name of ref ? ["HEAD", ref] : ["HEAD"]) {
+    const w = await reflogWitness(dir, name);
+    if (w.code !== 0 || w.lines[0] !== commit) return { leg: "witness" };
+    logs.push(w.lines.join("\n"));
+  }
+  return { ref, logs };
+}
+
+/** ANL-023 §7.4, after the seat returns: HEAD = `commit`, its symbolic state and referent unchanged, and both logs
+ * line for line as S0 found them — or the leg that changed, with the HEAD it found. */
+async function adjudicationSubjectChange(dir: string, commit: string, s0: SubjectWitness): Promise<{ leg: AdjudicationSubjectLeg; found: string } | undefined> {
+  const head = await shGit("git rev-parse HEAD", dir);
+  if (head.code !== 0) return { leg: "unreadable", found: "unreadable" };
+  const found = head.stdout.trim();
+  if (found !== commit) return { leg: "moved", found };
+  const sym = await shGit("git symbolic-ref -q HEAD", dir);
+  if (sym.code !== 0 && sym.code !== 1) return { leg: "unreadable", found: "unreadable" };
+  if ((sym.code === 0 ? sym.stdout.trim() : undefined) !== s0.ref) return { leg: "moved", found };
+  for (const [i, name] of (s0.ref ? ["HEAD", s0.ref] : ["HEAD"]).entries()) {
+    const w = await reflogWitness(dir, name);
+    if (w.code !== 0) return { leg: "unreadable", found: "unreadable" };
+    if (w.lines.join("\n") !== s0.logs[i]) return { leg: "restored", found };
+  }
+  return undefined;
 }
 
 export async function runGates(
@@ -1304,6 +1345,11 @@ export async function runGates(
     // reused. Only a criterion that REVERSES the newest prior ruling on the same subject key over
     // identical cited blobs needs a second, distinct judge; agreement stands (a sound FAIL included),
     // and a split, no distinct eligible seat or an unreadable adjudication parks for the operator.
+    // 2.8.1 T4 (ANL-023 §7.4): the record names the commit it judged, under a validated subject witness. Only when
+    // a second seat is about to run, the subject witness (HEAD's reflog and, when attached, its branch's reflog) is
+    // validated for the sampled HEAD before the second seat runs, read-only, and re-read after it returns with HEAD
+    // and its symbolic state; a move, a move-and-restore or an unwitnessable (or unreadable) subject parks infra with
+    // no record stamped and no worker charge.
     const adjudicate = async (fresh: GateResult): Promise<GateResult> => {
       const primary = String(fresh.meta?.judge ?? channelKey({ adapter: ctx.cfg.judge.adapter, model: ctx.cfg.judge.model }));
       const head = await shGit("git rev-parse HEAD", ctx.worktree);
@@ -1333,7 +1379,17 @@ export async function runGates(
       const seatVia = via
         ? { driver: via.driver, keep: via.keep, onSlot: via.onSlot, name: via.nameFor("judge", seatAdapter.id) + "-r2", label: via.labelFor("judge") }
         : undefined;
+      const subjectPark = (leg: AdjudicationSubjectLeg, found: string, ran?: string): GateResult => ({
+        gate: "acceptance", pass: false,
+        details: `the adjudication subject ${SUBJECT_LEG_TEXT[leg]}: sampled ${commit.slice(0, 12)}, found ${found.slice(0, 12)} (${leg}); parked for an operator ruling, no worker charge`,
+        meta: { classification: "infra", infra: true, retryable: false, cause: "subject-moved", judge: primary,
+          adjudication: { primary, ...(ran ? { adjudicator: ran } : {}), sampled: commit, found, leg } },
+      });
+      const s0 = await openSubjectWitness(ctx.worktree, commit);
+      if ("leg" in s0) return subjectPark(s0.leg, s0.leg === "unreadable" ? "unreadable" : commit);
       const second = await invokeJudge(seatAdapter, seat.model, seatVia, configuredEffort(ctx.cfg, seat));
+      const changed = await adjudicationSubjectChange(ctx.worktree, commit, s0);
+      if (changed) return subjectPark(changed.leg, changed.found, adjudicator);
       const rulings = Array.isArray(second.meta?.judgment) ? second.meta.judgment as JudgedCriterion[] : undefined;
       // A citation-less ruling cannot be compared, so it confirms nothing (invented evidence is already unparseable,
       // and an internally inconsistent verdict carries no judgment rows at all).

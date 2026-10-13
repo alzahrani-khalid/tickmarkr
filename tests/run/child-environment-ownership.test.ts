@@ -874,25 +874,29 @@ setInterval(() => { const go = dir + '/go-' + n; if (!fs.existsSync(go)) return;
     git(f.linked, "reset", "-q", "--keep", realHead);
     expect(refMap(f.hostile)).toBe(hostileRefs);
 
-    // ensureIntegration and mergeTask with ordinary-main and linked-integration checkouts
+    // ensureIntegration and mergeTask from ordinary-main and linked roots (2.8.1 T2: ref-only, no integration checkout)
     git(f.linked, "commit", "-qam", "task work", "--no-gpg-sign");
     const gated = git(f.linked, "rev-parse", "HEAD");
     for (const root of [f.repo, f.linked]) {
       const branch = `tickmarkr/run-${root === f.repo ? "main" : "linked"}`;
-      const intWt = await ensureIntegration(root, branch, f.base);
-      expect(await ensureIntegration(root, branch, f.base)).toBe(intWt); // reuse
-      expect(git(intWt, "rev-parse", "HEAD")).toBe(f.base);
-      const intArmed = { gitdir: realpathSync(git(intWt, "rev-parse", "--absolute-git-dir")), worktree: realpathSync(intWt) };
       seen.length = 0;
-      expect(await mergeTask(intWt, "task", `merge ${branch}`, f.base)).toEqual({ ok: false, tipMoved: { gatedCommit: f.base, branchTip: gated } });
-      expect(await mergeTask(intWt, "task", `merge ${branch}`, gated)).toEqual({ ok: true });
-      expect(git(intWt, "rev-parse", "HEAD^2")).toBe(gated);
-      expect(git(intWt, "rev-parse", "HEAD^{tree}")).toBe(git(f.repo, "rev-parse", `${gated}^{tree}`));
-      expect(git(f.repo, "rev-parse", `refs/heads/${branch}`)).toBe(git(intWt, "rev-parse", "HEAD"));
+      expect(await ensureIntegration(root, branch, f.base)).toBe(f.base);
+      await expect(ensureIntegration(root, branch, f.base)).rejects.toThrow(/already exists or cannot be created/); // never reused
+      expect(git(f.repo, "rev-parse", `refs/heads/${branch}`)).toBe(f.base);
+      const published: string[] = [];
+      expect(await mergeTask(root, { branch, expected: f.base }, "task", `merge ${branch}`, f.base, (c) => published.push(c)))
+        .toEqual({ ok: false, tipMoved: { gatedCommit: f.base, branchTip: gated } });
+      expect(await mergeTask(root, { branch, expected: f.base }, "task", `merge ${branch}`, gated, (c) => published.push(c)))
+        .toEqual({ ok: true, commit: published[0], from: f.base });
+      expect(git(f.repo, "rev-parse", `${published[0]}^2`)).toBe(gated);
+      expect(git(f.repo, "rev-parse", `${published[0]}^{tree}`)).toBe(git(f.repo, "rev-parse", `${gated}^{tree}`));
+      expect(git(f.repo, "rev-parse", `refs/heads/${branch}`)).toBe(published[0]);
+      expect(git(f.repo, "worktree", "list", "--porcelain")).not.toContain(`branch refs/heads/${branch}`);
       expect(seen.length).toBeGreaterThan(0);
       for (const s of seen) {
-        // mergeTask's merge and reads carry the default pin, ref store included, in the linked integration checkout
-        expectPinned(s, { gitdir: intArmed.gitdir, common: f.common, worktree: intArmed.worktree }, "linked integration");
+        // the publication's reads and writes carry the root's own pin, ref store included — none in the main checkout
+        if (root === f.repo) for (const k of PIN_KEYS) expect(s.env[k], `${s.cmd} ${k}`).toBeUndefined();
+        else expectPinned(s, f, "linked root publication");
       }
     }
 
@@ -1108,7 +1112,7 @@ setInterval(() => { const go = dir + '/go-' + n; if (!fs.existsSync(go)) return;
     // hook disable and the inherited hostile ref backend: a detached add of a SHA, a branch name or HEAD raced at its
     // resolution is refused by name having read the TRUSTED commit and registering nothing; raced at its add it is refused
     // by name and rolls back the checkout it registered in the TRUSTED store; a branch add (createWorktree's -B on a new
-    // and on a moved branch, ensureIntegration's existing-branch and -b forms) is refused by name and rolls back its
+    // and on a moved branch; 2.8.1 T2: ensureIntegration adds no checkout any more) is refused by name and rolls back its
     // checkout, its registration and the branch it created (deleted) or moved (restored), in the trusted store only
     const writerJs = join(makeTestTempDir("child-env-writer-"), "writer.cjs");
     writeFileSync(writerJs, `const fs = require('node:fs'); const dir = process.argv[2]; let n = 0;
@@ -1154,8 +1158,6 @@ setInterval(() => { const go = dir + '/go-' + n; if (!fs.existsSync(go)) return;
         const refsBefore = refMap(repo);
         await refusedAfter(f, () => createWorktree(f.linked, `c-${slug}`, f.base), tag);
         await refusedAfter(f, () => createWorktree(f.linked, `m-${slug}`, f.base), tag);
-        await refusedAfter(f, () => ensureIntegration(f.linked, `e-${slug}`, f.base), tag);
-        await refusedAfter(f, () => ensureIntegration(f.linked, `b-${slug}`, f.base), tag);
         armed = undefined;
         vi.unstubAllEnvs();
         expect(refMap(f.hostile), tag).toBe(hostileRefs);
@@ -1235,19 +1237,17 @@ setInterval(() => { const go = dir + '/go-' + n; if (!fs.existsSync(go)) return;
       git(repo, "branch", "-q", `pe-${slug}`, f.base);
       git(repo, "branch", "-q", `pm-${slug}`, linkedHead);
       const refsBefore = refMap(repo);
-      for (const add of [() => createWorktree(f.linked, `pc-${slug}`, f.base), () => createWorktree(f.linked, `pm-${slug}`, f.base),
-        () => ensureIntegration(f.linked, `pe-${slug}`, f.base), () => ensureIntegration(f.linked, `pb-${slug}`, f.base)]) {
+      for (const add of [() => createWorktree(f.linked, `pc-${slug}`, f.base), () => createWorktree(f.linked, `pm-${slug}`, f.base)]) {
         await expect(persistently(rewrite, /^git worktree add /, `${why} branch add`, add)).rejects.toMatchObject({ name: "GitTrustRefusal", path: commondir });
         expect(trustedWorktrees(), why).toEqual(["task"]);
         expect(refMap(repo), why).toBe(refsBefore);
         noStub(`${why} branch add`);
       }
       // the same persistent rewrite with the budget expiring after registration: a detached add, createWorktree's new and
-      // moved branch, ensureIntegration's existing branch and -b add each leave nothing behind in the trusted store
+      // moved branch each leave nothing behind in the trusted store (2.8.1 T2: ensureIntegration adds no checkout)
       const expired = join(tmp, `expired-${slug}`);
       for (const [kind, add, match] of [["detached", () => addDetachedWorktree(f.linked, expired, "HEAD"), DETACHED_ADD],
-        ["new branch", () => createWorktree(f.linked, `pc-${slug}`, f.base), /^git worktree add /], ["moved branch", () => createWorktree(f.linked, `pm-${slug}`, f.base), /^git worktree add /],
-        ["existing branch", () => ensureIntegration(f.linked, `pe-${slug}`, f.base), /^git worktree add /], ["-b branch", () => ensureIntegration(f.linked, `pb-${slug}`, f.base), /^git worktree add /]] as const) {
+        ["new branch", () => createWorktree(f.linked, `pc-${slug}`, f.base), /^git worktree add /], ["moved branch", () => createWorktree(f.linked, `pm-${slug}`, f.base), /^git worktree add /]] as const) {
         const tag = `${why} ${kind} add under an expired budget`;
         expect(await persistently(rewrite, match, tag, () => expiring(add)), tag).toMatchObject({ name: "GitTrustRefusal", path: commondir });
         expect(existsSync(expired), tag).toBe(false);
@@ -1257,6 +1257,10 @@ setInterval(() => { const go = dir + '/go-' + n; if (!fs.existsSync(go)) return;
       }
       expect(recaptureLeft(f.linked).concat(readdirSync(parent).filter(d => /^p[cmeb]-/.test(d))), why).toEqual([]);
       for (const branch of [`pe-${slug}`, `pm-${slug}`]) git(repo, "branch", "-q", "-D", branch);
+      // 2.8.1 T2: the resume created its missing integration ref create-only at the journaled base, in the trusted store
+      const integration = `refs/heads/tickmarkr/run-persistent-${slug}`;
+      expect(git(repo, "rev-parse", integration), why).toBe(run.journal.read().find((e) => e.event === "run-start")!.data.baseRef);
+      git(repo, "update-ref", "-d", integration);
       expect(refMap(repo), why).toBe(trustedRefs);
     }
     persistErrors.mockRestore();

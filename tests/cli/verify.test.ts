@@ -162,6 +162,8 @@ describe("tickmarkr verify — standalone gate battery", () => {
     vi.doMock("../../src/run/git.js", () => ({
       shGitOk: vi.fn(async (cmd: string) => cmd.includes("merge-base") ? "aaaaaaaaaaaa\n" : cmd.includes("main") ? "bbbbbbbbbbbb\n" : "cccccccccccc\n"),
       shGit: vi.fn(async () => ({ code: 0, stdout: "", stderr: "" })),
+      // The latch reads W(HEAD) before any gate. This fixture's rev-parse HEAD is cccccccccccc, so the witness is that one line.
+      reflogWitness: vi.fn(async () => ({ code: 0, lines: ["cccccccccccc"] })),
       linkNodeModules: vi.fn(),
       removeWorktree: vi.fn(),
     }));

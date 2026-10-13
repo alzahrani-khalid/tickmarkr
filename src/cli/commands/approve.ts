@@ -5,6 +5,7 @@ import { allAdapters } from "../../adapters/registry.js";
 import { channelKey } from "../../adapters/types.js";
 import { loadConfig } from "../../config/config.js";
 import { integrationBranch } from "../../run/merge.js";
+import { integrationAnchor } from "../../run/daemon.js";
 import { separabilityErrors, surfaceErrors, taskBudgetErrors } from "../../compile/collateral.js";
 import { GATE_NAMES, type GateName } from "../../graph/schema.js";
 import { applyScopeAmendments, bindingToken, captureOwedCheck, engagementComparable, engagementReleased, failedGateBeforePark, parseBindingToken, physicalLine, ATTEMPT_CAP_RELEASE, GATE_SATISFIED_RELEASE, Journal, RECHECK_RELEASE, REVIEW_UPHELD_RELEASE, type DecisionBinding, type JournalEvent } from "../../run/journal.js";
@@ -241,6 +242,11 @@ export async function approve(argv: string[], cwd = process.cwd()): Promise<stri
 
   try {
   const journal = Journal.open(cwd, runId);
+  // 2.8.1 T3 (ANL-023 §7.3): a marked run's recheck counts against its journal anchor; an unreadable one admits nothing.
+  const anchor = integrationAnchor(journal.read());
+  if (recheck && anchor && "unreadable" in anchor) {
+    throw new Error(`refusing to recheck ${taskId} in ${runId}: its journal names no readable published tip (${anchor.unreadable})`);
+  }
 
   const status = journal.replayStatuses().get(taskId);
   if (status === undefined) {
@@ -378,20 +384,24 @@ export async function approve(argv: string[], cwd = process.cwd()): Promise<stri
     // daemon's boundary never observes the decision without its obligation (or a second write).
     // The seats a review discharge may resolve to are this repository's declared channels, recorded on
     // the row so every later fold reads the same table whatever process or checkout it runs in.
-    let integrationRef = "unknown";
+    let byName = "unknown";
     let declared: Array<{ key: string; vendor: string }> | undefined;
     let owedTask: { acceptance?: unknown; files?: unknown } | undefined;
     try {
       const cfg = loadConfig(cwd);
-      integrationRef = integrationBranch(cfg, runId);
+      byName = integrationBranch(cfg, runId);
       declared = allAdapters().flatMap((a) => a.channels(cfg)).map((c) => ({ key: channelKey(c), vendor: c.vendor }));
     } catch { /* an unreadable config binds no range and declares no seat: unknown */ }
     try { owedTask = loadGraph(cwd).tasks.find((t) => t.id === taskId); } catch { /* recorded as unknown criteria and scope */ }
-    const obligation = captureOwedCheck({
+    const integration = integrationBase(journal.read(), () => byName);
+    const owed = captureOwedCheck({
       cwd, runId, taskId, gate: failedGate as GateName, events, acceptance: owedTask?.acceptance, files: owedTask?.files, declared,
       cause: reason ?? `operator waived failed ${failedGate} gate`, // the row's own park field binds the park
-      taskRef: `${integrationRef}--${taskId}`, integrationRef,
+      taskRef: `${integration.branch}--${taskId}`, integrationRef: integration.base,
     });
+    // An unreadable anchor still records the waive, its obligation unknown: the debt is never silently known.
+    const obligation = integration.unreadable === undefined ? owed
+      : { ...owed, known: false, unknownReason: `its journal names no readable published tip (${integration.unreadable})` };
     journal.append("task-approved", taskId, {
       by,
       ...(reason ? { reason } : {}),
@@ -437,6 +447,21 @@ export async function approve(argv: string[], cwd = process.cwd()): Promise<stri
   }
 }
 
+/**
+ * 2.8.1 T3 (ANL-023 §7.3): the integration branch and base a decision reads. A marked run (run-start
+ * `integrationAnchor: "journal"`) takes its branch from run-start, never the current config, and its base is the
+ * journal anchor A (`unreadable` when the journal names none); an unmarked run reads the branch by name, as before.
+ */
+function integrationBase(events: readonly JournalEvent[], byName: () => string): { branch: string; base: string; unreadable?: string } {
+  const anchor = integrationAnchor(events);
+  if (!anchor) {
+    const branch = byName();
+    return { branch, base: branch };
+  }
+  const branch = String(events.find((e) => e.event === "run-start")!.data.branch);
+  return "anchor" in anchor ? { branch, base: anchor.anchor } : { branch, base: "unknown", unreadable: anchor.unreadable };
+}
+
 /** The row a decision on this task answers right now: its newest failure when failed, else its newest park. */
 function openDecision(journal: Journal, taskId: string): DecisionBinding | undefined {
   const { events, sourceIndexes } = readJournalEvents(journal);
@@ -458,11 +483,12 @@ function requireBound(runId: string, taskId: string, bound: DecisionBinding | un
  * OBS-1022: what a failed task has landed. A preserved snapshot is authoritative only when it contains
  * the current task-branch tip; an older preservation can remain in the journal after a later retry has
  * advanced/rebuilt the branch. Missing task branches may still recover from a preserved ref. The selected
- * ref is counted against the run's integration branch; unreadable refs count as zero and fail closed.
+ * ref is counted against the run's integration base (integrationBase); unreadable refs count as zero and fail closed.
+ * `base` names the branch the text prints; the count reads `integration.base`.
  */
 function failedTaskCommitsAhead(cwd: string, journal: Journal, runId: string, taskId: string): { ref: string; base: string; count: number } {
-  const cfg = loadConfig(cwd);
-  const base = integrationBranch(cfg, runId);
+  const integration = integrationBase(journal.read(), () => integrationBranch(loadConfig(cwd), runId));
+  const base = integration.branch;
   const taskRef = `${base}--${taskId}`;
   const preserved = [...journal.read()].reverse().find((e) => e.taskId === taskId && e.event === "worktree-preserved" && typeof e.data.ref === "string");
   const preservedRef = preserved?.data.ref as string | undefined;
@@ -481,7 +507,7 @@ function failedTaskCommitsAhead(cwd: string, journal: Journal, runId: string, ta
     }
   }
   try {
-    const out = execFileSync("git", ["rev-list", "--count", `${base}..${ref}`], { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+    const out = execFileSync("git", ["rev-list", "--count", `${integration.base}..${ref}`], { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
     return { ref, base, count: Number.parseInt(out.trim(), 10) || 0 };
   } catch {
     return { ref, base, count: 0 };

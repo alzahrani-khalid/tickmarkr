@@ -25,12 +25,9 @@ async function failedResume(refuseAppend = false, setupFailure = false) {
   const realRead = Journal.prototype.read;
   let armed = false;
   let threw = false;
-  if (setupFailure) {
-    vi.spyOn(merge, "ensureIntegration").mockImplementationOnce(async () => {
-      threw = true;
-      throw original;
-    });
-  }
+  // 2.8.1 T2: a resume no longer calls ensureIntegration for an existing ref (E is read before run-resume, and a
+  // refusal there journals nothing), so the resumed setup failure is the first journal read after run-resume.
+  const ensureSpy = vi.spyOn(merge, "ensureIntegration");
   vi.spyOn(Journal.prototype, "read").mockImplementation(function (this: Journal) {
     if (armed && !threw) { threw = true; throw original; }
     return realRead.call(this);
@@ -40,6 +37,11 @@ async function failedResume(refuseAppend = false, setupFailure = false) {
   let fatalAttempts = 0;
   let lockedAtAppend = false;
   vi.spyOn(Journal.prototype, "append").mockImplementation(function (this: Journal, event, taskId, data) {
+    if (setupFailure && event === "run-resume") {
+      const row = realAppend.call(this, event, taskId, data);
+      armed = true;
+      return row;
+    }
     if (event === "run-end" && data?.fatal) {
       fatalAttempts++;
       lockedAtAppend = existsSync(join(tickmarkrDir(repo), "graph.lock"));
@@ -64,6 +66,7 @@ async function failedResume(refuseAppend = false, setupFailure = false) {
     },
   })).rejects.toBe(original);
   expect(threw).toBe(true);
+  expect(ensureSpy).not.toHaveBeenCalled(); // the existing ref is E: nothing is created on resume
   const events = journal.read();
   return { repo, runId, journal, original, before, events, rowsAtRelease, lockedAtAppend, fatalAttempts,
     errors: errors.mock.calls.flat().join("\n") };

@@ -1,4 +1,5 @@
 import { VITEST_CACHE_ENV, worktreeVitestCache } from "./src/gates/test-manifest.js";
+import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { configDefaults, coverageConfigDefaults, defineConfig } from "vitest/config";
 import LptSequencer from "./scripts/ci/shard.js";
@@ -22,6 +23,17 @@ for (const k of ["CI", "CONTINUOUS_INTEGRATION"] as const) delete process.env[k]
 // (e.g. extra pi tier models) must never reach unit-test fixtures — byte-pinned doctor/plan output
 // broke on the dev machine while green in CI (2026-07-15). Point XDG at a committed empty dir.
 process.env.XDG_CONFIG_HOME = new URL("./tests/.xdg-empty", import.meta.url).pathname;
+
+// Queue row 101 part (1) (D-1874): Node's native process.title setter checks in with LaunchServices on every write, and
+// every Vitest worker writes it; launchservicesd keeps about one Mach port per check-in until PORT_SPACE_FULL kills it, and
+// every GUI app started before its respawn stops taking input. The shipped title preload keeps a title write in JavaScript,
+// so it joins NODE_OPTIONS before workers fork: forks and the children tests spawn inherit it. Measured on tests/config/:
+// 175 check-ins without it, 56 with it alone (the runner and nested fixture runners start before the config loads), 2 when
+// the preload is also set before the runner starts (scripts/verify-export.sh). Darwin only; fails open when dist is not
+// built yet (a fresh clone before `npm run build`).
+const titlePreload = new URL("./dist/run/title-preload.cjs", import.meta.url).pathname;
+if (process.platform === "darwin" && existsSync(titlePreload) && !(process.env.NODE_OPTIONS ?? "").includes(titlePreload))
+  process.env.NODE_OPTIONS = [process.env.NODE_OPTIONS, `--require ${JSON.stringify(titlePreload)}`].filter(Boolean).join(" ");
 
 // OBS-96 fix (v1.60 T9): the repro rig's captured crash telemetry (scripts/repro-obs96.mjs
 // REPRO_RECORD.sampleCrashStderr) identifies the contended resource as the ROOT dist tree:

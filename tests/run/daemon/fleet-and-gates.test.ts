@@ -848,7 +848,8 @@ describe("v1.86 T7 the fatal handler cannot eat the error it reports", () => {
   const fault = (code: string, message: string) => Object.assign(new Error(message), { code });
 
   // A repo whose run dies in the fatal window (after run-start, before the task loop):
-  // refs/heads/tickmarkr blocks refs/heads/tickmarkr/<runId>, so ensureIntegration throws.
+  // refs/heads/tickmarkr blocks refs/heads/tickmarkr/<runId>, so ensureIntegration's create-only update-ref refuses
+  // (2.8.1 T2: "integration branch <branch> already exists or cannot be created: <git's message>").
   const setupFatalRepo = async () => {
     const { repo, fake } = setupRepo(
       [T("T1")],
@@ -857,7 +858,7 @@ describe("v1.86 T7 the fatal handler cannot eat the error it reports", () => {
     await shOk("git branch tickmarkr", repo);
     return { repo, fake };
   };
-  const originalErrorResembles = (runId: string) => new RegExp(`tickmarkr/${runId}|cannot lock ref|command failed`);
+  const originalErrorResembles = (runId: string) => new RegExp(`integration branch tickmarkr/${runId} already exists or cannot be created: .*tickmarkr`);
 
   const rejectionOf = async (p: Promise<unknown>): Promise<unknown> =>
     p.then(

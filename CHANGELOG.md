@@ -2,6 +2,46 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v2.8.1 — the run keeps its own integration identity: merges publish by compare-and-swap, the integration checkout is gone, and run end verifies what it published
+
+**v2.8.1** comes from one `tickmarkr run` (run-20261013-092304-…1173). All five of its tasks ship. Each passed build, lint, evidence,
+scope, the executed acceptance judge, a cross-vendor review and the full suite, and the run's tip verify passed. The work follows an
+assessment of every place tickmarkr read or wrote the integration branch (ANL-023): every decision read whatever the integration
+checkout's HEAD resolved to at that moment, so a moved, detached or retargeted checkout was taken as the run's own state.
+
+- **A merge is published only by compare-and-swap from the stored tip (queue rows 17, 154 and 157).** The daemon now keeps the tip it
+  last published and builds each merge off every worktree (`git merge-tree --write-tree`, then `git commit-tree`), publishing it with
+  `git update-ref --no-deref <ref> <merge> <tip>`. The run no longer creates an integration checkout. A checkout whose HEAD was
+  retargeted to `main` can no longer take a merge onto `main`, and a detached checkout can no longer take a merge the branch never sees.
+  A moved, symbolic, missing or unreadable integration ref parks the merge as infrastructure, names what it found, and prints a repair
+  that first preserves the found commit and then restores the ref by compare-and-swap; nothing is published. A fresh run refuses an
+  integration branch that already exists. A gated commit already in the published history is done only through its own recorded
+  merge; otherwise it parks. To look at a live run, use a detached snapshot (`git worktree add --detach <dir> tickmarkr/<runId>`) and
+  check the branch out attached only with the daemon stopped. Requires git 2.38 or later; an older git parks the merge.
+- **Run end verifies a fresh checkout of the tip and closes on an identity check after its last wait (queue rows 154 and 17).** The tip
+  battery runs in a fresh detached checkout of the published tip, created with HEAD logging on. After the battery, that checkout's HEAD,
+  its reflog and its tracked files must be unchanged, and the integration ref is read again after approvals settle, just before the
+  run-end record. Any difference fails the close with one integration failure naming what moved, and no verdict is stored. Declared:
+  the build verdict is tied to the checkout it ran in, so every non-cached close builds cold.
+- **Resume and approve read the run's journaled identity (queue row 152).** A run started by 2.8.1 marks its start row. Resuming it
+  requires the integration ref to be a regular ref at the commit of its newest merge (or at its base when nothing merged); otherwise the
+  resume is refused, naming what it found and printing a repair, and nothing is journaled. For such a run, `approve --recheck` and
+  `--waive` take the branch from its start row and count against that same anchor. A run started by an earlier version resumes from
+  its integration ref only when that is a regular ref (a missing ref with nothing merged is created at the run's base); a symbolic or
+  unreadable ref, or a missing one once merges are recorded, is refused with a repair instruction (a command when a symbolic ref
+  resolves to a commit). It then publishes by compare-and-swap like any 2.8.1 run; approve treats it as before.
+- **An adjudicated judgment names the commit it judged (queue row 153).** When a second seat settles a disputed criterion, tickmarkr
+  validates the subject's HEAD reflog (and its branch's, when attached) before that seat runs and reads it again after; a move, a move
+  and restore, or a subject it cannot witness parks the task as infrastructure and stamps no judgment. Declared: an adjudication in a
+  checkout with no valid HEAD reflog parks.
+- **`tickmarkr verify` reads HEAD's reflog through git (queue row 159).** It used to read `logs/HEAD` as a file and compare empty with
+  empty when the file was missing. It now refuses before any baseline capture, exiting non-zero with no verdict, when HEAD's reflog is
+  absent, unreadable on a detached checkout, or does not end at HEAD. Declared: verify refuses in such a checkout until HEAD moves are
+  recorded there.
+
+Declared, unchanged: a codex worker can still write its own run's integration ref inside its granted directory (queue row 151); 2.8.1
+detects that as a parked merge and never publishes through it. tickmarkr still refuses reftable repositories.
+
 ## v2.8.0 — acceptance cites what changed, a killed job is never forgiven, a codex worker writes only its branch directory, and doctor watches launchservicesd
 
 **v2.8.0** comes from one `tickmarkr run` (run-20261012-165954-…1148). All five of its tasks ship. Each passed build, lint,

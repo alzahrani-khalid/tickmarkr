@@ -130,7 +130,9 @@ describe("daemon integration (fake adapter, zero tokens)", () => {
     expect(merges).toHaveLength(2);
     expect(merges.map((m) => m.data.branch)).toEqual(["tickmarkr/run-happy--T1", "tickmarkr/run-happy--T2"]);
     expect(merges.every((m) => typeof m.data.commit === "string" && (m.data.commit as string).length > 0)).toBe(true);
-    expect(merges.every((m) => Object.keys(m.data).sort().join(",") === "branch,commit")).toBe(true);
+    // 2.8.1 T2: the merge row gains only `from`, the stored tip the publication was compared-and-swapped from
+    expect(merges.every((m) => Object.keys(m.data).sort().join(",") === "branch,commit,from")).toBe(true);
+    expect(merges[1]!.data.from).toBe(merges[0]!.data.commit);
   });
 
   test("test: a run's journal contains a phase-start event naming the task and phase for the worker dispatch and for each verification phase that ran", async () => {
@@ -697,9 +699,11 @@ describe("daemon integration (fake adapter, zero tokens)", () => {
     expect(pair.violations(evs)).toEqual([]);
     expect(evs.some((e) => e.event === "merge-conflict")).toBe(true);
     expect(evs.some((e) => e.event === "consult-verdict" && e.data.action === "human")).toBe(true);
-    // the aborted merge left the integration worktree clean
-    const intWt = worktreePath(repo, s.branch);
-    expect((await shOk("git status --porcelain", intWt)).trim()).toBe("");
+    // 2.8.1 T2: the conflict wrote no ref — the integration ref is still T1's published merge, and no checkout of it exists
+    const merged = evs.filter((e) => e.event === "merge");
+    expect(merged.map((e) => e.taskId)).toEqual(["T1"]);
+    expect((await shOk(`git rev-parse refs/heads/${s.branch}`, repo)).trim()).toBe(merged[0]!.data.commit);
+    expect(existsSync(worktreePath(repo, s.branch))).toBe(false);
   });
 
   test("ladder reaches consult; retry verdict feeds notes back and task completes", async () => {

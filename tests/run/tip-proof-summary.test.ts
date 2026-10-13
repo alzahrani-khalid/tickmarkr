@@ -101,7 +101,7 @@ function flaggedRun(runId: string, testCmd: (flag: string) => string) {
   const flag = join(makeTestTempDir("tickmarkr-flag-"), "flag");
   const { repo, fake } = setupRepo([T("T1"), T("T2", { humanGate: true })],
     { tasks: { T1: [{ shell: `echo one > t1.txt && ${COMMIT} t1`, result: { ok: true, summary: "t1" } }] } },
-    `gates: { build: 'node -e ""', test: 'node -e ""', tipTest: 'test ! -e t1.txt || ${testCmd(flag)}' }\n`);
+    `gates: { lint: 'node -e ""', test: 'node -e ""', tipTest: 'test ! -e t1.txt || ${testCmd(flag)}' }\n`);
   const notifies: string[] = [];
   const driver = new SubprocessDriver();
   driver.notify = async (message) => { notifies.push(message); };
@@ -110,7 +110,9 @@ function flaggedRun(runId: string, testCmd: (flag: string) => string) {
 }
 
 // D-131 regression 1: the whole-cycle cache is ineligible (the previous cycle was red), yet verifyIntegrationTip
-// carries build forward from its persisted verdict and executes only test — never "every command ran".
+// carries lint forward from its persisted verdict and executes only test — never "every command ran". 2.8.1 T1
+// (ANL-023 §6(d), declared): each close verifies a fresh checkout, and a build verdict is keyed to the physical
+// checkout, so the content-addressed lint verdict is the one a later close can carry.
 test("a cycle that reuses one persisted per-gate verdict and executes the rest is recorded as reused, never fresh", async () => {
   expect(runEndTipProof([...green, start(false), pass("build", true), pass("test")])).toEqual({ kind: "reused", tip: TIP, gates: [{ gate: "build", kind: "reused" }, { gate: "test", kind: "fresh" }] });
 
@@ -124,7 +126,7 @@ test("a cycle that reuses one persisted per-gate verdict and executes the rest i
   const cycle = events.slice(events.map((e) => e.event).lastIndexOf("tip-verify-start"));
   expect(cycle[0]!.data.cached).toBe(false);
   expect(cycle.some((e) => e.event === "tip-verify-cached")).toBe(false);
-  expect(cycle.find((e) => e.event === "tip-verify" && e.data.gate === "build")!.data.cached).toBe(true);
+  expect(cycle.find((e) => e.event === "tip-verify" && e.data.gate === "lint")!.data.cached).toBe(true);
   expect(cycle.find((e) => e.event === "tip-verify" && e.data.gate === "test")!.data.cached).toBeUndefined();
   expect(events.findLast((e) => e.event === "run-end")!.data.tipProof).toMatchObject({ kind: "reused" });
   expect(notifies.at(-1)).toContain("tip proof: reused");

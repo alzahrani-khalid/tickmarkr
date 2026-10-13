@@ -653,7 +653,10 @@ export async function shGitOk(cmd: string, cwd: string, own: OwnGitOptions = {})
  * A step raced by a commondir change is refused by name before the next one runs, and what the add created is rolled
  * back through the trusted common directory derived here once (dropWorktree), even while that commondir stays hostile.
  */
-export async function addDetachedWorktree(cwd: string, dir: string, commitish: string, timeoutMs = DEFAULT_SHELL_TIMEOUT_MS): Promise<ShResult> {
+export async function addDetachedWorktree(cwd: string, dir: string, commitish: string, timeoutMs = DEFAULT_SHELL_TIMEOUT_MS, { logHead = false } = {}): Promise<ShResult> {
+  // 2.8.1 T1 (ANL-023 §7.1): `logHead` writes the new checkout's HEAD reflog whatever the repository's
+  // core.logAllRefUpdates says, so a later HEAD move by any command is appended to an established witness.
+  const git = logHead ? "git -c core.logAllRefUpdates=always" : "git";
   // the authority this operation keeps, rollback included: derived once from the trusted layout, never a commondir
   const store = trustedCommonDir(cwd);
   const resolved = await shGit(`git rev-parse --verify --end-of-options ${shq(`${commitish}^{commit}`)}`, cwd, timeoutMs);
@@ -661,14 +664,24 @@ export async function addDetachedWorktree(cwd: string, dir: string, commitish: s
   const oid = resolved.stdout.trim();
   // under a ref payload git also resolves its new-HEAD stub into a shared refs/heads/.invalid; it is deleted again
   const rollback: WorktreeRollback = { dir, branch: { name: ".invalid" } };
-  const added = await shellEntry(`git worktree add --no-checkout --detach ${shq(dir)} ${shq(oid)}`, cwd, timeoutMs, false, {}, { createsWorktree: "detached", rollback });
+  const added = await shellEntry(`${git} worktree add --no-checkout --detach ${shq(dir)} ${shq(oid)}`, cwd, timeoutMs, false, {}, { createsWorktree: "detached", rollback });
   if (added.code !== 0) return added;
   let repaired: ShResult;
   try {
-    repaired = await shGit(`git update-ref --no-deref HEAD ${shq(oid)} && git update-ref -d refs/heads/.invalid && git reset -q --hard --no-recurse-submodules`, dir, timeoutMs);
+    repaired = await shGit(`${git} update-ref --no-deref HEAD ${shq(oid)} && ${git} update-ref -d refs/heads/.invalid && ${git} reset -q --hard --no-recurse-submodules`, dir, timeoutMs);
   } catch (error) { await dropWorktree(store, rollback, timeoutMs).catch((failure: unknown) => { throw rollbackFailed(error, failure); }); throw error; }
   if (repaired.code !== 0) await dropWorktree(store, rollback, timeoutMs);
   return repaired;
+}
+
+/**
+ * 2.8.1 T1 (ANL-023 §7.1): the reflog witness W(dir, ref) — read-only, the newest entry first. It is valid for a commit
+ * x only when the exit is 0, at least one line came back and the first is x: exit 0 with no lines is git's answer for
+ * a missing or unreadable log, so an empty witness is a refusal, never an accepted empty.
+ */
+export async function reflogWitness(dir: string, ref: string): Promise<{ code: number; lines: string[] }> {
+  const r = await shGit(`git reflog show --no-abbrev --format=%H ${shq(ref)}`, dir);
+  return { code: r.code, lines: r.stdout.split("\n").map((line) => line.trim()).filter(Boolean) };
 }
 
 /** A failed rollback is never swallowed: it rides on the error the operation already throws (a refusal stays one). */
@@ -776,13 +789,15 @@ export const WORKTREES_DIR = "worktrees.noindex";
 export const worktreePath = (repo: string, branch: string) =>
   join(tickmarkrDir(repo), WORKTREES_DIR, sanitize(branch));
 
-/** OBS-28: remove this run's recorded worktrees; tolerates already-gone paths. */
+/**
+ * OBS-28: remove this run's recorded task worktrees; tolerates already-gone paths. 2.8.1 T2: a run keeps no
+ * integration checkout, and a 2.8.0 run's legacy one is never removed here (it may hold the only view of a merge).
+ */
 export async function cleanupRunWorktrees(
   repo: string,
   branch: string,
-  opts: { removeIntegration: boolean; removeTaskIds: string[] },
+  opts: { removeTaskIds: string[] },
 ): Promise<void> {
-  if (opts.removeIntegration) await removeWorktree(repo, worktreePath(repo, branch));
   for (const id of opts.removeTaskIds) await removeWorktree(repo, worktreePath(repo, `${branch}--${id}`));
 }
 

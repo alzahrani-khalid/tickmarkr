@@ -225,9 +225,14 @@ test("a gate result recorded against a commit the task no longer carries is re-r
     const rebased = await seedResume("run-integration-base-changed", [[{ gate: "build", pass: true }]]);
     const cfg = loadConfig(rebased.repo);
     const branch = integrationBranch(cfg, rebased.runId);
-    const intWt = await ensureIntegration(rebased.repo, branch, await gitHead(rebased.repo));
-    writeFileSync(join(intWt, "changed.txt"), "a newly merged dependency\n");
-    await shGitOk("git add changed.txt && git commit --no-gpg-sign -m dependency", intWt);
+    // 2.8.1 T2: a sibling lands the way the daemon publishes — update-ref --no-deref from E plus a merge row with from.
+    const from = (await shGitOk(`git rev-parse ${shq(`refs/heads/${branch}`)}`, rebased.repo)).trim();
+    const sibling = await new SubprocessDriver().worktree(rebased.repo, `${branch}--T0`, from);
+    writeFileSync(join(sibling, "changed.txt"), "a newly merged dependency\n");
+    await shGitOk("git add changed.txt && git commit --no-gpg-sign -m dependency", sibling);
+    const landed = await gitHead(sibling);
+    await shGitOk(`git update-ref --no-deref ${shq(`refs/heads/${branch}`)} ${landed} ${from}`, rebased.repo);
+    rebased.journal.append("merge", "T0", { branch: `${branch}--T0`, commit: landed, from });
     expect(await gitHead(rebased.taskWorktree)).toBe(rebased.commit);
     const rebasedEvents = await resume(rebased);
     expect(rebasedEvents.filter((event) => event.event === "gate-reused")).toEqual([]);
@@ -554,10 +559,11 @@ test("resume preserves a completed legacy plain approval followed by gate replay
     seed.journal.append("gate-result", "T1", { gate, pass: true, commit: seed.commit, attempt: 0, replayMeasurement: true });
   }
   const branch = integrationBranch(loadConfig(seed.repo), seed.runId);
-  const intWt = await ensureIntegration(seed.repo, branch, seed.commit);
-  await shGitOk(`git merge --ff-only ${shq(seed.commit)}`, intWt);
+  // 2.8.1 T2: the landing is published the way the daemon publishes — update-ref --no-deref from E, a merge row with from.
+  const from = (await shGitOk(`git rev-parse ${shq(`refs/heads/${branch}`)}`, seed.repo)).trim();
+  await shGitOk(`git update-ref --no-deref ${shq(`refs/heads/${branch}`)} ${shq(seed.commit)} ${shq(from)}`, seed.repo);
   seed.journal.append("task-done", "T1", { attempts: 1, assignment: ASSIGNMENT });
-  seed.journal.append("merge", "T1", { branch: `${branch}--T1`, commit: await gitHead(intWt) });
+  seed.journal.append("merge", "T1", { branch: `${branch}--T1`, commit: seed.commit, from });
   const graph = loadGraph(seed.repo);
   saveGraph(seed.repo, { ...graph, tasks: graph.tasks.map((t) => ({ ...t, status: "done" })) });
   const before = seed.journal.replayResumeState().get("T1");

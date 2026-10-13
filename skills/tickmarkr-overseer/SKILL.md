@@ -503,6 +503,14 @@ journal tail to decide what happens next, or sweeping orphans — you have taken
    - **the INTEGRATION subject** — the integration-branch commit that worktree was created from, named by
      sha from the journal's `task-dispatch` row or `tickmarkr status`; never "the run", and never the
      branch name alone, which moves while you are reading it;
+   - **the operator view of that branch** — a live run has NO integration checkout: the daemon publishes
+     each merge onto `tickmarkr/<runId>` by compare-and-swap from the repository root. View it through a
+     detached snapshot (`git worktree add --detach <dir> tickmarkr/<runId>`), refreshed by removing it
+     (`git worktree remove <dir>`) and re-adding it; check the branch out attached only with the daemon
+     stopped (no live `graph.lock`) — an attached checkout taken while the run is live goes stale at the next
+     publication, and any write to the ref parks the next merge infra. Run `tickmarkr verify` and `report`
+     from the main checkout or a snapshot;
+     a legacy attached view from a 2.8.0 run is stale from the first publication;
    - **and, where the fix is a FILE the tree must hold** — a new test, a fixture, a schema — its presence
      at that commit: `git -C <task-worktree> cat-file -e <task-head>:<path>`. A fix that lives only in the
      daemon's `dist` cannot make a worker's missing oracle appear, and a worker red on that missing file is

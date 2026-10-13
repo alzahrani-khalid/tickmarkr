@@ -29,8 +29,7 @@ import {
   isInfraResult,
   type VerificationIdentity,
 } from "../gates/cache.js";
-import { tickmarkrDir } from "../graph/graph.js";
-import { dependencyLinkRefusal, describeCapacity, gitHead, linkNodeModules, resolveIntegrationBranch, resolvedCapacity, sameCapacity, sh, shGit, shGitOk, WORKTREES_DIR } from "./git.js";
+import { dependencyLinkRefusal, describeCapacity, resolveIntegrationBranch, resolvedCapacity, sameCapacity, sh, shGit } from "./git.js";
 import { executionSignal } from "./execution-budget.js";
 import type { GateEvidenceReceipt } from "./protocol.js";
 
@@ -68,6 +67,8 @@ export interface TipVerifyResult {
    * for a kill, the shared runner classifier for everything else. `infra` means nothing was verified.
    */
   cause?: FailureClassification;
+  /** 2.8.1 T1: with `deferVerdicts`, the verdict-store write this result would have made, left to the caller. */
+  deferredVerdict?: { id: VerificationIdentity; verdict: TipVerifyResult & { meta: Record<string, unknown> } };
 }
 
 /** Carry execution evidence without minting an invocation or rebasing its artifact paths. */
@@ -90,47 +91,156 @@ export function integrationBranch(cfg: TickmarkrConfig, runId: string): string {
   return `${cfg.integrationBranchPrefix}${runId}`;
 }
 
-const sanitize = (branch: string) => branch.replace(/[^\w.-]+/g, "-");
-
+/**
+ * 2.8.1 T2 (ANL-023 §7.2): creates the integration ref create-only at `baseRef` (the empty old value means "must not
+ * exist") and returns the published tip E. The run keeps no checkout of the branch: every later publication is a
+ * compare-and-swap of the ref from `repo` (mergeTask). An existing or uncreatable ref throws — the fatal path's text.
+ */
 export async function ensureIntegration(repo: string, branch: string, baseRef: string): Promise<string> {
   branch = await resolveIntegrationBranch(repo, branch);
-  const dir = join(tickmarkrDir(repo), WORKTREES_DIR, sanitize(branch));
-  if (!existsSync(join(dir, ".git"))) {
-    const exists = (await shGit(`git rev-parse --verify refs/heads/${shq(branch)}`, repo)).code === 0;
-    if (exists) {
-      await shGitOk(`git worktree add ${shq(dir)} ${shq(branch)}`, repo, { createsWorktree: "branch", rollback: { dir } });
-    } else {
-      await shGitOk(`git worktree add -b ${shq(branch)} ${shq(dir)} ${shq(baseRef)}`, repo, { createsWorktree: "branch", rollback: { dir, branch: { name: branch } } });
-    }
+  // ponytail: no --create-reflog (ANL-023 §7.2 names it): the repository's own core.logAllRefUpdates decides, because
+  // nothing reads this reflog (X10) and run-end-integration's E-P10 builds its no-reflog legacy branch through a fresh
+  // run with logging disabled. Add the flag back once that fixture builds its legacy branch by hand.
+  const r = await shGit(`git update-ref --no-deref -m ${shq("tickmarkr: run start")} ${shq(`refs/heads/${branch}`)} ${shq(baseRef)} ""`, repo);
+  if (r.code !== 0) throw new Error(`integration branch ${branch} already exists or cannot be created: ${(r.stderr || r.stdout).trim()}`);
+  return baseRef;
+}
+
+/** 2.8.1 T1 (ANL-023 §7.1): the closed states of the integration ref, as R(ref) reads them. */
+export type IntegrationRefState =
+  | { kind: "regular"; commit: string }
+  | { kind: "missing" }
+  | { kind: "symbolic"; target: string; commit?: string } // no commit: the target names none (dangling)
+  | { kind: "unreadable"; read: string };
+
+export type IntegrationLeg = "symbolic" | "missing" | "value" | "unreadable";
+
+/**
+ * R(ref): the integration ref read from `repo` through the own-git runner, never its reflog. The exact ref only —
+ * a descendant ref (`refs/heads/<branch>/x`) is not this ref, and a ref that exists but names no commit is unreadable.
+ */
+export async function readIntegrationRef(repo: string, branch: string): Promise<IntegrationRefState> {
+  const ref = `refs/heads/${branch}`;
+  const unreadable = (cmd: string, r: { code: number; stderr: string; stdout: string }): IntegrationRefState =>
+    ({ kind: "unreadable", read: `${cmd} exited ${r.code}${(r.stderr || r.stdout).trim() ? `: ${(r.stderr || r.stdout).trim()}` : ""}` });
+  const symbolic = await shGit(`git symbolic-ref -q ${shq(ref)}`, repo);
+  if (symbolic.code !== 0 && symbolic.code !== 1) return unreadable("git symbolic-ref", symbolic);
+  const commit = await shGit(`git rev-parse --verify -q ${shq(`${ref}^{commit}`)}`, repo);
+  if (commit.code !== 0 && commit.code !== 1) return unreadable("git rev-parse", commit);
+  const found = commit.code === 0 ? commit.stdout.trim() : undefined;
+  if (symbolic.code === 0) return { kind: "symbolic", target: symbolic.stdout.trim(), ...(found ? { commit: found } : {}) };
+  if (found) return { kind: "regular", commit: found };
+  const exists = await shGit(`git show-ref --verify -q ${shq(ref)}`, repo);
+  return exists.code === 1 ? { kind: "missing" } : unreadable("git show-ref", exists);
+}
+
+/** I(x): holds iff the ref is regular at x; otherwise the leg, with the state the repair text is chosen by. */
+export async function checkIntegrationIdentity(repo: string, branch: string, expected: string):
+Promise<{ ok: true; state: IntegrationRefState } | { ok: false; leg: IntegrationLeg; state: IntegrationRefState }> {
+  const state = await readIntegrationRef(repo, branch);
+  if (state.kind === "regular" && state.commit === expected) return { ok: true, state };
+  return { ok: false, leg: state.kind === "regular" ? "value" : state.kind, state };
+}
+
+/**
+ * The repair text (shared by run end's failure row, the merge park and the resume refusal): backticked commands run
+ * from the repository root in order, stopping at the first that fails. A found commit is preserved create-only under
+ * refs/tickmarkr/found/<runId>/<F> before a no-deref compare-and-swap restores the ref; a symbolic found ref or one
+ * already holding another commit stops the sequence before the restore. Dangling and unreadable print no command.
+ */
+export function integrationRepairText(state: IntegrationRefState, branch: string, runId: string, expected: string): string {
+  const ref = `refs/heads/${branch}`;
+  const byHand = `inspect ${ref} and restore it to ${expected} by hand`;
+  const found = state.kind === "regular" ? state.commit : state.kind === "symbolic" ? state.commit : undefined;
+  if (found) {
+    const keep = `refs/tickmarkr/found/${runId}/${found}`;
+    return `\`test -z "$(git symbolic-ref -q ${keep})"\` then \`test "$(git rev-parse -q --verify ${keep})" = ${found} || git update-ref --no-deref ${keep} ${found} ""\` then \`git update-ref --no-deref ${ref} ${expected} ${found}\``;
   }
-  linkNodeModules(repo, dir);
-  return dir;
+  if (state.kind === "missing") return `\`git update-ref --no-deref ${ref} ${expected} ""\``;
+  if (state.kind === "symbolic") return `symbolic to ${state.target}, which names no commit; ${byHand}`;
+  return state.kind === "unreadable" ? `${ref} is unreadable (${state.read}); ${byHand}` : byHand;
 }
 
-export function integrationHead(intWt: string): Promise<string> {
-  return gitHead(intWt);
+type GitResult = { code: number; stdout: string; stderr: string };
+/** The merge's git steps after the identity check, in order; `publish` is the compare-and-swap. */
+export type MergeStep = "ancestry" | "merge-tree" | "commit-tree" | "publish";
+/** Test-only: runs before each step; a returned result replaces that step's git result (never `publish`'s). */
+export type MergeSeam = (step: MergeStep) => Promise<GitResult | void> | GitResult | void;
+export interface IntegrationMove {
+  branch: string; expected: string; found: string | null; leg: IntegrationLeg; target?: string; stage: "check" | "publish";
 }
+export type MergeOutcome =
+  | { ok: true; commit: string; from: string }
+  | { ok: true; alreadyMerged: string }
+  | { ok: false; tipMoved: { gatedCommit: string; branchTip: string } }
+  | { ok: false; conflict: string }
+  | { ok: false; integrationMoved: IntegrationMove; state: IntegrationRefState }
+  | { ok: false; alreadyIntegrated: { gated: string; tip: string } }
+  | { ok: false; infra: { step: MergeStep; message: string } };
 
+/**
+ * 2.8.1 T2 (ANL-023 §7.2): publishes `gated` onto the integration ref by compare-and-swap from the stored tip
+ * `expected`, all git from `repo` — no checkout. (1) the task-tip check; (2) I(expected); (3) ancestry; (4) merge-tree;
+ * (5) commit-tree; (6) `update-ref --no-deref` from `expected`; (7) `onPublished(M)` in the same synchronous
+ * continuation as (6)'s result, so the caller's rows land in publication order. `merged` is the task's recorded merge
+ * commits, newest first: a gated commit already in the history is done only through its own recorded merge.
+ * `ancestorOnly` (a replay that ran no gates): a gated commit not in E is refused `infra`, never published.
+ */
 export async function mergeTask(
-  intWt: string,
+  repo: string,
+  { branch, expected, merged = [], ancestorOnly = false }: { branch: string; expected: string; merged?: readonly string[]; ancestorOnly?: boolean },
   taskBranch: string,
   message: string,
-  gatedCommit: string,
-): Promise<{ ok: boolean; conflict?: string; tipMoved?: { gatedCommit: string; branchTip: string } }> {
-  const tip = await shGit(`git rev-parse --verify ${shq(`refs/heads/${taskBranch}`)}`, intWt);
+  gated: string,
+  onPublished: (commit: string) => void,
+  seam?: MergeSeam,
+): Promise<MergeOutcome> {
+  const tip = await shGit(`git rev-parse --verify ${shq(`refs/heads/${taskBranch}`)}`, repo);
   if (tip.code !== 0) return { ok: false, conflict: tip.stderr || tip.stdout };
   const branchTip = tip.stdout.trim();
-  if (branchTip !== gatedCommit) return { ok: false, tipMoved: { gatedCommit, branchTip } };
+  if (branchTip !== gated) return { ok: false, tipMoved: { gatedCommit: gated, branchTip } };
 
-  // Merge the verified hash, not the mutable branch name: a move after the comparison cannot land ungated content.
-  const r = await shGit(`git merge --no-ff ${shq(gatedCommit)} -m ${shq(message)}`, intWt);
-  if (r.code === 0) return { ok: true };
-  const conflict = (await shGit("git status --porcelain", intWt)).stdout
-    .split("\n")
-    .filter((l) => l.startsWith("UU") || l.startsWith("AA"))
-    .join("\n") || r.stderr || r.stdout;
-  await shGit("git merge --abort", intWt);
-  return { ok: false, conflict };
+  const moved = (leg: IntegrationLeg, state: IntegrationRefState, stage: IntegrationMove["stage"]): MergeOutcome => ({
+    ok: false, state, integrationMoved: { branch, expected, leg, stage,
+      found: (state.kind === "regular" || state.kind === "symbolic" ? state.commit : undefined) ?? null,
+      ...(state.kind === "symbolic" ? { target: state.target } : {}) },
+  });
+  const infra = (step: MergeStep, r: GitResult): MergeOutcome =>
+    ({ ok: false, infra: { step, message: (r.stderr || r.stdout).trim() || `exit ${r.code}` } });
+  const run = async (step: MergeStep, cmd: string): Promise<GitResult> => (await seam?.(step)) || shGit(cmd, repo);
+
+  const held = await checkIntegrationIdentity(repo, branch, expected);
+  if (!held.ok) return moved(held.leg, held.state, "check");
+  const ancestry = await run("ancestry", `git merge-base --is-ancestor ${shq(gated)} ${shq(expected)}`);
+  if (ancestry.code === 0) {
+    // Ancestor or equal tip: only the task's own recorded merge (second parent = gated) makes it done. A resume replay
+    // hands the task's own gated commit here, never a tip recreated on E (runDaemon's resume gate replay).
+    for (const commit of merged) {
+      const second = await shGit(`git rev-parse --verify -q ${shq(`${commit}^2`)}`, repo);
+      if (second.code !== 0) break; // a failed read (no second parent, no such object) is never passed over: fail closed
+      if (second.stdout.trim() === gated) return { ok: true, alreadyMerged: commit };
+    }
+    return { ok: false, alreadyIntegrated: { gated, tip: expected } };
+  }
+  if (ancestry.code !== 1) return infra("ancestry", ancestry);
+  // A caller that skipped the gates on its own ancestry proof (a resume replay) never reaches construction.
+  if (ancestorOnly) return infra("ancestry", { code: 1, stdout: "", stderr: `${gated} is not in ${expected}; an ungated replay publishes nothing` });
+  const tree = await run("merge-tree", `git merge-tree --write-tree ${shq(expected)} ${shq(gated)}`);
+  if (tree.code === 1) return { ok: false, conflict: (tree.stdout || tree.stderr).trim() };
+  if (tree.code !== 0) return infra("merge-tree", tree);
+  const made = await run("commit-tree",
+    `git commit-tree ${shq(tree.stdout.split("\n")[0]!.trim())} -p ${shq(expected)} -p ${shq(gated)} -m ${shq(message)}`);
+  if (made.code !== 0) return infra("commit-tree", made);
+  const commit = made.stdout.trim();
+  await seam?.("publish");
+  const published = await shGit(`git update-ref --no-deref -m ${shq(message)} ${shq(`refs/heads/${branch}`)} ${shq(commit)} ${shq(expected)}`, repo);
+  if (published.code === 0) {
+    onPublished(commit); // no await between the compare-and-swap's result and the caller's rows
+    return { ok: true, commit, from: expected };
+  }
+  const state = await readIntegrationRef(repo, branch);
+  if (state.kind === "regular" && state.commit === expected) return infra("publish", published);
+  return moved(state.kind === "regular" ? "value" : state.kind, state, "publish");
 }
 
 // OBS-34 ruled strict exit-code verify; Q121s (TRIAL T-OBS-1) narrows it: a red whose failure
@@ -145,6 +255,7 @@ export async function verifyIntegrationTip(
   runDir: string,
   baseline?: Baseline,
   evidenceOptions: GateEvidenceOptions = {},
+  { deferVerdicts = false }: { deferVerdicts?: boolean } = {},
 ): Promise<TipVerifyResult[]> {
   const results: TipVerifyResult[] = [];
   let runStartCommands: Record<string, string> | undefined;
@@ -475,7 +586,7 @@ export async function verifyIntegrationTip(
     }
     const id = pending.get(result.gate);
     if (id && id.tree === completedTree && !isInfraResult(result)) {
-      store.set(id, { ...result, meta: {
+      const verdict = { ...result, meta: {
         fingerprints: result.fingerprints, forgiven: result.forgiven, baselineProvenance: result.baselineProvenance,
         ...(result.forgiven && result.gate === "test" ? { killTextRead: true } : {}),
         reportPath: result.reportPath, spawnedCommand: result.spawnedCommand,
@@ -483,7 +594,10 @@ export async function verifyIntegrationTip(
         evidenceReceipt: result.evidenceReceipt, evidenceReceipts: result.evidenceReceipts,
         evidenceAbsence: result.evidenceAbsence, originRunRoot: result.originRunRoot,
         nonce: result.nonce, stdoutPath: result.stdoutPath, stderrPath: result.stderrPath,
-      } });
+      } };
+      // 2.8.1 T1: a deferring caller (run end) writes the verdict itself, only after its closing identity check.
+      if (deferVerdicts) result.deferredVerdict = { id, verdict };
+      else store.set(id, verdict);
     }
   }
   return results;

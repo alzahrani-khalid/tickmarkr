@@ -16,10 +16,26 @@ import { graphDefinitionHash, loadGraph, saveGraph, tickmarkrDir } from "../../.
 import { validateGraph } from "../../../src/graph/schema.js";
 import * as gateRunner from "../../../src/gates/run-gates.js";
 import { runDaemon } from "../../../src/run/daemon.js";
+import * as merge from "../../../src/run/merge.js";
 import { gitHead, sanitizeBranch, shOk, worktreePath, WORKTREES_DIR } from "../../../src/run/git.js";
 import { activeRetryBan, deferredReviewFindings, GATE_FINGERPRINT_CAP, journaledFailureBrief, Journal, normalizeGateFailure, GATE_SATISFIED_RELEASE, outstandingConsultGuidance, outstandingReviewFindings, pendingRepairFindings, recordedTaskFailureKind, REVIEW_UPHELD_RELEASE, structuredFindings, UNIDENTIFIED, upheldFeedbackByTask, type JournalEvent, type StructuredFinding } from "../../../src/run/journal.js";
-import { COMMIT, authedModels, setupRepo, T } from "../../helpers/tmprepo.js";
+import { COMMIT, authedModels, makeTestTempDir, setupRepo, T } from "../../helpers/tmprepo.js";
 import { sameBasePair } from "../../helpers/worker-barrier.js";
+
+/** 2.8.1 T2: a sibling lands the way the daemon publishes — update-ref --no-deref from E plus a merge row with from. */
+async function landSibling(repo: string, runId: string, files: Record<string, string>): Promise<string> {
+  const branch = `tickmarkr/${runId}`;
+  const from = (await shOk(`git rev-parse ${shq(`refs/heads/${branch}`)}`, repo)).trim();
+  const dir = join(makeTestTempDir("tickmarkr-sibling-"), "wt");
+  await shOk(`git worktree add -q --detach ${shq(dir)} ${from}`, repo);
+  for (const [path, body] of Object.entries(files)) writeFileSync(join(dir, path), body);
+  await shOk(`${COMMIT} sibling`, dir);
+  const landed = (await shOk("git rev-parse HEAD", dir)).trim();
+  await shOk(`git worktree remove --force ${shq(dir)}`, repo);
+  await shOk(`git update-ref --no-deref ${shq(`refs/heads/${branch}`)} ${landed} ${from}`, repo);
+  Journal.open(repo, runId).append("merge", "T0", { branch: `${branch}--T0`, commit: landed, from });
+  return landed;
+}
 
 
 /**
@@ -746,11 +762,9 @@ describe("v1.25 trust-auto-answer journal (fake adapter, zero tokens)", () => {
       );
       const s = await runDaemon(repo, { adapters: [fake], runId: "run-wt-forever" });
       expect(s.done).toEqual(["T1"]);
-      expect(runWorktreeDirs(repo, s.branch)).toEqual([
-        sanitizeBranch(s.branch),
-        `${sanitizeBranch(s.branch)}--T1`,
-      ]);
-      expect(existsSync(worktreePath(repo, s.branch))).toBe(true);
+      // 2.8.1 T2: a run creates no integration checkout, so only the task's worktree is there to keep
+      expect(runWorktreeDirs(repo, s.branch)).toEqual([`${sanitizeBranch(s.branch)}--T1`]);
+      expect(existsSync(worktreePath(repo, s.branch))).toBe(false);
       expect(existsSync(worktreePath(repo, `${s.branch}--T1`))).toBe(true);
     });
 
@@ -775,11 +789,8 @@ describe("v1.25 trust-auto-answer journal (fake adapter, zero tokens)", () => {
       expect(s.human).toHaveLength(1);
       const doneId = s.done[0]!;
       const parkedId = s.human[0]!;
-      expect(runWorktreeDirs(repo, s.branch)).toEqual([
-        sanitizeBranch(s.branch),
-        `${sanitizeBranch(s.branch)}--${parkedId}`,
-      ]);
-      expect(existsSync(worktreePath(repo, s.branch))).toBe(true);
+      expect(runWorktreeDirs(repo, s.branch)).toEqual([`${sanitizeBranch(s.branch)}--${parkedId}`]);
+      expect(existsSync(worktreePath(repo, s.branch))).toBe(false); // 2.8.1 T2: no integration checkout exists
       expect(existsSync(worktreePath(repo, `${s.branch}--${doneId}`))).toBe(false);
       expect(existsSync(worktreePath(repo, `${s.branch}--${parkedId}`))).toBe(true);
     });
@@ -931,10 +942,16 @@ describe("v1.25 trust-auto-answer journal (fake adapter, zero tokens)", () => {
         [T("T1")],
         { tasks: { T1: [{ shell: `echo ok > ok.txt && ${COMMIT} ok`, result: { ok: true, summary: "ok" } }] } },
       );
-      addGateScripts(repo, failTest);
+      // 2.8.1 T1 (ANL-023 §7.1 file 5): the battery runs in a fresh checkout of the tip, so nothing written into any
+      // checkout reaches it. An oracle OUTSIDE the repository decides instead: red before the first run, green before
+      // the resume — nothing is committed, published or written into a checkout, so the integration ref never moves.
+      const oracle = join(makeTestTempDir("tickmarkr-tip-oracle-"), "verdict");
+      writeFileSync(oracle, "fail");
+      addGateScripts(repo, `test "$(cat ${oracle})" = pass || ${failTest}`);
       const first = await runDaemon(repo, { adapters: [fake], runId: "run-tip-resume" });
       expect(first.tipVerify).toBe("failed");
-      addGateScripts(worktreePath(repo, first.branch), passTest);
+      const tipBefore = execSync(`git rev-parse refs/heads/${first.branch}`, { cwd: repo, encoding: "utf8" });
+      writeFileSync(oracle, "pass");
       const resumed = await runDaemon(repo, { adapters: [fake], runId: "run-tip-resume", resume: true });
       expect(resumed.tipVerify).toBe("passed");
       const slice = Journal.open(repo, "run-tip-resume").read();
@@ -943,6 +960,7 @@ describe("v1.25 trust-auto-answer journal (fake adapter, zero tokens)", () => {
       expect(afterResume.some((e) => e.event === "task-dispatch")).toBe(false);
       expect(afterResume.filter((e) => e.event === "tip-verify")).toHaveLength(1);
       expect(afterResume.find((e) => e.event === "run-end")?.data.tipVerify).toBe("passed");
+      expect(execSync(`git rev-parse refs/heads/${first.branch}`, { cwd: repo, encoding: "utf8" })).toBe(tipBefore);
     });
 
     test("zero merged tasks skips tip verify", async () => {
@@ -1088,20 +1106,24 @@ describe("per-task timeout override (OBS-37b)", () => {
   });
 
   test("OBS-58: a brief premise asserting a commit that the fresh worktree lacks is corrected before dispatch", async () => {
+    // 2.8.1 T2: the conflicting integration change is a sibling task's own publication (T0), landed after T1's first
+    // attempt was dispatched on the earlier tip and before its retry — never a commit in an integration checkout.
     const { repo, fake } = setupRepo(
-      [T("T1")],
+      [T("T0", { timeoutMinutes: 5 }), T("T1")],
       {
-        tasks: { T1: [
-          { shell: `echo v1 > impl.txt && ${COMMIT} impl && sleep 30` },
-          { shell: `echo v2 > impl.txt && ${COMMIT} done`, result: { ok: true, summary: "ok" } },
-        ] },
+        tasks: {
+          T0: [{ shell: `echo conflict > impl.txt && ${COMMIT} sibling`, result: { ok: true, summary: "sibling" } }],
+          T1: [
+            { shell: `echo v1 > impl.txt && ${COMMIT} impl && sleep 30` },
+            { shell: `echo v2 > impl.txt && ${COMMIT} done`, result: { ok: true, summary: "ok" } },
+          ],
+        },
         consult: { action: "retry", guidance: "The src implementation is already committed — verify and emit the trailer." },
       },
       "taskTimeoutMinutes: 0.005\n",
     );
     const inner = new SubprocessDriver();
     const runId = "run-obs58-premise";
-    const intBranch = `tickmarkr/${runId}`;
     let closed = 0;
     const driver = {
       id: "subprocess",
@@ -1115,16 +1137,18 @@ describe("per-task timeout override (OBS-37b)", () => {
       notify: inner.notify.bind(inner),
       async close(slot: { id: string; name: string; cwd: string }) {
         await inner.close(slot);
-        if (++closed === 1) {
-          const intWt = worktreePath(repo, intBranch);
-          writeFileSync(join(intWt, "impl.txt"), "conflict\n");
-          await shOk(`git add impl.txt && ${COMMIT} integration-conflict`, intWt);
+        if (slot.name.includes("T1") && ++closed === 1) {
+          // T1's timed-out first attempt: hold its retry until the sibling's merge is published.
+          for (const deadline = Date.now() + 60_000; Date.now() < deadline;) {
+            if (Journal.open(repo, runId).read().some((e) => e.event === "merge" && e.taskId === "T0")) break;
+            await new Promise((resolve) => setTimeout(resolve, 25));
+          }
         }
       },
       worktree: inner.worktree.bind(inner),
     };
     const s = await runDaemon(repo, { adapters: [fake], runId, driver });
-    expect(s.done).toEqual(["T1"]);
+    expect(s.done).toEqual(["T0", "T1"]);
     const recreation = Journal.open(repo, runId).read().find((e) => e.event === "worktree-recreation")!;
     expect(recreation.data.carried).toEqual([]);
     expect((recreation.data.attempted as string[]).length).toBeGreaterThan(0);
@@ -1178,11 +1202,8 @@ describe("OBS-1107 carry verification reads content, not hashes (fake adapter, z
       expect(await shOk(`git diff --quiet ${empty}^ ${empty} && echo empty`, repo), variant).toBe("empty\n");
       // A sibling lands shared.txt's exact bytes on the integration tip; in the missing variant it also
       // lands other own.txt bytes, so own's nonempty change can neither apply nor be represented.
-      const intWt = worktreePath(repo, `tickmarkr/${runId}`);
-      writeFileSync(join(intWt, "shared.txt"), "shared\n");
-      writeFileSync(join(intWt, "green.txt"), "green\n");
-      if (variant === "missing") writeFileSync(join(intWt, "own.txt"), "other\n");
-      await shOk(`${COMMIT} sibling`, intWt);
+      await landSibling(repo, runId, { "shared.txt": "shared\n", "green.txt": "green\n",
+        ...(variant === "missing" ? { "own.txt": "other\n" } : {}) });
 
       await approve([runId, "T1", "--recheck", "--by", "op"], repo);
       const resumed = await runDaemon(repo, { adapters: [fake], runId, resume: true });
@@ -2207,18 +2228,19 @@ describe("T6 a settled review finding stops travelling (fake adapter, zero token
     await runDaemon(repo, { adapters: [closingReview(s.fake, s.scriptPath, "reraised"), reviewOnlySeat(s.repo, s.scriptPath)], runId });
     await approve([runId, "T1", "--uphold", "--by", "op"], repo);
 
-    // run B's reviewer APPROVES. The worker's own step commits the sibling change into the live
-    // integration worktree — the ordinary way a merge conflicts (someone else landed first), made
-    // deterministic: taskBase is stamped before the worker runs, so this moves the tip underneath it.
-    const intWt = worktreePath(repo, `tickmarkr/${runId}`);
+    // run B's reviewer APPROVES. The first merge conflicts — the ordinary way a merge conflicts (someone else landed
+    // first), made deterministic by mergeTask's test-only seam: merge-tree answers a content conflict on shared.txt.
+    // 2.8.1 T2: nothing writes the integration ref from a worker step (that is a moved ref, parked infra).
+    const realMerge = merge.mergeTask;
+    vi.spyOn(merge, "mergeTask").mockImplementationOnce((...a: Parameters<typeof merge.mergeTask>) =>
+      realMerge(a[0], a[1], a[2], a[3], a[4], a[5], (step) => step === "merge-tree"
+        ? { code: 1, stdout: "CONFLICT (content): Merge conflict in shared.txt", stderr: "" } : undefined));
     writeFileSync(s.scriptPath, JSON.stringify({
       judge: { pass: true, criteria: [{ criterion: "c1", met: true, reason: "ok" }] },
       review: { approve: true, issues: [] },
       consult: { action: "retry", notes: "a sibling landed first — rebase onto the new tip and re-land" },
       tasks: { T1: [
-        { shell: `echo worker > shared.txt && ${COMMIT} w1`
-          + ` && echo sibling > ${shq(join(intWt, "shared.txt"))}`
-          + ` && git -C ${shq(intWt)} add -A && git -C ${shq(intWt)} commit --no-gpg-sign -m sibling`,
+        { shell: `echo worker > shared.txt && ${COMMIT} w1`,
           result: { ok: true, summary: "a2 — fixed the reviewer's finding" } },
         { shell: `echo settled > shared.txt && ${COMMIT} w2`, result: { ok: true, summary: "a3" } },
       ] },

@@ -14,7 +14,7 @@ import type { GateResult } from "../../gates/types.js";
 import { getTask, loadGraph } from "../../graph/graph.js";
 import { GATE_NAMES, type AcceptanceItem, type GateName, type Task } from "../../graph/schema.js";
 import { executionSignal } from "../../run/execution-budget.js";
-import { addDetachedWorktree, linkNodeModules, removeWorktree, shGit, shGitOk } from "../../run/git.js";
+import { addDetachedWorktree, linkNodeModules, reflogWitness, removeWorktree, shGit, shGitOk } from "../../run/git.js";
 import { foldOwedChecks, integrationMapped, owedCriteria, Journal, OWED_DISCHARGE_EVENT, type OwedCheck, type OwedFold } from "../../run/journal.js";
 import { describeLeaseWait, withRepositoryLease } from "../../run/lease.js";
 import { isPidLive } from "../../run/lock.js";
@@ -214,11 +214,21 @@ export async function verify(argv: string[], cwd = process.cwd(), options: { evi
   }
   const cfg = loadConfig(fileRoot("config.yaml"));
   const head = (await shGitOk("git rev-parse HEAD", cwd)).trim();
-  // Git appends every move of HEAD to its reflog — one a gate command makes and undoes itself included —
-  // so the log as of this capture is the subject's witness: any later difference is a move (fail closed).
-  const headLogPath = resolve(cwd, (await shGitOk("git rev-parse --git-path logs/HEAD", cwd)).trim());
-  const headLog = () => { try { return readFileSync(headLogPath, "utf8"); } catch { return ""; } };
-  const headLogAtCapture = headLog();
+  // The latch reads HEAD's reflog through git as a validated witness, refuses before capture when it
+  // is absent or invalid, and compares it line for line at every subject check.
+  const witnessFault = (witness: { code: number; lines: string[] }, commit: string): string | undefined => {
+    if (witness.code !== 0) return `exit ${witness.code}`;
+    const newest = witness.lines[0];
+    if (newest === undefined) return "no reflog";
+    if (newest !== commit) return `newest is ${newest.slice(0, 12)}`;
+    return undefined;
+  };
+  const capturedWitness = await reflogWitness(cwd, "HEAD");
+  const fault = witnessFault(capturedWitness, head);
+  if (fault) {
+    throw new Error(`verify refused: HEAD's reflog cannot witness the candidate (${fault}) — record HEAD moves in this checkout, then verify again`);
+  }
+  const headReflogAtCapture = capturedWitness.lines.join("\n");
   const baseTip = (await shGitOk(`git rev-parse '${values.base}'`, cwd).catch(() => {
     throw new Error(`--base ${values.base} is not a resolvable ref — pass --base <ref> naming the branch this diff targets`);
   })).trim();
@@ -487,9 +497,14 @@ export async function verify(argv: string[], cwd = process.cwd(), options: { evi
   let subjectLatch: string | undefined;
   const subjectChange = async (): Promise<string | undefined> => {
     const now = await shGitOk("git rev-parse HEAD", cwd).then((out) => out.trim(), () => undefined);
+    // The latch reads HEAD's reflog through git as a validated witness, refuses before capture when it
+    // is absent or invalid, and compares it line for line at every subject check.
+    const witness = now === head ? await reflogWitness(cwd, "HEAD") : undefined;
+    const reflogMoved = witness !== undefined && (
+      witness.code !== 0 || witness.lines.join("\n") !== headReflogAtCapture || witness.lines[0] !== head);
     const why = now === undefined ? "HEAD is unreadable"
       : now !== head ? `HEAD moved from ${head.slice(0, 12)} to ${now.slice(0, 12)}`
-      : headLog() !== headLogAtCapture ? `HEAD moved and was restored to ${head.slice(0, 12)} (its reflog recorded the move)`
+      : reflogMoved ? `HEAD moved and was restored to ${head.slice(0, 12)} (its reflog recorded the move)`
       : await candidateDirt();
     if (why) subjectLatch ??= why;
     return subjectLatch;

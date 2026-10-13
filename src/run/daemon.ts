@@ -26,7 +26,7 @@ import { herdrSealShellPrefix, MAX_BUF, SubprocessDriver } from "../drivers/subp
 import { formatOwnedName, type ExecutorDriver, type Slot } from "../drivers/types.js";
 import { type Baseline, type BaselineProvenance, captureBaseline, detectGateCommands, detectVacuousOracles, type GateEvidenceOptions } from "../gates/baseline.js";
 import { reobserveTestFiles, runGates, type GateContext, type GateEvent } from "../gates/run-gates.js";
-import { isInfraResult } from "../gates/cache.js";
+import { getVerdictStore, isInfraResult, resolveStateDir } from "../gates/cache.js";
 import { RUNNER_INFRA_DIAGNOSTIC_RE, timeoutShaped } from "../gates/timeout-shaped.js";
 import type { GateResult } from "../gates/types.js";
 import { filesGlob } from "../graph/files-glob.js";
@@ -38,14 +38,14 @@ import { executionSignal, remainingExecutionMs, withExecutionBudget, withoutExec
 import { repairSelectionDecision, repairSelectionEnabled } from "./repair-selection.js";
 import { failureDisposition, reserveInfrastructureRetry } from "./recovery.js";
 import { runEnvironment } from "./environment.js";
-import { addDetachedWorktree, changeRepresented, cleanupRunWorktrees, deriveForkCap, FORK_CAP_ENV, gitHead, linkNodeModules, npmDependencyInstallCommand, npmDependencyManifestChanged, PRESERVE_COMMIT_SUBJECT, PRESERVE_PRODUCER_TRAILER, preserveWorktree, type PreserveProducer, producerFields, removeWorktree, resolvedCapacity, runWithForkBudget, runWithVerificationBudget, type RunCapacity, sameCapacity, sameVerification, sh, shell, shGit, SUITE_PARENT_ENV, verificationProtocol, WORKTREE_LAYOUT_CONTRACT, WORKTREES_DIR, worktreePath } from "./git.js";
+import { addDetachedWorktree, changeRepresented, cleanupRunWorktrees, deriveForkCap, FORK_CAP_ENV, gitHead, linkNodeModules, npmDependencyInstallCommand, npmDependencyManifestChanged, PRESERVE_COMMIT_SUBJECT, PRESERVE_PRODUCER_TRAILER, preserveWorktree, type PreserveProducer, producerFields, reflogWitness, removeWorktree, resolvedCapacity, runWithForkBudget, runWithVerificationBudget, type RunCapacity, sameCapacity, sameVerification, sh, shell, shGit, SUITE_PARENT_ENV, verificationProtocol, WORKTREE_LAYOUT_CONTRACT, WORKTREES_DIR, worktreePath } from "./git.js";
 import { MASK } from "./redact.js";
 import { runInteractiveSeed, type InteractiveSeedResult } from "./interactive-seed.js";
 import { classifyRepairDisposition, resolveScopeHints } from "./repair-disposition.js";
 import { applyScopeAmendments, activeRetryBan, interruptedAttempt, RESUME_HARVEST_SOURCE, resumeHarvestAuthor, approvalAction, APPROVAL_REFUSED, bindingToken, effectiveEvents, foldDecisions, physicalLine, staleApprovals, classifyTaskFailure, classifyWorkerResultCause, deferredReviewFindings, engagementComparable, formatPriorFindingEvidence, GATE_FINGERPRINT_CAP, GATE_SATISFIED_RELEASE, identicalGateFailures, isDeferredFinding, journaledFailureBrief, Journal, loadRoutingProfile, newRunId, normalizeGateFailure, outstandingConsultGuidance, readableExcerpt, receiptOrigin, outstandingReviewFindings, pendingApprovalActions, pendingRechecks, pendingRepairFindings, phaseForGate, priorJudgments, readPriorRunEvidence, recordedTaskFailureKind, reraisedReviewChains, RECHECK_RELEASE, renderStructuredReviewFinding, repairReachSinceApproval, repairsSinceApproval, reviewRoundsSinceApproval, runHasEnded, standingRulings, structuredFindings, upheldFeedbackByTask, type CurrentAttemptGateReplay, type JournalEvent, type ParkKind, type ResumeState, type RetryMode, type StructuredFinding } from "./journal.js";
 import { carriedAuthorVendors, gateReviewerFloor, isDiffCapPark, isGarbageReview, pickReviewer } from "../gates/review.js";
 import { acquireApprovalSerialization, acquireRunLock, isPidLive, releaseRunLock } from "./lock.js";
-import { ensureIntegration, integrationBranch, integrationHead, mergeTask, reusedTipEvidence, verifyIntegrationTip } from "./merge.js";
+import { checkIntegrationIdentity, ensureIntegration, integrationBranch, type IntegrationLeg, type IntegrationRefState, integrationRepairText, mergeTask, readIntegrationRef, reusedTipEvidence, type TipVerifyResult, verifyIntegrationTip } from "./merge.js";
 import { channelExclusion, climbChannel, inTaskPool, marginalCostRank, nextChannel, poolExhaustion, route, taskPool } from "../route/router.js";
 import { desiredPanes } from "./reconcile.js";
 import { readTierLiveness, readWatchBoard, supervisionPresencePath } from "./supervision.js";
@@ -1151,7 +1151,7 @@ export function formatTipProof(p: TipProof): string {
 // The child uses the same verifier and capacity; only the daemon writes lifecycle verdict rows.
 async function cancellableTipBattery(
   intWt: string, commands: Record<string, string>, runDir: string,
-  baseline: Baseline | undefined, signal: AbortSignal, evidence: GateEvidenceOptions = {},
+  baseline: Baseline | undefined, signal: AbortSignal, evidence: GateEvidenceOptions = {}, deferVerdicts = false,
 ): Promise<Awaited<ReturnType<typeof verifyIntegrationTip>>> {
   signal.throwIfAborted();
   const extension = import.meta.url.endsWith(".ts") ? "ts" : "js";
@@ -1201,9 +1201,9 @@ async function cancellableTipBattery(
       finally { process.send({ type: 'lease-release', id }); }
     };
     let input = ''; for await (const chunk of process.stdin) input += chunk;
-    const { intWt, commands, runDir, baseline, capacity, evidence } = JSON.parse(input);
+    const { intWt, commands, runDir, baseline, capacity, evidence, deferVerdicts } = JSON.parse(input);
     try {
-      const result = await runWithVerificationBudget(capacity, () => runWithCommandLease(lease, () => verifyIntegrationTip(intWt, commands, runDir, baseline, evidence)));
+      const result = await runWithVerificationBudget(capacity, () => runWithCommandLease(lease, () => verifyIntegrationTip(intWt, commands, runDir, baseline, evidence, { deferVerdicts })));
       if (!cancelled) process.stdout.write(JSON.stringify(result.map(row => ({ ...row, capacity: [...commandCapacities].reverse().find(([command]) => command === row.cmd || command.startsWith(row.cmd + " "))?.[1] ?? capacity }))));
     } catch (error) { if (!cancelled) throw error; }
     finally { process.disconnect(); }
@@ -1245,7 +1245,7 @@ async function cancellableTipBattery(
   });
   signal.addEventListener("abort", cancel, { once: true });
   child.stdin!.on("error", () => { /* exit/abort is reported by finished */ });
-  child.stdin!.end(JSON.stringify({ intWt, commands, runDir, baseline, capacity: resolvedCapacity(), evidence }));
+  child.stdin!.end(JSON.stringify({ intWt, commands, runDir, baseline, capacity: resolvedCapacity(), evidence, deferVerdicts }));
   try {
     if (signal.aborted) cancel();
     await finished;
@@ -1256,26 +1256,150 @@ async function cancellableTipBattery(
   }
 }
 
+/** 2.8.1 T1 (ANL-023 §7.1): what run end checks the integration ref against; `expected` absent = the opening read. */
+export interface TipIdentity { repo: string; branch: string; expected?: string }
+export type IdentityLeg = IntegrationLeg | "setup" | "witness" | "checkout";
+type DeferredVerdict = NonNullable<TipVerifyResult["deferredVerdict"]>;
+/** One close under an identity: `expected` is what the closing check must find; `identityFailed` skips it. */
+export interface TipClose { failed: boolean; expected?: string; identityFailed: boolean; deferred: DeferredVerdict[] }
+interface TipVerifyOptions { lastMergedTask?: string; baseline?: Baseline; signal?: AbortSignal; evidence?: GateEvidenceOptions }
+
+const short = (commit: string | undefined) => commit ? commit.slice(0, 12) : "none";
+
+/** In 7.1 alone a failed opening check has no expected value of its own: the newest journaled identity stands in. */
+function journaledTip(events: readonly JournalEvent[]): string | undefined {
+  for (const e of [...events].reverse()) {
+    if (e.event === "merge" && typeof e.data.commit === "string") return e.data.commit;
+    if ((e.event === "run-start" || e.event === "run-resume") && typeof e.data.baseRef === "string") return e.data.baseRef;
+  }
+  return undefined;
+}
+
+/**
+ * 2.8.1 T3 (ANL-023 §7.3): anchor A of a run whose run-start carries `integrationAnchor: "journal"` — the newest merge
+ * row's commit (that row must carry a `from`), else the run-start base; any of them not an object id is unreadable.
+ * No marker: undefined (legacy-ref). Resume and approve both read it.
+ */
+export function integrationAnchor(events: readonly JournalEvent[]): { anchor: string } | { unreadable: string } | undefined {
+  const start = events.find((e) => e.event === "run-start");
+  if (start?.data.integrationAnchor !== "journal") return undefined;
+  const oid = (v: unknown): v is string => typeof v === "string" && /^[0-9a-f]{40}([0-9a-f]{24})?$/.test(v);
+  const show = (v: unknown) => v === undefined ? "absent" : JSON.stringify(v);
+  const merge = [...events].reverse().find((e) => e.event === "merge");
+  if (!merge) return oid(start.data.baseRef) ? { anchor: start.data.baseRef } : { unreadable: `run-start baseRef is ${show(start.data.baseRef)}, not an object id` };
+  if (!oid(merge.data.commit)) return { unreadable: `the newest merge row's commit is ${show(merge.data.commit)}, not an object id` };
+  if (!oid(merge.data.from)) return { unreadable: `the newest merge row's from is ${show(merge.data.from)}, not an object id` };
+  return { anchor: merge.data.commit };
+}
+
+/** The ref legs' details: the leg, both commits, the symbolic target and the repair text. */
+export function identityDetails(leg: IntegrationLeg, state: IntegrationRefState, branch: string, runId: string, expected: string | undefined): string {
+  const found = state.kind === "regular" || state.kind === "symbolic" ? state.commit : undefined;
+  const target = state.kind === "symbolic" ? ` (symbolic to ${state.target})` : "";
+  return `integration identity moved (${leg}): expected ${short(expected)}, found ${short(found)}${target} — repair: `
+    + integrationRepairText(state, branch, runId, expected ?? "<expected commit>");
+}
+
+/**
+ * The one closed outcome row for every identity leg: an integration `tip-verify-failed` (preceded by a start row
+ * with no gates when this close appended none), which runEndTipProof and every consumer already read as failure.
+ */
+export function appendIdentityFailure(journal: Journal, f: {
+  started: boolean; branch: string; expected?: string; leg: IdentityLeg; details: string;
+  state?: IntegrationRefState; cmdHash: string; capacity: RunCapacity; infra?: boolean;
+}): void {
+  if (!f.started) journal.append("tip-verify-start", undefined, { tip: f.expected, cmdHash: f.cmdHash, capacity: f.capacity, gates: [], cached: false });
+  const found = f.state?.kind === "regular" || f.state?.kind === "symbolic" ? f.state.commit : undefined;
+  journal.append("tip-verify-failed", undefined, {
+    gate: "integration", cmd: "", exitCode: 1, fingerprints: [], details: f.details, ...(f.infra ? { infra: true } : {}),
+    integration: { branch: f.branch, expected: f.expected ?? null, found: found ?? null, leg: f.leg,
+      ...(f.state?.kind === "symbolic" ? { target: f.state.target } : {}) },
+    tip: f.expected, cmdHash: f.cmdHash, capacity: f.capacity,
+  });
+}
+
+/** O: I(expected) — or, with no expected value, the ref must be regular and its commit becomes the expected. */
+export async function openingIdentity(identity: TipIdentity, journal: Journal):
+Promise<{ ok: true; expected: string } | { ok: false; leg: IntegrationLeg; state: IntegrationRefState; expected?: string; details: string }> {
+  const { repo, branch } = identity;
+  const fail = (leg: IntegrationLeg, state: IntegrationRefState) => {
+    const expected = identity.expected ?? journaledTip(journal.read());
+    return { ok: false as const, leg, state, expected, details: identityDetails(leg, state, branch, journal.runId, expected) };
+  };
+  // One R(ref) read; with `expected` (2.8.1 T2: the daemon's E) it is I(expected) — regular at E, else the leg.
+  const state = await readIntegrationRef(repo, branch);
+  if (identity.expected === undefined) return state.kind === "regular" ? { ok: true, expected: state.commit } : fail(state.kind, state);
+  if (state.kind === "regular" && state.commit === identity.expected) return { ok: true, expected: identity.expected };
+  return fail(state.kind === "regular" ? "value" : state.kind, state);
+}
+
+/** C: a fresh detached checkout of `expected` whose HEAD reflog is established and validated before the battery. */
+async function openVerificationCheckout(repo: string, expected: string, created: (dir: string) => void):
+Promise<{ ok: true; dir: string; h0: string[] } | { ok: false; leg: "setup" | "witness"; details: string; infra?: true }> {
+  const parent = join(tickmarkrDir(repo), WORKTREES_DIR);
+  mkdirSync(parent, { recursive: true });
+  // A killed daemon never reaches the caller's finally; sweep checkouts whose owner is dead.
+  for (const entry of readdirSync(parent)) {
+    const owner = /^tip-verify-(\d+)-\w{6}$/.exec(entry)?.[1];
+    if (owner && !isPidLive(Number(owner))) await removeWorktree(repo, join(parent, entry));
+  }
+  const dir = mkdtempSync(join(parent, `tip-verify-${process.pid}-`));
+  created(dir);
+  const added = await addDetachedWorktree(repo, dir, expected, undefined, { logHead: true });
+  if (added.code !== 0) return { ok: false, leg: "setup", infra: true, details: `verification checkout setup failed (add: ${(added.stderr || added.stdout).trim()})` };
+  if (!linkNodeModules(repo, dir, { force: true })) return { ok: false, leg: "setup", infra: true, details: "verification checkout setup failed (node_modules link returned false)" };
+  const h0 = await reflogWitness(dir, "HEAD");
+  if (h0.code !== 0 || h0.lines[0] !== expected) {
+    const why = h0.code !== 0 ? `exit ${h0.code}` : h0.lines.length === 0 ? "no reflog" : `newest is ${short(h0.lines[0])}`;
+    return { ok: false, leg: "witness", details: `verification checkout witness unavailable: ${why}` };
+  }
+  return { ok: true, dir, h0: h0.lines };
+}
+
+/** K: C's HEAD still detached at `expected` under the same reflog, and its index and tracked files equal expected's tree. */
+async function checkoutChange(dir: string, expected: string, h0: string[]): Promise<string | undefined> {
+  if ((await shGit("git symbolic-ref -q HEAD", dir)).code !== 1) return "HEAD symbolic";
+  const head = await shGit("git rev-parse HEAD", dir);
+  if (head.code !== 0 || head.stdout.trim() !== expected) return `HEAD moved to ${short(head.code === 0 ? head.stdout.trim() : undefined)}`;
+  const witness = await reflogWitness(dir, "HEAD");
+  if (witness.code !== 0 || witness.lines.join("\n") !== h0.join("\n")) return "HEAD reflog changed";
+  const status = await shGit("git status --porcelain=v1 --untracked-files=no --ignore-submodules=none", dir);
+  if (status.code !== 0 || status.stdout.trim() !== "") return `tracked content: ${(status.stdout || status.stderr).trimEnd() || `exit ${status.code}`}`;
+  return undefined;
+}
+
 /**
  * OBS-34's strict tip verify, but it stops re-paying for an unmoved tip (~334m corpus-wide; 69.5m in
  * one park-heavy run whose 18 resume cycles merged nothing new). The verify journals the SHA it
  * verified and the hash of the command set, so a later run-end can recognize the same verified state:
- * head equals the LAST green verified SHA, commands unchanged, tree clean → journal
- * `tip-verify-cached` and skip. ANY doubt — moved head, changed commands, dirty tree, a gate missing
- * from that cycle's green set, a failure recorded in it, a cycle older than the last one — runs the
- * full verify. The tip-verify-before-green law is untouched: a cached green is a verified green OF
- * THAT EXACT COMMIT, established by the most recent real run of the same commands.
- * Returns whether the tip is failing.
+ * the expected commit equals the LAST green verified SHA and the commands are unchanged → journal
+ * `tip-verify-cached` and skip, with no checkout. ANY doubt — moved tip, changed commands, a gate
+ * missing from that cycle's green set, a failure recorded in it, a cycle older than the last one —
+ * runs the full verify. 2.8.1 T1 (ANL-023 §7.1): with `identity` (the daemon always passes it) run end
+ * verifies a fresh detached checkout of the expected commit under a validated HEAD reflog, never the
+ * integration checkout; it checks tracked content after the battery (the battery-end check also proves
+ * the checkout's HEAD and its reflog unchanged), defers verdict-store writes to the caller, and the
+ * caller closes on an identity check taken after the approval serialization with no await before the
+ * run-end row. The opening check reads the ref before the cycle decision, so a cached green is carried
+ * only for the commit the ref holds now. A caller without `identity` keeps the integration checkout's
+ * head and clean tree as the cache key, exactly as before.
+ * Returns whether the tip is failing (without `identity`) or the close's TipClose (with it).
  */
+export async function verifyIntegrationTipCached(
+  intWt: string, commands: Record<string, string>, journal: Journal, opts: TipVerifyOptions & { identity: TipIdentity },
+): Promise<TipClose>;
+export async function verifyIntegrationTipCached(
+  intWt: string, commands: Record<string, string>, journal: Journal, opts?: TipVerifyOptions,
+): Promise<boolean>;
 export async function verifyIntegrationTipCached(
   intWt: string,
   commands: Record<string, string>,
   journal: Journal,
-  opts: { lastMergedTask?: string; baseline?: Baseline; signal?: AbortSignal; evidence?: GateEvidenceOptions } = {},
-): Promise<boolean> {
+  opts: TipVerifyOptions & { identity?: TipIdentity } = {},
+): Promise<boolean | TipClose> {
   opts.signal?.throwIfAborted();
   const cmdHash = commandsHash(commands);
-  const tip = await gitHead(intWt);
+  const { identity } = opts;
   // T7: the capacity this session's verify children WOULD run under — the third thing a carried
   // green must match, beside the tip and the command set. A cached verdict is the one place a green
   // crosses a session boundary with nothing re-run, and a session resumed at a different capacity
@@ -1283,8 +1407,21 @@ export async function verifyIntegrationTipCached(
   // not carried forward and the commands run again. A pre-T7 cycle records no capacity and keeps
   // exactly the behaviour it has today.
   const capacity = resolvedCapacity();
-  const porcelain = await shGit("git status --porcelain", intWt);
-  const clean = porcelain.code === 0 && porcelain.stdout.trim() === "";
+  const identityFailure = (f: Omit<Parameters<typeof appendIdentityFailure>[1], "branch" | "cmdHash" | "capacity">): TipClose => {
+    appendIdentityFailure(journal, { ...f, branch: identity!.branch, cmdHash, capacity });
+    return { failed: true, identityFailed: true, deferred: [] };
+  };
+  let tip: string;
+  let clean = true; // with `identity` the battery runs in a fresh checkout and K checks tracked content
+  if (identity) {
+    const opened = await openingIdentity(identity, journal);
+    if (!opened.ok) return identityFailure({ started: false, ...opened });
+    tip = opened.expected;
+  } else {
+    tip = await gitHead(intWt);
+    const porcelain = await shGit("git status --porcelain", intWt);
+    clean = porcelain.code === 0 && porcelain.stdout.trim() === "";
+  }
   const last = lastVerifyCycle(journal.read());
   const gates = Object.keys(commands).filter((g) => g !== "tipTest");
   if (!gates.includes("test") && commands.tipTest) gates.push("test");
@@ -1306,43 +1443,60 @@ export async function verifyIntegrationTipCached(
       const cmd = gate === "test" && commands.tipTest ? commands.tipTest : commands[gate]!;
       journal.append("tip-verify", undefined, { ...reusedTipEvidence(last.evidenceByGate.get(gate) ?? {}), gate, cmd, pass: true, exitCode: 0, cached: true, tip, cmdHash, capacity });
     }
-    return false;
+    return identity ? { failed: false, expected: tip, identityFailed: false, deferred: [] } : false;
   }
-  let tipFailed = false;
-  for (const r of await runWithInterruptionSink(journalInterruption(journal, undefined), () => opts.signal
-    ? cancellableTipBattery(intWt, commands, journal.dir, opts.baseline, opts.signal, opts.evidence)
-    : verifyIntegrationTip(intWt, commands, journal.dir, opts.baseline, opts.evidence))) {
-    const measuredCapacity = (r as typeof r & { capacity?: RunCapacity }).capacity ?? capacity;
-    const evidence = r.reused ? reusedTipEvidence(r) : {
-      ...(r.originRunRoot ? { originRunRoot: r.originRunRoot } : {}),
-      ...(r.cause ? { cause: r.cause } : {}),
-      ...(r.evidenceReceipt ? { evidenceReceipt: r.evidenceReceipt } : {}),
-      ...(r.evidenceReceipts ? { evidenceReceipts: r.evidenceReceipts } : {}),
-      ...(r.evidenceAbsence ? { evidenceAbsence: r.evidenceAbsence } : {}),
-      ...Object.fromEntries(["nonce", "stdoutPath", "stderrPath"]
-        .filter(key => r[key as keyof typeof r] !== undefined).map(key => [key, r[key as keyof typeof r]])),
-    };
-    if (r.pass) {
-      // Q121s: a forgiven pass journals its fingerprints — honest about what was carried, never a silent green.
-      journal.append("tip-verify", undefined, { ...evidence, gate: r.gate, cmd: r.cmd, pass: true, exitCode: r.exitCode, details: r.details, ...(r.reused ? { cached: true } : {}), ...(r.forgiven ? { forgiven: true, fingerprints: r.fingerprints, ...(r.baselineProvenance ? { baselineProvenance: r.baselineProvenance } : {}) } : {}), tip, cmdHash, capacity: measuredCapacity });
-    } else {
-      journal.append("tip-verify-failed", undefined, {
-        ...evidence,
-        gate: r.gate,
-        cmd: r.cmd,
-        exitCode: r.exitCode,
-        fingerprints: r.fingerprints,
-        artifact: r.artifact,
-        ...(r.details ? { details: r.details } : {}),
-        lastMergedTask: opts.lastMergedTask,
-        tip,
-        cmdHash,
-        capacity: measuredCapacity,
-      });
-      tipFailed = true;
+  const battery = async (dir: string): Promise<{ tipFailed: boolean; deferred: DeferredVerdict[] }> => {
+    let tipFailed = false;
+    const deferred: DeferredVerdict[] = [];
+    const deferVerdicts = identity !== undefined;
+    for (const r of await runWithInterruptionSink(journalInterruption(journal, undefined), () => opts.signal
+      ? cancellableTipBattery(dir, commands, journal.dir, opts.baseline, opts.signal, opts.evidence, deferVerdicts)
+      : verifyIntegrationTip(dir, commands, journal.dir, opts.baseline, opts.evidence, { deferVerdicts }))) {
+      if (r.deferredVerdict) deferred.push(r.deferredVerdict);
+      const measuredCapacity = (r as typeof r & { capacity?: RunCapacity }).capacity ?? capacity;
+      const evidence = r.reused ? reusedTipEvidence(r) : {
+        ...(r.originRunRoot ? { originRunRoot: r.originRunRoot } : {}),
+        ...(r.cause ? { cause: r.cause } : {}),
+        ...(r.evidenceReceipt ? { evidenceReceipt: r.evidenceReceipt } : {}),
+        ...(r.evidenceReceipts ? { evidenceReceipts: r.evidenceReceipts } : {}),
+        ...(r.evidenceAbsence ? { evidenceAbsence: r.evidenceAbsence } : {}),
+        ...Object.fromEntries(["nonce", "stdoutPath", "stderrPath"]
+          .filter(key => r[key as keyof typeof r] !== undefined).map(key => [key, r[key as keyof typeof r]])),
+      };
+      if (r.pass) {
+        // Q121s: a forgiven pass journals its fingerprints — honest about what was carried, never a silent green.
+        journal.append("tip-verify", undefined, { ...evidence, gate: r.gate, cmd: r.cmd, pass: true, exitCode: r.exitCode, details: r.details, ...(r.reused ? { cached: true } : {}), ...(r.forgiven ? { forgiven: true, fingerprints: r.fingerprints, ...(r.baselineProvenance ? { baselineProvenance: r.baselineProvenance } : {}) } : {}), tip, cmdHash, capacity: measuredCapacity });
+      } else {
+        journal.append("tip-verify-failed", undefined, {
+          ...evidence,
+          gate: r.gate,
+          cmd: r.cmd,
+          exitCode: r.exitCode,
+          fingerprints: r.fingerprints,
+          artifact: r.artifact,
+          ...(r.details ? { details: r.details } : {}),
+          lastMergedTask: opts.lastMergedTask,
+          tip,
+          cmdHash,
+          capacity: measuredCapacity,
+        });
+        tipFailed = true;
+      }
     }
+    return { tipFailed, deferred };
+  };
+  if (!identity) return (await battery(intWt)).tipFailed;
+  let checkout: string | undefined;
+  try {
+    const opened = await openVerificationCheckout(identity.repo, tip, (dir) => { checkout = dir; });
+    if (!opened.ok) return identityFailure({ started: true, expected: tip, ...opened });
+    const { tipFailed, deferred } = await battery(opened.dir);
+    const changed = await checkoutChange(opened.dir, tip, opened.h0);
+    if (changed) return identityFailure({ started: true, expected: tip, leg: "checkout", details: `verification checkout changed during the battery: ${changed}` });
+    return { failed: tipFailed, expected: tip, identityFailed: false, deferred };
+  } finally {
+    if (checkout) await removeWorktree(identity.repo, checkout);
   }
-  return tipFailed;
 }
 
 /** OBS-953: a detected wall-over-monotonic discontinuity journals `host-suspend` (its offset was
@@ -2423,6 +2577,47 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
   branch = recordedBranch
     ? branchEvent!.event === "merge" ? recordedBranch.slice(0, recordedBranch.lastIndexOf("--")) : recordedBranch
     : integrationBranch(cfg, runId);
+  // 2.8.1 T3 (ANL-023 §7.3): the resume anchor. ONLY the run-start integration anchor marker
+  // (`integrationAnchor: "journal"`) selects the journal anchor A; the shape of merge rows never chooses. A marked
+  // resume refuses any ref not regular at the newest merge row's commit, or at the run-start base when no merge exists
+  // (moved, symbolic, deleted, reset to an older published tip, unreadable), and any unreadable anchor: unlike the
+  // superseded resume, it never adopts whatever the ref holds. An unmarked run resumes legacy-ref: E = the regular
+  // commit the ref holds; a missing ref whose journal holds no merge row is created create-only at the run-start base
+  // where a fresh run creates it (below).
+  // Every refusal throws HERE, before this resume journals anything (no exit-cause, lock-reclaimed or approval-refused
+  // row), and leaves the ref as found — after the superseded check and the run-start read, which refuse first.
+  let resumedTip: string | undefined;
+  let resumeAnchor: "journal" | "legacy-ref" | undefined;
+  if (opts.resume) {
+    // v1.53 T5: a superseded run is dead — resuming it beside its successor is the exact
+    // two-concurrent-runs hazard supersession exists to prevent. Fail closed, naming the successor.
+    const superseded = [...journal.read()].reverse().find((e) => e.event === "superseded" && typeof e.data.by === "string");
+    if (superseded) throw new Error(`refusing to resume ${runId}: superseded by ${superseded.data.by as string}`);
+    if (!journal.read().some((e) => e.event === "run-start")) throw new Error(`journal for ${runId} has no run-start event`);
+    const refuse = (why: string) => new Error(`refusing to resume ${runId}: ${why}`);
+    const anchor = integrationAnchor(journal.read());
+    if (anchor && "unreadable" in anchor) throw refuse(`its journal names no readable published tip (${anchor.unreadable})`);
+    const found = await readIntegrationRef(repoRoot, branch);
+    if (anchor) {
+      if (found.kind !== "regular" || found.commit !== anchor.anchor) {
+        const at = found.kind === "regular" || found.kind === "symbolic" ? found.commit : undefined;
+        throw refuse(`integration branch ${branch} does not hold its last published tip (${found.kind === "regular" ? "value" : found.kind}): `
+          + `expected ${short(anchor.anchor)}, found ${short(at)}${found.kind === "symbolic" ? ` (symbolic to ${found.target})` : ""}`
+          + ` — repair: ${integrationRepairText(found, branch, runId, anchor.anchor)}, then resume`);
+      }
+      resumedTip = anchor.anchor;
+      resumeAnchor = "journal";
+    } else if (found.kind === "regular" || (found.kind === "missing" && !journal.read().some((e) => e.event === "merge"))) {
+      resumedTip = found.kind === "regular" ? found.commit : undefined;
+      resumeAnchor = "legacy-ref";
+    } else {
+      // A symbolic ref resolving to F is made regular at its own value; anything else has no trusted tip to print.
+      const repair = found.kind === "symbolic" && found.commit ? integrationRepairText(found, branch, runId, found.commit) : "restore the branch to the tip you trust";
+      throw refuse(`integration branch ${branch} is ${found.kind === "missing" ? "missing while the journal records merges"
+        : found.kind === "symbolic" ? `symbolic to ${found.target}${found.commit ? ` at ${short(found.commit)}` : ", which names no commit"}`
+          : `unreadable: ${found.read}`} (${found.kind}) — repair: ${repair}, then resume`);
+    }
+  }
   if (lock.reclaimed) {
     // T15: SIGKILL/the kernel/power loss cannot ask the dead daemon to append a cause. The next live
     // observer owns that classification: a reclaimed durable lock plus an open journal lifecycle is
@@ -2773,12 +2968,8 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     modeSource: rm.source,
   };
   if (opts.resume) {
-    // v1.53 T5: a superseded run is dead — resuming it beside its successor is the exact
-    // two-concurrent-runs hazard supersession exists to prevent. Fail closed, naming the successor.
-    const superseded = [...journal.read()].reverse().find((e) => e.event === "superseded" && typeof e.data.by === "string");
-    if (superseded) throw new Error(`refusing to resume ${runId}: superseded by ${superseded.data.by as string}`);
-    const start = journal.read().find((e) => e.event === "run-start");
-    if (!start) throw new Error(`journal for ${runId} has no run-start event`);
+    // The superseded check and the run-start read refused at the resume anchor (above), before any append.
+    const start = journal.read().find((e) => e.event === "run-start")!;
     baseRef = start.data.baseRef as string;
     // T3 (Sol #2 / Fable F2): refuse to replay this journal's task states onto a graph it does not
     // belong to — overlapping ids would inherit foreign done/human/approval state, missing ids throw.
@@ -2855,6 +3046,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     journal.append("run-resume", undefined, {
       ...sessionMetadata,
       pid: process.pid, // v1.13 (VIS-11): record the live daemon pid for status liveness
+      integrationAnchor: resumeAnchor, // 2.8.1 T3: "journal" (E = A) or "legacy-ref" (E = the ref)
       ...(replayedExclusions.size > 0 ? { excludedChannels: [...replayedExclusions].sort() } : {}),
       ...(opts.retryFailed ? { retryFailed: true } : {}),
       ...(opts.graphChanged ? { graphChanged: true } : {}), // OBS-1073: the release is the engagement's
@@ -2937,6 +3129,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       driver: driver.id,
       driverEvidence: driverEvidence(cfg, driver, opts.driverOverride),
       branch, graphDefinitionHash: graphDefinitionHash(graph),
+      integrationAnchor: "journal", // 2.8.1 T2: this run creates its branch at baseRef and journals every publication with `from`
       ...(prior ? { supersedes: prior.runId } : {}),
     }); // graphDefinitionHash: T3 engagement identity (status+resume share it); pid: v1.13 (VIS-11) liveness; mode/modeSource: v1.51 T2; supersedes: v1.53 T5
     runStarted = true;
@@ -2958,7 +3151,9 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
   const collateral = pinnedCollateral ?? collateralHits(graph.tasks, repoRoot);
   if (!pinnedCollateral) writeFileSync(collateralPath, JSON.stringify(Object.fromEntries(collateral), null, 2));
 
-  const intWt = await ensureIntegration(repoRoot, branch, baseRef);
+  // 2.8.1 T2 (ANL-023 §7.2): the published tip E — a daemon-lifetime value, advanced only by this daemon's own
+  // compare-and-swap publications. No checkout of the integration branch exists.
+  let published = resumedTip ?? await ensureIntegration(repoRoot, branch, baseRef);
 
   // v1.1 visibility: role-named slots; panes persist per keepPanes (attempt = v1 close-after-harvest)
   const keepOpen = cfg.visibility.keepPanes !== "attempt";
@@ -3046,14 +3241,31 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
   // as its OWN completion — silently LYING about a worker's outcome. Pinned by the stale-trailer oracle
   // in tests/run/daemon.test.ts ("a retained prior-attempt trailer cannot complete a retry"); a future
   // hoist back to run scope reddens it.
-  // merges are serialized — two concurrent `git merge`s in one worktree would corrupt each other
+  // merges are serialized: each is a compare-and-swap from E, and its rows land in publication order (task-done
+  // immediately before its merge row, which names its own commit and the E it was published from).
   let mergeChain: Promise<unknown> = Promise.resolve();
-  const mergeSerial = (taskBranch: string, t: Task, gated: string) => {
-    const next = mergeChain.then(() => {
+  const mergeSerial = (taskBranch: string, t: Task, gated: string, done: Record<string, unknown>, ancestorOnly?: true) => {
+    const next = mergeChain.then(async () => {
       fatalStop.signal.throwIfAborted();
       executionSignal()?.throwIfAborted();
       journal.phaseStart(t.id, "merge");
-      return mergeTask(intWt, taskBranch, `tickmarkr: merge ${t.id} ${t.title}`, gated);
+      const setDone = () => {
+        graph = setStatus(graph, t.id, "done");
+        saveGraph(repoRoot, graph);
+        journal.append("task-done", t.id, done);
+      };
+      const merged = journal.read().filter((e) => e.taskId === t.id && e.event === "merge" && typeof e.data.commit === "string")
+        .map((e) => e.data.commit as string).reverse();
+      const from = published;
+      const m = await mergeTask(repoRoot, { branch, expected: from, merged, ...(ancestorOnly ? { ancestorOnly } : {}) }, taskBranch, `tickmarkr: merge ${t.id} ${t.title}`, gated,
+        (commit) => {
+          published = commit;
+          setDone();
+          journal.append("merge", t.id, { branch: taskBranch, commit, from });
+        });
+      // Already merged through its own recorded merge: done, with nothing published and no new merge row.
+      if (m.ok && "alreadyMerged" in m) setDone();
+      return m;
     });
     mergeChain = next.catch(() => undefined);
     return next;
@@ -3907,29 +4119,43 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       disposition: () => { author: Assignment; attempt: number };
       beforeMerge?: () => void; firstAttemptOk: boolean;
       metering: { tokens?: TokenUsage | undefined; meteredAttempts?: number | undefined };
+      ancestorOnly?: true; // no gates ran: mergeTask may only find the commit already in E, never publish it
     }): Promise<{ kind: "merged" | "regate" | "parked" | "red" } | { kind: "conflict"; conflict: string | undefined }> => {
-      const parkAs = (reason: string, kind: ParkKind) =>
-        park(t, reason, kind, p.author, p.attempts, startMs, gateFails, consults, tokens, metered, retryMode);
+      const parkAs = (reason: string, kind: ParkKind, details?: Record<string, unknown>) =>
+        park(t, reason, kind, p.author, p.attempts, startMs, gateFails, consults, tokens, metered, retryMode, details);
       if (results.every(gateSatisfied)) {
         p.beforeMerge?.();
-        const m = await mergeSerial(p.taskBranch, t, p.gated);
-        if (m.tipMoved) {
+        // §7.2: the author fold is taken BEFORE the serializer; a throw here propagates before any publication.
+        const authors = mergedAuthors(await subjectAuthors(journal.read(), t.id, p.wt, p.taskBase));
+        const m = await mergeSerial(p.taskBranch, t, p.gated,
+          { attempts: p.attempts, assignment: p.author, taskContentDigest: contentDigest, authors }, p.ancestorOnly);
+        if ("tipMoved" in m) {
           journal.append("tip-moved", t.id, m.tipMoved);
           if (tipMoves++ === 0) return { kind: "regate" };
           await parkAs("task branch tip moved twice after gating", "tip-moved");
           return { kind: "parked" };
         }
-        if (!m.ok) {
+        if ("conflict" in m) {
           journal.append("merge-conflict", t.id, { conflict: m.conflict });
           return { kind: "conflict", conflict: m.conflict };
         }
-        graph = setStatus(graph, t.id, "done");
-        saveGraph(repoRoot, graph);
-        journal.append("task-done", t.id, {
-          attempts: p.attempts, assignment: p.author, taskContentDigest: contentDigest,
-          authors: mergedAuthors(await subjectAuthors(journal.read(), t.id, p.wt, p.taskBase)),
-        });
-        journal.append("merge", t.id, { branch: p.taskBranch, commit: await integrationHead(intWt) });
+        if ("integrationMoved" in m) {
+          const { leg, expected, found, target } = m.integrationMoved;
+          await parkAs(`integration branch ${branch} moved (${leg}): expected ${short(expected)}, found ${short(found ?? undefined)}`
+            + `${target ? ` (symbolic to ${target})` : ""} — repair: ${integrationRepairText(m.state, branch, runId, expected)}, then approve a recheck`,
+          "infra", { integrationMoved: m.integrationMoved });
+          return { kind: "parked" };
+        }
+        if ("alreadyIntegrated" in m) {
+          await parkAs(`gated commit ${short(m.alreadyIntegrated.gated)} is already in the integration history at ${short(m.alreadyIntegrated.tip)}`
+            + " without this task's recorded merge — nothing was published; inspect the task branch, then approve a recheck", "infra");
+          return { kind: "parked" };
+        }
+        if ("infra" in m) {
+          await parkAs(`merge publication failed (${m.infra.step}): ${m.infra.message}`, "infra");
+          return { kind: "parked" };
+        }
+        // Published (or already merged through its own recorded merge): the serializer set the task done.
         await trackedDriver.project?.(t.id, "completed");
         // firstAttemptOk/gateFails/consults are recorded FACTS, not policy — a parkKind:"stall" row is
         // recorded but NOT quality-negative in v1.6; Phase 12 owns reward policy, so flipping it later needs zero data migration.
@@ -4145,7 +4371,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           const uncertain = await reapOwned(found.launch.slot, found.launch);
           if (uncertain) return decline(uncertain);
         }
-        const commits = existsSync(wt) ? await commitsAheadOf(await integrationHead(intWt), wt) : [];
+        const commits = existsSync(wt) ? await commitsAheadOf(published, wt) : [];
         if (!found.result.finished && commits.length === 0) return decline("unfinished");
         recordHarvest(commits, found.result.finished, found.result.summary);
         return found.assignment;
@@ -4180,7 +4406,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       const foreign = !finished && [...pane.matchAll(/TICKMARKR_RESULT_([0-9a-z]+)/g)]
         .some(([, other]) => other !== nonce && adapter.parse(pane, other!).cause === undefined);
       if (foreign) return decline("foreign-nonce");
-      const taskBase = await integrationHead(intWt);
+      const taskBase = published;
       if (!finished && (await commitsAheadOf(taskBase, wt)).length === 0) return decline("unfinished");
       const uncertain = await reapOwned(ownedSlot, launch);
       if (uncertain) return decline(uncertain);
@@ -4235,7 +4461,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       }
     }
     resumeGateReplay: if (satisfiedGate || replayedGates || recheck || harvestAuthor) {
-      const taskBase = await integrationHead(intWt);
+      const taskBase = published;
       taskBases.set(t.id, taskBase);
       const taskBranch = `${branch}--${t.id}`;
       const priorWt = worktreePath(repoRoot, taskBranch);
@@ -4262,6 +4488,26 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       const priorTaskTip = preservedRef ? (await shGit(`git rev-parse ${shq(preservedRef)}`, repoRoot)).stdout.trim() : await gitHead(priorWt);
       const priorTaskSubject = await gateCommitSubject(taskBase, priorTaskTip, preservedRef ? repoRoot : priorWt);
       const commitsToCarry = preservedRef ? await commitsAheadOfRef(taskBase, priorTaskTip, repoRoot) : await commitsAheadOf(taskBase, priorWt);
+      // 2.8.1 T2 (ANL-023 §7.2): a task with a recorded merge whose prior tip is PROVEN in E (`merge-base --is-ancestor`
+      // exit 0 — an empty or failed history read is no proof) keeps that tip as its gated subject — recreated on E it
+      // would be gated AT E, and a sibling's publication since its merge would hide the recorded merge. Nothing is gated
+      // or published (ancestorOnly): the serializer's already-merged rule decides (done through its own recorded merge,
+      // else an alreadyIntegrated park). A moved task tip, or any failed proof, regates below.
+      if (!preservedRef && journal.read().some((e) => e.taskId === t.id && e.event === "merge")
+        && (await shGit(`git merge-base --is-ancestor ${shq(priorTaskTip)} ${shq(taskBase)}`, repoRoot)).code === 0) {
+        const author = rs?.lastAssignment ?? assignment;
+        const settled = await settleResults([], {
+          wt: priorWt, taskBase, taskBranch, gated: priorTaskTip, commit: priorTaskSubject, outsideScopeForced: false,
+          author, attempts: rs?.attempts ?? 0, infraReason: (g) => `${g.gate}: ${g.details}`,
+          reobserve: { attempt: rs?.attempts ?? 0, replayed: true }, firstAttemptOk: false, metering: {},
+          disposition: () => ({ author, attempt: rs?.attempts ?? 0 }), ancestorOnly: true,
+        });
+        if (settled.kind === "parked") return;
+        if (settled.kind === "merged") {
+          await reconcile({ spareLiveLlm: true });
+          return;
+        }
+      }
       const wt = await recreateTaskWorktree(taskBranch, taskBase, priorWt);
       const { carried: carriedCommits, accounted: accountedCommits } = await cherryPickCommits(wt, commitsToCarry);
       // Reuse is about the tree the gates will actually inspect. The integration tip may have moved
@@ -4862,7 +5108,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       });
       journal.phaseStart(t.id, "worker", { attempt, assignment });
 
-      const taskBase = await integrationHead(intWt); // deps are merged → visible to this task
+      const taskBase = published; // deps are merged → visible to this task (E, never the ref as it stands)
 
       taskBases.set(t.id, taskBase);
       const taskBranch = `${branch}--${t.id}`; // "--": a ref can't nest under the existing integration branch (locked decision 10)
@@ -7066,7 +7312,12 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     fatalPhase = "tip-verify";
     // OBS-34: post-merge integration-tip verify — strict exit codes, no baseline forgiveness.
     const lastMergedTask = [...journal.read()].reverse().find((e) => e.event === "merge" && e.taskId)?.taskId;
+    // 2.8.1 T1 (ANL-023 §7.1): every close opens on the integration identity and closes on it below.
+    const identity: TipIdentity = { repo: repoRoot, branch, expected: published }; // 2.8.1 T2: E
+    let tipClose: TipClose;
+    let tipStarted = false;
     if (summary.done.length > 0 && Object.keys(commands).length > 0) {
+      tipStarted = true;
       const controller = new AbortController();
       const cancellation = new Error("tip verify cancelled by approval");
       const checkApprovals = () => {
@@ -7083,12 +7334,11 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         if (!controller.signal.aborted) poll = setTimeout(pollApprovals, APPROVAL_POLL_MS);
       };
       poll = setTimeout(pollApprovals, APPROVAL_POLL_MS);
-      let tipFailed: boolean;
       try {
         const verification = withCommandContext(undefined,
-          () => verifyIntegrationTipCached(intWt, commands, journal, { lastMergedTask, baseline, signal: controller.signal, evidence: { quotaBytes: cfg.gates?.evidenceQuotaBytes } }), controller.signal);
+          () => verifyIntegrationTipCached(repoRoot, commands, journal, { lastMergedTask, baseline, signal: controller.signal, evidence: { quotaBytes: cfg.gates?.evidenceQuotaBytes }, identity }), controller.signal);
         activeTipVerify = { controller, settled: verification.then(() => {}, () => {}) };
-        tipFailed = await verification;
+        tipClose = await verification;
       } catch (error) {
         if (error !== cancellation) throw error;
         journal.append("tip-verify-cancelled", undefined, { reason: "approval", lastMergedTask });
@@ -7097,12 +7347,22 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         activeTipVerify = undefined;
         clearTimeout(poll);
       }
-      summary.tipVerify = tipFailed ? "failed" : "passed";
+      summary.tipVerify = tipClose.failed ? "failed" : "passed";
       summary.tipProof = runEndTipProof(journal.read());
-      if (tipFailed && lastMergedTask) summary.lastMergedTask = lastMergedTask;
+      if (tipClose.failed && lastMergedTask) summary.lastMergedTask = lastMergedTask;
     } else {
-      // Exactly one proof per close: no cycle ran for THIS close, and an earlier one is not inherited.
-      summary.tipProof = { kind: "incomplete" };
+      // The opening check runs on every close, also with nothing done or no command configured.
+      const opened = await openingIdentity(identity, journal);
+      if (opened.ok) {
+        tipClose = { failed: false, expected: opened.expected, identityFailed: false, deferred: [] };
+        // Exactly one proof per close: no cycle ran for THIS close, and an earlier one is not inherited.
+        summary.tipProof = { kind: "incomplete" };
+      } else {
+        appendIdentityFailure(journal, { started: false, branch, ...opened, cmdHash: commandsHash(commands), capacity: resolvedCapacity() });
+        tipClose = { failed: true, identityFailed: true, deferred: [] };
+        summary.tipVerify = "failed";
+        summary.tipProof = runEndTipProof(journal.read());
+      }
     }
 
     // T14: read the journal, not the startup `approved` set — an approval appended DURING this run is
@@ -7129,15 +7389,24 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     const forgiven = forgivenFingerprints(journal.read());
     if (forgiven.length > 0) summary.forgiven = forgiven;
 
+    // Z: the closing identity check — after the serialization and the hold branch, the last await before the
+    // run-end row. Deferred verdicts reach the store only when it holds; every other path discarded them.
+    if (!tipClose.identityFailed && tipClose.expected !== undefined) {
+      const closing = await checkIntegrationIdentity(repoRoot, branch, tipClose.expected);
+      if (!closing.ok) {
+        appendIdentityFailure(journal, { started: tipStarted, branch, expected: tipClose.expected, leg: closing.leg, state: closing.state,
+          details: identityDetails(closing.leg, closing.state, branch, runId, tipClose.expected), cmdHash: commandsHash(commands), capacity: resolvedCapacity() });
+        summary.tipVerify = "failed";
+        summary.tipProof = runEndTipProof(journal.read());
+      } else {
+        const store = getVerdictStore(resolveStateDir(repoRoot, journal.dir));
+        for (const { id, verdict } of tipClose.deferred) store.set(id, verdict);
+      }
+    }
     journal.append("run-end", undefined, { ...summary });
     await reconcile(); // run-end boundary: nothing in flight — full sweep (empty desired set)
     // OBS-28: lingering worktrees starve CLI probes; keepPanes:forever is the debug override.
-    if (!keepForever) {
-      const green = summary.failed.length === 0 && summary.human.length === 0
-        && summary.blocked.length === 0 && summary.pending.length === 0
-        && summary.tipVerify !== "failed";
-      await cleanupRunWorktrees(repoRoot, branch, { removeIntegration: green, removeTaskIds: summary.done });
-    }
+    if (!keepForever) await cleanupRunWorktrees(repoRoot, branch, { removeTaskIds: summary.done });
     // VIS-02: name each blocked subtree by its nearest parked/failed root, e.g. "3 blocked behind P40-02".
     const attribution = [...attributeBlocked(graph).entries()]
       .sort(([a], [b]) => a.localeCompare(b))

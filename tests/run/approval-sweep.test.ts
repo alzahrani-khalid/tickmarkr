@@ -352,8 +352,9 @@ test("test: a run whose loop drains with a parked task blocking every remaining 
 async function runningVerifyApproval() {
   const marker = join(makeTestTempDir("tickmarkr-tip-cancel-"), "running");
   const pidFile = `${marker}.pid`;
-  // Only the parked integration tip waits. Task gates and the final tip finish normally.
-  const command = `if test "$(basename "$PWD")" = tickmarkr-run-tip-cancel && test -f S.txt && ! test -f A.txt; then echo $$ > ${shq(pidFile)}; echo running > ${shq(marker)}; sleep 30; echo escaped >> ${shq(marker)}; fi`;
+  // Only the parked integration tip waits. Task gates and the final tip finish normally. 2.8.1 T1: the tip
+  // battery runs in its own fresh verification checkout (tip-verify-*), never the integration checkout.
+  const command = `if case "$(basename "$PWD")" in tip-verify-*) true;; *) false;; esac && test -f S.txt && ! test -f A.txt; then echo $$ > ${shq(pidFile)}; echo running > ${shq(marker)}; sleep 30; echo escaped >> ${shq(marker)}; fi`;
   const { repo, fake } = closingRepo(true, command);
   const graph = loadGraph(repo);
   saveGraph(repo, { ...graph, tasks: [...graph.tasks, { ...graph.tasks[1]!, id: "C", title: "C" }] });
