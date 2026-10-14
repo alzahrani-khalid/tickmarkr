@@ -245,6 +245,7 @@ test("an observation runDaemon cannot complete is recorded unreadable and never 
 
 test("a worktree change runDaemon detects rearms the stall window and not only the journal, with a stall window shorter than the nudge grace a worker whose tree changes once just before the old deadline is concluded only at a new deadline measured from that change, while the identical worker whose tree never changes is concluded at the old deadline, so a contact row written without moving the progress clock fails", async () => {
   // Isolate the rolling worktree clock from the independent nudge-grace hold.
+  const WINDOW_MS = 1_200; // the stall window (timeoutMinutes 0.02)
   setHarvestCpuFlatMsForTests(50);
   setDeadChannelFastKillMsForTests(5_000);
 
@@ -254,7 +255,7 @@ test("a worktree change runDaemon detects rearms the stall window and not only t
     // slice plus harvest), measured at 913-945 ms against a 600 ms window on 2.6.1 and 2.6.2 alike. So the
     // old 1000 ms ceiling kept a 7 % margin and went red under full-suite gate load (1001-1080 ms). Doubling
     // the window doubles every slack below while the lag stays fixed; each claim keeps its meaning.
-    const { repo, fake } = setupRepo([T("T1", { timeoutMinutes: 0.02 })], STALLED);
+    const { repo, fake } = setupRepo([T("T1", { timeoutMinutes: WINDOW_MS / 60_000 })], STALLED);
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       await runDaemon(repo, {
@@ -289,7 +290,12 @@ test("a worktree change runDaemon detects rearms the stall window and not only t
   const changedEnd = taskEventTime(changed, "worker-result");
 
   expect(unchangedDuration).toBeGreaterThanOrEqual(1_000);
-  expect(unchangedDuration).toBeLessThan(2_000);
+  // Concluded at the OLD deadline: one window plus the conclusion lag, never a second window. The lag is not
+  // fixed under load — public CI 38440067387's 3-core macOS runner under coverage measured 2087 ms against the
+  // old absolute 2000 ms ceiling (D-1958). A clock rearmed without a tree change is held until another
+  // mechanism concludes it (the 5 s dead-channel kill above), far past two windows, so this bound keeps the
+  // claim; the rearm itself is pinned relative to this run below.
+  expect(unchangedDuration).toBeLessThan(2 * WINDOW_MS);
   expect(changedContact - taskEventTime(changed, "worker-launch")).toBeGreaterThanOrEqual(900);
   expect(changedEnd - changedContact).toBeGreaterThanOrEqual(1_000);
   expect(changedEnd - taskEventTime(changed, "worker-launch")).toBeGreaterThan(unchangedDuration + 600);
