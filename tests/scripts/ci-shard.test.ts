@@ -170,7 +170,7 @@ test("test: a sharded run with a malformed or missing durations file fails close
     // `durations`: per path the rounded mean over passed, failed and skipped entries, minimum 1, keys sorted
     const entry = (file: string, state: string, durationMs: number, project = "suite") => ({ file, project, state, durationMs });
     const record = (files: object[], shard: object | null = null) =>
-      `${JSON.stringify({ schema: "tickmarkr-ci-record/1", head: null, shard, files })}\n`;
+      `${JSON.stringify({ schema: "tickmarkr-ci-record/2", head: null, shard, files, reason: "passed", unhandled: [], tests: [] })}\n`;
     const one = join(root, "one.record.json");
     const two = join(root, "two.record.json");
     writeFileSync(one, record([
@@ -191,7 +191,12 @@ test("test: a sharded run with a malformed or missing durations file fails close
 
     for (const [label, text] of [
       ["syntax", "{"],
-      ["repeated key", '{"schema": "tickmarkr-ci-record/1", "schema": "tickmarkr-ci-record/1", "head": null, "shard": null, "files": []}'],
+      ["repeated key", '{"schema": "tickmarkr-ci-record/2", "schema": "tickmarkr-ci-record/2", "head": null, "shard": null, "files": [], "reason": "passed", "unhandled": [], "tests": []}'],
+      // an F2 document is another schema: no F2 record persists across versions
+      ["format F2", '{"schema": "tickmarkr-ci-record/1", "head": null, "shard": null, "files": []}'],
+      ["unknown reason", record([]).replace('"reason":"passed"', '"reason":"done"')],
+      ["test entry without a name", record([]).replace('"tests":[]', '"tests":[{"file":"tests/a.test.ts","project":"suite","state":"passed"}]')],
+      ["unhandled entry without a type", record([]).replace('"unhandled":[]', '"unhandled":[{"name":"Error","message":"boom"}]')],
       ["negative duration", record([entry("tests/a.test.ts", "passed", -1)])],
       ["unknown state", record([entry("tests/a.test.ts", "done", 1)])],
       ["noncanonical path", record([entry("./tests/a.test.ts", "passed", 1)])],
@@ -258,7 +263,12 @@ test("test: a production-config run under the record variable writes one record 
     const text = readFileSync(join(out, "ci.record.json"), "utf8");
     expect(text.endsWith("\n") && !text.slice(0, -1).includes("\n")).toBe(true);
     const record = parseRecord(readJson(text), "ci.record.json");
-    expect(record).toMatchObject({ schema: "tickmarkr-ci-record/1", head: null, shard: null });
+    expect(record).toMatchObject({ schema: "tickmarkr-ci-record/2", head: null, shard: null, reason: "failed", unhandled: [] });
+    expect(record.tests.map(({ file, name, state }) => ({ file, name, state }))).toEqual([
+      { file: probe("fail"), name: "fails", state: "failed" },
+      { file: probe("nested"), name: "starts a nested runner", state: "passed" },
+      { file: probe("pass"), name: "passes", state: "passed" },
+    ]);
     expect(record.files.map(({ file, project, state }) => ({ file, project, state }))).toEqual([
       { file: probe("fail"), project: "suite", state: "failed" },
       { file: probe("nested"), project: "suite", state: "passed" },
@@ -290,22 +300,31 @@ test("test: a production-config run under the record variable writes one record 
   // the writer sums the five diagnostics, then rounds once; absent counts 0; negative or non-finite throws by name
   const root = realpathSync(mkdtempSync(join(tmpdir(), "ci-record-")));
   try {
-    const module = (file: string, state: string, diagnostic: Record<string, number | undefined>) => ({
+    const module = (file: string, state: string, diagnostic: Record<string, number | undefined>, tests: [string, string][] = []) => ({
       moduleId: join(root, file), project: { name: "suite" }, state: () => state, diagnostic: () => diagnostic,
+      children: { allTests: () => tests.map(([fullName, testState]) => ({ fullName, result: () => ({ state: testState }) })) },
     }) as unknown as TestModule;
     const fifths = { environmentSetupDuration: 0.4, prepareDuration: 0.4, collectDuration: 0.4, setupDuration: 0.4, duration: 0.4 };
     const write = (path: string, modules: TestModule[]) => {
       const reporter = new CiRecordReporter({ outputFile: path });
       reporter.onInit({ config: { root, shard: { index: 2, count: 3 } } } as unknown as Vitest);
-      reporter.onTestRunEnd(modules);
+      reporter.onTestRunEnd(modules, [{ name: "Error", message: "line one\nline two", type: "Unhandled Error", stack: "at x" }, { message: "bare" }], "passed");
     };
     const good = join(root, "good.record.json");
-    write(good, [module("tests/z.test.ts", "skipped", { duration: 1.6 }), module("tests/y.test.ts", "passed", fifths)]);
+    write(good, [module("tests/z.test.ts", "skipped", { duration: 1.6 }, [["b", "skipped"], ["a", "skipped"]]), module("tests/y.test.ts", "passed", fifths, [["only", "passed"]])]);
     expect(parseRecord(readJson(readFileSync(good, "utf8")), good)).toEqual({
-      schema: "tickmarkr-ci-record/1", head: null, shard: { index: 2, count: 3 },
+      schema: "tickmarkr-ci-record/2", head: null, shard: { index: 2, count: 3 },
       files: [ // 5 × 0.4 rounds to 2 once summed (0 per diagnostic); an absent diagnostic counts 0
         { file: "tests/y.test.ts", project: "suite", state: "passed", durationMs: 2 },
         { file: "tests/z.test.ts", project: "suite", state: "skipped", durationMs: 2 },
+      ],
+      // Vitest's order and each WHOLE message; an absent name or type is null, a stack is never kept
+      reason: "passed",
+      unhandled: [{ name: "Error", message: "line one\nline two", type: "Unhandled Error" }, { name: null, message: "bare", type: null }],
+      tests: [ // sorted by file, project, then full name
+        { file: "tests/y.test.ts", project: "suite", name: "only", state: "passed" },
+        { file: "tests/z.test.ts", project: "suite", name: "a", state: "skipped" },
+        { file: "tests/z.test.ts", project: "suite", name: "b", state: "skipped" },
       ],
     });
     for (const broken of [-1, Number.POSITIVE_INFINITY, Number.NaN]) {

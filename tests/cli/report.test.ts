@@ -333,7 +333,7 @@ describe("OBS-1201 disjoint wall budget", () => {
 // swept once — not doubled per wait.
 describe("OBS-1201 queue subtraction (D-639)", () => {
   const t = (s: number) => new Date(Date.parse("2026-09-28T00:00:00.000Z") + s * 1_000).toISOString();
-  test("a matched suite wait is cut only from the gate that owns it, and a thousand waits stay linear", () => {
+  test("a matched suite wait is cut only from the gate that owns it", () => {
     const b = wallBudget([
       { ts: t(0), event: "run-start", data: {} },
       { ts: t(0), event: "phase-start", taskId: "T1", data: { phase: "judge", gate: "acceptance" } },
@@ -364,18 +364,62 @@ describe("OBS-1201 queue subtraction (D-639)", () => {
     expect(owned.taskMs.queue).toBe(4_000);
     expect(owned.taskMs.test).toBe(10_000);
 
-    const many: JournalEvent[] = [{ ts: t(0), event: "run-start", data: {} }];
-    for (let i = 0; i < 1_000; i++) {
-      many.push({ ts: t(2 * i), event: "suite-wait", taskId: "T1", data: { count: 1 } });
-      many.push({ ts: t(2 * i + 1), event: "suite-admitted", taskId: "T1", data: {} });
-    }
-    many.push({ ts: t(2_000), event: "gate-result", taskId: "T1", data: { gate: "test", pass: true, durationMs: 2_000_000 } });
-    many.push({ ts: t(2_000), event: "run-end", data: {} });
-    const started = Date.now();
-    const big = wallBudget(many)!;
-    expect(Date.now() - started).toBeLessThan(2_000);
-    expect(big.taskMs.queue).toBe(1_000_000);
-    expect(big.taskMs.test).toBe(1_000_000);
+  });
+
+  test("test: the wall budget's cost on four thousand rows stays under three times its cost on two thousand above a one hundred millisecond noise floor, while a deliberately quadratic stand-in measured the same way fails it (T-F4)", () => {
+    // ANL-022 §3 T1 #5 (REL, T-F4): the former 2 s ceiling tested machine speed. Linearity is a
+    // same-run relative measurement; the arithmetic witness on both sizes stays. T = default 20 s.
+    const waits = (pairs: number): JournalEvent[] => {
+      const many: JournalEvent[] = [{ ts: t(0), event: "run-start", data: {} }];
+      for (let i = 0; i < pairs; i++) {
+        many.push({ ts: t(2 * i), event: "suite-wait", taskId: "T1", data: { count: 1 } });
+        many.push({ ts: t(2 * i + 1), event: "suite-admitted", taskId: "T1", data: {} });
+      }
+      many.push({ ts: t(2 * pairs), event: "gate-result", taskId: "T1", data: { gate: "test", pass: true, durationMs: 2 * pairs * 1_000 } });
+      many.push({ ts: t(2 * pairs), event: "run-end", data: {} });
+      return many;
+    };
+    const twoThousand = waits(1_000);
+    const fourThousand = waits(2_000);
+    expect(wallBudget(twoThousand)!.taskMs).toMatchObject({ queue: 1_000_000, test: 1_000_000 });
+    expect(wallBudget(fourThousand)!.taskMs).toMatchObject({ queue: 2_000_000, test: 2_000_000 });
+
+    let observed: unknown;
+    const costRatio = (work: (rows: JournalEvent[]) => unknown) => {
+      const measure = (rows: JournalEvent[], repeats: number) => {
+        const start = performance.now();
+        for (let i = 0; i < repeats; i++) observed = work(rows);
+        return performance.now() - start;
+      };
+      // Warm both sizes. Every sample re-validates the 100 ms noise floor on its own smaller
+      // measurement: a scheduling pause that inflates one calibration batch cannot leave later
+      // samples sub-millisecond, and the denominator is never clamped — a sample below the
+      // floor doubles the identical batch count and remeasures BOTH sizes.
+      measure(twoThousand, 1); measure(fourThousand, 1);
+      let repeats = 1;
+      const sample = (i: number): number => {
+        // Alternate order so neither size systematically meets the host's load first.
+        const times = i % 2 ? [measure(fourThousand, repeats), measure(twoThousand, repeats)].reverse()
+          : [measure(twoThousand, repeats), measure(fourThousand, repeats)];
+        if (times[0]! < 100) { repeats *= 2; return sample(i); }
+        return times[1]! / times[0]!;
+      };
+      const ratios = Array.from({ length: 3 }, (_, i) => sample(i));
+      return ratios.sort((a, b) => a - b)[1]!;
+    };
+    const linear = (ratio: number) => expect(ratio).toBeLessThan(3);
+    linear(costRatio(wallBudget));
+    // Every row is compared with every other: doubling the rows quadruples the work.
+    const quadratic = (rows: JournalEvent[]) => {
+      let sum = 0;
+      for (let i = 0; i < rows.length; i += 4)
+        for (let j = 0; j < rows.length; j += 4) sum = (sum + rows[i]!.ts.length * rows[j]!.ts.length) | 0;
+      return sum;
+    };
+    const badRatio = costRatio(quadratic);
+    expect(badRatio).toBeGreaterThanOrEqual(3);
+    expect(() => linear(badRatio)).toThrow();
+    expect(Number.isFinite(observed)).toBe(true); // consume the measured stand-in's result
   });
 });
 

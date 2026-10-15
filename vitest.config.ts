@@ -80,15 +80,16 @@ export const resolveForkCap = (value: string | undefined): number => {
   return Number.isFinite(supplied) && supplied > 0 ? supplied : Number(DEFAULT_FORK_CAP);
 };
 
-// Report-26 birpc-starver class (Q72s): on the 2-core hosted runner the single vitest worker
-// starves its own birpc channel under long SYNCHRONOUS work — first 4/4 deterministic
+// Report-26 birpc-starver class (Q72s): on the hosted runner (measured 4 cores Linux, 3 macOS; ANL-022 X8)
+// the single vitest worker starves its own birpc channel under long SYNCHRONOUS work — first 4/4 deterministic
 // end-of-suite kills (docs-truth member sweep, remedied by async spawn), then run 31452816678
 // still lost sweep.test.ts at 601s + post-suite onTaskUpdate timeouts. The starver is a CLASS;
 // this list is ONLY its members with a produced CI red (RULING-1890-CI-DESIGN option c: own
 // serial CI step, no rpc tuning, no class-wide absorption — an unknown red does not belong
 // here). ci.public.yml runs this project as a separate step so the main suite's worker channel
 // never carries their sync work.
-// OBS-634 add (v2.6.3 T1): that isolation is a 2-core-CI remedy, so only the CI guard keeps it.
+// OBS-634 add (v2.6.3 T1): that isolation is a hosted-CI remedy (one fork on 4 cores Linux, 3 macOS), so only
+// the CI guard keeps it.
 // Locally the members pool in `suite` under its fork cap instead of paying their ~221 s as a
 // one-fork tail while five forks idle; their generous leaf ceiling moves with them per file
 // (SYNC_HEAVY_LEAF_CEILINGS, applied by tests/setup.ts), and every other file keeps 20 s.
@@ -124,7 +125,17 @@ const ciRecordValue = process.env[CI_RECORD_ENV];
 delete process.env[CI_RECORD_ENV];
 const ciRecordPath = ciRecordValue ? resolve(ciRecordValue) : undefined;
 
-export const createVitestConfig = (forkCapValue: string | undefined, lean = leanCiGuard(), record = ciRecordPath) => defineConfig({
+// v2.8.2 T7 (ANL-022 §7.4, from 2.7.8 T5): TICKMARKR_CI_COVERAGE_BLOB=<path> marks ONE shard of a coverage run, read
+// once and deleted like the record variable. It adds Vitest's blob reporter (the shard's results and coverage map go to
+// <path>) and clears the thresholds: a partial map checks no floor. The per-OS `vitest run --merge-reports=<dir>
+// --coverage` over every shard's blob writes the merged summary the floors step (`cli.ts floors`) decides. Vitest
+// refuses to merge with a blob reporter configured, so the variable leaked into the merge fails it.
+export const CI_COVERAGE_BLOB_ENV = "TICKMARKR_CI_COVERAGE_BLOB";
+const ciBlobValue = process.env[CI_COVERAGE_BLOB_ENV];
+delete process.env[CI_COVERAGE_BLOB_ENV];
+const ciBlobPath = ciBlobValue ? resolve(ciBlobValue) : undefined;
+
+export const createVitestConfig = (forkCapValue: string | undefined, lean = leanCiGuard(), record = ciRecordPath, blob = ciBlobPath) => defineConfig({
   cacheDir: worktreeVitestCache(process.cwd(), process.env[VITEST_CACHE_ENV]),
   test: {
     setupFiles: ["tests/setup.ts"], // v1.51 T2: scrub leaked TICKMARKR_QUALITY/NO_EXPLORE (gate hermeticity)
@@ -132,12 +143,6 @@ export const createVitestConfig = (forkCapValue: string | undefined, lean = lean
     // (scripts/vitest-lease.ts); `vitest list` and a repository-less cwd take none.
     globalSetup: [VITEST_LEASE_HOOK],
     testTimeout: 20000,
-    // Queue row 148, a LOCAL remedy: the shipped CI classifier reads a raw "Test timed out in Nms." in captured
-    // test output as a timed-out test, and daemon tests print the baseline gate's raw failure lines in their
-    // notifications. A user's suite that prints such a line still reds under that classifier. Drop only those
-    // console entries; Vitest still reports a real timeout itself. DELETE this filter when row 148 ships
-    // (CI graded from a machine reporter, per invocation).
-    onConsoleLog: (log) => (/(Test|Hook) timed out in [0-9]+ ?ms/.test(log) ? false : undefined),
     // v2.7.8 T2: `--shard` plans by LPT over scripts/ci/durations.json; file order stays BaseSequencer's
     sequence: { sequencer: LptSequencer },
     // The fork budget lives on the ROOT: vitest 3.2.7 builds one forks pool from the root config
@@ -146,14 +151,20 @@ export const createVitestConfig = (forkCapValue: string | undefined, lean = lean
     // singleFork projects still run one file at a time after the parallel fan-out.
     poolOptions: { forks: { maxForks: resolveForkCap(forkCapValue) } },
     // GO-10 cycle-2 final candidate (threads reverted: 45 isolation-semantics fails at local
-    // proof): the 2-core CI host answers worker birpc BETWEEN reporter/coverage rendering work,
+    // proof): the CI host (4 cores Linux, 3 macOS) answers worker birpc BETWEEN reporter/coverage rendering work,
     // and the fixed 60s worker->host timeout fires at the suite tail with every test green.
     // Trim host-side rendering under an env guard so CI's host answers inside the window;
     // local runs keep full reporters. Env-only delta: run commands and the ci-platform pin
     // stay byte-stable.
     ...(lean ? { reporters: ["dot" as const] } : {}),
-    // v2.7.8 T2: the record reporter joins the reporters the run would otherwise use, never replaces them
-    ...(record ? { reporters: [lean ? "dot" as const : "default" as const, [CI_RECORD_REPORTER, { outputFile: record }] as const] } : {}),
+    // v2.7.8 T2 / v2.8.2 T7: the record and blob reporters join the reporters the run would otherwise use, never replace them
+    ...(record || blob ? {
+      reporters: [
+        lean ? "dot" as const : "default" as const,
+        ...(record ? [[CI_RECORD_REPORTER, { outputFile: record }] as const] : []),
+        ...(blob ? [["blob", { outputFile: blob }] as const] : []),
+      ],
+    } : {}),
     // Each project owns a Vite server; set its cacheDir explicitly as well as the root.
     // Leave test.cache untouched so --no-cache keeps disabling result persistence.
     projects: [
@@ -221,9 +232,12 @@ export const createVitestConfig = (forkCapValue: string | undefined, lean = lean
     coverage: {
       provider: "v8",
       // GO-10: json-summary alone under the CI guard — thresholds enforce off the coverage map
-      // regardless of reporter; text/html rendering is pure host-side crunch the 2-core runner
-      // pays while the worker's last onTaskUpdate waits.
+      // regardless of reporter; text/html rendering is pure host-side crunch the hosted runner (4 cores Linux,
+      // 3 macOS) pays while the worker's last onTaskUpdate waits.
       ...(lean ? { reporter: ["json-summary" as const] } : {}),
+      // v2.8.2 T2 (ANL-022 N9): the summary is written when a test fails too, so the floors step (`cli.ts floors`,
+      // the only coverage-threshold verdict) reads a summary whatever the tests did.
+      reportOnFailure: true,
       include: [
         "src/graph/**", "src/route/**", "src/gates/**", "src/run/**",
         "src/config/**", "src/compile/**", "src/adapters/**", "src/drivers/**", "src/cli/**",
@@ -242,6 +256,8 @@ export const createVitestConfig = (forkCapValue: string | undefined, lean = lean
         "src/drivers/**": { lines: 82, branches: 80 },  // measured 93.33 / 88.88 on 2026-07-10 (types.ts excluded)
         "src/cli/**": { lines: 85, branches: 75 },      // measured 94.82 / 81.52 on 2026-07-10 (post-backfill)
       },
+      // v2.8.2 T7: a shard's partial map checks no floor; the floors step over the merge of every blob decides them
+      ...(blob ? { thresholds: undefined } : {}),
     },
   },
 });

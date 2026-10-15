@@ -8,6 +8,8 @@ on:
 permissions:
   id-token: write
   contents: read
+  # the release gate reads this commit's CI (public) run and downloads its proof groups
+  actions: read
 
 jobs:
   release:
@@ -26,21 +28,42 @@ jobs:
       - run: npm ci
       - run: npm run build
       - run: npm run lint
-      # OBS-148 (release-runner CPU-starvation finding, 2026-07-24) serialized the full
-      # suite here; since then the suite outgrew the 2-core runner's fixed 60s vitest
-      # worker->host RPC window: four consecutive 2026-08-11 runs (ci.public.yml coverage
-      # on both platforms, and this workflow's own npm test) ended with every test green
-      # and then died at teardown with `[vitest-worker]: Timeout calling "onTaskUpdate"` —
-      # vitest's bundled birpc DEFAULT_TIMEOUT=6e4 has no override and is fixed upstream
-      # only in vitest 4.x (.planning/EVIDENCE-1890-CYCLE2-RED.md).
-      # That teardown timeout is genuine, but it does not establish full-suite green:
-      # release trees have also carried genuine assertion failures this artifact-scoped
-      # subset does not run. On v2.1.2, three such failures sat beside the timeout with
-      # the same failures on ubuntu and macOS. This gate therefore proves only the artifact
-      # scope it runs — build, lint, and the built-CLI/signal suites that exercise dist/ —
-      # while full-suite truth lives in ci.public.yml and must be green before the tag.
-      - run: npx vitest run --project built-cli --project signal-reaper
+      # The publish gate (v2.8.2 T6, ANL-022 §7.5, D-1960): publish ONLY the commit whose public CI proof grades
+      # GREEN. Exactly one completed, successful `CI (public)` push run of this tag's commit must exist — none, two,
+      # one still running (this job fails, it does not wait: rerun it after CI ends) or one concluded otherwise
+      # fails here — and the shipped grader must grade that run GREEN against this checkout: the closed job
+      # inventory, every declared step and every job's and the run's conclusion `success`, both proof groups'
+      # original records CLEAN or RPC-only at this commit, every test file this commit tracks recorded once and
+      # finished, and the floors sidecar GREEN. The step carries no `if:` and no `continue-on-error`, so publish
+      # never runs past it (tests/repo/release-gate.test.ts reads the step graph).
+      # Why no test subset runs here any more: OBS-148 (release-runner CPU-starvation finding, 2026-07-24)
+      # serialized the full suite on this runner; it then outgrew vitest's fixed 60s worker->host RPC window, and
+      # four consecutive 2026-08-11 runs ended with every test green and then died at teardown with
+      # `[vitest-worker]: Timeout calling "onTaskUpdate"`. That teardown timeout is genuine, but it never
+      # established full-suite green: release trees have also carried genuine assertion failures an artifact-scoped
+      # subset does not run. On v2.1.2, three such failures sat beside the timeout with the
+      # same failures on ubuntu and macOS. So the built-cli/signal-reaper subset is gone and the full-suite proof is
+      # read, not rerun; install, build and lint stay (dropping the subset drops a proof of the dist built on this
+      # runner, ANL-022 §8).
+      # Measured capacity (ANL-022 X8): the suite's capacity stamp reads `fork cap 1 of 4 cores` on ubuntu-latest,
+      # the runner this job uses, and `fork cap 1 of 3 cores` on macos-latest.
+      - name: Grade the CI (public) run of this commit
         env:
-          TICKMARKR_SWEEP_TIMEOUT_MS: "900000"
-          VITEST_MAX_FORKS: "1"
+          GH_TOKEN: ${{ github.token }}
+          TKR_GRADE_CI_DIR: ${{ runner.temp }}/grade-ci
+        run: |
+          runs=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.public.yml --commit "$GITHUB_SHA" --event push --json databaseId,headSha,status,conclusion)
+          run_id=$(printf '%s' "$runs" | node -e '
+            const sha = process.argv[1];
+            const runs = JSON.parse(require("fs").readFileSync(0, "utf8"));
+            const [run] = Array.isArray(runs) ? runs : [];
+            if (runs.length !== 1 || run.headSha !== sha || run.status !== "completed" || run.conclusion !== "success"
+              || !Number.isSafeInteger(run.databaseId) || run.databaseId <= 0) {
+              console.error(`release gate: need exactly one completed successful ci.public.yml push run of ${sha}, got ${JSON.stringify(runs)}`);
+              process.exit(1);
+            }
+            console.log(run.databaseId);
+          ' "$GITHUB_SHA")
+          echo "release gate: grading CI (public) run $run_id of $GITHUB_SHA"
+          bash skills/tickmarkr-overseer/scripts/grade-ci.sh "$run_id" "$GITHUB_SHA" . "$GITHUB_REF_NAME"
       - run: npm publish --provenance --access public

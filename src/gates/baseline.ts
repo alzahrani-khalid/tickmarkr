@@ -457,9 +457,9 @@ const VOCAB_RE = /\b(?:error|fail(?:ed|ure|ing)?)\b/i;
 // OBS-791: `[vitest-worker]: Timeout calling "<method>"` is the SAME birpc mechanism one layer up.
 // Vitest's bundled birpc has a fixed 60s DEFAULT_TIMEOUT with no override (fixed upstream only in
 // vitest 4.x), so a suite whose tests all pass can still die at teardown when the worker->host RPC
-// window closes. `.github/workflows/release.yml` has forgiven this exact fingerprint since 2026-08-11
-// while this classifier called it a regression — the product charged a worker for the failure the
-// release gate was written to forgive. The METHOD NAME IS DELIBERATELY NOT PINNED: the timeout is a
+// window closes. Public CI's proof forgives this exact fingerprint (the RPC-only rule; since v2.8.2 decided
+// from the run's own record, queue rows 148 and 149) and this classifier once called it a regression — the
+// product charged a worker for the failure its own release proof forgives. The METHOD NAME IS DELIBERATELY NOT PINNED: the timeout is a
 // property of the RPC window, not of `onTaskUpdate`, and pinning one method would forgive a run and
 // charge its sibling for the same infrastructure event. This stays a CLOSED signature — the
 // `[vitest-worker]: ` prefix is vitest's own RPC layer and never user assertion text — and the

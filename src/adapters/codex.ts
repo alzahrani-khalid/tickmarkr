@@ -108,8 +108,9 @@ function codexRetirement(upgrade: unknown): ModelRetirement | null | undefined {
 // literal-string fallback. Every emitted root is therefore a TOML basic string that parses back to the exact
 // path (git's own trailing newline is stripped through a sentinel, never a path's). No common-root fallback;
 // packed-refs is not granted (packed-ref ops fail closed); stash, tags, notes and branches outside the leaf
-// are denied. Declared: sibling refs in the same leaf (other task branches, the run's integration branch
-// under the default prefix) stay writable until 2.8.1's integration identity.
+// are denied. Declared (queue row 151): sibling refs in the same leaf (other task branches, the run's integration
+// branch under the default prefix) stay writable; since 2.8.1 a write to the integration ref parks the merge and is
+// never published.
 // doctor's probe (codex-commit-check.ts) executes these exact bytes; it never rebuilds the grant.
 export const CODEX_GIT_GRANT = `-c "sandbox_workspace_write.writable_roots=[$(tkr_common=$(git rev-parse --path-format=absolute --git-common-dir && echo /) && tkr_gitdir=$(git rev-parse --absolute-git-dir && echo /) && tkr_common=\${tkr_common%?/} && tkr_gitdir=\${tkr_gitdir%?/} && { tkr_head=$(git symbolic-ref -q HEAD); [ $? -le 1 ]; } && case $tkr_head in (refs/heads/*) tkr_leaf=\${tkr_head%/*};; (*) tkr_leaf=;; esac && [ "$(printf %s "$tkr_common$tkr_gitdir$tkr_leaf" | LC_ALL=C tr -d '\\0-\\37\\177"\\\\')" = "$tkr_common$tkr_gitdir$tkr_leaf" ] && { [ "$tkr_gitdir" = "$tkr_common" ] || printf '"%s",' "$tkr_gitdir"; } && printf '"%s/objects"' "$tkr_common" && { [ -z "$tkr_leaf" ] || printf ',"%s/%s","%s/logs/%s"' "$tkr_common" "$tkr_leaf" "$tkr_common" "$tkr_leaf"; })]"`;
 

@@ -1,6 +1,7 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { once } from "node:events";
 import {
-  chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync,
+  appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, watch, writeFileSync,
 } from "node:fs";
 import { release, tmpdir } from "node:os";
 import { join } from "node:path";
@@ -1207,8 +1208,48 @@ describe("beat loop", () => {
 
 // ---- OOB M2: a detached loop re-checks the COMPLETE owned generation before every tick ----
 
-test("a real detached loop whose owner arm epoch or durable arm epoch is replaced exits nonzero within two ticks with the refusal in its log, writes no further beat and leaves the replacement untouched, while an unchanged generation keeps beating", async () => {
+test("test: a real detached loop whose generation is replaced exits nonzero on its own exit event within the test's timeout and writes no beat after the replacement, while a stand-in writer that keeps beating after the replacement is caught by that same count (T-F5)", async ({ onTestFinished }) => {
   const tier = "overseer" as const;
+  // ANL-022 §7.3a row 162: the child's exit event and the control's next write have
+  // only this test's 90 s timeout. Count the child's committed beat records, not wall time.
+  const ledger = (repo: string) => join(repo, "beat-writes.jsonl");
+  const records = (repo: string): Array<{ kind: string }> => existsSync(ledger(repo))
+    ? readFileSync(ledger(repo), "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line)) : [];
+  const afterReplacement = (repo: string) => {
+    const rows = records(repo);
+    const replacement = rows.findIndex((row) => row.kind === "replacement");
+    expect(replacement).toBeGreaterThanOrEqual(0);
+    return rows.slice(replacement + 1).filter((row) => row.kind === "beat").length;
+  };
+  const withinTwoTicks = (count: number) => expect(count).toBeLessThanOrEqual(1);
+  const markReplacement = (repo: string) => appendFileSync(ledger(repo), JSON.stringify({ kind: "replacement" }) + "\n");
+  // Observe successful atomic beat publications inside the real child; polling the final file
+  // could miss intermediate writes. The preload is test-local and does not change production code.
+  const observer = (repo: string) => `data:text/javascript,${encodeURIComponent(`
+    import fs from 'node:fs'; import { syncBuiltinESMExports } from 'node:module';
+    const rename = fs.renameSync;
+    fs.renameSync = (from, to) => {
+      rename(from, to);
+      if (String(to) === ${JSON.stringify(supervisionBeatPath(repo, tier))})
+        fs.appendFileSync(${JSON.stringify(ledger(repo))}, JSON.stringify({ kind: 'beat', record: JSON.parse(fs.readFileSync(to, 'utf8')) }) + '\\n');
+    };
+    syncBuiltinESMExports();
+  `)}`;
+  const observedDeps = deps({ spawn: (command, args, options) => {
+    const child = spawn(command, ["--import", observer(String(options.cwd)), ...args], options);
+    spawned.push(child);
+    return child;
+  } });
+  const exitEvent = (child: ChildProcess) => child.exitCode !== null || child.signalCode !== null
+    ? Promise.resolve() : once(child, "exit").then(() => {});
+  const recordEvent = (repo: string, predicate: () => boolean) => new Promise<void>((resolve, reject) => {
+    const watcher = watch(repo, { recursive: true }, () => {
+      try { if (predicate()) { watcher.close(); resolve(); } } catch (error) { watcher.close(); reject(error); }
+    });
+    onTestFinished(() => watcher.close());
+    watcher.on("error", reject);
+    if (predicate()) { watcher.close(); resolve(); }
+  });
   const json = (path: string) => JSON.parse(readFileSync(path, "utf8")) as Record<string, string>;
   const bump = (path: string) => put(path, JSON.stringify({ ...json(path), armEpoch: new Date(Date.parse(json(path).armEpoch) + 1).toISOString() }) + "\n");
   const armReplaced = /durable arm \S+ \(epoch .*\) replaced generation \S+ arm — left in place/;
@@ -1222,28 +1263,61 @@ test("a real detached loop whose owner arm epoch or durable arm epoch is replace
   ].map((row) => ({ ...row, repo: mkRepo() }));
   const control = mkRepo();
   // Launched together so the three loops tick in the same intervals.
-  for (const repo of [...rows.map((row) => row.repo), control]) expect((await run(repo, ["start", tier, "--seat", "s"])).code).toBe(0);
+  for (const repo of [...rows.map((row) => row.repo), control]) {
+    const started = await run(repo, ["start", tier, "--seat", "s"], observedDeps);
+    expect(started.code, started.out).toBe(0);
+  }
   const children = spawned.slice(-4);
   const controlBeat = bytes(supervisionBeatPath(control, tier));
   const frozen = rows.map((row) => {
     for (const path of row.replace) bump(path(row.repo, tier));
+    markReplacement(row.repo);
     return recordSnapshot(row.repo, tier);
   });
   for (const [index, row] of rows.entries()) {
-    const child = children[index];
-    await until(() => child.exitCode !== null || child.signalCode !== null, 2 * SUPERVISION_BEAT_MS + 5_000);
+    const child = children[index]!;
+    await exitEvent(child);
     expect(child.exitCode).toBe(1);
+    expect(child.signalCode).toBeNull(); // it refused on its own, without a test signal
+    expect(records(row.repo).filter((entry) => entry.kind === "beat").length).toBeGreaterThan(0);
+    withinTwoTicks(afterReplacement(row.repo));
+    expect(afterReplacement(row.repo)).toBe(0);
     expect(readFileSync(beatLogPath(row.repo, tier), "utf8")).toMatch(row.reason);
     // no beat after the replacement, and the replacement owner/arm exactly as written
     expect(recordSnapshot(row.repo, tier)).toEqual(frozen[index]);
     expect((await run(row.repo, ["status", tier, "--seat", "s"])).code).toBe(1);
   }
   // Control: the unchanged generation is still alive, still owned and its beat advanced.
-  await until(() => bytes(supervisionBeatPath(control, tier)) !== controlBeat, SUPERVISION_BEAT_MS + 5_000);
+  await recordEvent(control, () => bytes(supervisionBeatPath(control, tier)) !== controlBeat);
   expect(alive(owner(control, tier).pid)).toBe(true);
   expect(await run(control, ["status", tier, "--seat", "s"])).toMatchObject({ code: 0, out: expect.stringContaining("overseer ARMED (s)") });
   expect((await run(control, ["stop", tier, "--seat", "s"])).code).toBe(0);
-}, 90_000);
+  await exitEvent(children[3]!);
+
+  // Test-local mutation: an owned writer ignores the replacement and keeps publishing beats.
+  const bad = mkRepo();
+  const target = supervisionBeatPath(bad, tier);
+  mkdirSync(join(target, ".."), { recursive: true });
+  const writer = spawn(process.execPath, ["--import", observer(bad), "-e", `
+    const fs = require('node:fs'); const path = ${JSON.stringify(target)};
+    setInterval(() => {
+      fs.writeFileSync(path + '.tmp', JSON.stringify({ beatAt: new Date().toISOString(), pid: process.pid }));
+      fs.renameSync(path + '.tmp', path);
+    }, 10);
+  `], { detached: true, stdio: "ignore" });
+  spawned.push(writer);
+  try {
+    await recordEvent(bad, () => records(bad).some((row) => row.kind === "beat"));
+    put(beatOwnerPath(bad, tier), JSON.stringify({ generation: "replacement" }) + "\n");
+    markReplacement(bad);
+    await recordEvent(bad, () => afterReplacement(bad) > 1);
+    expect(() => withinTwoTicks(afterReplacement(bad))).toThrow();
+  } finally {
+    const exited = exitEvent(writer);
+    writer.kill("SIGKILL");
+    await exited;
+  }
+}, 300_000); // queue row 162 hang guard: T-F5 spans 2-5 beat intervals plus four CLI starts, and 90 s timed out under full-suite load (D-1982, D-1986)
 
 // ---- Criterion 6: the shipped recipes, executed verbatim, and the Darwin detachment receipt ----
 

@@ -825,17 +825,16 @@ describe("harvest: finished work is gated, never redispatched (OBS-264)", () => 
         tasks: { T1: [{ shell: `echo headless > h.txt && ${COMMIT} h && sleep 20` }] },
       });
       const restoreProbe = await cpuProbeFallback(repo, "run-harvest-headless", "flat");
-      const startedAt = Date.now();
       let s: Awaited<ReturnType<typeof runDaemon>>;
       try {
         s = await runDaemon(repo, { adapters: [fake], runId: "run-harvest-headless" });
       } finally {
         restoreProbe();
       }
-      const waited = Date.now() - startedAt;
 
       expect(s.done).toEqual(["T1"]);
-      expect(waited).toBeLessThan(60_000); // the 5m window was never ridden out
+      // ANL-022 §3 T1 #29 (EV, T-F1): 5 min window > T = 120 s;
+      // s.done == [T1] and the worker-harvest row still reject the long path.
       const evs = evsOf(repo, "run-harvest-headless");
       const concluded = evs.filter((e) => e.event === "worker-harvest" && e.taskId === "T1");
       expect(concluded).toHaveLength(1);
@@ -973,15 +972,12 @@ describe("harvest: finished work is gated, never redispatched (OBS-264)", () => 
         NUDGEABLE_ADAPTERS.add("fake");
         let nudges = 0;
         let s: Awaited<ReturnType<typeof runDaemon>>;
-        let waited = 0;
         const restoreProbe = await cpuProbeFallback(held.repo, "run-harvest-nudge-held", "flat");
         try {
-          const startedAt = Date.now();
           s = await runDaemon(held.repo, {
             adapters: [held.fake], runId: "run-harvest-nudge-held",
             driver: hdriver({ nudge: async () => { nudges++; return true; }, notify: async () => {} }),
           });
-          waited = Date.now() - startedAt;
         } finally {
           NUDGEABLE_ADAPTERS.delete("fake");
           restoreProbe();
@@ -993,7 +989,8 @@ describe("harvest: finished work is gated, never redispatched (OBS-264)", () => 
         expect(evs.filter((e) => e.event === "worker-harvest" && e.taskId === "T1")).toHaveLength(0);
         // the hold is bounded by the nudge's own grace, never by the 5m window
         expect(evs.filter((e) => e.event === "worker-nudge-expired" && e.taskId === "T1")).toHaveLength(1);
-        expect(waited).toBeLessThan(60_000);
+        // ANL-022 §3 T1 #30 (EV, T-F1): 5 min window > T = 120 s;
+        // the single worker-nudge-expired row above proves grace expiry.
         // and the OBS-264 win survives the hold: the committed work is still gated on THIS attempt
         expect(evs.filter((e) => e.event === "worker-result-harvested" && e.taskId === "T1")).toHaveLength(1);
         expect(evs.filter((e) => e.event === "task-dispatch" && e.taskId === "T1")).toHaveLength(1);
@@ -1080,14 +1077,11 @@ describe("harvest: finished work is gated, never redispatched (OBS-264)", () => 
         NUDGEABLE_ADAPTERS.delete("fake");
         const free = fixture("free");
         const restoreFree = await cpuProbeFallback(free.repo, "run-harvest-unreachable-free", "flat");
-        let freeWaited = 0;
         try {
-          const startedAt = Date.now();
           await runDaemon(free.repo, {
             adapters: [free.fake], runId: "run-harvest-unreachable-free",
             driver: hdriver({ nudge: async () => false, notify: async () => {} }),
           });
-          freeWaited = Date.now() - startedAt;
         } finally {
           restoreFree();
         }
@@ -1095,7 +1089,9 @@ describe("harvest: finished work is gated, never redispatched (OBS-264)", () => 
         expect(freeEvs.filter((e) => e.event === "worker-nudge-failed" && e.taskId === "T1")).toHaveLength(0);
         expect(freeEvs.filter((e) => e.event === "worker-harvest" && e.taskId === "T1")).toHaveLength(1);
         expect(freeEvs.filter((e) => e.event === "worker-dead" && e.taskId === "T1")).toHaveLength(0);
-        expect(freeWaited).toBeLessThan(6_000); // concluded by the triad, not by the hard ceiling
+        // ANL-022 §3 T1 #20 (EV, T-F1), T = 120 s: the hard ceiling past 6 s
+        // writes worker-result-harvested but NO worker-harvest. The row above excludes it;
+        // keep the held leg's >= 6 s lower bound as well.
       } finally {
         NUDGEABLE_ADAPTERS.delete("fake");
         resetNudgeTimingForTests();
