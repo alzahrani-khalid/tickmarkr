@@ -89,11 +89,12 @@ describe("review caller verdict cause", () => {
     const slow = new SlowReviewer(script);
     const cfg = structuredClone(DEFAULT_CONFIG);
     cfg.review.timeoutMs = 25;
-    const startedAt = Date.now();
     const row = await reviewGate(task, repo, base, author, channels, [slow], cfg);
 
     expect(DEFAULT_CONFIG.review.timeoutMs).toBe(900_000);
-    expect(Date.now() - startedAt).toBeLessThan(1_000);
+    // ANL-022 §3 T1 #3 (EV, T-F1): the former 1 s ceiling is gone. The long path — the 25 ms key
+    // ignored, the sleep-1 reviewer finishing — is rejected by the witness row itself: cause silent
+    // at timeoutMs 25 and the configured 25ms named in its details.
     expect(row).toMatchObject({ pass: false, meta: { cause: "silent", timeoutMs: 25 } });
     expect(row.details).toContain("configured review timeout 25ms");
   });

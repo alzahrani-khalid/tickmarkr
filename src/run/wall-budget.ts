@@ -96,7 +96,10 @@ export function wallBudget(events: readonly JournalEvent[]): WallBudget | undefi
     if (opened === undefined) return;
     span("queue", opened, ts);
     // One open wait per owner, closed in journal order: the list stays sorted and non-overlapping.
-    queued.set(key, [...(queued.get(key) ?? []), [opened, ts]]);
+    // Appended in place: a copy per close made a run with n waits cost O(n^2) (ANL-022 §3 T1 #5).
+    const list = queued.get(key);
+    if (list) list.push([opened, ts]);
+    else queued.set(key, [[opened, ts]]);
     waits.delete(key);
   };
   const service = (gate: string, task: string, a: number, b: number) => {

@@ -1,4 +1,5 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { once } from "node:events";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync, type PathLike } from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
@@ -61,10 +62,53 @@ const ROOT = join(import.meta.dirname, "../..");
 const TSX = pathToFileURL(join(ROOT, "node_modules/tsx/dist/loader.mjs")).href;
 const CLI = [process.execPath, "--import", TSX, join(ROOT, "src/cli/index.ts")];
 
+// ANL-022 §7.3a row 163: all five real-kill seams share this guard, including
+// forwarding seams. Record BEFORE refusing so a mistaken identity remains diagnosable.
+type Kill = BeatLifecycleDeps["kill"];
+const killAttempts: Array<{ seam: string; pid: number; signal: NodeJS.Signals }> = [];
+let protectedGroups: Set<number> | undefined;
+const workerGroups = () => {
+  if (!protectedGroups) {
+    const ps = spawnSync("ps", ["-o", "pgid=", "-p", `${process.pid},${process.ppid}`], { encoding: "utf8" });
+    const groups = ps.stdout?.trim().split(/\s+/).map(Number) ?? [];
+    if (ps.status !== 0 || groups.length !== 2 || groups.some((g) => !Number.isInteger(g) || g <= 0))
+      throw new Error("cannot prove the Vitest worker's process groups");
+    protectedGroups = new Set(groups);
+  }
+  return protectedGroups;
+};
+const guardedKill = (seam: string, record: Kill = () => {}, forward: Kill = (p, signal) => { process.kill(p, signal); }): Kill =>
+  (pid, signal) => {
+    killAttempts.push({ seam, pid, signal });
+    record(pid, signal);
+    const refuses = () => { throw new Error(`would signal the Vitest worker ${pid}`); };
+    if ([0, process.pid, process.ppid, -process.pid, -process.ppid].includes(pid)) refuses();
+    if (pid < 0) {
+      // Unknown groups fail closed; there is no fallback that could signal the worker.
+      let groups: Set<number>;
+      try { groups = workerGroups(); } catch { return refuses(); }
+      if (groups.has(-pid)) refuses();
+    }
+    forward(pid, signal);
+  };
+type KillSeam = (record: Kill, forward?: Kill) => Kill;
+// The closed set at the base: :186, :252, :380, :970, :1317. The mutation test
+// instantiates THESE factories, the same ones wired into the real tests below.
+const realKillSeams = {
+  displacedAt: (record, forward = undefined) => guardedKill("displacedAt", record, forward),
+  teardownIdentity: (record, forward = undefined) => guardedKill("teardownIdentity", record, forward),
+  legacyMigration: (record, forward = undefined) => guardedKill("legacyMigration", record, forward),
+  counted: (record, forward = undefined) => guardedKill("counted", record, forward),
+  darwinReadback: (record, forward = undefined) => guardedKill("darwinReadback", record, forward),
+} satisfies Record<string, KillSeam>;
+const cleanupKill = guardedKill("cleanup");
+
 const spawned: ChildProcess[] = [];
 afterEach(() => {
   for (const child of spawned.splice(0)) {
-    try { if (child.pid) process.kill(child.pid, "SIGKILL"); } catch { /* already gone */ }
+    try { if (child.pid) cleanupKill(child.pid, "SIGKILL"); } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+    }
   }
 });
 
@@ -76,7 +120,7 @@ const mkRepo = () => {
 };
 const env = () => { const e = { ...process.env }; delete e[BEAT_GENERATION_ENV]; return e; };
 const deps = (over: Partial<BeatLifecycleDeps> = {}, host: IdentityHost = {}): BeatLifecycleDeps => ({
-  ...defaultBeatDeps(host), cli: CLI, env: env(),
+  ...defaultBeatDeps(host), cli: CLI, env: env(), kill: guardedKill("default"),
   spawn: (command, args, options) => { const child = spawn(command, args, options); spawned.push(child); return child; },
   ...over,
 });
@@ -183,7 +227,7 @@ async function displacedAt(k: number, repo: string, argv: string[], over: Partia
   const base = deps(over);
   const result = await run(repo, argv, {
     ...base, identity: (p) => at(() => base.identity(p)), now: () => at(() => base.now()), sleep: (ms) => at(() => base.sleep(ms)),
-    kill: (p, signal) => { acts.kills++; base.kill(p, signal); },
+    kill: realKillSeams.displacedAt(() => { acts.kills++; }, base.kill),
     spawn: (command, args, options) => { acts.spawns++; return base.spawn(command, args, options); },
   });
   if (!frozen) return undefined;
@@ -245,11 +289,47 @@ exec ${real ? `'${real}'` : "false"} "$@"
   return { bin, fail, doom, missing: join(dir, "absent-lsof") };
 }
 
+test("test: each of the five closed real-kill seams, routed through one guard, throws naming the pid and records the attempt without sending any signal when handed the worker's own pid, its parent's pid or its group, while each seam handed a child the test spawned signals it, and the file's other tests still run (T-F6)", async () => {
+  expect(Object.keys(realKillSeams)).toEqual(["displacedAt", "teardownIdentity", "legacyMigration", "counted", "darwinReadback"]);
+  const forbidden = new Set([process.pid, process.ppid, -process.pid, -process.ppid, 0,
+    ...[...workerGroups()].map((group) => -group)]);
+  for (const [name, factory] of Object.entries(realKillSeams)) {
+    const recorded: Array<[number, NodeJS.Signals]> = [];
+    const forward = name === "displacedAt" || name === "counted" ? deps().kill : undefined;
+    const seam = factory((pid, signal) => { recorded.push([pid, signal]); }, forward);
+    // Intercept the OS boundary as well: a regression in the guard must red this test,
+    // never terminate the test runner before Vitest can record the failure.
+    const send = vi.spyOn(process, "kill").mockImplementation(() => { throw new Error("unguarded signal"); });
+    try {
+      for (const pid of forbidden) {
+        const before = killAttempts.length;
+        expect(() => seam(pid, "SIGTERM")).toThrow(`would signal the Vitest worker ${pid}`);
+        expect(killAttempts.slice(before)).toEqual([{ seam: name, pid, signal: "SIGTERM" }]);
+        expect(recorded.at(-1)).toEqual([pid, "SIGTERM"]);
+      }
+      expect(send).not.toHaveBeenCalled();
+    } finally { send.mockRestore(); }
+
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore" });
+    spawned.push(child);
+    const exited = once(child, "exit");
+    try {
+      await once(child, "spawn");
+      seam(child.pid!, "SIGTERM");
+      expect(await exited).toEqual([null, "SIGTERM"]);
+      expect(recorded.at(-1)).toEqual([child.pid, "SIGTERM"]);
+    } finally {
+      if (child.exitCode === null && child.signalCode === null) cleanupKill(child.pid!, "SIGKILL");
+      await exited;
+    }
+  }
+});
+
 test("test: production beat pre-signal readers treat Linux teardown argv as unknown versus a genuine foreign identity in the closed beat table", async () => {
   const repo = mkRepo();
   const { pid, id } = await ownedFixture(repo, "overseer", "s");
   const kills: Array<[number, string]> = [];
-  const kill = (p: number, signal: NodeJS.Signals) => { kills.push([p, signal]); process.kill(p, signal); };
+  const kill = realKillSeams.teardownIdentity((p, signal) => { kills.push([p, signal]); });
   const seen = (shape: (real: ProcessIdentity) => ProcessIdentity) => deps({ kill, identity: (p) => p === pid ? shape(id) : readProcessIdentity(p) });
   const teardown = (real: ProcessIdentity) => ({ ...real, command: "[node]" });
   const ownerBytes = bytes(beatOwnerPath(repo, "overseer"));
@@ -377,7 +457,7 @@ test("test: production beat start prints the recorded-seat legacy exit and migra
     try { return JSON.parse(readFileSync(supervisionBeatPath(repo, "overseer"), "utf8")).pid === legacy.pid; } catch { return false; }
   });
   const kills: number[] = [];
-  const watched = deps({ kill: (p, signal) => { kills.push(p); process.kill(p, signal); } });
+  const watched = deps({ kill: realKillSeams.legacyMigration((p) => { kills.push(p); }) });
   const live = await run(repo, ["start", "overseer", "--seat", "new:seat"], watched);
   expect(live.code).toBe(1);
   expect(live.out).toContain(`stop pid ${legacy.pid} first`);
@@ -967,7 +1047,7 @@ test("test: production beat start/stop/legacy writers reclaim the exact dead cla
   const counted = async (r: string, argv: string[], over: Partial<BeatLifecycleDeps> | undefined, acts: { kills: number; spawns: number }) => {
     const base = deps({ ...fast, ...over });
     return run(r, argv, {
-      ...base, kill: (p, signal) => { acts.kills++; base.kill(p, signal); },
+      ...base, kill: realKillSeams.counted(() => { acts.kills++; }, base.kill),
       spawn: (command, args, options) => { acts.spawns++; return base.spawn(command, args, options); },
     });
   };
@@ -1314,7 +1394,7 @@ test("test: production beat readback reports confirmed death and missing Darwin 
   const lsof = lsofFixture();
   const darwin = { platform: "darwin" as const, lsof: lsof.bin };
   const kills: number[] = [];
-  const kill = (p: number, signal: NodeJS.Signals) => { kills.push(p); process.kill(p, signal); };
+  const kill = realKillSeams.darwinReadback((p) => { kills.push(p); });
   // The child dies between ps and its cwd read at the initial proof: confirmed death, named, never signalled.
   const dies = mkRepo();
   const diedEarly = await run(dies, ["start", "overseer", "--seat", "s"], deps({

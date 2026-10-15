@@ -14,7 +14,7 @@ import type { AuthHealth, BillingChannel } from "../../src/adapters/types.js";
 import { captureBaseline } from "../../src/gates/baseline.js";
 import { resetLoadProviderForTests, setLoadProviderForTests } from "../../src/gates/run-gates.js";
 import { graphDefinitionHash, loadGraph } from "../../src/graph/graph.js";
-import { gitHead } from "../../src/run/git.js";
+import { gitHead, sh } from "../../src/run/git.js";
 import { GATE_NAMES } from "../../src/graph/schema.js";
 import { runDaemon as daemon } from "../../src/run/daemon.js";
 import { Journal } from "../../src/run/journal.js";
@@ -146,16 +146,14 @@ describe("gate-result telemetry (v2.0 T2, fake adapter, zero tokens)", () => {
     expect(Object.hasOwn(rows.find((row) => row.gate === "lint")!, "reapedGroup")).toBe(false);
   }, 120000);
 
-  // The composite path, staged so the three intervals are separable by construction: the SELECTED
-  // screen sleeps 0.5s (the test command sees its file arguments), the `acceptance` gate that runs
-  // between the screen and the merge-candidate suite sleeps 1.2s, and the FULL suite sleeps 1.6s (no
-  // arguments). A summing-the-wrong-thing implementation is arithmetically visible: full-only reports
-  // ~1.6s, wait-inclusive reports ~3.3s, and only the two test intervals sum to ~2.1s.
+  // ANL-022 §3 T1 #4/#10 (ALT, T-F2): scale both long alternatives x10, T = 180 s.
+  // Keep the selected delay and all lower bounds; half the full run separates selection,
+  // and half the intervening gate separates the sum from a span that includes that wait.
   const SELECTED_MS = 500;
-  const INTERVENING_MS = 1200;
-  const FULL_MS = 1600;
+  const INTERVENING_MS = 1200 * 10;
+  const FULL_MS = 1600 * 10;
 
-  test("test: a delayed selected screen beside a separately delayed intervening gate beside a delayed full suite journals a test durationMs summing only the two test intervals so full-only or wait-inclusive counting fails", async () => {
+  test("test: with the full suite and the intervening gate scaled ten times the screen stays below half the full run and the summed duration below the sum less half the intervening gate, while a screen command that runs the whole suite measures at least half the scaled full run (T-F2)", async () => {
     // `$#` is 0 for the merge-candidate full suite and 1 once run-gates appends the selected file,
     // so ONE configured command gives the screen and the suite different, known costs.
     const testCmd = `sh -c 'if [ $# -gt 0 ]; then sleep ${SELECTED_MS / 1000}; else sleep ${FULL_MS / 1000}; fi' tkr`;
@@ -195,14 +193,15 @@ describe("gate-result telemetry (v2.0 T2, fake adapter, zero tokens)", () => {
     expect(Object.hasOwn(row, "selectedDurationMs")).toBe(false);
     const duration = selected + full;
     expect(selected).toBeGreaterThanOrEqual(SELECTED_MS);
-    expect(selected).toBeLessThan(FULL_MS); // the screen is the subset, not a second full suite
+    const screenIsSelected = (ms: number) => expect(ms).toBeLessThan(FULL_MS / 2);
+    screenIsSelected(selected);
     expect(full).toBeGreaterThanOrEqual(FULL_MS);
 
     // full-only counting fails: the screen's cost is in there too
     expect(duration).toBeGreaterThanOrEqual(SELECTED_MS + FULL_MS);
-    // wait-inclusive counting fails: the intervening gate's 1.2s sat BETWEEN the two intervals and is
-    // excluded, so the sum stays under the span that would have swallowed it
-    expect(duration).toBeLessThan(SELECTED_MS + FULL_MS + INTERVENING_MS);
+    const excludesIntervening = (ms: number) => expect(ms).toBeLessThan(SELECTED_MS + FULL_MS + INTERVENING_MS / 2);
+    excludesIntervening(duration);
+    expect(() => excludesIntervening(duration + intervening.durationMs)).toThrow();
 
     // and it is measured where the gate runs, not re-derived: the journal span from the round's first
     // `test` phase-start to its verdict is strictly larger, because it contains everything in between
@@ -210,6 +209,13 @@ describe("gate-result telemetry (v2.0 T2, fake adapter, zero tokens)", () => {
     const verdict = events.filter((e) => e.event === "gate-result" && e.data.gate === "test").at(-1)!;
     const journalSpan = Date.parse(verdict.ts) - Date.parse(firstTestStart.ts);
     expect(journalSpan).toBeGreaterThan(duration + INTERVENING_MS);
+
+    // Test-local mutation: ignore the selected file argument and execute the fixture's whole suite.
+    // This is the same timed shell seam used by the real gate, with no nested Vitest invocation.
+    const wholeSuiteScreen = await sh(`sh -c 'sleep ${FULL_MS / 1000}' tkr covered.test.js`, repo);
+    expect(wholeSuiteScreen.code).toBe(0);
+    expect(wholeSuiteScreen.durationMs).toBeGreaterThanOrEqual(FULL_MS / 2);
+    expect(() => screenIsSelected(wholeSuiteScreen.durationMs!)).toThrow();
   }, 180000);
 
   // OBS-1176/1070: acceptance and review are launched on the strength of a green selected screen, so

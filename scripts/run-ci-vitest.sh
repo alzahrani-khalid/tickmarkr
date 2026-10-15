@@ -1,62 +1,47 @@
 #!/usr/bin/env bash
-# run-ci-vitest.sh <log> <command...> — run one public-CI Vitest invocation, tee its output to <log>,
-# and exit with the command's OWN status (pipefail semantics, as the step had before) unless the shared
-# classifier proves the complete RPC-only exception (OBS-1184): the command exited exactly 1 and the
-# log is a complete run whose only unhandled errors are vitest-worker RPC timeouts (OBS-1058). grade-ci.sh
-# grades with the same classifier, so the CI badge and the grade agree. A signal or any other nonzero
-# status, a truncated log, a coverage-threshold miss, a failed or timed-out test, or a missing classifier
-# keeps the raw status. The count oracle (assert-test-file-count.sh) stays a separate step.
+# run-ci-vitest.sh <log> <command...> — run one public-CI Vitest invocation, tee its output to <log>, and
+# decide its exit from the invocation's OWN record (v2.8.2 T1, ANL-022 §7.1; queue row 148), never from the
+# text the run printed. The badge (this exit) and the grade (grade-ci.sh, which downloads the same records
+# once ANL-022 §7.2b ships) read the same record, so they cannot disagree; no text rule decides this exit.
 #
 # Every invocation first creates the log's parent directory and removes a stale record, then runs as
 # `TICKMARKR_CI_RECORD=<log>.record.json <command...>` — a prefix, never exported — so the command's own
-# Vitest writes its CI record (FORMAT F2) there and nothing else this script starts inherits the variable.
-# If either step fails the command is never run and the exit is 2: a stale record must never pass for this run's.
+# Vitest writes its CI record (FORMAT F3, scripts/ci/reporter.ts) there and nothing else this script starts
+# inherits the variable. If either step fails the command is never run and the exit is 2: a stale record must
+# never pass for this run's.
 #
-# UNSHARDED (no token starts with --shard): "complete" includes the run's declared contract (D-893: an RPC
-# timeout once ended a run before its single-fork projects, and its log still read RPC_ONLY). The command
-# declares its projects with its own --project argv; Vitest's own discovery (`npx vitest list --filesOnly`)
-# in the candidate tree — this working directory — names the files those projects own, and their sum is the
-# classifier's file count, so a never-started declared project is a short count: a log that collected fewer
-# is RED reason=partial and keeps its 1, whatever its tests printed or its record holds; so does a declared
-# project discovery cannot find. An unsharded command that declares no project carries no count contract.
-#
-# SHARDED (any token starts with --shard; v2.7.8 T3, G5): a count can never hold a shard, so the shard's
-# RECORD is held to its PLAN as a SET of {file, project} by `scripts/ci/cli.ts contract`, run through this
-# checkout's own tsx as the classifier is found here. The command must match the CLOSED ARGV GRAMMAR —
-# `npm run test:coverage -- <args>` or `npx vitest run <args>`, args being any `--project p`/`--project=p`
-# and exactly one canonical `--shard=k/n`/`--shard k/n` — or the contract is UNREADABLE (defect kind argv):
-# a positional filter, a second or noncanonical shard and any other flag included. The plan is T2's
-# lptShards over scripts/ci/durations.json and Vitest's own discovery (`npx vitest list --filesOnly
-# --json`) of those projects — every project when none is declared — which is the partition the root
-# sequencer applied; the record's shard must equal the argument's. The contract is checked at status 0 AND 1:
-#   status neither 0 nor 1                 -> that status
-#   contract RED or UNREADABLE             -> 1 (a missing, unexpected, duplicate or unfinished file, an absent
-#                                             record, an argv or shard-mismatch defect, a discovery failure)
-#   contract GREEN, status 0               -> 0
-#   contract GREEN, status 1               -> 0 only when the classifier, given the planned count, reads
-#                                             RPC_ONLY; else 1
-# So an unfiltered or incomplete shard is never laundered, a status-0 run over another shard's files is red,
-# and a declared project that contributes no file to this shard owes none. The callers pass nothing new.
+# At status 0 and 1 two machine verdicts are computed through this checkout's own tsx and both lines print:
+#   the record verdict  `scripts/ci/cli.ts verdict <record>`  -> RECORD_VERDICT CLEAN | RPC_ONLY | RED | UNREADABLE
+#                       (RPC_ONLY: every unhandled error is an exact vitest-worker RPC timeout — name Error, the
+#                       whole message `[vitest-worker]: Timeout calling "<m>"`, type Unhandled Error — and no
+#                       file or test failed or stayed unfinished; an absent record is UNREADABLE)
+#   the set contract    `scripts/ci/cli.ts contract --record <record> -- <command...>` -> SHARD_CONTRACT
+#                       The command must match the CLOSED ARGV GRAMMAR — `npm run test:coverage -- <args>` or
+#                       `npx vitest run <args>`, args being any `--project p`/`--project=p` and at most one
+#                       canonical `--shard=k/n`/`--shard k/n` — or the contract is UNREADABLE (defect argv).
+#                       UNSHARDED: the record's {file, project} set must equal Vitest's own discovery
+#                       (`npx vitest list --filesOnly --json`) of the declared projects — every project when none
+#                       is declared — and each declared project must own a discovered file, so a never-started
+#                       project or an RPC timeout's stranded module (absent from the record) is RED.
+#                       SHARDED: the record is held to its LPT plan over scripts/ci/durations.json and that
+#                       discovery, the partition the root sequencer applied; the record's shard must equal the
+#                       argument's.
+# The status-versus-record table:
+#   status neither 0 nor 1                          -> that status (a signal, a crash, a tee failure)
+#   status 0, record CLEAN and contract GREEN       -> 0
+#   status 1, record RPC_ONLY and contract GREEN    -> 0 (the complete RPC-only exception: the set is complete
+#                                                     and every file in it passed or skipped)
+#   status 0 or 1, anything else                    -> 1 (a RED, unfinished or interrupted record, a CLEAN record
+#                                                     at status 1, an absent record, a RED or UNREADABLE contract)
+# Coverage thresholds are the floors step's verdict (`cli.ts floors --out`), not this wrapper's. The callers
+# pass nothing new.
 set -uo pipefail
 
 log=${1:?usage: run-ci-vitest.sh <log> <command...>}
 shift
 [ "$#" -gt 0 ] || { echo "run-ci-vitest: a command is required" >&2; exit 2; }
 checkout="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-classifier="$checkout/skills/tickmarkr-overseer/scripts/classify-vitest-log.sh"
 record="$log.record.json"
-
-projects=()
-sharded=
-prev=
-for arg in "$@"; do
-  [ "$prev" = --project ] && projects+=("$arg")
-  case "$arg" in
-    --project=*) projects+=("${arg#--project=}") ;;
-    --shard*) sharded=1 ;;
-  esac
-  prev=$arg
-done
 
 mkdir -p -- "$(dirname -- "$log")" || { echo "run-ci-vitest: cannot create the directory of $log; the command was not run" >&2; exit 2; }
 rm -f -- "$record" || { echo "run-ci-vitest: cannot remove the stale record $record; the command was not run" >&2; exit 2; }
@@ -64,50 +49,26 @@ TICKMARKR_CI_RECORD="$record" "$@" 2>&1 | tee "$log"
 statuses=("${PIPESTATUS[@]}")
 [ "${statuses[1]}" -eq 0 ] || exit "${statuses[1]}"
 status=${statuses[0]}
+[ "$status" -eq 0 ] || [ "$status" -eq 1 ] || exit "$status"
 
-contract=()
-if [ -n "$sharded" ]; then
-  [ "$status" -eq 0 ] || [ "$status" -eq 1 ] || exit "$status"
-  shard_contract=$("$checkout/node_modules/.bin/tsx" "$checkout/scripts/ci/cli.ts" contract --record "$record" -- "$@")
-  contract_status=$?
-  [ -z "$shard_contract" ] || printf '%s\n' "$shard_contract"
-  planned=$(printf '%s\n' "$shard_contract" | sed -n '$s|^SHARD_CONTRACT verdict=GREEN shard=[0-9]*/[0-9]* planned=\([0-9][0-9]*\) .*|\1|p')
-  if [ "$contract_status" -ne 0 ] || [ -z "$planned" ]; then
-    if [ "$status" -eq 1 ]; then echo "run-ci-vitest: exit 1 kept: the shard contract is not GREEN"
-    else echo "run-ci-vitest: exit 0 -> 1: the shard contract is not GREEN"; fi
-    exit 1
-  fi
-  [ "$status" -eq 1 ] || exit 0
-  contract=("$planned")
-  echo "run-ci-vitest: shard contract GREEN: $planned planned files"
-else
-  [ "$status" -eq 1 ] || exit "$status"
-  if [ "${#projects[@]}" -gt 0 ]; then
-    selection=()
-    for project in "${projects[@]}"; do selection+=(--project "$project"); done
-    if ! discovered=$(npx vitest list --filesOnly "${selection[@]}" 2>/dev/null); then
-      echo "run-ci-vitest: exit 1 kept: candidate-tree discovery failed for ${projects[*]}"
-      exit 1
-    fi
-    expected=0
-    for project in "${projects[@]}"; do
-      owned=$(printf '%s\n' "$discovered" | awk -v label="[$project] " 'index($0, label) == 1 { n++ } END { print n + 0 }')
-      if [ "$owned" -eq 0 ]; then
-        echo "run-ci-vitest: exit 1 kept: candidate-tree discovery found no test file for declared project $project"
-        exit 1
-      fi
-      expected=$((expected + owned))
-    done
-    contract=("$expected")
-    echo "run-ci-vitest: declared contract: $expected files across $(IFS=,; printf '%s' "${projects[*]}")"
-  fi
+cli=("$checkout/node_modules/.bin/tsx" "$checkout/scripts/ci/cli.ts")
+verdict_out=$("${cli[@]}" verdict "$record")
+verdict_status=$?
+[ -z "$verdict_out" ] || printf '%s\n' "$verdict_out"
+contract_out=$("${cli[@]}" contract --record "$record" -- "$@")
+contract_status=$?
+[ -z "$contract_out" ] || printf '%s\n' "$contract_out"
+verdict=$(printf '%s\n' "$verdict_out" | sed -n '$s/^RECORD_VERDICT verdict=\([A-Z_]*\) .*/\1/p')
+contract=$(printf '%s\n' "$contract_out" | sed -n '$s/^SHARD_CONTRACT verdict=\([A-Z]*\) .*/\1/p')
+# fail closed: a verdict word is believed only beside its own exit status
+if [ "$verdict_status" -ne 0 ] && { [ "$verdict" = CLEAN ] || [ "$verdict" = RPC_ONLY ]; }; then verdict=UNREADABLE; fi
+[ "$contract_status" -eq 0 ] || [ "$contract" != GREEN ] || contract=UNREADABLE
+
+want=CLEAN
+[ "$status" -eq 0 ] || want=RPC_ONLY
+if [ "$verdict" = "$want" ] && [ "$contract" = GREEN ]; then
+  echo "run-ci-vitest: exit $status -> 0: record ${verdict} and set contract GREEN"
+  exit 0
 fi
-
-verdict=$(bash "$classifier" "$log" ${contract[@]+"${contract[@]}"} 2>&1)
-case "$verdict" in
-  "VITEST_LOG verdict=RPC_ONLY "*)
-    echo "run-ci-vitest: exit 1 -> 0, every unhandled error is a vitest-worker RPC timeout: $verdict"
-    exit 0 ;;
-esac
-echo "run-ci-vitest: exit 1 kept: ${verdict:-classifier produced no verdict}"
+echo "run-ci-vitest: exit $status -> 1: record ${verdict:-UNREADABLE} (status $status needs $want) and set contract ${contract:-UNREADABLE} (needs GREEN)"
 exit 1

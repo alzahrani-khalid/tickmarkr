@@ -72,41 +72,65 @@ Per release:
 
    The captured proof must show the exported candidate complete `npm ci`, `npm run build`,
    **`npm run lint`**, and only then `npm test`, with a zero exit. A suite summary without the preceding
-   lint block is not a release proof. Then export into the persistent mirror, review the commit, and
-   derive the count oracle `N` from its tracked tree using real glob semantics:
+   lint block is not a release proof. The suite is decided from its own record (the printed `RECORD_VERDICT`
+   and `SET_ORACLE` lines), and only a zero exit writes the **export proof** — `tickmarkr-export-proof/1`,
+   naming this `HEAD`, the exported tree, the version and those two lines — at
+   `$(git rev-parse --git-path tickmarkr-release/export-proof.json)`: inside the git directory, so the tree
+   stays clean. Every run first removes the previous proof. Then export into the persistent mirror:
 
    ```bash
    bash scripts/export-public.sh --onto /path/to/tickmarkr-public-mirror
-   git -C /path/to/tickmarkr-public-mirror show --stat
-   git -C /path/to/tickmarkr-public-mirror ls-files \
-     ':(glob)tests/**/*.test.ts' ':(glob)tests/**/*.test.tsx' | wc -l
+   ```
+
+   `--onto` reads the export proof before it touches the mirror: no proof, a proof of another `HEAD` (a commit
+   made since `verify:export`) or of another export tree refuses with exit 1 and leaves the mirror
+   byte-identical — prove the new `HEAD` again. On success it prints exactly one `MIRROR_COMMIT=<40 hex>` line,
+   the mirror commit whose tree is the proven tree. Paste that line into the shell (step 4 reads
+   `$MIRROR_COMMIT`), review the commit, and push it:
+
+   ```bash
+   git -C /path/to/tickmarkr-public-mirror show --stat "$MIRROR_COMMIT"
    git -C /path/to/tickmarkr-public-mirror push origin HEAD:main
    ```
 
-   A bare git pathspec such as `tests/**/*.test.ts` does not give `**` glob semantics; use `:(glob)` as
-   above (or `git ls-files | grep`) or the expected count is false. Wait for the [`CI (public)`](.github/workflows/ci.public.yml) workflow run triggered by that exact mirror `main`
+   Wait for the [`CI (public)`](.github/workflows/ci.public.yml) workflow run triggered by that exact mirror `main`
    push to reach **run-end**. Its `test` and `test-macos` jobs run the parallel `suite` project under
-   coverage and the single-fork projects `ci.public.yml` runs by name independently, then count-assert the sum of both
-   collected test-file totals against `N`.
-4. At run-end, match the run's head SHA to the mirror's `HEAD`, then grade the two JOB LOGS — never the
-   badge and never an in-progress run — with the shipped tri-state grader:
+   coverage and the single-fork projects `ci.public.yml` runs by name independently, write the floors
+   sidecar, assert the collected test-file set in-job, and upload each job's proof group as `proof-<job>`.
+4. At run-end grade that run against `MIRROR_COMMIT`, the mirror's `HEAD` — never the badge and never an
+   in-progress run — with the shipped tri-state grader, giving it the mirror clone that holds the commit:
 
    ```bash
-   bash skills/tickmarkr-overseer/scripts/grade-ci.sh <run-id> <N> v2.8.1
+   bash skills/tickmarkr-overseer/scripts/grade-ci.sh <run-id> "$MIRROR_COMMIT" /path/to/tickmarkr-public-mirror v2.8.2
    ```
 
-   `gh run view --job --log` can be empty while a run is in progress, so `UNREADABLE` (exit 2) is a hard
-   stop, not green. `GREEN` requires the expected `COUNT_ORACLE`, zero failed/timed-out tests, and the
-   matching collected total in both job logs; `RED` exits 1. This is the count-asserted full-suite proof
-   for the exported tree. It does not make the post-tag workflow rerun that suite or automatically bind
-   publication to the recorded pre-tag proof.
+   The grader is bound to that head: a run of any other commit, or one not yet at run-end, reads
+   `UNREADABLE` (exit 2) before anything is downloaded — a hard stop, not green. It reads each job's step
+   outcomes and conclusions from `gh run view --json`, downloads the job's `proof-<job>` artifact (an
+   authenticated `gh` is required; an expired or missing artifact reads `UNREADABLE`) and recomputes it with
+   `scripts/ci/cli.ts proof`: the Vitest records CLEAN or RPC-only at that head, every test file the commit
+   tracks recorded exactly once and finished, and the floors sidecar GREEN. No job log text is read and no
+   count is derived by hand. `RED` exits 1 and `INFRA_KILLED` (a cancelled job) exits 3; neither is green.
+   This is the set-checked full-suite proof for the exported tree; the Release workflow (step 5) grades the
+   same run again before it publishes.
 
-   Only after the grader returns GREEN for both jobs, tag the export commit in the **public** mirror and
-   push the tag:
+   Before creating the public tag, check that the graded commit is still the clean mirror tip and
+   fetched `origin/main`, and that the tag is absent both locally and at the origin. Both checks must
+   print `GREEN` (exit 0); stop on `RED` or `UNREADABLE`:
 
    ```bash
-   git tag -a v2.8.1 -m "v2.8.1"
-   git push origin v2.8.1
+   npx --no-install tsx scripts/ci/cli.ts release subject /path/to/tickmarkr-public-mirror "$MIRROR_COMMIT"
+   npx --no-install tsx scripts/ci/cli.ts release tag-absent /path/to/tickmarkr-public-mirror v2.8.2
+   ```
+
+   Only after the grader prints `VERDICT rc=0` (GREEN for both jobs), tag `MIRROR_COMMIT` in the **public**
+   mirror and push the tag. The two release checks above must also have printed `GREEN` immediately
+   before this act:
+
+   ```bash
+   cd /path/to/tickmarkr-public-mirror
+   git tag -a v2.8.2 "$MIRROR_COMMIT" -m "v2.8.2"
+   git push origin v2.8.2
    ```
 
 5. The tag push runs `release.yml` in the public repository:
@@ -114,12 +138,15 @@ Per release:
    - `npm ci`
    - `npm run build`
    - `npm run lint`
-   - `npx vitest run --project built-cli --project signal-reaper` (artifact-scoped release gate —
-     it proves only the built CLI and signal-reaper scope it runs. It does not rerun or establish
-     the multi-project, tree-count-asserted full-suite proof from step 3, nor verify that proof is on
-     record for this exact SHA; matching the pre-tag run remains the operator's required manual
-     precondition. The teardown RPC timeout is real, but release trees have also carried genuine
-     assertion failures this subset does not run)
+   - the release gate (`permissions: actions: read`): `gh run list --workflow ci.public.yml --commit
+     <tagged sha> --event push` must return exactly one run, completed with conclusion `success` — none, two,
+     one still running or one concluded otherwise fails the job (it fails, it does not wait: rerun the Release
+     workflow after CI ends) — and `skills/tickmarkr-overseer/scripts/grade-ci.sh` must grade that run GREEN
+     against the tagged checkout: the same inventory, declared steps, conclusions, proof groups and recomputed
+     test-file set as step 4. The step has no `if:` and no `continue-on-error`, so nothing after it runs when it
+     fails. No test subset runs here any more: the multi-project, tree-count-asserted full-suite proof from
+     step 3 is read, not rerun (the teardown RPC timeout was real, but release trees have also carried genuine
+     assertion failures a subset does not run)
    - `npm publish --provenance --access public` (only if all checks pass)
 
    After the Release run reaches success, query `npm view tickmarkr version` and the published
@@ -127,11 +154,20 @@ Per release:
    returns the prior version, wait and **re-read the registry before ruling**. Record publication only
    after a fresh read shows the intended version and provenance.
 
-6. Before a release is complete, run and retain the enabled forced-stall proof for the release tree:
+6. Before a release is complete, run and retain the enabled forced-stall proof and the installed-Orca smoke
+   for the release tree, each decided from its own record and never from its exit status — Vitest exits 0
+   when the named leaf is skipped:
 
    ```bash
-   TICKMARKR_TEST_FORCE_STALL=1 npx --no-install vitest run tests/e2e/forced-stall.e2e.test.ts -t 'the enabled forced-stall release proof makes the integration tip verifier recover a real RPC-stranded serial file as parallel exit1 then serial-only exit0 under distinct nonces, so a helper-only green or a full-suite retry fails'
+   TICKMARKR_CI_RECORD=/tmp/tickmarkr-forced-stall.record.json TICKMARKR_TEST_FORCE_STALL=1 npx --no-install vitest run tests/e2e/forced-stall.e2e.test.ts -t 'the enabled forced-stall release proof makes the integration tip verifier recover a real RPC-stranded serial file as parallel exit1 then serial-only exit0 under distinct nonces, so a helper-only green or a full-suite retry fails'
+   npx --no-install tsx scripts/ci/cli.ts verdict --require-test 'tests/e2e/forced-stall.e2e.test.ts::the enabled forced-stall release proof makes the integration tip verifier recover a real RPC-stranded serial file as parallel exit1 then serial-only exit0 under distinct nonces, so a helper-only green or a full-suite retry fails' /tmp/tickmarkr-forced-stall.record.json
+   TICKMARKR_CI_RECORD=/tmp/tickmarkr-orca-smoke.record.json TICKMARKR_E2E=1 npx --no-install vitest run tests/e2e/orca-smoke.e2e.test.ts
+   npx --no-install tsx scripts/ci/cli.ts verdict --require-test 'tests/e2e/orca-smoke.e2e.test.ts::e2e: orca driver smoke > live: the real-orca terminal leg — vitest-skipped without the gate or a reachable runtime' /tmp/tickmarkr-orca-smoke.record.json
    ```
+
+   Each proof passes only when its `verdict --require-test` exits 0: the named leaf recorded `passed`. An unset
+   `TICKMARKR_TEST_FORCE_STALL`, a `-t` filter that drifted from the title (every leaf recorded skipped), or an
+   Orca live leg that left through `ctx.skip()` reads `RED` (exit 1).
 
    This opt-in experiment takes at least 60 seconds: it drops only the final parallel worker
    acknowledgement after the production reporter records completion, then lets the installed
@@ -143,7 +179,34 @@ Per release:
    full-suite retry, or skipped expensive leaf is not release proof. Normal suites may skip this
    experiment; the healthy, assertion-red, and all-skipped controls always run in unfiltered suites.
 
-Publish is fail-closed: a failing build, lint, or test blocks publication.
+### 7. Private tag after step 6
+
+   After merging the release into private `main`, record that commit and compare its three shipped trees
+   with the public tag before creating the private annotated tag. Other private paths may differ. Run
+   the check from the private repository; only `GREEN` (exit 0) permits the tag:
+
+   ```bash
+   cd /path/to/tickmarkr-private-main
+   PRIVATE_RELEASE_COMMIT=$(git -C /path/to/tickmarkr-private-main rev-parse main)
+   npx --no-install tsx scripts/ci/cli.ts release trees-equal /path/to/tickmarkr-private-main "$PRIVATE_RELEASE_COMMIT" /path/to/tickmarkr-public-mirror v2.8.2
+   git -C /path/to/tickmarkr-private-main tag -a v2.8.2 "$PRIVATE_RELEASE_COMMIT" -m "v2.8.2"
+   ```
+
+### 8. Branch deletion after the private tag
+
+   Before deleting any release spec or merged run branch, list every branch intended for deletion in
+   `BRANCHES_TO_DELETE` (replace the run id with the actual branch). Check them together against the
+   private release commit. A missing or unmerged branch prints `RED` and names that branch; archive
+   any unmerged branch under `refs/archive/<name>` before a separate deletion decision. Delete branches
+   by hand only after `GREEN` (exit 0):
+
+   ```bash
+   BRANCHES_TO_DELETE=(spec/v2.8.2 tickmarkr/run-<run-id>)
+   npx --no-install tsx scripts/ci/cli.ts release prune-safe /path/to/tickmarkr-private-main "$PRIVATE_RELEASE_COMMIT" "${BRANCHES_TO_DELETE[@]}"
+   git -C /path/to/tickmarkr-private-main branch -d "${BRANCHES_TO_DELETE[@]}"
+   ```
+
+Publish is fail-closed: a failing build, lint, or release gate blocks publication.
 
 ## Post-publish local sync (mandatory)
 
@@ -152,7 +215,15 @@ registry shows the new version:
 
 1. `npm i -g tickmarkr@latest` — registry propagation can lag a minute; if the next step still
    shows the prior release, wait and retry once.
-2. `tickmarkr version` must report exactly the just-published version. A mismatch is a hard
+2. From the private source repository, check the installed binary against the just-published
+   version; only `GREEN` (exit 0) permits local sync to continue:
+
+   ```bash
+   cd /path/to/tickmarkr-private-main
+   npx --no-install tsx scripts/ci/cli.ts release installed-version tickmarkr 2.8.2
+   ```
+
+   `tickmarkr version` must report exactly the just-published version. A mismatch is a hard
    stop: diagnose the publish or the install — never leave the machine half-updated (a stale
    binary silently skips daemon gates; see the version preflight in the agent docs).
 3. In the active consumer workspaces `SentioQ` and `quranic-insights`, run
@@ -234,6 +305,8 @@ The public repository maintains **append-only history** with one commit per rele
 
    After building and leak-checking the export exactly as above (a leak aborts before the mirror
    is touched), `--onto`:
+   - refuses, before the mirror is touched, unless the export proof `verify:export` wrote (per-release
+     step 3) names this `HEAD` and this export's tree;
    - fetches the mirror's `origin` and **resets the mirror clone to its own `origin/main`**
      (`git reset --hard origin/main`) before applying anything;
    - removes the mirror's tracked files with `git rm` only — it never runs a filesystem delete
@@ -241,7 +314,7 @@ The public repository maintains **append-only history** with one commit per rele
      retired manual recipe's `rm -rf -- */ *.* .*` glob could match `.git`);
    - extracts the export's committed tree on top;
    - records a single commit on top of `main` — `tickmarkr <version> — public export`, with the
-     version read from the export's own `package.json`;
+     version read from the export's own `package.json` — and prints it as `MIRROR_COMMIT=<40 hex>`;
    - **never pushes**.
 
 3. Review the mirror commit, then push manually:

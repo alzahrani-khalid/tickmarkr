@@ -983,7 +983,6 @@ describe("v1.25 trust-auto-answer journal (fake adapter, zero tokens)", () => {
 // v1.39 OBS-37b: per-task timeoutMinutes overrides config taskTimeoutMinutes for that task only.
 describe("per-task timeout override (OBS-37b)", () => {
   test("shorter task override times out before the config default would", async () => {
-    const t0 = Date.now();
     const { repo, fake } = setupRepo(
       [T("T1", { timeoutMinutes: 0.02 })],
       { tasks: { T1: [{ shell: "sleep 30" }] }, consult: { action: "human", notes: "stalled" } },
@@ -991,7 +990,8 @@ describe("per-task timeout override (OBS-37b)", () => {
     );
     const s = await runDaemon(repo, { adapters: [fake], runId: "run-timeout-short" });
     expect(s.human).toEqual(["T1"]);
-    expect(Date.now() - t0).toBeLessThan(5_000); // config default 5m would not fire this fast
+    // ANL-022 §3 T1 #15 (EV, T-F1): config default 5 min > T = 30 s;
+    // s.human == [T1] and the overrun row reject the long path.
     const row = Journal.open(repo, "run-timeout-short").readTelemetry().find((r) => r.taskId === "T1")!;
     expect(row.overrun).toBe(true);
   }, 30_000);
@@ -1009,7 +1009,6 @@ describe("per-task timeout override (OBS-37b)", () => {
   }, 30_000);
 
   test("tasks without override keep config-default timeout behavior", async () => {
-    const t0 = Date.now();
     const { repo, fake } = setupRepo(
       [T("T1", { timeoutMinutes: 0.02 }), T("T2")],
       {
@@ -1024,7 +1023,8 @@ describe("per-task timeout override (OBS-37b)", () => {
     const s = await runDaemon(repo, { adapters: [fake], runId: "run-timeout-default" });
     expect(s.human).toEqual(["T1"]);
     expect(s.done).toEqual(["T2"]);
-    expect(Date.now() - t0).toBeLessThan(8_000); // T1 short override; T2 uses 5m default and finishes quickly
+    // ANL-022 §3 T1 #22 (EV, T-F1): T1 config default 5 min > T = 30 s;
+    // retain s.human == [T1] and s.done == [T2] above.
   }, 30_000);
 
   test("a run whose worker dies leaving scoped files uncommitted journals a `worktree-preserved` row naming a reference that resolves; the row precedes the recreation row it protects against; a journal carrying only what the recreation carried reads complete over a destroyed half: it fails", async () => {

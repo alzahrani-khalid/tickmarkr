@@ -275,11 +275,11 @@ describe("fixture stress harness", () => {
     expect(alive(-tracked.pid!)).toBe(false);
 
     // Discovery that never answers is cut at half of one teardown deadline, and the reaping still happens.
-    const started = Date.now();
     const stalled = await runOwned("sh", ["-c", "sleep 60 & sleep 60"], {
       ms: 200, boundMs: 2_000, ps: (o) => o.phase === "teardown" ? new Promise<never>(() => {}) : psTable(o),
     });
-    expect(Date.now() - started).toBeLessThan(10_000);
+    // ANL-022 §3 T1 #24 (EV, T-F1): discovery never answers (L unbounded > T = 240 s);
+    // the named discovery timeout and complete reaping remain the witnesses.
     expect(stalled.why).toBe("expired");
     expect(stalled.unresolved).toBe("process discovery failed: discovery past its 1000 ms share of the teardown bound timed out");
     expect(stalled.survivors).toEqual([]);

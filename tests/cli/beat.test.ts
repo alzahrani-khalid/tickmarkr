@@ -225,11 +225,13 @@ function beatChild(repo: string, args: string[], prelude = "") {
     async close() { if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL"); await exited; },
   };
 }
-const awaitDisk = async (predicate: () => boolean, timeout = 5_000) => {
-  const deadline = Date.now() + timeout;
+type Clock = { now: () => number; sleep: (ms: number) => Promise<void> };
+const realClock: Clock = { now: Date.now, sleep: ms => new Promise(resolve => setTimeout(resolve, ms)) };
+const awaitDisk = async (predicate: () => boolean, timeout = 5_000, clock: Clock = realClock) => {
+  const deadline = clock.now() + timeout;
   while (!predicate()) {
-    if (Date.now() >= deadline) throw new Error("timed out waiting for beat process");
-    await new Promise(resolve => setTimeout(resolve, 20));
+    if (clock.now() >= deadline) throw new Error("timed out waiting for beat process");
+    await clock.sleep(20);
   }
 };
 
@@ -251,8 +253,19 @@ test("test: beat with loop creates a durable arm identity then beats the tier un
     standDownTier(repo, "overseer", "loop-seat");
     const marker = readFileSync(supervisionStandDownPath(repo, "overseer"), "utf8");
     const stoppedAt = Date.now();
-    await awaitDisk(() => runner.child.exitCode !== null, SUPERVISION_BEAT_MS + 1_000);
-    expect(Date.now() - stoppedAt).toBeLessThanOrEqual(SUPERVISION_BEAT_MS + 500);
+    // ANL-022 §3 T1 #26 (DW, T-F3): "within one interval" is bounded by 2 x SUPERVISION_BEAT_MS,
+    // the awaitDisk deadline raised to match. The healthy exit only has to land under it.
+    const exitsWithinOneInterval = (exited: () => boolean, clock?: Clock) =>
+      awaitDisk(exited, 2 * SUPERVISION_BEAT_MS, clock);
+    await exitsWithinOneInterval(() => runner.child.exitCode !== null);
+    expect(Date.now() - stoppedAt).toBeLessThan(2 * SUPERVISION_BEAT_MS);
+    // The long path: a test-local failover that exits one extra configured window late, driven on
+    // a simulated clock (one beat per poll) so it costs no wall time and is independent of the
+    // healthy run's measured duration; the same guard must reject it.
+    let simulatedNow = 0;
+    const lateClock: Clock = { now: () => simulatedNow, sleep: async () => { simulatedNow += SUPERVISION_BEAT_MS; } };
+    const lateFailover = () => simulatedNow >= 3 * SUPERVISION_BEAT_MS;
+    await expect(exitsWithinOneInterval(lateFailover, lateClock)).rejects.toThrow(/timed out/);
     // a stood-down loop ends NONZERO with its reason: a refusal never reads as a quiet, healthy exit
     expect(await runner.exited).not.toBe(0);
     expect(runner.errors()).toContain("DISARMED — stood down");

@@ -60,7 +60,9 @@ describe("child-report reader (OBS-1200)", () => {
     await expect(readChildReport(malformed, deadline)).rejects.toThrow(/incomplete after 700 ms: "\{ not json"/);
     const elapsed = Date.now() - before;
     expect(elapsed).toBeGreaterThanOrEqual(deadline);
-    expect(elapsed).toBeLessThan(deadline + 2_000);
+    // ANL-022 §3 T1 #9 (EV, T-F1): no upper ceiling. The long path — the 60 s production default
+    // taken instead of the 700 ms argument — fails by the test's own 20 s timeout (L > T), and the
+    // rejection naming 700 ms plus the lower bound above stay as the witness.
     expect(CHILD_REPORT_DEADLINE_MS).toBe(60_000); // the production caller keeps the 600 × 100 ms bound
   }, 20_000);
 });

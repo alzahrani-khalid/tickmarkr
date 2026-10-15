@@ -38,7 +38,10 @@ function fixture() {
   const base = (): Summary => Object.fromEntries(dirs.map((dir) => [join(root, `src/${dir}/a.ts`), source()]));
   const record = (subset: File[], name: string, selectedHead: string | null = head): string => {
     const path = join(root, name);
-    writeFileSync(path, JSON.stringify({ schema: "tickmarkr-ci-record/1", head: selectedHead, shard: null, files: subset }));
+    writeFileSync(path, JSON.stringify({
+      schema: "tickmarkr-ci-record/2", head: selectedHead, shard: null, files: subset, reason: "passed", unhandled: [],
+      tests: subset.map(({ file, project, state }) => ({ file, project, name: "case", state })),
+    }));
     return path;
   };
   const summary = (value: Summary, name: string): string => {
@@ -175,6 +178,10 @@ test("test: a summary path outside --root and a malformed record or summary exit
   const malformed = join(f.root, "bad-record.json");
   writeFileSync(malformed, "{");
   expect((await run(f.root, [malformed], [record], a, b, runnerRoot)).code).toBe(2);
+  // a record of the previous format (F2: no reason, unhandled errors or test entries) is another schema
+  const formatTwo = join(f.root, "f2-record.json");
+  writeFileSync(formatTwo, JSON.stringify({ schema: "tickmarkr-ci-record/1", head: f.head, shard: null, files: f.rows() }));
+  expect((await run(f.root, [formatTwo], [record], a, b, runnerRoot)).code).toBe(2);
   writeFileSync(join(f.root, "bad-summary.json"), readFileSync(a, "utf8").slice(0, 10));
   expect((await run(f.root, [record], [record], join(f.root, "bad-summary.json"), b, runnerRoot)).code).toBe(2);
 });

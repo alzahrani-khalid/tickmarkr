@@ -869,16 +869,52 @@ describe("redactSecrets (persistence-seam redaction pass)", () => {
     expect(redactSecrets(once)).toBe(once);
   });
 
-  test("redaction stays linear on parked-diff-scale payloads", () => {
-    // Regression: a leading [A-Za-z0-9_.-]* in the assignment pattern backtracked quadratically —
-    // ~24s on one 130K token, paid on every journal append. Bound is ~100× current cost so it only
-    // trips on a complexity regression, never on machine load.
+  test("test: redaction's cost on twice the payload stays under three times its cost on the payload above a one hundred millisecond noise floor, while a deliberately quadratic stand-in measured by the same ratio fails it (T-F4)", () => {
+    // ANL-022 §3 T1 #19 (REL): the former 5 s ceiling tested machine speed.
+    // Preserve both backtracking triggers and byte equality; T remains the default 20 s.
     const giantToken = "A".repeat(130_000);
     const diffWithKeyword = `--- a/big.min.js\n+${"sha512-AbCdEf0123456789".repeat(7000)}\ntoken refresh flow`;
-    const t0 = performance.now();
+    // Keep this token uninterrupted: repeating separated tokens would let per-token
+    // quadratic backtracking masquerade as linear growth.
+    const payload = giantToken + "sha512-AbCdEf0123456789".repeat(7000);
+    const doubled = payload.repeat(2);
     expect(redactSecrets(giantToken)).toBe(giantToken);
     expect(redactSecrets(diffWithKeyword)).toBe(diffWithKeyword);
-    expect(performance.now() - t0).toBeLessThan(5000);
+    expect(redactSecrets(doubled)).toBe(doubled);
+
+    let observed: unknown;
+    const costRatio = (work: (text: string) => unknown) => {
+      const measure = (text: string, repeats: number) => {
+        const start = performance.now();
+        for (let i = 0; i < repeats; i++) observed = work(text);
+        return performance.now() - start;
+      };
+      // Warm both sizes, then calibrate an identical batch count ABOVE the 100 ms noise floor.
+      measure(payload, 1); measure(doubled, 1);
+      let repeats = 1;
+      while (measure(payload, repeats) < 100) repeats *= 2;
+      const ratios = Array.from({ length: 3 }, (_, i) => {
+        // Alternate order to avoid systematically favouring either size as the host load changes.
+        const times = i % 2 ? [measure(doubled, repeats), measure(payload, repeats)].reverse()
+          : [measure(payload, repeats), measure(doubled, repeats)];
+        return times[1]! / Math.max(100, times[0]!);
+      });
+      return ratios.sort((a, b) => a - b)[1]!;
+    };
+    const linear = (ratio: number) => expect(ratio).toBeLessThan(3);
+    linear(costRatio(redactSecrets));
+    // Every sampled character is paired with every other: doubling the input quadruples work.
+    // Sampling keeps this deliberately quadratic stand-in within the unchanged test timeout.
+    const quadratic = (text: string) => {
+      let sum = 0;
+      for (let i = 0; i < text.length; i += 128)
+        for (let j = 0; j < text.length; j += 128) sum = (sum + text.charCodeAt(i) * text.charCodeAt(j)) | 0;
+      return sum;
+    };
+    const badRatio = costRatio(quadratic);
+    expect(badRatio).toBeGreaterThanOrEqual(3);
+    expect(() => linear(badRatio)).toThrow();
+    expect(Number.isFinite(observed)).toBe(true); // consume the measured stand-in's result
   });
 
   test("existing journal replay and dossier fixtures keep their outcomes under the redaction pass", () => {

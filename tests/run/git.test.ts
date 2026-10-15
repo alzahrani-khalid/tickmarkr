@@ -82,9 +82,10 @@ describe("sh", () => {
       const groupId = Number(readFileSync(groupFile, "utf8"));
 
       expect(reaped).toMatchObject({ code: 0, reapedGroup: true });
+      // ANL-022 §3 T1 #16 (EV, T-F1): the 8 s timeout sets timedOut; T = 15 s.
+      // Keep the grace lower bound and successful reap witness; slowness alone is not a failure.
       expect(reaped.timedOut).not.toBe(true);
       expect(Date.now() - startedAt).toBeGreaterThanOrEqual(1800);
-      expect(Date.now() - startedAt).toBeLessThan(5000);
       await vi.waitFor(() => expect(processGroupExists(groupId)).toBe(false), { timeout: 2000, interval: 20 });
 
       const closedAt = Date.now();
@@ -121,31 +122,38 @@ describe("sh", () => {
   // Measured at this seam, not by each caller — two callers bracketing their own Date.now() is how a
   // "measured" duration starts disagreeing with itself. A killed child reports elapsed-at-the-kill.
   test("every shell reports its own wall clock, and a killed one reports elapsed at the kill", async () => {
+    const ranAt = Date.now();
     const ran = await sh("sleep 0.3", "/tmp");
+    const ranSpan = Date.now() - ranAt;
     expect(ran.durationMs).toBeGreaterThanOrEqual(300);
-    expect(ran.durationMs).toBeLessThan(20000);
+    // ANL-022 §3 T1 #27 (REL): reject mis-scaled reporting against this call, T = 15 s.
+    const withinSpan = (duration: number | undefined, span: number) => expect(duration).toBeLessThanOrEqual(span);
+    withinSpan(ran.durationMs, ranSpan);
+    expect(() => withinSpan(ranSpan + 1, ranSpan)).toThrow();
 
+    const killedAt = Date.now();
     const killed = await sh("sleep 30", "/tmp", 300);
+    const killedSpan = Date.now() - killedAt;
     expect(killed.timedOut).toBe(true);
     expect(killed.durationMs).toBeGreaterThanOrEqual(300);
-    expect(killed.durationMs).toBeLessThan(5000); // the kill's elapsed, never the 30s the command asked for
+    // ANL-022 §3 T1 #17 (REL, T-F4): the asked 30 s is outside the measured span, T = 15 s.
+    withinSpan(killed.durationMs, killedSpan);
+    expect(() => withinSpan(30_000, killedSpan)).toThrow();
     expect(DEFAULT_SHELL_TIMEOUT_MS).toBe(600000); // the shipped ceiling every unmeasured caller falls back to
   }, 15000);
 
   test("timeout resolves even when a grandchild keeps the stdio pipes open", async () => {
     // v1.33.1 init hang: SIGKILLing bash orphaned a background child that inherited our
     // stdout pipe, so "close" never fired. The background sleep here reproduces that.
-    const t0 = Date.now();
     const r = await sh("sleep 30 & sleep 30", "/tmp", 300);
+    // ANL-022 §3 T1 #18 (EV, T-F1): held pipes sleep 30 s > T = 10 s; keep timedOut.
     expect(r.timedOut).toBe(true);
-    expect(Date.now() - t0).toBeLessThan(5000);
   }, 10000);
 
   test("stdin-reading command returns promptly (stdin ignored)", async () => {
-    const t0 = Date.now();
     // cat blocks forever on an open stdin pipe; with stdin ignore it EOFs and exits.
     const r = await sh("cat", "/tmp", 5000);
-    expect(Date.now() - t0).toBeLessThan(2000);
+    // ANL-022 §3 T1 #7 (EV, T-F1): taking the 5 s timeout fails these witnesses, T = 10 s.
     expect(r.timedOut).not.toBe(true);
     expect(r.code).toBe(0);
   }, 10000);
@@ -688,11 +696,11 @@ describe("reap error visibility (§B T6)", () => {
       return realKill(pid, sig as never);
     }) as typeof process.kill);
     try {
-      const startedAt = Date.now();
       const timed = await sh(`printf '%s' "$$" > ${JSON.stringify(group)}; sleep 30 & exit 0`, dir, 2_500);
       groupId = Number(readFileSync(group, "utf8"));
+      // ANL-022 §3 T1 #12 (EV, T-F1): surviving pipe sleeps 30 s > T = 20 s;
+      // retain both the timeout and EPERM witnesses.
       expect(timed).toMatchObject({ timedOut: true, reapError: expect.stringMatching(/EPERM/) });
-      expect(Date.now() - startedAt).toBeLessThan(4_000); // the ceiling, not the surviving pipe, settled it
       realKill(-groupId, "SIGKILL");
       groupId = undefined;
 

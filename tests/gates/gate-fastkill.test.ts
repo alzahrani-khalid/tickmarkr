@@ -213,8 +213,12 @@ describe("v2.0 calibrated gate inactivity policy", () => {
     expect(timedReview?.meta?.unparseable).toBeUndefined();
   });
 
-  test("test: a runViaDriver gate wait with a frozen snapshot and a cpu-flat dispatched tree and no trailer concludes at the inactivity window not the full timeout", async () => {
-    setGateInactivityWindowMsForTests(24);
+  test("test: with the inactivity window and the call's own timeout scaled ten times a frozen gate wait concludes below half the scaled timeout, while a stand-in wait that rides the whole scaled timeout fails that bound (T-F2)", async () => {
+    // ANL-022 §3 T1 #1/#2 (ALT, T-F2): window 24 -> 240 ms, the call's timeout 250 -> 2500 ms;
+    // the inactivity exit must land below half the scaled timeout. T stays the default 20 s.
+    const WINDOW_MS = 240;
+    const TIMEOUT_MS = 2_500;
+    setGateInactivityWindowMsForTests(WINDOW_MS);
     setHarvestCpuFlatMsForTests(0);
     useCpuModes("flat");
     const driver = new ProbeDriver([{ trailerAfterMs: Number.POSITIVE_INFINITY, verdict: judgeVerdict }]);
@@ -227,15 +231,23 @@ describe("v2.0 calibrated gate inactivity policy", () => {
       `TICKMARKR-JUDGE\n${verdictNonceLine(nonce)}`,
       process.cwd(),
       { driver, name: "T1-judge-fake" },
-      250,
+      TIMEOUT_MS,
     );
     const elapsed = Date.now() - startedAt;
 
     expect(output).toBe("frozen gate snapshot");
-    expect(elapsed).toBeGreaterThanOrEqual(24);
-    expect(elapsed).toBeLessThan(180);
+    expect(elapsed).toBeGreaterThanOrEqual(WINDOW_MS);
+    const belowHalfTimeout = (ms: number) => expect(ms).toBeLessThan(TIMEOUT_MS / 2);
+    belowHalfTimeout(elapsed);
     expect(driver.waitDurations.length).toBeGreaterThan(1);
-    expect(Math.max(...driver.waitDurations)).toBeLessThan(250);
+    expect(Math.max(...driver.waitDurations)).toBeLessThan(TIMEOUT_MS);
+
+    // Test-local stand-in for a wait that ignores the inactivity window and rides the whole timeout.
+    const rodeAt = Date.now();
+    await new Promise((resolve) => setTimeout(resolve, TIMEOUT_MS));
+    const rode = Date.now() - rodeAt;
+    expect(rode).toBeGreaterThanOrEqual(TIMEOUT_MS / 2);
+    expect(() => belowHalfTimeout(rode)).toThrow();
   });
 
   test("test: snapshot growth or cpu activity or an unmeasurable cpu sample each hold the runViaDriver wait open until the trailer arrives", async () => {

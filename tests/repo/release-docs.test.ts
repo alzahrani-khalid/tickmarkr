@@ -1,10 +1,12 @@
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { execFileSync, execSync, spawnSync } from "node:child_process";
 import { afterAll, beforeAll, describe, test, expect } from "vitest";
 import { parse as parseYaml } from "yaml";
 import { makeRepo } from "../helpers/tmprepo.js";
+import { candidateCheckout, childEnv, greenArtifacts, recordedRun, recordedRuns, RUN_ID } from "../fixtures/ci/recorded-run.js";
+import { ownedFailures, runOwned } from "../helpers/owned-process.js";
 
 const ROOT = execSync("git rev-parse --show-toplevel", { encoding: "utf8" }).trim();
 const RELEASING_MD = join(ROOT, "RELEASING.md");
@@ -30,12 +32,13 @@ function getCurrentVersion(): string {
   return pkg.version;
 }
 
+// v2.8.2 T6: the comment block directly above the step that calls the shipped grader — the publish gate
 function publishGateComment(): string {
   const content = readFile(RELEASE_YML);
-  const match = content.match(
-    /((?:[ \t]*#[^\n]*\n)+)[ \t]*- run: npx vitest run --project built-cli --project signal-reaper/
-  );
-  expect(match, "the artifact-scoped publish gate needs its adjacent explanation").toBeTruthy();
+  const call = content.indexOf("bash skills/tickmarkr-overseer/scripts/grade-ci.sh ");
+  expect(call, "the publish gate calls the shipped grader").toBeGreaterThan(0);
+  const match = content.slice(0, content.lastIndexOf("\n      - ", call) + 1).match(/((?:[ \t]*#[^\n]*\n)+)$/);
+  expect(match, "the publish gate needs its adjacent explanation").toBeTruthy();
   return match![1];
 }
 
@@ -201,14 +204,16 @@ describe("release documentation", () => {
       );
     });
 
-    test.skipIf(OVERSEER_SKILL_TWIN_SKIP_REASON !== undefined)("the overseer skill names the no-vitest-probe-while-live law the runner-name-never-in-argv law the files-versus-oracle pin sweep the verify-base gate for mid-run fixes the job-log grading at run-end the glob pathspec count the idle send with read-back and the registry re-read and RELEASING.md's steps 3 to 5 name lint in the proof the grader by job logs and the registry re-read as the diff shows in both skill twins and the release guide", () => {
+    test.skipIf(OVERSEER_SKILL_TWIN_SKIP_REASON !== undefined)("the overseer skill names the no-vitest-probe-while-live law the runner-name-never-in-argv law the files-versus-oracle pin sweep the verify-base gate for mid-run fixes the record grading at run-end bound to the mirror head the idle send with read-back and the registry re-read and RELEASING.md's steps 3 to 5 name lint in the proof the grader bound to the mirror head and the registry re-read as the diff shows in both skill twins and the release guide", () => {
       const skill = readFile(OVERSEER_SKILL);
       expect(skill).toContain("files[]-versus-oracle pin sweep");
       expect(skill).toMatch(/run is live[\s\S]*no `vitest` probe of any size/i);
       expect(skill).toContain("runner's name never enters a shell argv");
       expect(skill).toContain("tickmarkr verify --base <main>");
-      expect(skill).toMatch(/JOB LOGS AT RUN-END ONLY/);
-      expect(skill).toContain(":(glob)tests/**/*.test.ts");
+      expect(skill).toMatch(/GRADE PUBLIC CI FROM ITS RUN RECORD AND PROOF GROUPS AT RUN-END ONLY/);
+      expect(skill).toContain("`scripts/grade-ci.sh <run-id> <mirror HEAD sha> <mirror clone> <tag>`");
+      // v2.8.2 T3: the grader recomputes the tracked set from the commit, so no hand-derived count remains
+      expect(skill).not.toContain("<expected-count>");
       expect(skill).toMatch(
         /seat-send to a WORKING seat leaves a DRAFT[\s\S]*idle[\s\S]*dim-only[\s\S]*read back activity or an ACK/
       );
@@ -226,12 +231,60 @@ describe("release documentation", () => {
       const step5 = steps.match(/(?:^|\n)5\. ([\s\S]*)$/)?.[1] ?? "";
       expect(step3).toContain("npm run-script verify:export");
       expect(step3).toContain("npm run lint");
-      expect(step3).toContain(":(glob)tests/**/*.test.ts");
+      expect(step3).not.toContain("ls-files");
       expect(step4).toContain("grade-ci.sh");
-      expect(step4).toMatch(/run-end[\s\S]*JOB LOGS[\s\S]*never\s+the\s+badge/i);
+      expect(step4).toMatch(/run-end[\s\S]*mirror's `HEAD`[\s\S]*never\s+the\s+badge/i);
       expect(step4).toContain("UNREADABLE");
+      expect(step4).not.toContain("<N>");
       expect(step5).toContain("npm view tickmarkr version");
       expect(step5).toMatch(/Registry propagation[\s\S]*re-read the registry before ruling/i);
+    });
+
+    test.skipIf(OVERSEER_SKILL_TWIN_SKIP_REASON !== undefined)("test: the grade command the release runbook and the overseer law print, run verbatim with the mirror head and a mirror clone against a recorded green run, grades it GREEN, and the installed grader copy is byte-identical to the canonical one (G-F12)", { timeout: 600_000 }, async () => {
+      // RELEASING.md step 4 prints one grade line; the overseer law prints one grade command
+      const step4 = perReleaseSteps().match(/(?:^|\n)4\. ([\s\S]*?)(?=\n5\. )/)?.[1] ?? "";
+      const runbook = step4.split("\n").map((line) => line.trim()).filter((line) => line.includes("grade-ci.sh") && line.startsWith("bash "));
+      expect(runbook).toHaveLength(1);
+      expect(runbook[0]).toMatch(/^bash skills\/tickmarkr-overseer\/scripts\/grade-ci\.sh <run-id> "\$MIRROR_COMMIT" \/path\/to\/tickmarkr-public-mirror v\d+\.\d+\.\d+$/);
+      const law = [...readFile(OVERSEER_SKILL).matchAll(/`([^`\n]*grade-ci\.sh[^`\n]*)`/g)].map((match) => match[1]!);
+      expect(law).toEqual(["scripts/grade-ci.sh <run-id> <mirror HEAD sha> <mirror clone> <tag>"]);
+
+      const canonical = join(ROOT, "skills/tickmarkr-overseer/scripts/grade-ci.sh");
+      const installed = join(ROOT, ".claude/skills/tickmarkr-overseer/scripts/grade-ci.sh");
+      const root = realpathSync(mkdtempSync(join(tmpdir(), "tickmarkr-release-grade-")));
+      try {
+        // a mirror clone holding the exported commit, and the recorded green CI run of that commit
+        const c = candidateCheckout(root);
+        const { serve, exec } = recordedRuns(root);
+        const green = recordedRun(c.head);
+        const expectGreen = (graded: { status: number | null; stdout: string; stderr: string }, label: string) => {
+          expect(graded.status, `${label}\n${graded.stdout}${graded.stderr}`).toBe(0);
+          expect(graded.stdout, label).toContain(`RUN head=${c.head} expected=${c.head} status=completed conclusion=success`);
+          for (const job of ["test", "test-macos"]) expect(graded.stdout, label).toMatch(new RegExp(`^${job}: GREEN$`, "m"));
+          expect(graded.stdout, label).toMatch(/^VERDICT rc=0 /m);
+        };
+        // the runbook's line verbatim but for the run id and the mirror clone's path, run from this checkout's root
+        // after the `MIRROR_COMMIT=<sha>` line export-public.sh --onto printed for that clone's head (step 3)
+        const runbookLine = `MIRROR_COMMIT=${c.head}\n${runbook[0]!.replace("<run-id>", RUN_ID).replaceAll("/path/to/tickmarkr-public-mirror", c.dir)}`;
+        expectGreen(await exec(serve(green, greenArtifacts(c)), "bash", ["-c", runbookLine], ROOT), "runbook");
+        // the law's command with its placeholders filled, run from the skill's own directory
+        const lawLine = law[0]!.replace("<run-id>", RUN_ID).replace("<mirror HEAD sha>", c.head).replace("<mirror clone>", c.dir).replace("<tag>", "v-law");
+        expect(lawLine).not.toMatch(/[<>]/);
+        expectGreen(await exec(serve(green, greenArtifacts(c)), "bash", ["-c", lawLine], join(ROOT, "skills/tickmarkr-overseer")), "law");
+        // the binding is live: the same runbook line against a green run of the mirror's previous head reads UNREADABLE
+        const stale = await exec(serve({ ...green, headSha: c.parent }, greenArtifacts(c)), "bash", ["-c", runbookLine], ROOT);
+        expect(stale.status, stale.stdout).toBe(2);
+        expect(stale.calls.filter((call) => call.startsWith("run download "))).toEqual([]);
+        // the installed copy, reached by the same line, grades the run GREEN from the same checkout
+        const installedLine = runbookLine.replace("bash skills/tickmarkr-overseer/", "bash .claude/skills/tickmarkr-overseer/");
+        expect(installedLine).not.toBe(runbookLine);
+        expectGreen(await exec(serve(green, greenArtifacts(c)), "bash", ["-c", installedLine], ROOT), "installed");
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+      // G-F12: the installed grader copy is byte-identical to the canonical one, and both are executable
+      expect(readFileSync(installed), installed).toEqual(readFileSync(canonical));
+      for (const path of [canonical, installed]) expect(statSync(path).mode & 0o111, path).not.toBe(0);
     });
   });
 
@@ -310,6 +363,10 @@ describe("release documentation", () => {
       expect(comment).toMatch(/artifact-scoped\s*#?\s*\n?\s*#?\s*subset does not run/is);
       expect(comment).toMatch(/v2\.1\.2.*three such failures/is);
       expect(comment).toMatch(/same failures on ubuntu and macOS/is);
+      // N3 (ANL-022 X8): the cores are the measured ones, and no comment keeps the stale 2-core claim
+      expect(comment).toContain("`fork cap 1 of 4 cores` on ubuntu-latest");
+      expect(comment).toMatch(/`fork cap 1 of 3 cores` on macos-latest/);
+      expect(readFile(RELEASE_YML)).not.toMatch(/2-core/);
     });
 
     test("that comment's ledger citation is qualified so it names exactly one of the two findings this project issued under that identifier, so a citation left ambiguous points a reader at either and fails", () => {
@@ -336,6 +393,24 @@ describe("release documentation", () => {
       execFileSync("bash", [MIRROR_HOOK_INSTALLER, mirrorPath], {
         cwd: ROOT, encoding: "utf8",
       });
+    // v2.8.2 T6 (ANL-022 §7.5): --onto publishes only behind the export proof verify-export.sh writes. These
+    // fixtures exercise the mirror guards, so each source checkout carries the proof of its HEAD over the tree the
+    // bare exporter builds from it; the proof's own write and every refusal for a missing or stale one run through
+    // the production entries in tests/repo/release-chain.test.ts.
+    const proveExport = (repo: string) => {
+      const exported = /^export path: (.+)$/m.exec(execFileSync("bash", [EXPORT_SCRIPT], { cwd: repo, encoding: "utf8" }))![1]!;
+      try {
+        const proof = git(repo, "rev-parse", "--path-format=absolute", "--git-path", "tickmarkr-release/export-proof.json");
+        mkdirSync(dirname(proof), { recursive: true });
+        writeFileSync(proof, `${JSON.stringify({
+          schema: "tickmarkr-export-proof/1", source_head: git(repo, "rev-parse", "HEAD"), export_tree: git(exported, "rev-parse", "HEAD^{tree}"),
+          version: "9.9.9", record_verdict: "RECORD_VERDICT verdict=CLEAN files=1 tests=1 failed=0 unfinished=0 unhandled=0 rpc=0 reason=passed",
+          set_oracle: "SET_ORACLE verdict=GREEN expected=1 actual=1 defects=0",
+        }, null, 2)}\n`);
+      } finally {
+        rmSync(exported, { recursive: true, force: true });
+      }
+    };
 
     let originDir: string;
     let mirror: string;
@@ -351,6 +426,7 @@ describe("release documentation", () => {
         "src.txt": "fixture source\n",
         ...Object.fromEntries(PAGES.map((p) => [`docs/codebase/${p}`, `# ${p}\n`])),
       });
+      proveExport(privRepo);
       // "public repo" remote with one prior release commit, and its persistent mirror clone
       originDir = makeRepo({ "previous-release.txt": "previous public release\n" });
       originMain = git(originDir, "rev-parse", "HEAD");
@@ -415,7 +491,7 @@ describe("release documentation", () => {
     test("test: a mirror carrying the installed guard is written and handed over for push, so a check refusing every mirror halts working machinery and fails", () => {
       expect(existsSync(join(mirror, ".git", "hooks", "pre-push"))).toBe(true);
       expect(git(mirror, "rev-parse", "HEAD~1")).toBe(originMain);
-      expect(publishOutput).toContain("mirror commit:");
+      expect(publishOutput).toMatch(new RegExp(`^MIRROR_COMMIT=${git(mirror, "rev-parse", "HEAD")}$`, "m"));
       expect(publishOutput).toContain("review the mirror diff, then push manually");
     });
 
@@ -442,6 +518,7 @@ describe("release documentation", () => {
           ...Object.fromEntries(PAGES.map((p) => [`docs/codebase/${p}`, `# ${p}\n`])),
         });
         cleanup2.push(repo);
+        proveExport(repo);
         return repo;
       }
 
@@ -865,4 +942,73 @@ test("RELEASING.md's per-release steps gain one appended numbered step, after st
   expect(steps).toContain("multi-project, tree-count-asserted full-suite proof");
   expect(steps).not.toContain("the three single-fork projects");
   expect(steps).not.toContain("four-project");
+});
+
+// v2.8.2 T6 (ANL-022 §7.5 Named leaves; N7, V02): a release proof whose named leaf skipped exits 0 under Vitest, so
+// the forced-stall and Orca-smoke proofs pass only through the verdict command RELEASING.md step 6 and the overseer
+// law print, over the record their Vitest run writes. The leaves' titles are read from the e2e sources, as
+// tests/scripts/ci-verdict.test.ts reads them; each record carries the named leaf beside an always-run sibling.
+test("test: the verdict command the release runbook and the overseer law print for the forced-stall and Orca smoke proofs, run over a record whose named leaf passed, exits zero, and over a record whose stall leaf or live leg was recorded skipped, a drifted -t filter included, exits one (C-P3 C-F9)", { timeout: 300_000 }, async () => {
+  const titleIn = (file: string, pattern: RegExp): string => {
+    const match = pattern.exec(readFile(join(ROOT, file)));
+    expect(match, `${file}: ${pattern}`).toBeTruthy();
+    return JSON.parse(match![1]!) as string;
+  };
+  const STALL = "tests/e2e/forced-stall.e2e.test.ts";
+  const SMOKE = "tests/e2e/orca-smoke.e2e.test.ts";
+  const leaf: Record<string, string> = {
+    [STALL]: titleIn(STALL, /test\.skipIf\(process\.env\.TICKMARKR_TEST_FORCE_STALL !== "1"\)\(("[^"]+")/),
+    [SMOKE]: `${titleIn(SMOKE, /\ndescribe\(("e2e: orca driver smoke")/)} > ${titleIn(SMOKE, /const LIVE_TITLE = ("[^"]+")/)}`,
+  };
+
+  // what each document prints: per proof, one Vitest run writing a record and one verdict over that record
+  const steps = perReleaseSteps();
+  const runbook = steps.slice(steps.indexOf("\n6. ")).split("\n").map((line) => line.trim())
+    .filter((line) => /^TICKMARKR_CI_RECORD=|cli\.ts verdict /.test(line));
+  const law = [...readFile(OVERSEER_SKILL).matchAll(/`((?:TICKMARKR_CI_RECORD=|npx --no-install tsx scripts\/ci\/cli\.ts verdict )[^`\n]*)`/g)].map((match) => match[1]!);
+  expect([...law].sort()).toEqual([...runbook].sort());
+  const commands = Object.entries(leaf).map(([file, name]) => {
+    const run = runbook.filter((line) => line.includes(` vitest run ${file}`));
+    const verdict = runbook.filter((line) => line.includes(`--require-test '${file}::`));
+    expect([run.length, verdict.length], file).toEqual([1, 1]);
+    const record = /^TICKMARKR_CI_RECORD=(\S+) /.exec(run[0]!)?.[1];
+    const required = /^npx --no-install tsx scripts\/ci\/cli\.ts verdict --require-test '([^']+)::([^']+)' (\S+)$/.exec(verdict[0]!);
+    // the verdict reads the record that run writes and requires the leaf the source names; a -t filter names it too
+    expect([required?.[1], required?.[2], required?.[3]], file).toEqual([file, name, record]);
+    const filter = / -t '([^']+)'$/.exec(run[0]!)?.[1];
+    if (filter !== undefined) expect(name.endsWith(filter), `${file}: -t '${filter}'`).toBe(true);
+    return { file, name, command: verdict[0]!, record: record! };
+  });
+  expect(runbook[0]).toMatch(/ TICKMARKR_TEST_FORCE_STALL=1 npx --no-install vitest run tests\/e2e\/forced-stall\.e2e\.test\.ts -t '/);
+  expect(runbook).toContain(`TICKMARKR_CI_RECORD=${commands[1]!.record} TICKMARKR_E2E=1 npx --no-install vitest run ${SMOKE}`);
+
+  const dir = mkdtempSync(join(tmpdir(), "tickmarkr-named-leaf-"));
+  try {
+    for (const { file, name, command, record } of commands) {
+      const recorded = (tests: Array<[string, string]>) => `${JSON.stringify({
+        schema: "tickmarkr-ci-record/2", head: "a".repeat(40), shard: null,
+        files: [{ file, project: "e2e", state: tests.some(([, state]) => state === "passed") ? "passed" : "skipped", durationMs: 1 }],
+        reason: "passed", unhandled: [],
+        tests: tests.map(([test, state]) => ({ file, project: "e2e", name: test, state })),
+      })}\n`;
+      const sibling = `${file} control leaf`;
+      const cases: Array<[label: string, text: string, exit: number, defect: string | null]> = [
+        ["passed", recorded([[name, "passed"], [sibling, "passed"]]), 0, null],
+        ["the named leaf skipped", recorded([[name, "skipped"], [sibling, "passed"]]), 1, "required-not-passed"],
+        ["a drifted -t filter: every leaf skipped", recorded([[name, "skipped"], [sibling, "skipped"]]), 1, "required-not-passed"],
+        ["a drifted title: the named leaf absent", recorded([[`${name} (renamed)`, "passed"], [sibling, "passed"]]), 1, "required-absent"],
+      ];
+      for (const [label, text, exit, defect] of cases) {
+        const path = join(dir, `${cases.findIndex(([l]) => l === label)}-${file.split("/").at(-1)}.record.json`);
+        writeFileSync(path, text);
+        const ran = await runOwned("bash", ["-c", command.replace(record, path)], { cwd: ROOT, env: childEnv(), ms: 120_000 });
+        expect(ownedFailures(ran, label)).toEqual([]);
+        expect(ran.exitCode, `${file}: ${label}\n${ran.out}${ran.err}`).toBe(exit);
+        expect(ran.out, `${file}: ${label}`).toMatch(new RegExp(`^RECORD_VERDICT verdict=${exit === 0 ? "CLEAN" : "RED"} `, "m"));
+        if (defect !== null) expect(ran.out, `${file}: ${label}`).toContain(`"kind":"${defect}"`);
+      }
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

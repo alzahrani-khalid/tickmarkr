@@ -10,7 +10,7 @@
 // reject at any depth. Secret findings disclose pattern id, path, and occurrence count only —
 // never the matched text.
 import { execSync, spawnSync } from "node:child_process";
-import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, describe, expect, test } from "vitest";
@@ -298,7 +298,6 @@ describe("export boundary — fail-closed dual-context allowlist manifest", () =
       "src/compile/gsd.ts",
       "schema/rungraph.schema.json",
       "assets/mark.svg",
-      "scripts/assert-test-file-count.sh",
       "scripts/emit-schema.ts",
       "scripts/probe-rig.mjs",
       "scripts/run-ci-vitest.sh",
@@ -361,6 +360,8 @@ describe("export boundary — fail-closed dual-context allowlist manifest", () =
       "scripts/atlas.mjs",
       "tests/docs/analysis-library.test.ts",
       "scripts/measure-trailer-width.mjs",
+      // v2.8.2 T6 (ANL-022 §7.5 Deleted): the retired count helper leaves the allowlist with its file
+      "scripts/assert-test-file-count.sh",
       "unclassified-new-top-level.md",
     ];
     for (const p of rejected) expect(accepts(p), `should reject ${p}`).toBe(false);
@@ -385,38 +386,77 @@ describe("export boundary — fail-closed dual-context allowlist manifest", () =
 // The exported tree ships ci.public.yml (self-contained CI) in place of the private ci.yml, whose
 // selftest job invokes the export script the export itself excludes — the red-X launch trap class.
 const workflowPaths = (c: Candidate): string[] => c.paths.filter((p) => p.startsWith(".github/workflows/"));
-// ends on a word character so a path cited at the end of a comment sentence keeps no trailing dot
-const extractScriptRefs = (text: string): string[] => text.match(/\bscripts\/[\w./-]*\w/g) ?? [];
+// a WHOLE path through a scripts/ segment (v2.8.2 T6): the Release workflow's skills/tickmarkr-overseer/scripts/grade-ci.sh
+// is that path, never read as scripts/grade-ci.sh; it ends on a word character so a path cited at the end of a comment
+// sentence keeps no trailing dot
+const extractScriptRefs = (text: string): string[] => text.match(/(?<![\w./-])(?:[\w.-]+\/)*scripts\/[\w./-]*\w/g) ?? [];
 const NOREPLY_IDENTITY = "53393181+alzahrani-khalid@users.noreply.github.com";
 
-// OBS-1184: every public-CI Vitest step runs through the wrapper that consults the overseer skill's
-// shared log classifier (the one grade-ci.sh uses), and the count oracle sums exactly the logs those
-// steps write. Returns the violations plus each wrapped command as "<job>: <command>".
+// OBS-1184: every public-CI Vitest step runs through the wrapper (since v2.8.2 T1 it decides from the run's own
+// record, `<log>.record.json`, not the log). v2.8.2 T2 (ANL-022 §7.2a): the set step reads exactly the records those
+// steps write, no count step remains, and the last step uploads the records' directory as proof-<job>. What the set
+// step reads is what bash expands its arguments to in a scratch runner temp holding every file the job's steps
+// write there (the logs, their records, the floors sidecar). Returns the violations plus each wrapped command as
+// "<job>: <command>".
 const CI_WRAPPER = "scripts/run-ci-vitest.sh";
-const CI_CLASSIFIER = "skills/tickmarkr-overseer/scripts/classify-vitest-log.sh";
+const SET_STEP = /^npx tsx scripts\/ci\/cli\.ts assert (.+)$/;
+type PublicStep = { run?: string; uses?: string; if?: string; with?: Record<string, string> };
 function publicCiShape(workflow: string): { violations: string[]; wrapped: string[] } {
-  const jobs = (parseYaml(workflow) as { jobs?: Record<string, { steps?: { run?: string }[] }> }).jobs ?? {};
+  const jobs = (parseYaml(workflow) as { jobs?: Record<string, { steps?: PublicStep[] }> }).jobs ?? {};
   const violations: string[] = [];
   const wrapped: string[] = [];
-  for (const [job, { steps = [] }] of Object.entries(jobs)) {
-    const logs: string[] = [];
-    let counted: string[] | undefined;
-    for (const run of steps.map((step) => (step.run ?? "").trim())) {
-      if (/\bvitest\b|\bnpm (?:run )?test\b/.test(run)) {
-        const m = /^bash scripts\/run-ci-vitest\.sh "([^"]+)" ([^\n]+)$/.exec(run);
-        if (m) {
-          logs.push(m[1]);
-          wrapped.push(`${job}: ${m[2]}`);
-        } else violations.push(`${job}: Vitest step bypasses the shared classifier: ${run}`);
+  const runnerTemp = realpathSync(mkdtempSync(join(tmpdir(), "tickmarkr-ci-shape-")));
+  // bash's own expansion of shell words under RUNNER_TEMP=<scratch>, one path per line
+  const expand = (words: string): string[] => {
+    const run = spawnSync("bash", ["-c", `printf '%s\\n' ${words}`], { cwd: runnerTemp, encoding: "utf8", env: { ...process.env, RUNNER_TEMP: runnerTemp } });
+    if (run.status !== 0) throw new Error(`bash could not expand ${words}: ${run.stderr}`);
+    return run.stdout.split("\n").filter((line) => line !== "");
+  };
+  try {
+    for (const [job, { steps = [] }] of Object.entries(jobs)) {
+      const logs: string[] = [];
+      const sets: string[] = [];
+      const written: string[] = [];
+      for (const run of steps.map((step) => (step.run ?? "").trim())) {
+        if (/\bvitest\b|\bnpm (?:run )?test\b/.test(run)) {
+          const m = /^bash scripts\/run-ci-vitest\.sh ("[^"]+") ([^\n]+)$/.exec(run);
+          if (m) {
+            logs.push(m[1]);
+            wrapped.push(`${job}: ${m[2]}`);
+          } else violations.push(`${job}: Vitest step bypasses the record wrapper: ${run}`);
+        }
+        if (/assert-test-file-count|Assert collected test-file count/.test(run)) violations.push(`${job}: keeps the old count step: ${run}`);
+        const out = /--out ("[^"]+"|\S+)/.exec(run);
+        if (out) written.push(out[1]);
+        const set = SET_STEP.exec(run);
+        if (set) sets.push(set[1]);
       }
-      const count = /^sh scripts\/assert-test-file-count\.sh((?: "[^"]+")+)$/.exec(run);
-      if (count) counted = [...count[1].matchAll(/"([^"]+)"/g)].map((arg) => arg[1]);
+      if (logs.length === 0) continue;
+      if (sets.length !== 1) {
+        violations.push(`${job}: ${sets.length} set steps, expected exactly one`);
+        continue;
+      }
+      // every file the job's steps write under the runner temp exists before the set step's words expand
+      const logPaths = expand(logs.join(" "));
+      const records = logPaths.map((log) => `${log}.record.json`);
+      for (const path of [...logPaths, ...records, ...expand(written.join(" "))]) {
+        mkdirSync(join(path, ".."), { recursive: true });
+        writeFileSync(path, "");
+      }
+      const read = expand(sets[0]);
+      if ([...read].sort().join("\n") !== [...records].sort().join("\n")) {
+        violations.push(`${job}: set step reads [${read.join(", ")}] but the Vitest steps write [${records.join(", ")}]`);
+      }
+      const upload = steps.at(-1);
+      const proofDirs = new Set(records.map((record) => join(record, "..")));
+      const uploaded = (upload?.with?.path ?? "").replace("${{ runner.temp }}", runnerTemp).replace(/\/$/, "");
+      if (upload?.uses !== "actions/upload-artifact@v4" || upload.if !== "always()" || upload.with?.name !== "proof-${{ github.job }}"
+        || proofDirs.size !== 1 || !proofDirs.has(uploaded)) {
+        violations.push(`${job}: the last step must upload the records' directory as proof-<job> under always(): ${JSON.stringify(upload)}`);
+      }
     }
-    if (logs.length === 0) continue;
-    if (!counted) violations.push(`${job}: no count oracle step`);
-    else if ([...counted].sort().join("\n") !== [...logs].sort().join("\n")) {
-      violations.push(`${job}: count oracle reads [${counted.join(", ")}] but the Vitest steps write [${logs.join(", ")}]`);
-    }
+  } finally {
+    rmSync(runnerTemp, { recursive: true, force: true });
   }
   if (wrapped.length === 0) violations.push("no wrapped Vitest step found");
   return { violations, wrapped };
@@ -438,22 +478,37 @@ describe("export workflow correctness — the exported CI stands alone", () => {
     }
   });
 
-  test("every script referenced by an exported workflow file exists in the exported tree", { timeout: 180_000 }, () => {
-    // extractor self-check: it must catch the trap class this criterion exists for
+  test("test: every script the exported workflows call exists in the exported tree, with the Release workflow calling the shipped grader at its full path and nothing calling the retired count helper, so a workflow left calling a script the export lacks fails (C-del)", { timeout: 180_000 }, () => {
+    // extractor self-checks: it catches the trap class this criterion exists for, and reads a whole path whole
     expect(extractScriptRefs("      run: bash scripts/export-public.sh")).toEqual(["scripts/export-public.sh"]);
+    expect(extractScriptRefs('bash skills/tickmarkr-overseer/scripts/grade-ci.sh "$run_id" "$GITHUB_SHA" .'))
+      .toEqual(["skills/tickmarkr-overseer/scripts/grade-ci.sh"]);
     const c = getCandidate();
     const shipped = new Set(c.paths);
+    const unshipped = (text: string) => extractScriptRefs(text).filter((ref) => !shipped.has(ref));
     for (const wf of workflowPaths(c)) {
-      for (const ref of extractScriptRefs(readFileSync(join(c.root, wf), "utf8"))) {
-        expect(shipped.has(ref), `${wf} references ${ref}`).toBe(true);
-      }
+      const text = readFileSync(join(c.root, wf), "utf8");
+      expect(unshipped(text), `${wf} calls a script the export lacks`).toEqual([]);
+      expect(text, wf).not.toMatch(/assert-test-file-count/);
     }
+    // the Release workflow calls the shipped grader by its full path, and the export ships it
+    const release = readFileSync(join(c.root, ".github/workflows/release.yml"), "utf8");
+    expect(extractScriptRefs(release)).toContain("skills/tickmarkr-overseer/scripts/grade-ci.sh");
+    expect(shipped.has("skills/tickmarkr-overseer/scripts/grade-ci.sh")).toBe(true);
+    // the retired count helper is gone from the tree and from the export (ANL-022 §7.5 Deleted)
+    expect(existsSync(join(ROOT, "scripts/assert-test-file-count.sh"))).toBe(false);
+    expect(shipped.has("scripts/assert-test-file-count.sh")).toBe(false);
+    // a workflow left calling a script the export lacks fails: the retired helper, or the grader by its scripts/ tail
+    expect(unshipped(`${release}      - run: sh scripts/assert-test-file-count.sh "$RUNNER_TEMP/proof/a.log"\n`))
+      .toEqual(["scripts/assert-test-file-count.sh"]);
+    expect(unshipped(release.replace("bash skills/tickmarkr-overseer/scripts/grade-ci.sh ", "bash scripts/grade-ci.sh ")))
+      .toEqual(["scripts/grade-ci.sh"]);
   });
 
-  test("test: the exported public workflow runs its coverage and serial commands through the shared classifier and retains exact file counting, so an omitted classifier or one missing counted file fails", { timeout: 180_000 }, () => {
+  test("test: the exported public workflow's set assertion reads exactly the records its two wrapped Vitest steps write, so a set step reading one record fewer or a workflow that keeps the old count step fails (W-F2)", { timeout: 180_000 }, () => {
     const c = getCandidate();
     const wf = ".github/workflows/ci.public.yml";
-    for (const path of [wf, CI_WRAPPER, CI_CLASSIFIER, "scripts/assert-test-file-count.sh"]) expect(c.paths, path).toContain(path);
+    for (const path of [wf, CI_WRAPPER, "scripts/ci/cli.ts"]) expect(c.paths, path).toContain(path);
     const workflow = readFileSync(join(c.root, wf), "utf8");
     const { violations, wrapped } = publicCiShape(workflow);
     expect(violations).toEqual([]);
@@ -461,30 +516,76 @@ describe("export workflow correctness — the exported CI stands alone", () => {
       expect(wrapped, job).toContain(`${job}: npm run test:coverage -- --project suite`);
       expect(wrapped.filter((w) => w.startsWith(`${job}: npx vitest run `)), job).toHaveLength(1);
     }
+    expect(workflow).not.toMatch(/assert-test-file-count/);
 
-    // the guard reds the two regressions it exists for
-    const bare = workflow.replace(`bash ${CI_WRAPPER} "$RUNNER_TEMP/tickmarkr-test-output.log" `, "");
-    expect(bare).not.toBe(workflow);
-    expect(publicCiShape(bare).violations.join("\n")).toMatch(/bypasses the shared classifier/);
-    const uncounted = workflow.replace(' "$RUNNER_TEMP/tickmarkr-test-output-singlefork.log"\n', "\n");
-    expect(uncounted).not.toBe(workflow);
-    expect(publicCiShape(uncounted).violations.join("\n")).toMatch(/count oracle reads/);
+    // the guard reds each regression it exists for, each in one job of the exported text
+    const regress = (from: string, to: string): string => {
+      const changed = workflow.replace(from, to);
+      expect(changed, from).not.toBe(workflow);
+      return publicCiShape(changed).violations.join("\n");
+    };
+    expect(regress(`bash ${CI_WRAPPER} "$RUNNER_TEMP/proof/tickmarkr-test-output.log" `, "")).toMatch(/^test: Vitest step bypasses the record wrapper/m);
+    // one record fewer: the set step names only the coverage step's record
+    expect(regress("assert $RUNNER_TEMP/proof/*.record.json", "assert $RUNNER_TEMP/proof/tickmarkr-test-output.log.record.json"))
+      .toMatch(/^test: set step reads \[[^,\]]+\] but the Vitest steps write \[[^,\]]+, [^,\]]+\]$/m);
+    // a wider glob reads the logs and the floors sidecar as well
+    expect(regress("assert $RUNNER_TEMP/proof/*.record.json", "assert $RUNNER_TEMP/proof/*")).toMatch(/^test: set step reads /m);
+    // the old count step kept beside the set step, or in its place
+    const countStep = '      - name: Assert collected test-file count\n        if: always()\n'
+      + '        run: sh scripts/assert-test-file-count.sh "$RUNNER_TEMP/proof/tickmarkr-test-output.log" "$RUNNER_TEMP/proof/tickmarkr-test-output-singlefork.log"\n';
+    const setStep = "      - name: Assert collected test-file set\n";
+    expect(regress(setStep, countStep + setStep)).toMatch(/^test: keeps the old count step/m);
+    const replaced = regress("        run: npx tsx scripts/ci/cli.ts assert $RUNNER_TEMP/proof/*.record.json\n",
+      '        run: sh scripts/assert-test-file-count.sh "$RUNNER_TEMP/proof/tickmarkr-test-output.log" "$RUNNER_TEMP/proof/tickmarkr-test-output-singlefork.log"\n');
+    expect(replaced).toMatch(/^test: keeps the old count step/m);
+    expect(replaced).toMatch(/^test: 0 set steps, expected exactly one$/m);
+    // the proof group never uploaded
+    expect(regress("          name: proof-${{ github.job }}\n", "          name: proof\n")).toMatch(/^test: the last step must upload/m);
 
-    // the exported wrapper reaches the exported classifier: a complete RPC-only exit 1 becomes 0, while
-    // the same wrapper without the classifier beside it keeps the raw 1 (fail closed)
+    // v2.8.2 T1: the exported wrapper decides from the run's own record through the exported record tooling
+    // (scripts/ci) — a complete RPC-only exit 1 becomes 0 — while the same wrapper without that tooling beside it
+    // keeps the raw 1 (fail closed). A stand-in npx in a one-file candidate tree answers discovery and writes the
+    // record the run would.
+    for (const path of ["scripts/ci/cli.ts", "scripts/ci/reporter.ts"]) expect(c.paths, path).toContain(path);
     const dir = mkdtempSync(join(tmpdir(), "tickmarkr-ci-wrapper-"));
     try {
+      const tree = join(dir, "tree");
+      mkdirSync(join(tree, "tests/suite"), { recursive: true });
+      mkdirSync(join(tree, "bin"));
+      writeFileSync(join(tree, "tests/suite/a.test.ts"), "");
       writeFileSync(join(dir, "rpc-only.log"), RPC_ONLY_LOG);
+      writeFileSync(join(dir, "rpc-only.record.json"), `${JSON.stringify({
+        schema: "tickmarkr-ci-record/2", head: "b".repeat(40), shard: null,
+        files: [{ file: "tests/suite/a.test.ts", project: "suite", state: "passed", durationMs: 1 }], reason: "passed",
+        unhandled: [{ name: "Error", message: '[vitest-worker]: Timeout calling "onTaskUpdate"', type: "Unhandled Error" }],
+        tests: [{ file: "tests/suite/a.test.ts", project: "suite", name: "a", state: "passed" }],
+      })}\n`);
+      writeFileSync(join(tree, "bin/npx"), `#!/usr/bin/env bash
+case "$2" in
+  list) for arg in "$@"; do case "$arg" in --json=*) printf '[{"file":"%s/tests/suite/a.test.ts","projectName":"suite"}]\\n' "$PWD" > "\${arg#--json=}" ;; esac; done ;;
+  run) cp "$RECORD_SRC" "$TICKMARKR_CI_RECORD"; cat "$LOG_SRC"; exit 1 ;;
+esac
+`);
+      chmodSync(join(tree, "bin/npx"), 0o755);
+      // the exported wrapper and record tooling, with the dependency link and module type the checkout gives them
+      const exportedCheckout = (root: string, withTooling: boolean) => {
+        mkdirSync(join(root, "scripts"), { recursive: true });
+        copyFileSync(join(c.root, CI_WRAPPER), join(root, CI_WRAPPER));
+        if (withTooling) cpSync(join(c.root, "scripts/ci"), join(root, "scripts/ci"), { recursive: true });
+        symlinkSync(realpathSync(join(ROOT, "node_modules")), join(root, "node_modules"), "dir");
+        copyFileSync(join(c.root, "package.json"), join(root, "package.json"));
+        return root;
+      };
       const wrap = (root: string) =>
-        spawnSync("bash", [join(root, CI_WRAPPER), join(dir, "ci.log"), "bash", "-c", 'cat "$1"; exit 1', "fake-vitest", join(dir, "rpc-only.log")], {
-          encoding: "utf8",
+        spawnSync("bash", [join(root, CI_WRAPPER), join(dir, "ci.log"), "npx", "vitest", "run", "--project", "suite"], {
+          cwd: tree, encoding: "utf8",
+          env: { ...process.env, PATH: `${join(tree, "bin")}:${process.env.PATH}`, RECORD_SRC: join(dir, "rpc-only.record.json"), LOG_SRC: join(dir, "rpc-only.log") },
         });
-      const exported = wrap(c.root);
+      const exported = wrap(exportedCheckout(join(dir, "exported"), true));
       expect(exported.status, exported.stdout + exported.stderr).toBe(0);
-      expect(exported.stdout).toContain("VITEST_LOG verdict=RPC_ONLY");
-      mkdirSync(join(dir, "scripts"));
-      copyFileSync(join(c.root, CI_WRAPPER), join(dir, CI_WRAPPER));
-      expect(wrap(dir).status).toBe(1);
+      expect(exported.stdout).toContain("RECORD_VERDICT verdict=RPC_ONLY");
+      expect(exported.stdout).toContain("SHARD_CONTRACT verdict=GREEN shard=none planned=1 recorded=1 defects=0");
+      expect(wrap(exportedCheckout(join(dir, "bare"), false)).status).toBe(1);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

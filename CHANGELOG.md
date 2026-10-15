@@ -2,6 +2,40 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v2.8.2 — every release verdict reads a machine record of its exact commit, the release steps check each other, and timing ceilings stop failing under load
+
+**v2.8.2** comes from two `tickmarkr run`s of one spec. Run-20261014-213701-…1198 merged the test-ceiling task and was halted when that
+task's own rewritten beat test timed out under full-suite load; the guard was raised and the second run (run-20261015-011134-…1223)
+delivered the other seven tasks. Each passed build, lint, evidence, scope, the acceptance judge, a cross-vendor review and the full
+suite. The work follows an assessment of every place a release verdict was produced or read (ANL-022): verdicts were read from log
+text and hand-derived counts, a grade named no commit, and an export could be built and left unpushed.
+
+- **`tickmarkr report` stays linear on long runs.** The wall budget copied each owner's wait list on every close, so a run with `n`
+  queued waits cost O(n²) (`src/run/wall-budget.ts`); it now appends in place and every budget value is unchanged.
+- **The overseer skill's CI grader reads records, not logs (queue rows 148 and 165).** `skills/tickmarkr-overseer/scripts/grade-ci.sh
+  <run-id> <expected-sha> <repo> <tag>` is bound to the commit it is given: a run of any other commit, or one not yet at run-end, reads
+  `UNREADABLE` (exit 2) before anything is downloaded. It reads each job's step outcomes and conclusions from `gh run view --json`,
+  downloads the job's proof group and recomputes it — the Vitest records CLEAN or RPC-only at that commit, every tracked test file
+  recorded exactly once, the coverage floors GREEN. No log text is read and no count is derived by hand, so a log GitHub labels
+  `UNKNOWN STEP` or a test that prints timeout text cannot move the grade. It needs an authenticated `gh`. The classifier script that
+  read logs is removed.
+- **Every Vitest invocation of a release proof is decided from its own record (queue rows 148 and 149).** The CI record (schema 2)
+  carries the run's reason, every unhandled error's name, message and type, and one entry per test case. The worker RPC-timeout
+  exception is a rule over that structured field; a release leaf counts only when it is recorded `passed`, so a skipped leaf or a `-t`
+  filter that matched nothing reads RED instead of exiting 0.
+- **The release steps check each other (D-1960).** `verify:export` writes an export proof naming the commit and the exported tree only
+  on a zero exit; `scripts/export-public.sh --onto` refuses without that proof and prints the mirror commit it made; the Release
+  workflow publishes only a commit whose one completed `CI (public)` push run grades GREEN; and the steps after the grade are machine
+  checks (`scripts/ci/cli.ts release subject|tag-absent|trees-equal|prune-safe|installed-version`) that `RELEASING.md` calls.
+- **Timing ceilings stop failing under load (queue rows 162, 163 and the row-164 class).** Twenty-three wall-clock upper bounds in the
+  tests are replaced by the witness that already rejects the slow path, a scaled alternative, or a bound relative to the same run; the
+  beat tests wait on the loop's own exit event and refuse to signal the Vitest worker.
+
+Declared: public CI stays serial. Sharding (queue row 6) was built and graded GREEN job by job, but its parity gate — one sharded and
+one serial public run at one commit — read RED: the sharded merged coverage reports different branch totals and higher branch coverage
+than the serial run, so its coverage verdict is not the serial one's. It is reverted and stays open. Also unchanged: two timing bounds
+with no seam (queue row 168) and LaunchServices check-ins (queue row 156).
+
 ## v2.8.1 — the run keeps its own integration identity: merges publish by compare-and-swap, the integration checkout is gone, and run end verifies what it published
 
 **v2.8.1** comes from one `tickmarkr run` (run-20261013-092304-…1173). All five of its tasks ship. Each passed build, lint, evidence,

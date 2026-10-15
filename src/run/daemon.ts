@@ -7310,7 +7310,8 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     });
 
     fatalPhase = "tip-verify";
-    // OBS-34: post-merge integration-tip verify — strict exit codes, no baseline forgiveness.
+    // OBS-34: post-merge integration-tip verify — the battery forgives only what its baseline entry recorded red
+    // (src/run/merge.ts, the same predicate as the gate battery).
     const lastMergedTask = [...journal.read()].reverse().find((e) => e.event === "merge" && e.taskId)?.taskId;
     // 2.8.1 T1 (ANL-023 §7.1): every close opens on the integration identity and closes on it below.
     const identity: TipIdentity = { repo: repoRoot, branch, expected: published }; // 2.8.1 T2: E

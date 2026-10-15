@@ -20,8 +20,6 @@ const SEED: InteractiveSeed = {
 const PIN = { via: "fake", model: "fake-1" };
 const TIMEOUT_MINUTES = 0.03;
 const DEADLINE_MS = TIMEOUT_MINUTES * 60_000;
-// One trust-poll cycle (interactive-seed.ts TRUST_POLL_MS) plus the closing banner read.
-const POLL_SLACK_MS = 1_500;
 const FINDINGS = "funded repair findings: tests/x.test.ts red";
 
 async function runPinned(runId: string, answers: boolean) {
@@ -62,13 +60,16 @@ test("the production daemon fails over off a pinned channel after a seed deadlin
   const first = stuck.events.find((e) => e.event === "task-dispatch")!;
   expect((first.data.assignment as { model: string }).model).toBe(PIN.model); // routed onto the pin
 
-  // Every pinned launch waited out exactly its configured deadline — never longer — and ended there.
+  // ANL-022 §3 T1 #11 (DW, T-F3): T = 120 s; retain the configured lower bound.
+  // A failover one whole window late reaches 2 * DEADLINE_MS and must fail.
+  const withinWindow = (waitedMs: number) => expect(waitedMs).toBeLessThan(2 * DEADLINE_MS);
   const deadlines = stuck.events.filter((e) => e.event === "delivery-readiness-failed");
   expect(deadlines.length).toBeGreaterThan(0);
   for (const d of deadlines) {
     expect(stuck.dispatched.get(Number(d.data.attempt))).toBe(PIN.model);
     expect(Number(d.data.waitedMs)).toBeGreaterThanOrEqual(DEADLINE_MS);
-    expect(Number(d.data.waitedMs)).toBeLessThan(DEADLINE_MS + POLL_SLACK_MS);
+    withinWindow(Number(d.data.waitedMs));
+    expect(() => withinWindow(Number(d.data.waitedMs) + DEADLINE_MS)).toThrow();
   }
   // …each spent its one Enter on its own fresh modal, and none of them counts as a launched worker.
   expect(stuck.enters).toBe(deadlines.length);

@@ -33,10 +33,10 @@ test("task execution ceiling terminates its sleeping worker, preserves edits, pa
     tasks: { T1: [{ shell: "echo $$ > worker.pid; echo preserved > unfinished.txt; sleep 30 & echo $! > child.pid; wait", result: { ok: true, summary: "late" } }] },
   }, policy);
   const foreign = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)"], { stdio: "ignore" });
-  const started = Date.now();
   try {
     const summary = await runDaemon(repo, { runId: "run-budget-owned", adapters: [fake], driver: new SubprocessDriver() });
-    expect(Date.now() - started).toBeLessThan(7000);
+    // ANL-022 §3 T1 #21 (EV, T-F1): worker sleep 30 s > T = 10 s;
+    // execution-budget-exhausted below proves why it parked.
     expect(summary.human).toEqual(["T1"]);
     const rows = Journal.open(repo, "run-budget-owned").read();
     expect(rows.filter((e) => e.event === "task-human")).toHaveLength(1);
@@ -139,9 +139,9 @@ test("external-suite admission waiting consumes task budget and launches no veri
   writeFileSync(join(journal.dir, "journal.jsonl"), rows.map((e) => JSON.stringify(e)).join("\n") + "\n");
   writeFileSync(join(journal.dir, "baseline.json"), JSON.stringify({ commands: { test: { exitCode: 0, fingerprints: [] } } }));
   setLiveSuiteCountForTests(async () => 1);
-  const started = Date.now();
   const summary = await runDaemon(repo, { runId: journal.runId, resume: true, adapters: [fake], driver: new SubprocessDriver() });
-  expect(Date.now() - started).toBeLessThan(8000);
+  // ANL-022 §3 T1 #23 (EV, T-F1): admission count stays 1 forever > T = 12 s;
+  // the suite-wait and execution-budget-exhausted witnesses must both remain.
   expect(summary.human).toEqual(["T1"]);
   expect(journal.read().some((e) => e.event === "suite-wait" && e.taskId === "T1")).toBe(true);
   expect(journal.read().find((e) => e.event === "task-human")?.data.disposition).toBe("execution-budget-exhausted");

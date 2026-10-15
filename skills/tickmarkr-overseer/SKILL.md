@@ -691,12 +691,13 @@ subject of a release proof is never *"the run"* and never *"the fix leg"* — it
 the one commit that carries the run's work AND every leg merged into it. Name that commit's sha in the
 proof, in the same act as the grade, and the proof is bound to that sha alone. **When the subject moves — a
 later merge, a new integration tip, an amended or re-cut commit, a fresh export, a re-tag — the proof is
-VOID, and the new subject is graded from scratch**, count oracle included, since the oracle is derived from
-the merged tree and not from either parent. Two greens assembled into one verdict are two claims about two
-trees that never contained each other: the union's own conflict resolutions, its ordering and its
-collected-test total are exactly what neither green observed — which is why `RELEASING.md` step 4 matches
-the run's head SHA to the mirror's `HEAD` before a single job log is graded. This is the void-condition duty
-pointed at bytes: **a proof that names no commit cannot notice its subject leaving.**
+VOID, and the new subject is graded from scratch**, its tracked test set included, since that set is
+recomputed from the merged tree and not from either parent. Two greens assembled into one verdict are two
+claims about two trees that never contained each other: the union's own conflict resolutions, its ordering
+and its collected test set are exactly what neither green observed — which is why `RELEASING.md` step 4
+hands the grader the mirror's `HEAD` and the grader refuses a run of any other head before a single record
+is downloaded. This is the void-condition duty pointed at bytes: **a proof that names no commit cannot
+notice its subject leaving.**
 
 **THE RECIPROCAL DUTY, and it is yours because you write both documents:** when you issue a ruling that
 re-scopes, narrows, splits or re-owns anything, **the ruling must name every sealed document its subject
@@ -1059,7 +1060,8 @@ they are left implicit:
      test exists — the acceptance oracle runs the sentence as vitest `-t` and a paraphrase matches zero tests.
    - Every fix-leg verify carries `--author <the seat that wrote it>`; without it the author is HUMAN, every
      vendor stays eligible, and a same-vendor approval is not the cross-vendor review the criterion names.
-   - A grader change is proved on a captured REAL job log, never on a synthetic one.
+   - A grader change is proved on a recorded run — GitHub's structured run record and the proof groups its
+     jobs uploaded — never on a synthetic job log: the grader reads no log text at all.
    - A public-CI red is classified in a throttled Linux container first (`docker run --cpus=2 node:22`),
      by measurement: starvation on the base tree is not a defect on the branch.
 
@@ -1603,19 +1605,31 @@ Create specialist seats using `orca terminal create --worktree path:<repo> --com
    - **RUN BOTH RELEASE PROOFS BEFORE STANDING DOWN.** The first is the exported-tree suite, which
      maintainers run from the private repo with its `verify:export` script — that tooling is deliberately
      not part of this package, so the command does not exist in a public checkout; it must install,
-     build, lint, and only then run the suite in the exported tree; then
-     `TICKMARKR_E2E=1 npx vitest run tests/e2e/orca-smoke.e2e.test.ts` must exercise the installed-Orca
-     smoke. A skipped smoke is not proof. Record both results before declaring the release complete.
+     build, lint, and only then run the suite in the exported tree, and only its zero exit writes the export
+     proof that `export-public.sh --onto` reads before it writes the mirror commit. Then the installed-Orca
+     smoke must exercise its live leg, decided from its own record and never from Vitest's exit status:
+     `TICKMARKR_CI_RECORD=/tmp/tickmarkr-orca-smoke.record.json TICKMARKR_E2E=1 npx --no-install vitest run tests/e2e/orca-smoke.e2e.test.ts`,
+     then
+     `npx --no-install tsx scripts/ci/cli.ts verdict --require-test 'tests/e2e/orca-smoke.e2e.test.ts::e2e: orca driver smoke > live: the real-orca terminal leg — vitest-skipped without the gate or a reachable runtime' /tmp/tickmarkr-orca-smoke.record.json`
+     must exit 0. The forced-stall proof (RELEASING.md step 6) is decided the same way: its record from
+     `TICKMARKR_CI_RECORD=/tmp/tickmarkr-forced-stall.record.json TICKMARKR_TEST_FORCE_STALL=1 npx --no-install vitest run tests/e2e/forced-stall.e2e.test.ts -t 'the enabled forced-stall release proof makes the integration tip verifier recover a real RPC-stranded serial file as parallel exit1 then serial-only exit0 under distinct nonces, so a helper-only green or a full-suite retry fails'`,
+     then
+     `npx --no-install tsx scripts/ci/cli.ts verdict --require-test 'tests/e2e/forced-stall.e2e.test.ts::the enabled forced-stall release proof makes the integration tip verifier recover a real RPC-stranded serial file as parallel exit1 then serial-only exit0 under distinct nonces, so a helper-only green or a full-suite retry fails' /tmp/tickmarkr-forced-stall.record.json`
+     must exit 0. A skipped smoke or stall leaf is not proof: Vitest exits 0 when the named leaf skips (the gate
+     unset, Orca unreachable, a drifted `-t` title), and the verdict reads it RED. Record both results before
+     declaring the release complete.
 
-   - **GRADE PUBLIC CI FROM JOB LOGS AT RUN-END ONLY (law 48).** A badge is not the grade, and
-     `gh run view --job --log` is empty while the run is in progress. At run-end execute
-     `scripts/grade-ci.sh <run-id> <expected-count> <tag>` and require GREEN from every job of the
-     declared inventory it prints first — serial `test` and `test-macos`, or sharded, per OS, the four
-     `suite <os> k/4` shards, `single-fork <os>` and `aggregate <os>`; a missing, duplicated or unknown
-     job reads UNREADABLE, never a skip. Its UNREADABLE state is a hard stop, not a green default.
-     Derive the expected glob pathspec count with `git ls-files ':(glob)tests/**/*.test.ts'`
-     (including the `.tsx` sibling where present), never a bare
-     `tests/**/*.test.ts`: bare `**` is not a git glob (law 49).
+   - **GRADE PUBLIC CI FROM ITS RUN RECORD AND PROOF GROUPS AT RUN-END ONLY (law 48).** A badge is not
+     the grade, and an in-progress run is never graded. At run-end execute
+     `scripts/grade-ci.sh <run-id> <mirror HEAD sha> <mirror clone> <tag>` and require GREEN from every job
+     of the declared inventory it prints first — serial `test` and `test-macos`; a missing, duplicated or
+     unknown job reads UNREADABLE, never a skip, and a sharded run reads UNREADABLE until its proof-group
+     selection ships (ANL-022 §7.4). The grader is bound to the head: a run of any other commit reads
+     UNREADABLE before anything is downloaded. It reads GitHub's structured step outcomes and conclusions and
+     recomputes each job's uploaded proof group (`proof-<job>`: the Vitest records and the floors sidecar)
+     against the test files that commit tracks in the mirror clone — there is no count to derive, and no job
+     log text is read, so a log gh labels `UNKNOWN STEP` or a test that prints timeout text cannot move the
+     grade. Its UNREADABLE state is a hard stop, not a green default.
 
    - **RE-READ THE REGISTRY BEFORE RULING (law 51).** A successful Release run and the first
      `npm view` are separate observations: registry propagation can briefly return the prior version.
