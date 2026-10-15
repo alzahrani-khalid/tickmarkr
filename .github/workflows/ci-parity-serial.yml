@@ -1,0 +1,145 @@
+# OBSERVER 2.8.2 PARITY TWIN (D-1824 / D-1817 shape; T7 outOfScope's parity gate). NEVER on main: it lives only on the
+# public mirror's parity/v2.8.2 branch, whose PR is closed unmerged. It is dfd25a5ac's serial ci.public.yml (v2.8.2 T2's form)
+# byte-for-byte except: this header, the name, the trigger (pull_request only), its own concurrency group, and ONE extra step
+# per job that uploads coverage/coverage-summary.json as parity-serial-<job> (cli.ts parity's --serial-coverage input) AFTER
+# the proof-group upload, so the proof group itself is the shipped serial form's.
+# The public tree's CI — shipped by the export in place of the private ci.yml, which the export
+# excludes because its selftest job invokes the private export script that never ships.
+# Everything here runs against the checked-out tree on its own: no private files, no secrets,
+# no agent CLIs. No paths-ignore: documentation-only PRs get a conclusive check too.
+name: CI parity serial
+
+on:
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-parity-serial-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    # Runs ONLY in the public repo. This file is tracked privately (the export ships it),
+    # but in the private tree the manifest suite would correctly fail against .planning/
+    # and every private push would bill a second full CI run. After the launch rename the
+    # private repo is tickmarkr-dev, so the canonical name selects the public repo alone.
+    if: github.repository == 'alzahrani-khalid/tickmarkr'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: npm run lint
+      # Full-suite proof in TWO invocations (OBS-829, measured 2026-09-01/02 on four collapses): a
+      # host stall on the hosted runner times out a parallel `suite` worker's onTaskUpdate rpc and
+      # vitest throws BEFORE dispatching the four single-fork projects, whose files then vanish
+      # unnamed and unfailed. Running those projects in their own `if: always()` invocation means a
+      # throw in `suite` cannot lose them, and the set step holds both records to the tracked tree.
+      # OBS-156: serialize to one fork on the hosted runner (measured 4 cores here, 3 on macOS;
+      # ANL-022 X8). OBS-148 fixed release.yml only, so this job starved a different load-sensitive
+      # test on every release (v1.78 herdr READINESS, v1.79 daemon tip-verify artifact) while Release
+      # passed on the identical commit.
+      # v2.8.2 T2 (ANL-022 §7.2a): each Vitest step runs through run-ci-vitest.sh, which tees its log
+      # and decides its exit from the invocation's own record (`<log>.record.json`); both logs live in
+      # $RUNNER_TEMP/proof/, so the floors sidecar, the two records and the logs form one proof group
+      # that the last step uploads as proof-<job>, the group the grader recomputes (ANL-022 §7.2b).
+      - name: Run coverage proof (parallel suite project)
+        shell: bash
+        run: bash scripts/run-ci-vitest.sh "$RUNNER_TEMP/proof/tickmarkr-test-output.log" npm run test:coverage -- --project suite
+        env:
+          TICKMARKR_CI_LEAN_REPORTERS: "1"
+          VITEST_MAX_FORKS: "1"
+          TICKMARKR_SWEEP_TIMEOUT_MS: "900000"
+      # v2.7.8 T1 (queue row 118): vitest's threshold check reads istanbul percent(0,0) as 100, so a
+      # floor glob matching nothing passes silently. Recheck the json-summary the lean reporter
+      # wrote against the very thresholds object vitest.config.ts enforces; a glob that owns no
+      # entry, or only statement-free entries, reds here even when the coverage step stayed green.
+      # The summary is written when a test fails too (coverage.reportOnFailure), and the producer
+      # writes its own sidecar (`--out`, no pipe), so its exit status reaches the step unmasked.
+      - name: Recheck coverage floors
+        if: always()
+        shell: bash
+        run: npx tsx scripts/ci/cli.ts floors coverage/coverage-summary.json --out "$RUNNER_TEMP/proof/floors.out"
+      - name: Run single-fork projects (independent of the step above)
+        if: always()
+        shell: bash
+        run: bash scripts/run-ci-vitest.sh "$RUNNER_TEMP/proof/tickmarkr-test-output-singlefork.log" npx vitest run --project sync-heavy --project keys-ledger --project built-cli --project signal-reaper
+        env:
+          TICKMARKR_CI_LEAN_REPORTERS: "1"
+          VITEST_MAX_FORKS: "1"
+          TICKMARKR_SWEEP_TIMEOUT_MS: "900000"
+      # An in-job check only: every tracked test file once, finished, across both records. The grader
+      # recomputes the set from the uploaded records and never reads this step's output.
+      - name: Assert collected test-file set
+        if: always()
+        shell: bash
+        run: npx tsx scripts/ci/cli.ts assert $RUNNER_TEMP/proof/*.record.json
+      - name: Upload proof group
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: proof-${{ github.job }}
+          path: ${{ runner.temp }}/proof/
+      - name: Upload parity coverage summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: parity-serial-${{ github.job }}
+          path: coverage/coverage-summary.json
+
+  test-macos:
+    if: github.repository == 'alzahrani-khalid/tickmarkr'
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: npm run lint
+      # Same two-invocation proof, serialization and proof group as ubuntu (the lane-equality test pins
+      # it); one fork on the 3-core macOS runner (ANL-022 X8).
+      - name: Run coverage proof (parallel suite project)
+        shell: bash
+        run: bash scripts/run-ci-vitest.sh "$RUNNER_TEMP/proof/tickmarkr-test-output.log" npm run test:coverage -- --project suite
+        env:
+          TICKMARKR_CI_LEAN_REPORTERS: "1"
+          VITEST_MAX_FORKS: "1"
+          TICKMARKR_SWEEP_TIMEOUT_MS: "900000"
+      # Same recheck as ubuntu: the lane-equality test pins both jobs to the same steps.
+      - name: Recheck coverage floors
+        if: always()
+        shell: bash
+        run: npx tsx scripts/ci/cli.ts floors coverage/coverage-summary.json --out "$RUNNER_TEMP/proof/floors.out"
+      - name: Run single-fork projects (independent of the step above)
+        if: always()
+        shell: bash
+        run: bash scripts/run-ci-vitest.sh "$RUNNER_TEMP/proof/tickmarkr-test-output-singlefork.log" npx vitest run --project sync-heavy --project keys-ledger --project built-cli --project signal-reaper
+        env:
+          TICKMARKR_CI_LEAN_REPORTERS: "1"
+          VITEST_MAX_FORKS: "1"
+          TICKMARKR_SWEEP_TIMEOUT_MS: "900000"
+      # An in-job check only: every tracked test file once, finished, across both records. The grader
+      # recomputes the set from the uploaded records and never reads this step's output.
+      - name: Assert collected test-file set
+        if: always()
+        shell: bash
+        run: npx tsx scripts/ci/cli.ts assert $RUNNER_TEMP/proof/*.record.json
+      - name: Upload proof group
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: proof-${{ github.job }}
+          path: ${{ runner.temp }}/proof/
+      - name: Upload parity coverage summary
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: parity-serial-${{ github.job }}
+          path: coverage/coverage-summary.json
