@@ -1,4 +1,5 @@
 import { graphDefinitionHash, loadGraph, saveGraph, taskDefinitionFingerprint } from "../../graph/graph.js";
+import { filesGlob } from "../../graph/files-glob.js";
 import { execFileSync } from "node:child_process";
 import { userInfo } from "node:os";
 import { allAdapters } from "../../adapters/registry.js";
@@ -7,7 +8,7 @@ import { loadConfig } from "../../config/config.js";
 import { integrationBranch } from "../../run/merge.js";
 import { integrationAnchor } from "../../run/daemon.js";
 import { separabilityErrors, surfaceErrors, taskBudgetErrors } from "../../compile/collateral.js";
-import { GATE_NAMES, type GateName } from "../../graph/schema.js";
+import { GATE_NAMES, type GateName, type Task } from "../../graph/schema.js";
 import { applyScopeAmendments, bindingToken, captureOwedCheck, engagementComparable, engagementReleased, failedGateBeforePark, parseBindingToken, physicalLine, ATTEMPT_CAP_RELEASE, GATE_SATISFIED_RELEASE, Journal, RECHECK_RELEASE, REVIEW_UPHELD_RELEASE, type DecisionBinding, type JournalEvent } from "../../run/journal.js";
 
 export const APPROVAL_DISPOSITIONS = ["dispatch", "waive-gate", "re-dispatch", "fund-fixed-attempt", "fresh-budget"] as const;
@@ -312,7 +313,7 @@ export async function approve(argv: string[], cwd = process.cwd()): Promise<stri
     const amendedFiles = [...new Set([...task.files, ...files])];
     if (amendedFiles.length === task.files.length) throw new Error("--files must extend the parked files[] revision");
     const amended = { ...graph, tasks: graph.tasks.map((t) => t.id === taskId ? { ...t, files: amendedFiles } : t) };
-    const conflicts = separabilityErrors(amended.tasks);
+    const conflicts = scopeGrantConflicts(cwd, journal, runId, taskId, amended.tasks, events);
     if (conflicts.length) throw new Error(`refusing scope-request approval for ${taskId}: ${conflicts.join("\n")}`);
     // C4: a live grant may not take a task past the bounds that fail every compile. The exception
     // list is EMPTY on purpose — a recorded historical compile exception confers no live authority.
@@ -460,6 +461,106 @@ function integrationBase(events: readonly JournalEvent[], byName: () => string):
   }
   const branch = String(events.find((e) => e.event === "run-start")!.data.branch);
   return "anchor" in anchor ? { branch, base: anchor.anchor } : { branch, base: "unknown", unreadable: anchor.unreadable };
+}
+
+/**
+ * Queue 169 (D-1982/D-1983/D-1986): the in-run OBS-212 check a scope-request grant runs. Only the
+ * pairs this amendment changes are judged — the requester against each unordered sibling; a pair
+ * another amendment created was judged by that grant and is never re-judged here. A sibling is
+ * exempt only when this run already merged it into the requester's branch: its replayed status is
+ * done, its NEWEST journaled merge row names a full lowercase object id, and that commit is an
+ * ancestor of the requester's task branch (the run's integration branch plus --taskId, read exactly
+ * as the failed-task recheck reads it — a marked run's branch comes from its run-start record, never
+ * the current config). Every other overlapping pair keeps the compile-time refusal, an unreadable
+ * git answer included. The surviving errors are separabilityErrors' own rows, so the refusal text
+ * and its pair order are unchanged.
+ */
+function scopeGrantConflicts(
+  cwd: string, journal: Journal, runId: string, requesterId: string,
+  tasks: ReadonlyArray<Pick<Task, "id" | "files" | "deps">>, events: readonly JournalEvent[],
+): string[] {
+  const errors = separabilityErrors(tasks);
+  if (!errors.length) return errors;
+  const pairs = separabilityPairs(tasks);
+  if (pairs.length !== errors.length) return errors; // a misaligned local fold refuses everything
+  const statuses = journal.replayStatuses();
+  let taskRef: string | undefined;
+  const requesterRef = () => (taskRef ??= `${integrationBase(events, () => integrationBranch(loadConfig(cwd), runId)).branch}--${requesterId}`);
+  const kept: string[] = [];
+  for (let i = 0; i < errors.length; i++) {
+    const { a, b } = pairs[i]!;
+    const sibling = a === requesterId ? b : b === requesterId ? a : undefined;
+    if (sibling === undefined) continue;
+    if (mergedSiblingExempt(cwd, events, statuses.get(sibling), sibling, requesterRef)) continue;
+    kept.push(errors[i]!);
+  }
+  return kept;
+}
+
+/** A full lowercase git object id: 40 (SHA-1) or 64 (SHA-256) hex, nothing else. */
+const FULL_OBJECT_ID = /^[0-9a-f]{40}([0-9a-f]{24})?$/;
+
+/**
+ * The one exemption: the sibling is done in THIS run's replay and its newest merge row's commit is a
+ * full object id that is an ancestor of the requester's task branch. Any unreadable git answer — a
+ * missing requester branch, a commit the repository lacks, a failed ancestry read — is no exemption.
+ */
+function mergedSiblingExempt(
+  cwd: string, events: readonly JournalEvent[], status: string | undefined, siblingId: string, requesterRef: () => string,
+): boolean {
+  if (status !== "done") return false;
+  const merge = [...events].reverse().find((e) => e.event === "merge" && e.taskId === siblingId);
+  const commit = typeof merge?.data.commit === "string" ? merge.data.commit : undefined;
+  if (commit === undefined || !FULL_OBJECT_ID.test(commit)) return false;
+  const ref = requesterRef();
+  try {
+    execFileSync("git", ["rev-parse", "--verify", ref], { cwd, stdio: "ignore" });
+    execFileSync("git", ["merge-base", "--is-ancestor", commit, ref], { cwd, stdio: "ignore" });
+  } catch {
+    return false;
+  }
+  return true;
+}
+
+/** The conflicting unordered pairs of separabilityErrors, in its exact emission order. */
+function separabilityPairs(tasks: ReadonlyArray<Pick<Task, "id" | "files" | "deps">>): Array<{ a: string; b: string }> {
+  const byId = new Map(tasks.map((t) => [t.id, t.deps ?? []] as const));
+  const pairs: Array<{ a: string; b: string }> = [];
+  for (let i = 0; i < tasks.length; i++) {
+    for (let j = i + 1; j < tasks.length; j++) {
+      const a = tasks[i]!, b = tasks[j]!;
+      if (pairReachable(a.id, byId).has(b.id) || pairReachable(b.id, byId).has(a.id)) continue; // ordered
+      if (pairOverlap(a.files ?? [], b.files ?? []).length > 0) pairs.push({ a: a.id, b: b.id });
+    }
+  }
+  return pairs;
+}
+
+/** Tasks reachable from `id` through deps (transitive) — separabilityErrors' own fold. */
+function pairReachable(id: string, byId: Map<string, readonly string[]>): Set<string> {
+  const seen = new Set<string>();
+  const stack = [...(byId.get(id) ?? [])];
+  while (stack.length) {
+    const next = stack.pop()!;
+    if (seen.has(next)) continue;
+    seen.add(next);
+    stack.push(...(byId.get(next) ?? []));
+  }
+  return seen;
+}
+
+/** separabilityErrors' conservative overlap: identical patterns, or a glob matching the other's literal path. */
+function pairOverlap(a: readonly string[], b: readonly string[]): string[] {
+  const hits = new Set<string>();
+  const isGlob = (p: string) => /[*?[\]{}]/.test(p);
+  for (const pa of a) {
+    for (const pb of b) {
+      if (pa === pb) { hits.add(pa); continue; }
+      if (isGlob(pa) && !isGlob(pb) && filesGlob(pa)(pb)) hits.add(`${pb} ⊂ ${pa}`);
+      else if (isGlob(pb) && !isGlob(pa) && filesGlob(pb)(pa)) hits.add(`${pa} ⊂ ${pb}`);
+    }
+  }
+  return [...hits].sort();
 }
 
 /** The row a decision on this task answers right now: its newest failure when failed, else its newest park. */

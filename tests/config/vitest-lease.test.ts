@@ -9,7 +9,7 @@ import type { TestProject } from "vitest/node";
 import * as lease from "../../src/run/lease.js";
 import { discoverTestManifest } from "../../src/gates/test-manifest.js";
 import { COMMAND_LEASE_TOKEN_ENV, REPOSITORY_LEASE_TOKEN_ENV, readHolder, repositoryLeasePath, withRepositoryLease } from "../../src/run/lease.js";
-import vitestLease, { isListingInvocation, stopOwnedRunners } from "../../scripts/vitest-lease.js";
+import vitestLease, { CLOSE_DEADLINE_ENV, isListingInvocation, stopOwnedRunners } from "../../scripts/vitest-lease.js";
 import { makeRepo, makeTestTempDir } from "../helpers/tmprepo.js";
 
 vi.mock("node:child_process", async importOriginal => ({
@@ -369,22 +369,74 @@ test("test: gate and nested mutation children reenter only a live identity-bound
 
 // D-1300: the close hook waited until EVERY descendant was gone, and Vite's esbuild service (a child the
 // main process keeps for its whole life) made every close pay the full 10 s deadline, nested runs included.
-test("close releases the lease after the owned forks exit without waiting out the deadline on the runner's own long-lived tooling child", async () => {
+// Queue row 168 (ANL-022 §3 row 13): the bound is half the deadline the runner was GIVEN, not a wall-clock literal.
+test("test: a real configured Vitest runner given a thirty second close deadline and a release wait of at least sixty thousand milliseconds releases the repository lease after its probe ends in under half that deadline with the probe's fork gone first, so a close that waits out its deadline on the runner's own tooling child reaches and fails that elapsed bound", async () => {
   const log = join(makeTestTempDir("lease-log-"), "rows.jsonl");
   const repo = fixtureRepo();
   const path = await repositoryLeasePath(repo);
-  const r = vitest(repo, "prompt", log);
+  const closeDeadlineMs = 30_000;
+  const releaseWaitMs = 60_000; // >= 60000: a close that awaits its tooling child reaches the 30 s deadline and fails on `waited` below, not here
+  const r = vitest(repo, "prompt", log, { [CLOSE_DEADLINE_ENV]: String(closeDeadlineMs) });
   await until(() => rows(log).some(row => row.name === "prompt" && row.event === "end"), 60_000, `the probe to finish:\n${r.out()}`);
   const mine = rows(log).filter(row => row.name === "prompt");
-  await until(() => !existsSync(path), 30_000, `the lease release:\n${r.out()}`);
+  await until(() => !existsSync(path), releaseWaitMs, `the lease release:\n${r.out()}`);
   const released = Date.now();
   expect(running(mine[0]!.pid), "the fork that ran the probe is gone before the release").toBe(false);
   await passed(r);
-  // The defect pays the whole 10 s deadline; a release within 5 s (pool shutdown, two ps censuses and the
+  // The defect pays the whole close deadline; a release under half of it (pool shutdown, two ps censuses and the
   // lease layer's own reap) proves the tooling child was not awaited. Observed at 50 ms polling.
   const waited = released - mine.find(row => row.event === "end")!.at;
-  expect(waited, `${waited} ms from the probe's end to the lease release`).toBeLessThan(5_000);
-}, 120_000);
+  expect(waited, `${waited} ms from the probe's end to the lease release against a ${closeDeadlineMs} ms close deadline`).toBeLessThan(closeDeadlineMs / 2);
+}, 180_000);
+
+test("test: the close hook holds the lease for a workload that never drains until its deadline, ten seconds when the deadline variable is unset, empty, zero, negative, fractional, padded, carries a plus sign, a leading zero or a value above the largest safe integer, or is not a number, and thirty seconds or one second when it reads thirty thousand or one thousand, and releases at once when only the tooling child it recorded at setup survives, so a hook that ignores the variable, accepts a malformed value or awaits its tooling child fails", async () => {
+  const table: Array<[string | undefined, number]> = [
+    [undefined, 10_000], ["", 10_000], ["0", 10_000], ["-1", 10_000], ["1.5", 10_000], [" 30000", 10_000], ["+30000", 10_000],
+    ["030000", 10_000], ["9007199254740992", 10_000], ["ten", 10_000], ["30000", 30_000], ["1000", 1_000],
+  ];
+  const tooling = `999997 ${process.pid} S Mon Oct  5 00:00:00 2026\n`;
+  const workload = `999999 ${process.pid} S Mon Oct  5 00:00:01 2026\n`;
+  let workloadLive = true;
+  vi.spyOn(childProcesses, "spawnSync").mockImplementation(() => ({
+    status: 0, stdout: tooling + (workloadLive ? workload : ""), stderr: "", pid: 999998, output: [], signal: null,
+  }));
+  vi.spyOn(lease, "repositoryLeasePath").mockResolvedValue(join(root, "unused.lease"));
+  let released = false;
+  vi.spyOn(lease, "withRepositoryLease").mockImplementation(async (_cwd, run) => { try { return await run(); } finally { released = true; } });
+  const previous = process.env[CLOSE_DEADLINE_ENV];
+  const flush = async () => { for (let i = 0; i < 8; i++) await Promise.resolve(); };
+  vi.useFakeTimers();
+  try {
+    const close = async (value: string | undefined, live: boolean) => {
+      if (value === undefined) delete process.env[CLOSE_DEADLINE_ENV]; else process.env[CLOSE_DEADLINE_ENV] = value;
+      workloadLive = false; released = false; // setup records only the tooling child; the workload is born after it
+      let closing!: () => Promise<void>;
+      const project = { vitest: { onClose: (callback: () => Promise<void>) => { closing = callback; } } } as unknown as TestProject;
+      const teardown = await vitestLease(project);
+      await teardown!();
+      workloadLive = live;
+      const done = closing();
+      return { done, releasedNow: () => released };
+    };
+    for (const [value, deadlineMs] of table) {
+      const hook = await close(value, true);
+      await vi.advanceTimersByTimeAsync(deadlineMs - 20);
+      expect(hook.releasedNow(), `${JSON.stringify(value)} released before ${deadlineMs} ms`).toBe(false);
+      await vi.advanceTimersByTimeAsync(20);
+      await hook.done;
+      expect(hook.releasedNow(), `${JSON.stringify(value)} not released at ${deadlineMs} ms`).toBe(true);
+    }
+    // Only the recorded tooling child survives: the hook releases without advancing time at all.
+    const atOnce = await close("30000", false);
+    await flush();
+    expect(atOnce.releasedNow()).toBe(true);
+    await atOnce.done;
+  } finally {
+    vi.useRealTimers();
+    vi.restoreAllMocks(); // the spawnSync, repositoryLeasePath and withRepositoryLease spies must not reach the real-runner tests below
+    if (previous === undefined) delete process.env[CLOSE_DEADLINE_ENV]; else process.env[CLOSE_DEADLINE_ENV] = previous;
+  }
+});
 
 test("a nested runner still running at close holds the lease until it exits", async () => {
   const log = join(makeTestTempDir("lease-log-"), "rows.jsonl");

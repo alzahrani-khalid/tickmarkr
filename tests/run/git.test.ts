@@ -88,15 +88,61 @@ describe("sh", () => {
       expect(Date.now() - startedAt).toBeGreaterThanOrEqual(1800);
       await vi.waitFor(() => expect(processGroupExists(groupId)).toBe(false), { timeout: 2000, interval: 20 });
 
-      const closedAt = Date.now();
+      // Queue row 168 (ANL-022 §3 row 6): the closed case keeps its witnesses — code 0, no reap flag, no timeout —
+      // and the absolute 2000 ms bound moved to the deterministic twin below, which measures the grace itself.
       const closed = await sh(":", dir, 5000);
       expect(closed).toMatchObject({ code: 0 });
       expect(closed.reapedGroup).toBeUndefined();
-      expect(Date.now() - closedAt).toBeLessThan(2000);
+      expect(closed.timedOut).not.toBe(true);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
   }, 15000);
+
+  // Queue row 168: the "settles on its close, not at the grace" claim, measured under fake timers through the
+  // spawn seam (as the drain test above does) rather than against a wall clock the suite does not own.
+  test("test: a shell whose child exits zero and then closes its pipes settles on that close with code zero, no reap flag and no timer pending before any time passes, while a stand-in that settles only when the reap grace elapses is still unsettled at that point, so a close path that pays the grace fails", async () => {
+    vi.useFakeTimers();
+    const children: Array<EventEmitter & { pid: number; stdout: PassThrough; stderr: PassThrough; kill: () => boolean }> = [];
+    setSpawnForTests((() => {
+      const child = Object.assign(new EventEmitter(), { pid: 800100 + children.length, stdout: new PassThrough(), stderr: new PassThrough(), kill: () => true });
+      children.push(child);
+      return child;
+    }) as unknown as Parameters<typeof setSpawnForTests>[0]);
+    const kill = vi.spyOn(process, "kill").mockImplementation(() => true);
+    const settledFlag = (p: Promise<unknown>) => { const flag = { settled: false }; void p.then(() => { flag.settled = true; }); return flag; };
+    try {
+      const closing = shell(":", "/tmp", 5000);
+      const closingFlag = settledFlag(closing);
+      const lingering = shell("sleep 30 &", "/tmp", 5000);
+      const lingeringFlag = settledFlag(lingering);
+      const [closes, lingers] = children as [typeof children[number], typeof children[number]];
+      closes.emit("exit", 0, null);
+      closes.stdout.end(); closes.stderr.end();
+      closes.emit("close", 0, null);
+      lingers.emit("exit", 0, null); // its pipes stay held by the escaped descendant
+      for (let i = 0; i < 16; i++) await Promise.resolve(); // microtasks only: no fake time elapses
+      expect(closingFlag.settled).toBe(true);
+      expect(await closing).toMatchObject({ code: 0, timedOut: false });
+      expect((await closing).reapedGroup).toBeUndefined();
+      expect(lingeringFlag.settled).toBe(false);
+      expect(kill).not.toHaveBeenCalled();
+      // Only the lingering shell still owns timers (its reap grace and command ceiling); the closed one left none.
+      expect(vi.getTimerCount()).toBe(2);
+      // The stand-in settles only once the 2000 ms grace reaps its group and the 100 ms drain bound fires.
+      await vi.advanceTimersByTimeAsync(1999);
+      expect(lingeringFlag.settled).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(kill).toHaveBeenCalledWith(-lingers.pid, "SIGKILL");
+      lingers.emit("close", 0, null);
+      for (let i = 0; i < 16; i++) await Promise.resolve();
+      expect(lingeringFlag.settled).toBe(true);
+      expect(await lingering).toMatchObject({ code: 0, reapedGroup: true, timedOut: false });
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      resetSpawnForTests(); kill.mockRestore(); vi.useRealTimers();
+    }
+  });
 
   test("test: a command that reaches its timeout is still killed as a whole group and reports timedOut without reapedGroup whereas a reap path that reclassifies a timeout kill as a grace reap fails", async () => {
     const dir = mkdtempSync(join(tmpdir(), "tickmarkr-timeout-group-"));

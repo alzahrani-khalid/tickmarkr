@@ -71,7 +71,15 @@ export function stopOwnedRunners(deadlineMs = 10_000): boolean {
  * process keeps for its own lifetime (Vite's esbuild service, measured as the sole survivor at
  * every close) is `tooling` — it was already below this process before the first fork — and
  * waiting on it would only pay the full deadline at every close, nested runs included (D-1300). */
-async function awaitRunnerShutdown(tooling: ReadonlySet<string>, deadlineMs = 10_000): Promise<void> {
+export const CLOSE_DEADLINE_ENV = "TICKMARKR_VITEST_CLOSE_DEADLINE_MS";
+/** Queue row 168: the close deadline, read at close time. Only a plain positive safe integer (`^[1-9][0-9]*$`)
+ * is accepted; anything else — unset, empty, zero, signed, padded, fractional, spaced, unsafe — is the 10 s default. */
+export function closeDeadlineMs(env: NodeJS.ProcessEnv = process.env): number {
+  const value = env[CLOSE_DEADLINE_ENV];
+  return value !== undefined && /^[1-9][0-9]*$/.test(value) && Number.isSafeInteger(Number(value)) ? Number(value) : 10_000;
+}
+
+async function awaitRunnerShutdown(tooling: ReadonlySet<string>, deadlineMs = closeDeadlineMs()): Promise<void> {
   const end = Date.now() + deadlineMs;
   const workload = () => descendants().some(({ identity }) => !tooling.has(identity));
   while (workload() && Date.now() < end) await new Promise(resolve => setTimeout(resolve, 20));

@@ -2,6 +2,39 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v2.8.3 — a review seat that printed only its launch preamble reads silent, a scope grant is not refused by a sibling already merged into the requester's branch, and the last two seamless test ceilings derive from their window
+
+**v2.8.3** comes from one `tickmarkr run` of one spec (run-20261016-020933-…1248, three tasks). Each passed build, lint, evidence,
+scope, the acceptance judge, a cross-vendor review and the full suite.
+
+- **A review seat that printed only its launch preamble measures zero seat bytes (queue row 135(a)).** On an orca pane a dead seat's
+  capture holds the checkout frame, the launch echo, the banner and the identity row, and qwen 0.25.1 adds a SAFE MODE row and a
+  reworded yolo warning. The seat-byte measure (`reviewSeatOutput`, `src/gates/llm.ts`) counted those rows as the seat's own output, so
+  the seat never read silent: no first-strike demotion, and each dead seat held its review until the 900 s ceiling. The preamble walk
+  now accepts orca's checkout frame exactly as `checkoutProofLine` writes it (or a still-painting prefix of it on the last row) and the
+  launch echo directly above it, and qwen declares its SAFE MODE row and both recorded yolo wordings (0.21.15 and 0.25.1) as harness
+  rows, in render order, each at most once. Such a seat is re-routed at the first liveness beat as `launch-never-started` and demoted
+  at its first strike. Anything that only resembles the preamble — another checkout, a malformed or impossible frame, a repeated or
+  out-of-order row, a third yolo wording — still counts in full.
+- **A scope-request grant is not refused by a sibling done and merged into the requester's branch (queue row 169).** `tickmarkr approve
+  <run> <task> --files …` refused any path another unordered task also writes, even when that task had finished and its merge was
+  already in the requester's task branch. It now exempts exactly that sibling — done in the run's current replayed status, with its
+  newest journaled merge a full lowercase commit id the repository has and an ancestor of the requester's branch (read from the run's
+  recorded branch) — and checks only the requester's own pairs. A running, never-dispatched, parked, failed, re-dispatched or
+  pending-release sibling, a sibling with no merge, an abbreviated, uppercase or symbolic merge value, or a newer merge outside the
+  branch still refuses, with the graph and journal unchanged.
+- **The last two seamless test ceilings derive from their window (queue row 168).** The shell close case asserts its settlement under
+  fake timers instead of a 2000 ms wall bound, and the Vitest lease close hook reads its deadline from
+  `TICKMARKR_VITEST_CLOSE_DEADLINE_MS` (a positive safe integer; anything else is the 10 s default) while its test bounds the release by
+  half the deadline it set.
+
+Also in this release (test- and repo-only): the lock-table test compares words rather than the status header's wrap, which moves with
+host load and the clock (it failed the run's tip verify, D-2030); a test capture uses a synthetic checkout path; and `scripts/ci/cli.ts`
+release checks read `git status` without optional locks and time out a hung read (queue row 171).
+
+Declared: the qwen launch still prints its yolo warning (queue row 175), codex exec's header rows still count as seat bytes (row 176), an
+acceptance oracle is still selected by test title across the whole suite (row 179), and public CI stays serial (row 6, row 172).
+
 ## v2.8.2 — every release verdict reads a machine record of its exact commit, the release steps check each other, and timing ceilings stop failing under load
 
 **v2.8.2** comes from two `tickmarkr run`s of one spec. Run-20261014-213701-…1198 merged the test-ceiling task and was halted when that

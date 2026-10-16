@@ -85,8 +85,11 @@ const surfaces = async (repo: string, runId: string) => {
   };
 };
 
+// D-2030: the tty header wraps its facts to the board width and carries the live load1 and a clock-relative
+// "last event Nh ago", so where the run line wraps moves with host load and the date. Compare the words, not the layout.
+const words = (text: string) => text.replace(/\s+/g, " ");
 const expectEverySurfaceToName = (outputs: Awaited<ReturnType<typeof surfaces>>, line: string) => {
-  for (const [surface, output] of Object.entries(outputs)) expect(output, surface).toContain(line);
+  for (const [surface, output] of Object.entries(outputs)) expect(words(output), surface).toContain(words(line));
 };
 
 describe("run lock decision table (HARD-01, HARD-02)", () => {
@@ -106,7 +109,7 @@ describe("run lock decision table (HARD-01, HARD-02)", () => {
     ]);
     const outputs = await surfaces(abandoned, "run-abandoned");
     expectEverySurfaceToName(outputs, "run run-abandoned abandoned since 2026-09-04T12:34:56.000Z");
-    for (const [surface, output] of Object.entries(outputs)) expect(output, surface).not.toContain("run run-abandoned active");
+    for (const [surface, output] of Object.entries(outputs)) expect(words(output), surface).not.toContain("run run-abandoned active");
   });
 
   test("repository-wide non-run locks do not invent a run on init status or plan", async () => {
@@ -119,7 +122,7 @@ describe("run lock decision table (HARD-01, HARD-02)", () => {
     const outputs = await surfaces(repo, "run-abandoned");
 
     expectEverySurfaceToName(outputs, "run run-abandoned abandoned since 2026-09-04T12:34:56.000Z");
-    for (const [surface, output] of Object.entries(outputs)) expect(output, surface).not.toContain("run compile");
+    for (const [surface, output] of Object.entries(outputs)) expect(words(output), surface).not.toContain("run compile");
   });
 
   const dirs: string[] = [];

@@ -1,3 +1,4 @@
+import { constants } from "node:buffer";
 import { execSync } from "node:child_process";
 import { mkdtempSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -5,10 +6,10 @@ import { join } from "node:path";
 import { describe, expect, test, vi } from "vitest";
 import { FakeAdapter } from "../../src/adapters/fake.js";
 import { qwen } from "../../src/adapters/qwen.js";
-import type { Assignment, BillingChannel } from "../../src/adapters/types.js";
+import { shq, type Assignment, type BillingChannel } from "../../src/adapters/types.js";
 import { PLAIN_BANNER } from "../../src/brand.js";
 import { DEFAULT_CONFIG } from "../../src/config/config.js";
-import { OrcaDriver } from "../../src/drivers/orca.js";
+import { checkoutProofLine, inCheckout, OrcaDriver } from "../../src/drivers/orca.js";
 import type { ExecutorDriver, Slot } from "../../src/drivers/types.js";
 import { type GateVia, runLlmDetailed, SeatLaunchError, REVIEW_FIRST_LIVENESS_MS, REVIEW_SILENT_BYTE_FLOOR, PROMPT_GLYPHS, reviewSeatOutput, setGateCpuAccountantFactoryForTests, resetGateCpuAccountantFactoryForTests, verdictNonceLine } from "../../src/gates/llm.js";
 import { captureBaseline } from "../../src/gates/baseline.js";
@@ -168,13 +169,32 @@ class ClockedPane extends VerdictPane {
   override async close(): Promise<void> { this.closed++; }
 }
 
+// The first seat reads the clocked capture; the replacement seat answers a valid verdict at once.
+class ReplacementPane extends ClockedPane {
+  seats = 0;
+  private replacementNonce = "";
+  override async slot(cwd: string, name: string): Promise<Slot> {
+    this.seats++;
+    return super.slot(cwd, name);
+  }
+  override async waitOutput(slot: Slot, pattern: string, timeoutMs = 0): Promise<boolean> {
+    if (this.seats === 1) return super.waitOutput(slot, pattern, timeoutMs);
+    this.replacementNonce = /TICKMARKR_EXIT_([0-9a-f]+):/.exec(pattern)![1]!;
+    return true;
+  }
+  override async read(): Promise<string> {
+    if (this.seats === 1) return super.read();
+    return JSON.stringify({ nonce: this.replacementNonce, approve: true, findings: [] });
+  }
+}
+
 // The beat is bytes-only: a moving or unmeasurable dispatch tree changes nothing.
 const flatTree = () => ({ async start() {}, async stop() {}, read: () => ({ cpu: { ms: 40, resolutionMs: 10 }, gaps: 0 }) });
 const busyTree = (pane: ClockedPane) => ({
   async start() {}, async stop() {}, read: () => ({ cpu: { ms: 40 + pane.elapsed, resolutionMs: 10 }, gaps: 0 }),
 });
 
-async function clockedReview(text: string, ceiling: number, artifacts?: string, initialText?: string, tree = flatTree) {
+async function clockedReview(text: string, ceiling: number, artifacts?: string, initialText?: string, tree = flatTree, seat = reviewer()) {
   const { repo, base } = repoWithCommit();
   const pane = new ClockedPane(text, initialText);
   const cfg = structuredClone(DEFAULT_CONFIG);
@@ -183,7 +203,7 @@ async function clockedReview(text: string, ceiling: number, artifacts?: string, 
   const clock = vi.spyOn(Date, "now").mockImplementation(() => origin + pane.elapsed);
   setGateCpuAccountantFactoryForTests(() => tree(pane));
   try {
-    const row = await reviewGate(task, repo, base, author, channels, [reviewer()], cfg,
+    const row = await reviewGate(task, repo, base, author, channels, [seat], cfg,
       { ...via(pane), keep: true }, [], artifacts);
     return { row, pane };
   } finally {
@@ -205,21 +225,277 @@ const MID_PAINT = [
   PLAIN_BANNER,
 ];
 
+function qwenFixtureRows(name: string): string[] {
+  return readFileSync(new URL(`../fixtures/qwen/${name}`, import.meta.url), "utf8").trimEnd().split("\n");
+}
+
+// Row 135(a): the orca launch preamble, built from the production constructors. Run 1223's dead qwen seats
+// (T2, T3) recorded exactly this: an empty row, the checkout frame, the banner, a blank row, the bare
+// identity row, then qwen 0.25.1's SAFE MODE and yolo rows, 906 B with no trailing newline. The checkout
+// path here is synthetic but keeps the recorded 135 bytes, so the frame keeps its three-digit declared length
+// (a 294 B row) and the capture its 906 B; only the hex payload differs from the recording.
+const [SAFE_ROW, YOLO_0_21] = qwenFixtureRows("safe-mode.stderr") as [string, string];
+const YOLO_0_25 = qwenFixtureRows("safe-mode-0.25.1.stderr")[1]!;
+const CHECKOUT_1223 = "/tmp/tickmarkr-review-cause/synthetic-checkout-sized-to-the-recorded-135-byte-length/tickmarkr-run-20261015-011134-0000000000001223--T2";
+const FRAME = checkoutProofLine(CHECKOUT_1223);
+// A repainted echo keeps the printf argument's head: "_CHECKOUT <length>:" and the path's first two bytes in hex.
+const REPAINTED_FRAME_ARG = FRAME.slice("TICKMARKR".length, FRAME.indexOf(":") + 5);
+const ORCA_PREAMBLE = `\n${FRAME}\n${PLAIN_BANNER}\ntickmarkr\n`;
+const RUN_1223_CAPTURE = `${ORCA_PREAMBLE}${SAFE_ROW}\n${YOLO_0_25}`;
+// The shell's echo of the typed launch line above the frame: typed whole, and repainted as run 269 recorded it.
+const LAUNCH_ECHOES = [
+  inCheckout(CHECKOUT_1223, "export VITEST_MAX_FORKS='2'; bash '/tmp/tickmarkr-llm-x/dispatch.sh'"),
+  `patch.sh'\\''cd ${shq(CHECKOUT_1223)}    printf '%s%s\\n'           '${REPAINTED_FRAME_ARG}'export VITEST_MAX_FORKS='2d'6'56'; bash '36'/tmp/tickmarkr-llm-x/dispatch.sh'  ''`,
+];
+const qwenSeat = () => Object.assign(reviewer(), { harnessBannerRows: qwen.harnessBannerRows });
+
 test("test: a pane capture holding the dispatch echo, the qwen SAFE MODE banner rows from the recorded fixture and the identity line measures zero seat-authored bytes at every read position, while the same capture followed by one seat-authored word measures that word's bytes, so a banner row measured as seat output fails", () => {
   const dispatch = PREAMBLE.split("\n")[0]!;
-  const recordedRows = readFileSync(new URL("../fixtures/qwen/safe-mode.stderr", import.meta.url), "utf8").trimEnd().split("\n");
-  expect(qwen.harnessBannerRows).toEqual(recordedRows);
-  const harness = `${dispatch}\n${recordedRows.join("\n")}\nreview · T1 · attempt 0 · run-test\n`;
+  // Row 135(a): every recorded fixture — qwen 0.21.15 and qwen 0.25.1 — is swept, each row declared verbatim.
+  for (const name of ["safe-mode.stderr", "safe-mode-0.25.1.stderr"]) {
+    const recordedRows = qwenFixtureRows(name);
+    expect(recordedRows, name).toHaveLength(2);
+    for (const row of recordedRows) expect(qwen.harnessBannerRows, name).toContain(row);
+    const harness = `${dispatch}\n${recordedRows.join("\n")}\nreview · T1 · attempt 0 · run-test\n`;
+    const wrong: string[] = [];
+    for (let n = 1; n <= harness.length; n++) {
+      for (const capture of [harness.slice(0, n), harness.slice(0, n).replace(/\n$/, "") + "\n"]) {
+        const measured = reviewSeatOutput(capture, "test-nonce", qwen.harnessBannerRows);
+        if (measured !== "") wrong.push(`@${n}: ${JSON.stringify(measured)}`);
+      }
+    }
+    expect(wrong, name).toEqual([]);
+    expect(reviewSeatOutput(`${harness}verdict`, "test-nonce", qwen.harnessBannerRows), name).toBe("verdict");
+    expect(Buffer.byteLength(reviewSeatOutput(`${harness}verdict`, "test-nonce", qwen.harnessBannerRows)), name).toBe(7);
+  }
+});
+
+test("test: a pane review whose capture holds only the orca launch preamble and the qwen 0.25.1 banner rows as run 1223 recorded them is re-routed at the first liveness beat with cause launch-never-started, zero seat-authored bytes and a review-pool-demotion note for that seat at its first strike, and the same capture killed at a ceiling under the beat is recorded cause silent with zero bytes, while that capture followed by one seat-authored row of sixty-four bytes runs to its ceiling as truncated, so a seat whose checkout row or yolo warning counts as its output fails", async () => {
+  expect(Buffer.byteLength(CHECKOUT_1223)).toBe(135);
+  expect(Buffer.byteLength(RUN_1223_CAPTURE)).toBe(906);
+  expect(reviewSeatOutput(RUN_1223_CAPTURE, "test-nonce", qwen.harnessBannerRows)).toBe("");
+  // The named failure: a grammar without the 0.25.1 declaration counts the yolo warning as the seat's.
+  expect(reviewSeatOutput(RUN_1223_CAPTURE, "test-nonce", qwen.harnessBannerRows.slice(0, 2))).toBe(YOLO_0_25);
+
+  const beat = await clockedReview(RUN_1223_CAPTURE, 900_000, undefined, RUN_1223_CAPTURE, undefined, qwenSeat());
+  expect(beat.row.meta).toMatchObject({ cause: "launch-never-started", seatAuthoredBytes: 0, infra: true });
+  expect(beat.pane.elapsed).toBe(REVIEW_FIRST_LIVENESS_MS);
+  expect(beat.pane.closed).toBe(1);
+
+  const ceiling = await clockedReview(RUN_1223_CAPTURE, 10_000, undefined, RUN_1223_CAPTURE, undefined, qwenSeat());
+  expect(ceiling.row.meta).toMatchObject({ cause: "silent", seatAuthoredBytes: 0, timeoutMs: 10_000 });
+  expect(ceiling.pane.elapsed).toBe(10_000);
+
+  const own = "x".repeat(REVIEW_SILENT_BYTE_FLOOR);
+  expect(Buffer.byteLength(own)).toBe(64);
+  const working = await clockedReview(`${RUN_1223_CAPTURE}\n${own}`, 900_000, undefined, RUN_1223_CAPTURE, undefined, qwenSeat());
+  expect(working.row.meta).toMatchObject({ cause: "truncated", seatAuthoredBytes: 64 });
+  expect(working.pane.elapsed).toBe(900_000);
+
+  // First strike: the dead seat is demoted and re-routed to the replacement at the beat.
+  const { repo, base } = repoWithCommit();
+  const pane = new ReplacementPane(RUN_1223_CAPTURE, RUN_1223_CAPTURE);
+  const clock = vi.spyOn(Date, "now").mockImplementation(() => 1_800_000_000_000 + pane.elapsed);
+  const events: GateEvent[] = [];
+  setGateCpuAccountantFactoryForTests(() => flatTree());
+  try {
+    const replacement = Object.assign(reviewer(), { id: "replacement", vendor: "replacement-vendor" });
+    const demoted = new Set<string>();
+    const round = await runGates({ ...task, gates: ["review"] }, {
+      worktree: repo, baseRef: base, author, channels: [...channels,
+        { adapter: "replacement", vendor: "replacement-vendor", model: "replacement-1", tier: "frontier", channel: "api" }],
+      adapters: [qwenSeat(), replacement], cfg: DEFAULT_CONFIG, commands: {},
+      baseline: await captureBaseline(repo, {}), result: { ok: true, summary: "work", raw: "", deviations: [] },
+      via: via(pane), demotedReviewers: demoted, onGate: (event) => { events.push(event); },
+    });
+    expect(pane.seats).toBe(2);
+    expect(pane.elapsed).toBe(REVIEW_FIRST_LIVENESS_MS);
+    expect(round.results.find((row) => row.gate === "review")).toMatchObject({ pass: true,
+      meta: { reviewRetry: { flaked: "fake:fake-2", retried: "replacement:replacement-1" } } });
+    expect(demoted.has("fake:fake-2")).toBe(true);
+    expect(events.filter((event) => event.phase === "note" && event.name === "review-pool-demotion")).toMatchObject([
+      { payload: { reviewer: "fake:fake-2", cause: "launch-never-started", seatAuthoredBytes: 0 } },
+    ]);
+  } finally {
+    clock.mockRestore();
+    resetGateCpuAccountantFactoryForTests();
+  }
+});
+
+test("test: every orca launch preamble measures zero seat-authored bytes at every read position after launch, bare and line-terminated, the checkout frame row with or without an empty row above it, the same frame still painting as the last row, and the launch echo naming the frame's own checkout directly above the frame, each followed by the banner, the blank row and the bare identity row, with qwen's SAFE MODE row and either recorded yolo wording or with no adapter rows, while each complete preamble followed by one seat word measures exactly that word's bytes", () => {
+  const tails: Array<[string, string, readonly string[]]> = [
+    ["SAFE MODE + 0.21.15 yolo", `\n${SAFE_ROW}\n${YOLO_0_21}`, qwen.harnessBannerRows],
+    ["SAFE MODE + 0.25.1 yolo", `\n${SAFE_ROW}\n${YOLO_0_25}`, qwen.harnessBannerRows],
+    ["no adapter rows, qwen declared", "", qwen.harnessBannerRows],
+    ["no adapter rows, none declared", "", []],
+  ];
+  // [shape, rows above the frame, first read position]: without an echo the frame is swept from its first
+  // byte (still painting as the last row); behind an echo, from the read that holds the complete frame —
+  // the driver returns only then, and an echo over a frame still painting is a declared residual.
+  const heads: Array<[string, string, (capture: string) => number]> = [
+    ["frame", "", () => 1],
+    ["empty row + frame", "\n", () => 1],
+    ...LAUNCH_ECHOES.map((echo, i): [string, string, (capture: string) => number] =>
+      [`launch echo ${i} + frame`, `${echo}\n`, () => echo.length + 1 + FRAME.length]),
+  ];
   const wrong: string[] = [];
-  for (let n = 1; n <= harness.length; n++) {
-    for (const capture of [harness.slice(0, n), harness.slice(0, n).replace(/\n$/, "") + "\n"]) {
-      const measured = reviewSeatOutput(capture, "test-nonce", qwen.harnessBannerRows);
-      if (measured !== "") wrong.push(`@${n}: ${JSON.stringify(measured)}`);
+  let swept = 0;
+  for (const [headName, head, from] of heads) {
+    for (const [tailName, tail, rows] of tails) {
+      const capture = `${head}${FRAME}\n${PLAIN_BANNER}\ntickmarkr${tail}`;
+      const shape = `${headName} / ${tailName}`;
+      for (let n = from(capture); n <= capture.length; n++) {
+        for (const read of [capture.slice(0, n), capture.slice(0, n).replace(/\n$/, "") + "\n"]) {
+          swept++;
+          const measured = reviewSeatOutput(read, "test-nonce", rows);
+          if (measured !== "") wrong.push(`${shape} @${n}: ${Buffer.byteLength(measured)} B ${JSON.stringify(measured.slice(0, 40))}`);
+        }
+      }
+      expect(reviewSeatOutput(`${capture}\nword`, "test-nonce", rows), shape).toBe("word");
+      expect(Buffer.byteLength(reviewSeatOutput(`${capture}\nword`, "test-nonce", rows)), shape).toBe(4);
+    }
+  }
+  expect(wrong.slice(0, 20)).toEqual([]);
+  expect(swept).toBeGreaterThan(heads.length * tails.length * FRAME.length);
+  // The frame still painting, cut at each of its fields, with and without the empty row above it.
+  for (const k of ["T".length, "TICKMARKR_C".length, "TICKMARKR_CHECKOUT ".length, "TICKMARKR_CHECKOUT 13".length,
+    FRAME.indexOf(":") + 1, FRAME.length - 1]) {
+    for (const read of [FRAME.slice(0, k), `\n${FRAME.slice(0, k)}`, `\n${FRAME.slice(0, k)}\n`]) {
+      expect(reviewSeatOutput(read, "test-nonce", qwen.harnessBannerRows), JSON.stringify(read)).toBe("");
+    }
+  }
+  // A checkout holding two-, three- and four-byte characters: every cut of its frame, mid-character and
+  // mid-byte included, is still a prefix checkoutProofLine prints.
+  const unicodeFrame = checkoutProofLine("/tmp/é—😀 review");
+  for (let k = 1; k < unicodeFrame.length; k++) {
+    for (const read of [unicodeFrame.slice(0, k), `\n${unicodeFrame.slice(0, k)}`, `\n${unicodeFrame.slice(0, k)}\n`]) {
+      expect(reviewSeatOutput(read, "test-nonce", qwen.harnessBannerRows), JSON.stringify(read)).toBe("");
+    }
+  }
+  expect(reviewSeatOutput(`\n${unicodeFrame}\n${PLAIN_BANNER}\ntickmarkr\nword`, "test-nonce", qwen.harnessBannerRows)).toBe("word");
+});
+
+test("test: rows that only resemble the orca preamble count in full, a first row that does not name the next frame's checkout, an echo naming another checkout, an echo-shaped first row with no frame row directly under it, a frame row after the banner, the identity row or a qwen row, a second frame row, a frame row whose declared length disagrees with its hex, whose hex is uppercase or which lacks its terminator, a yolo warning in a wording neither recorded qwen version printed, and after either preamble a recorded qwen row repeated or out of render order, a yolo row twice in either wording or a declared row after a later one, which counts exactly from its first such row whether it ends the capture bare or line-terminated, so a strip that drops any of them fails", () => {
+  const rest = `\n${PLAIN_BANNER}\ntickmarkr`;
+  const typedEcho = LAUNCH_ECHOES[0]!;
+  const length = Buffer.byteLength(CHECKOUT_1223);
+  const hex = Buffer.from(CHECKOUT_1223, "utf8").toString("hex");
+  const thirdWording = "Warning: running headless with --yolo / approval-mode=yolo and no sandbox. Something else entirely.";
+  // [case, harness rows before it, the first row that must count, rows after it]. Each case is measured with
+  // the rows after it and, where the row is not a frame still painting, as the capture's last row too.
+  const cases: Array<[string, string, string, string]> = [
+    ["first row is seat text", "", "seat says hi", `\n${FRAME}${rest}`],
+    ["first row is the echo repainted without its cd path", "", `patch.sh'\\''    printf '%s%s\\n'  '${REPAINTED_FRAME_ARG}'`, `\n${FRAME}${rest}`],
+    ["echo naming another checkout", "", inCheckout("/elsewhere/tickmarkr-run-x--T9", "bash '/tmp/x/dispatch.sh'"), `\n${FRAME}${rest}`],
+    ["echo naming a checkout the frame's extends", "", typedEcho, `\n${checkoutProofLine(`${CHECKOUT_1223}0`)}${rest}`],
+    ["echo with an empty row under it", "", typedEcho, `\n\n${FRAME}${rest}`],
+    ["echo with seat text under it", "", typedEcho, "\nI reviewed it."],
+    ["echo below an earlier non-blank row", "\n", "seat text", `\n${typedEcho}\n${FRAME}${rest}`],
+    ["frame after the banner", `\n${FRAME}\n${PLAIN_BANNER}`, FRAME, "\ntickmarkr"],
+    ["frame after a banner with none before it", PLAIN_BANNER, FRAME, "\ntickmarkr"],
+    ["frame after the identity row", ORCA_PREAMBLE, FRAME, `\n${SAFE_ROW}`],
+    ["frame after a qwen row", `${ORCA_PREAMBLE}${SAFE_ROW}\n`, FRAME, `\n${YOLO_0_25}`],
+    ["second frame row", `\n${FRAME}\n`, FRAME, rest],
+    ["declared length above its hex", "\n", `TICKMARKR_CHECKOUT ${length + 1}:${hex};`, rest],
+    ["declared length below its hex", "\n", `TICKMARKR_CHECKOUT ${length - 1}:${hex};`, rest],
+    ["uppercase hex", "\n", `TICKMARKR_CHECKOUT ${length}:${hex.toUpperCase()};`, rest],
+    ["frame without its terminator", "\n", FRAME.slice(0, -1), rest],
+    // Trailing whitespace never completes a frame, extends its prefix or lets an echo above it pass.
+    ["frame with a trailing space", "\n", `${FRAME} `, rest],
+    ["frame with a trailing tab", "\n", `${FRAME}\t`, rest],
+    ["frame without its terminator, a space in its place", "\n", `${FRAME.slice(0, -1)} `, rest],
+    ["echo above a frame with a trailing space", "", typedEcho, `\n${FRAME} ${rest}`],
+    // Payloads checkoutProofLine can never print: not UTF-8, or an open sequence the length cannot close.
+    ["a byte no UTF-8 holds", "\n", "TICKMARKR_CHECKOUT 1:ff", rest],
+    ["a whole payload no UTF-8 holds", "\n", `TICKMARKR_CHECKOUT 24:${"ff".repeat(24)}`, rest],
+    ["a terminated payload no UTF-8 holds", "\n", "TICKMARKR_CHECKOUT 1:ff;", rest],
+    ["an encoded surrogate", "\n", "TICKMARKR_CHECKOUT 3:eda0", rest],
+    ["a two-byte sequence opened in a one-byte frame", "\n", "TICKMARKR_CHECKOUT 1:c3", rest],
+    ["a four-byte sequence opened in a three-byte frame", "\n", "TICKMARKR_CHECKOUT 3:f09f", rest],
+    ["a third yolo wording", `${ORCA_PREAMBLE}${SAFE_ROW}\n`, thirdWording, ""],
+  ];
+  // Declared lengths checkoutProofLine can never print: unsafe, non-finite once parsed, or one past the longest
+  // row the runtime's string limit holds. Each counts whether its hex is absent, empty, valid or not UTF-8.
+  for (const digits of ["9007199254740993", "9".repeat(37), "9".repeat(309), String(longestFrameLength() + 1)]) {
+    for (const payload of ["", ":", ":ff", ":f09f", ":c3", ":ed"]) {
+      cases.push([`declared length ${digits.slice(0, 20)}… (${digits.length} digits) then ${JSON.stringify(payload)}`, "\n", `TICKMARKR_CHECKOUT ${digits}${payload}`, rest]);
+    }
+  }
+  // A recorded qwen row repeated or out of render order, after either preamble: [case, rows, first that counts].
+  const S = SAFE_ROW, O = YOLO_0_21, N = YOLO_0_25;
+  const sequences: Array<[string, string[], number]> = [
+    ["SAFE MODE twice", [S, S], 1],
+    ["0.21.15 yolo twice", [S, O, O], 2], ["0.25.1 yolo twice", [S, N, N], 2],
+    ["0.21.15 yolo twice without SAFE MODE", [O, O], 1], ["0.25.1 yolo twice without SAFE MODE", [N, N], 1],
+    ["SAFE MODE after the 0.21.15 yolo", [O, S], 1], ["SAFE MODE after the 0.25.1 yolo", [N, S], 1],
+    ["0.21.15 yolo after the 0.25.1 yolo", [N, O], 1], ["0.21.15 yolo after SAFE MODE and the 0.25.1 yolo", [S, N, O], 2],
+  ];
+  for (const [pre, preamble] of [["orca", ORCA_PREAMBLE], ["herdr", PREAMBLE]] as const) {
+    for (const [name, rows, first] of sequences) {
+      cases.push([`${pre}: ${name}`, preamble + rows.slice(0, first).map((r) => `${r}\n`).join(""), rows.slice(first).join("\n"), ""]);
+    }
+  }
+  const wrong: string[] = [];
+  for (const [name, harness, first, after] of cases) {
+    // A last row lacking only the frame's terminator IS the frame still painting (zero, swept above).
+    const ends = first === FRAME.slice(0, -1) ? [after] : [after, ""];
+    for (const tail of new Set(ends)) {
+      for (const terminator of ["", "\n"]) {
+        const capture = `${harness}${first}${tail}${terminator}`;
+        const measured = reviewSeatOutput(capture, "test-nonce", qwen.harnessBannerRows);
+        if (measured !== capture.slice(harness.length)) {
+          wrong.push(`${name}${tail === "" ? " (last row)" : ""}${terminator ? " terminated" : " bare"}: ${Buffer.byteLength(measured)} B, expected ${Buffer.byteLength(capture.slice(harness.length))}`);
+        }
+      }
     }
   }
   expect(wrong).toEqual([]);
-  expect(reviewSeatOutput(`${harness}verdict`, "test-nonce", qwen.harnessBannerRows)).toBe("verdict");
-  expect(Buffer.byteLength(reviewSeatOutput(`${harness}verdict`, "test-nonce", qwen.harnessBannerRows))).toBe(7);
+  // Control: the legal sequences the same preambles carry measure zero, so every row above counts for its own reason.
+  for (const preamble of [ORCA_PREAMBLE, PREAMBLE]) {
+    for (const rows of [[S, O], [S, N], [S, O, N], [N], [O]]) {
+      expect(reviewSeatOutput(preamble + rows.join("\n"), "test-nonce", qwen.harnessBannerRows)).toBe("");
+    }
+  }
+  // Control: the longest declared length the runtime can print is still a frame painting, bare and terminated.
+  for (const payload of ["", ":", ":f09f", ":c3"]) {
+    for (const read of [`\nTICKMARKR_CHECKOUT ${longestFrameLength()}${payload}`, `\nTICKMARKR_CHECKOUT ${longestFrameLength()}${payload}\n`]) {
+      expect(reviewSeatOutput(read, "test-nonce", qwen.harnessBannerRows), JSON.stringify(read)).toBe("");
+    }
+  }
+});
+
+// The largest n whose checkoutProofLine row — `TICKMARKR_CHECKOUT <n>:`, 2n hex digits, `;` — fits one string.
+function longestFrameLength(): number {
+  let n = Math.floor(constants.MAX_STRING_LENGTH / 2);
+  while (`TICKMARKR_CHECKOUT ${n}:`.length + 2 * n + 1 > constants.MAX_STRING_LENGTH) n--;
+  return n;
+}
+
+test("test: a headless review whose qwen stand-in writes the SAFE MODE row and either recorded yolo wording to stderr and outlives the ceiling is recorded cause silent with zero seat-authored bytes, while the same stand-in writing one more stderr row of its own is recorded truncated with that row's bytes, so a headless seat whose yolo warning counts as output fails", async () => {
+  class StderrQwen extends FakeAdapter {
+    harnessBannerRows = qwen.harnessBannerRows;
+    constructor(scriptPath: string, private readonly rows: string[]) { super(scriptPath); }
+    override headlessCommand(): string { return `printf '%s\\n' ${this.rows.map(shq).join(" ")} >&2; sleep 10`; }
+  }
+  const { repo, base } = repoWithCommit();
+  const script = join(mkdtempSync(join(tmpdir(), "tickmarkr-headless-qwen-")), "script.json");
+  writeFileSync(script, JSON.stringify({ tasks: {} }));
+  const artifacts = mkdtempSync(join(tmpdir(), "tickmarkr-headless-qwen-raw-"));
+  const cfg = structuredClone(DEFAULT_CONFIG);
+  // The budget lets a login shell on a loaded host print both rows before the ceiling kills its tree.
+  cfg.review.timeoutMs = 2_000;
+  const own = "my own stderr row";
+  for (const yolo of [YOLO_0_21, YOLO_0_25]) {
+    const silent = await reviewGate(task, repo, base, author, channels, [new StderrQwen(script, [SAFE_ROW, yolo])], cfg,
+      undefined, [], artifacts);
+    expect(silent.meta).toMatchObject({ cause: "silent", seatAuthoredBytes: 0 });
+    // The stand-in did write both rows before the ceiling killed it: the zero is measured, not an empty read.
+    expect(readFileSync(String(silent.meta?.rawPath), "utf8")).toContain(`${SAFE_ROW}\n${yolo}`);
+
+    const truncated = await reviewGate(task, repo, base, author, channels, [new StderrQwen(script, [SAFE_ROW, yolo, own])], cfg,
+      undefined, [], artifacts);
+    expect(truncated.meta).toMatchObject({ cause: "truncated", seatAuthoredBytes: Buffer.byteLength(own) });
+  }
 });
 
 test("no read position inside the preamble measures a seat-authored byte", () => {
@@ -467,23 +743,6 @@ test("test: a pane review seat whose capture holds only the harness preamble thr
   expect(silent.pane.elapsed).toBe(REVIEW_FIRST_LIVENESS_MS);
   expect(silent.pane.closed).toBe(1);
   const { repo, base } = repoWithCommit();
-  class ReplacementPane extends ClockedPane {
-    seats = 0;
-    private replacementNonce = "";
-    override async slot(cwd: string, name: string): Promise<Slot> {
-      this.seats++;
-      return super.slot(cwd, name);
-    }
-    override async waitOutput(slot: Slot, pattern: string, timeoutMs = 0): Promise<boolean> {
-      if (this.seats === 1) return super.waitOutput(slot, pattern, timeoutMs);
-      this.replacementNonce = /TICKMARKR_EXIT_([0-9a-f]+):/.exec(pattern)![1]!;
-      return true;
-    }
-    override async read(): Promise<string> {
-      if (this.seats === 1) return super.read();
-      return JSON.stringify({ nonce: this.replacementNonce, approve: true, findings: [] });
-    }
-  }
   const pane = new ReplacementPane(PREAMBLE);
   const clock = vi.spyOn(Date, "now").mockImplementation(() => 1_800_000_000_000 + pane.elapsed);
   const events: GateEvent[] = [];

@@ -695,8 +695,11 @@ const releaseChecks = new Set<ReleaseCheck>(["subject", "tag-absent", "trees-equ
 const hexCommit = /^[0-9a-fA-F]{40}$/;
 const field = (value: string | number | boolean) => typeof value === "string" ? JSON.stringify(value) : String(value);
 
+// Queue row 171 (3): a read that hangs (a stalled fetch, a wedged binary) ends as UNREADABLE instead of holding the release.
+const READ_TIMEOUT_MS = 300_000;
+
 function readCommand(command: string, args: string[], cwd?: string): string {
-  const result = spawnSync(command, args, { cwd, encoding: "utf8", maxBuffer: 1 << 24 });
+  const result = spawnSync(command, args, { cwd, encoding: "utf8", maxBuffer: 1 << 24, timeout: READ_TIMEOUT_MS });
   if (result.error || result.status !== 0) {
     throw new Error(`${command} ${args.join(" ")} failed (${result.status ?? result.signal}): ${message(result.error ?? result.stderr)}`);
   }
@@ -768,7 +771,8 @@ const runRelease = async (args: readonly string[]): Promise<number> => {
       gitRead(repo, "fetch", "origin", "main");
       const head = gitRead(repo, "rev-parse", "--verify", "HEAD^{commit}");
       const origin = gitRead(repo, "rev-parse", "--verify", "refs/remotes/origin/main^{commit}");
-      const dirty = gitRead(repo, "status", "--porcelain", "--ignored", "--untracked-files=all") !== "";
+      // Queue row 171 (1): a read-only status never refreshes the mirror's index (export-public.sh's own rule).
+      const dirty = gitRead(repo, "--no-optional-locks", "status", "--porcelain", "--ignored", "--untracked-files=all") !== "";
       Object.assign(fields, { head, origin, dirty });
       if (head !== sha) defects.push({ kind: "head", expected: sha, actual: head });
       if (origin !== sha) defects.push({ kind: "origin", expected: sha, actual: origin });

@@ -1,13 +1,14 @@
 import { stripVTControlCharacters } from "node:util";
 import { AsyncLocalStorage } from "node:async_hooks";
+import { constants } from "node:buffer";
 import { randomBytes } from "node:crypto";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { matchesTrustDialog, type WorkerAdapter } from "../adapters/types.js";
+import { matchesTrustDialog, shq, type WorkerAdapter } from "../adapters/types.js";
 import type { Effort } from "../graph/schema.js";
 import { formatOwnedName, parseOwnedName, type ExecutorDriver, type Slot } from "../drivers/types.js";
-import type { SeatLaunchCause } from "../drivers/orca.js";
+import { CHECKOUT_MARK, checkoutProofLine, type SeatLaunchCause } from "../drivers/orca.js";
 import { bannerShell, paneDispatchCommand, PLAIN_BANNER } from "../brand.js";
 import { sh } from "../run/git.js";
 import {
@@ -273,6 +274,54 @@ const START_ROW = /^TICKMARKR_START_[\w-]+$/;
 const IDENTITY_LINE = /^(?:review\s*·|tickmarkr(?::|$))/;
 const IDENTITY_OPENERS = ["review ·", "tickmarkr"];
 
+// Row 135(a): the orca driver's launch preamble. create returns only once it read the complete checkout
+// frame, so every gate read holds the frame row whole — exactly checkoutProofLine's form (declared length
+// equal to half its lowercase hex, terminated) — or, as the last row, a strict prefix of that form.
+// Above it, as the first non-blank row, the shell may echo the typed launch line, which names that
+// frame's own checkout as `cd <shq checkout>`. Anything else shaped like them is the seat's. Frame rows
+// are read untrimmed: a trailing space or tab can never complete a frame or extend its prefix.
+function frameCheckout(row: string): string | undefined {
+  const hex = /^TICKMARKR_CHECKOUT \d+:(.*);$/.exec(row)?.[1];
+  if (hex === undefined) return undefined;
+  const checkout = Buffer.from(hex, "hex").toString("utf8");
+  return checkoutProofLine(checkout) === row ? checkout : undefined;
+}
+function partialFrameRow(row: string): boolean {
+  if (row.length > 0 && `${CHECKOUT_MARK} `.startsWith(row)) return true;
+  const m = /^TICKMARKR_CHECKOUT (0|[1-9]\d*)(?::([0-9a-f]*))?$/.exec(row);
+  if (m === null || !printableFrameLength(m[1]!)) return false;
+  return m[2] === undefined || frameHexCompletable(m[2], Number(m[1]));
+}
+// checkoutProofLine prints `TICKMARKR_CHECKOUT <n>:`, 2n hex digits and `;` as one string, so the length it
+// declares is a safe integer whose row fits the runtime's longest string. Any other length, unsafe or
+// non-finite included, is never its output, nor a prefix of one.
+function printableFrameLength(digits: string): boolean {
+  const n = Number(digits);
+  return Number.isSafeInteger(n) && CHECKOUT_MARK.length + digits.length + 2 * n + 3 <= constants.MAX_STRING_LENGTH;
+}
+// A hex prefix checkoutProofLine could still extend to `bytes` bytes: valid UTF-8 so far, with its open
+// sequence closable inside the declared length. A trailing half byte is tried at each of its 16 values.
+function frameHexCompletable(hex: string, bytes: number): boolean {
+  if (hex.length > bytes * 2) return false;
+  const whole = Buffer.from(hex.slice(0, hex.length - (hex.length % 2)), "hex");
+  const candidates = hex.length % 2 === 0 ? [whole]
+    : Array.from({ length: 16 }, (_, lo) => Buffer.concat([whole, Buffer.of(parseInt(hex.at(-1)!, 16) * 16 + lo)]));
+  return candidates.some((c) => {
+    const owed = utf8Owed(c);
+    return owed !== undefined && owed <= bytes - c.length;
+  });
+}
+// Continuation bytes the last sequence still owes, or undefined when no continuation makes it UTF-8.
+function utf8Owed(bytes: Buffer): number | undefined {
+  try { new TextDecoder("utf-8", { fatal: true }).decode(bytes, { stream: true }); } catch { return undefined; }
+  let lead = bytes.length;
+  while (lead > 0 && bytes.length - lead < 3 && (bytes[lead - 1]! & 0xc0) === 0x80) lead--;
+  if (lead === 0) return 0;
+  const b = bytes[lead - 1]!;
+  const size = b >= 0xf0 ? 4 : b >= 0xe0 ? 3 : b >= 0xc0 ? 2 : 1;
+  return Math.max(0, size - (bytes.length - lead + 1));
+}
+
 // Stages of the preamble walk. Each complete harness row is accepted only at or after its stage.
 const ECHO = 0, START = 1, BANNER = 2, IDENTITY = 3, SEAT = 4;
 
@@ -284,6 +333,7 @@ function seatStart(output: string, adapterBannerRows: readonly string[]): number
   let bannerAt: number | undefined; // next banner row expected once the banner has begun
   let adapterBannerAt: number | undefined;
   let identitySeen = false;
+  let frameSeen = false;
   let offset = 0;
   for (let i = 0; i < rows.length; i++) {
     const row = rows[i]!.replace(/[ \t]+$/, "");
@@ -291,34 +341,35 @@ function seatStart(output: string, adapterBannerRows: readonly string[]): number
     const last = i === rows.length - 1;
     // Complete harness rows: equality against the shape the preamble allows at this stage.
     let accepted = false;
+    const below = last ? undefined : frameCheckout(rows[i + 1]!);
     if (!identitySeen && stage < SEAT && t.length === 0) accepted = true; // blank rows between preamble rows
+    else if (stage === ECHO && !frameSeen && frameCheckout(rows[i]!) !== undefined) { frameSeen = true; accepted = true; }
+    else if (below !== undefined && row.includes(`cd ${shq(below)}`) && rows.slice(0, i).every((r) => r.trim() === "")) accepted = true; // orca launch echo
     else if (stage <= ECHO && completeEchoRow(row)) accepted = true;
     else if (stage <= START && START_ROW.test(row)) { stage = BANNER; accepted = true; }
     else if (!identitySeen && stage <= BANNER && bannerAt === undefined && BANNER_ROWS.includes(row)) { stage = BANNER; bannerAt = BANNER_ROWS.indexOf(row) + 1; accepted = true; }
     else if (!identitySeen && stage <= BANNER && bannerAt !== undefined && row === BANNER_ROWS[bannerAt]) { bannerAt++; accepted = true; }
-    else if (stage <= IDENTITY && adapterBannerAt === undefined && adapterBannerRows.includes(row)) {
+    else if (stage <= IDENTITY && adapterBannerRows.indexOf(row, adapterBannerAt ?? 0) >= 0) {
+      // A closed list in render order: each row at most once, in list order, skipping allowed.
       stage = BANNER;
-      adapterBannerAt = adapterBannerRows.indexOf(row) + 1;
+      adapterBannerAt = adapterBannerRows.indexOf(row, adapterBannerAt ?? 0) + 1;
       accepted = true;
     }
-    else if (stage <= IDENTITY && adapterBannerAt !== undefined && row === adapterBannerRows[adapterBannerAt]) { adapterBannerAt++; accepted = true; }
     else if (!identitySeen && stage <= IDENTITY && IDENTITY_LINE.test(t)) { stage = IDENTITY; identitySeen = true; accepted = true; }
     if (accepted) { offset += rows[i]!.length + 1; continue; }
     if (!last) return offset;
     // The last row may be a partial paint: a prefix of the next harness row the preamble allows.
     if (stage <= ECHO && partialEchoRow(row)) return -1;
+    if (stage === ECHO && !frameSeen && partialFrameRow(rows[i]!)) return -1;
     if (stage <= START && (START_MARKER.startsWith(row) || /^TICKMARKR_START_[\w-]*$/.test(row))) return -1;
     if (stage <= BANNER && (bannerAt === undefined
       ? BANNER_ROWS.some((b) => b.startsWith(row))
       : BANNER_ROWS[bannerAt]?.startsWith(row) === true)) return -1;
-    if (stage <= IDENTITY && (adapterBannerAt === undefined
-      ? adapterBannerRows.some((b) => b.startsWith(row))
-      : adapterBannerRows[adapterBannerAt]?.startsWith(row) === true)) return -1;
+    if (stage <= IDENTITY && adapterBannerRows.slice(adapterBannerAt ?? 0).some((b) => b.startsWith(row))) return -1;
     // The identity row is painted right after the banner, so its prefix is a partial paint only there;
     // with no banner in the capture, "review" or "tick" alone is the seat's own first row.
     if (!identitySeen && stage <= IDENTITY
-      && (bannerAt === BANNER_ROWS.length
-        || (adapterBannerRows.length > 0 && adapterBannerAt === adapterBannerRows.length))
+      && (bannerAt === BANNER_ROWS.length || adapterBannerAt !== undefined)
       && IDENTITY_OPENERS.some((o) => o.startsWith(t))) return -1;
     return offset;
   }

@@ -52,11 +52,17 @@ function initEvent(name: string): QwenInit {
 }
 
 describe("qwen native drive", () => {
-  test("qwen declares each recorded SAFE MODE stderr row as harness banner bytes", () => {
-    const recorded = fixture("safe-mode.stderr").trimEnd().split("\n");
-    expect(QWEN_HARNESS_BANNER_ROWS).toEqual(recorded);
+  test("test: qwen declares as harness banner rows exactly the SAFE MODE row and the yolo row of each recorded stderr fixture, the 0.21.15 wording and the 0.25.1 wording, in render order, so a declaration missing either wording or holding a row no fixture recorded fails", () => {
+    const v0_21 = fixture("safe-mode.stderr").trimEnd().split("\n");
+    const v0_25 = fixture("safe-mode-0.25.1.stderr").trimEnd().split("\n");
+    expect(v0_21).toHaveLength(2);
+    expect(v0_25).toHaveLength(2);
+    // Both versions print the same SAFE MODE row first; only the yolo row's wording changed.
+    expect(v0_25[0]).toBe(v0_21[0]);
+    expect(v0_25[1]).not.toBe(v0_21[1]);
+    expect(QWEN_HARNESS_BANNER_ROWS).toEqual([v0_21[0], v0_21[1], v0_25[1]]);
+    for (const row of QWEN_HARNESS_BANNER_ROWS) expect([...v0_21, ...v0_25]).toContain(row);
     expect(qwen.harnessBannerRows).toBe(QWEN_HARNESS_BANNER_ROWS);
-    expect(recorded).toHaveLength(2);
   });
 
   test("test: the qwen headless command run against a stub qwen on PATH passes --safe-mode beside --approval-mode yolo -m the model -o json and -p with an empty argument and declares --safe-mode among its hardcoded flags whereas a form without --safe-mode or one that drops -o json fails", () => {

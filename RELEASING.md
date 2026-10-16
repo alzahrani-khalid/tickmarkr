@@ -101,7 +101,7 @@ Per release:
    in-progress run — with the shipped tri-state grader, giving it the mirror clone that holds the commit:
 
    ```bash
-   bash skills/tickmarkr-overseer/scripts/grade-ci.sh <run-id> "$MIRROR_COMMIT" /path/to/tickmarkr-public-mirror v2.8.2
+   bash skills/tickmarkr-overseer/scripts/grade-ci.sh <run-id> "$MIRROR_COMMIT" /path/to/tickmarkr-public-mirror v2.8.3
    ```
 
    The grader is bound to that head: a run of any other commit, or one not yet at run-end, reads
@@ -120,7 +120,7 @@ Per release:
 
    ```bash
    npx --no-install tsx scripts/ci/cli.ts release subject /path/to/tickmarkr-public-mirror "$MIRROR_COMMIT"
-   npx --no-install tsx scripts/ci/cli.ts release tag-absent /path/to/tickmarkr-public-mirror v2.8.2
+   npx --no-install tsx scripts/ci/cli.ts release tag-absent /path/to/tickmarkr-public-mirror v2.8.3
    ```
 
    Only after the grader prints `VERDICT rc=0` (GREEN for both jobs), tag `MIRROR_COMMIT` in the **public**
@@ -129,8 +129,8 @@ Per release:
 
    ```bash
    cd /path/to/tickmarkr-public-mirror
-   git tag -a v2.8.2 "$MIRROR_COMMIT" -m "v2.8.2"
-   git push origin v2.8.2
+   git tag -a v2.8.3 "$MIRROR_COMMIT" -m "v2.8.3"
+   git push origin v2.8.3
    ```
 
 5. The tag push runs `release.yml` in the public repository:
@@ -188,8 +188,8 @@ Per release:
    ```bash
    cd /path/to/tickmarkr-private-main
    PRIVATE_RELEASE_COMMIT=$(git -C /path/to/tickmarkr-private-main rev-parse main)
-   npx --no-install tsx scripts/ci/cli.ts release trees-equal /path/to/tickmarkr-private-main "$PRIVATE_RELEASE_COMMIT" /path/to/tickmarkr-public-mirror v2.8.2
-   git -C /path/to/tickmarkr-private-main tag -a v2.8.2 "$PRIVATE_RELEASE_COMMIT" -m "v2.8.2"
+   npx --no-install tsx scripts/ci/cli.ts release trees-equal /path/to/tickmarkr-private-main "$PRIVATE_RELEASE_COMMIT" /path/to/tickmarkr-public-mirror v2.8.3
+   git -C /path/to/tickmarkr-private-main tag -a v2.8.3 "$PRIVATE_RELEASE_COMMIT" -m "v2.8.3"
    ```
 
 ### 8. Branch deletion after the private tag
@@ -201,7 +201,7 @@ Per release:
    by hand only after `GREEN` (exit 0):
 
    ```bash
-   BRANCHES_TO_DELETE=(spec/v2.8.2 tickmarkr/run-<run-id>)
+   BRANCHES_TO_DELETE=(spec/v2.8.3 tickmarkr/run-<run-id>)
    npx --no-install tsx scripts/ci/cli.ts release prune-safe /path/to/tickmarkr-private-main "$PRIVATE_RELEASE_COMMIT" "${BRANCHES_TO_DELETE[@]}"
    git -C /path/to/tickmarkr-private-main branch -d "${BRANCHES_TO_DELETE[@]}"
    ```
@@ -220,7 +220,7 @@ registry shows the new version:
 
    ```bash
    cd /path/to/tickmarkr-private-main
-   npx --no-install tsx scripts/ci/cli.ts release installed-version tickmarkr 2.8.2
+   npx --no-install tsx scripts/ci/cli.ts release installed-version tickmarkr 2.8.3
    ```
 
    `tickmarkr version` must report exactly the just-published version. A mismatch is a hard

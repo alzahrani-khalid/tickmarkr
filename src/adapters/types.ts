@@ -407,7 +407,8 @@ export interface WorkerAdapter {
   headlessCommand(promptFile: string, model: string, effort?: Effort): string;
   // Adapter-owned launch notices are emitted by the CLI, not by the review seat. Each entry is one
   // complete recorded terminal row, in render order. The seat-byte grammar treats only this closed
-  // list (and partial paints of its next row) as harness at the banner boundary.
+  // list as harness at the banner boundary: each row at most once, in list order, skipping allowed
+  // (and, as the last row, a partial paint of a row it could still accept).
   harnessBannerRows?: readonly string[];
   // v1.2: launch the CLI's real interactive TUI with the prompt injected; null = adapter can't → print fallback
   interactiveCommand(promptFile: string, model: string, effort?: Effort): string | null;
