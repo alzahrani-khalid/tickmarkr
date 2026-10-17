@@ -8,6 +8,7 @@ import { afterEach, expect, test, vi } from "vitest";
 import { beat } from "../../src/cli/commands/beat.js";
 import { dispatch } from "../../src/cli/index.js";
 import { tickmarkrDir } from "../../src/graph/graph.js";
+import { TeardownLedger } from "../helpers/owned-process.js";
 import {
   BEAT_CLAIM_WAIT, BEAT_GENERATION_ENV, acquireBeatClaim, beatClaimPath, beatOwnerPath, defaultBeatDeps, readProcessIdentity, releaseBeatClaim, withLegacyClaim,
   type BeatLifecycleDeps, type IdentityHost, type ProcessIdentity,
@@ -103,14 +104,9 @@ const realKillSeams = {
 } satisfies Record<string, KillSeam>;
 const cleanupKill = guardedKill("cleanup");
 
-const spawned: ChildProcess[] = [];
-afterEach(() => {
-  for (const child of spawned.splice(0)) {
-    try { if (child.pid) cleanupKill(child.pid, "SIGKILL"); } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
-    }
-  }
-});
+const processes = new TeardownLedger();
+const spawned = processes.children;
+afterEach(() => processes.teardown(cleanupKill));
 
 const mkRepo = () => {
   const repo = realpathSync(mkdtempSync(join(tmpdir(), "tickmarkr-beat-residual-")));
@@ -121,7 +117,7 @@ const mkRepo = () => {
 const env = () => { const e = { ...process.env }; delete e[BEAT_GENERATION_ENV]; return e; };
 const deps = (over: Partial<BeatLifecycleDeps> = {}, host: IdentityHost = {}): BeatLifecycleDeps => ({
   ...defaultBeatDeps(host), cli: CLI, env: env(), kill: guardedKill("default"),
-  spawn: (command, args, options) => { const child = spawn(command, args, options); spawned.push(child); return child; },
+  spawn: (command, args, options) => { const child = spawn(command, args, options); processes.addChild(child); return child; },
   ...over,
 });
 const run = (repo: string, argv: string[], d: BeatLifecycleDeps = deps()) => dispatch("beat", argv, { beat: (a) => beat(a, repo, d) });
@@ -199,7 +195,7 @@ else {
 type TakerMode = "recover" | "release" | "write" | "mistaken";
 const spawnTaker = (repo: string, mode: TakerMode, step: string) => {
   const child = spawn(process.execPath, ["--import", TSX, "--input-type=module", "-e", TAKER, ROOT, repo, mode, step], { stdio: "ignore", env: env() });
-  spawned.push(child);
+  processes.addChild(child);
   return child;
 };
 async function pausedTaker(repo: string, mode: TakerMode, step: string) {
@@ -241,7 +237,7 @@ async function displacedAt(k: number, repo: string, argv: string[], over: Partia
 const launchFixture = (repo: string, detached: boolean): Partial<BeatLifecycleDeps> => ({
   spawn: (_command, args, options) => {
     const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)", "--", ...args], { ...options, detached });
-    spawned.push(child);
+    processes.addChild(child);
     const arm = { armId: args[args.indexOf("--arm-id") + 1], armEpoch: new Date().toISOString(), markerFence: "NONE" };
     put(supervisionArmPath(repo, "overseer"), JSON.stringify(arm) + "\n");
     put(supervisionBeatPath(repo, "overseer"), JSON.stringify({ tier: "overseer", seat: "s", ...arm, pid: child.pid, beatAt: new Date().toISOString() }) + "\n");
@@ -252,7 +248,7 @@ const launchFixture = (repo: string, detached: boolean): Partial<BeatLifecycleDe
 /** A real process this test owns that never beats, recorded as the tier's owned generation. */
 async function ownedFixture(repo: string, tier: SupervisionTier, seat: string) {
   const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)", "gen-fixture"], { cwd: repo, detached: true, stdio: "ignore" });
-  spawned.push(child);
+  processes.addChild(child);
   await until(() => typeof readProcessIdentity(child.pid!) === "object");
   const id = readProcessIdentity(child.pid!) as ProcessIdentity;
   recordOwner(repo, tier, seat, child.pid!, id);
@@ -311,7 +307,7 @@ test("test: each of the five closed real-kill seams, routed through one guard, t
     } finally { send.mockRestore(); }
 
     const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore" });
-    spawned.push(child);
+    processes.addChild(child);
     const exited = once(child, "exit");
     try {
       await once(child, "spawn");
@@ -430,7 +426,7 @@ test("test: production beat pre-signal readers treat Linux teardown argv as unkn
       // A same-session child carrying the launch argv that never arms: the rollback is the only actor on it.
       spawn: (_command, args, options) => {
         child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)", "--", ...args], { ...options, detached: false });
-        spawned.push(child);
+        processes.addChild(child);
         return child;
       },
       identity: (p) => {
@@ -452,7 +448,7 @@ test("test: production beat start prints the recorded-seat legacy exit and migra
   const recipe = "`tickmarkr beat overseer --seat legacy:seat --stand-down`";
   // A pre-lifecycle --loop writer this test owns independently of tickmarkr.
   const legacy = spawn(CLI[0], [...CLI.slice(1), "beat", "overseer", "--seat", "legacy:seat", "--loop"], { cwd: repo, stdio: "ignore", env: env() });
-  spawned.push(legacy);
+  processes.addChild(legacy);
   await until(() => {
     try { return JSON.parse(readFileSync(supervisionBeatPath(repo, "overseer"), "utf8")).pid === legacy.pid; } catch { return false; }
   });
@@ -476,7 +472,7 @@ test("test: production beat start prints the recorded-seat legacy exit and migra
   expect(await run(repo, printed, watched)).toMatchObject({ code: 0, out: expect.stringContaining("DISARMED") });
   expect(await run(repo, ["start", "overseer", "--seat", "new:seat"], watched)).toMatchObject({ code: 0, out: expect.stringContaining("ARMED as new:seat") });
   const started = owner(repo, "overseer");
-  spawned.push({ pid: started.pid } as ChildProcess);
+  processes.addPid(started.pid);
   expect(await run(repo, ["status", "overseer", "--seat", "new:seat"], watched))
     .toMatchObject({ code: 0, out: `overseer ARMED (new:seat) — detached pid ${started.pid}, generation ${started.generation}` });
   expect(started.pid).not.toBe(legacy.pid);
@@ -488,7 +484,7 @@ test("test: production beat start prints the recorded-seat legacy exit and migra
   // it leaves that claim behind, which the same printed step reclaims with the notice before standing the tier down.
   const stranded = mkRepo();
   const writer = spawn(CLI[0], [...CLI.slice(1), "beat", "overseer", "--seat", "legacy:seat", "--loop"], { cwd: stranded, stdio: "ignore", env: env() });
-  spawned.push(writer);
+  processes.addChild(writer);
   const recordedBy = (path: string) => { try { return JSON.parse(readFileSync(path, "utf8")).pid === writer.pid; } catch { return false; } };
   await until(() => recordedBy(supervisionBeatPath(stranded, "overseer")));
   const advice = await run(stranded, ["start", "overseer", "--seat", "new:seat"], watched);
@@ -513,7 +509,7 @@ test("test: production beat start prints the recorded-seat legacy exit and migra
   expect(migrated.out).toContain("overseer DISARMED — legacy:seat handed off");
   expect(existsSync(strandedClaim)).toBe(false);
   expect(await run(stranded, ["start", "overseer", "--seat", "new:seat"], watched)).toMatchObject({ code: 0, out: expect.stringContaining("ARMED as new:seat") });
-  spawned.push({ pid: owner(stranded, "overseer").pid } as ChildProcess);
+  processes.addPid(owner(stranded, "overseer").pid);
   expect(kills).toEqual([]);
   // POSITIVE COMPATIBILITY CONTROL: the unchanged old-format {tier, token, pid, claimedAt} bytes a pre-2.6.8 legacy
   // writer publishes, left by its real process killed holding them, are reclaimed by the same printed step on
@@ -523,7 +519,7 @@ test("test: production beat start prints the recorded-seat legacy exit and migra
   mkdirSync(dirname(oldClaim), { recursive: true });
   const oldWriter = spawn(process.execPath, ["-e", "require('fs').writeFileSync(process.argv[1], JSON.stringify({ tier: 'overseer', token: 'legacy', " +
     "pid: process.pid, claimedAt: new Date().toISOString() }) + '\\n'); setInterval(() => {}, 1000)", oldClaim], { stdio: "ignore" });
-  spawned.push(oldWriter);
+  processes.addChild(oldWriter);
   await until(() => existsSync(oldClaim));
   const oldBytes = bytes(oldClaim)!;
   expect(Object.keys(JSON.parse(oldBytes))).toEqual(["tier", "token", "pid", "claimedAt"]);
@@ -543,7 +539,7 @@ test("test: production beat start prints the recorded-seat legacy exit and migra
   const dashStep = /`tickmarkr beat ([^`]+)`/.exec(dashExit.out)![1].split(" ");
   expect(await run(dashed, dashStep, watched)).toMatchObject({ code: 0, out: expect.stringContaining("DISARMED — --legacy handed off") });
   expect(await run(dashed, ["start", "overseer", "--seat", "new:seat"], watched)).toMatchObject({ code: 0, out: expect.stringContaining("ARMED as new:seat") });
-  spawned.push({ pid: owner(dashed, "overseer").pid } as ChildProcess);
+  processes.addPid(owner(dashed, "overseer").pid);
 
   // Missing seat: a seatless legacy arm gets no invented seat and no recipe.
   const seatless = mkRepo();
@@ -574,7 +570,7 @@ test("test: production beat start/stop/legacy writers reclaim the exact dead cla
   const started = await run(repo, ["start", "overseer", "--seat", "s"]);
   expect(started).toMatchObject({ code: 0, out: expect.stringContaining(`overseer reclaimed the claim of dead pid ${corpse} (token dead-token)`) });
   expect(started.out).toContain("ARMED as s");
-  spawned.push({ pid: owner(repo, "overseer").pid } as ChildProcess);
+  processes.addPid(owner(repo, "overseer").pid);
   expect(existsSync(beatClaimPath(repo, "overseer"))).toBe(false);
   const stopCorpse = deadPid();
   put(beatClaimPath(repo, "overseer"), claimOf(stopCorpse, "stop-dead"));
@@ -621,7 +617,7 @@ test("test: production beat start/stop/legacy writers reclaim the exact dead cla
     ["overseer", "--seat", "s", "--new-arm"], ["overseer", "--seat", "s", "--stand-down"]];
   const held = mkRepo();
   const holder = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
-  spawned.push(holder);
+  processes.addChild(holder);
   const fast = { sleep: async () => {} };
   const rows: Array<[string, BeatLifecycleDeps, string]> = [
     [claimOf(holder.pid, "live"), deps(fast), `pid ${holder.pid} holds`],
@@ -733,7 +729,7 @@ test("test: production beat start/stop/legacy writers reclaim the exact dead cla
     expect([mode, step, recovered.code]).toEqual([mode, step, 0]);
     expect(recovered.out).toContain(`overseer recovered the removal lock of killed taker pid ${taker.pid}`);
     expect(recovered.out).toContain(verb === "stop" ? "overseer DISARMED" : "ARMED as s");
-    if (verb === "start") spawned.push({ pid: owner(r, "overseer").pid } as ChildProcess);
+    if (verb === "start") processes.addPid(owner(r, "overseer").pid);
     expect([mode, step, claimLeftovers(r), existsSync(beatClaimPath(r, "overseer"))]).toEqual([mode, step, [], false]);
   }
   // No ownerless instant: a removal lock first appears by the rename of a directory already holding its owner entry.
@@ -894,7 +890,7 @@ test("test: production beat start/stop/legacy writers reclaim the exact dead cla
       expect([shape, verb, result.code, result.out]).toEqual([shape, verb, 0, expect.stringContaining("overseer reclaimed the claim of dead pid")]);
       expect(result.out).toContain("overseer recovered dead generation gen-fixture");
       expect(result.out).toContain({ start: "ARMED as s", stop: "overseer DISARMED", legacy: "overseer DISARMED — s handed off", "one-shot": "overseer ARMED as s" }[verb]);
-      if (verb === "start") spawned.push({ pid: owner(r, "overseer").pid } as ChildProcess);
+      if (verb === "start") processes.addPid(owner(r, "overseer").pid);
       else {
         // The ordinary one-shot records the beat it was asked for (on the dead generation's arm, or a new initial one).
         expect([shape, verb, existsSync(beatOwnerPath(r, "overseer")), supervisionStatus(r, "overseer").state])
@@ -990,7 +986,7 @@ test("test: production beat start/stop/legacy writers reclaim the exact dead cla
     expect(recoverer.out).toContain(`overseer reclaimed the claim of dead pid ${corpse2}`);
     expect(recoverer).toMatchObject({ code: 0, out: expect.stringContaining(verb === "start" ? "overseer ARMED as s" : "overseer DISARMED — published DISARMED") });
     const child = verb === "start" ? owner(resumed, "overseer").pid : undefined;
-    if (child) spawned.push({ pid: child } as ChildProcess);
+    if (child) processes.addPid(child);
     expect(await deferred!).toMatchObject({ code: 0, out: expect.stringContaining(verb === "start" ? `retired detached pid ${child}` : "already stood down; checked no-op") });
     expect(existsSync(resumedClaim)).toBe(false);
     expect(existsSync(beatOwnerPath(resumed, "overseer"))).toBe(false);
@@ -1183,7 +1179,7 @@ test("test: production beat start/stop/legacy writers reclaim the exact dead cla
     for (let k = 1; ; k++) {
       const r = mkRepo();
       const launcher = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
-      spawned.push(launcher);
+      processes.addChild(launcher);
       recordOwner(r, "overseer", "s", process.pid, readProcessIdentity(process.pid) as ProcessIdentity);
       const claim = beatClaimPath(r, "overseer");
       put(claim, JSON.stringify({ tier: "overseer", token: "gen-fixture", pid: launcher.pid }) + "\n");
@@ -1218,14 +1214,14 @@ test("test: production beat start/stop/legacy writers reclaim the exact dead cla
   const racing = mkRepo();
   const racingClaim = beatClaimPath(racing, "overseer");
   const launcher = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
-  spawned.push(launcher);
+  processes.addChild(launcher);
   const launchOwner = (r: string, generation: string) => put(beatOwnerPath(r, "overseer"), JSON.stringify({
     tier: "overseer", seat: "s", generation, armId: generation, cwd: r, startedAt: new Date().toISOString(),
   }) + "\n");
   const launched = (r: string, generation: string) => {
     const child = spawn(CLI[0], [...CLI.slice(1), "beat", "overseer", "--seat", "s", "--loop", "--arm-id", generation],
       { cwd: r, stdio: ["ignore", "pipe", "pipe"], env: { ...env(), [BEAT_GENERATION_ENV]: generation } });
-    spawned.push(child);
+    processes.addChild(child);
     let out = "";
     child.stdout!.on("data", (chunk) => { out += chunk; });
     child.stderr!.on("data", (chunk) => { out += chunk; });
@@ -1272,7 +1268,7 @@ test("test: production beat start/stop/legacy writers reclaim the exact dead cla
   // with its recovery command, and that printed stop retires it (nothing signalled).
   const unbound = mkRepo();
   const unboundLauncher = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
-  spawned.push(unboundLauncher);
+  processes.addChild(unboundLauncher);
   put(beatClaimPath(unbound, "overseer"), JSON.stringify({ tier: "overseer", token: "gen-unbound", pid: unboundLauncher.pid }) + "\n");
   launchOwner(unbound, "gen-unbound");
   const unboundWriter = launched(unbound, "gen-unbound");
@@ -1326,7 +1322,7 @@ test("test: production beat admits twelve concurrent one-shots and stop after ti
   const owned = mkRepo();
   expect((await run(owned, ["start", "overseer", "--seat", "s"])).code).toBe(0);
   const child = owner(owned, "overseer");
-  spawned.push({ pid: child.pid } as ChildProcess);
+  processes.addPid(child.pid);
   const ownedClaim = beatClaimPath(owned, "overseer");
   put(ownedClaim, JSON.stringify({ tier: "overseer", token: "tick", pid: child.pid, claimedAt: new Date().toISOString() }) + "\n");
   const stopWaits: number[] = [];
@@ -1398,7 +1394,7 @@ test("test: production beat readback reports confirmed death and missing Darwin 
   // The child dies between ps and its cwd read at the initial proof: confirmed death, named, never signalled.
   const dies = mkRepo();
   const diedEarly = await run(dies, ["start", "overseer", "--seat", "s"], deps({
-    kill, spawn: (command, args, options) => { const child = spawn(command, args, options); spawned.push(child); writeFileSync(lsof.doom, String(child.pid)); return child; },
+    kill, spawn: (command, args, options) => { const child = spawn(command, args, options); processes.addChild(child); writeFileSync(lsof.doom, String(child.pid)); return child; },
   }, darwin));
   expect(diedEarly).toMatchObject({ code: 1, out: expect.stringContaining("died before its beat read back") });
   expect(diedEarly.out).toContain("rolled back this generation only");
@@ -1408,7 +1404,7 @@ test("test: production beat readback reports confirmed death and missing Darwin 
   let child: ChildProcess | undefined;
   const diedLate = await run(final, ["start", "overseer", "--seat", "s"], deps({
     kill,
-    spawn: (command, args, options) => { child = spawn(command, args, options); spawned.push(child); return child; },
+    spawn: (command, args, options) => { child = spawn(command, args, options); processes.addChild(child); return child; },
     identity: (p) => {
       const bound = existsSync(beatOwnerPath(final, "overseer")) && JSON.parse(readFileSync(beatOwnerPath(final, "overseer"), "utf8")).armEpoch;
       if (p === child?.pid && bound) killConfirmed(p);
@@ -1421,7 +1417,7 @@ test("test: production beat readback reports confirmed death and missing Darwin 
   // A live child whose cwd cannot be read stays UNREADABLE, names lsof, and is never signalled.
   const blind = mkRepo();
   const unreadable = await run(blind, ["start", "overseer", "--seat", "s"], deps({
-    kill, spawn: (command, args, options) => { const c = spawn(command, args, options); spawned.push(c); writeFileSync(lsof.fail, String(c.pid)); return c; },
+    kill, spawn: (command, args, options) => { const c = spawn(command, args, options); processes.addChild(c); writeFileSync(lsof.fail, String(c.pid)); return c; },
   }, darwin));
   expect(unreadable).toMatchObject({ code: 1, out: expect.stringContaining("UNREADABLE — child pid") });
   expect(unreadable.out).toContain(`lsof (${lsof.bin}) exited 1`);
@@ -1440,7 +1436,7 @@ test("test: production beat readback reports confirmed death and missing Darwin 
   const restored = deps({ kill }, darwin);
   expect(await run(repo, ["start", "overseer", "--seat", "s"], restored)).toMatchObject({ code: 0, out: expect.stringContaining("ARMED as s") });
   const armed = owner(repo, "overseer");
-  spawned.push({ pid: armed.pid } as ChildProcess);
+  processes.addPid(armed.pid);
   expect(await run(repo, ["status", "overseer", "--seat", "s"], restored)).toMatchObject({ code: 0, out: expect.stringContaining("ARMED (s)") });
   // lsof lost under a live owned beat: status and stop name lsof, nothing is signalled or removed.
   for (const verb of ["status", "stop"]) {
@@ -1487,7 +1483,7 @@ syncBuiltinESMExports();`);
   const handedOff = await run(handoff, ["start", "overseer", "--seat", "s"], handoffDeps);
   expect(handedOff).toMatchObject({ code: 0, out: expect.stringContaining("ARMED as s") });
   const handoffOwner = owner(handoff, "overseer");
-  spawned.push({ pid: handoffOwner.pid } as ChildProcess);
+  processes.addPid(handoffOwner.pid);
   // start returned while its child sat between its first beat and that tick's return; the launch claim is released.
   expect([existsSync(join(gate, "paused")), existsSync(join(gate, "resume")), existsSync(beatClaimPath(handoff, "overseer"))]).toEqual([true, false, false]);
   const beatAt = () => JSON.parse(bytes(supervisionBeatPath(handoff, "overseer"))!) as { pid: number; beatAt: string };

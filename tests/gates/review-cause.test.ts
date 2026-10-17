@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test, vi } from "vitest";
 import { FakeAdapter } from "../../src/adapters/fake.js";
+import { claudeCode } from "../../src/adapters/claude-code.js";
 import { qwen } from "../../src/adapters/qwen.js";
 import { shq, type Assignment, type BillingChannel } from "../../src/adapters/types.js";
 import { PLAIN_BANNER } from "../../src/brand.js";
@@ -188,15 +189,33 @@ class ReplacementPane extends ClockedPane {
   }
 }
 
+// Queue row 184: a print mode that buffers its whole output (`claude -p --output-format text`) shows only the launch
+// preamble until it exits, then everything at once; `exitsAt` undefined is a buffering seat that never exits.
+class BufferingPane extends ClockedPane {
+  private verdictNonce = "";
+  constructor(private readonly preamble: string, private readonly exitsAt: number | undefined) { super(preamble, preamble); }
+  override async waitOutput(slot: Slot, pattern: string, timeoutMs = 0): Promise<boolean> {
+    if (this.exitsAt !== undefined && this.elapsed + timeoutMs >= this.exitsAt) {
+      this.elapsed = this.exitsAt;
+      this.verdictNonce = /TICKMARKR_EXIT_([0-9a-f]+):/.exec(pattern)![1]!;
+      return true;
+    }
+    return super.waitOutput(slot, pattern, timeoutMs);
+  }
+  override async read(): Promise<string> {
+    if (!this.verdictNonce) return super.read();
+    return `${this.preamble}${JSON.stringify({ nonce: this.verdictNonce, approve: true, findings: [] })}\n`;
+  }
+}
+
 // The beat is bytes-only: a moving or unmeasurable dispatch tree changes nothing.
 const flatTree = () => ({ async start() {}, async stop() {}, read: () => ({ cpu: { ms: 40, resolutionMs: 10 }, gaps: 0 }) });
 const busyTree = (pane: ClockedPane) => ({
   async start() {}, async stop() {}, read: () => ({ cpu: { ms: 40 + pane.elapsed, resolutionMs: 10 }, gaps: 0 }),
 });
 
-async function clockedReview(text: string, ceiling: number, artifacts?: string, initialText?: string, tree = flatTree, seat = reviewer()) {
+async function clockedReview(text: string, ceiling: number, artifacts?: string, initialText?: string, tree = flatTree, seat = reviewer(), pane: ClockedPane = new ClockedPane(text, initialText)) {
   const { repo, base } = repoWithCommit();
-  const pane = new ClockedPane(text, initialText);
   const cfg = structuredClone(DEFAULT_CONFIG);
   cfg.review.timeoutMs = ceiling;
   const origin = Date.now();
@@ -320,6 +339,31 @@ test("test: a pane review whose capture holds only the orca launch preamble and 
     clock.mockRestore();
     resetGateCpuAccountantFactoryForTests();
   }
+});
+
+test("test: a pane review by an adapter whose print mode buffers its whole output until exit is not re-routed at the first liveness beat while it has written nothing and passes on the verdict it prints at exit, the same buffering seat that never exits ends at its ceiling as silent with zero seat bytes, and an adapter that does not buffer is still re-routed at that beat, so a beat that kills a working buffering reviewer fails", async () => {
+  // Queue row 184: claude-code is the buffering adapter (its pane review command is `claude -p … --output-format text`).
+  expect(claudeCode.paneReviewBuffersOutput).toBe(true);
+  expect(qwen.paneReviewBuffersOutput).toBeUndefined();
+  const buffering = () => Object.assign(reviewer(), { paneReviewBuffersOutput: true });
+  expect(reviewSeatOutput(ORCA_PREAMBLE, "test-nonce", [])).toBe("");
+
+  // Working: nothing of its own for two minutes, past the beat, then its whole verdict at exit.
+  const working = await clockedReview(ORCA_PREAMBLE, 900_000, undefined, ORCA_PREAMBLE, undefined, buffering(), new BufferingPane(ORCA_PREAMBLE, 120_000));
+  expect(working.row.pass).toBe(true);
+  expect(working.row.meta?.cause).not.toBe("launch-never-started");
+  expect(working.pane.elapsed).toBe(120_000);
+  expect(working.pane.elapsed).toBeGreaterThan(REVIEW_FIRST_LIVENESS_MS);
+
+  // Dead: a buffering seat that never exits is bounded by its ceiling, never held open past it.
+  const dead = await clockedReview(ORCA_PREAMBLE, 300_000, undefined, ORCA_PREAMBLE, undefined, buffering(), new BufferingPane(ORCA_PREAMBLE, undefined));
+  expect(dead.row.meta).toMatchObject({ cause: "silent", seatAuthoredBytes: 0, timeoutMs: 300_000 });
+  expect(dead.pane.elapsed).toBe(300_000);
+
+  // Not buffering: the same preamble-only seat is still re-routed at the beat (2.8.3's row 135(a) behaviour).
+  const plain = await clockedReview(ORCA_PREAMBLE, 900_000, undefined, ORCA_PREAMBLE, undefined, reviewer(), new BufferingPane(ORCA_PREAMBLE, 120_000));
+  expect(plain.row.meta).toMatchObject({ cause: "launch-never-started", seatAuthoredBytes: 0, infra: true });
+  expect(plain.pane.elapsed).toBe(REVIEW_FIRST_LIVENESS_MS);
 });
 
 test("test: every orca launch preamble measures zero seat-authored bytes at every read position after launch, bare and line-terminated, the checkout frame row with or without an empty row above it, the same frame still painting as the last row, and the launch echo naming the frame's own checkout directly above the frame, each followed by the banner, the blank row and the bare identity row, with qwen's SAFE MODE row and either recorded yolo wording or with no adapter rows, while each complete preamble followed by one seat word measures exactly that word's bytes", () => {

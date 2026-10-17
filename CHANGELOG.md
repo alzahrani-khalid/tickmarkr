@@ -2,6 +2,37 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v2.8.4 — an acceptance test criterion can only be satisfied by its own suite file, kimi workers launch in Never Ask mode, claude pane reviewers are no longer killed at the first liveness beat, and test teardowns signal only processes they own
+
+**v2.8.4** is the stable point before a development pause. Its work comes from one `tickmarkr run` (run-20261016-144707-…1297),
+which merged one task, plus three changes gated afterwards by `tickmarkr verify`; each passed build, lint, evidence, its acceptance
+criteria, a cross-vendor review and the full suite.
+
+- **An acceptance `test:` criterion is satisfied only by its declared suite file (queue row 179).** The oracle ran
+  `<testCmd> -t <title>` over the whole suite, so a same-titled test in any other file could satisfy a criterion the worker never
+  wrote. It now runs the criterion's `suite:` file and reads that file's own per-file report: the file absent, a directory, a
+  title found only in another file or a containing path, or a run without a per-file report fails the criterion as work (never a
+  pass, never a skipped zero-test run), and the test command does not start for an absent or non-regular file. A non-Vitest runner
+  receives the suite file as its argument. A criterion with no `suite:` keeps the whole-suite selection.
+- **kimi workers launch in Never Ask mode where the installed kimi defines it (queue row 178).** kimi 2.x redefined `-y` as "Ask
+  When Needed", so an unattended worker could stop on a question nobody answers. Each launch reads `kimi --help` (bounded at 10 s)
+  and uses `--auto` when it defines "Start in Never Ask mode"; any other or unreadable help keeps `-y`. The pane driver runs both
+  launch forms as commands.
+- **A claude-code pane reviewer is no longer killed at the first liveness beat (queue row 184).** The pane review runs
+  `claude -p … --output-format text`, which prints nothing until the turn ends, so since 2.8.3 every working claude reviewer on a
+  pane driver (`visibility.llm: pane`) read zero seat bytes at 30 s and was re-routed, then retired. An adapter now declares that
+  its pane review output is buffered; the beat does not arm for it and the review ceiling bounds it. Other adapters keep the beat,
+  so a banner-only seat is still re-routed at 30 s.
+- **Test teardowns signal only processes they own (queue rows 177 and 183, repository-only).** Under a full suite the pid space
+  wraps within a minute, so teardowns that killed remembered pids could hit an unrelated process. They now signal a child only
+  while it is unreaped and a recorded non-child pid only when its start time still matches; the test helpers' git failures report
+  the command, exit status, signal and stderr.
+
+Declared: public CI stays serial. The sharded-CI re-land (queue rows 6 and 172) was built and gated but its full suites failed on
+a different timing test each time, consistent with its own in-suite Vitest runs adding load; it is held for after the pause.
+Also open: the kimi ask-prompt stall classification, codex exec's header rows as seat bytes (row 176), a dead claude pane seat
+waiting out its review ceiling (the bound row 184 restores), and the test suite's temp-directory leak (row 186).
+
 ## v2.8.3 — a review seat that printed only its launch preamble reads silent, a scope grant is not refused by a sibling already merged into the requester's branch, and the last two seamless test ceilings derive from their window
 
 **v2.8.3** comes from one `tickmarkr run` of one spec (run-20261016-020933-…1248, three tasks). Each passed build, lint, evidence,

@@ -1,4 +1,4 @@
-import { execFileSync, execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -138,24 +138,31 @@ export function setupRepo(tasks: unknown[], script: object, extraCfg = ""): { re
  * vanished under it, and the gate reports "authoring" on whichever suite lost the race. Fixtures never
  * need maintenance; switch it off at init so no background git process ever runs inside one.
  */
+function fixtureGit(dir: string, args: string[]): void {
+  try {
+    execFileSync("git", args, { cwd: dir, encoding: "utf8", stdio: "pipe" });
+  } catch (cause) {
+    const failure = cause as { status?: number | null; signal?: string | null; stderr?: string | Buffer | null };
+    throw new Error(`command: ${JSON.stringify(["git", ...args].join(" "))}, status: ${failure.status ?? null}, signal: ${failure.signal ?? null}, stderr: ${JSON.stringify(failure.stderr?.toString() ?? "")}`, { cause });
+  }
+}
+
 export function quietGitInit(dir: string, branch = "main"): void {
-  const git = (c: string) => execSync(`git ${c}`, { cwd: dir, encoding: "utf8", stdio: "pipe" });
-  git(`init -q -b ${branch}`);
-  git("config gc.auto 0");
-  git("config maintenance.auto false");
+  fixtureGit(dir, ["init", "-q", "-b", branch]);
+  fixtureGit(dir, ["config", "gc.auto", "0"]);
+  fixtureGit(dir, ["config", "maintenance.auto", "false"]);
 }
 
 export function makeRepo(files: Record<string, string>): string {
   const dir = makeTestTempDir("tickmarkr-repo-");
-  const git = (c: string) => execSync(`git ${c}`, { cwd: dir, encoding: "utf8" });
   quietGitInit(dir);
-  git("config user.email tickmarkr@test.local");
-  git("config user.name tickmarkr-test");
+  fixtureGit(dir, ["config", "user.email", "tickmarkr@test.local"]);
+  fixtureGit(dir, ["config", "user.name", "tickmarkr-test"]);
   for (const [p, content] of Object.entries(files)) {
     mkdirSync(join(dir, dirname(p)), { recursive: true });
     writeFileSync(join(dir, p), content);
   }
-  git("add -A");
-  git('commit -m init --no-gpg-sign');
+  fixtureGit(dir, ["add", "-A"]);
+  fixtureGit(dir, ["commit", "-m", "init", "--no-gpg-sign"]);
   return dir;
 }

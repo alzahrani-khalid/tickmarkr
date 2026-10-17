@@ -541,15 +541,20 @@ async function runViaDriverDetailed(
         // OBS-1177: the beat is armed for an INTERACTIVE (pane) driver only. On the subprocess driver
         // a headless `claude -p` buffers every byte until it exits, so 0 seat bytes at 30 s is not a
         // dead launch; that seat keeps its full ceiling, which still bounds it (fail-closed by timeout).
-        if (reviewing && via.driver.interactive && !firstLivenessObserved && now - startedAt >= REVIEW_FIRST_LIVENESS_MS) {
+        // Queue row 184: an adapter whose pane review command buffers its whole output until exit
+        // (claude-code's `claude -p`) has written nothing of its own until its verdict, working or
+        // dead, so the beat cannot tell the two apart and does not arm for it; its ceiling bounds it.
+        if (reviewing && via.driver.interactive && adapter.paneReviewBuffersOutput !== true && !firstLivenessObserved && now - startedAt >= REVIEW_FIRST_LIVENESS_MS) {
           firstLivenessObserved = true;
           // RS-2: the beat reads seat-authored bytes ALONE. CPU evidence never holds a preamble-only
           // capture open to the ceiling; a seat that has not written one byte of its own is re-routed.
-          // OBS-944 is why a buffering runner earns no exemption here: the claude-code seat's 901 s
-          // capture was byte-identical across two legs and ended at the pane-identity line — that
-          // seat never started, it was not quietly working. RULING-229-06 puts the beat on the PANE
-          // path only; a headless `-p` runner (runHeadlessDetailed, no pane, no beat) buffers every
-          // byte until completion and keeps its full ceiling.
+          // OBS-944: the claude-code seat's 901 s capture was byte-identical across two legs and ended
+          // at the pane-identity line — that seat never started. Until 2.8.3 the orca checkout frame
+          // counted as seat bytes and kept every claude pane seat past this beat; once it stopped
+          // counting (row 135(a)) the beat killed working claude reviewers too, hence the declared
+          // exemption above (row 184), which restores that pre-2.8.3 bound for buffering adapters only.
+          // RULING-229-06 puts the beat on the PANE path only; a headless `-p` runner
+          // (runHeadlessDetailed, no pane, no beat) buffers every byte until completion and keeps its full ceiling.
           if (seatAuthoredBytes === 0) {
             launchNeverStarted = true;
             forceClose = true;

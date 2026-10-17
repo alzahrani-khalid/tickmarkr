@@ -1,11 +1,13 @@
-import { readdirSync } from "node:fs";
-import { join } from "node:path";
+import { randomBytes } from "node:crypto";
+import { lstatSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { isAbsolute, join, relative, resolve } from "node:path";
 import { z } from "zod";
 import { channelKey, shq, type WorkerAdapter } from "../adapters/types.js";
 import { compileNative } from "../compile/native.js";
 import { DEFAULT_DIFF_CAP } from "../config/config.js";
 import { type Effort, renderAcceptanceItem, type AcceptanceItem, type Task } from "../graph/schema.js";
-import { sh } from "../run/git.js";
+import { DEFAULT_SHELL_TIMEOUT_MS, sh, shell } from "../run/git.js";
 import { checkTaskDiffCaps, fetchTaskDiff, isProtectedEvidence, setAsideReceiptPath } from "./review.js";
 import { appendAnchoredReview, COMPLETION_FAKING_CHECKLIST, extractVerdictJson, generateVerdictNonce, type LlmVia, runLlm, SeatLaunchError, verdictNonceLine } from "./llm.js";
 import type { GateResult } from "./types.js";
@@ -14,6 +16,8 @@ import { reviewableLogicDiff } from "./artifact-manifest.js";
 import { diffSidePath } from "./git-paths.js";
 import { classifyFailureOutput } from "./baseline.js";
 import { operationFactsAtHead, readOperationFacts } from "./operation-facts.js";
+import { isVitestTestCommand, manifestChildEnv, readTestReport, singleForkRetryCommand, toManifestPath } from "./test-manifest.js";
+import { TEST_REPORTER_SOURCE } from "./test-reporter.js";
 
 // Fable F4: acceptance judge shares review's 900s timeout — 300s default killed frontier judges on cap-sized diffs.
 const JUDGE_TIMEOUT_MS = 900_000;
@@ -129,6 +133,28 @@ export function testFiltered(testCmd: string, name: string): string {
   if (wrapped && /\s--\s/.test(testCmd)) return `${testCmd} -t ${shq(pattern)}`;
   const fwd = wrapped ? "-- " : "";
   return `${testCmd} ${fwd}-t ${shq(pattern)}`;
+}
+
+// Queue row 179: the criterion's suite file as the runner's file argument AHEAD of the title filter, appended to a
+// base that already carries its forwarding separator (npmForwarded, under either runner). testFiltered keeps its
+// two-argument form: a criterion with no suite file, and the eval harness.
+const fileFiltered = (base: string, file: string, name: string): string =>
+  `${base} ${shq(file)} -t ${shq(testFilterPattern(name))}`;
+// The forwarding separator, decided on shell WORDS — the test gate's tokenizer (test-manifest.ts shellTokens/words,
+// unexported) beside its unquoting — never on the raw text: behind any `NAME=value` assignments (whose value, even
+// ` -- `, is not a word of the command), an npm manager word, bare, quoted or escaped, gets ONE `--` unless a later
+// word already is `--` (bare, quoted or escaped). npx, pnpm, yarn and a direct runner forward their arguments as they
+// are. Both runners' branches append through it; the Vitest branch asks the gate's parser only whether the reporter
+// can be forwarded at all (V5), since that parser's own separator reads the raw text.
+const SHELL_TOKEN = /(?:[^\s'"\\&|;<>]+|'[^']*'|"(?:\\.|[^"\\])*"|\\.)+|[&|;<>]+/g;
+const unquoted = (token: string): string => token.replace(/'([^']*)'|"((?:\\.|[^"\\])*)"|\\(.)/g,
+  (_all, single, double, escaped) => single ?? (double !== undefined ? double.replace(/\\(["\\$`])/g, "$1") : escaped));
+function npmForwarded(testCmd: string): string {
+  const raw = testCmd.match(SHELL_TOKEN) ?? [];
+  let manager = 0;
+  while (/^[A-Za-z_]\w*=/.test(raw[manager] ?? "")) manager++;
+  const argv = raw.slice(manager).map(unquoted);
+  return argv[0] === "npm" && !argv.includes("--") ? `${testCmd} --` : testCmd;
 }
 
 export interface VitestListedTest {
@@ -307,6 +333,88 @@ function oracleExecutionFailure(label: string, code: number, stdout: string, std
   };
 }
 
+// today's rule for a test oracle's run: exit 0 AND a positive printed run count (OBS-55: a zero-match run is vacuous).
+function countedTestRun(label: string, filter: string, r: { code: number; stdout: string; stderr: string }): GateResult | undefined {
+  if (r.code !== 0) return oracleExecutionFailure(label, r.code, r.stdout, r.stderr);
+  const out = (r.stderr || "") + "\n" + (r.stdout || "");
+  const ran = testsRan(out);
+  if (ran === null || ran < 1) {
+    return { gate: "acceptance", pass: false,
+      details: `oracle failed: ${label} — name filter matched zero tests (filter: ${filter})${tail(out)}` };
+  }
+  return undefined;
+}
+
+/**
+ * Queue row 179 (D-2018, D-2019): a test criterion that declares its suite file L is satisfied by L alone — run
+ * 1248's oracles named one file and a same-titled test in another satisfied them. Closed table:
+ * L1 L absent or not a regular file (a directory included) in the worktree: a work verdict naming L, under either
+ *    runner, and the test command never starts.
+ * Vitest: L alone, file argument then title filter, under the test gate's nonce-bound per-file reporter, because
+ *    Vitest's file filter selects EVERY path containing L. PASS only when that report, of this nonce and ending in
+ *    its run-end certificate with exit 0, shows a passed body in module L and none run in any other module.
+ *    V2 L without the title (another file holding it): no passed body in L. V3 a deeper path ending with L holding
+ *    it, whether or not L does: a body run in another module. V4 report missing, another nonce or no certificate,
+ *    and V5 a script body the reporter cannot be forwarded to: fail closed, unverified.
+ * Other runner: L as its file argument before the title filter, today's run-count rule. Declared residual: such a
+ *    runner gives no per-file evidence, so a test of the title in a path containing L can still satisfy it there.
+ */
+async function landedTestOracle(testCmd: string, title: string, landing: string, worktree: string): Promise<GateResult> {
+  const label = `test "${title}" in ${landing}`;
+  const passed: GateResult = { gate: "acceptance", pass: true, details: `✓ test: ${title} (exit 0) in ${landing}` };
+  const work = (why: string): GateResult => ({ gate: "acceptance", pass: false, details: `oracle failed: ${label} — ${why}` });
+  const unverified = (why: string): GateResult => ({ gate: "acceptance", pass: false,
+    details: `oracle failed: ${label} — ${why}; unverified, failing closed`,
+    meta: { cause: "oracle-execution", classification: "infra", infra: true, retryable: false } });
+  const path = resolve(worktree, landing);
+  const within = relative(worktree, path);
+  let regular = false;
+  try { regular = !within.startsWith("..") && !isAbsolute(within) && lstatSync(path).isFile(); }
+  catch { /* absent */ }
+  if (!regular) return work(`suite file ${landing} is absent from the worktree or is not a regular file; the test command never started`);
+  if (!isVitestTestCommand(testCmd, worktree)) {
+    return countedTestRun(label, title, await sh(fileFiltered(npmForwarded(testCmd), landing, title), worktree)) ?? passed;
+  }
+  // V5: the test gate's own parser, through its one pure export, throws on a compound or non-direct script body,
+  // where an appended --reporter would reach some other command. Only its refusal is read: its separator reads the
+  // raw text, so a quoted `"--"` or an assignment's ` -- ` value would misplace the file, filter and reporter.
+  try { singleForkRetryCommand(testCmd, worktree, [], []); }
+  catch (error) { return unverified(`the per-file reporter cannot be forwarded to this test command (${error instanceof Error ? error.message : String(error)})`); }
+  const cmd = fileFiltered(npmForwarded(testCmd), landing, title);
+  const dir = mkdtempSync(join(tmpdir(), "tickmarkr-oracle-"));
+  try {
+    const nonce = randomBytes(16).toString("hex");
+    const reporterPath = join(dir, `test-reporter-${nonce}.mjs`);
+    const reportPath = join(dir, `test-report-${nonce}.json`);
+    writeFileSync(reporterPath, TEST_REPORTER_SOURCE);
+    const r = await shell(`${cmd} --reporter=${shq(reporterPath)} --outputFile=${shq(reportPath)}`, worktree, DEFAULT_SHELL_TIMEOUT_MS, false,
+      { env: { ...manifestChildEnv(worktree), TICKMARKR_TEST_REPORT: reportPath, TICKMARKR_TEST_NONCE: nonce } });
+    const raw = readTestReport(reportPath);
+    const report = raw?.nonce === nonce ? raw : undefined;
+    if (r.code !== 0) {
+      // the reporter replaces the runner's own output: its failure identities are the evidence of a red.
+      const named = report ? [...Object.values(report.completed).flatMap((c) => c.failures ?? []), ...(report.certificate?.diagnostics ?? [])] : [];
+      return oracleExecutionFailure(label, r.code, r.stdout, [r.stderr, ...named].filter(Boolean).join("\n"));
+    }
+    if (!raw) return unverified("the runner exited 0 but wrote no per-file report");
+    if (!report) return unverified(`the per-file report carries nonce "${raw.nonce}", not this invocation's`);
+    if (report.certificate?.exitCode !== 0) return unverified("the per-file report never reached its run-end certificate with exit 0");
+    const key = toManifestPath(within, worktree);
+    // a module completed more than once (one path in several projects) keeps only its LAST counters, so its record
+    // cannot show that no earlier completion ran a body: it counts as run.
+    const repeated = new Set(report.duplicateCompletions ?? []);
+    const elsewhere = [...new Set([...Object.keys(report.started), ...Object.keys(report.completed)])].filter((file) => {
+      const t = report.completed[file]?.tests;
+      return file !== key && (repeated.has(file) || !t || t.passed + t.failed > 0);
+    }).sort();
+    if (elsewhere.length) return work(`the runner's per-file report shows a test body run outside ${landing}, in ${elsewhere.join(", ")} — only ${landing} can satisfy this criterion`);
+    if (!((report.completed[key]?.tests?.passed ?? 0) > 0)) return work(`the runner's per-file report shows no passing test of that title in ${landing}`);
+    return passed;
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 // v1.70 / OBS-129: the new-file line numbers each changed HUNK spans, per path — parsed from the
 // unified-diff so a citation is validated against real changed regions, not a substring of the whole
 // diff text (which also matches the diff's own +++/@@ headers). A hunk's span is every new-file line it
@@ -429,17 +537,16 @@ export async function acceptanceGate(
         return { gate: "acceptance", pass: false,
           details: `oracle failed: test "${a.test}" — no test command configured to run it (failing closed)` };
       }
-      const r = await sh(testFiltered(opts.testCmd, a.test), worktree);
-      const out = (r.stderr || "") + "\n" + (r.stdout || "");
-      if (r.code !== 0) {
-        return oracleExecutionFailure(`test "${a.test}"`, r.code, r.stdout, r.stderr);
+      // queue row 179: a declared suite file is the only file that can satisfy its criterion.
+      if (a.landing !== undefined) {
+        const landed = await landedTestOracle(opts.testCmd, a.test, a.landing, worktree);
+        if (!landed.pass) return landed;
+        passedDet.push(landed.details);
+        continue;
       }
       // OBS-55: exit 0 alone is vacuous when the name filter matched zero tests — fail closed.
-      const ran = testsRan(out);
-      if (ran === null || ran < 1) {
-        return { gate: "acceptance", pass: false,
-          details: `oracle failed: test "${a.test}" — name filter matched zero tests (filter: ${a.test})${tail(out)}` };
-      }
+      const red = countedTestRun(`test "${a.test}"`, a.test, await sh(testFiltered(opts.testCmd, a.test), worktree));
+      if (red) return red;
       passedDet.push(`✓ test: ${a.test} (exit 0)`);
     }
   }

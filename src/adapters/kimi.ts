@@ -1,3 +1,4 @@
+import { spawnSync } from "node:child_process";
 import { readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -201,7 +202,28 @@ export interface KimiInteractiveSeedResult {
   sessionId?: string;
 }
 
-const kimiTuiLaunch = (model: string) => `kimi -y -m ${shq(model)}`;
+const KIMI_HELP_TIMEOUT_MS = 10_000;
+
+function kimiHasNeverAskOption(help: string): boolean {
+  let inOptions = false;
+  for (const line of help.split(/\r?\n/)) {
+    if (line === "Options:") { inOptions = true; continue; }
+    if (inOptions && /^[^\s].*:$/.test(line)) break;
+    if (inOptions && /^  --auto[ \t]{2,}Start in Never Ask mode\b/.test(line)) return true;
+  }
+  return false;
+}
+
+const kimiTuiLaunch = (model: string) => {
+  let neverAsk = false;
+  try {
+    const help = spawnSync("kimi", ["--help"], {
+      encoding: "utf8", timeout: KIMI_HELP_TIMEOUT_MS, stdio: ["ignore", "pipe", "ignore"],
+    });
+    neverAsk = !help.error && help.status === 0 && kimiHasNeverAskOption(help.stdout);
+  } catch { /* unreadable help keeps the existing launch form */ }
+  return `kimi ${neverAsk ? "--auto" : "-y"} -m ${shq(model)}`;
+};
 
 const KIMI_ANSI_SGR_RE = /\u001B\[[0-9;]*m/g;
 const KIMI_EDITOR_TOP_RE = /^╭─+╮$/;
@@ -245,7 +267,10 @@ export const KIMI_INPUT_BOX = declareInputBox("kimi", {
   fingerprint: "│ > ",
   match: (paneText: string) => matchesKimiEditorBox(paneText, false),
   emptyMatch: (paneText: string) => matchesKimiEditorBox(paneText, true),
-  launchCommand: (command: string) => command.startsWith("kimi -y -m "),
+  launchCommand: (command: string) => {
+    const match = /^kimi (?:--auto|-y) -m '([^']+)'$/.exec(command);
+    return match !== null && MODEL_ID_RE.test(match[1]);
+  },
   readinessTimeoutMs: 15_000,
 });
 

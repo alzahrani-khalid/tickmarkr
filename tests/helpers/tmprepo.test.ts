@@ -1,12 +1,56 @@
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
-import { describe, expect, test } from "vitest";
-import { CHILD_REPORT_DEADLINE_MS, makeRepo, makeTestTempDir, readChildReport, recordTmpdirChild, TEST_TEMP_ROOT, TMPDIR_CHILD_ENV, TMPDIR_CHILD_TEST } from "./tmprepo.js";
+import { describe, expect, test, vi } from "vitest";
+import { CHILD_REPORT_DEADLINE_MS, makeRepo, makeTestTempDir, quietGitInit, readChildReport, recordTmpdirChild, TEST_TEMP_ROOT, TMPDIR_CHILD_ENV, TMPDIR_CHILD_TEST } from "./tmprepo.js";
 
 const CHILD_ENV = "TICKMARKR_TMPREPO_CHILD";
 const CHILD_TEST = "child runner: plant one fixture repository and hold it until released";
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+test("test: a fixture repository whose git call fails by exit or by signal fails with an error carrying four labelled values, the git command, its exit status, its signal and its standard error, the status or signal null and the standard error empty where they do not apply, whether the shared quiet init's call or the repository builder's own call failed, so a helper that rethrows the bare command failure or drops any of the four fails", () => {
+  const bin = makeTestTempDir("git-failure-bin-");
+  const dir = makeTestTempDir("git-failure-repo-");
+  const fakeGit = join(bin, "git");
+  const calls = [
+    ["init", "-q", "-b", "main"],
+    ["config", "gc.auto", "0"],
+    ["config", "maintenance.auto", "false"],
+    ["config", "user.email", "tickmarkr@test.local"],
+    ["config", "user.name", "tickmarkr-test"],
+    ["add", "-A"],
+    ["commit", "-m", "init", "--no-gpg-sign"],
+  ];
+  vi.stubEnv("PATH", `${bin}:${process.env.PATH}`);
+  try {
+    for (const args of calls) for (const mode of ["exit", "signal"] as const) for (const stderr of ["", 'fixture git failed: "quoted"\n']) {
+      writeFileSync(fakeGit, `#!${process.execPath}\n
+if (JSON.stringify(process.argv.slice(2)) === ${JSON.stringify(JSON.stringify(args))}) {
+  require('node:fs').writeSync(2, ${JSON.stringify(stderr)});
+  ${mode === "exit" ? "process.exit(23);" : "process.kill(process.pid, 'SIGKILL');"}
+}
+`);
+      chmodSync(fakeGit, 0o755);
+      const expected = `command: ${JSON.stringify(["git", ...args].join(" "))}, status: ${mode === "exit" ? 23 : null}, signal: ${mode === "signal" ? "SIGKILL" : null}, stderr: ${JSON.stringify(stderr)}`;
+      // Exercise the shared init directly as well as every call reached through makeRepo.
+      const helpers = [() => makeRepo({ "a.txt": "a\n" })];
+      if (calls.indexOf(args) < 3) helpers.push(() => { quietGitInit(dir); return dir; });
+      for (const helper of helpers) {
+        let failure: unknown;
+        try { helper(); } catch (error) { failure = error; }
+        expect(failure).toBeInstanceOf(Error);
+        expect((failure as Error).message).toBe(expected);
+      }
+    }
+    // A shell would split this into another command; the argv helper passes it as one branch.
+    const branch = 'branch with spaces; echo "split"';
+    writeFileSync(fakeGit, `#!${process.execPath}\nrequire('node:fs').appendFileSync(${JSON.stringify(join(bin, "argv.jsonl"))}, JSON.stringify(process.argv.slice(2)) + '\\n');\n`);
+    quietGitInit(dir, branch);
+    expect(readFileSync(join(bin, "argv.jsonl"), "utf8").trim().split("\n").map((line) => JSON.parse(line))).toEqual([
+      ["init", "-q", "-b", branch], calls[1], calls[2],
+    ]);
+  } finally { vi.unstubAllEnvs(); }
+}, 60_000);
 
 // Runs only inside a child vitest spawned by the parallel-runner test below: plants a fixture
 // repository, reports its path + pid, then holds the fixture until the parent releases it.

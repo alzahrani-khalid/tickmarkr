@@ -10,6 +10,7 @@ import { afterEach, describe, expect, test } from "vitest";
 import { beat } from "../../src/cli/commands/beat.js";
 import { dispatch } from "../../src/cli/index.js";
 import { tickmarkrDir } from "../../src/graph/graph.js";
+import { TeardownLedger } from "../helpers/owned-process.js";
 import {
   BEAT_GENERATION_ENV, beatClaimPath, beatLogPath, beatOwnerPath, defaultBeatDeps, readProcessIdentity,
   type BeatLifecycleDeps, type BeatOwner, type ProcessIdentity,
@@ -47,14 +48,13 @@ const TSX = pathToFileURL(join(ROOT, "node_modules/tsx/dist/loader.mjs")).href;
 const CLI = [process.execPath, "--import", TSX, join(ROOT, "src/cli/index.ts")];
 const RECEIPT = join(ROOT, "tests/fixtures/beat-lifecycle/darwin-detach.receipt.json");
 
-const spawned: ChildProcess[] = [];
-const foreign: number[] = [];
-afterEach(() => {
-  for (const pid of [...spawned.map((c) => c.pid), ...foreign.splice(0)]) {
-    try { if (pid) process.kill(pid, "SIGKILL"); } catch { /* already gone */ }
-  }
-  spawned.splice(0);
-});
+const cleanupKill: BeatLifecycleDeps["kill"] = (pid, signal) => {
+  if (pid <= 0 || pid === process.pid || pid === process.ppid) throw new Error(`would signal the Vitest worker ${pid}`);
+  process.kill(pid, signal);
+};
+const processes = new TeardownLedger();
+const spawned = processes.children;
+afterEach(() => processes.teardown(cleanupKill));
 
 const mkRepo = (state = true) => {
   const repo = realpathSync(mkdtempSync(join(tmpdir(), "tickmarkr-beat-life-")));
@@ -69,7 +69,7 @@ const deps = (over: Partial<BeatLifecycleDeps> = {}): BeatLifecycleDeps => {
   delete env[BEAT_GENERATION_ENV];
   return {
     ...base, cli: CLI, env,
-    spawn: (command, args, options) => { const child = spawn(command, args, options); spawned.push(child); return child; },
+    spawn: (command, args, options) => { const child = spawn(command, args, options); processes.addChild(child); return child; },
     ...over,
   };
 };
@@ -102,7 +102,7 @@ function ownedArm(repo: string, tier: SupervisionTier, armId: string): string {
 /** A real process this test owns that never beats, recorded as the tier's owner (or as a foreign one). */
 async function recordedProcess(repo: string, tier: SupervisionTier, seat: string, generation = "gen-fixture") {
   const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)", generation], { cwd: repo, detached: true, stdio: "ignore" });
-  spawned.push(child);
+  processes.addChild(child);
   await until(() => typeof readProcessIdentity(child.pid!) === "object");
   const id = readProcessIdentity(child.pid!) as ProcessIdentity;
   put(beatOwnerPath(repo, tier), JSON.stringify({
@@ -129,7 +129,7 @@ function boundaryRig() {
   const d = deps({
     spawn: (command, args, options) => {
       const child = spawn(command, args, options);
-      spawned.push(child);
+      processes.addChild(child);
       if (child.pid) children.set(child.pid, {
         child, identity: { birth: `checked-birth-${child.pid}`, command: [command, ...args].join(" "), cwd: String(options.cwd), pgid: child.pid },
       });
@@ -572,7 +572,7 @@ describe("beat start", () => {
     expect(dead).toMatchObject({ code: 0, out: expect.stringContaining(`overseer recovered dead generation ${first.generation} (recorded pid ${first.pid} is gone)`) });
     expect(dead.out).toContain("ARMED as a:b");
     const second = owner(repo, "overseer");
-    spawned.push({ pid: second.pid } as ChildProcess);
+    processes.addPid(second.pid);
     expect(second.generation).not.toBe(first.generation);
     // old-seat stale record / new seat: refusal, then checked old-owner cleanup, then new-owner read-back
     process.kill(second.pid, "SIGKILL");
@@ -614,12 +614,13 @@ describe("beat start", () => {
     const race = mkRepo();
     const pair = await Promise.all(["x", "y"].map((seat) => new Promise<number>((resolve) => {
       const p = spawn(CLI[0], [...CLI.slice(1), "beat", "start", "overseer", "--seat", seat], { cwd: race, stdio: "ignore" });
+      processes.addChild(p);
       p.on("exit", (code) => resolve(code ?? 9));
     })));
     expect(pair.filter((code) => code === 0)).toHaveLength(1);
     const winner = owner(race, "overseer");
     expect(alive(winner.pid)).toBe(true);
-    foreign.push(winner.pid);
+    processes.addPid(winner.pid);
 
     // Falsely successful launch: a child that never beats can never report started — the deadline
     // (fake clock, 60000 ms ceiling) refuses and rolls back only this generation.
@@ -628,7 +629,7 @@ describe("beat start", () => {
     const neverBeats = deps({
       spawn: (_c, args, options) => {
         const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)", "--", ...args], options);
-        spawned.push(child);
+        processes.addChild(child);
         return child;
       },
       now: () => Date.now() + offset,
@@ -682,7 +683,7 @@ describe("beat start", () => {
     const died = await run(dies, ["start", "overseer", "--seat", "s"], deps({
       spawn: (_c, args, options) => {
         const child = spawn(process.execPath, ["-e", "setTimeout(() => process.exit(3), 300)", "--", ...args], options);
-        spawned.push(child);
+        processes.addChild(child);
         return child;
       },
     }));
@@ -694,7 +695,7 @@ describe("beat start", () => {
     const attached = await run(sameSession, ["start", "overseer", "--seat", "s"], deps({
       spawn: (command, args, options) => {
         const child = spawn(command, args, { ...options, detached: false });
-        spawned.push(child);
+        processes.addChild(child);
         return child;
       },
     }));
@@ -758,7 +759,7 @@ describe("beat start", () => {
     const kept = await run(replacedDuringWait, ["start", "overseer", "--seat", "s"], deps({
       spawn: (_c, args, options) => {
         const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)", "--", ...args], { ...options, detached: false });
-        spawned.push(child);
+        processes.addChild(child);
         return child;
       },
       kill: (pid, signal) => {
@@ -781,7 +782,7 @@ describe("beat start", () => {
     const unsignalled = await run(replacedDuringRead, ["start", "overseer", "--seat", "s"], deps({
       spawn: (_c, args, options) => {
         const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)", "--", ...args], { ...options, detached: false });
-        spawned.push(child);
+        processes.addChild(child);
         return child;
       },
       kill: (pid, signal) => { readKills.push([pid, signal]); },
@@ -1022,7 +1023,7 @@ describe("beat stop", () => {
     expect(alive(old.pid)).toBe(true);
     expect(supervisionStatus(barrier, "overseer").state).toBe("ARMED"); // no marker published either
     expect(kills.filter(([pid]) => pid === old.pid)).toEqual([]);
-    foreign.push(old.pid);
+    processes.addPid(old.pid);
 
     // A bound owner whose durable arm is ABSENT proves nothing — whether it was gone before the stop or removed
     // while stop read the identity: no signal, no marker, no deletion, and status names the mismatch.
@@ -1237,7 +1238,7 @@ test("test: a real detached loop whose generation is replaced exits nonzero on i
   `)}`;
   const observedDeps = deps({ spawn: (command, args, options) => {
     const child = spawn(command, ["--import", observer(String(options.cwd)), ...args], options);
-    spawned.push(child);
+    processes.addChild(child);
     return child;
   } });
   const exitEvent = (child: ChildProcess) => child.exitCode !== null || child.signalCode !== null
@@ -1305,7 +1306,7 @@ test("test: a real detached loop whose generation is replaced exits nonzero on i
       fs.renameSync(path + '.tmp', path);
     }, 10);
   `], { detached: true, stdio: "ignore" });
-  spawned.push(writer);
+  processes.addChild(writer);
   try {
     await recordEvent(bad, () => records(bad).some((row) => row.kind === "beat"));
     put(beatOwnerPath(bad, tier), JSON.stringify({ generation: "replacement" }) + "\n");
@@ -1368,7 +1369,7 @@ test("test: production CLI recipes satisfy the closed detachment outcome table v
     const start = sh(shellOf(recipe.start, repo, "orchestrator", "seat:recipe"));
     expect(start.status, `${source} start: ${start.stderr}`).toBe(0);
     const child = owner(repo, "orchestrator");
-    foreign.push(child.pid);
+    processes.addPid(child.pid);
     expect(child.pgid).toBe(child.pid);
     const status = sh(shellOf(recipe.status, repo, "orchestrator", "seat:recipe"));
     expect(status.status, source).toBe(0);
@@ -1393,15 +1394,15 @@ test("test: production CLI recipes satisfy the closed detachment outcome table v
     `touch '${out}/ready'`,
     "wait",
   ].join("\n")], { detached: true, stdio: "ignore", env });
-  spawned.push(launcher);
+  processes.addChild(launcher);
   await until(() => existsSync(join(out, "ready")), 30_000);
   const launcherPgid = launcher.pid!;
   const control = Number(readFileSync(join(out, "control"), "utf8"));
   const orphan = Number(readFileSync(join(out, "orphan"), "utf8"));
-  foreign.push(control, orphan);
+  processes.addPid(control, orphan);
   expect(readFileSync(join(out, "start"), "utf8").trim()).toBe("0");
   const child = owner(repo, "overseer");
-  foreign.push(child.pid);
+  processes.addPid(child.pid);
   const before = { child: psRow(child.pid)!, control: psRow(control)!, orphan: psRow(orphan)! };
   const identity = readProcessIdentity(child.pid);
   const lastBeat = beatRecord(repo, "overseer").beatAt;

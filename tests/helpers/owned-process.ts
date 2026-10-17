@@ -4,9 +4,9 @@
 // ownership tag in its environment that every descendant inherits, and a tracker records its
 // descendants every TRACK_MS, so a detached child is still owned after the root exits on its own.
 // The root is spawned detached, so its process group is a handle known from spawn: when `ps`
-// discovery fails or outlives its share of the teardown bound, every pid and group already recorded
-// (and the root's own group) is still killed and awaited, and the teardown names ownership as
-// unresolved — a failure, never a pass.
+// discovery fails or outlives its share of the teardown bound, a per-pid start-time read checks the
+// recorded descendants before killing them. A remembered pid or group number alone never owns its
+// current holder. Failed discovery still names ownership as unresolved — a failure, never a pass.
 // ponytail: a descendant that detaches in the last TRACK_MS before its root exits is found only through
 // its tag, and darwin hides the environment of platform binaries (sh, sleep, git), so such a child can
 // escape; a kernel-held owner (a Linux subreaper, a darwin audit session) is the upgrade if one leaks.
@@ -15,8 +15,9 @@ import { randomUUID } from "node:crypto";
 import { once } from "node:events";
 import { readFile } from "node:fs/promises";
 import { promisify } from "node:util";
+import { readProcessIdentity, type IdentityRead } from "../../src/run/beat-lifecycle.js";
 
-export type Proc = { pid: number; ppid: number; pgid: number; tags?: string[] };
+export type Proc = { pid: number; ppid: number; pgid: number; startTime: string; tags?: string[] };
 export type PsTable = (o: { phase: "track" | "teardown"; timeoutMs: number }) => Promise<Proc[]>;
 export interface Teardown {
   /** Every process recorded under the root — tracked while it ran or discovered at teardown. */
@@ -46,6 +47,54 @@ export const alive = (pid: number) => { try { process.kill(pid, 0); return true;
 const signal = (pid: number, sig: NodeJS.Signals) => { try { process.kill(pid, sig); } catch { /* already gone */ } };
 export const exited = (c: ChildProcess) => c.exitCode !== null || c.signalCode !== null;
 
+/** The beat suites' complete teardown ledger: child handles and identities read at pid registration. */
+export class TeardownLedger {
+  readonly children: ChildProcess[] = [];
+  readonly pids = new Map<number, IdentityRead>();
+
+  addChild(child: ChildProcess): ChildProcess {
+    this.children.push(child);
+    return child;
+  }
+
+  addPid(...pids: number[]): void {
+    for (const pid of pids) this.pids.set(pid, readProcessIdentity(pid));
+  }
+
+  async teardown(kill: (pid: number, signal: NodeJS.Signals) => void): Promise<void> {
+    const children = this.children.splice(0);
+    const pids = new Map(this.pids);
+    this.pids.clear();
+    const matches = (pid: number, recorded: IdentityRead) => {
+      if (typeof recorded !== "object") return false;
+      const current = readProcessIdentity(pid);
+      return typeof current === "object" && current.birth === recorded.birth
+        && current.command === recorded.command && current.cwd === recorded.cwd;
+    };
+    const send = (pid: number) => {
+      try { kill(pid, "SIGKILL"); } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+      }
+    };
+    for (const child of children) if (child.pid !== undefined && !exited(child)) {
+      send(child.pid);
+      pids.delete(child.pid); // The same live child needs only one signal, even if an owner record also named it.
+    }
+    for (const [pid, identity] of pids) if (matches(pid, identity)) send(pid);
+    const left = () => [
+      ...children.filter((child) => child.pid !== undefined && !exited(child)).map((child) => child.pid!),
+      ...[...pids].filter(([pid, identity]) => matches(pid, identity)).map(([pid]) => pid),
+    ];
+    const deadline = Date.now() + 5_000;
+    let survivors = left();
+    while (survivors.length && Date.now() < deadline) {
+      await sleep(25);
+      survivors = left();
+    }
+    if (survivors.length) throw new Error(`teardown ledger survivors: ${survivors.join(",")}`);
+  }
+}
+
 /** `p`, or a rejection once `by` (epoch ms) passes — whichever settles first. */
 function within<T>(p: Promise<T>, by: number, what: string): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -58,27 +107,48 @@ function within<T>(p: Promise<T>, by: number, what: string): Promise<T> {
 export async function psTable(o: { timeoutMs?: number } = {}): Promise<Proc[]> {
   const linux = process.platform === "linux";
   // darwin's ps appends each process's environment to its command under -E; linux reads it from /proc
-  const { stdout } = await execFileP("ps", ["-A", "-ww", ...(linux ? [] : ["-E"]), "-o", "pid=,ppid=,pgid=,command="], {
-    timeout: o.timeoutMs, killSignal: "SIGKILL", maxBuffer: 1 << 28,
+  const { stdout } = await execFileP("ps", ["-A", "-ww", ...(linux ? [] : ["-E"]), "-o", "pid=,ppid=,pgid=,stat=,lstart=,command="], {
+    timeout: o.timeoutMs, killSignal: "SIGKILL", maxBuffer: 1 << 28, env: { ...process.env, LC_ALL: "C" },
   });
-  return Promise.all(stdout.trim().split("\n").map(async (line) => {
-    const [pid, ppid, pgid] = line.trim().split(/\s+/, 3).map(Number);
-    const env = linux ? await readFile(`/proc/${pid}/environ`, "utf8").catch(() => "") : line;
-    return { pid: pid!, ppid: ppid!, pgid: pgid!, tags: TAG_RE.exec(env)?.[1]?.split(",") ?? [] };
+  const rows = await Promise.all(stdout.trim().split("\n").map(async (line) => {
+    const row = parseProc(line);
+    if (!row) return [];
+    const env = linux ? await readFile(`/proc/${row.pid}/environ`, "utf8").catch(() => "") : line;
+    return [{ ...row, tags: TAG_RE.exec(env)?.[1]?.split(",") ?? [] }];
   }));
+  return rows.flat();
 }
+
+function parseProc(line: string): Proc | undefined {
+  const row = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S+)\s+(\w{3} \w{3} [ \d]\d \d\d:\d\d:\d\d \d{4})(?:\s|$)/.exec(line);
+  if (!row) return undefined;
+  return { pid: Number(row[1]), ppid: Number(row[2]), pgid: Number(row[3]), startTime: row[5]! };
+}
+
+/** A failed full census grants no authority; the recorded birth must still match a per-pid read. */
+async function readProc(pid: number, deadline: number): Promise<Proc | undefined> {
+  try {
+    const { stdout } = await execFileP("ps", ["-o", "pid=,ppid=,pgid=,stat=,lstart=", "-p", String(pid)], {
+      timeout: Math.max(1, deadline - Date.now()), killSignal: "SIGKILL", env: { ...process.env, LC_ALL: "C" },
+    });
+    return parseProc(stdout);
+  } catch { return undefined; }
+}
+
+const sameStart = (recorded: Proc | undefined, current: Proc) =>
+  recorded !== undefined && !!recorded.startTime && recorded.startTime === current.startTime;
 
 /** Every row owned through a live root, a recorded pid or the ownership tag, with all their descendants. */
 function ownedRows(rows: Proc[], root: ChildProcess, recorded: Map<number, Proc>, tag: string | undefined): Proc[] {
   const children = new Map<number, Proc[]>();
   for (const p of rows) children.set(p.ppid, [...(children.get(p.ppid) ?? []), p]);
-  // an exited root's pid is free for reuse, so only a live root seeds the walk; its group is still killed
-  // ponytail: pids allocate sequentially, so a recorded pid is reused only after a full pid wrap
-  const queue = rows.filter((p) => recorded.has(p.pid) || (p.pid === root.pid && !exited(root))
-    || (tag !== undefined && p.tags?.includes(tag)));
+  const eligible = (p: Proc) => !!p.startTime && (p.pid === root.pid ? !exited(root)
+    : !recorded.has(p.pid) || sameStart(recorded.get(p.pid), p));
+  const queue = rows.filter((p) => eligible(p) && (sameStart(recorded.get(p.pid), p) || p.pid === root.pid
+    || (tag !== undefined && p.tags?.includes(tag))));
   const seen = new Map<number, Proc>();
   for (let p = queue.shift(); p; p = queue.shift()) {
-    if (seen.has(p.pid)) continue;
+    if (seen.has(p.pid) || !eligible(p)) continue;
     seen.set(p.pid, p);
     queue.push(...(children.get(p.pid) ?? []));
   }
@@ -91,10 +161,10 @@ function ownedRows(rows: Proc[], root: ChildProcess, recorded: Map<number, Proc>
  * them. Descendants are the processes `known` recorded while the root ran, the ones carrying `tag`, and
  * everything under those or under a live root. Freeze-then-kill: SIGSTOP each newly seen descendant
  * until a ps pass finds none new (a stopped process cannot fork out of the snapshot), then SIGKILL
- * every recorded pid plus the root's group and every group led by a recorded pid, and await all of
- * them. One deadline bounds it all: discovery gets the first half of `boundMs`, and a discovery that
- * fails or runs past it leaves ownership unresolved but never loses what was already recorded;
- * whatever outlives the bound is a survivor. Never throws.
+ * identified pids and the groups they lead. The root's group is owned only while the child is unreaped
+ * or an identified member holds it. One deadline bounds it all: discovery gets the first half of
+ * `boundMs`; a failed census falls back to per-pid reads of recorded start times. A mismatched or
+ * unreadable holder is neither a signal target nor a survivor. Never throws.
  */
 export async function teardownTree(root: ChildProcess, o: {
   boundMs?: number; ps?: PsTable; tag?: string; known?: Map<number, Proc>;
@@ -104,6 +174,7 @@ export async function teardownTree(root: ChildProcess, o: {
   const discoverBy = deadline - bound / 2;
   const tree = new Map(o.known);
   let unresolved: string | undefined;
+  let current: Proc[] | undefined;
   if (root.pid !== undefined && exited(root) && !o.tag && !o.known) {
     unresolved = "root exited before its descendants were tracked";
   } else {
@@ -113,6 +184,7 @@ export async function teardownTree(root: ChildProcess, o: {
         grew = false;
         const rows = await within((o.ps ?? psTable)({ phase: "teardown", timeoutMs: Math.max(1, discoverBy - Date.now()) }),
           discoverBy, `discovery past its ${bound / 2} ms share of the teardown bound`);
+        current = rows;
         for (const p of ownedRows(rows, root, tree, o.tag)) {
           tree.set(p.pid, p);
           if (frozen.has(p.pid)) continue;
@@ -122,23 +194,37 @@ export async function teardownTree(root: ChildProcess, o: {
         }
       }
     } catch (e) {
+      current = undefined;
       unresolved = `process discovery failed: ${message(e)}`;
     }
   }
-  // ponytail: the root's group id is only reused once that group is empty, and then the kill is ESRCH
-  const groups = new Set(root.pid === undefined ? [] : [root.pid]);
-  for (const p of tree.values()) if (tree.has(p.pgid)) groups.add(p.pgid);
-  for (const g of groups) signal(-g, "SIGKILL");
-  for (const pid of tree.keys()) signal(pid, "SIGKILL");
-  const left = () => [
-    ...(root.pid !== undefined && !exited(root) ? [root.pid] : []),
-    ...[...tree.keys()].filter((pid) => pid !== root.pid && alive(pid)),
-    ...[...groups].filter((g) => alive(-g)).map((g) => -g),
-  ];
-  let survivors = left();
+  const identified = async (rows?: Proc[]) => {
+    const read = rows ?? (await Promise.all([...tree.keys()].map((pid) => readProc(pid, deadline))))
+      .filter((p): p is Proc => p !== undefined);
+    return read.filter((p) => sameStart(tree.get(p.pid), p) && (p.pid !== root.pid || !exited(root)));
+  };
+  const groupsOf = (members: Proc[]) => {
+    const groups = new Set<number>();
+    if (root.pid !== undefined && (!exited(root) || members.some((p) => p.pid !== root.pid && p.pgid === root.pid))) groups.add(root.pid);
+    for (const p of members) if (p.pid !== root.pid && p.pid === p.pgid) groups.add(p.pgid);
+    return groups;
+  };
+  const targets = await identified(current);
+  for (const g of groupsOf(targets)) signal(-g, "SIGKILL");
+  for (const p of targets) if (p.pid !== root.pid) signal(p.pid, "SIGKILL");
+  if (root.pid !== undefined && !exited(root)) signal(root.pid, "SIGKILL");
+  const left = async () => {
+    const members = await identified();
+    return [
+      ...(root.pid !== undefined && !exited(root) ? [root.pid] : []),
+      ...members.filter((p) => p.pid !== root.pid).map((p) => p.pid),
+      ...[...groupsOf(members)].filter((g) => alive(-g)).map((g) => -g),
+    ];
+  };
+  let survivors = await left();
   while (survivors.length > 0 && Date.now() < deadline) {
     await sleep(50);
-    survivors = left();
+    survivors = await left();
   }
   return { tree: [...tree.values()], survivors, ...(unresolved ? { unresolved } : {}) };
 }

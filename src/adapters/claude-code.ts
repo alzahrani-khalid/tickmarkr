@@ -249,6 +249,9 @@ export const claudeCode: WorkerAdapter = {
   // of process argv. The redirect path is shell-quoted independently from the model.
   headlessCommand: (promptFile: string, model: string, effort?: Effort) =>
     `claude -p '' --model ${shq(model)}${claudeEffortFlag(effort)} --permission-mode bypassPermissions --strict-mcp-config --mcp-config '{"mcpServers":{}}' --output-format text < ${shq(promptFile)}`,
+  // Queue row 184: `--output-format text` prints nothing until the turn ends, so a working pane reviewer reads zero seat bytes at
+  // the first-liveness beat; the beat must not re-route it (2.8.3 killed every claude pane reviewer at 30 s).
+  paneReviewBuffersOutput: true,
   // HYG-03 / OBS-137: the residual first-entry dialog is workspace trust, not MCP config loading.
   // Claude's only store is global last-writer-wins ~/.claude.json, so tickmarkr still does not seed it;
   // the daemon safely answers only the exact adapter-declared dialog once per slot.

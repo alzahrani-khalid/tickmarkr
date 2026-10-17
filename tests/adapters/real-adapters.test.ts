@@ -1,5 +1,5 @@
 import { execSync, spawnSync } from "node:child_process";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
@@ -152,10 +152,22 @@ describe("real adapters", () => {
   test("kimi declares an interactiveSeed launch-then-seed capability", () => {
     expect(kimi.interactiveSeed).toBeDefined();
     expect(kimi.interactiveCommand("/tmp/p.md", "kimi-code/k3")).toBeNull();
-    const launch = kimi.interactiveSeed!.launch("kimi-code/k3");
-    expect(launch).toContain("kimi -y");
-    expect(launch).toContain("-m");
-    expect(launch).toContain("k3");
+    const fakeRoot = mkdtempSync(join(tmpdir(), "tickmarkr-kimi-real-"));
+    const originalPath = process.env.PATH;
+    try {
+      const help = readFileSync(join(import.meta.dirname, "../fixtures/kimi/help-2.2.0.txt"), "utf8")
+        .replace(/^  --auto[^\n]*\n                                [^\n]*\n/m, "");
+      writeFileSync(join(fakeRoot, "help.txt"), help);
+      writeFileSync(join(fakeRoot, "kimi"), `#!/bin/sh\n/bin/cat '${join(fakeRoot, "help.txt")}'\n`);
+      chmodSync(join(fakeRoot, "kimi"), 0o755);
+      process.env.PATH = fakeRoot;
+      const launch = kimi.interactiveSeed!.launch("kimi-code/k3");
+      expect(launch).toBe("kimi -y -m 'kimi-code/k3'");
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      rmSync(fakeRoot, { recursive: true, force: true });
+    }
     expect(kimi.interactiveSeed!.readinessMatch).toBe("Send /help for help information.");
     const seed = kimi.interactiveSeed!.seedLine("/tmp/p.md");
     expect(seed).toContain("/tmp/p.md");

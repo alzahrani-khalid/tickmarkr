@@ -1,5 +1,6 @@
-import { describe, expect, test } from "vitest";
-import { readFileSync } from "node:fs";
+import { afterAll, beforeAll, describe, expect, test } from "vitest";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   confirmKimiSeedBanner,
@@ -21,6 +22,24 @@ const LIVE_BANNER_FRAME = readFileSync(
   "utf8",
 );
 const LIVE_BANNER_SESSION = "session_4d758ead-0dd9-475f-8ba4-bfa38741b59e";
+const priorPath = process.env.PATH;
+let fakeKimiRoot: string;
+
+beforeAll(() => {
+  fakeKimiRoot = mkdtempSync(join(tmpdir(), "tickmarkr-kimi-seed-"));
+  const help = readFileSync(join(import.meta.dirname, "../fixtures/kimi/help-2.2.0.txt"), "utf8")
+    .replace(/^  --auto[^\n]*\n                                [^\n]*\n/m, "");
+  writeFileSync(join(fakeKimiRoot, "help.txt"), help);
+  writeFileSync(join(fakeKimiRoot, "kimi"), `#!/bin/sh\n/bin/cat '${join(fakeKimiRoot, "help.txt")}'\n`);
+  chmodSync(join(fakeKimiRoot, "kimi"), 0o755);
+  process.env.PATH = fakeKimiRoot;
+});
+
+afterAll(() => {
+  if (priorPath === undefined) delete process.env.PATH;
+  else process.env.PATH = priorPath;
+  rmSync(fakeKimiRoot, { recursive: true, force: true });
+});
 
 function makeKimiSeedDriver(banner: string, opts: { submit?: boolean } = {}) {
   let buf = banner;
@@ -37,7 +56,7 @@ function makeKimiSeedDriver(banner: string, opts: { submit?: boolean } = {}) {
     slot: async () => slot,
     run: async (_s: Slot, cmd: string) => {
       runs.push(cmd);
-      if (cmd.includes("kimi -y -m")) {
+      if (KIMI_INPUT_BOX.launchCommand?.(cmd)) {
         // launch: the TUI banner is already in the pane buffer
       } else if (cmd === seedText) {
         buf += `\n${cmd}\n`;
@@ -69,6 +88,9 @@ describe("kimi TUI seed banner checks", () => {
     expect(kimi.inputBox?.match?.(welcomeBanner)).toBe(false);
     expect(kimi.inputBox?.emptyMatch?.(welcomeBanner)).toBe(false);
     expect(kimi.inputBox?.launchCommand?.(kimi.interactiveSeed!.launch(FULL_MODEL))).toBe(true);
+    expect(kimi.inputBox?.launchCommand?.(`kimi --auto -m '${FULL_MODEL}'`)).toBe(true);
+    expect(kimi.inputBox?.launchCommand?.(`kimi --autosave -m '${FULL_MODEL}'`)).toBe(false);
+    expect(kimi.inputBox?.launchCommand?.(`kimi --auto -m '${FULL_MODEL}' && echo extra`)).toBe(false);
     expect(kimi.inputBox?.launchCommand?.("Read /tmp/prompt.md and do exactly what it says.")).toBe(false);
     expect(kimi.inputBox?.readinessTimeoutMs).toBe(15_000);
   });
@@ -197,7 +219,7 @@ describe("kimi TUI seed banner checks", () => {
     expect(r.seedFailed).toBe(true);
     expect(r.seedError).toMatch(/model mismatch/);
     expect(runs).toHaveLength(1);
-    expect(runs[0]).toContain("kimi -y -m");
+    expect(runs[0]).toMatch(/^kimi (?:--auto|-y) -m /);
     expect(r.output).toContain("Model: kimi-for-coding");
     // Pure confirm on the same banner text — no probe of its own.
     expect(confirmKimiSeedBanner(banner, ASSIGNMENT.model).ok).toBe(false);
