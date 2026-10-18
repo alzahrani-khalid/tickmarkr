@@ -1,6 +1,7 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { parse } from "yaml";
+import { repoOverlayPath } from "../config/config.js";
 import { type RunGraph, type SpecSource, validateGraph } from "../graph/schema.js";
 import { taskUnitContractErrors } from "./collateral.js";
 import { blocksCompile, ownershipFindings, renderOwnershipFinding } from "./ownership.js";
@@ -51,7 +52,9 @@ function detect(src: string): SourceType | null {
 // hours, which is exactly the class of thing that has to fail at authoring time.
 function repoOverlayMode(repoRoot?: string): string | undefined {
   if (!repoRoot) return undefined;
-  const path = join(repoRoot, ".tickmarkr", "config.yaml");
+  // Queue row 195 / D-2102: the ONE repo-layer path rule — a linked worktree without an overlay of
+  // its own proves against the main checkout's file, never against defaults.
+  const path = repoOverlayPath(repoRoot);
   if (!existsSync(path)) return undefined;
   try {
     const cfg = parse(readFileSync(path, "utf8")) as { routing?: { mode?: unknown } } | null;

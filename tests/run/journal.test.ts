@@ -1,7 +1,7 @@
-import { spawnSync } from "node:child_process";
-import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
+import { appendFileSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { describe, expect, test, vi } from "vitest";
 import { channelKey } from "../../src/adapters/types.js";
@@ -9,6 +9,21 @@ import { buildDossierPrompt, type Dossier } from "../../src/run/consult.js";
 import { ATTEMPT_CAP_RELEASE, appendProfileDiscount, engagementComparable, formatJournalNarration, gateResultJournalData, Journal, newRunId, outstandingReviewFindings, parseRunId, readAllTelemetry, readProfileDiscounts, recordedGraphDefinitionHash, REVIEW_UPHELD_RELEASE, structuredFindings, TelemetryRowSchema } from "../../src/run/journal.js";
 import { foldPairIntegrity, type DecisionEventWrite } from "../../src/run/protocol.js";
 import { MASK, redactSecrets } from "../../src/run/redact.js";
+import { makeRepo, quietGitInit } from "../helpers/tmprepo.js";
+
+// Queue row 194 (D-2102): the stale-reader seam — the allocator's ticket mkdir (a 16-digit leaf) is the
+// instant between its read and its claim; `beforeTicket` runs there once, so other processes can overtake
+// a paused reader.
+const pause = vi.hoisted(() => ({ beforeTicket: undefined as (() => void) | undefined }));
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  const mkdirSync = ((path: Parameters<typeof actual.mkdirSync>[0], options?: Parameters<typeof actual.mkdirSync>[1]) => {
+    const run = pause.beforeTicket;
+    if (run && /^\d{16}$/.test(basename(String(path)))) { pause.beforeTicket = undefined; run(); }
+    return actual.mkdirSync(path, options);
+  }) as typeof actual.mkdirSync;
+  return { ...actual, mkdirSync, default: { ...actual, mkdirSync } };
+});
 
 // Phase 46 (RES-01/RES-02 derivation half): the verbatim vendored incident fixture — a line subset of
 // run-20260711-185020 quoted at plan time, never regenerated from the live .tickmarkr tree.
@@ -24,6 +39,13 @@ const withAllocatorRepo = <T>(repoRoot: string, allocate: () => T): T => {
   } finally {
     cwd.mockRestore();
   }
+};
+
+// Queue row 194: the run-id sequence lives at the trusted common git dir, so an allocator repo is a checkout.
+const allocatorRepo = (prefix: string): string => {
+  const repo = mkdtempSync(join(tmpdir(), prefix));
+  quietGitInit(repo);
+  return repo;
 };
 
 const allocateInFreshProcess = (repoRoot: string, instant: string, timezone = "UTC"): string => {
@@ -81,12 +103,12 @@ test("test: a resume that restores upheld feedback names the task it was restore
 
 describe("journal", () => {
   test("newRunId shape", () => {
-    const repo = mkdtempSync(join(tmpdir(), "tickmarkr-run-id-"));
+    const repo = allocatorRepo("tickmarkr-run-id-");
     expect(withAllocatorRepo(repo, () => newRunId())).toMatch(/^run-\d{8}-\d{6}-\d{16}$/);
   });
 
   test("test: ids sort chronologically across the closed set of clock hazards — a westward-move fixture, an eastward-move fixture, a spring-forward fixture and a fall-back fixture — with no pair out of order and no pair equal", () => {
-    const repo = mkdtempSync(join(tmpdir(), "tickmarkr-run-id-hazards-"));
+    const repo = allocatorRepo("tickmarkr-run-id-hazards-");
     const originalTimezone = process.env.TZ;
     const fixtures = [
       { hazard: "westward move", instant: "2026-01-15T10:00:00.000Z", timezone: "Asia/Tokyo" },
@@ -117,7 +139,7 @@ describe("journal", () => {
   });
 
   test("test: two runs minted inside the same second receive distinct ids and the later one sorts later", () => {
-    const repo = mkdtempSync(join(tmpdir(), "tickmarkr-run-id-second-"));
+    const repo = allocatorRepo("tickmarkr-run-id-second-");
     const [first, second] = withAllocatorRepo(repo, () => [
       newRunId(new Date("2026-08-05T00:00:00.001Z")),
       newRunId(new Date("2026-08-05T00:00:00.999Z")),
@@ -127,7 +149,7 @@ describe("journal", () => {
   });
 
   test("test: two runs minted at the same instant by SEPARATE allocator invocations sharing no in-memory state, against one repo, receive distinct ids and the second sorts later, so the suffix cannot be a counter that resets when the process does", () => {
-    const repo = mkdtempSync(join(tmpdir(), "tickmarkr-run-id-processes-"));
+    const repo = allocatorRepo("tickmarkr-run-id-processes-");
     const instant = "2026-08-05T00:00:00.000Z";
     const first = allocateInFreshProcess(repo, instant);
     const second = allocateInFreshProcess(repo, instant);
@@ -137,14 +159,14 @@ describe("journal", () => {
 
   test("test: an id minted at a known instant is identical whatever the host timezone is set to", () => {
     const instant = "2026-08-05T00:00:00.000Z";
-    const utc = allocateInFreshProcess(mkdtempSync(join(tmpdir(), "tickmarkr-run-id-utc-")), instant, "UTC");
-    const losAngeles = allocateInFreshProcess(mkdtempSync(join(tmpdir(), "tickmarkr-run-id-la-")), instant, "America/Los_Angeles");
-    const tokyo = allocateInFreshProcess(mkdtempSync(join(tmpdir(), "tickmarkr-run-id-tokyo-")), instant, "Asia/Tokyo");
+    const utc = allocateInFreshProcess(allocatorRepo("tickmarkr-run-id-utc-"), instant, "UTC");
+    const losAngeles = allocateInFreshProcess(allocatorRepo("tickmarkr-run-id-la-"), instant, "America/Los_Angeles");
+    const tokyo = allocateInFreshProcess(allocatorRepo("tickmarkr-run-id-tokyo-"), instant, "Asia/Tokyo");
     expect([losAngeles, tokyo]).toEqual([utc, utc]);
   });
 
   test("test: an existing pre-change id still parses and still sorts against new ids without special-casing", () => {
-    const repo = mkdtempSync(join(tmpdir(), "tickmarkr-run-id-legacy-"));
+    const repo = allocatorRepo("tickmarkr-run-id-legacy-");
     const legacy = "run-20260804-235959";
     const current = withAllocatorRepo(repo, () => newRunId(new Date("2026-08-05T00:00:00.000Z")));
     expect(parseRunId(legacy)).toBe(legacy);
@@ -991,4 +1013,87 @@ describe("outstandingReviewFindings — bound anchors retire on explicit deferra
     const round2Claimed = gate({ resolved: [], reraised: [older], findings: [stale, deferOlder] });
     expect(outstandingReviewFindings([seeded, round2Claimed], "T1").map((f) => f.note)).toContain(anchor.note);
   });
+});
+
+// Queue row 194 (D-2102): the run-id sequence is the REPOSITORY's — shared by its main checkout M and its
+// session worktrees W (nested at M/.claude/worktrees/<name>) — never one per checkout.
+describe("run-id sequence shared across a main checkout and its session worktrees (queue row 194)", () => {
+  const TSX = join(import.meta.dirname, "..", "..", "node_modules", ".bin", "tsx");
+  const JOURNAL_SRC = pathToFileURL(join(import.meta.dirname, "..", "..", "src", "run", "journal.ts")).href;
+  const INSTANT = "2026-10-17T12:00:00.000Z";
+  const seq = (id: string): bigint => BigInt(id.slice(-16));
+
+  const sessionPair = (name: string): { M: string; W: string } => {
+    const M = realpathSync(makeRepo({ "base.txt": "base\n" }));
+    const W = join(M, ".claude", "worktrees", name);
+    execFileSync("git", ["-C", M, "worktree", "add", "-q", "-b", `session-${name}`, W], { stdio: "ignore" });
+    return { M, W };
+  };
+
+  // separate processes sharing no in-memory state, minting from `cwd` (the allocator keys on the process cwd)
+  const mintConcurrently = (cwd: string, count: number): Promise<string[]> => new Promise((ok, fail) => {
+    const script = `import { newRunId } from ${JSON.stringify(JOURNAL_SRC)};
+const ids = []; for (let i = 0; i < ${count}; i++) ids.push(newRunId(new Date(${JSON.stringify(INSTANT)})));
+process.stdout.write(ids.join("\\n"));`;
+    const child = spawn(TSX, ["--eval", script], { cwd, stdio: ["ignore", "pipe", "pipe"] });
+    let out = "", err = "";
+    child.stdout.on("data", (d) => { out += d; });
+    child.stderr.on("data", (d) => { err += d; });
+    child.once("exit", (code) => (code === 0 ? ok(out.trim().split("\n")) : fail(new Error(`minter exited ${code}: ${err}`))));
+  });
+  const mintHere = (cwd: string): string => withAllocatorRepo(cwd, () => newRunId(new Date(INSTANT)));
+
+  // every ticket-shaped entry anywhere under the repository's common git dir
+  const sharedTickets = (M: string): string[] =>
+    readdirSync(join(M, ".git"), { recursive: true }).map(String).filter((entry) => /^\d{16}$/.test(basename(entry)));
+
+  test("test: run ids minted at one instant from a main checkout and from its session worktree differ and the later sorts later, concurrent allocation from both checkouts in which a paused stale reader is overtaken by two allocations and their pruning stays unique through that interleaving, the first id a checkout mints after the change carries a sequence above every ticket its own earlier sequence held, and many mints leave a bounded number of ticket entries in the shared sequence, so a per-checkout sequence, a restart at one, a prune that lets a stale reader reissue an id or an ever-growing ticket directory fails", async () => {
+    // one instant, two checkouts, separate processes: distinct, and the later sorts later
+    {
+      const { M, W } = sessionPair("instant");
+      const fromMain = allocateInFreshProcess(M, INSTANT);
+      const fromSession = allocateInFreshProcess(W, INSTANT);
+      const fromMainAgain = allocateInFreshProcess(M, INSTANT);
+      expect(fromSession).not.toBe(fromMain);
+      expect(fromSession > fromMain).toBe(true);
+      expect(fromMainAgain > fromSession).toBe(true);
+    }
+
+    // a reader in W paused between its read and its claim, overtaken by two allocations from M (which
+    // prune behind them), still mints an id neither of them holds
+    {
+      const { M, W } = sessionPair("stale");
+      let overtaking: string[] = [];
+      pause.beforeTicket = () => { overtaking = [allocateInFreshProcess(M, INSTANT), allocateInFreshProcess(M, INSTANT)]; };
+      const stale = mintHere(W);
+      expect(overtaking).toHaveLength(2);
+      expect(new Set([...overtaking, stale]).size).toBe(3);
+      expect(stale > overtaking[1]!).toBe(true);
+
+      // and truly concurrent allocators from both checkouts stay unique
+      const all = (await Promise.all([mintConcurrently(M, 15), mintConcurrently(W, 15), mintConcurrently(M, 15), mintConcurrently(W, 15)])).flat();
+      expect(all).toHaveLength(60);
+      expect(new Set([...all, ...overtaking, stale]).size).toBe(63);
+    }
+
+    // the first id after the change sits above the checkout's own earlier per-checkout sequence
+    {
+      const { M, W } = sessionPair("legacy");
+      for (const ticket of ["0000000000000017", "0000000000000900"]) mkdirSync(join(M, ".tickmarkr", "run-id-sequence", ticket), { recursive: true });
+      mkdirSync(join(W, ".tickmarkr", "run-id-sequence", "0000000000000004"), { recursive: true });
+      expect(seq(mintHere(W))).toBeGreaterThan(4n);
+      expect(seq(mintHere(M))).toBeGreaterThan(900n);
+    }
+
+    // many mints, a bounded shared sequence (and it is the common dir's, not a checkout's)
+    {
+      const { M, W } = sessionPair("bounded");
+      const ids = Array.from({ length: 60 }, (_, i) => mintHere(i % 2 ? W : M));
+      expect(new Set(ids).size).toBe(60);
+      expect(ids).toEqual([...ids].sort());
+      const tickets = sharedTickets(M);
+      expect(tickets.length).toBeGreaterThanOrEqual(1);
+      expect(tickets.length).toBeLessThanOrEqual(2);
+    }
+  }, 120_000);
 });

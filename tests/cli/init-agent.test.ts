@@ -299,6 +299,49 @@ describe("tickmarkr init --agent portable docs (T3)", () => {
     expect(handoffs).toContain("when a prompt or choice holds focus instead, resolve it first and re-read before retrying");
 
   });
+
+  test("test: init with agent docs in a scratch repository renders a Verified handoffs paragraph that keeps the herdr form with its read-back guard and adds the plain-host form, a cross-session message confirmed by the peer's reply, while the block names no .claude path and no skill slash command, and every guidance file present at this repository's root carries that rendered block byte for byte, so a paragraph without the plain form or a stale CLAUDE.md block fails", async () => {
+    vi.spyOn(registry, "allAdapters").mockReturnValue([]);
+    const repo = makeRepo({ "keep.txt": "x" });
+    await runInit(repo, "--agent", "--docs");
+    const block = agentDocsSection(repo);
+
+    // queue row 192: the herdr form keeps its read-back guard; a plain host hands off by a cross-session message the
+    // peer answers. The block itself stays host-path- and slash-command-free.
+    const findings = (rendered: string) => {
+      const begin = rendered.indexOf("### Verified handoffs");
+      const handoffs = rendered.slice(begin, rendered.indexOf("### Orient before you act", begin));
+      const out: string[] = [];
+      if (begin < 0 || !handoffs.includes('Use `herdr pane run <pane> "<message>"`')
+        || !handoffs.includes("an Enter sent onto an active prompt approves it or picks a choice instead of submitting the message (OBS-1119)")
+        || !handoffs.includes('Never report "relayed" without read-back.')) out.push("herdr form");
+      if (!handoffs.includes("On a plain host (neither herdr nor Orca)") || !/cross-session message tool/.test(handoffs)
+        || !/confirmed only by the peer's reply/.test(handoffs)) out.push("plain form");
+      if (/\.claude/.test(rendered) || /(?:^|[\s`(])\/(?:tickmarkr|tkr)[\w-]*/m.test(rendered)) out.push("host path or skill slash command");
+      return out;
+    };
+    expect(findings(block)).toEqual([]);
+
+    // Wrong discriminators: the paragraph without its plain form — the shape a stale CLAUDE.md block still carries —
+    // and a block that names a skill slash command.
+    const stale = block.replace(/ On a plain host \(neither herdr nor Orca\)[^\n]*peer's reply\./, "");
+    expect([stale === block, findings(stale)]).toEqual([false, ["plain form"]]);
+    expect(findings(block.replace("### Orient before you act", "Then run /tickmarkr-loop.\n\n### Orient before you act"))).toEqual(["host path or skill slash command"]);
+
+    // Every guidance file present at this repository's root carries the rendered block byte for byte. The export ships
+    // none, so there the subject is its absence (the same positive discriminator as the preflight test below).
+    if (!existsSync(join(ROOT, "scripts/export-public.sh"))) {
+      for (const doc of ["CLAUDE.md", "AGENTS.md"]) expect(existsSync(join(ROOT, doc))).toBe(false);
+      return;
+    }
+    const present = ["CLAUDE.md", "AGENTS.md"].filter((doc) => existsSync(join(ROOT, doc)));
+    expect(present.length).toBeGreaterThan(0);
+    for (const doc of present) {
+      const rendered = agentDocsSection(ROOT, doc);
+      expect(rendered, doc).toBe(block);
+      expect(rendered, doc).not.toBe(stale);
+    }
+  });
 });
 
 describe("tickmarkr init --agent preflight authority (T3)", () => {

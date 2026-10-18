@@ -352,3 +352,115 @@ test("LEG A REPAIR: overseer fallback launches use the recorded ORCH handle or p
   expect(loop).toContain("with the same detached launch above");
   expect(loop).not.toContain("host-owned split form");
 });
+
+// Queue row 192: the reading a plain host (neither herdr nor Orca) follows — every universal scope plus the one scope
+// headed for it, every On herdr and On Orca scope skipped — over the same tree walk hostViolations uses.
+const PLAIN_HEADING = "On a plain host (neither herdr nor Orca)";
+const PLAIN_LINK = `[${PLAIN_HEADING}](#on-a-plain-host-neither-herdr-nor-orca)`;
+const orcaCommand = /(?<![\w-])orca\s+(?:terminal|worktree)\s+[a-z]/;
+const closedList = [
+  /the daemon-placed board is the live surface/,
+  /treat that as a daemon\/run liveness fault/,
+  /interactive TUI[^.]*never headless/i,
+  /say so and stop/,
+  /foreground\s+`?until\s+grep/i,
+  /at most every twenty minutes/i,
+];
+
+function plainReading(markdown: string): { lines: string[]; scope: string[]; scopes: number } {
+  type Node = { parent?: Node; host?: "herdr" | "orca" | "plain"; depth: number };
+  const hostOfPlain = (text: string): Node["host"] => text.replace(/^[*_]+/, "").startsWith(PLAIN_HEADING) ? "plain" : hostOf(text);
+  const headings: Node[] = [{ depth: -1 }];
+  const bullets: Node[] = [];
+  const inherited = (node: Node | undefined): Node["host"] => node && (node.host ?? inherited(node.parent));
+  const lines: string[] = [];
+  const scope: string[] = [];
+  let scopes = 0;
+  let fence: string | undefined;
+  for (const line of markdown.split("\n")) {
+    const trimmed = line.trimStart();
+    const indent = line.length - trimmed.length;
+    if (!fence) {
+      const heading = /^(#{1,6})\s+(.+)$/.exec(line);
+      const bullet = /^(\s*)(?:[-+*]|\d+[.)])\s+(.+)$/.exec(line);
+      let node: Node | undefined;
+      if (heading) {
+        bullets.length = 0;
+        while (headings.at(-1)!.depth >= heading[1].length) headings.pop();
+        node = { parent: headings.at(-1), depth: heading[1].length, host: hostOfPlain(heading[2]) };
+        headings.push(node);
+      } else if (bullet) {
+        while (bullets.length && bullets.at(-1)!.depth >= indent) bullets.pop();
+        node = { parent: bullets.at(-1) ?? headings.at(-1), depth: indent, host: hostOfPlain(bullet[2]) };
+        bullets.push(node);
+      } else if (trimmed) {
+        while (bullets.length && indent <= bullets.at(-1)!.depth) bullets.pop();
+      }
+      if (node?.host === "plain") scopes++;
+    }
+    const host = inherited(bullets.at(-1) ?? headings.at(-1));
+    if (host === undefined || host === "plain") lines.push(line);
+    if (host === "plain") scope.push(line);
+    const marker = /^(`{3,}|~{3,})/.exec(trimmed)?.[1];
+    if (marker && (!fence || marker[0] === fence[0] && marker.length >= fence.length)) fence = fence ? undefined : marker;
+  }
+  return { lines, scope, scopes };
+}
+
+/** What a plain host meets that it cannot follow, or misses that it needs; empty means the skill routes it. */
+function plainHostFindings(name: string, markdown: string): string[] {
+  const { lines, scope, scopes } = plainReading(markdown);
+  const findings: string[] = [];
+  if (scopes !== 1) findings.push(`${scopes} scopes headed ${PLAIN_HEADING}`);
+  if (!markdown.includes(`\n## ${PLAIN_HEADING}\n`)) findings.push("no heading the route's anchor resolves to");
+  const check = name === "overseer"
+    ? markdown.split("\n").find((l) => l.startsWith("Requires a supported host")) ?? ""
+    : markdown.slice(markdown.indexOf("## Two-tier by default — role check before the loop"), markdown.indexOf(`\n## ${PLAIN_HEADING}\n`));
+  if (!check.includes(PLAIN_LINK) || check.includes("say so and stop")) findings.push("the host or role check does not route a plain host to its scope");
+  const text = scope.join("\n");
+  const needs: [string, boolean][] = [
+    ["the single-tier orchestrator", /single-tier/i.test(text) && /orchestrator/i.test(text)],
+    ["the background wait under the ten-minute cap", /background wait/i.test(text) && /ten-minute/i.test(text)],
+    ["the status command with its plain watch view", text.includes("tickmarkr status <runId>") && text.includes("status --watch --plain")],
+    ["the headless reviews", /reviews and judges run headless/i.test(text)],
+    ["the empty-mission ask", /empty mission is asked for/i.test(text)],
+    ["the anchor-free launch", /anchor-free lines/i.test(text)],
+    ["the cross-session handoff confirmed by the peer's reply", /cross-session message tool/i.test(text) && /peer's reply/i.test(text)],
+    ["the non-stalling permission mode", /permission mode that never stalls per command/i.test(text)],
+  ];
+  for (const [what, ok] of needs) if (!ok) findings.push(`the plain scope lacks ${what}`);
+  for (const line of lines) {
+    if (herdrOnly.test(line)) findings.push(`herdr-only token: ${line.trim()}`);
+    if (orcaCommand.test(line)) findings.push(`Orca command: ${line.trim()}`);
+  }
+  // A mandate may wrap across lines, so the closed list is read over the whole reading.
+  const reading = lines.join("\n").replace(/\s+/g, " ");
+  for (const mandate of closedList) {
+    const hit = mandate.exec(reading);
+    if (hit) findings.push(`plain-host-impossible mandate: ${hit[0]}`);
+  }
+  return findings;
+}
+
+test("test: a plain-host reading of each shipped skill, following every universal scope and the scope headed On a plain host (neither herdr nor Orca) and skipping every On herdr and On Orca scope, reaches that scope from the host or role check, finds there the single-tier orchestrator, the background wait under the ten-minute cap, the status command with its plain watch view and the headless reviews, and meets no herdr-only token, no Orca command and none of the closed list of plain-host-impossible mandates, so a skill that still stops on a plain host or leaves a board or seat mandate universal fails", () => {
+  for (const name of ["overseer", "loop", "auto"]) {
+    const skill = readFileSync(new URL(`../skills/tickmarkr-${name}/SKILL.md`, import.meta.url), "utf8");
+    expect(plainHostFindings(name, skill), name).toEqual([]);
+    // The herdr walk stays whole beside it: herdr-only tokens only in herdr scopes, every herdr scope beside an Orca one.
+    expect(hostViolations(skill), name).toEqual([]);
+
+    // Wrong discriminators: each closed-list mandate left universal, and the old stop (or no route) in the check.
+    const universal = (mandate: string) => `${skill}\n## Appended universally\n\n${mandate}\n`;
+    for (const mandate of [
+      "the daemon-placed board is the live surface.",
+      "If it is absent, treat that as a daemon/run liveness fault and use the normal recovery path.",
+      "2. **Seats are interactive TUI, never headless `-p`.**",
+      "Keep a foreground `until grep` on the run's terminal events, re-armed at most every twenty minutes.",
+    ]) expect(plainHostFindings(name, universal(mandate)), `${name}: ${mandate}`).not.toEqual([]);
+    const stops = name === "overseer"
+      ? skill.replace(/ for that hierarchy; if neither host is detected, do not stop: .*$/m, "; if neither host is detected, say so and stop.")
+      : skill.replace(/^With neither herdr nor Orca there is no role to decide.*$/m, "Outside a multi-agent terminal environment, run the loop directly.");
+    expect(stops, name).not.toBe(skill);
+    expect(plainHostFindings(name, stops), `${name}: stops`).toContain("the host or role check does not route a plain host to its scope");
+  }
+});

@@ -1,6 +1,6 @@
 ---
 name: tickmarkr-overseer
-description: "Use when the user asks to oversee/supervise/babysit an autonomous tickmarkr run in a Herdr workspace or Orca session (e.g. '/tickmarkr-overseer run the milestone', 'supervise this tickmarkr run', 'babysit this pipeline'). Requires a supported host: herdr (HERDR_ENV=1) or Orca (TERM_PROGRAM=Orca and non-empty ORCA_TERMINAL_HANDLE). The skill argument is the mission (what to run end-to-end)."
+description: "Use when the user asks to oversee/supervise/babysit an autonomous tickmarkr run in a Herdr workspace, an Orca session or a plain agent session (e.g. '/tickmarkr-overseer run the milestone', 'supervise this tickmarkr run', 'babysit this pipeline'). Two-tier on herdr (HERDR_ENV=1) or Orca (TERM_PROGRAM=Orca and non-empty ORCA_TERMINAL_HANDLE); single-tier as the orchestrator on a plain host with neither. The skill argument is the mission (what to run end-to-end)."
 ---
 
 # Overseer (tickmarkr)
@@ -10,7 +10,7 @@ hierarchy of VISIBLE agents (you → orchestrator → tickmarkr's own worker fle
 to the user with evidence.
 
 The mission is the skill argument. If empty, ask the user what to run end-to-end before doing anything else.
-Requires a supported host: herdr (`HERDR_ENV=1`) or Orca (`TERM_PROGRAM=Orca` and non-empty `ORCA_TERMINAL_HANDLE`); if neither host is detected, say so and stop.
+Requires a supported host: herdr (`HERDR_ENV=1`) or Orca (`TERM_PROGRAM=Orca` and non-empty `ORCA_TERMINAL_HANDLE`) for that hierarchy; if neither host is detected, do not stop: this is a plain host — follow [On a plain host (neither herdr nor Orca)](#on-a-plain-host-neither-herdr-nor-orca) and run single-tier as the orchestrator.
 
 Use the canonical loop skill's [cockpit, parked decisions and printed twins](../tickmarkr-loop/SKILL.md#cockpit-parked-decisions-and-printed-twins)
 when reading or relaying operator evidence. Delivered views are **1 Home, 4 Run, 5 Evidence**;
@@ -68,6 +68,41 @@ ran each task"* was unanswerable from every mission artifact (no ruling, log, or
 the answer took session-file archaeology). The flip from the engine (P89, journaled runs on disk) to
 GSD legs (P92) had been RULED NOWHERE — no ledger entry decides it — and then propagated for six phases
 through brief lineage. **An executor choice nobody made is still an executor choice, and it compounds.**
+
+## On a plain host (neither herdr nor Orca)
+
+Neither `HERDR_ENV=1` nor the Orca markers are set: the Claude Desktop Code tab, a plain terminal, any
+agent session that owns no panes (queue row 192; D-2102). There is no hierarchy to build, so this scope
+replaces the two-tier setup.
+
+- **This session runs SINGLE-TIER as the orchestrator.** The OVERSEER's rulings and the ORCHESTRATOR's
+  loop (`tickmarkr compile` → `plan` → `run` → `report`) are this one session: there are no seats, no
+  pane briefs, no tab canon and no board. Skip Setup steps 1–4, the seat-spawn recipes, the watcher
+  instruments and every On herdr and On Orca scope; read
+  [what the ORCHESTRATOR does](#what-the-orchestrator-does-and-what-you-require-of-it) as your own
+  duties and keep every ruling and evidence law.
+- **An empty mission is asked for, never assumed.** With an empty skill argument, ask the operator what
+  to run end-to-end before doing anything else; there is no other tier to relay it to.
+- **Run and resume launch through the anchor-free lines** of the
+  [detached launch](#host-owned-daemon-and-detached-beats): the same `node` detach with no address, one
+  line for `tickmarkr run` and one for `tickmarkr resume <runId>`. The daemon places no board, so a
+  missing board is never a fault; confirm the launch from the lock pid as that section says.
+- **Run-end and parks are watched through the host's background wait**, never a foreground wait past
+  the host's ten-minute tool cap: the cap kills that wait, ends the turn and leaves the run unwatched.
+  Start the wait as a background task whose exit wakes this session, on journal lines after a baseline
+  taken at arm time and on the lock holder's death:
+  `n=$(wc -l < <journal>); until tail -n +$((n + 1)) <journal> | grep -qE '"event":"(run-end|task-human|task-failed|consult-verdict)"' || ! kill -0 <pid>; do sleep 20; done`
+  (`<journal>` is `<state-dir>/runs/<runId>/journal.jsonl`, `<pid>` the lock pid). On every wake read
+  CURRENT `tickmarkr status <runId>` first, then re-arm.
+- **The operator's view is `tickmarkr status <runId>`**, plus its live `status --watch --plain` form,
+  `tickmarkr status <runId> --watch --plain`, in a read-only Terminal tab beside this session.
+- **Reviews and judges run headless.** The subprocess driver runs every worker, judge and review as a
+  headless CLI call with no pane to watch: read their verdicts from the journal, the gate evidence and
+  `tickmarkr status <runId>`, never from a screen. No seat transport rule applies: there are no seats.
+- **Sessions hand off through the host's cross-session message tool**, confirmed by the peer's reply:
+  there is no composer to read back, so a message no peer answered is not a handoff.
+- **Keep a permission mode that never stalls per command** for the whole run (for example
+  `bypassPermissions`): nobody answers a per-command approval prompt in an unattended session.
 
 ## Setup
 
@@ -333,12 +368,13 @@ For Leg-2 (both hosts), a Codex reviewer under `workspace-write` must be briefed
 ## Host-owned daemon and detached beats
 
 Launch the daemon DETACHED, with no pane of its own: one `tickmarkr run` or `tickmarkr resume <runId>`
-process in its own session, its stdout and stderr appended to `<state-dir>/daemon.log`, and the
-ORCH's recorded address as its board anchor, so the daemon self-places its one board beside the
-ORCH in the ORCH tab. Never launch it in a visible split, pane or tab, as an agent harness
-background task, or tied to an agent session: the launching shell may end, and the daemon keeps
-running and logging. The detach wrapper is `node`, which tickmarkr already requires — no private
-script, no extra visible daemon pane and no CLI log flag:
+process in its own session, its stdout and stderr appended to `<state-dir>/daemon.log`, and on
+herdr or Orca the ORCH's recorded address as its board anchor, so the daemon self-places its one
+board beside the ORCH in the ORCH tab; with neither host it carries no address and places no board.
+Never launch it in a visible split, pane or tab, as an agent harness background task, or tied to
+an agent session: the launching shell may end, and the daemon keeps running and logging. The
+detach wrapper is `node`, which tickmarkr already requires — no private script, no extra visible
+daemon pane and no CLI log flag:
 
 ```bash
 # On Orca: <ORCH handle> is the ORCH terminal handle
@@ -347,6 +383,9 @@ cd <repo> && ORCA_TERMINAL_HANDLE="<ORCH handle>" node -e "require('child_proces
 # On herdr: <ORCH pane id> is the ORCH pane id
 cd <repo> && HERDR_PANE_ID="<ORCH pane id>" node -e "require('child_process').spawn(process.argv[1], process.argv.slice(2), { detached: true, stdio: 'inherit' }).unref()" tickmarkr run >> <state-dir>/daemon.log 2>&1 < /dev/null
 cd <repo> && HERDR_PANE_ID="<ORCH pane id>" node -e "require('child_process').spawn(process.argv[1], process.argv.slice(2), { detached: true, stdio: 'inherit' }).unref()" tickmarkr resume <runId> >> <state-dir>/daemon.log 2>&1 < /dev/null
+# On a plain host (neither herdr nor Orca): the same detach with no address
+cd <repo> && node -e "require('child_process').spawn(process.argv[1], process.argv.slice(2), { detached: true, stdio: 'inherit' }).unref()" tickmarkr run >> <state-dir>/daemon.log 2>&1 < /dev/null
+cd <repo> && node -e "require('child_process').spawn(process.argv[1], process.argv.slice(2), { detached: true, stdio: 'inherit' }).unref()" tickmarkr resume <runId> >> <state-dir>/daemon.log 2>&1 < /dev/null
 ```
 
 - **On Orca (`TERM_PROGRAM=Orca` and non-empty `ORCA_TERMINAL_HANDLE`)**: run the
@@ -357,13 +396,18 @@ cd <repo> && HERDR_PANE_ID="<ORCH pane id>" node -e "require('child_process').sp
 - **On herdr (`HERDR_ENV=1`)**: run the `HERDR_PANE_ID` lines; `<ORCH pane id>` is the ORCH's own
   `$HERDR_PANE_ID`. When the OVERSEER launches the fallback, substitute the ORCH pane id recorded
   at seat creation, never the OVERSEER's pane.
+- With neither host, run the two lines that carry no address
+  ([On a plain host (neither herdr nor Orca)](#on-a-plain-host-neither-herdr-nor-orca)).
 
-After either launch, read this repository's lock pid from `<state-dir>/graph.lock` and confirm it:
+After any launch, read this repository's lock pid from `<state-dir>/graph.lock` and confirm it:
 `kill -0 <pid>` succeeds, `ps -o pgid= -p <pid>` prints that same pid (its own session group;
 ppid 1 is never proof on its own), walk its ppid chain and verify no agent session is an ancestor,
 and read `<state-dir>/daemon.log`. No live holder means the launch failed: read the log, fix the
 cause and run the same line again — never a second daemon beside a live holder, and never a
-visible split to watch it; the daemon-placed board is the live surface.
+visible split to watch it.
+
+- **On herdr (`HERDR_ENV=1`)**: the daemon-placed board is the live surface.
+- **On Orca (`TERM_PROGRAM=Orca` and non-empty `ORCA_TERMINAL_HANDLE`)**: the daemon-placed board is the live surface.
 
 Detached beats are product-owned, one per (tier, seat), from the repository root, through the
 shipped lifecycle verbs — never a hand-rolled setsid plus nohup wrapper, pidfile or shell loop:
@@ -521,26 +565,34 @@ journal tail to decide what happens next, or sweeping orphans — you have taken
 
 ### What the ORCHESTRATOR does, and what you require of it
 
-- **The live surface arrives with the run.** `tickmarkr run` is stdout-silent until run-end by design;
-  its daemon self-places one shipped `role: "watch"` board BESIDE the supervising seat — the right half
-  of the tab, narration on the left — and pins that board to the daemon's run id. **Look for the matching
-  daemon-placed pane.** If it is absent, treat that as a daemon/run liveness fault and use the normal
-  recovery path; never hand-place, hand-roll, or launch a replacement live surface. A board the daemon
-  could not stack is not silently re-arranged: the split is closed and the run continues BOARDLESS, so an
-  absent board means the placement failed, never that it landed somewhere else in the tab.
+- **The live surface arrives with the run.** `tickmarkr run` is stdout-silent until run-end by design.
+  With neither host there is no board: the plain-host scope's status view is the live surface.
+  - **On herdr (`HERDR_ENV=1`)**: its daemon self-places one shipped `role: "watch"` board BESIDE the
+    supervising seat — the right half of the tab, narration on the left — and pins that board to the
+    daemon's run id. **Look for the matching daemon-placed pane.** If it is absent, treat that as a
+    daemon/run liveness fault and use the normal recovery path; never hand-place, hand-roll, or launch a
+    replacement live surface. A board the daemon could not stack is not silently re-arranged: the split
+    is closed and the run continues BOARDLESS, so an absent board means the placement failed, never that
+    it landed somewhere else in the tab.
+  - **On Orca (`TERM_PROGRAM=Orca` and non-empty `ORCA_TERMINAL_HANDLE`)**: the same board, placed and
+    pinned the same way beside the ORCH. **Look for the matching daemon-placed pane.** If it is absent,
+    treat that as a daemon/run liveness fault and use the normal recovery path; never hand-place,
+    hand-roll, or launch a replacement live surface.
 - **The journal is the source of truth**, not panes. Watchers go on `run-end` / `task-human` /
   `task-failed` / `consult-verdict`; never sleep-poll inside an agent turn. **Never key a watcher on an
   agent's `done`** — that is turn end and fires the moment a seat finishes acknowledging you.
   A watch ending the seat's turn is no watch: keep a **blocking journal consumer** alive for those terminal
-  events — the shipped watcher below, or a foreground `until grep` on the run's terminal events — and
-  ensure it is re-armed at most every twenty minutes. Never rely on a `Monitor`-only wake.
-  - **On herdr (`HERDR_ENV=1`)**: Use the shipped journal instruments:
+  events, and never rely on a `Monitor`-only wake. The consumer is host-specific; with neither host it is
+  the plain-host scope's background wait.
+  - **On herdr (`HERDR_ENV=1`)**: the consumer is the shipped watcher below, or a foreground `until grep`
+    on the run's terminal events; ensure it is re-armed at most every twenty minutes. Use the shipped
+    journal instruments:
     **All four are covered by one shipped instrument** — `scripts/watch-journal.sh <runs-dir> [poll] [cap]
     [events-csv]` — which arms on a line baseline, wakes once, and grades a `run-end`'s execution clauses —
     `EXECUTION COMPLETE` or `NOT GREEN`, never green: green is CURRENT `tickmarkr status <runId>` at
     `outstanding 0`. `scripts/watch-parks.sh` stays the park-specific wake for THIS seat (it counts parks and speaks
     about rulings); the two overlap on `task-human` deliberately, and arming both is coverage, not a bug.
-  - **On Orca (`TERM_PROGRAM=Orca` and non-empty `ORCA_TERMINAL_HANDLE`)**: Arm a file/journal consumer for the same terminal events and inspect the seat with `orca terminal read --terminal <handle> --screen --json`; re-arm after every wake.
+  - **On Orca (`TERM_PROGRAM=Orca` and non-empty `ORCA_TERMINAL_HANDLE`)**: Arm a file/journal consumer for the same terminal events, or a foreground `until grep` on them, and ensure it is re-armed at most every twenty minutes; inspect the seat with `orca terminal read --terminal <handle> --screen --json`; re-arm after every wake.
 - **Daemon liveness ≠ journal activity.** A dead daemon emits no events, so journal watchers sleep through
   its death. Liveness comes from the lock's OWN pid (`kill -0`), never a command-name grep. Recovery is
   `tickmarkr resume <runId>` — **the orchestrator's command, not yours** — and note that resume REPLAYS the
@@ -777,10 +829,10 @@ an overseer ran nine hours at 86% unable to read its own number; a context watch
 when the run's own status text pushed the percentage off the statusline; and an orchestrator went
 **366k → 970k of 1M between two checks** while its ACT wake sat unread in a detached log.
 
-**On Orca (`TERM_PROGRAM=Orca` and non-empty `ORCA_TERMINAL_HANDLE`)**, use the same mutual-clear
-policy through brief/handoff files and `orca terminal send --enter --wait-submit`; identify seats by
-terminal handle, verify submission from the receipt, and read the terminal before continuing. Do not
-run the Herdr pane commands or Herdr context watcher below.
+- **On Orca (`TERM_PROGRAM=Orca` and non-empty `ORCA_TERMINAL_HANDLE`)**, use the same mutual-clear
+  policy through brief/handoff files and `orca terminal send --enter --wait-submit`; identify seats by
+  terminal handle, verify submission from the receipt, and read the terminal before continuing. Do not
+  run the Herdr pane commands or Herdr context watcher below.
 
 #### On herdr (`HERDR_ENV=1`) — mutual clear
 
@@ -1020,13 +1072,17 @@ they are left implicit:
    - **On herdr (`HERDR_ENV=1`)**, subagents run as visible herdr panes in per-task tabs (`herdr agent start …`);
    - **On Orca (`TERM_PROGRAM=Orca` and non-empty `ORCA_TERMINAL_HANDLE`)**, they run as visible terminals created with the Orca seat-spawn recipe. A seat report whose work
    was produced by invisible subagents is rejected on read.
-2. **Seats are interactive TUI, never headless `-p`.** The P92–P96 exec lane —
-   `cat brief | claude -p … ` in a visible pane — satisfied visibility in the letter only: `claude -p`
-   buffers output until exit, so the pane renders idle for the entire run; it is blind to SessionStart
-   hook errors (a broken and a fixed hook both return green); and its silence has no midpoint for a
-   stall watcher to catch — silent-time equals lifetime. Standing operator rule since 2026-07-13:
-   consults and one-off LLM calls run as the CLI's real interactive TUI in a visible named pane.
-   Headless is for exit-code probes — a quota check that wants `rc`, never work anyone must watch.
+2. **Seat transport is host-specific.** With neither host there are no seats, and the plain-host scope's
+   reviews and judges run headless.
+   - **On herdr (`HERDR_ENV=1`)**: **Seats are interactive TUI, never headless `-p`.** The P92–P96 exec
+     lane — `cat brief | claude -p … ` in a visible pane — satisfied visibility in the letter only:
+     `claude -p` buffers output until exit, so the pane renders idle for the entire run; it is blind to
+     SessionStart hook errors (a broken and a fixed hook both return green); and its silence has no
+     midpoint for a stall watcher to catch — silent-time equals lifetime. Standing operator rule since
+     2026-07-13: consults and one-off LLM calls run as the CLI's real interactive TUI in a visible named
+     pane. Headless is for exit-code probes — a quota check that wants `rc`, never work anyone must watch.
+   - **On Orca (`TERM_PROGRAM=Orca` and non-empty `ORCA_TERMINAL_HANDLE`)**: **Seats are interactive TUI,
+     never headless `-p`**, for every reason the herdr branch gives, in a visible named terminal.
 3. **Buy seat diversity through Fleet, at every dispatch and respawn.** Resolve authors with `tickmarkr fleet --pick consult` and independent checkers/verifiers with `tickmarkr fleet --pick review --exclude-vendor <author-vendor>`, adding every applicable vendor exclusion under the Fleet selection contract. Consume the successful JSON adapter/model before using the visible-seat recipes; never select directly from doctor data. When one vendor's model
    quota collapses, the reflex is to collapse every seat onto the surviving model and hold the
    cross-vendor CLI back for a late probe — P97 ran planner, checker and verifier as one family that

@@ -1,7 +1,8 @@
-import { closeSync, constants, fstatSync, linkSync, lstatSync, mkdtempSync, openSync, readFileSync, renameSync, rmdirSync, statSync, unlinkSync, utimesSync, writeFileSync, type Stats } from "node:fs";
-import { join } from "node:path";
+import { closeSync, constants, fstatSync, linkSync, lstatSync, mkdtempSync, openSync, readdirSync, readFileSync, realpathSync, renameSync, rmdirSync, statSync, unlinkSync, utimesSync, writeFileSync, type Stats } from "node:fs";
+import { basename, dirname, join } from "node:path";
 import { z } from "zod";
 import { tickmarkrDir, stateDirName } from "../graph/graph.js";
+import { GitTrustRefusal, trustedCommonDir } from "./git-trust.js";
 import { parseRunId } from "./journal.js";
 
 // HARD-01/02: coarse per-run advisory lock over .tickmarkr/graph.json. LOCK-02: the lock is created by
@@ -20,19 +21,34 @@ export const STALE_MS = 60_000; // 6× heartbeat headroom; PITFALLS floor is ≥
 // pid/runId/startedAt are ever read; anything else is ignored (info-disclosure surface).
 const PayloadSchema = z.object({ pid: z.number().int().positive(), runId: z.string(), startedAt: z.number() });
 
+// Queue row 194 (D-2102): graph.lock lives per CHECKOUT, so a run in a linked worktree (Claude Desktop
+// nests each session under <repo>/.claude/worktrees/) never saw a run in the main checkout. The daemon's
+// acquire therefore also takes this REPOSITORY RUN CLAIM at the trusted common git dir — the runner
+// lease's anchor — by the same link(2) idiom and the same decision table (shouldRefuse). compile's two
+// holders take graph.lock only: it guards that checkout's own graph, never the repository's run.
+const ClaimSchema = PayloadSchema.extend({ checkout: z.string() });
+const MarkerSchema = z.object({ pid: z.number().int().positive(), startedAt: z.number() });
+const CLAIM_FILE = "tickmarkr-run.claim";
+const COMPILE_HOLDERS = new Set(["compile", "compile-refusal"]);
+const NO_CHECKOUT = "no checkout encloses this directory"; // git-trust's refusal detail outside any checkout
+
 const lockPath = (repoRoot: string) => join(tickmarkrDir(repoRoot), "graph.lock");
 const approvalSerializationPath = (repoRoot: string) => join(tickmarkrDir(repoRoot), "approval.lock");
 
 let heartbeat: NodeJS.Timeout | undefined;
 let heldPath: string | undefined;
+const heldClaims = new Map<string, { path: string; checkout: string }>(); // graph.lock path → its repository claim
 let approvalSequence = 0;
 
 // Best-effort release if the daemon exits without hitting its finally (crash mid-body). NO
 // SIGINT/SIGTERM handlers — those change kill semantics and leak listeners across the test
 // suite's many runDaemon calls; signal-death is exactly what stale-reclaim exists for.
-process.once("exit", () => { if (heldPath) unlinkIfOurs(heldPath); });
+process.once("exit", () => {
+  for (const claim of heldClaims.values()) unlinkClaimIfOurs(claim);
+  if (heldPath) unlinkIfOurs(heldPath);
+});
 
-export interface Inspection { pid?: number; runId?: string; garbage: boolean; dead: boolean; expired: boolean; mtimeMs: number; ino: number }
+export interface Inspection { pid?: number; runId?: string; startedAt?: number; checkout?: string; garbage: boolean; dead: boolean; expired: boolean; mtimeMs: number; ino: number }
 export type RunLineEvent = { event: string; ts: string };
 
 // LOCK-04: the ONE decision table. Both acquireRunLock and isRunLockLive consume this — the two
@@ -70,16 +86,17 @@ export function isPidLive(pid: number): boolean {
 }
 
 // statSync throws ENOENT when no lock exists — callers treat that as "not held".
-function inspect(p: string): Inspection {
+function inspect(p: string, schema: typeof PayloadSchema | typeof ClaimSchema = PayloadSchema): Inspection {
   const st = statSync(p); // single stat: both the heartbeat mtime and the reclaim-guard inode
   const mtimeMs = st.mtimeMs;
   const expired = Date.now() - mtimeMs > STALE_MS;
-  const parsed = PayloadSchema.safeParse(readPayload(p));
+  const parsed = schema.safeParse(readPayload(p));
   const garbage = !parsed.success; // LOCK-01: its own state — shouldRefuse refuses it unconditionally; only `tickmarkr unlock` removes it
   const pid = parsed.success ? parsed.data.pid : undefined;
   // harmless fallback for the garbage row — garbage short-circuits shouldRefuse before this is read
   const dead = pid === undefined ? true : !isPidLive(pid);
-  return { pid, runId: parsed.success ? parsed.data.runId : undefined, garbage, dead, expired, mtimeMs, ino: st.ino };
+  const checkout = parsed.success ? (parsed.data as { checkout?: string }).checkout : undefined;
+  return { pid, runId: parsed.success ? parsed.data.runId : undefined, startedAt: parsed.success ? parsed.data.startedAt : undefined, checkout, garbage, dead, expired, mtimeMs, ino: st.ino };
 }
 
 function readPayload(p: string): unknown {
@@ -93,7 +110,123 @@ function unlinkIfOurs(p: string): void {
   } catch { /* ENOENT — nothing to release */ }
 }
 
+function unlinkClaimIfOurs(claim: { path: string; checkout: string }): void {
+  try {
+    const parsed = ClaimSchema.safeParse(readPayload(claim.path));
+    if (parsed.success && parsed.data.pid === process.pid && parsed.data.checkout === claim.checkout) unlinkSync(claim.path);
+  } catch { /* ENOENT — nothing to release */ }
+}
+
+/** The repository run claim for the checkout enclosing `repoRoot`; undefined when no checkout encloses it
+ * (graph.lock alone guards there, as before). Any other git trust refusal propagates: fail closed. */
+export function repositoryClaimPath(repoRoot: string): string | undefined {
+  try { return join(trustedCommonDir(repoRoot), CLAIM_FILE); }
+  catch (e) {
+    if (e instanceof GitTrustRefusal && e.detail === NO_CHECKOUT) return undefined;
+    throw e;
+  }
+}
+
+// The case table: a live holder from ANY other checkout of this repository refuses naming its checkout,
+// run id and pid; a provably dead holder is reclaimed, then the taker re-serializes through link(2);
+// garbage refuses and is removed by hand only. A holder in another repository never meets this path: its
+// common dir — and so its claim — differs.
+function takeRepositoryClaim(repoRoot: string, runId: string): void {
+  const p = repositoryClaimPath(repoRoot);
+  if (!p) return;
+  const checkout = realpathSync(repoRoot);
+  while (!linkExclusive(p, { pid: process.pid, runId, startedAt: Date.now(), checkout })) {
+    const held = readClaim(p);
+    if (!held) continue; // released between our link and our read
+    if (shouldRefuse(held.insp)) refuseClaim(p, held.insp);
+    reclaimDeadClaim(p, held.id);
+  }
+  heldClaims.set(lockPath(repoRoot), { path: p, checkout });
+  // While this live claim is the claim, every reclaim marker is keyed to a claim gone for good — moot,
+  // guarding nothing — so the taker sweeps them all; a reclaimer that died holding one strands nothing.
+  const prefix = `${basename(p)}.reclaim.`;
+  try {
+    for (const name of readdirSync(dirname(p))) if (name.startsWith(prefix)) try { unlinkSync(join(dirname(p), name)); } catch { /* another taker swept it */ }
+  } catch { /* best-effort: a later taker sweeps what is left */ }
+}
+
+// link(2) exclusive create of a complete payload: true when created, false when `p` already exists.
+function linkExclusive(p: string, payload: object): boolean {
+  const tmp = join(dirname(p), `${CLAIM_FILE}.${process.pid}.tmp`); // one per process: the claim and its markers share it
+  try { unlinkSync(tmp); } catch { /* best-effort clean of our own stray tmp from a prior SIGKILL */ }
+  writeFileSync(tmp, JSON.stringify(payload));
+  try { linkSync(tmp, p); return true; }
+  catch (e) { if ((e as NodeJS.ErrnoException).code === "EEXIST") return false; throw e; }
+  finally { unlinkSync(tmp); }
+}
+
+// A claim's identity is its inode, pid and start time: a claim is never rewritten in place, so an identity
+// once replaced never returns. undefined when no claim exists.
+function readClaim(p: string): { insp: Inspection; id: string } | undefined {
+  try {
+    const insp = inspect(p, ClaimSchema);
+    return { insp, id: `${insp.ino}-${insp.pid}-${insp.startedAt}` };
+  } catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw e; }
+}
+
+// The reclaim runs under an exclusive RECLAIM MARKER beside the claim, keyed to the dead claim's identity:
+// two takers that both saw one dead claim could otherwise each pass a re-stat, and the later unlink would
+// delete the earlier taker's live replacement. Under the marker the claim is re-read, and only that same
+// dead claim is removed. A live marker owner refuses the other taker — a concurrent reclaimer is a run
+// starting in this repository. A marker whose owner died inside the reclaim is STRANDED: the next taker
+// passes to the next generation, which only one taker creates — a dead owner never removes its marker, so
+// two live owners never hold one identity at once — and recovers with no hand removal.
+// ponytail: a stranded marker whose dead pid is reused by an unrelated live process reads live and refuses
+// until the next successful taker sweeps it or it is removed by hand — the fail-closed direction, as graph.lock.
+function reclaimDeadClaim(p: string, id: string): void {
+  let marker = `${p}.reclaim.${id}.0`;
+  for (let gen = 0; !linkExclusive(marker, { pid: process.pid, startedAt: Date.now() });) {
+    if (markerStranded(p, marker)) marker = `${p}.reclaim.${id}.${++gen}`;
+  }
+  try {
+    const now = readClaim(p);
+    if (now?.id !== id) return; // replaced since our read: the caller re-serializes through link(2)
+    if (shouldRefuse(now.insp)) refuseClaim(p, now.insp);
+    try { unlinkSync(p); } catch (e) { if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e; }
+  } finally {
+    try { unlinkSync(marker); } catch { /* swept as moot by the claim's next taker */ }
+  }
+}
+
+// true when `marker`'s owner provably died holding it: dead, and the same bytes on the same inode after the
+// death proof. false when it went or changed under the read (that generation is retried). A live owner
+// refuses; a garbage marker refuses for removal by hand.
+function markerStranded(p: string, marker: string): boolean {
+  const read = () => {
+    try { return { ino: statSync(marker).ino, bytes: readFileSync(marker, "utf8") }; }
+    catch (e) { if ((e as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw e; }
+  };
+  const before = read();
+  if (!before) return false;
+  let owner: z.infer<typeof MarkerSchema>;
+  try { owner = MarkerSchema.parse(JSON.parse(before.bytes)); }
+  catch { throw new Error(`reclaim marker ${marker} holds an unreadable/garbage payload — refusing to reclaim repository run claim ${p}; once no tickmarkr run is starting in this repository, remove ${marker} by hand`); }
+  if (isPidLive(owner.pid)) throw new Error(`repository run claim ${p} is being reclaimed from its dead holder by another tickmarkr process (pid ${owner.pid}) — retry; if none is starting in this repository, remove ${marker} by hand`);
+  const after = read();
+  return after !== undefined && after.ino === before.ino && after.bytes === before.bytes;
+}
+
+function refuseClaim(p: string, insp: Inspection): never {
+  if (insp.garbage) throw new Error(`repository run claim ${p} holds an unreadable/garbage payload — refusing to reclaim it; once no tickmarkr run is live in this repository, remove ${p} by hand`);
+  throw new Error(`repository run claim ${p} held by pid ${insp.pid} (run ${insp.runId}) in checkout ${insp.checkout} — one live tickmarkr run per repository across its main checkout and linked worktrees; wait for that run to end`);
+}
+
+// Run and resume (runDaemon) take graph.lock, then the repository claim; a claim refusal releases the
+// graph.lock just taken, before any journal exists. compile's holders take graph.lock alone.
 export function acquireRunLock(repoRoot: string, runId: string): { reclaimed?: { pid: number; mtimeMs: number } } {
+  const acquired = acquireGraphLock(repoRoot, runId);
+  if (COMPILE_HOLDERS.has(runId)) return acquired;
+  try { takeRepositoryClaim(repoRoot, runId); }
+  catch (e) { releaseRunLock(repoRoot); throw e; }
+  return acquired;
+}
+
+function acquireGraphLock(repoRoot: string, runId: string): { reclaimed?: { pid: number; mtimeMs: number } } {
   const p = lockPath(repoRoot);
   const tmp = join(tickmarkrDir(repoRoot), `graph.lock.${process.pid}.tmp`);
   try {
@@ -117,9 +250,9 @@ export function acquireRunLock(repoRoot: string, runId: string): { reclaimed?: {
       // race; a real fix needs unlink-by-inode (no POSIX primitive) or a lock-directory rename dance.
       // Single-machine tool — this is the ceiling.
       const st = statSync(p); // re-stat immediately before removing — abort if replaced since inspect()
-      if (st.ino !== insp.ino || st.mtimeMs !== insp.mtimeMs) return acquireRunLock(repoRoot, runId); // loser path
+      if (st.ino !== insp.ino || st.mtimeMs !== insp.mtimeMs) return acquireGraphLock(repoRoot, runId); // loser path
       try { unlinkSync(p); } catch (e2) { if ((e2 as NodeJS.ErrnoException).code !== "ENOENT") throw e2; } // successor already took it
-      const again = acquireRunLock(repoRoot, runId); // re-serializes two stealers through linkSync
+      const again = acquireGraphLock(repoRoot, runId); // re-serializes two stealers through linkSync
       return { reclaimed: { pid: pid ?? -1, mtimeMs }, ...again };
     }
     const stateDir = stateDirName(repoRoot);
@@ -132,6 +265,9 @@ export function acquireRunLock(repoRoot: string, runId: string): { reclaimed?: {
 
 export function releaseRunLock(repoRoot: string): void {
   if (heartbeat) { clearInterval(heartbeat); heartbeat = undefined; }
+  // the claim goes first: released after graph.lock, a successor run in this checkout would meet our claim
+  const claim = heldClaims.get(lockPath(repoRoot));
+  if (claim) { unlinkClaimIfOurs(claim); heldClaims.delete(lockPath(repoRoot)); }
   unlinkIfOurs(lockPath(repoRoot)); // never delete a reclaiming successor's lock — only ours
   heldPath = undefined;
 }

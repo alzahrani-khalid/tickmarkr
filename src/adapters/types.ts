@@ -185,11 +185,26 @@ export const CODEX_TRUST_PANE = [
 // v1.22 T5 / OBS-19, cursor-agent's per-worktree dialog.
 export const CURSOR_TRUST_PANE = "Workspace Trust Required\nTrust this folder?";
 
+// Queue row 198, kimi 2.2.0's folder-trust modal on a fresh task worktree (run 1394 T3, read off the
+// Orca screen before its one Enter). The worktree path is shortened as above; every other row is as
+// rendered. 2.2.0 renamed the selected option, so the 0.29.0 fingerprint below never matched it and the
+// seat sat on this modal for 21 minutes.
+export const KIMI_TRUST_PANE = [
+  "Trust this folder?",
+  "↑↓ navigate · Enter select · Esc exit",
+  "/Users/…/.tickmarkr/worktrees.noindex/tickmarkr-run-20261017-122301-…1394--T3",
+  "No project integrations or instructions to activate.",
+  "Trust is remembered for this folder, including future project config changes.",
+  "Tool approvals follow your permission settings.",
+  " ❯ Trust and continue",
+  "   Exit",
+].join("\n");
+
 // OBS-358, live pane wW:p2TB of run-20260805-121252 — the dialog that cost 30 minutes — quoted from
 // the record holding all five lines, .overseer/REPAIR-v186/GATE-T28-1.md (OBSERVATIONS.md abridges
 // it to the first three). "← highlighted" is the observer's annotation of the selected row, kept
-// exactly as recorded rather than tidied away.
-export const KIMI_TRUST_PANE = [
+// exactly as recorded rather than tidied away. kimi 0.29.0; superseded by the 2.2.0 capture above.
+export const KIMI_TRUST_PANE_029 = [
   "Trust this folder?",
   "  /Users/…/.tickmarkr/worktrees.noindex/tickmarkr-run-20260805-121252--T29",
   "❯ Trust this folder     ← highlighted",
@@ -205,7 +220,7 @@ export const KIMI_MCP_TRUST_PANE = [
 ].join("\n");
 
 export const RECORDED_TRUST_PANES: readonly string[] = [
-  CLAUDE_TRUST_PANE, CODEX_TRUST_PANE, CURSOR_TRUST_PANE, KIMI_TRUST_PANE, KIMI_MCP_TRUST_PANE,
+  CLAUDE_TRUST_PANE, CODEX_TRUST_PANE, CURSOR_TRUST_PANE, KIMI_TRUST_PANE, KIMI_TRUST_PANE_029, KIMI_MCP_TRUST_PANE,
 ];
 
 // v1.89 T1 / OBS-414 round 4 — EXACT, not "leading bytes of a recorded line". Round 3 accepted any
@@ -225,6 +240,7 @@ export const APPROVED_TRUST_FINGERPRINTS: readonly string[] = [
   "Do you trust the contents of this directory?", // codex 0.144.6, OBS-137
   "Workspace Trust Required", // cursor-agent, OBS-19
   "❯ Trust this folder", // kimi 0.29.0, OBS-358 + OBS-406 — the cursor glyph is load-bearing
+  "❯ Trust and continue", // kimi 2.2.0, queue row 198 — the same gate with its option renamed
 ];
 
 const isApprovedFingerprint = (fingerprint: string): boolean =>

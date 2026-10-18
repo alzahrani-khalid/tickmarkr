@@ -15,7 +15,7 @@ import { getTask, loadGraph } from "../../graph/graph.js";
 import { GATE_NAMES, type AcceptanceItem, type GateName, type Task } from "../../graph/schema.js";
 import { executionSignal } from "../../run/execution-budget.js";
 import { addDetachedWorktree, linkNodeModules, reflogWitness, removeWorktree, shGit, shGitOk } from "../../run/git.js";
-import { foldOwedChecks, integrationMapped, owedCriteria, Journal, OWED_DISCHARGE_EVENT, type OwedCheck, type OwedFold } from "../../run/journal.js";
+import { foldOwedChecks, integrationMapped, owedCriteria, Journal, OWED_DISCHARGE_EVENT, parseRunId, type OwedCheck, type OwedFold } from "../../run/journal.js";
 import { describeLeaseWait, withRepositoryLease } from "../../run/lease.js";
 import { isPidLive } from "../../run/lock.js";
 import { LAUNCHSERVICES_PORT_STOP, probeLaunchServicesPorts, recordLaunchServices } from "../../run/launchservices-check.js";
@@ -209,8 +209,17 @@ export async function verify(argv: string[], cwd = process.cwd(), options: { evi
   const fileRoot = (file: typeof STATE_FILES[number]) =>
     existsSync(join(cwd, ".tickmarkr", file)) ? cwd : stateRoot;
   if (resolve(stateRoot) !== resolve(cwd)) {
-    console.error(`verify: state files resolved read-only from ${join(stateRoot, ".tickmarkr")} (linked worktree; per-file origins: `
-      + STATE_FILES.map(file => `${file}: ${join(fileRoot(file), ".tickmarkr", file)} (${fileRoot(file) === cwd ? "local" : "common root"})`).join("; ") + ")");
+    // Queue row 195 / D-2102: the fallback is no longer "read-only" — the one line names every
+    // state file with the path it was read from and its origin, AND every path this invocation
+    // writes: the shared verdict store always, doctor.json when present, the --record journal when given.
+    const reads = STATE_FILES.map(file => `${file}: ${join(fileRoot(file), ".tickmarkr", file)} (${fileRoot(file) === cwd ? "local" : "common root"})`).join("; ");
+    const doctorPath = join(fileRoot("doctor.json"), ".tickmarkr", "doctor.json");
+    const writes = [
+      `verdict store ${getVerdictStore(join(stateRoot, ".tickmarkr")).dir}`,
+      ...(existsSync(doctorPath) ? [`doctor.json ${doctorPath}`] : []),
+      ...(values.record ? [`record journal ${join(stateRoot, ".tickmarkr", "runs", parseRunId(values.record), "journal.jsonl")}`] : []),
+    ].join("; ");
+    console.error(`verify: linked worktree — state files resolve from ${join(stateRoot, ".tickmarkr")} (reads: ${reads}; writes: ${writes})`);
   }
   const cfg = loadConfig(fileRoot("config.yaml"));
   const head = (await shGitOk("git rev-parse HEAD", cwd)).trim();

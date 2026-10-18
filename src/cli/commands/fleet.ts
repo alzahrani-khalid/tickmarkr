@@ -20,6 +20,7 @@ import {
   loadConfigWithMode,
   lowerLayerModelOverrides,
   overlayBytesLoadError,
+  ownRepoOverlayPath,
   readOverlayFile,
   stagedDenyKeyOf,
   renderFleetOverlayWrite,
@@ -452,7 +453,10 @@ export async function assembleFleetEditor(
   // them (destinationEdits below) — the repository overlay when it declares the key or masks it
   // with null at it or above, else the user overlay.
   const userPath = join(globalDir, "config.yaml");
-  const repoPath = repoOverlayPath(cwd);
+  // Queue row 195 / D-2102: the save destination is the checkout's OWN file even when the reader
+  // fallback (repoOverlayPath) has this linked worktree reading its main checkout's overlay — a
+  // first save here creates the worktree's own overlay, which then wins wholesale.
+  const repoPath = ownRepoOverlayPath(cwd);
   const currentUserText = () => (existsSync(userPath) ? readFileSync(userPath, "utf8") : "");
   type Destination = "user" | "repo";
   const pathOf = (destination: Destination) => (destination === "repo" ? repoPath : userPath);
@@ -1383,7 +1387,12 @@ export async function assembleFleetEditor(
   // T10: both overlays are guarded whichever one is written, so a holder that moved after the review
   // (the destination itself) refuses instead of retargeting. Null = still current.
   const stalePreview = (pending: PendingWrite, reviewed: string, prior?: string): string | null => {
-    const destinationNow = prior ?? (pending.destination === "repo" ? currentRepoOverlayText(cwd) : currentUserText());
+    // Queue row 195 / D-2102: a repo-destination review renders against the EFFECTIVE repository
+    // overlay — in a linked worktree with no overlay of its own that is the main checkout's file,
+    // while the write lands in the worktree's own (ownRepoOverlayPath). The guard therefore
+    // re-reads the effective layer, not the destination's prior bytes; either file moving after
+    // the review moves that read (an own file appearing wins wholesale), so the refusal stands.
+    const destinationNow = pending.destination === "repo" ? currentRepoOverlayText(cwd) : (prior ?? currentUserText());
     const repoNow = pending.destination === "repo" ? destinationNow : currentRepoOverlayText(cwd);
     const userNow = pending.destination === "user" ? destinationNow : currentUserText();
     if (repoNow !== pending.repo) {

@@ -12,7 +12,7 @@ import { pi } from "../../src/adapters/pi.js";
 import type { CliEntry } from "../../src/adapters/catalog.js";
 import { allAdapters, getAdapter } from "../../src/adapters/registry.js";
 import {
-  CLAUDE_TRUST_PANE, CODEX_TRUST_PANE, CURSOR_TRUST_PANE, KIMI_MCP_TRUST_PANE, KIMI_TRUST_PANE,
+  CLAUDE_TRUST_PANE, CODEX_TRUST_PANE, CURSOR_TRUST_PANE, KIMI_MCP_TRUST_PANE, KIMI_TRUST_PANE, KIMI_TRUST_PANE_029,
   matchesTrustDialog, RECORDED_TRUST_PANES, TRUST_DIALOG_BLANK_MESSAGE, TRUST_DIALOG_UNRECORDED_MESSAGE,
   type InteractiveSeed, type TrustDialog, type WorkerAdapter,
 } from "../../src/adapters/types.js";
@@ -44,7 +44,7 @@ const RECORDED_CAPTURES = [
   { id: "claude-code", file: "claude-code.ts", dialog: CLAUDE_TRUST_DIALOG, panes: [CLAUDE_TRUST_PANE] },
   { id: "codex", file: "codex.ts", dialog: CODEX_TRUST_DIALOG, panes: [CODEX_TRUST_PANE] },
   { id: "cursor-agent", file: "cursor-agent.ts", dialog: CURSOR_TRUST_DIALOG, panes: [CURSOR_TRUST_PANE] },
-  { id: "kimi", file: "kimi.ts", dialog: KIMI_TRUST_DIALOG, panes: [KIMI_TRUST_PANE, KIMI_MCP_TRUST_PANE] },
+  { id: "kimi", file: "kimi.ts", dialog: KIMI_TRUST_DIALOG, panes: [KIMI_TRUST_PANE] }, // kimi 2.2.0 (queue row 198)
 ] as const;
 
 const NO_DIALOG_ADAPTERS = [
@@ -421,6 +421,15 @@ test("production registry construction accepts the recorded kimi folder-trust ca
       for (const pane of panes) expect(matchesTrustDialog(pane, declaration), `${id} vs recorded pane`).toBe(false);
     }
   }
+});
+
+// Queue row 198: kimi 2.2.0 renamed the gate's selected option, so the declaration follows the 2.2.0
+// capture; the 0.29.0 captures stay recorded (and approved) as the history the old fingerprint quoted.
+test("test: kimi's trust declaration matches the recorded kimi 2.2.0 folder-trust modal, whose selected option reads Trust and continue, and no longer matches either recorded 0.29.0 option row, while prose naming the option without the selection cursor matches nothing", () => {
+  expect(matchesTrustDialog(KIMI_TRUST_PANE, KIMI_TRUST_DIALOG)).toBe(true);
+  expect(matchesTrustDialog(KIMI_TRUST_PANE_029, KIMI_TRUST_DIALOG)).toBe(false);
+  expect(matchesTrustDialog(KIMI_MCP_TRUST_PANE, KIMI_TRUST_DIALOG)).toBe(false);
+  expect(matchesTrustDialog("press Trust and continue in kimi's folder-trust modal", KIMI_TRUST_DIALOG)).toBe(false);
 });
 
 test("the daemon keys the same pane bytes only for the captured declaration, never for a no-dialog one", async () => {

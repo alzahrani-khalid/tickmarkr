@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { TickmarkrConfig } from "../config/config.js";
 import type { Task } from "../graph/schema.js";
+import { withoutHostSession } from "../drivers/host-env.js";
 import { probeVersion } from "./claude-code.js";
 import { parseWorkerResult } from "./prompt.js";
 import { type Assignment, type BillingChannel, channelsFromConfig, type ContextUsage, type Invocation, MODEL_ID_RE, type SessionRef, shq, type TokenUsage, TokenUsageSchema, type WorkerAdapter } from "./types.js";
@@ -157,7 +158,7 @@ export const pi: WorkerAdapter = {
     // The store is local and independently useful: preserve its advisory even when the network/auth
     // capability call below fails. A failed model listing must not erase evidence of a substitution.
     const drift = servedModelNote();
-    const r = spawnSync("pi", ["--list-models"], { encoding: "utf8", timeout: 15000 });
+    const r = spawnSync("pi", ["--list-models"], { encoding: "utf8", timeout: 15000, env: withoutHostSession() });
     if (r.error || r.status !== 0) {
       return drift ? { ...h, note: `${h.note ? `${h.note}; ` : ""}${drift}` } : h;
     }
@@ -200,7 +201,7 @@ export const pi: WorkerAdapter = {
   // v1.5 MODEL-01: fail OPEN to [] (detection is advisory — unlike gates' fail-closed posture).
   // spawnSync mirrors probeVersion; 15s timeout. Live-verified 2026-07-10, pi 0.80.3.
   listModels: async () => {
-    const r = spawnSync("pi", ["--list-models"], { encoding: "utf8", timeout: 15000 });
+    const r = spawnSync("pi", ["--list-models"], { encoding: "utf8", timeout: 15000, env: withoutHostSession() });
     return r.error || r.status !== 0 ? [] : parsePiModels(r.stdout || "");
   },
   collectUsage(cwd: string, sinceMs: number): TokenUsage | undefined {

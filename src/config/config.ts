@@ -1,11 +1,12 @@
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, sep } from "node:path";
 import { filesGlob } from "../graph/files-glob.js";
 import { Document, isScalar, parse } from "yaml";
 import { z } from "zod";
 import { CITED_MODEL_WINDOWS } from "../adapters/model-windows.js";
 import { stateDirName } from "../graph/graph.js";
+import { assertGitTrust, trustedCommonDir } from "../run/git-trust.js";
 import { EFFORTS, type Effort, SHAPES, TIERS } from "../graph/schema.js";
 
 const TierEnum = z.enum(TIERS, {
@@ -808,7 +809,7 @@ export function globalConfigDir(): string {
 
 export function overlayPreferShapes(repoRoot: string, opts: { globalDir?: string } = {}): ReadonlySet<string> {
   const shapes = new Set<string>();
-  for (const layer of [readYaml(join(opts.globalDir ?? globalConfigDir(), "config.yaml")), readYaml(join(repoRoot, stateDirName(repoRoot), "config.yaml"))]) {
+  for (const layer of [readYaml(join(opts.globalDir ?? globalConfigDir(), "config.yaml")), readYaml(repoOverlayPath(repoRoot))]) {
     const map = (layer as { routing?: { map?: Record<string, { prefer?: unknown }> } } | undefined)?.routing?.map;
     if (!map) continue;
     for (const [shape, entry] of Object.entries(map)) {
@@ -907,7 +908,7 @@ export function loadConfigWithMode(
   // v1.52 T2: repoOverlayText substitutes candidate bytes for the on-disk repo layer — the fleet
   // write guard validates EXACTLY what it is about to write through this one loader path.
   const repoCfg = opts.repoOverlayText === undefined
-    ? readYaml(join(repoRoot, stateDirName(repoRoot), "config.yaml"))
+    ? readYaml(repoOverlayPath(repoRoot))
     : parse(opts.repoOverlayText);
   const merged = deepMerge(deepMerge(structuredClone(DEFAULT_CONFIG), globalCfg), repoCfg);
   const r = TickmarkrConfigSchema.safeParse(merged);
@@ -1129,8 +1130,46 @@ export type FleetEditable = Partial<Record<DenyScopeKey, string[]>> & {
   floors: Record<string, Tier>;
 };
 
-export function repoOverlayPath(repoRoot: string): string {
+/** The checkout's OWN repo-layer overlay — every writer's destination, and the reader's answer in
+ *  every case but the one fallback below. */
+export function ownRepoOverlayPath(repoRoot: string): string {
   return join(repoRoot, stateDirName(repoRoot), "config.yaml");
+}
+
+/**
+ * Queue row 195 / D-2102: .tickmarkr/ is gitignored, so a fresh session worktree has no overlay of
+ * its own and every command there would silently run on defaults plus the global layer. ONE rule,
+ * and every repo-layer reader goes through it: a checkout whose own state-dir config.yaml exists
+ * reads it; otherwise a LINKED worktree — a gitfile checkout whose trusted common dir
+ * (src/run/git-trust.ts trustedCommonDir) lies outside it — reads
+ * dirname(common dir)/<state dir>/config.yaml when that file exists; every other case (a main
+ * checkout or its subdirectory, no enclosing checkout, a git trust refusal, an absent main file)
+ * keeps the checkout's own path. WRITERS never follow this fallback: they use ownRepoOverlayPath.
+ * The trust check includes missing, redirected or symlinked commondir metadata and config.worktree
+ * under extensions.worktreeConfig; none can authorize a shared overlay.
+ */
+export function repoOverlayPath(repoRoot: string): string {
+  const own = ownRepoOverlayPath(repoRoot);
+  if (existsSync(own)) return own;
+  let dotGit: string | undefined;
+  try {
+    for (let dir = realpathSync(repoRoot); ;) {
+      const candidate = join(dir, ".git");
+      try { lstatSync(candidate); dotGit = candidate; break; } catch { /* keep walking */ }
+      const up = dirname(dir);
+      if (up === dir) break;
+      dir = up;
+    }
+  } catch { return own; }
+  // A directory .git is a main checkout (or one of its subdirectories); only a gitfile can be linked.
+  if (!dotGit) return own;
+  try { if (!lstatSync(dotGit).isFile()) return own; } catch { return own; }
+  let common: string;
+  try { assertGitTrust(repoRoot); common = trustedCommonDir(repoRoot); } catch { return own; }
+  const checkoutRoot = dirname(dotGit);
+  if (common === checkoutRoot || common.startsWith(`${checkoutRoot}${sep}`)) return own; // not linked
+  const shared = ownRepoOverlayPath(dirname(common));
+  return existsSync(shared) ? shared : own;
 }
 
 export function readOverlayFile(path: string): Record<string, unknown> {

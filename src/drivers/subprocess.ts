@@ -1,6 +1,7 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { shq } from "../adapters/types.js";
 import { createWorktree, FORK_CAP_ENV, resolvedForkCap } from "../run/git.js";
+import { HOST_SESSION_VARS, withoutHostSession } from "./host-env.js";
 import type { ExecutorDriver, NotifyOpts, Slot, TransportState } from "./types.js";
 
 // HARD-03: cap retained worker output so a chatty worker can't grow tickmarkr's heap unbounded.
@@ -25,12 +26,12 @@ export const HERDR_CONTROL_VARS = [
 ] as const;
 
 /**
- * Copy of worker env with the fork cap applied and host control-plane vars stripped.
+ * Copy of worker env with the fork cap applied and host control-plane and host-session vars stripped.
  * Workers retain the run's concurrency-derived cap (resolvedForkCap), independently of
  * verification's suite-window budget. The operator's own export still wins.
  */
 export function sealHerdrEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
-  const out: NodeJS.ProcessEnv = { ...env };
+  const out = withoutHostSession(env); // queue row 193
   if (!(FORK_CAP_ENV in out)) out[FORK_CAP_ENV] = resolvedForkCap();
   for (const k of HERDR_CONTROL_VARS) delete out[k];
   return out;
@@ -40,7 +41,7 @@ export function sealHerdrEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.Proce
 export function herdrSealShellPrefix(env: NodeJS.ProcessEnv = process.env): string {
   const forkCap = sealHerdrEnv(env)[FORK_CAP_ENV] ?? resolvedForkCap();
   return `export ${FORK_CAP_ENV}=${shq(forkCap)}; ` +
-    HERDR_CONTROL_VARS.map((k) => `unset ${k}`).join("; ") + "; ";
+    HERDR_CONTROL_VARS.map((k) => `unset ${k}`).join("; ") + `; unset ${HOST_SESSION_VARS.join(" ")}; `;
 }
 
 /** Queue row 108 (D-1622): ONE invocation's own stream state, written only by that invocation's process listeners. */

@@ -4,13 +4,14 @@ import { executionSignal, withoutExecutionBudget } from "./execution-budget.js";
 import { commandLeaseEnvironment, repositoryLeaseEnvironment, registerRepositoryChild, withCommandLease } from "./lease.js";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { execFile, execFileSync, spawn } from "node:child_process";
-import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { availableParallelism, homedir, tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { shq } from "../adapters/types.js";
 import { tickmarkrDir } from "../graph/graph.js";
 import { ROUTING_ENV_SEAMS } from "../route/router.js";
+import { HOST_SESSION_VARS } from "../drivers/host-env.js";
 import { titleEnvironment } from "./title-environment.js";
 import { assertGitTrust, GitTrustRefusal, ownGitPin, protectedGitEnv, trustedCommonDir, type DetachedAddCapability, type OwnGitCapability, type TrustedStoreCapability, type WorktreeRollback } from "./git-trust.js";
 
@@ -416,6 +417,8 @@ function executeShell(cmd: string, cwd: string, timeoutMs: number, login: boolea
   const payloadEnv = verificationJobEnvironment(repositoryLeaseEnvironment(commandLeaseEnvironment(options.env ?? process.env)));
   const env = ownGit ? protectedGitEnv(payloadEnv) : payloadEnv;
   for (const k of ROUTING_ENV_SEAMS) delete env[k];
+  // Queue row 193 (D-2102 add.1): no gate or agent child inherits the launching agent session's host variables.
+  for (const k of HOST_SESSION_VARS) delete env[k];
   // A run freezes the operator override and cores at startup; admission can lower the round cap.
   env[FORK_CAP_ENV] = verificationBudget.getStore()
     ? String(resolvedCapacity().forkCap)
@@ -1183,18 +1186,11 @@ export async function probeRefsWritable(cwd: string = process.cwd()): Promise<Re
     return { ok: false, path: refsDir, refsDir, error };
   }
 
-  // Clean up empty directories left behind by git
-  try {
-    const preflightDir = join(refsDir, "tickmarkr", "preflight");
-    if (existsSync(preflightDir) && readdirSync(preflightDir).length === 0) {
-      rmSync(preflightDir, { recursive: true, force: true });
-    }
-    const tmDir = join(refsDir, "tickmarkr");
-    if (existsSync(tmDir) && readdirSync(tmDir).length === 0) {
-      rmSync(tmDir, { recursive: true, force: true });
-    }
-  } catch {
-    // best-effort cleanup of empty dirs
+  // Queue row 194 (D-2102): remove only EMPTY directories git left behind, non-recursively — rmdir(2)
+  // refuses (ENOTEMPTY) a ref another process writes under refs/tickmarkr at this moment, where an
+  // emptiness check followed by a recursive remove deleted it. Best-effort: a refusal leaves the tree.
+  for (const dir of [join(refsDir, "tickmarkr", "preflight"), join(refsDir, "tickmarkr")]) {
+    try { rmdirSync(dir); } catch { /* absent, or no longer empty */ }
   }
 
   return { ok: true, path: refsDir, refsDir };

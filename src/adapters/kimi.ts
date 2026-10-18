@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { TickmarkrConfig } from "../config/config.js";
 import type { Task } from "../graph/schema.js";
+import { withoutHostSession } from "../drivers/host-env.js";
 import { probeVersion } from "./claude-code.js";
 import { parseWorkerResult } from "./prompt.js";
 import type { ExecutorDriver, Slot } from "../drivers/types.js";
@@ -218,7 +219,7 @@ const kimiTuiLaunch = (model: string) => {
   let neverAsk = false;
   try {
     const help = spawnSync("kimi", ["--help"], {
-      encoding: "utf8", timeout: KIMI_HELP_TIMEOUT_MS, stdio: ["ignore", "pipe", "ignore"],
+      encoding: "utf8", timeout: KIMI_HELP_TIMEOUT_MS, stdio: ["ignore", "pipe", "ignore"], env: withoutHostSession(),
     });
     neverAsk = !help.error && help.status === 0 && kimiHasNeverAskOption(help.stdout);
   } catch { /* unreadable help keeps the existing launch form */ }
@@ -315,8 +316,12 @@ const KIMI_SEED: InteractiveSeed = {
 // cursor glyph; prose never does. Enter accepts the highlighted "Trust this folder" option, and the
 // two captures above are the reason the cursor+label pair is the fingerprint rather than either
 // prompt's heading: the same gate ships two different headings.
+// Queue row 198: kimi 2.2.0 renders that gate as one modal whose selected option is "Trust and continue"
+// (KIMI_TRUST_PANE in types.ts), so the 0.29.0 pair above no longer appears and the seat waited out its
+// readiness budget on an unanswered modal. The declaration follows the installed kimi, which updates
+// itself; a kimi older than 2.2.0 renders the 0.29.0 option, which this declaration no longer answers.
 export const KIMI_TRUST_DIALOG: TrustDialog = {
-  fingerprint: "❯ Trust this folder",
+  fingerprint: "❯ Trust and continue",
   key: "Enter",
 };
 
@@ -351,13 +356,10 @@ export const kimi: WorkerAdapter = {
   // v1.65 T3: every flag the command builders below hardcode (-S is resumeCommand's) — verified in
   // `kimi --help` 2026-07-22.
   hardcodedFlags: { binary: "kimi", flags: ["-p", "--model", "--output-format", "-S"] },
-  // KNOWN GAP, stated rather than implied: this declaration is consumed by the daemon's trust loop,
-  // which is entered only AFTER runInteractiveSeed returns — and that seed waits for
-  // `readinessMatch` for the whole task timeout, which is exactly the window this prompt blocks in
-  // (run …215). So on a kimi startup pane the declaration is correct and still unreached: the seed
-  // reports `readiness pattern not seen` with zero keypresses. Answering it during the readiness
-  // wait is a change to src/run/interactive-seed.ts — WHEN and HOW OFTEN a declaration is answered
-  // is T19's half of this contract, and src/run may not appear in this task's diff.
+  // The seed's readiness wait answers this declaration once per slot before the banner appears
+  // (src/run/interactive-seed.ts awaitReadiness); the daemon's post-seed trust loop is the second
+  // consumer. Queue row 198: a declaration whose fingerprint the installed kimi no longer renders is
+  // never answered, and the seat waits out its readiness budget on the modal (row 199).
   trustDialog: KIMI_TRUST_DIALOG,
   // KIMI-02 headless. -p prompt mode + explicit model, NO permission flag: kimi 0.26.0 rejects
   // -p combined with -y/--auto at argument parse time ("Cannot combine --prompt with --yolo",

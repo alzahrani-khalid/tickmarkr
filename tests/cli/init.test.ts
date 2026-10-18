@@ -728,6 +728,41 @@ describe("T4 init closing block", () => {
     expect(out).toContain("no herdr or Orca terminal? same fail-closed gates, headless subprocess driver");
   });
 
+  test("test: init's environments footer keeps the claude code row's existing text and appends the Claude Desktop form, naming the single-tier run on the headless subprocess driver and the status watch view, while the herdr, orca and anywhere rows are unchanged, so a footer that drops the existing claude code text or omits the Desktop form fails", async () => {
+    vi.spyOn(registry, "allAdapters").mockReturnValue([]);
+    const repo = makeRepo({ "keep.txt": "x" });
+    stampDoctor(repo, 5 * 60 * 1000);
+    const out = await runInit(repo);
+
+    const prefix = (label: string) => new RegExp(`^\\s*${label}\\s+— `);
+    const row = (text: string, label: string) => text.split("\n").find((l) => prefix(label).test(l))?.replace(prefix(label), "");
+    const existing = "tickmarkr init --agent installs the /tkr skills + AGENTS.md so Claude Code (or any agent CLI) drives the loop natively";
+    const unchanged: Record<string, string> = {
+      herdr: "the full cockpit — every worker, judge, and consult is a visible pane you can watch and unblock · https://herdr.dev · auto picks it first when HERDR_ENV=1",
+      orca: "visible terminals in the Orca app — auto picks it inside an Orca terminal after herdr and before subprocess; set driver: orca to force it · https://onorca.dev",
+      anywhere: "no herdr or Orca terminal? same fail-closed gates, headless subprocess driver (legacy: no herdr? same fail-closed gates, headless subprocess driver when Orca markers are absent)",
+    };
+    // queue row 192: the claude code row keeps its text and appends the Desktop form after it.
+    const findings = (text: string) => {
+      const claudeCode = row(text, "claude code") ?? "";
+      const desktop = claudeCode.startsWith(existing) ? claudeCode.slice(existing.length) : "";
+      const found: string[] = [];
+      if (!claudeCode.startsWith(existing)) found.push("existing claude code text");
+      if (!desktop.includes("Claude Desktop") || !/single-tier/.test(desktop) || !desktop.includes("headless subprocess driver")
+        || !desktop.includes("status --watch --plain")) found.push("Desktop form");
+      for (const [label, value] of Object.entries(unchanged)) if (row(text, label) !== value) found.push(`${label} row`);
+      return found;
+    };
+    expect(findings(out)).toEqual([]);
+
+    // Wrong discriminators: the row with its existing text dropped, and the row as it was before the Desktop form.
+    const line = out.split("\n").find((l) => prefix("claude code").test(l))!;
+    const desktopForm = line.slice(line.indexOf(existing) + existing.length);
+    expect(desktopForm.length).toBeGreaterThan(0);
+    expect(findings(out.replace(line, line.replace(existing, "the /tkr skills drive the loop")))).toContain("existing claude code text");
+    expect(findings(out.replace(line, line.replace(desktopForm, "")))).toEqual(["Desktop form"]);
+  });
+
   test("the herdr footer row contains no npm install line", async () => {
     vi.spyOn(registry, "allAdapters").mockReturnValue([]);
     const repo = makeRepo({ "keep.txt": "x" });

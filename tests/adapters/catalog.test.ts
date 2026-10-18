@@ -380,7 +380,8 @@ test("the fable alias stamp reads claude-fable-5-1 with a dated comment and the 
     opencode: "15ce06482a58b5096642974bf4f9a1c3031b62b4aa4de46e6d8038f6cb94ad82",
     pi: "d8c6ab42a4052ee982ead3e119d02d4df8734429b36a129a9e926cf1c2f8c3b7",
     grok: "e8ad783fecb4f8cace029446707028f6fd304f25c315d8b76c4f392644cb8d3e",
-    kimi: "2cdc23a0fa58ff0d677b1762575e47775539a83efa4938e4f0a62e90de1e5799",
+    // queue row 198: kimi's trust declaration follows its 2.2.0 capture ("❯ Trust and continue"), which moves this tuple.
+    kimi: "0be8ad5247931e5368740247e6fde5d864c27cdfd1984ad5c4155953142e2692",
     gemini: "461d1b3b0e974957b000d94d812fcda355b360908d6d6446d70c4a8d29ccd9be",
     qwen: "461d1b3b0e974957b000d94d812fcda355b360908d6d6446d70c4a8d29ccd9be",
     aider: "461d1b3b0e974957b000d94d812fcda355b360908d6d6446d70c4a8d29ccd9be",

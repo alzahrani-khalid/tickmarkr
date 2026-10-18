@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { TickmarkrConfig } from "../config/config.js";
 import type { Effort, Task } from "../graph/schema.js";
+import { withoutHostSession } from "../drivers/host-env.js";
 import { parseWorkerResult } from "./prompt.js";
 import { type Assignment, type AuthHealth, type BillingChannel, channelsFromConfig, type ContextUsage, declareInputBox, type Invocation, MODEL_ID_RE, promptFitsArgv, type SessionRef, shq, type TokenUsage, TokenUsageSchema, type TrustDialog, type WorkerAdapter } from "./types.js";
 
@@ -192,7 +193,7 @@ export function probeClaudeAliasIdentity(cwd: string, alias: ClaudeAlias): strin
       "--strict-mcp-config",
       "--mcp-config", '{"mcpServers":{}}',
       "--output-format", "text",
-    ], { cwd, encoding: "utf8", timeout: 60000, stdio: ["ignore", "pipe", "pipe"] });
+    ], { cwd, encoding: "utf8", timeout: 60000, stdio: ["ignore", "pipe", "pipe"], env: withoutHostSession() });
     if (r.error || r.status !== 0) return undefined;
     const identity = (r.stdout || "").trim();
     return MODEL_ID_RE.test(identity) && belongsToAliasFamily(identity, alias) ? identity : undefined;
@@ -210,7 +211,7 @@ export function resolveClaudeAliasIdentity(
 }
 
 export function probeVersion(bin: string): AuthHealth {
-  const r = spawnSync(bin, ["--version"], { encoding: "utf8", timeout: 10000 });
+  const r = spawnSync(bin, ["--version"], { encoding: "utf8", timeout: 10000, env: withoutHostSession() });
   if (r.error || r.status !== 0) return { installed: false, authed: false, models: [] };
   return {
     installed: true,

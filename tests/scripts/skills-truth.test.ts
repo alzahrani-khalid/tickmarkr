@@ -156,6 +156,54 @@ test("test: documented run-resume recipes execute one detached logged daemon at 
   expect([sameSession.survived, sameSession.advanced, sameSession.ownGroup]).toEqual([false, false, false]);
 }, 120_000);
 
+test("test: from each of the three shipped skills and their installed aliases, the fenced daemon lines that carry no host address, one for run and one for resume, executed through a shell with only their placeholders substituted, each start exactly one detached daemon whose record carries no Orca or herdr address, make no host call, keep logging after the launcher's whole session group dies and lead their own process group, while each anchored host line still appears exactly once, so a plain line missing for either verb, one that splits a pane or one that dies with its launcher fails", async () => {
+  const bin = hostBin();
+  const runId = "run-20261017-000000-0000000000000001";
+  // A plain host (queue row 192) has neither address in its environment.
+  const base = { ...process.env };
+  delete base.ORCA_TERMINAL_HANDLE;
+  delete base.HERDR_PANE_ID;
+  const daemonLines = (skill: string) => fencedLines(skill).flat().filter((l) => / tickmarkr (run|resume <runId>) /.test(l));
+  const plainLines = (skill: string, verb: string) => daemonLines(skill)
+    .filter((l) => !/<ORCH handle>|<ORCH pane id>|ORCA_TERMINAL_HANDLE|HERDR_PANE_ID/.test(l) && l.includes(` tickmarkr ${verb} `));
+  // One verdict for every candidate below: one record with no address, no host call, its own group, alive and logging.
+  const detached = (got: Launch, argv: string) => got.records.length === 1 && got.records[0].argv === argv
+    && got.records[0].orca === "" && got.records[0].herdr === "" && got.hostCalls === ""
+    && got.ownGroup && got.survived && got.advanced && got.controlDied;
+  const cases: Promise<void>[] = [];
+  for (const source of skillSources()) {
+    const skill = readFileSync(source, "utf8");
+    for (const anchor of ["<ORCH handle>", "<ORCH pane id>"]) {
+      for (const verb of ["run", "resume <runId>"]) {
+        expect(daemonLines(skill).filter((l) => l.includes(anchor) && l.includes(` tickmarkr ${verb} `)), `${source}: ${anchor} ${verb}`).toHaveLength(1);
+      }
+    }
+    for (const verb of ["run", "resume <runId>"]) {
+      const found = plainLines(skill, verb);
+      expect(found, `${source}: plain ${verb}`).toHaveLength(1);
+      const argv = verb === "run" ? "run" : `resume ${runId}`;
+      cases.push((async () => {
+        const got = await launch(found[0].replaceAll("<runId>", runId), bin, base);
+        const label = `${source} plain ${verb}`;
+        expect([label, got.records, got.hostCalls, got.ownGroup, got.survived, got.advanced, got.controlDied])
+          .toEqual([label, [expect.objectContaining({ argv, orca: "", herdr: "" })], "", true, true, true, true]);
+        expect(detached(got, argv), label).toBe(true);
+      })());
+    }
+  }
+  await Promise.all(cases);
+
+  // Wrong discriminators through the same verdict: a skill without its plain line yields none, a pane split creates a
+  // pane and no daemon, and the plain line stripped of its detach wrapper dies with the launcher's session.
+  const shipped = readFileSync(skillSources()[0], "utf8");
+  const plainRun = plainLines(shipped, "run")[0];
+  expect(plainLines(shipped.replace(plainRun, ""), "run")).toEqual([]);
+  const split = await launch('cd <repo> && herdr pane split --direction right --command "tickmarkr run"', bin, base);
+  expect([split.hostCalls.includes("pane split"), split.records.length, detached(split, "run")]).toEqual([true, 0, false]);
+  const sameSession = await launch(`${plainRun.replace(/ node -e "[^"]*"/, "")} &`, bin, base);
+  expect([sameSession.records.length, sameSession.survived, detached(sameSession, "run")]).toEqual([1, false, false]);
+}, 120_000);
+
 // ---- row 2: both watch-journal copies ----
 
 const RUN = "run-20261006-000000-0000000000000002";

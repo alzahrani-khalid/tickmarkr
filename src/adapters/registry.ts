@@ -11,6 +11,7 @@ import { sh } from "../run/git.js";
 import { FakeAdapter } from "./fake.js";
 import { parseWorkerResult } from "./prompt.js";
 import { sealHerdrEnv } from "../drivers/subprocess.js";
+import { withoutHostSession } from "../drivers/host-env.js";
 import {
   catalogEntries, isNativeCliDrive, projectCliEntries, SHIPPED_CLI_CATALOG,
   type CatalogEntriesOptions, type CliEntry, type DeclarativeCliDrive, type ModelIdField,
@@ -215,7 +216,7 @@ export function formatCandidateCliRow({ binary, path }: CandidateCliDetection): 
 // so no drift verdict piles onto the existing auth report.
 export function probeHelpText(bin: string): string | undefined {
   try {
-    const r = spawnSync(bin, ["--help"], { encoding: "utf8", timeout: 10000 });
+    const r = spawnSync(bin, ["--help"], { encoding: "utf8", timeout: 10000, env: withoutHostSession() });
     if (r.error || r.status !== 0) return undefined;
     return `${r.stdout || ""}\n${r.stderr || ""}`;
   } catch {

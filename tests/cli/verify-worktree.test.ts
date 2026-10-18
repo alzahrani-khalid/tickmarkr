@@ -67,7 +67,8 @@ describe("verify worktree truth", () => {
       const result = await verify(["--base", "main", "--task", "T1", "--no-review", "--no-acceptance"], linked);
       expect(result.code).toBe(0);
       const lines = errors.mock.calls.map((call) => String(call[0]));
-      expect(lines[0]).toContain(`resolved read-only from ${join(realpathSync(repo), ".tickmarkr")}`);
+      expect(lines[0]).toContain(`state files resolve from ${join(realpathSync(repo), ".tickmarkr")}`);
+      expect(lines[0]).not.toContain("read-only");
       expect(lines.find((line) => line.includes("WARNING --task T1"))).toContain(ownMerge);
       expect(lines.find((line) => line.includes("WARNING --task T1"))).toContain("T2");
     } finally {
@@ -233,6 +234,48 @@ test("test: verify run from a linked worktree whose state directory holds config
     git(repo, `worktree remove --force '${linked}'`);
   }
 }, 60_000);
+
+test("test: verify run in a linked worktree whose state files resolve from the main checkout prints one line naming every state file with the path it was read from and every path it writes, the shared verdict store always and doctor.json and the record journal when they apply, and no longer calls them read-only, while verify in the main checkout prints no such line, so a message that omits a written path fails", async () => {
+  const repo = makeRepo({ ".gitignore": ".tickmarkr/\n", "src.txt": "base\n" });
+  branch(repo);
+  saveGraph(repo, validateGraph({ version: 1, spec: { source: "prd", paths: ["p"], hash: "h" },
+    tasks: [T("T1", { files: ["src.txt"] })] }));
+  writeFileSync(join(repo, ".tickmarkr", "config.yaml"), "judge: { adapter: fake, model: fake-1 }\n");
+  writeDoctor(repo, { fake: { installed: true, authed: true, models: [], modelAuth: authedModels(["fake-1", "fake-2"]) } });
+  const script = join(makeTestTempDir("tickmarkr-linked-writes-"), "script.json");
+  writeFileSync(script, JSON.stringify({ tasks: {}, review: { approve: true, issues: [] } }));
+  process.env.TICKMARKR_FAKE_SCRIPT = script;
+  Journal.create(repo, "run-linked-writes").append("run-start", undefined, {});
+  const linked = join(makeTestTempDir("tickmarkr-linked-writes-"), "linked");
+  git(repo, `worktree add --detach '${linked}' HEAD`);
+  const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+  try {
+    const result = await verify(["--task", "T1", "--no-acceptance", "--record", "run-linked-writes"], linked);
+    expect(result.code, result.out).toBe(0);
+    const main = realpathSync(repo);
+    const lines = errors.mock.calls.map((call) => String(call[0])).filter((line) => line.includes("state files resolve from"));
+    expect(lines).toHaveLength(1);
+    const line = lines[0]!;
+    expect(line).not.toContain("read-only");
+    expect(line).toContain(`state files resolve from ${join(main, ".tickmarkr")}`);
+    for (const file of ["graph.json", "doctor.json", "config.yaml"]) {
+      expect(line).toContain(`${file}: ${join(main, ".tickmarkr", file)} (common root)`);
+    }
+    expect(line).toContain(`verdict store ${getVerdictStore(join(main, ".tickmarkr")).dir}`);
+    expect(line).toContain(`doctor.json ${join(main, ".tickmarkr", "doctor.json")}`);
+    expect(line).toContain(`record journal ${join(main, ".tickmarkr", "runs", "run-linked-writes", "journal.jsonl")}`);
+
+    // verify in the main checkout prints no such line
+    errors.mockClear();
+    const ownRun = await verify(["--task", "T1", "--no-acceptance"], repo);
+    expect(ownRun.code, ownRun.out).toBe(0);
+    const ownLines = errors.mock.calls.map((call) => String(call[0]));
+    expect(ownLines.some((entry) => entry.includes("state files resolve from"))).toBe(false);
+    expect(ownLines.some((entry) => entry.includes("read-only"))).toBe(false);
+  } finally {
+    git(repo, `worktree remove --force '${linked}'`);
+  }
+}, 120_000);
 
 test("test: standalone verify persists each executed tool gate's receipt in verify results and when review recording is enabled its review leg2 row references that exact results artifact by hash, so dropping tool receipts or fabricating a review row fails", async () => {
   const repo = makeRepo({

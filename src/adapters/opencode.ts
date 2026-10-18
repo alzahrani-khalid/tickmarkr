@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import type { TickmarkrConfig } from "../config/config.js";
 import type { Task } from "../graph/schema.js";
+import { withoutHostSession } from "../drivers/host-env.js";
 import { probeVersion } from "./claude-code.js";
 import { parseWorkerResult } from "./prompt.js";
 import { type Assignment, type BillingChannel, channelsFromConfig, type Invocation, MODEL_ID_RE, OPENCODE_BUSY_FRAME_MARKERS, shq, type TokenUsage, TokenUsageSchema, type WorkerAdapter } from "./types.js";
@@ -59,7 +60,7 @@ export const opencode: WorkerAdapter = {
   // opencode reads its own cache offline; --refresh adds an avoidable network dependency (RESEARCH
   // anti-pattern). Live-verified 2026-07-10, opencode 1.17.15.
   listModels: async () => {
-    const r = spawnSync("opencode", ["models"], { encoding: "utf8", timeout: 15000 });
+    const r = spawnSync("opencode", ["models"], { encoding: "utf8", timeout: 15000, env: withoutHostSession() });
     return r.error || r.status !== 0 ? [] : parseOpencodeModels(r.stdout || "");
   },
   // SPEND-09: opencode 1.x writes per-message token deltas to SQLite opencode.db (NOT the dead 0.7.x

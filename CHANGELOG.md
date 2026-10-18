@@ -2,6 +2,50 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v2.8.5 — tickmarkr on a plain agent-session host: the Claude Desktop Code tab, linked session worktrees and seats that no longer inherit their launcher's session
+
+**v2.8.5** makes tickmarkr work from a host with neither herdr nor Orca, such as the Claude Desktop Code tab, and closes the defects a
+full assessment of that host found. Its work comes from one `tickmarkr run` (run-20261017-122301-…1394), which merged two tasks, plus
+four changes gated afterwards by `tickmarkr verify`; each passed build, lint, evidence, scope, its acceptance criteria, a cross-vendor
+review and the full suite.
+
+- **Seats never inherit the launching agent session's host variables (queue row 193).** A daemon started from an agent session (the
+  Claude Desktop Code tab, or a claude CLI seat on Orca or herdr) passed that session's variables to every worker, reviewer, judge and
+  probe, so a `claude -p` seat gained the host's Artifact and ListAgents tools and its effort, and every vendor CLI received the host's
+  messaging token. A closed list of thirty-one host-session names is now removed at every launch path (the shell seam, the subprocess
+  driver, the herdr seed and the Orca terminal command, and each adapter probe); user auth and provider variables pass through unchanged.
+- **One live run per repository across its main checkout and its linked worktrees (queue row 194).** The run lock lived in each checkout,
+  so two session worktrees of one repository could run at once. `run` and `resume` now also take a repository-wide claim at the common
+  git directory (a dead holder is reclaimed); `compile` keeps its per-checkout lock. Run ids are unique across checkouts, and the refs
+  preflight removes only empty directories, so another run's ref is never deleted.
+- **A linked worktree without its own tickmarkr config reads its main checkout's (queue row 195).** `.tickmarkr/` is gitignored, so a
+  fresh session worktree silently ran on defaults. Every reader of the repository layer now falls back to the main checkout's
+  `config.yaml` when the worktree has none (a local file wins; a checkout that git trust refuses keeps its own path); writers stay local.
+  `verify` names each state file it read and each path it writes instead of calling them read-only.
+- **doctor names the host and the locale, and checks a repository-wide test runner's session-worktree ignore (queue rows 196 and 197).** A host
+  row says when seats run headless on the subprocess driver with no board (naming Claude Desktop under its entry point) and warns that
+  `visibility.llm: pane` cannot be honored there; a locale row warns when no locale is set (or it is C/POSIX). The runner-ignore row reports
+  whether a repository-wide Jest or Vitest config's own ignore list carries the anchored `.claude/worktrees` entry — it does not prove what
+  the runner collects — and warns, naming the entry and the file, otherwise; `doctor --fix` adds the entry (or the ignore property). Declared: when it adds
+  a missing Vitest `exclude`, it writes Vitest 3.2.7's default exclude list before the two entries, so a
+  project on another Vitest version should compare that list with its own defaults. Also declared: doctor reads a Jest ignore entry only
+  when it is a plain path (led by `<rootDir>`, or literal), so an entry holding other regex syntax (`\.d\.ts$`, `/(fixtures|__mocks__)/`),
+  a `rootDir` other than the config's own directory, a JSON config that does not parse, or a JavaScript or TypeScript config that runs
+  code (doctor reads only plain data exported directly or through the runner's own `defineConfig`, so `plugins: [react()]`, a
+  `path.join` helper or a `process.env` ternary count as code) makes the row warn that doctor could not read it, even beside the
+  canonical entry; on Node older than 22.13 every TypeScript config reads that way (row 208).
+- **The shipped skills have a plain-host path (queue row 192).** On a host with neither herdr nor Orca, `/tickmarkr-overseer`,
+  `/tickmarkr-loop` and `/tickmarkr-auto` run the mission single-tier: the daemon launches detached with an anchor-free line, run-end and
+  parks are watched through the host's background wait, `tickmarkr status <runId>` and `status --watch --plain` are the operator's view,
+  and sessions hand off through the host's cross-session messages. The agent-docs block and `init`'s footer state the same.
+- **A kimi 2.2.0 worker's folder-trust modal is answered again (queue row 198).** kimi 2.2.0 renamed the modal's selected option to
+  "Trust and continue", so the declared fingerprint never matched and a fresh-worktree seat waited out its readiness budget. The 2.2.0
+  capture is recorded and approved, and kimi's declaration follows it.
+
+Declared: public CI stays serial (the sharded re-land, rows 6 and 172, stays held). Also open: a seed that never reaches readiness waits
+silently until the task timeout (row 199), repair escalation can exhaust a task's independent reviewers (row 200), the failure consult can
+reroute to the same channel (row 201), and rows 202–208.
+
 ## v2.8.4 — an acceptance test criterion can only be satisfied by its own suite file, kimi workers launch in Never Ask mode, claude pane reviewers are no longer killed at the first liveness beat, and test teardowns signal only processes they own
 
 **v2.8.4** is the stable point before a development pause. Its work comes from one `tickmarkr run` (run-20261016-144707-…1297),

@@ -1,7 +1,8 @@
 import { writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync, readdirSync } from "node:fs";
-import { join } from "node:path";
+import { Script } from "node:vm";
+import { existsSync, readFileSync, readdirSync, realpathSync } from "node:fs";
+import { extname, join, normalize, resolve } from "node:path";
 import { detectPackageManager, turboContinueFindings } from "../../gates/baseline.js";
 import { version } from "./version.js";
 import { allAdapters, binaryShadowWarnings, detectCandidateClis, doctorAgeMs, flagDriftWarnings, modelAliasExclusions, modelAliasLine, probeAll, probeModels, readDoctor, resolveShellBinary, servableExclusions, servabilityLine, writeDoctor } from "../../adapters/registry.js";
@@ -12,6 +13,7 @@ import { graphPath, loadGraph, tickmarkrDir, stateDirName } from "../../graph/gr
 import { catalogModelAdvisory, catalogTierRanking, declaredModelWindow, hasWindowsConfig, modelLints, suggestOverlay, ttyVisual } from "../../adapters/model-lints.js";
 import { loadConfig, overlayPreferShapes } from "../../config/config.js";
 import { HerdrDriver } from "../../drivers/herdr.js";
+import { classifyHost } from "../../drivers/index.js";
 import { ORCA_FIXTURE_VERSION, parseEnvelope, resolveOrcaCliBinary } from "../../drivers/orca.js";
 import type { WorkerAdapter } from "../../adapters/types.js";
 import { kimi, type KimiDoctorTurnResult, probeKimiDoctorTurn } from "../../adapters/kimi.js";
@@ -236,11 +238,28 @@ export async function probeOrcaCapability(
  * include/exclude globs match root-relative paths, so they cannot self-match, but the
  * prescribed shape is root-anchored anyway.
  *
- * Text-level heuristic, advisory only — never enters health/doctor.json or routing.
- * ponytail: ceilings — comment LINES are stripped before judgment (line-granular; see
- * stripComments), but an include built from variables is still judged by its literal
- * text, and a trailing same-line comment survives the strip. Each costs one advisory
- * row, nothing more.
+ * Queue row 197 (D-2102 add.1; the claim is add.30's): an agent session's worktrees nest at
+ * <repo>/.claude/worktrees/<name>/ (Vitest 3.2.7 globs with dot: true, so its default include collects
+ * them). The row reports ONLY whether the config's own ignore list — jest testPathIgnorePatterns, vitest
+ * test.exclude — literally carries the CANONICAL session-worktree entry beside the state dir's; it never
+ * claims to prove what the runner collects. A missing entry, a rooted include, an unanchored entry (Q130s:
+ * jest reads its ignores against absolute paths, so one inside a worktree self-matches) and a config
+ * doctor cannot read warn, naming the entry and the file. Reading means locating that literal list: the
+ * file parses cleanly (add.29, see unclean), is simple and static (add.22, see staticExport), no other
+ * file configures the runner beside it, the settings keys that locate the list are plain (add.25, see
+ * settingsOf), its values decode strictly (add.28, see literalList), and it declares no projects (each
+ * carries its own list). Only collection settings count, never coverage or cache ones (D-2102 add.8).
+ * A jest ignore entry is judged only inside a whitelist, and then by executing it as jest reads it against a
+ * probe suite inside each worktree root and in the main checkout (add.33, see selfMatching); a jest rootDir
+ * other than the config's own directory leaves the config unread, since it re-roots <rootDir>. A defineConfig
+ * or defineProject call reads as an identity wrapper only when the runner's own module binds it (add.34). The
+ * top level and the path objects are read through a whitelist, and every evaluated value must compile as
+ * JavaScript (add.35, see staticExport, bindingsOf and settingsOf). The exported config must be pure data, and
+ * the file must parse with a real parser in a child process (add.37, see pureData and realParse).
+ *
+ * Advisory only — never enters health/doctor.json or routing.
+ * ponytail: ceilings — text-level; a config doctor cannot locate the list in reads as a warn, never a
+ * pass. A spurious warn costs one config line; a false pass is the defect.
  */
 type RunnerInfo = {
   kind: "jest" | "vitest";
@@ -249,8 +268,14 @@ type RunnerInfo = {
   pkgJestBlock: boolean;
 };
 
+/** A file's text, "" when absent, or the error code when it cannot be read (D-2102 add.31: never a throw). */
+function readText(cwd: string, p: string): { text: string; error?: string } {
+  if (!existsSync(join(cwd, p))) return { text: "" };
+  try { return { text: readFileSync(join(cwd, p), "utf8") }; } catch (e) { return { text: "", error: (e as NodeJS.ErrnoException).code ?? "unreadable" }; }
+}
+
 function detectRunner(cwd: string): RunnerInfo | undefined {
-  const readIf = (p: string): string => (existsSync(join(cwd, p)) ? readFileSync(join(cwd, p), "utf8") : "");
+  const readIf = (p: string): string => readText(cwd, p).text;
   let pkg: { scripts?: Record<string, string>; jest?: unknown } = {};
   try { pkg = JSON.parse(readIf("package.json") || "{}") as typeof pkg; } catch { /* unparseable manifest: judge config files alone */ }
   const jestConfig = ["jest.config.js", "jest.config.cjs", "jest.config.mjs", "jest.config.ts", "jest.config.json"].find((p) => existsSync(join(cwd, p)));
@@ -265,57 +290,724 @@ function detectRunner(cwd: string): RunnerInfo | undefined {
   return undefined;
 }
 
+// Vitest 3.2.7's configDefaults.exclude, written out so an exclude doctor adds keeps the runner's defaults.
+const VITEST_DEFAULT_EXCLUDE = ["**/node_modules/**", "**/dist/**", "**/cypress/**", "**/.{idea,git,cache,output,temp}/**",
+  "**/{karma,rollup,webpack,vite,vitest,jest,ava,babel,nyc,cypress,tsup,build,eslint,prettier}.config.*"];
+// Queue row 197 (D-2102 add.15, add.30): the canonical entries, as string values.
+const CANONICAL = {
+  jest: { state: "<rootDir>/\\.tickmarkr/", session: "<rootDir>/\\.claude/worktrees/", ignore: "testPathIgnorePatterns" },
+  vitest: { state: ".tickmarkr/**", session: ".claude/worktrees/**", ignore: "test.exclude" },
+} as const;
+type Dir = "state" | "session";
+const DIRS = ["state", "session"] as const;
+const SCANS: Record<Dir, string> = { state: ".tickmarkr/ run worktrees", session: ".claude/worktrees/ session worktrees" };
+const INSIDE: Record<Dir, string> = {
+  state: "inside run worktrees (provisioned under .tickmarkr/worktrees.noindex/)",
+  session: "inside a session worktree (.claude/worktrees/<name>/)",
+};
+const STRING_LITERAL = /^(["'])(?:\\.|(?!\1)[^\\\n])*\1$/;
+// The one spread with a known value: Vitest 3.2.7's own default exclude list (it holds neither entry).
+// The ECMAScript line terminators: a line comment ends at any of them (queue row 197 review, D-2102 add.31).
+const LINE_END = /[\n\r\u2028\u2029]/;
+/** The offset of the first line terminator at or after `from`, or the end of `text`. */
+const lineEnd = (text: string, from: number): number => {
+  const at = text.slice(from).search(LINE_END);
+  return at < 0 ? text.length : from + at;
+};
+// Whitespace and commas between members or elements (comments are already blanked).
+const BETWEEN = /^[\s,]*/;
+
+
+// Comments are blanked (offsets kept, so the writer can splice the original) before judgment: a
+// commented-out ignore must not false-pass, and a prose comment mentioning .tickmarkr must not
+// false-warn the anchor probe. The scan skips string literals on purpose: regex stripping ate glob
+// strings — `'**/*.d.ts'` contains `/*` and later globs contain `*/`, so a naive block-comment regex
+// deleted the middle of real configs and false-PASSED a repo-wide vitest include (caught on
+// Intl-Dossier's config; shipped briefly in 1.90.1). Queue row 197: a block comment's inner lines
+// are blanked too, so entries commented out between its delimiters never read as live.
+function blankComments(s: string): string {
+  let out = "";
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    let end = i + 1;
+    if (c === '"' || c === "'" || c === "`") {
+      for (; end < s.length && s[end] !== c && (c === "`" || !LINE_END.test(s[end])); end++) if (s[end] === "\\") end++;
+      end = Math.min(end + 1, s.length);
+    } else if (c === "\\") end = i + 2;
+    else if (s.startsWith("//", i)) end = lineEnd(s, i);
+    else if (s.startsWith("/*", i)) end = s.indexOf("*/", i + 2) < 0 ? s.length : s.indexOf("*/", i + 2) + 2;
+    const chunk = s.slice(i, end);
+    out += c === "/" && (s[i + 1] === "/" || s[i + 1] === "*") ? chunk.replace(/[^\n\r\u2028\u2029]/g, " ") : chunk;
+    i = end - 1;
+  }
+  return out;
+}
+
+/** Offset of the first top-level , ) ] or } at or after `start` (strings skipped, brackets nested). */
+function scanValue(text: string, start: number): number {
+  let depth = 0;
+  for (let i = start; i < text.length; i++) {
+    const c = text[i];
+    if (c === '"' || c === "'" || c === "`") {
+      for (i++; i < text.length && text[i] !== c; i++) if (text[i] === "\\") i++;
+    } else if ("([{".includes(c)) depth++;
+    else if (")]}".includes(c) && depth-- === 0) return i;
+    else if (c === "," && depth === 0) return i;
+  }
+  return text.length;
+}
+
+/** The offset just past the bracket opened at `open` (strings skipped, brackets nested). */
+function closing(text: string, open: number): number {
+  let depth = 0;
+  for (let i = open; i < text.length; i++) {
+    const c = text[i];
+    if (c === '"' || c === "'" || c === "`") {
+      for (i++; i < text.length && text[i] !== c; i++) if (text[i] === "\\") i++;
+    } else if ("([{".includes(c)) depth++;
+    else if (")]}".includes(c) && --depth === 0) return i + 1;
+  }
+  return text.length;
+}
+
+/** The top-level elements of an array literal's source (offsets into it); undefined for any other expression. */
+function arrayElements(value: string): { text: string; start: number }[] | undefined {
+  if (!value.startsWith("[") || closing(value, 0) !== value.length) return undefined;
+  const out: { text: string; start: number }[] = [];
+  for (let pos = 1; pos < value.length - 1;) {
+    pos += BETWEEN.exec(value.slice(pos, value.length - 1))?.[0].length ?? 0;
+    if (pos >= value.length - 1) break;
+    const end = Math.min(scanValue(value, pos), value.length - 1);
+    out.push({ text: value.slice(pos, end).trimEnd(), start: pos });
+    pos = end > pos ? end : pos + 1;
+  }
+  return out;
+}
+
+/** `key` is the key as written (a quoted key's body, escapes unresolved); "" for a member without one. */
+type Member = { key: string; start: number; value: string };
+
+/** The members directly inside the object literal opened at `open`; a spread, shorthand, method or computed key has key "". */
+function members(text: string, open: number): Member[] {
+  const close = closing(text, open) - 1;
+  const out: Member[] = [];
+  for (let i = open + 1; i < close;) {
+    i += BETWEEN.exec(text.slice(i, close))?.[0].length ?? 0;
+    if (i >= close) break;
+    const key = /^(?:(["'])((?:\\.|(?!\1)[^\\\n])*)\1|((?:[A-Za-z_$]|\\u[0-9a-fA-F]{4}|\\u\{[0-9a-fA-F]+\})(?:[\w$]|\\u[0-9a-fA-F]{4}|\\u\{[0-9a-fA-F]+\})*))\s*:\s*/.exec(text.slice(i, close));
+    const start = i + (key?.[0].length ?? 0);
+    const stop = Math.min(scanValue(text, start), close);
+    out.push({ key: key ? key[3] ?? key[2] : "", start, value: text.slice(start, stop).trimEnd() });
+    i = stop > i ? stop : i + 1;
+  }
+  return out;
+}
+
+/**
+ * D-2102 add.25 (c′) and add.28: a settings key's or a string value's escapes decoded strictly — \xHH,
+ * \uHHHH, \u{H…} and \n \t \r \b \f \v \0 \' \" \\ — or undefined for any other escape (an octal, a line
+ * continuation, any other character).
+ */
+function decodeString(raw: string): string | undefined {
+  let bad = false;
+  const SINGLE: Record<string, string> = { n: "\n", t: "\t", r: "\r", b: "\b", f: "\f", v: "\v", "0": "\0" };
+  const out = raw.replace(/\\(?:x([0-9a-fA-F]{2})|u([0-9a-fA-F]{4})|u\{([0-9a-fA-F]{1,6})\}|([ntrbfv'"\\]|0(?![0-9]))|[\s\S]?)/g, (_, x, u, cp, single) => {
+    const code = x ?? u ?? cp;
+    if (code !== undefined && parseInt(code, 16) <= 0x10ffff) return String.fromCodePoint(parseInt(code, 16));
+    if (single !== undefined) return SINGLE[single] ?? single;
+    bad = true;
+    return "";
+  });
+  return bad ? undefined : out;
+}
+
+/**
+ * The named members of a PATH object (the exported config, its `test` object), and why they cannot be read
+ * literally (D-2102 add.25, add.35): every member must be `<plain identifier | plain string>: <value>` and every
+ * key must appear once — a spread, a computed, escaped or shorthand key, a method or getter, `__proto__` or a
+ * repeated key reads unverifiable. Values off the path are only compiled; the keys of nested value maps
+ * (transform, moduleNameMapper, alias…) are data and are never read here.
+ */
+function settingsOf(text: string, open: number, keys: readonly string[], what: string): { get: (key: string) => Member | undefined; computed?: string } {
+  const all = members(text, open);
+  const found = new Map<string, Member>();
+  const seen = new Set<string>();
+  let computed: string | undefined;
+  for (const m of all) {
+    if (m.key === "" || m.key.includes("\\")) computed ??= `${what} has a member that is not a plain key and value`;
+    else if (m.key === "__proto__") computed ??= `${what} sets __proto__`;
+    else if (seen.has(m.key)) computed ??= `${m.key} is set twice`;
+    seen.add(m.key);
+    if (keys.includes(m.key)) found.set(m.key, m);
+  }
+  return { get: (key) => found.get(key), computed };
+}
+
+/**
+ * D-2102 add.28: what a decoded value may still escape. A jest regex may use \. \/ \- and \\ outside a
+ * character class only; a glob or a path may hold no backslash at all.
+ */
+function plainEscapes(value: string, form: "regex" | "path"): boolean {
+  if (form === "path") return !value.includes("\\");
+  let inClass = false;
+  for (let i = 0; i < value.length; i++) {
+    const c = value[i];
+    if (c === "\\") {
+      if (inClass || i + 1 >= value.length || !"./-\\".includes(value[i + 1])) return false;
+      i++;
+    } else if (inClass) inClass = c !== "]";
+    else if (c === "[") inClass = true;
+  }
+  return true;
+}
+
+/**
+ * A setting's literal strings, each decoded strictly (D-2102 add.28) so every check reads the value the
+ * runner reads: undefined when absent, "computed" for any other expression, "escape" for an escape the
+ * decoder or the value's form does not allow.
+ */
+function literalList(value: string | undefined, form: "regex" | "path" = "path", defaults: ReadonlySet<string> = new Set()): string[] | undefined | "computed" | "escape" {
+  if (value === undefined) return undefined;
+  const elements = STRING_LITERAL.test(value) ? [{ text: value, start: 0 }] : arrayElements(value);
+  if (!elements?.every((e) => STRING_LITERAL.test(e.text) || defaultsSpread(e.text, defaults))) return "computed";
+  const out: string[] = [];
+  for (const e of elements.filter((e) => STRING_LITERAL.test(e.text))) {
+    const decoded = decodeString(e.text.slice(1, -1));
+    if (decoded === undefined || !plainEscapes(decoded, form)) return "escape";
+    out.push(decoded);
+  }
+  return out;
+}
+/** The spread of Vitest's own default excludes, `...<configDefaults>.exclude`, through a bound configDefaults. */
+const defaultsSpread = (element: string, defaults: ReadonlySet<string>): boolean =>
+  defaults.has(/^\.\.\.\s*([A-Za-z_$][\w$]*)\.exclude$/.exec(element)?.[1] ?? "");
+
+/** Why a literalList result is unreadable, for a setting shown as `name`. */
+const unreadableList = (list: ReturnType<typeof literalList>, name: string): string | undefined =>
+  list === "computed" ? `${name} is not a literal` : list === "escape" ? `${name} holds an escape doctor does not read` : undefined;
+
+const NOT_ONE_OBJECT = "is not one object literal";
+// D-2102 add.34: the modules whose defineConfig / defineProject return their one object argument unchanged.
+const WRAPPER_MODULES: Record<RunnerInfo["kind"], readonly string[]> = { vitest: ["vitest/config", "vitest", "vite"], jest: ["jest"] };
+/** Local names bound to an identity wrapper, by a static import or a const require of the runner's own module. */
+type Wrappers = ReadonlySet<string>;
+
+/**
+ * The offset of the object literal a value is COMPLETELY — itself, or the one argument of an identity wrapper
+ * call — at `start` in its text, or why it is not: `a && b`, a conditional, a trailing operator, and any call
+ * whose callee is not one of `wrappers` (a custom, local, re-exported or unresolved defineConfig included).
+ */
+function objectIn(value: string, start: number, wrappers: Wrappers): number | string {
+  const call = /^([A-Za-z_$][\w$]*)\(\s*/.exec(value);
+  if (call && !wrappers.has(call[1])) return `the call ${call[1]}(…) is not an identity wrapper imported from the runner`;
+  const lead = call?.[0].length ?? 0;
+  if (value[lead] !== "{") return NOT_ONE_OBJECT;
+  const rest = value.slice(closing(value, lead)).trim();
+  return rest === (lead ? ")" : "") ? start + lead : NOT_ONE_OBJECT;
+}
+
+const ID = "[A-Za-z_$][\\w$]*";
+// D-2102 add.37: the only value imports doctor reads — named bindings from the runner's own module (an import of
+// any other module runs that module's code). `import type` binds no value and is checked by the real parse.
+const NAMED_IMPORT = /^import\s+\{([^}]*)\}\s*from\s*(["'])([^"'\n]+)\2$/;
+const REQUIRE = new RegExp(`^const\\s+\\{([^}]*)\\}\\s*=\\s*require\\(\\s*(["'])([^"'\\n]+)\\2\\s*\\)$`);
+// The modules whose configDefaults is Vitest's own default data (D-2102 add.37 follow-up).
+const DEFAULTS_MODULES: readonly string[] = ["vitest/config", "vitest"];
+// What any other code a config would run reads as (D-2102 add.37).
+const RUNS = "it runs code doctor does not read";
+
+/**
+ * The value names one named import, or one const require, of the runner's own module binds, and the identity
+ * wrappers among them (D-2102 add.34, add.35, add.37); "invalid" for a malformed specifier list; "runs" for an
+ * import doctor does not read; undefined for any other statement. A wrapper is trusted only by name, as a value.
+ */
+type Bound = { names: string[]; wrappers: string[]; defaults: string[] };
+
+function bindingsOf(statement: string, kind: RunnerInfo["kind"]): Bound | "invalid" | "runs" | undefined {
+  const named = (list: string, rename: RegExp, dataModule: boolean): Bound | "invalid" => {
+    const out: Bound = { names: [], wrappers: [], defaults: [] };
+    const specs = list.split(",").map((x) => x.trim());
+    if (specs.length > 1 && specs[specs.length - 1] === "") specs.pop(); // one trailing comma
+    for (const spec of specs) {
+      const m = rename.exec(spec);
+      if (!m) return "invalid";
+      if (m[1]) continue; // a `type` specifier binds no value
+      const local = m[3] ?? m[2];
+      out.names.push(local);
+      if (m[2] === "defineConfig" || m[2] === "defineProject") out.wrappers.push(local);
+      if (m[2] === "configDefaults" && dataModule) out.defaults.push(local);
+    }
+    return out;
+  };
+  if (/^import(?=[\s{*'"])/.test(statement)) {
+    const m = NAMED_IMPORT.exec(statement);
+    if (!m || !WRAPPER_MODULES[kind].includes(m[3])) return "runs";
+    return named(m[1], new RegExp(`^(type\\s+)?(${ID})(?:\\s+as\\s+(${ID}))?$`), DEFAULTS_MODULES.includes(m[3]));
+  }
+  const r = REQUIRE.exec(statement);
+  if (!r || !WRAPPER_MODULES[kind].includes(r[3])) return undefined;
+  return named(r[1], new RegExp(`^()(${ID})(?:\\s*:\\s*(${ID}))?$`), DEFAULTS_MODULES.includes(r[3]));
+}
+
+/**
+ * D-2102 add.37: whether `value` is PURE DATA, read with a small strict grammar — string, number, boolean and
+ * null literals, a template with no `${`, `process.env.<NAME>`, an identifier naming an earlier pure-data
+ * const, arrays of pure data, and objects whose every member is `<plain identifier | string>: <pure data>`
+ * with each key once, at every level. Nothing else reads: no call, `new`, function or arrow, operator but a
+ * unary minus on a number, `this`, `arguments`, spread, computed key, getter, method, shorthand or `__proto__`.
+ * ponytail: the declared cost — a config that calls anything beyond the runner's own defineConfig or
+ * defineProject (a plugin, a helper, a ternary on the environment) warns, queue row 208.
+ */
+function pureData(value: string, consts: ReadonlySet<string>, defaults: ReadonlySet<string> = new Set()): boolean {
+  let i = 0;
+  const ws = (): void => { while (i < value.length && /\s/.test(value[i])) i++; };
+  const take = (re: RegExp): RegExpExecArray | null => {
+    const m = re.exec(value.slice(i));
+    if (m) i += m[0].length;
+    return m;
+  };
+  let path: string[] = [];
+  const list = (close: string, item: () => boolean): boolean => {
+    i++;
+    ws();
+    if (value[i] === close) { i++; return true; }
+    for (;;) {
+      if (!item()) return false;
+      ws();
+      if (value[i] === ",") { i++; ws(); if (value[i] === close) { i++; return true; } continue; }
+      if (value[i] === close) { i++; return true; }
+      return false;
+    }
+  };
+  const datum = (): boolean => {
+    ws();
+    const c = value[i];
+    if (c === '"' || c === "'") return take(/^(["'])(?:\\[\s\S]|(?!\1)[^\\\n\r])*\1/) !== null;
+    if (c === "`") return take(/^`(?:\\[\s\S]|[^\\`$]|\$(?!\{))*`/) !== null;
+    if (c === "[") {
+      // The one spread pure data admits: Vitest's own default excludes, as an element of test.exclude, from a
+      // configDefaults bound by a named import of "vitest/config" or "vitest" (the docs' own spelling).
+      const inExclude = path.join(".") === "test.exclude";
+      return list("]", () => {
+        ws();
+        const spread = inExclude ? /^\.\.\.\s*([A-Za-z_$][\w$]*)\.exclude(?![\w$.([])/.exec(value.slice(i)) : null;
+        if (spread && defaults.has(spread[1])) { i += spread[0].length; return true; }
+        return datum();
+      });
+    }
+    if (c === "{") {
+      const seen = new Set<string>();
+      return list("}", () => {
+        ws();
+        const k = take(/^(?:([A-Za-z_$][\w$]*)|(["'])((?:\\[\s\S]|(?!\2)[^\\\n\r])*)\2)\s*:/);
+        if (!k) return false;
+        const key = k[1] ?? decodeString(k[3]);
+        if (key === undefined || key === "__proto__" || seen.has(key)) return false;
+        seen.add(key);
+        const outer = path;
+        path = [...outer, key];
+        const ok = datum();
+        path = outer;
+        return ok;
+      });
+    }
+    if (take(/^-?(?:0[xX][\da-fA-F](?:_?[\da-fA-F])*|0[oO][0-7](?:_?[0-7])*|0[bB][01](?:_?[01])*|(?:\d(?:_?\d)*)?\.?\d(?:_?\d)*(?:[eE][+-]?\d+)?)n?(?![\w$.])/)) return true;
+    const word = /^(?:process\.env\.[A-Za-z_$][\w$]*|[A-Za-z_$][\w$]*)(?![\w$.([`])/.exec(value.slice(i))?.[0];
+    if (word && (["true", "false", "null"].includes(word) || word.startsWith("process.env.") || consts.has(word))) { i += word.length; return true; }
+    return false;
+  };
+  if (!datum()) return false;
+  ws();
+  return i === value.length;
+}
+
+/**
+ * The top-level statements of a (comment-blanked) module: each ends at a `;` or a line break outside
+ * strings and brackets, unless the line ends in an operator or the next one continues the expression.
+ */
+function topLevel(text: string): { start: number; text: string }[] {
+  const out: { start: number; text: string }[] = [];
+  let [depth, start] = [0, -1];
+  const end = (at: number) => {
+    const raw = text.slice(start, at);
+    if (raw.trim()) out.push({ start: start + raw.length - raw.trimStart().length, text: raw.trim() });
+    start = -1;
+  };
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (start < 0) {
+      if (/[\s;]/.test(c)) continue;
+      start = i;
+    }
+    if (c === '"' || c === "'" || c === "`") {
+      for (i++; i < text.length && text[i] !== c; i++) if (text[i] === "\\") i++;
+    } else if ("([{".includes(c)) depth++;
+    else if (")]}".includes(c)) depth--;
+    else if (depth === 0 && c === ";") end(i);
+    else if (depth === 0 && LINE_END.test(c) && !/[-=+*/%&|^!?:,.<>([{]$/.test(text.slice(start, i).trimEnd())
+      && !/^(?:[-.?:&|+*/%=,<>()[\]{}`]|as\b|satisfies\b|in\b|instanceof\b)/.test(text.slice(i + 1).trimStart())) end(i);
+  }
+  if (start >= 0) end(text.length);
+  return out;
+}
+
+/**
+ * D-2102 add.22: the offset of the exported config object when the file is SIMPLE AND STATIC, else why
+ * not. The top level holds only imports, type-only declarations and exactly one export (`export default`
+ * or `module.exports =`) of a supported literal — an object, or defineConfig/defineProject around one — or
+ * of one binding declared to such a literal; a TypeScript config is read with its types already erased. `module`, `exports` and that
+ * binding occur nowhere else, so no alias, bracket access or later assignment can change what the read saw.
+ */
+type Exported = { open: number; wrappers: Wrappers; defaults: ReadonlySet<string> };
+
+function staticExport(text: string, json: boolean, kind: RunnerInfo["kind"]): Exported | string {
+  const wrappers = new Set<string>();
+  const defaults = new Set<string>();
+  const literal = (value: string, start: number): Exported | string => {
+    const open = objectIn(value, start, wrappers);
+    return typeof open === "number" ? { open, wrappers, defaults } : open === NOT_ONE_OBJECT ? `the export ${NOT_ONE_OBJECT}` : open;
+  };
+  if (json) {
+    const open = objectIn(text.trim(), text.search(/\S/), wrappers);
+    return typeof open === "number" ? { open, wrappers, defaults } : `the config ${NOT_ONE_OBJECT}`;
+  }
+  // D-2102 add.35, a whitelist: the top level holds only imports in the strict grammar (type-only included),
+  // at most one `const { … } = require(<the runner's module>)`, `const <ident>[: T] = <expr>` lines, and EXACTLY
+  // ONE export of an object or an identity wrapper around one, directly or through one such const. Any other
+  // statement — let or var, a function or class, an expression, a second export, exports.default,
+  // `export { x as default }`, a reassignment — reads unverifiable.
+  const other = RUNS;
+  let exported: { start: number; value: string; cjs: boolean } | undefined;
+  const consts = new Map<string, { start: number; value: string }>();
+  const bound = new Map<string, number>(); // every value name a top-level statement binds, and how often
+  const values: string[] = []; // every expression a top-level statement evaluates
+  let requires = 0;
+  for (const { start, text: t } of topLevel(text)) {
+    const b = bindingsOf(t, kind);
+    if (b === "invalid") return "invalid syntax";
+    if (b === "runs") return RUNS;
+    if (b) {
+      for (const name of b.names) bound.set(name, (bound.get(name) ?? 0) + 1);
+      for (const name of b.wrappers) wrappers.add(name);
+      if (kind === "vitest") for (const name of b.defaults) defaults.add(name);
+      if (!/^import/.test(t)) {
+        if (++requires > 1) return "the config requires the runner's module more than once";
+        values.push(t.slice(t.indexOf("=") + 1));
+      }
+      continue;
+    }
+    const exp = /^(?:export\s+default|(module)\.exports\s*=)\s*/.exec(t);
+    const decl = /^const\s+([A-Za-z_$][\w$]*)\s*=\s*/.exec(t);
+    if (exp) {
+      if (exported) return "the config exports more than once";
+      exported = { start: start + exp[0].length, value: t.slice(exp[0].length), cjs: exp[1] !== undefined };
+      values.push(exported.value);
+    } else if (decl) {
+      consts.set(decl[1], { start: start + decl[0].length, value: t.slice(decl[0].length) });
+      bound.set(decl[1], (bound.get(decl[1]) ?? 0) + 1);
+      values.push(t.slice(decl[0].length));
+    } else return other;
+  }
+  if (!exported) return "the config has no export";
+  // Wrapper trust through require holds only for the unbound CommonJS global, so a file that binds require,
+  // module or exports itself — or binds any name twice — is unread.
+  const shadow = ["require", "module", "exports"].find((name) => bound.has(name));
+  if (shadow) return `the config binds its own ${shadow}`;
+  const twice = [...bound].find(([, n]) => n > 1)?.[0];
+  if (twice) return `the config binds ${twice} more than once`;
+  const id = /^[A-Za-z_$][\w$]*$/.exec(exported.value.trim())?.[0];
+  const value = id ? consts.get(id) : exported;
+  if (!value) return `the export of ${id}`;
+  // Balanced brackets are not syntax: every evaluated expression must compile as JavaScript (compiled, never
+  // run). A TypeScript config arrives here with its types already erased to whitespace (D-2102 add.39, see
+  // realParse), so no TypeScript form is skipped or stripped by hand.
+  for (const v of values) {
+    try { new Script(`(${v}\n)`); } catch { return "invalid syntax"; }
+  }
+  // D-2102 add.37: the exported config is pure data — every const, and the export itself (or the one argument
+  // of an identity wrapper around it), read with the pure-data grammar; a const may name only earlier consts.
+  const earlier = new Set<string>();
+  for (const [name, c] of consts) {
+    if (!pureData(c.value, earlier, name === id ? defaults : undefined)) return RUNS;
+    earlier.add(name);
+  }
+  const shown = exported.value;
+  const call = /^([A-Za-z_$][\w$]*)\(([\s\S]*)\)$/.exec(shown);
+  if (call && !wrappers.has(call[1])) return `the call ${call[1]}(…) is not an identity wrapper imported from the runner`;
+  if (!pureData(call ? call[2] : shown, earlier, defaults)) return RUNS;
+  return literal(value.value, value.start);
+}
+
+// D-2102 add.33: the jest ignore entries doctor judges, by a whitelist — ANCHORED: one leading <rootDir>, then
+// only [A-Za-z0-9_./-] or "\." and no ".." segment (so "<rootDir>/.next/" reads); LITERAL: no <rootDir>, only
+// [A-Za-z0-9_/-] or "\." (a bare "." is a wildcard). Every other entry is opaque and leaves the config unread.
+const ANCHORED_ENTRY = /^<rootDir>(?:[A-Za-z0-9_./-]|\\\.)*$/;
+const LITERAL_ENTRY = /^(?:[A-Za-z0-9_/-]|\\\.)*$/;
+const judged = (entry: string): boolean =>
+  (ANCHORED_ENTRY.test(entry) && !/(?:^|\/)\.\.(?:\/|$)/.test(entry.slice("<rootDir>".length))) || LITERAL_ENTRY.test(entry);
+// The exact unanchored spellings the SentioQ run-2 shape used (Q130s), which --fix replaces with the canonical twin.
+const POISON: Record<Dir, RegExp> = { state: /^\/?\\?\.tickmarkr\/?$/, session: /^\/?\\?\.claude\/worktrees\/?$/ };
+const WORKTREE_DIRS: Record<Dir, string> = { state: ".tickmarkr/worktrees.noindex", session: ".claude/worktrees" };
+const PROBE = "tkr-doctor-probe";
+
+/** Jest's reading of an ignore entry under `rootDir`: a leading <rootDir> resolved as jest-config does, then a RegExp. */
+const jestIgnore = (entry: string, rootDir: string): RegExp =>
+  new RegExp(entry.startsWith("<rootDir>") ? resolve(rootDir, normalize(`./${entry.slice("<rootDir>".length)}`)) : entry);
+
+/**
+ * D-2102 add.33: the first ignore entry that SELF-MATCHES (Q130s), found by executing it as jest reads it — it
+ * matches a probe suite inside a run or session worktree, rooted there, but not the same suite in the main
+ * checkout at `root` (probed at src/ and, for a literal, along its own tail: add.34, see literalTails). It
+ * classifies the ignore list only; it never claims what the runner collects.
+ * ponytail: residual — a literal keyed on a worktree NAME that does not exist yet is not probed (queue row
+ * 208); the names probed are a fixed one plus every directory present under each worktree root.
+ */
+function selfMatching(entries: string[], root: string): { pattern: string; dir: Dir } | undefined {
+  const file = `${PROBE}.test.ts`;
+  for (const pattern of entries) {
+    for (const dir of DIRS) {
+      if (POISON[dir].test(pattern)) return { pattern, dir };
+      const base = join(root, WORKTREE_DIRS[dir]);
+      let present: string[] = [];
+      try { present = readdirSync(base, { withFileTypes: true }).filter((d) => d.isDirectory()).map((d) => d.name); } catch { /* none yet */ }
+      for (const name of [PROBE, ...present]) {
+        const tree = join(base, name);
+        try {
+          for (const rel of [`src/${file}`, ...literalTails(pattern, `${tree}/`, root, file)]) {
+            if (jestIgnore(pattern, tree).test(`${tree}/${rel}`) && !jestIgnore(pattern, root).test(`${root}/${rel}`)) return { pattern, dir };
+          }
+        } catch { return { pattern, dir }; } // a root path that does not compile as a regex: judged self-matching
+      }
+    }
+  }
+  return undefined;
+}
+
+/**
+ * D-2102 add.34: the probe paths a LITERAL entry's own tail builds — wherever the end of `tree` (with its "/")
+ * begins the literal and that occurrence reaches past `root`, the rest of the literal becomes the path below
+ * the tree, so an entry like "worktrees/feature-x/test/" is probed at feature-x/test/ and not only at src/.
+ */
+function literalTails(pattern: string, tree: string, root: string, file: string): string[] {
+  if (pattern.startsWith("<rootDir>")) return [];
+  const literal = pattern.replace(/\\\./g, ".");
+  const out: string[] = [];
+  for (let i = 0; i < tree.length; i++) {
+    const tail = tree.slice(i);
+    if (literal.length > tail.length && literal.startsWith(tail) && i + literal.length > root.length) out.push(`${literal.slice(tail.length)}${file}`);
+  }
+  return out;
+}
+
+/**
+ * D-2102 add.22 and add.29: why the source is not one clean parse, else undefined — a "/" outside strings
+ * and comments (a regex literal or a division: doctor parses neither), an unclosed string or comment, a
+ * template with a substitution, or an unmatched or unclosed bracket. The end of the file never closes anything.
+ */
+function unclean(text: string): string | undefined {
+  const stack: string[] = [];
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (text.startsWith("//", i)) i = lineEnd(text, i); else if (text.startsWith("/*", i)) {
+      const end = text.indexOf("*/", i + 2);
+      if (end < 0) return "an unclosed comment";
+      i = end + 1;
+    } else if (c === "/") return "a / outside strings and comments (a regex literal or a division)";
+    else if (c === "\\") return RUNS; // D-2102 add.37: an escaped identifier spells a name doctor would not see
+    else if (c === '"' || c === "'" || c === "`") {
+      let j = i + 1;
+      for (; j < text.length && text[j] !== c; j++) {
+        if (text[j] === "\\") j++;
+        else if (c !== "`" && LINE_END.test(text[j])) return "an unclosed string";
+        else if (c === "`" && text.startsWith("${", j)) return "a template literal with a substitution";
+      }
+      if (j >= text.length) return "an unclosed string";
+      i = j;
+    } else if ("([{".includes(c)) stack.push(c);
+    else if (")]}".includes(c) && stack.pop() !== "([{"[")]}".indexOf(c)]) return "an unmatched closing bracket";
+  }
+  return stack.length ? "an unclosed bracket" : undefined;
+}
+
+/**
+ * The config's own literal ignore list (D-2102 add.30) — jest testPathIgnorePatterns, vitest test.exclude —
+ * located through a clean parse of a simple static file, or why doctor could not read it. `entries` is
+ * undefined when the config sets no list (the runner's default, which holds neither canonical entry);
+ * `target` is the literal array and `top` the exported object, for the writer.
+ */
+type IgnoreList = {
+  file: string; key: string; json: boolean; unreadable?: string; entries?: string[]; target?: Member; top?: number; open?: number;
+  /** the configDefaults bindings whose `.exclude` spread the vitest exclude may hold */
+  defaults?: ReadonlySet<string>;
+  /** a jest ignore entry that self-matches inside a run or session worktree (D-2102 add.33) */
+  floating?: { pattern: string; dir: Dir };
+};
+
+// D-2102 add.37 and add.39: the one child that reads the source on stdin, erases TypeScript types (when this Node
+// has stripTypeScriptTypes; its default strip mode replaces each type with whitespace, so offsets stay put) and
+// parses the result as a module (vm.SourceTextModule, never linked or evaluated), then as a script (vm.Script,
+// never run), reporting {"ok":true,"text":<stripped>} or {"ok":false,"why":"no-strip"|"syntax"} on stdout. It
+// runs with --no-warnings, so 22.x's ExperimentalWarning never reaches doctor's output; no temp file is written.
+const PARSE_CHILD = `(() => {
+  const fs = require("node:fs"), vm = require("node:vm"), mod = require("node:module");
+  const [ext, strip] = process.argv.slice(1);
+  const out = (r) => process.stdout.write(JSON.stringify(r));
+  let code = fs.readFileSync(0, "utf8");
+  if (/^\\.(?:m|c)?ts$/.test(ext)) {
+    if (strip === "absent" || typeof mod.stripTypeScriptTypes !== "function") return out({ ok: false, why: "no-strip" });
+    try { code = mod.stripTypeScriptTypes(code); } catch { return out({ ok: false, why: "syntax" }); }
+  }
+  let parsed = false;
+  if (typeof vm.SourceTextModule === "function") {
+    try { new vm.SourceTextModule(code); parsed = true; } catch {}
+  }
+  if (!parsed) {
+    try { new vm.Script(code); parsed = true; } catch {}
+  }
+  out(parsed ? { ok: true, text: code } : { ok: false, why: "syntax" });
+})()`;
+// ponytail: verdicts are memoized by exact bytes (and extension and seam), so one doctor run's reads before and
+// after a repair, and its re-reads of unchanged bytes, parse once; the memo is dropped past 64 entries.
+const parsed = new Map<string, { text: string } | { why: string }>();
+
+/** D-2102 add.39: the seams for a Node without stripTypeScriptTypes, and for a child that does not answer in time. */
+export type ParseSeam = { strip?: "absent"; timeoutMs?: number };
+
+/**
+ * D-2102 add.37 and add.39: the config's text with its TypeScript types erased (offsets unchanged), once a real
+ * parser accepts it — or why not. The source reaches PARSE_CHILD on stdin through process.execPath with no shell
+ * and no temp file. A spawn error, a timeout, a non-zero exit, a missing or malformed answer, or erased text of
+ * another length reads "doctor could not check <file>'s syntax"; a TypeScript config on a Node without
+ * stripTypeScriptTypes (below 22.13) reads unverifiable; nothing here throws.
+ */
+export function realParse(source: string, configPath: string, seam: ParseSeam = {}): { text: string } | { why: string } {
+  const ext = extname(configPath) || ".js";
+  const key = `${seam.strip ?? ""}\0${seam.timeoutMs ?? ""}\0${ext}\0${source}`;
+  const hit = parsed.get(key);
+  if (hit) return hit;
+  const unchecked = { why: `doctor could not check ${configPath}'s syntax` };
+  let result: { text: string } | { why: string } = unchecked;
+  try {
+    const r = spawnSync(process.execPath, ["--no-warnings", "--experimental-vm-modules", "-e", PARSE_CHILD, ext, seam.strip ?? "auto"], {
+      input: source, encoding: "utf8", env: {}, timeout: seam.timeoutMs ?? 10_000, maxBuffer: 4 * (source.length + 1024 * 1024), shell: false,
+    });
+    let verdict: { ok?: unknown; why?: unknown; text?: unknown } | undefined;
+    try { verdict = JSON.parse(r.stdout ?? "") as typeof verdict; } catch { verdict = undefined; }
+    if (r.error || r.status !== 0 || !verdict) result = unchecked;
+    else if (verdict.ok === true && typeof verdict.text === "string") result = verdict.text.length === source.length ? { text: verdict.text } : unchecked;
+    else if (verdict.why === "no-strip") result = { why: "this Node has no stripTypeScriptTypes to read a TypeScript config" };
+    else if (verdict.why === "syntax") result = { why: "invalid syntax" };
+  } catch {
+    result = unchecked;
+  }
+  if (parsed.size >= 64) parsed.clear();
+  parsed.set(key, result);
+  return result;
+}
+
+// Out of claim (D-2102 add.30, add.35, queue row 207): a Vite plugin's config hook and a jest preset change what
+// the runner resolves, not the config's own literal list, so this reader neither follows nor warns on them.
+function ignoreList(cwd: string, runner: RunnerInfo): IgnoreList {
+  const isJest = runner.kind === "jest";
+  let pkg: { jest?: unknown } = {};
+  try { pkg = JSON.parse(readText(cwd, "package.json").text || "{}") as typeof pkg; } catch { /* judged by detectRunner */ }
+  const config = runner.configPath ? readText(cwd, runner.configPath) : { text: isJest && pkg.jest ? JSON.stringify(pkg.jest) : "" };
+  const source = config.text;
+  const json = !runner.configPath || runner.configPath.endsWith(".json");
+  const base = { file: runner.configPath ?? (isJest ? "the package.json jest block" : "a vitest config"), key: CANONICAL[runner.kind].ignore, json };
+  const unreadable = (why: string): IgnoreList => ({ ...base, unreadable: why });
+  if (config.error) return unreadable(config.error);
+  // D-2102 add.22: another file the runner may read instead of, or beside, this one.
+  const present = (stem: string): string[] => ["ts", "mts", "cts", "js", "mjs", "cjs", "json"].map((e) => `${stem}.${e}`).filter((f) => existsSync(join(cwd, f)));
+  const external = isJest ? [] : [...present("vitest.workspace"), ...present("vitest.projects")];
+  if (external.length) return unreadable(`${external[0]} declares projects beside it`);
+  const configs = isJest ? [...present("jest.config"), ...(pkg.jest !== undefined ? ["the package.json jest block"] : [])] : present("vitest.config");
+  if (configs.length > 1) return unreadable(`${configs.join(" and ")} both configure ${runner.kind}`);
+  if (!source.trim()) return base; // no config: the runner's default list
+  // D-2102 add.32: a JSON config is read only once JSON.parse accepts it — jest reads it with JSON.parse.
+  if (json) {
+    try { JSON.parse(source); } catch { return unreadable("invalid JSON"); }
+  }
+  // D-2102 add.39: a TypeScript config is read only through its type-erased text (same offsets, so the writer
+  // edits the original bytes in place); a JavaScript one is read as written and parsed for real last.
+  const path = runner.configPath ?? "config.js";
+  const ts = /\.(?:m|c)?ts$/.test(path);
+  const erased = ts ? realParse(source, path) : undefined;
+  if (erased && "why" in erased) return unreadable(erased.why);
+  const plain = erased?.text ?? source;
+  const dirty = unclean(plain);
+  if (dirty) return unreadable(dirty);
+  const text = blankComments(plain);
+  const exported = staticExport(text, json, runner.kind);
+  if (typeof exported === "string") return unreadable(exported);
+  if (!json && !ts) {
+    const parse = realParse(source, path);
+    if ("why" in parse) return unreadable(parse.why);
+  }
+  const top = exported.open;
+  // Projects carry their own ignore lists, which the config's own list does not speak for.
+  const read = (open: number, keys: string[], what: string, key: string, form: "regex" | "path"): IgnoreList => {
+    const s = settingsOf(text, open, keys, what);
+    if (s.computed) return unreadable(s.computed);
+    if (s.get("projects") ?? s.get("workspace")) return unreadable("it declares projects, each with its own ignore list");
+    const target = s.get(key);
+    const entries = literalList(target?.value, form, isJest ? undefined : exported.defaults);
+    if (typeof entries === "string") return unreadable(unreadableList(entries, base.key) ?? entries);
+    if (!isJest) return { ...base, entries, target, top, open, defaults: exported.defaults };
+    // D-2102 add.32 and add.33: an entry outside the whitelist can spell a worktree directory without its
+    // letters in a row (a class, a group, a bare-dot wildcard), so a config holding one is unread while it
+    // stays; the canonical entries are anchored. The exact SentioQ spellings stay judged, so --fix replaces them.
+    const opaque = (entries ?? []).find((e) => !judged(e) && !POISON.state.test(e) && !POISON.session.test(e));
+    if (opaque !== undefined) return unreadable(`testPathIgnorePatterns entry ${JSON.stringify(opaque)} holds regex syntax doctor does not read`);
+    // D-2102 add.33: a rootDir other than the config's own directory re-roots <rootDir>, canonical entries included.
+    const rootDir = literalList(s.get("rootDir")?.value);
+    if (typeof rootDir === "string" || (rootDir && (rootDir.length !== 1 || !/^(?:\.\/?|<rootDir>\/?)$/.test(rootDir[0])))) {
+      return unreadable(typeof rootDir === "string" ? "rootDir is not a literal, so doctor cannot tell whether it re-roots <rootDir>"
+        : `rootDir ${JSON.stringify(rootDir.join(", "))} re-roots <rootDir> away from ${base.file}'s own directory`);
+    }
+    let root = cwd;
+    try { root = realpathSync(cwd); } catch { /* judged from cwd as given */ }
+    return { ...base, entries, target, top, open, floating: selfMatching(entries ?? [], root) };
+  };
+  if (isJest) return read(top, ["testPathIgnorePatterns", "projects", "rootDir"], "the config", "testPathIgnorePatterns", "regex");
+  const outer = settingsOf(text, top, ["test"], "the config");
+  if (outer.computed) return unreadable(outer.computed);
+  const test = outer.get("test");
+  if (!test) return { ...base, entries: undefined, top };
+  const open = objectIn(test.value, test.start, exported.wrappers);
+  if (typeof open === "string") return unreadable(open === NOT_ONE_OBJECT ? `test ${NOT_ONE_OBJECT}` : open);
+  return { ...read(open, ["exclude", "projects", "workspace"], "test", "exclude", "path"), top };
+}
+
 export function runnerIgnoreFinding(cwd: string): { verdict: "pass" | "warn"; detail: string } | undefined {
-  const readIf = (p: string): string => (existsSync(join(cwd, p)) ? readFileSync(join(cwd, p), "utf8") : "");
   const runner = detectRunner(cwd);
   if (!runner) return undefined;
-  const isJest = runner.kind === "jest";
-  const jestConfig = isJest ? runner.configPath : undefined;
-  const vitestConfig = isJest ? undefined : runner.configPath;
-  let pkg: { jest?: unknown } = {};
-  try { pkg = JSON.parse(readIf("package.json") || "{}") as typeof pkg; } catch { /* judged above */ }
-
-  // Comment LINES are stripped before judgment: a commented-out ignore must not
-  // false-pass, and a prose comment mentioning .tickmarkr must not false-warn the
-  // anchor probe. Stripping is LINE-granular on purpose: in-line regex stripping ate
-  // glob strings — `'**/*.d.ts'` contains `/*` and later globs contain `*/`, so a
-  // naive block-comment regex deleted the middle of real configs and false-PASSED a
-  // repo-wide vitest include (caught on Intl-Dossier's config; shipped briefly in
-  // 1.90.1). Trailing same-line comments survive — acceptable: they can only make the
-  // probe more conservative on lines that also carry code.
-  const stripComments = (s: string): string => s.split("\n").filter((l) => {
-    const t = l.trimStart();
-    return !(t.startsWith("//") || t.startsWith("/*") || t.startsWith("*"));
-  }).join("\n");
-  const configText = stripComments(isJest
-    ? `${jestConfig ? readIf(jestConfig) : ""}${pkg.jest ? JSON.stringify(pkg.jest) : ""}`
-    : vitestConfig ? readIf(vitestConfig) : "");
-  if (/\.tickmarkr|worktrees\.noindex/.test(configText)) {
-    // Q130s self-match probe: erase every <rootDir>-anchored token (through the end of
-    // its quoted string); any surviving mention is a pattern that would also match
-    // inside a provisioned worktree (jest regex-vs-absolute-path semantics only).
-    const unanchored = configText.replace(/<rootDir>[^"'`\s]*/g, "");
-    if (isJest && /\.tickmarkr|worktrees\.noindex/.test(unanchored)) {
-      return {
-        verdict: "warn",
-        detail: `jest ignore for .tickmarkr/ is not <rootDir>-anchored — testPathIgnorePatterns are regexes against ABSOLUTE paths, so inside run worktrees (provisioned under .tickmarkr/worktrees.noindex/) it matches EVERY suite and the test gate fails closed; use "<rootDir>/\\\\.tickmarkr/" in ${jestConfig ?? "the package.json jest block"}`,
-      };
-    }
-    return { verdict: "pass", detail: `${isJest ? "jest" : "vitest"} config ignores .tickmarkr/ — run worktrees stay out of the suite` };
+  const name = runner.kind;
+  const quoted = (d: Dir): string => JSON.stringify(CANONICAL[name][d]);
+  const list = ignoreList(cwd, runner);
+  const where = `${list.key} in ${list.file}`;
+  if (list.unreadable) {
+    return { verdict: "warn", detail: `doctor could not read ${list.file} (${list.unreadable}); add ${quoted("session")} to ${list.key}, with ${quoted("state")} beside it` };
   }
-  // Rooted collection globs never reach .tickmarkr/…; only repo-wide `**/`-style patterns (or
-  // runner defaults, which are repo-wide) can collect worktree copies.
-  const repoWide = configText === "" || /["'`]\*\*\//.test(configText);
-  if (!repoWide) {
-    return { verdict: "pass", detail: `${isJest ? "jest" : "vitest"} collection globs are rooted — run worktrees are not collectable` };
+  // Q130s, and queue row 197 for the session worktree: a run started inside a worktree carries the
+  // directories above the checkout in every absolute test path.
+  const float = list.floating;
+  if (float) {
+    const what = float.dir === "state" ? ".tickmarkr/" : ".claude/worktrees/";
+    return {
+      verdict: "warn",
+      detail: `jest ignore for ${what} is not <rootDir>-anchored: ${JSON.stringify(float.pattern)} — testPathIgnorePatterns are regexes against ABSOLUTE paths, so ${INSIDE[float.dir]} it matches the checkout's own suites and the test gate fails closed; use ${quoted("state")} and ${quoted("session")} in ${where}`,
+    };
   }
-  const remedy = isJest
-    ? `add "<rootDir>/\\\\.tickmarkr/" to testPathIgnorePatterns in ${jestConfig ?? "the package.json jest block"}`
-    : `add ".tickmarkr/**" to test.exclude in ${vitestConfig ?? "a vitest config"}`;
-  return {
-    verdict: "warn",
-    detail: `${isJest ? "jest" : "vitest"} collects repo-wide and will scan .tickmarkr/ run worktrees (duplicate suites, false reds) — ${remedy}`,
-  };
+  const missing = DIRS.filter((d) => !(list.entries ?? []).includes(CANONICAL[name][d]));
+  if (missing.length) {
+    const [first, second] = missing.map(quoted);
+    return {
+      verdict: "warn",
+      detail: `${where} does not carry ${missing.map(quoted).join(" or ")}, so ${name} may scan ${missing.map((d) => SCANS[d]).join(" and ")} (duplicate suites, false reds) — add ${first} to ${where}${second ? `, with ${second} beside it` : ""}`,
+    };
+  }
+  return { verdict: "pass", detail: `${where} carries ${quoted("session")} beside ${quoted("state")} — doctor reads this literal list only and does not prove what ${name} collects` };
 }
 
 /**
@@ -323,55 +1015,124 @@ export function runnerIgnoreFinding(cwd: string): { verdict: "pass" | "warn"; de
  * repos a hand-edit (SentioQ run 2 paid a whole run first); --fix applies the ignore
  * where a safe textual edit exists and refuses loudly otherwise.
  *
- * Safety contract: only three write shapes, each verified by re-running
- * runnerIgnoreFinding afterward — a write that does not turn the row green is
- * REVERTED and reported as manual. Never touches package.json (jest block → manual).
- * ponytail: text-level edits, same ceilings as the finding; the verify-then-revert
- * loop is what makes them safe to ship.
+ * Safety contract (queue row 197; D-2102 add.8 and add.30): the canonical entries the config's own literal
+ * ignore list lacks go into that array as complete string-literal elements (never a coverage array or a
+ * scalar), beside the state dir's canonical entry, else first; a jest element that is exactly an unanchored
+ * entry for either directory (the SentioQ run-2 shape) is replaced by its canonical twin; a jest config with
+ * no testPathIgnorePatterns gets the property, preserving jest's default /node_modules/ ignore, as before
+ * this change (a JSON config with its key quoted), and a vitest config without test.exclude gets one that
+ * keeps Vitest 3.2.7's default excludes ahead of the two entries — inside a new test object where it has
+ * none (D-2102 add.31). A config doctor could not read or any other element is manual with the file
+ * byte-unchanged. The write is verified by
+ * re-running the same rule on the written file (and JSON.parse for a .json config); a write that does not
+ * turn the row green is REVERTED byte-for-byte and reported as manual. Never touches package.json.
  */
 export function applyRunnerIgnore(cwd: string): { action: "none" | "wrote" | "manual"; detail: string } {
   const finding = runnerIgnoreFinding(cwd);
   if (!finding) return { action: "none", detail: "no recognized test runner" };
   if (finding.verdict === "pass") return { action: "none", detail: finding.detail };
   const runner = detectRunner(cwd);
-  if (!runner?.configPath) {
-    // package.json jest block, or a runner detected only via the test script: hand edit.
-    return { action: "manual", detail: finding.detail };
-  }
+  const manual = { action: "manual" as const, detail: finding.detail };
+  // package.json jest block, or a runner detected only via the test script: hand edit.
+  if (!runner?.configPath) return manual;
+  const list = ignoreList(cwd, runner);
+  if (list.unreadable) return manual;
+  const kind = runner.kind;
+  const canon = CANONICAL[kind];
   const file = join(cwd, runner.configPath);
-  const original = readFileSync(file, "utf8");
-  let text = original;
-  if (runner.kind === "jest") {
-    // 1) Replace unanchored poison entries in place (the SentioQ run-2 shape).
-    text = text.replace(/(["'])\/?\.tickmarkr\/?\1/g, '"<rootDir>/\\\\.tickmarkr/"');
-    if (text === original && !/\.tickmarkr/.test(text)) {
-      const arr = /testPathIgnorePatterns(["']?)\s*:\s*\[/;
-      if (arr.test(text)) {
-        // 2) Existing ignore array: prepend the anchored entry.
-        text = text.replace(arr, (m) => `${m}"<rootDir>/\\\\.tickmarkr/", `);
-        if (runner.configPath.endsWith(".json")) text = text.replace(/,(\s*)\]/g, "$1]");
-      } else {
-        // 3) No array: add the property, preserving jest's default /node_modules/ ignore.
-        const anchor = /(module\.exports\s*=\s*\{|export\s+default\s+\{|export\s+default\s+defineConfig\(\{)/g;
-        if ((text.match(anchor) ?? []).length === 1) {
-          text = text.replace(anchor, (m) => `${m}\n  testPathIgnorePatterns: ["/node_modules/", "<rootDir>/\\\\.tickmarkr/"],`);
-        }
-      }
+  const read = readText(cwd, runner.configPath);
+  if (read.error) return manual;
+  const original = read.text;
+  const edits: { at: number; remove: number; insert: string }[] = [];
+  const entries = (...values: string[]): string => `[${values.map((v) => JSON.stringify(v)).join(", ")}]`;
+  /** Insert `member` first in the object literal opened at `open`, in the object's own layout. */
+  const addMember = (open: number, member: string): void => {
+    const lead = /^\s*/.exec(original.slice(open + 1))?.[0] ?? "";
+    const empty = original[open + 1 + lead.length] === "}";
+    const gap = /[\n\r]/.test(lead) ? lead.replace(/^[^\n\r]*/, "") : " ";
+    edits.push({ at: open + 1, remove: 0, insert: `${gap}${member}${empty ? "" : ","}` });
+  };
+  const target = list.target;
+  if (target) {
+    const elements = arrayElements(target.value);
+    if (!elements?.every((e) => STRING_LITERAL.test(e.text) || defaultsSpread(e.text, list.defaults ?? new Set()))) return manual;
+    const at = (i: number): number => target.start + elements[i].start;
+    const values = elements.map((e) => {
+      const value = STRING_LITERAL.test(e.text) ? decodeString(e.text.slice(1, -1)) : undefined;
+      if (kind !== "jest" || value === undefined) return value;
+      return POISON.state.test(value) ? canon.state : POISON.session.test(value) ? canon.session : value;
+    });
+    values.forEach((v, i) => {
+      if (v !== undefined && v !== decodeString(elements[i].text.slice(1, -1))) edits.push({ at: at(i), remove: elements[i].text.length, insert: JSON.stringify(v) });
+    });
+    const add = DIRS.filter((d) => !values.includes(canon[d])).map((d) => JSON.stringify(canon[d])).join(", ");
+    const state = values.indexOf(canon.state);
+    if (add) {
+      edits.push(state >= 0 ? { at: at(state) + elements[state].text.length, remove: 0, insert: `, ${add}` }
+        : elements.length ? { at: at(0), remove: 0, insert: `${add}, ` }
+        : { at: target.start + 1, remove: 0, insert: add });
     }
-  } else if (!/\.tickmarkr/.test(text)) {
-    // vitest: add the glob to every exclude array — test.exclude is the target;
-    // coverage.exclude gaining it is correct behavior, not collateral.
-    const arr = /exclude\s*:\s*\[/g;
-    if (arr.test(text)) text = text.replace(arr, (m) => `${m}'.tickmarkr/**', `);
+  } else if (kind === "jest" && list.top !== undefined) {
+    // No ignore property: add it whole, preserving jest's default /node_modules/ ignore (the 2.8.4 repair;
+    // a JSON config gets the quoted key, D-2102 add.31).
+    addMember(list.top, `${list.json ? '"testPathIgnorePatterns"' : "testPathIgnorePatterns"}: ${entries("/node_modules/", canon.state, canon.session)}`);
+  } else if (kind === "vitest" && list.top !== undefined) {
+    // No test.exclude (D-2102 add.31): add it, keeping Vitest's own defaults ahead of the two entries; with
+    // no test object at all, add that.
+    const exclude = `exclude: ${entries(...VITEST_DEFAULT_EXCLUDE, canon.state, canon.session)}`;
+    if (list.open !== undefined) addMember(list.open, exclude);
+    else addMember(list.top, `test: { ${exclude} }`);
   }
-  if (text === original) return { action: "manual", detail: finding.detail };
-  writeFileSync(file, text);
-  const after = runnerIgnoreFinding(cwd);
-  if (after?.verdict === "pass") {
-    return { action: "wrote", detail: `wrote ${runner.configPath} — ${after.detail}` };
+  if (!edits.length) return manual; // no safe target, or a self-match no canonical entry can fix
+  // Last offset first; at one offset the replacement precedes the insertion before it.
+  const text = [...edits].sort((a, b) => b.at - a.at || b.remove - a.remove)
+    .reduce((t, e) => t.slice(0, e.at) + e.insert + t.slice(e.at + e.remove), original);
+  let after: ReturnType<typeof runnerIgnoreFinding>;
+  try {
+    writeFileSync(file, text);
+    if (runner.configPath.endsWith(".json")) JSON.parse(text);
+    after = runnerIgnoreFinding(cwd);
+  } catch { after = undefined; }
+  if (after?.verdict === "pass") return { action: "wrote", detail: `wrote ${runner.configPath} — ${after.detail}` };
+  try { writeFileSync(file, original); } catch { /* the write itself failed, so the file is unchanged */ } // verify failed: never leave a half-fix behind
+  return manual;
+}
+
+type EnvLike = NodeJS.ProcessEnv | Record<string, string | undefined>;
+
+/**
+ * Queue row 196 (D-2102 add.1): the host decides where seats run. herdr or Orca markers (classifyHost)
+ * name that driver; with neither, seats run headless on the subprocess driver with no daemon board.
+ * Only the exact claude-desktop entry point names Claude Desktop — a cli entry point is a terminal seat
+ * and no Claude variable alone is a host. Panes configured where no pane host exists cannot be honored.
+ */
+export function hostRows(env: EnvLike, llm: "pane" | "headless"): { verdict: "pass" | "warn"; key: string; detail: string }[] {
+  const host = classifyHost(env as NodeJS.ProcessEnv);
+  if (host !== "none") {
+    return [{ verdict: "pass", key: "host", detail: `${host === "herdr" ? "herdr" : "Orca"} — auto selects the ${host} driver` }];
   }
-  writeFileSync(file, original); // verify failed: never leave a half-fix behind
-  return { action: "manual", detail: finding.detail };
+  const name = env.CLAUDE_CODE_ENTRYPOINT === "claude-desktop" ? "Claude Desktop" : "no herdr or Orca host";
+  return [
+    { verdict: "pass", key: "host", detail: `${name} — seats run headless on the subprocess driver with no daemon board` },
+    ...(llm === "pane"
+      ? [{ verdict: "warn" as const, key: "visibility", detail: "visibility.llm is pane, but panes cannot be honored on this host — run under herdr or Orca, or set visibility.llm: headless" }]
+      : []),
+  ];
+}
+
+/**
+ * Queue row 196 (D-2102 add.1): gates inherit the launching locale. The effective value is LC_ALL, else
+ * LC_CTYPE, else LANG (an empty value counts as unset). Unset, C or POSIX is the C-locale fallback;
+ * C.UTF-8 is a UTF-8 locale and passes. Advisory only — doctor never sets or writes a locale.
+ */
+export function localeFinding(env: EnvLike): { verdict: "pass" | "warn"; detail: string } {
+  const name = (["LC_ALL", "LC_CTYPE", "LANG"] as const).find((key) => env[key]);
+  const value = name ? env[name] : undefined;
+  if (name && value !== "C" && value !== "POSIX") return { verdict: "pass", detail: `${name}=${value}` };
+  return {
+    verdict: "warn",
+    detail: `${name ? `${name}=${value}` : "no locale set (LC_ALL, LC_CTYPE and LANG unset)"} — gates inherit the C-locale fallback (Node formats as en-US); fix: set LANG in your shell profile, e.g. export LANG=en_US.UTF-8`,
+  };
 }
 
 /**
@@ -541,9 +1302,10 @@ const RUNNER_CONFIG_PATHS = [
 ] as const;
 
 function runnerConfigSnapshot(cwd: string): Map<string, string> {
+  // An unreadable config is not snapshotted: the writer never edits a file it could not read (D-2102 add.31).
   return new Map(RUNNER_CONFIG_PATHS.flatMap((path) => {
-    const absolute = join(cwd, path);
-    return existsSync(absolute) ? [[path, readFileSync(absolute, "utf8")] as const] : [];
+    const read = readText(cwd, path);
+    return existsSync(join(cwd, path)) && !read.error ? [[path, read.text] as const] : [];
   }));
 }
 
@@ -575,8 +1337,8 @@ export function doctorFixOnly(cwd = process.cwd()): string {
     : { action: "none" as const, detail: finding?.detail ?? "no recognized test runner" };
   const verified = runnerIgnoreFinding(cwd);
   const diffs = [...before].flatMap(([path, original]) => {
-    const current = readFileSync(join(cwd, path), "utf8");
-    return current === original ? [] : [actualTextDiff(path, original, current)];
+    const current = readText(cwd, path);
+    return current.error || current.text === original ? [] : [actualTextDiff(path, original, current.text)];
   });
   const result = repair.action === "wrote" && verified?.verdict !== "pass"
     ? "invalid repair result (verification did not pass)"
@@ -810,6 +1572,10 @@ export async function doctor(
   ));
   const herdr = HerdrDriver.available();
   rows.push(alignedStatusRow(herdr ? "pass" : "fail", "herdr", herdr ? "driver available (HERDR_ENV=1)" : "not detected — subprocess driver will be used"));
+  // Queue rows 196 and 197 (D-2102 add.1): where seats run, and the locale every gate inherits.
+  for (const row of hostRows(process.env, cfg.visibility.llm)) rows.push(alignedStatusRow(row.verdict, row.key, row.detail));
+  const locale = localeFinding(process.env);
+  rows.push(alignedStatusRow(locale.verdict, "locale", locale.detail));
   // Q122s: the target repo's runner must not scan tickmarkr's own worktrees (advisory row).
   // Q134s: `doctor --fix` writes the ignore when a safe edit exists (verified, else reverted).
   const runnerIgnore = runnerIgnoreFinding(cwd);

@@ -1,7 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmdirSync } from "node:fs";
 import { join } from "node:path";
 import { z } from "zod";
 import { channelKey, shq, TokenUsageSchema, type Assignment } from "../adapters/types.js";
@@ -19,7 +19,7 @@ import {
   type TrackedJournalRow,
 } from "./protocol.js";
 import { PRESERVE_COMMIT_SUBJECT, PRESERVE_PRODUCER_TRAILER } from "./git.js";
-import { assertGitTrust, protectedGitEnv } from "./git-trust.js";
+import { assertGitTrust, protectedGitEnv, trustedCommonDir } from "./git-trust.js";
 import { normalizeGateOutcome } from "./outcome.js";
 import { redactSecrets } from "./redact.js";
 
@@ -1807,29 +1807,46 @@ export function engagementComparable(events: JournalEvent[], loadedHash: string)
 }
 
 const RUN_SEQUENCE_WIDTH = 16;
+const TICKET = /^\d{16}$/;
+
+const ticketsIn = (dir: string): string[] => {
+  try { return readdirSync(dir).filter((name) => TICKET.test(name)); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return []; throw error; }
+};
+const highest = (tickets: string[]): bigint => tickets.reduce((max, name) => (BigInt(name) > max ? BigInt(name) : max), 0n);
 
 // The daemon mints before acquiring graph.lock, and each CLI invocation has fresh module state. Claim
-// a repository-state ticket with mkdir's atomic EEXIST boundary instead: a losing process advances and
-// retries, while the winning directory remains as the durable high-water evidence for later invocations.
+// a ticket with mkdir's atomic EEXIST boundary: a losing process advances and retries. Queue row 194
+// (D-2102): the sequence lives at the trusted common git dir, shared by the main checkout and every
+// linked worktree (a trust refusal refuses — never a per-checkout fallback), and its first ticket sits
+// above this checkout's own pre-change sequence. Pruning keeps it bounded, and the durable high-water
+// mark is the highest ticket itself: a prune removes a ticket only after seeing a higher one, so the
+// highest ever claimed survives. A stale reader can recreate a pruned ticket, but then sees that higher
+// one and claims again above it — only a ticket that is the highest after its own mkdir is issued.
 function claimRunSequence(repoRoot = process.cwd()): string {
-  const dir = join(tickmarkrDir(repoRoot), "run-id-sequence");
+  const dir = join(trustedCommonDir(repoRoot), "tickmarkr-run-id-sequence");
   mkdirSync(dir, { recursive: true });
-  const allocated = readdirSync(dir).filter((name) => /^\d{16}$/.test(name));
-  let candidate = allocated.reduce((max, name) => {
-    const value = BigInt(name);
-    return value > max ? value : max;
-  }, 0n) + 1n;
+  const own = highest(ticketsIn(join(repoRoot, stateDirName(repoRoot), "run-id-sequence")));
+  const shared = highest(ticketsIn(dir));
+  let candidate = (own > shared ? own : shared) + 1n;
 
   while (true) {
     const suffix = candidate.toString().padStart(RUN_SEQUENCE_WIDTH, "0");
     if (suffix.length > RUN_SEQUENCE_WIDTH) throw new Error("run id sequence exhausted");
     try {
       mkdirSync(join(dir, suffix));
-      return suffix;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
       candidate += 1n;
+      continue;
     }
+    const tickets = ticketsIn(dir);
+    const top = highest(tickets);
+    if (top > candidate) { candidate = top + 1n; continue; }
+    for (const name of tickets) {
+      if (BigInt(name) < candidate) try { rmdirSync(join(dir, name)); } catch { /* a concurrent prune took it */ }
+    }
+    return suffix;
   }
 }
 

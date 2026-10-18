@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { closeSync, fstatSync, openSync, readSync, statSync, type BigIntStats } from "node:fs";
 import { join } from "node:path";
 import { graphPath, stateDirName } from "../../graph/graph.js";
+import { repoOverlayPath } from "../../config/config.js";
 import { validateGraph, type RunGraph } from "../../graph/schema.js";
 import { foldOwedChecks, parseJournalText, parseRunId, type JournalEvent, type OwedFold, type OwedProofMemo } from "../../run/journal.js";
 import { isPidLive, STALE_MS } from "../../run/lock.js";
@@ -184,7 +185,7 @@ export class JournalTail {
 export interface CachedSource<T = unknown> { source: string; identity?: string; value?: T; status: "readable" | "absent" | "unreadable"; error?: string; observedAt: number }
 class JsonSource<T> {
   private cached?: CachedSource<T>;
-  constructor(private path: string, private parse: (raw: string) => T, private maxBytes: number = STORE_LIMITS.recordBytes) {}
+  constructor(readonly path: string, private parse: (raw: string) => T, private maxBytes: number = STORE_LIMITS.recordBytes) {}
   read(now: number): CachedSource<T> {
     try {
       const st = statSync(this.path, { bigint: true });
@@ -260,7 +261,15 @@ export function createLiveStore(options: LiveStoreOptions) {
     reset: () => { fold = new OperatorStateFold(); }, record: record => fold.apply(record),
   });
   const graph = new JsonSource<RunGraph>(graphPath(options.cwd), raw => validateGraph(JSON.parse(raw)), STORE_LIMITS.graphBytes);
-  const config = new JsonSource(options.configPath ?? join(state, "config.yaml"), raw => raw);
+  // Queue row 195 / D-2102: the cockpit's live config source follows the ONE repo-layer path rule, re-resolved
+  // on every observation so an own overlay created or removed, or a main file
+  // appearing, moves the source; an explicit configPath stays fixed.
+  let config: JsonSource<string> | undefined;
+  const readConfig = (at: number): CachedSource<string> => {
+    const path = options.configPath ?? repoOverlayPath(options.cwd);
+    if (config?.path !== path) config = new JsonSource(path, raw => raw);
+    return config.read(at);
+  };
   const cache = new JsonSource(options.cachePath ?? join(state, "doctor.json"), JSON.parse);
   const lock = new JsonSource<{ pid: number; runId: string; startedAt: number }>(join(state, "graph.lock"), raw => {
     const v = JSON.parse(raw);
@@ -302,7 +311,7 @@ export function createLiveStore(options: LiveStoreOptions) {
     // whole file now: lifecycle and debt then come from the same bytes. A repeat rewrite is unknown debt.
     if (tail.invalidated) { journal = tail.poll(observedAt); owed = owedOf(journal); }
     const graphReading = graph.read(observedAt);
-    const configReading = config.read(observedAt);
+    const configReading = readConfig(observedAt);
     const cacheReading = cache.read(observedAt);
     const owner = lock.read(observedAt);
     const alive = owner.status === "readable" && owner.value ? (options.isDaemonAlive ?? isPidLive)(owner.value.pid) : undefined;

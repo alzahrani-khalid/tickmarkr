@@ -9,18 +9,50 @@ Use this for any spec that `tickmarkr compile` accepts. It is SDD-agnostic: use 
 
 ## Two-tier by default — role check before the loop
 
-When working in a multi-agent terminal environment, decide your role before starting:
+When working in a multi-agent terminal environment (herdr or Orca), decide your role before starting:
 
 - **Orchestrator:** your session was started to execute the mission. Rename your own tab/pane `ORCH · <version>` (short labels: ≤20 chars, `ROLE · token`) and run the loop below.
 - **Supervisor with a live orchestrator:** do not start a second run. Relay the mission to the existing orchestrator with a [verified handoff](#verified-handoffs-agent-to-agent-messaging), then supervise it as OVERSEER.
 - **Primary session without an orchestrator:** rename your own tab `OVERSEER · <version>` and your agent `overseer`, spawn one child orchestration session with your host's launch form, label its tab `ORCH · <version>` and name its agent, give it the mission and these rules verbatim, then supervise it. Do not drive a duplicate single-tier run yourself. Before spawning, confirm any PREVIOUS orchestrator has [stood down](#stand-down-mission-end-and-retirement) and close its tab.
-  - **Spawning on current herdr is two-step** — the one-shot `agent start --cwd/--tab/--no-focus` form was removed in the herdr CLI redesign and now fails with `unknown option` (OBS-138). First create the pane: `herdr tab create --workspace <ws> --cwd <repo> --label "ORCH · <version>"` (tab create does not steal focus unless `--focus` is passed; parse `result.root_pane.pane_id` from its JSON), then start the agent in it:
-  - **Claude Code:** `herdr agent start orchestrator --kind claude --pane <root-pane-id> -- --permission-mode bypassPermissions`
-  - **Codex:** `herdr agent start orchestrator --kind codex --pane <root-pane-id> -- --dangerously-bypass-approvals-and-sandbox` — the unsandboxed flag is REQUIRED, not optional: codex's `workspace-write` sandbox keeps `.git` refs read-only, so a sandboxed orchestrator's `tickmarkr run` dies at integration-branch creation (`git worktree add` cannot lock the ref). Do not downgrade this flag; the herdr pane and repo scope are the containment.
+  - **On herdr (`HERDR_ENV=1`)**: **spawning on current herdr is two-step** — the one-shot `agent start --cwd/--tab/--no-focus` form was removed in the herdr CLI redesign and now fails with `unknown option` (OBS-138). First create the pane: `herdr tab create --workspace <ws> --cwd <repo> --label "ORCH · <version>"` (tab create does not steal focus unless `--focus` is passed; parse `result.root_pane.pane_id` from its JSON), then start the agent in it:
+    - **Claude Code:** `herdr agent start orchestrator --kind claude --pane <root-pane-id> -- --permission-mode bypassPermissions`
+    - **Codex:** `herdr agent start orchestrator --kind codex --pane <root-pane-id> -- --dangerously-bypass-approvals-and-sandbox` — the unsandboxed flag is REQUIRED, not optional: codex's `workspace-write` sandbox keeps `.git` refs read-only, so a sandboxed orchestrator's `tickmarkr run` dies at integration-branch creation (`git worktree add` cannot lock the ref). Do not downgrade this flag; the herdr pane and repo scope are the containment.
+    - **Auxiliary seats run as the CLI's interactive TUI in their visible pane — never headless** (`claude -p` / `codex exec`): headless buffers output until exit so the pane renders idle for the entire run, is blind to SessionStart hook errors (a broken and a fixed hook both return green), and gives a stall watcher no midpoint — silent-time equals lifetime. Headless is for exit-code probes only (a quota check that wants `rc`), never for work anyone must watch.
+  - **On Orca (`TERM_PROGRAM=Orca` and non-empty `ORCA_TERMINAL_HANDLE`)**: spawn it with `orca terminal create --worktree path:<repo> --title "ORCH · <version>" --command "<agent-cmd>" --json` and parse `result.terminal.handle` from the create receipt. **Auxiliary seats run as the CLI's interactive TUI in their visible terminal — never headless**, for the reasons the herdr branch gives.
   - **Auxiliary agents you spawn (consultants, reviewers, scouts) follow the same forms.** Never launch a claude session in plan mode or default permission mode for autonomous work — both stall on per-command approval prompts nobody is watching; claude is always `--permission-mode bypassPermissions` (tickmarkr's own adapter uses exactly this for workers, judges, and consults). A read-only codex consultant may use `--sandbox read-only`; any codex session that must touch git needs the unsandboxed flag above.
-  - **Auxiliary seats run as the CLI's interactive TUI in their visible pane — never headless** (`claude -p` / `codex exec`): headless buffers output until exit so the pane renders idle for the entire run, is blind to SessionStart hook errors (a broken and a fixed hook both return green), and gives a stall watcher no midpoint — silent-time equals lifetime. Headless is for exit-code probes only (a quota check that wants `rc`), never for work anyone must watch.
 
-Outside a multi-agent terminal environment, run the loop directly.
+With neither herdr nor Orca there is no role to decide and no seat to spawn: follow [On a plain host (neither herdr nor Orca)](#on-a-plain-host-neither-herdr-nor-orca) and run the loop directly, single-tier.
+
+## On a plain host (neither herdr nor Orca)
+
+Neither `HERDR_ENV=1` nor the Orca markers are set: the Claude Desktop Code tab, a plain terminal, any
+agent session that owns no panes (queue row 192; D-2102). The role check above does not apply.
+
+- **This session runs SINGLE-TIER as the orchestrator.** There are no seats, no pane briefs, no tab
+  canon and no board: run every step of [the loop](#the-loop) yourself and skip every On herdr and On
+  Orca scope.
+- **An empty mission is asked for, never assumed.** With no spec named, ask the operator what to run
+  end-to-end before compiling anything; there is no other tier to relay it to.
+- **Run and resume launch through the anchor-free lines** of the
+  [detached launch](#host-owned-daemon-and-detached-beats): the same `node` detach with no address, one
+  line for `tickmarkr run` and one for `tickmarkr resume <runId>`. The daemon places no board, so a
+  missing board is never a fault; confirm the launch from the lock pid as that section says.
+- **Run-end and parks are watched through the host's background wait**, never a foreground wait past
+  the host's ten-minute tool cap: the cap kills that wait, ends the turn and leaves the run unwatched.
+  Start the wait as a background task whose exit wakes this session, on journal lines after a baseline
+  taken at arm time and on the lock holder's death:
+  `n=$(wc -l < <journal>); until tail -n +$((n + 1)) <journal> | grep -qE '"event":"(run-end|task-human|task-failed|consult-verdict)"' || ! kill -0 <pid>; do sleep 20; done`
+  (`<journal>` is `<state-dir>/runs/<runId>/journal.jsonl`, `<pid>` the lock pid). On every wake read
+  CURRENT `tickmarkr status <runId>` first, then re-arm.
+- **The operator's view is `tickmarkr status <runId>`**, plus its live `status --watch --plain` form,
+  `tickmarkr status <runId> --watch --plain`, in a read-only Terminal tab beside this session.
+- **Reviews and judges run headless.** The subprocess driver runs every worker, judge and review as a
+  headless CLI call with no pane to watch: read their verdicts from the journal, the gate evidence and
+  `tickmarkr status <runId>`, never from a screen.
+- **Sessions hand off through the host's cross-session message tool**, confirmed by the peer's reply:
+  there is no composer to read back, so a message no peer answered is not a handoff.
+- **Keep a permission mode that never stalls per command** for the whole run (for example
+  `bypassPermissions`): nobody answers a per-command approval prompt in an unattended session.
 
 ## Invariants
 
@@ -65,14 +97,15 @@ concurrently* — so a machine-wide check answers a question nobody asked and bl
 
 ## Verified handoffs (agent-to-agent messaging)
 
-When relaying missions between agents in a multi-agent terminal, **never use bare send-text** (`herdr agent send` / pane send-text) — it writes text without pressing Enter, so handoffs sit unsubmitted (OBS-39).
+Never report "briefed" or "relayed" without the confirmation your host gives:
 
-Use one of:
+- **On herdr (`HERDR_ENV=1`)**: when relaying missions between agents in a multi-agent terminal, **never use bare send-text** (`herdr agent send` / pane send-text) — it writes text without pressing Enter, so handoffs sit unsubmitted (OBS-39). Use one of:
+  - `herdr pane run <pane> "<message>"` — text plus Enter in the target shell
+  - `herdr notification show "<message>"` — OS-level delivery for the operator
 
-- `herdr pane run <pane> "<message>"` — text plus Enter in the target shell
-- `herdr notification show "<message>"` — OS-level delivery for the operator
-
-After sending, **confirm delivery** by reading the target pane and verifying the message landed (input empty, agent status `working`, or notification acknowledged). Never report "briefed" or "relayed" without read-back confirmation.
+  After sending, **confirm delivery** by reading the target pane and verifying the message landed (input empty, agent status `working`, or notification acknowledged). Never report "briefed" or "relayed" without read-back confirmation.
+- **On Orca (`TERM_PROGRAM=Orca` and non-empty `ORCA_TERMINAL_HANDLE`)**: send with `orca terminal send --terminal <handle> --text "<message>" --enter --wait-submit 15 --json` and treat it as delivered only when `result.send.prompt.stages` carries a `turn_started` stage — `accepted: true` proves input acceptance, not a started turn.
+- With neither host, hand off through the host's cross-session message tool, confirmed by the peer's reply ([On a plain host (neither herdr nor Orca)](#on-a-plain-host-neither-herdr-nor-orca)).
 
 ## Dedicated consultant tab rule
 
@@ -88,19 +121,22 @@ When spawning consultants (agents gathering synthesis input for decisions like S
 1. **Prepare** — start from the requested spec. Run the [binary preflight](#binary-preflight-before-compile-or-run). Check `git status`, confirm no tickmarkr run is active, and work from a non-main branch.
 2. **Compile** — run `tickmarkr compile <spec>`. Correct compilation errors in the spec, never in the generated graph.
 3. **Plan** — run `tickmarkr plan`. Review the routing table, capability-floor warnings, and every human gate, including work that each gate blocks.
-4. **Run** — launch `tickmarkr run` using the [detached launch](#host-owned-daemon-and-detached-beats), and start detached beats with their run-end stop items. A watch ending the seat's turn is no watch: keep a **blocking journal consumer** alive for the run's terminal events — the shipped watcher below, or a foreground `until grep` on the run's terminal events — and ensure it is re-armed at most every twenty minutes. Never rely on a `Monitor`-only wake. Watch the run journal rather than polling agents, using the shipped watcher — `.claude/skills/tickmarkr-overseer/scripts/watch-journal.sh <state-dir>/runs 20 28800` — which takes a line baseline at arm time, then wakes ONCE on `run-end`, `task-human`, `task-failed` or `consult-verdict` and grades the run-end summary's execution clauses for you — `EXECUTION COMPLETE` or `NOT GREEN`, never green, because a run-end record is history; the debt clause is yours — read CURRENT `tickmarkr status <runId>` (step 5). Re-arm after every wake. ⛔ Never `tail -F | grep -m1` (run-end is the journal's last line, so tail never notices the broken pipe and the watcher hangs forever) and never a pane-level done wait (it fires on every agent turn end, not mission end). ⚠ A bare whole-file `grep -q '"event":"run-end"'` is the trap the watcher exists to avoid: on a resume it matches the PREVIOUS run's run-end and returns instantly, so a re-armed watcher reads as coverage that does not exist. Resolve blocked interactions in the agent session; do not turn them into proxy questions.
+4. **Run** — launch `tickmarkr run` using the [detached launch](#host-owned-daemon-and-detached-beats), and start detached beats with their run-end stop items. A watch ending the seat's turn is no watch: keep a **blocking journal consumer** alive for the run's terminal events, and never rely on a `Monitor`-only wake. Watch the run journal rather than polling agents: the consumer takes a line baseline at arm time, then wakes ONCE on `run-end`, `task-human`, `task-failed` or `consult-verdict`. A run-end record is history, never green; the debt clause is yours — read CURRENT `tickmarkr status <runId>` (step 5). Re-arm after every wake. ⛔ Never `tail -F | grep -m1` (run-end is the journal's last line, so tail never notices the broken pipe and the watcher hangs forever) and never a pane-level done wait (it fires on every agent turn end, not mission end). ⚠ A bare whole-file `grep -q '"event":"run-end"'` is the trap the watcher exists to avoid: on a resume it matches the PREVIOUS run's run-end and returns instantly, so a re-armed watcher reads as coverage that does not exist. Resolve blocked interactions in the agent session; do not turn them into proxy questions. The consumer is host-specific; with neither host it is the background wait of [On a plain host (neither herdr nor Orca)](#on-a-plain-host-neither-herdr-nor-orca).
+   - **On herdr (`HERDR_ENV=1`)**: the consumer is the shipped watcher — `.claude/skills/tickmarkr-overseer/scripts/watch-journal.sh <state-dir>/runs 20 28800`, which grades the run-end summary's execution clauses for you, `EXECUTION COMPLETE` or `NOT GREEN`, never green — or a foreground `until grep` on the run's terminal events; ensure it is re-armed at most every twenty minutes.
+   - **On Orca (`TERM_PROGRAM=Orca` and non-empty `ORCA_TERMINAL_HANDLE`)**: the consumer is that same shipped journal watcher or a foreground `until grep` on the run's terminal events; ensure it is re-armed at most every twenty minutes.
 5. **Verify and consolidate** — accept only a green run. A run is green when the run-end event exists in the journal, the tip verify is not "failed", the summary's `failed`, `human`, `blocked` and `pending` buckets are all empty, and CURRENT `tickmarkr status <runId>` reads its owed checks outstanding empty AND known (`outstanding 0`) — a run with a parked task is partial, not green. Empty execution buckets alone are not green either (D-660): every bucket empty and the tip passed, but an operator waived one review, leaves one accepted-risk review check owed — status reads `outstanding 1 (T7 review)` and `run`/`resume` still exit 0 on execution alone, so the run is execution complete, not green. It turns green only when a `tickmarkr verify --record <runId>` discharge moves CURRENT status to `outstanding 0`, including a discharge landing after run-end — the historical run-end record keeps the old count, so never read debt from it; `outstanding unknown` is never green. Tickmarkr consolidates accepted task work on `tickmarkr/<runId>`; it never signs off to the main branch. A human may later merge that integration branch through the repository's normal release process.
 6. **Record** — `tickmarkr report <runId> --md` prints Markdown to stdout. Redirect it explicitly beside the source spec (for example `tickmarkr report <runId> --md > feature.record.md`) and commit the execution record when the repository tracks those records. Then [stand down](#stand-down-mission-end-and-retirement).
 
 ## Host-owned daemon and detached beats
 
 Launch the daemon DETACHED, with no pane of its own: one `tickmarkr run` or `tickmarkr resume <runId>`
-process in its own session, its stdout and stderr appended to `<state-dir>/daemon.log`, and the
-ORCH's recorded address as its board anchor, so the daemon self-places its one board beside the
-ORCH in the ORCH tab. Never launch it in a visible split, pane or tab, as an agent harness
-background task, or tied to an agent session: the launching shell may end, and the daemon keeps
-running and logging. The detach wrapper is `node`, which tickmarkr already requires — no private
-script, no extra visible daemon pane and no CLI log flag:
+process in its own session, its stdout and stderr appended to `<state-dir>/daemon.log`, and on
+herdr or Orca the ORCH's recorded address as its board anchor, so the daemon self-places its one
+board beside the ORCH in the ORCH tab; with neither host it carries no address and places no board.
+Never launch it in a visible split, pane or tab, as an agent harness background task, or tied to
+an agent session: the launching shell may end, and the daemon keeps running and logging. The
+detach wrapper is `node`, which tickmarkr already requires — no private script, no extra visible
+daemon pane and no CLI log flag:
 
 ```bash
 # On Orca: <ORCH handle> is the ORCH terminal handle
@@ -109,19 +145,27 @@ cd <repo> && ORCA_TERMINAL_HANDLE="<ORCH handle>" node -e "require('child_proces
 # On herdr: <ORCH pane id> is the ORCH pane id
 cd <repo> && HERDR_PANE_ID="<ORCH pane id>" node -e "require('child_process').spawn(process.argv[1], process.argv.slice(2), { detached: true, stdio: 'inherit' }).unref()" tickmarkr run >> <state-dir>/daemon.log 2>&1 < /dev/null
 cd <repo> && HERDR_PANE_ID="<ORCH pane id>" node -e "require('child_process').spawn(process.argv[1], process.argv.slice(2), { detached: true, stdio: 'inherit' }).unref()" tickmarkr resume <runId> >> <state-dir>/daemon.log 2>&1 < /dev/null
+# On a plain host (neither herdr nor Orca): the same detach with no address
+cd <repo> && node -e "require('child_process').spawn(process.argv[1], process.argv.slice(2), { detached: true, stdio: 'inherit' }).unref()" tickmarkr run >> <state-dir>/daemon.log 2>&1 < /dev/null
+cd <repo> && node -e "require('child_process').spawn(process.argv[1], process.argv.slice(2), { detached: true, stdio: 'inherit' }).unref()" tickmarkr resume <runId> >> <state-dir>/daemon.log 2>&1 < /dev/null
 ```
 
 - **On Orca (`TERM_PROGRAM=Orca` and non-empty `ORCA_TERMINAL_HANDLE`)**: run the
   `ORCA_TERMINAL_HANDLE` lines; `<ORCH handle>` is the ORCH's own `$ORCA_TERMINAL_HANDLE`.
 - **On herdr (`HERDR_ENV=1`)**: run the `HERDR_PANE_ID` lines; `<ORCH pane id>` is the ORCH's own
   `$HERDR_PANE_ID`.
+- With neither host, run the two lines that carry no address
+  ([On a plain host (neither herdr nor Orca)](#on-a-plain-host-neither-herdr-nor-orca)).
 
-After either launch, read this repository's lock pid from `<state-dir>/graph.lock` and confirm it:
+After any launch, read this repository's lock pid from `<state-dir>/graph.lock` and confirm it:
 `kill -0 <pid>` succeeds, `ps -o pgid= -p <pid>` prints that same pid (its own session group;
 ppid 1 is never proof on its own), walk its ppid chain and verify no agent session is an ancestor,
 and read `<state-dir>/daemon.log`. No live holder means the launch failed: read the log, fix the
 cause and run the same line again — never a second daemon beside a live holder, and never a
-visible split to watch it; the daemon-placed board is the live surface.
+visible split to watch it.
+
+- **On herdr (`HERDR_ENV=1`)**: the daemon-placed board is the live surface.
+- **On Orca (`TERM_PROGRAM=Orca` and non-empty `ORCA_TERMINAL_HANDLE`)**: the daemon-placed board is the live surface.
 
 Detached beats are product-owned, one per (tier, seat), from the repository root, through the
 shipped lifecycle verbs — never a hand-rolled setsid plus nohup wrapper, pidfile or shell loop:

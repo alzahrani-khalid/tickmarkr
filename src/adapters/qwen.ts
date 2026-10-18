@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process";
 import type { TickmarkrConfig } from "../config/config.js";
 import type { Task } from "../graph/schema.js";
+import { withoutHostSession } from "../drivers/host-env.js";
 import { parseWorkerResult, type ClassifiedWorkerResult } from "./prompt.js";
 import {
   type Assignment,
@@ -158,7 +159,7 @@ export function parseQwenResult(raw: string, nonce: string): ClassifiedWorkerRes
 }
 
 function probeQwen(): AuthHealth {
-  const result = spawnSync("qwen", ["--version"], { encoding: "utf8", timeout: 10_000 });
+  const result = spawnSync("qwen", ["--version"], { encoding: "utf8", timeout: 10_000, env: withoutHostSession() });
   if (result.error || result.status !== 0) return { installed: false, authed: false, models: [] };
   const version = (result.stdout || result.stderr).trim().split("\n")[0] ?? "";
   if (!QWEN_VERSION_IDENTITY.test(version)) {

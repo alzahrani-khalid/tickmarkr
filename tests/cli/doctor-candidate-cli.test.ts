@@ -179,11 +179,12 @@ describe("doctor candidate-CLI truth (v1.86 T12)", () => {
       resolveClaudeAliasIdentity: () => undefined,
     });
     const health = JSON.parse(readFileSync(join(repo, ".tickmarkr", "doctor.json"), "utf8")) as Record<string, AuthHealth>;
-    // herdr and tickmarkr-binary are ENVIRONMENT rows (driver presence, Q142s self-shadow of the
-    // operator's live PATH) — real truths of the machine, not candidate-CLI matrix content. The
-    // self-shadow row fires on any dev tree versioned ahead of the global install, which is every
-    // pre-publish tree by construction.
-    const rows = capabilityRows(out).filter((row) => row.id !== "herdr" && row.id !== "tickmarkr-binary");
+    // herdr, host, locale and tickmarkr-binary are ENVIRONMENT rows (driver presence, the launching
+    // host and locale of queue rows 196/197, Q142s self-shadow of the operator's live PATH) — real
+    // truths of the machine, not candidate-CLI matrix content. The self-shadow row fires on any dev
+    // tree versioned ahead of the global install, which is every pre-publish tree by construction.
+    const environmentRows = new Set(["herdr", "host", "visibility", "locale", "tickmarkr-binary"]);
+    const rows = capabilityRows(out).filter((row) => !environmentRows.has(row.id));
     const adapterIds = new Set(adapters.map((adapter) => adapter.id));
     const adapterRows = rows.filter((row) => adapterIds.has(row.id));
     const advisoryRows = rows.filter((row) => !adapterIds.has(row.id));

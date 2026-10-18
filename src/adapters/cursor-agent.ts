@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process";
 import type { TickmarkrConfig } from "../config/config.js";
 import type { Task } from "../graph/schema.js";
+import { withoutHostSession } from "../drivers/host-env.js";
 import { probeVersion } from "./claude-code.js";
 import { parseWorkerResult } from "./prompt.js";
 import { type Assignment, type BillingChannel, channelsFromConfig, type Invocation, MODEL_ID_RE, shq, type TrustDialog, type WorkerAdapter } from "./types.js";
@@ -65,7 +66,7 @@ export const cursorAgent: WorkerAdapter = {
   // network (1.35s wall vs 0.34s CPU, RESEARCH A1); 15s timeout + fail-open covers offline.
   // Live-verified 2026-07-10, cursor-agent 2026.07.08.
   listModels: async () => {
-    const r = spawnSync("cursor-agent", ["--list-models"], { encoding: "utf8", timeout: 15000 });
+    const r = spawnSync("cursor-agent", ["--list-models"], { encoding: "utf8", timeout: 15000, env: withoutHostSession() });
     return r.error || r.status !== 0 ? [] : parseCursorModels(r.stdout || "");
   },
 };

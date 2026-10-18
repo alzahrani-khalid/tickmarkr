@@ -14,6 +14,21 @@ import ts from "typescript";
 import { shq } from "../../src/adapters/types.js";
 import { NATIVE_PROCESS_TITLE_ENV, resetTitleEnvironmentForTests, setTitleEnvironmentForTests, TITLE_PREFLIGHT_TIMEOUT_MS } from "../../src/run/title-environment.js";
 
+// Queue row 194 (D-2102): the run preflight's refs probe runs before any lock, so another checkout's run
+// may write under refs/tickmarkr while the probe cleans up. `refsRace` lands that write at the instant the
+// probe removes refs/tickmarkr (whichever fs removal it uses), before the removal itself executes.
+const refsRace = vi.hoisted(() => ({ dir: undefined as string | undefined, write: undefined as (() => void) | undefined }));
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  const strike = (path: unknown) => {
+    const write = refsRace.write;
+    if (write && String(path) === refsRace.dir) { refsRace.write = undefined; write(); }
+  };
+  const rmSync = ((path: Parameters<typeof actual.rmSync>[0], options?: Parameters<typeof actual.rmSync>[1]) => { strike(path); return actual.rmSync(path, options); }) as typeof actual.rmSync;
+  const rmdirSync = ((path: Parameters<typeof actual.rmdirSync>[0], options?: Parameters<typeof actual.rmdirSync>[1]) => { strike(path); return actual.rmdirSync(path, options); }) as typeof actual.rmdirSync;
+  return { ...actual, rmSync, rmdirSync, default: { ...actual, rmSync, rmdirSync } };
+});
+
 const processGroupExists = (groupId: number): boolean => {
   try {
     process.kill(-groupId, 0);
@@ -824,6 +839,28 @@ describe("refs probe (OBS-983/984)", () => {
     } finally {
       chmodSync(refsDir, 0o755);
     }
+  });
+
+  test("test: a ref another process writes under refs/tickmarkr at the moment the run preflight's refs probe removes that directory survives the probe, while an empty preflight tree the probe leaves is still removed, so a cleanup that removes recursively fails", async () => {
+    const git = (repo: string, ...args: string[]) => execFileSync("git", ["-C", repo, ...args], { encoding: "utf8" }).trim();
+    const repo = makeRepo({ "a.txt": "a\n" });
+    const head = git(repo, "rev-parse", "HEAD");
+    refsRace.dir = join(realpathSync(join(repo, ".git", "refs")), "tickmarkr");
+    refsRace.write = () => { git(repo, "update-ref", "refs/tickmarkr/preserved/other", head); };
+    try {
+      expect((await probeRefsWritable(repo)).ok).toBe(true);
+      expect(refsRace.write).toBeUndefined(); // the foreign write landed at the removal
+    } finally {
+      refsRace.write = undefined;
+    }
+    expect(git(repo, "rev-parse", "refs/tickmarkr/preserved/other")).toBe(head);
+    expect(git(repo, "for-each-ref", "refs/tickmarkr/preflight")).toBe("");
+
+    const clean = makeRepo({ "b.txt": "b\n" });
+    expect((await probeRefsWritable(clean)).ok).toBe(true);
+    const refs = realpathSync(join(clean, ".git", "refs"));
+    expect(existsSync(join(refs, "tickmarkr", "preflight"))).toBe(false);
+    expect(existsSync(join(refs, "tickmarkr"))).toBe(false);
   });
 
   test("probeRefsWritable returns ok false on non-git directory", async () => {

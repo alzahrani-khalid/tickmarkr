@@ -1126,7 +1126,7 @@ describe("§4.4 LiveBench table staleness lint", () => {
 test("Production doctor --fix-only repairs a seeded supported runner-ignore defect and reports the actual diff/result with adapters present and zero fake probe calls. Normal explicitly requested doctor probing still invokes the configured fake probe and records its result. A PATH with all CLIs removed, an unchanged broken runner reported repaired or fix-only falling through into probes fails.", async () => {
   const repo = makeRepo({
     "package.json": JSON.stringify({ scripts: { test: "vitest run" } }),
-    "vitest.config.ts": `export default { test: { include: ["**/*.test.ts"], exclude: ["node_modules"] } };`,
+    "vitest.config.mjs": `export default { test: { include: ["**/*.test.ts"], exclude: ["node_modules"] } };`,
   });
   withOverlay(repo, `tiers:
   fixture:
@@ -1151,7 +1151,7 @@ test("Production doctor --fix-only repairs a seeded supported runner-ignore defe
   expect(repaired).toContain("repair verification: pass");
   expect(repaired).toContain("repair diff:");
   expect(repaired).toContain(".tickmarkr/**");
-  expect(readFileSync(join(repo, "vitest.config.ts"), "utf8")).toContain(".tickmarkr/**");
+  expect(readFileSync(join(repo, "vitest.config.mjs"), "utf8")).toContain(".tickmarkr/**");
 
   const probed = await doctor(["--probe"], repo, [adapter], { banner: false });
   expect(probe).toHaveBeenCalledOnce();

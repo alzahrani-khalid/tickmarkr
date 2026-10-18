@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { promisify } from "node:util";
 import { assertGitTrust, GitTrustRefusal, protectedGitEnv } from "../run/git-trust.js";
+import { withoutHostSession } from "../drivers/host-env.js";
 import { CODEX_GIT_GRANT, codex } from "./codex.js";
 import { type AuthHealth, type CodexCommitStatus, shq, type WorkerAdapter } from "./types.js";
 
@@ -63,7 +64,7 @@ export const codexSandboxArgs = (p: CodexCommitProbe, grant = CODEX_GIT_GRANT): 
 ];
 /** A sandbox executing `grant`; production is CODEX_GIT_GRANT. Tests pass a mutant grant to prove discrimination. */
 export const codexSandboxFor = (grant: string): CodexSandbox => async (p) =>
-  (await exec("sh", codexSandboxArgs(p, grant), { cwd: p.worktree, timeout: 20_000, signal: p.signal })).stdout;
+  (await exec("sh", codexSandboxArgs(p, grant), { cwd: p.worktree, timeout: 20_000, signal: p.signal, env: withoutHostSession() })).stdout;
 export const codexSandbox: CodexSandbox = codexSandboxFor(CODEX_GIT_GRANT);
 
 const holds = (path: string, token: string): boolean => {
