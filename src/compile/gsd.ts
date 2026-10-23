@@ -1,9 +1,9 @@
-import { spawnSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative } from "node:path";
 import { parse as parseYaml } from "yaml";
 import { AcceptanceItemSchema, TIERS, type AcceptanceItem, type RunGraph, validateGraph } from "../graph/schema.js";
 import { CompileError, assertWriteScope, inferShape, sha256, type WriteDirective } from "./common.js";
+import { gitSync } from "../run/git.js";
 import { classifyContextPath } from "./native.js";
 
 // GSD artifact front-end (spec v1.3): one GSD *plan* is one tickmarkr *task* — a plan is
@@ -332,9 +332,10 @@ export function compileGsd(src: string, root?: string): RunGraph {
   // Match native context reachability against the committed tree. This block only obtains the HEAD
   // snapshot; classifyContextPath remains the single authority for missing, untracked, and glob refs.
   const gitDir = dirname(files[0]);
-  const top = spawnSync("git", ["-C", gitDir, "rev-parse", "--show-toplevel"], { encoding: "utf8", maxBuffer: 1 << 28 });
+  // queue row 2 item b: protected git; a trust refusal throws instead of reading as "no repository"
+  const top = gitSync(gitDir, ["rev-parse", "--show-toplevel"]);
   // -z (queue row 71): without it a non-ASCII path is C-quoted and a tracked ref reads as untracked
-  const tree = spawnSync("git", ["-C", gitDir, "ls-tree", "--full-tree", "-r", "--name-only", "-z", "HEAD"], { encoding: "utf8", maxBuffer: 1 << 28 });
+  const tree = gitSync(gitDir, ["ls-tree", "--full-tree", "-r", "--name-only", "-z", "HEAD"]);
   const repoRoot = typeof top.stdout === "string" ? top.stdout.trim() : "";
   // `root` is the repository whose worktrees will consume these refs. A source nested inside some
   // unrelated repository (as with vendored fixtures) must not be judged against that outer tree.

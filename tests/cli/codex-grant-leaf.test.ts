@@ -1,20 +1,24 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { join } from "node:path";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
-import { CODEX_GIT_GRANT, codex } from "../../src/adapters/codex.js";
-import { codexSandboxFor, recordCodexCommit } from "../../src/adapters/codex-commit-check.js";
-import type { AuthHealth } from "../../src/adapters/types.js";
-import { makeRepo, makeTestTempDir, quietGitInit } from "../helpers/tmprepo.js";
+import { renderCodexGitGrant, codex } from "../../src/adapters/codex.js";
+import { codexSandboxArgs, codexSandboxFor, probeCodexCommit, recordCodexCommit } from "../../src/adapters/codex-commit-check.js";
+import { FakeAdapter } from "../../src/adapters/fake.js";
+import { channelsFromConfig, shq, type Assignment, type AuthHealth, type WorkerAdapter, type WorkerLaunchContext } from "../../src/adapters/types.js";
+import type { TickmarkrConfig } from "../../src/config/config.js";
+import { SubprocessDriver } from "../../src/drivers/subprocess.js";
+import type { ExecutorDriver } from "../../src/drivers/types.js";
+import type { Effort, Task } from "../../src/graph/schema.js";
+import { runDaemon } from "../../src/run/daemon.js";
+import { checkedAuthority } from "../../src/run/git-trust.js";
+import { Journal } from "../../src/run/journal.js";
+import { authedModels, COMMIT, makeRepo, makeTestTempDir, quietGitInit, setupRepo, T } from "../helpers/tmprepo.js";
 
-// v2.8.0 T1 (rows 17/18, D-910). BASE is the 2.6.6–2.7.9 fragment this task replaces (gitdir when distinct,
-// whole common objects/refs/logs, printf '"%s"'); SHIPPED and D910 are the broad grants before it.
+// Queue rows 2 and 151 (D-2112, D-910): historical broad grants remain negative controls.
 const BASE = `-c "sandbox_workspace_write.writable_roots=[$(tkr_common=$(git rev-parse --path-format=absolute --git-common-dir); tkr_gitdir=$(git rev-parse --absolute-git-dir); if [ "$tkr_gitdir" != "$tkr_common" ]; then printf '"%s",' "$tkr_gitdir"; fi; printf '"%s/objects","%s/refs","%s/logs"' "$tkr_common" "$tkr_common" "$tkr_common")]"`;
 const SHIPPED = `-c "sandbox_workspace_write.writable_roots=[\\"$(git rev-parse --path-format=absolute --git-common-dir)\\"]"`;
 const D910 = `-c "sandbox_workspace_write.writable_roots=[\\"$(git rev-parse --path-format=absolute --git-common-dir)\\",\\"$(git rev-parse --absolute-git-dir)\\"]"`;
-// the leaf grant minus its reflog leaf, rebuilt from the production bytes
-const REFLOG_DENIED = CODEX_GIT_GRANT.replace(`,"%s/%s","%s/logs/%s"' "$tkr_common" "$tkr_leaf" "$tkr_common" "$tkr_leaf"`, `,"%s/%s"' "$tkr_common" "$tkr_leaf"`);
-
 // A token-free stand-in for `codex`. Every launch logs its argv and each writable_roots value as TOML sees it:
 // legal only as an array of basic strings without escapes (any Unicode but the double quote, the backslash and
 // the controls TOML forbids raw — every C0 but tab, and DEL), whose roots are then the strings verbatim.
@@ -78,9 +82,9 @@ const prompt = () => {
   return p;
 };
 /** The two production WORKER builders: invoke()'s headless worker form and the interactive TUI. */
-const builders = (p: string): Array<[string, string]> => [
-  ["invoke().command", codex.invoke({} as never, "/wt", { model: "fixture-model", channel: "sub", tier: "mid" }, { promptFile: p }).command],
-  ["interactiveCommand", codex.interactiveCommand(p, "fixture-model")!],
+const builders = (p: string, ctx: WorkerLaunchContext): Array<[string, string]> => [
+  ["invoke().command", codex.invoke({} as never, ctx.cwd, { model: "fixture-model", channel: "sub", tier: "mid" }, { promptFile: p, ...ctx }).command],
+  ["interactiveCommand", codex.interactiveCommand(p, "fixture-model", undefined, ctx)!],
 ];
 type Grant = { legal: true; roots: string[] } | { legal: false; value: string };
 /** Runs `command` through sh at `cwd` and returns the one writable_roots grant the fake codex parsed. */
@@ -105,6 +109,101 @@ const linkedFixture = (branch: string) => {
   return { repo, common, linked, gitdir: join(common, "worktrees", name) };
 };
 
+test("test: the Codex worker launches from invoke and the interactive builder, shell-run at a linked task worktree on its assigned branch, hand a recording codex the gitdir, common objects and branch-leaf ref and reflog roots byte-equal to today's while a recording git sees no launch-time invocation, so a launch shell still running git or drifting roots fails", () => {
+  const branch = "tickmarkr/run-x--T1";
+  const { repo, common, linked, gitdir } = linkedFixture(branch);
+  const bin = makeTestTempDir("recording-git-");
+  const calls = join(bin, "calls");
+  writeFileSync(join(bin, "git"), '#!/bin/sh\necho called >> "$GIT_CALLS"\nexit 99\n', { mode: 0o755 });
+  for (const [name, command] of builders(prompt(), { cwd: linked, branch, repoRoot: repo })) {
+    expect(roots(launch(command, linked, { PATH: `${bin}:${process.env.PATH}`, GIT_CALLS: calls })), name)
+      .toEqual([gitdir, `${common}/objects`, `${common}/refs/heads/tickmarkr`, `${common}/logs/refs/heads/tickmarkr`]);
+    expect(existsSync(calls)).toBe(false);
+  }
+});
+
+test("test: for ordinary and linked checkouts whose commondir or gitfile is intact or names a foreign repository, with HEAD on the assigned branch, another slashless branch or detached, the grant names no foreign path, is empty for a foreign pointer or double-quote path and loses only ref and reflog roots off the assigned branch, so following commondir or HEAD fails", () => {
+  for (const kind of ["ordinary", "linked"]) for (const pointer of ["intact", "commondir", "gitfile"]) {
+    for (const head of ["assigned", "other", "detached"]) for (const byte of ["safe", 'double"quote']) {
+      const parent = makeTestTempDir("grant-table-");
+      const repo = join(parent, byte);
+      mkdirSync(repo);
+      quietGitInit(repo);
+      git(repo, "-c", "user.name=t", "-c", "user.email=t@t.invalid", "commit", "--no-gpg-sign", "--allow-empty", "-qm", "base");
+      // Queue row 2 (D-2112): an ordinary gitfile can redirect while the run's anchor stays trusted.
+      let common = join(realpathSync(repo), ".git");
+      if (kind === "ordinary" && pointer === "gitfile") {
+        common = join(realpathSync(parent), `${byte}-store`);
+        git(repo, "init", "-q", "--separate-git-dir", common);
+      }
+      const anchor = join(parent, "anchor");
+      git(repo, "worktree", "add", "-q", "--detach", anchor);
+      const branch = "tickmarkr/run-x--T1";
+      const cwd = kind === "ordinary" ? repo : join(parent, "task");
+      if (kind === "ordinary") git(repo, "checkout", "-qb", branch);
+      else git(repo, "worktree", "add", "-q", "-b", branch, cwd);
+      const gitdir = kind === "ordinary" ? common : join(common, "worktrees", "task");
+      const ownHead = git(repo, "rev-parse", "HEAD");
+      writeFileSync(join(gitdir, "HEAD"), head === "assigned" ? `ref: refs/heads/${branch}\n` : head === "other" ? "ref: refs/heads/main\n" : `${ownHead}\n`);
+      const foreign = makeRepo({ "foreign.txt": "foreign" });
+      if (pointer === "commondir") writeFileSync(join(gitdir, "commondir"), `${foreign}/.git\n`);
+      if (pointer === "gitfile") writeFileSync(join(cwd, ".git"), `gitdir: ${foreign}/.git\n`);
+      const base = [...(kind === "linked" ? [gitdir] : []), `${common}/objects`];
+      const want = pointer !== "intact" || byte !== "safe" ? [] : head !== "assigned" ? base
+        : [...base, `${common}/refs/heads/tickmarkr`, `${common}/logs/refs/heads/tickmarkr`];
+      const ctx = { cwd, branch, repoRoot: anchor };
+      for (const [name, command] of builders(prompt(), ctx)) {
+        const got = roots(launch(command, cwd));
+        expect(got, `${name} ${kind} ${pointer} ${head} ${byte}`).toEqual(want);
+        expect(got.some(root => root.startsWith(foreign))).toBe(false);
+      }
+    }
+  }
+  expect(renderCodexGitGrant()).toBe("-c 'sandbox_workspace_write.writable_roots=[]'");
+  const valid = linkedFixture("task");
+  const context = { cwd: valid.linked, branch: "task", repoRoot: valid.repo };
+  for (const key of ["cwd", "branch", "repoRoot"] as const) expect(renderCodexGitGrant({ ...context, [key]: undefined })).toBe(renderCodexGitGrant());
+  const outside = makeTestTempDir("outside-");
+  expect(renderCodexGitGrant({ cwd: outside, branch: "task", repoRoot: outside })).toBe(renderCodexGitGrant());
+}, 120_000);
+
+test("test: worktree paths holding an apostrophe, a space, a dollar expression or a backtick reach the recording codex as exact roots from one shell-quoted grant argument, every substitution marker file left unwritten, so a grant quoted for shell expansion fails", () => {
+  for (const byte of ["apost'rophe", "a space", "$(touch marker-dollar)", "`touch marker-backtick`"]) {
+    const repo = join(makeTestTempDir("grant-bytes-"), byte);
+    mkdirSync(repo);
+    quietGitInit(repo);
+    git(repo, "-c", "user.name=t", "-c", "user.email=t@t.invalid", "commit", "--no-gpg-sign", "--allow-empty", "-qm", "base");
+    const cwd = join(repo, "task");
+    const branch = "tickmarkr/run-x--T1";
+    git(repo, "worktree", "add", "-q", "-b", branch, cwd);
+    const common = join(realpathSync(repo), ".git");
+    const ctx = { cwd, branch, repoRoot: repo };
+    for (const [name, command] of builders(prompt(), ctx)) {
+      expect(roots(launch(command, cwd)), name).toEqual([`${common}/worktrees/task`, `${common}/objects`, `${common}/refs/heads/tickmarkr`, `${common}/logs/refs/heads/tickmarkr`]);
+      const { args } = JSON.parse(readFileSync(log, "utf8")) as { args: string[] };
+      const grants = args.filter(arg => arg.startsWith("sandbox_workspace_write.writable_roots="));
+      expect(grants).toHaveLength(1);
+      expect(args[args.indexOf(grants[0]!) - 1]).toBe("-c");
+      for (const marker of ["marker-dollar", "marker-backtick"]) expect(existsSync(join(cwd, marker))).toBe(false);
+    }
+  }
+});
+
+// Queue row 2 (D-2112): keep the complete forbidden-byte rule, including path and branch leaf sources.
+test("the literal grant refuses every forbidden root character and preserves Unicode paths", () => {
+  for (const byte of ['"', '\\', ...Array.from({ length: 31 }, (_, i) => String.fromCharCode(i + 1)), "\x7f", "é 日本"]) {
+    const repo = join(makeTestTempDir("grant-forbidden-"), `repo${byte}`);
+    mkdirSync(repo);
+    quietGitInit(repo);
+    const expected = byte === "é 日本" ? [`${realpathSync(repo)}/.git/objects`, `${realpathSync(repo)}/.git/refs/heads`, `${realpathSync(repo)}/.git/logs/refs/heads`] : [];
+    for (const [, command] of builders(prompt(), { cwd: repo, branch: "main", repoRoot: repo })) expect(roots(launch(command, repo))).toEqual(expected);
+  }
+  const repo = makeRepo({ "base": "base" });
+  const branch = 'x","/tmp/evil/y';
+  git(repo, "checkout", "-qb", branch);
+  for (const [, command] of builders(prompt(), { cwd: repo, branch, repoRoot: repo })) expect(roots(launch(command, repo))).toEqual([]);
+}, 120_000);
+
 test("test: both worker builders in a linked worktree on branch tickmarkr/run-x--T1 grant only its gitdir the common objects and the refs/heads/tickmarkr ref and reflog leaves so a sandboxed commit lands on that branch while moving main or another branch or creating a tag or a stash is denied versus whole common refs and logs letting each through", () => {
   const p = prompt();
   const branch = "tickmarkr/run-x--T1";
@@ -117,14 +216,16 @@ test("test: both worker builders in a linked worktree on branch tickmarkr/run-x-
     "git tag t1",
     `echo y >> a.txt && git ${id} stash push -q`,
   ].map((c) => `{ ${c}; } 2>/dev/null`).join("; ") + "; true";
-  for (const [name, command] of builders(p)) {
-    expect(command, name).toContain(CODEX_GIT_GRANT);
+  for (const name of ["invoke().command", "interactiveCommand"]) {
     for (const grant of ["leaf", "base"] as const) {
       const { repo, common, linked, gitdir } = linkedFixture(branch);
+      const ctx = { cwd: linked, branch, repoRoot: repo };
+      const command = builders(p, ctx).find(([builder]) => builder === name)![1];
+      expect(command, name).toContain(renderCodexGitGrant(ctx));
       const base = git(repo, "rev-parse", "HEAD");
       const reflog = () => readFileSync(join(common, "logs", "refs", "heads", "tickmarkr", "run-x--T1"), "utf8").trimEnd().split("\n");
       const before = reflog().length;
-      const g = launch(grant === "leaf" ? command : command.replace(CODEX_GIT_GRANT, BASE), linked, { FAKE_CODEX_RUN: work });
+      const g = launch(grant === "leaf" ? command : command.replace(renderCodexGitGrant(ctx), BASE), linked, { FAKE_CODEX_RUN: work });
       const tip = git(repo, "rev-parse", `refs/heads/${branch}`);
       // the worker's commit lands on its branch, ref and reflog, under either grant
       expect(tip, `${name} ${grant}`).not.toBe(base);
@@ -145,75 +246,6 @@ test("test: both worker builders in a linked worktree on branch tickmarkr/run-x-
         expect(git(repo, "rev-parse", "--verify", "-q", "refs/stash"), name).toMatch(/^[0-9a-f]{40}$/);
       }
     }
-  }
-}, 120_000);
-
-test("test: the closed root table gives a branch without a slash the refs/heads leaf and a detached HEAD no refs or reflog root and an ordinary checkout no gitdir root and a directory outside any repository an empty array versus the base fragment granting slash objects refs and logs outside any repository", () => {
-  const p = prompt();
-  const { repo, common, linked, gitdir } = linkedFixture("task");
-  const detached = join(makeTestTempDir("codex-leaf-detached-"), "det");
-  git(repo, "worktree", "add", "-q", "--detach", detached, "HEAD");
-  const outside = join(makeTestTempDir("codex-leaf-outside-"), "plain");
-  mkdirSync(outside);
-  // outside any repository: git may not search above the fixture's parent
-  const noRepo = { GIT_CEILING_DIRECTORIES: dirname(outside) };
-  const heads = [`${common}/refs/heads`, `${common}/logs/refs/heads`];
-  const rows: Array<[string, string, string[], Record<string, string>?]> = [
-    ["branch without a slash", linked, [gitdir, `${common}/objects`, ...heads]],
-    ["detached HEAD", detached, [join(common, "worktrees", "det"), `${common}/objects`]],
-    ["ordinary checkout", repo, [`${common}/objects`, ...heads]],
-    ["outside any repository", outside, [], noRepo],
-  ];
-  for (const [name, command] of builders(p)) {
-    for (const [row, cwd, want, env] of rows) expect(roots(launch(command, cwd, env)), `${name}: ${row}`).toEqual(want);
-    // the base fragment grants /objects, /refs and /logs at the filesystem root outside any repository
-    expect(roots(launch(command.replace(CODEX_GIT_GRANT, BASE), outside, noRepo)), name).toEqual(["/objects", "/refs", "/logs"]);
-  }
-}, 120_000);
-
-test("test: a repository path holding spaces and non-ASCII letters keeps every root exact while a path holding a double quote or the sequence quote comma quote or a backslash or any one C0 character from U+0001 to U+001F or DEL looped over that whole table through both worker builders yields one empty TOML-legal roots array versus the base fragment injecting a second root or emitting a string TOML forbids", () => {
-  const p = prompt();
-  const fixture = (dirName: string) => {
-    const repo = join(makeTestTempDir("codex-leaf-path-"), dirName);
-    mkdirSync(repo);
-    quietGitInit(repo);
-    git(repo, "-c", "user.name=t", "-c", "user.email=t@t.invalid", "commit", "-q", "--no-gpg-sign", "--allow-empty", "-m", "i");
-    return { repo, common: join(realpathSync(repo), ".git") };
-  };
-  // spaces and non-ASCII letters: every root exact, through a linked worktree on a slashed branch (git
-  // sanitizes a worktree NAME, so the spaces live in the repository path every root carries)
-  const { repo, common } = fixture("re po é ü 日本");
-  const linked = join(dirname(repo), "wt-é-日");
-  git(repo, "worktree", "add", "-q", "-b", "tickmarkr/run-é", linked, "HEAD");
-  for (const [name, command] of builders(p)) {
-    expect(roots(launch(command, linked)), name).toEqual([join(common, "worktrees", "wt-é-日"), `${common}/objects`, `${common}/refs/heads/tickmarkr`, `${common}/logs/refs/heads/tickmarkr`]);
-  }
-  // the closed forbidden set, one character per repository path
-  const forbidden = ['"', '","', "\\", ...Array.from({ length: 31 }, (_, i) => String.fromCharCode(i + 1)), "\x7f"];
-  for (const ch of forbidden) {
-    const { repo: bad, common: badCommon } = fixture(`re${ch}po`);
-    const label = JSON.stringify(ch);
-    for (const [name, command] of builders(p)) {
-      expect(launch(command, bad), `${name} ${label}`).toEqual({ legal: true, roots: [] });
-      const base = launch(command.replace(CODEX_GIT_GRANT, BASE), bad);
-      const exact = [`${badCommon}/objects`, `${badCommon}/refs`, `${badCommon}/logs`];
-      if (ch === '","') {
-        // TOML-legal, yet each root splits in two: a second root injected per root
-        expect(roots(base), name).toEqual(exact.flatMap((r) => r.split(ch)));
-      } else if (ch === "\t") {
-        // the one control TOML allows raw: the base grants the tab path, the leaf refuses it (a declared cost)
-        expect(roots(base), name).toEqual(exact);
-      } else {
-        expect(base.legal, `${name} ${label}`).toBe(false);
-      }
-    }
-  }
-  // a branch name is a root's source too: a refname holding quote comma quote cannot inject a root
-  const { repo: br, common: brCommon } = fixture("branchy");
-  git(br, "checkout", "-q", "-b", 'x","/tmp/evil/y');
-  for (const [name, command] of builders(p)) {
-    expect(launch(command, br), name).toEqual({ legal: true, roots: [] });
-    expect(roots(launch(command.replace(CODEX_GIT_GRANT, BASE), br)), name).toEqual([`${brCommon}/objects`, `${brCommon}/refs`, `${brCommon}/logs`]);
   }
 }, 120_000);
 
@@ -244,8 +276,16 @@ test("test: doctor's commit probe executing the leaf grant through the fake code
   expect(snapshot()).toEqual(before);
 
   // the same bytes minus the reflog leaf: the branch commit cannot append its reflog
-  expect(REFLOG_DENIED).not.toBe(CODEX_GIT_GRANT);
-  expect(await probe(REFLOG_DENIED)).toBe("protected");
+  const denied = async (p: Parameters<ReturnType<typeof codexSandboxFor>>[0]) => {
+    const grant = renderCodexGitGrant({ cwd: p.worktree, branch: p.branch, repoRoot: repo });
+    const roots = [join(common, "worktrees", p.branch), `${common}/objects`, `${common}/refs/heads`];
+    const mutant = `-c '${"sandbox_workspace_write.writable_roots=" + JSON.stringify(roots)}'`;
+    expect(mutant).not.toBe(grant);
+    return codexSandboxFor(mutant)(p);
+  };
+  const health: Record<string, AuthHealth> = { codex: { installed: true, authed: true, models: [] } };
+  await recordCodexCommit([codex], health, repo, denied);
+  expect(health.codex!.codexCommit).toBe("protected");
   expect(snapshot()).toEqual(before);
 
   // the broad grants still write shared hooks/config members
@@ -254,3 +294,81 @@ test("test: doctor's commit probe executing the leaf grant through the fake code
     expect(snapshot(), broad).toEqual(before);
   }
 }, 300_000);
+
+// Queue row 2 item a (D-2112, D-2114): the real command reaches a recording child through each daemon transport.
+class GrantSeat extends FakeAdapter {
+  constructor(script: string, private readonly path: string) { super(script); this.id = "codex"; this.vendor = "openai"; }
+  override async probe() { return { installed: true, authed: true, models: ["gpt-6-sol"], modelAuth: authedModels(["gpt-6-sol"]) }; }
+  override channels(cfg: TickmarkrConfig) { return channelsFromConfig(this.id, cfg); }
+  override invoke(task: Task, cwd: string, a: Assignment, ctx: Parameters<WorkerAdapter["invoke"]>[3]) {
+    const command = codex.invoke(task, cwd, a, ctx).command;
+    return { command: `PATH=${shq(this.path)} ${command} && ${super.invoke(task, cwd, a, ctx).command}` };
+  }
+  override interactiveCommand(prompt: string, model: string, effort?: Effort, ctx?: WorkerLaunchContext) {
+    const command = codex.interactiveCommand(prompt, model, effort, ctx);
+    return command === null ? null : `PATH=${shq(this.path)} ${command} && ${super.interactiveCommand(prompt, model)}`;
+  }
+}
+
+const driver = (): ExecutorDriver => {
+  const inner = new SubprocessDriver();
+  return { id: "interactive-test", interactive: true,
+    slot: inner.slot.bind(inner), run: inner.run.bind(inner), read: inner.read.bind(inner),
+    status: inner.status.bind(inner), close: inner.close.bind(inner), notify: inner.notify.bind(inner),
+    waitOutput: inner.waitOutput.bind(inner), waitAgentStatus: inner.waitAgentStatus.bind(inner), worktree: inner.worktree.bind(inner),
+  } as ExecutorDriver;
+};
+
+test("test: daemon runs dispatching a Codex worker over the headless transport, the interactive transport and the oversized-prompt fallback hand the recording codex child that task's worktree gitdir and branch leaf, and doctor's probe hands it the renderer's grant for its fixture with no grant lookup there, so a transport or the probe left without context fails", async () => {
+  const bin = makeTestTempDir("daemon-codex-bin-");
+  const log = join(bin, "record.jsonl");
+  const home = join(bin, "codex-home");
+  mkdirSync(home);
+  vi.stubEnv("CODEX_HOME", home);
+  writeFileSync(join(bin, "codex"), `#!${process.execPath}\nconst fs = require('node:fs');\nfs.appendFileSync(${JSON.stringify(log)}, JSON.stringify({ cwd: process.cwd(), args: process.argv.slice(2) }) + '\\n');\n`, { mode: 0o755 });
+  const path = `${bin}:${process.env.PATH}`;
+  for (const mode of ["headless", "interactive", "oversized"]) {
+    const { repo, scriptPath, fake } = setupRepo(
+      [T("T1", { ...(mode === "oversized" ? { goal: "x".repeat(950_000) } : {}), routingHints: { pin: { via: "codex", model: "gpt-6-sol" } } })],
+      { tasks: { T1: [{ shell: `echo done > done.txt && ${COMMIT} done`, result: { ok: true, summary: "done" } }] } },
+      `visibility: { worker: ${mode === "headless" ? "print" : "interactive"} }\n`,
+    );
+    const runId = `run-grant-${mode}`;
+    const result = await runDaemon(repo, { adapters: [new GrantSeat(scriptPath, path), fake], runId, ...(mode === "headless" ? {} : { driver: driver() }) });
+    expect(result.done, mode).toEqual(["T1"]);
+    const records = readFileSync(log, "utf8").trim().split("\n").map(line => JSON.parse(line) as { cwd: string; args: string[] });
+    const child = records.at(-1)!;
+    const common = checkedAuthority(repo)!.common;
+    const branch = `tickmarkr/${runId}--T1`;
+    const gitdir = join(common, "worktrees", branch.replaceAll("/", "-"));
+    const values = child.args.filter(arg => arg.startsWith("sandbox_workspace_write.writable_roots="));
+    expect(values, mode).toHaveLength(1);
+    const roots = JSON.parse(values[0]!.split("=").slice(1).join("=")) as string[];
+    // Queue row 2 (D-2112): compare the actual task registration, not the test driver's command.
+    expect(roots, mode).toEqual([gitdir, `${common}/objects`, `${common}/refs/heads/tickmarkr`, `${common}/logs/refs/heads/tickmarkr`]);
+    expect(child.cwd).toContain("T1");
+    expect(child.args[0]).toBe(mode === "interactive" ? "-a" : "exec");
+    const events = Journal.open(repo, runId).read();
+    expect(events.some(e => e.event === "worker-mode-fallback")).toBe(mode === "oversized");
+
+    vi.stubEnv("PATH", path);
+    const marker = join(bin, `probe-git-${mode}`);
+    const guard = makeTestTempDir("probe-no-lookup-");
+    writeFileSync(join(guard, "git"), `#!/bin/sh\nprintf called > ${shq(marker)}\nexit 99\n`, { mode: 0o755 });
+    const probe = await probeCodexCommit(repo, async p => {
+      const grant = renderCodexGitGrant({ cwd: p.worktree, branch: p.branch, repoRoot: repo });
+      expect(grant).not.toBe(renderCodexGitGrant());
+      expect(codexSandboxArgs(p)[1]).toContain(` ${grant} -- sh `);
+      const priorPath = process.env.PATH;
+      try {
+        process.env.PATH = `${guard}:${path}`;
+        await codexSandboxFor()(p);
+      } finally { process.env.PATH = priorPath; }
+      expect(existsSync(marker)).toBe(false);
+      const child = JSON.parse(readFileSync(log, "utf8").trim().split("\n").at(-1)!) as { args: string[] };
+      expect(child.args).toContain(`sandbox_workspace_write.writable_roots=${JSON.stringify([checkedAuthority(p.worktree)!.gitdir, `${common}/objects`, `${common}/refs/heads`, `${common}/logs/refs/heads`])}`);
+      return "unreadable";
+    });
+    expect(probe.status).toBe("unknown");
+  }
+}, 120_000);

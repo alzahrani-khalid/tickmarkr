@@ -132,7 +132,9 @@ export const RunGraphSchema = z
       source: z.enum(SPEC_SOURCES),
       paths: z.array(z.string()),
       hash: z.string(),
-      // Q11 compile half: an author-declared ref only. Runtime Git resolution/enforcement is later.
+      // Q11 / queue row 220: an author-declared ref, proven at run and resume start against the run's
+      // starting commit (HEAD for a run, the recorded run-start base for a resume) by ancestry or patch-id;
+      // drifted or unresolvable, the run or resume is refused before it writes anything. Never rebased onto.
       base: z.string().min(1).optional(),
     }),
     tasks: z.array(TaskSchema).min(1),

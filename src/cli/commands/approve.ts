@@ -1,11 +1,11 @@
 import { graphDefinitionHash, loadGraph, saveGraph, taskDefinitionFingerprint } from "../../graph/graph.js";
 import { filesGlob } from "../../graph/files-glob.js";
-import { execFileSync } from "node:child_process";
 import { userInfo } from "node:os";
 import { allAdapters } from "../../adapters/registry.js";
 import { channelKey } from "../../adapters/types.js";
 import { loadConfig } from "../../config/config.js";
 import { integrationBranch } from "../../run/merge.js";
+import { gitSync } from "../../run/git.js";
 import { integrationAnchor } from "../../run/daemon.js";
 import { separabilityErrors, surfaceErrors, taskBudgetErrors } from "../../compile/collateral.js";
 import { GATE_NAMES, type GateName, type Task } from "../../graph/schema.js";
@@ -513,14 +513,11 @@ function mergedSiblingExempt(
   const commit = typeof merge?.data.commit === "string" ? merge.data.commit : undefined;
   if (commit === undefined || !FULL_OBJECT_ID.test(commit)) return false;
   const ref = requesterRef();
-  try {
-    execFileSync("git", ["rev-parse", "--verify", ref], { cwd, stdio: "ignore" });
-    execFileSync("git", ["merge-base", "--is-ancestor", commit, ref], { cwd, stdio: "ignore" });
-  } catch {
-    return false;
-  }
-  return true;
+  return gitOk(cwd, "rev-parse", "--verify", ref) && gitOk(cwd, "merge-base", "--is-ancestor", commit, ref);
 }
+
+/** Queue row 2 item b: approve's git runs through the protected path; a trust refusal throws, never reads as false. */
+const gitOk = (cwd: string, ...args: string[]): boolean => gitSync(cwd, args).status === 0;
 
 /** The conflicting unordered pairs of separabilityErrors, in its exact emission order. */
 function separabilityPairs(tasks: ReadonlyArray<Pick<Task, "id" | "files" | "deps">>): Array<{ a: string; b: string }> {
@@ -595,24 +592,11 @@ function failedTaskCommitsAhead(cwd: string, journal: Journal, runId: string, ta
   const preservedRef = preserved?.data.ref as string | undefined;
   let ref = taskRef;
   if (preservedRef) {
-    try {
-      execFileSync("git", ["rev-parse", "--verify", taskRef], { cwd, stdio: "ignore" });
-      execFileSync("git", ["merge-base", "--is-ancestor", taskRef, preservedRef], { cwd, stdio: "ignore" });
-      ref = preservedRef;
-    } catch {
-      try {
-        execFileSync("git", ["rev-parse", "--verify", taskRef], { cwd, stdio: "ignore" });
-      } catch {
-        ref = preservedRef;
-      }
-    }
+    if (gitOk(cwd, "rev-parse", "--verify", taskRef) && gitOk(cwd, "merge-base", "--is-ancestor", taskRef, preservedRef)) ref = preservedRef;
+    else if (!gitOk(cwd, "rev-parse", "--verify", taskRef)) ref = preservedRef;
   }
-  try {
-    const out = execFileSync("git", ["rev-list", "--count", `${integration.base}..${ref}`], { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
-    return { ref, base, count: Number.parseInt(out.trim(), 10) || 0 };
-  } catch {
-    return { ref, base, count: 0 };
-  }
+  const out = gitSync(cwd, ["rev-list", "--count", `${integration.base}..${ref}`]);
+  return { ref, base, count: out.status === 0 ? Number.parseInt(out.stdout.trim(), 10) || 0 : 0 };
 }
 
 // The status is command OUTPUT, not a typed sibling result: the registered approve function returns

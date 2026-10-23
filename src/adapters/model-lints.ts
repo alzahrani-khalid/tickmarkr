@@ -1,8 +1,8 @@
-import { spawnSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { DEFAULT_CONFIG, type TickmarkrConfig, TIER_RANK, type Tier } from "../config/config.js";
 import { filesGlob } from "../graph/files-glob.js";
+import { gitSync } from "../run/git.js";
 import type { Task } from "../graph/schema.js";
 import { piModelVendor } from "./pi.js";
 import { buildTaskPrompt } from "./prompt.js";
@@ -319,7 +319,8 @@ const GLOB_CHARS = /[*?{[]/;
 // and `-z` is load-bearing correctness, not economy: without it git quotes any non-ASCII path, so
 // every Arabic/UTF-8 tracked file read as absent.
 function baseTreeAtHead(dir: string): BaseTree | undefined {
-  const git = (...args: string[]) => spawnSync("git", ["-C", dir, ...args], { encoding: "utf8", maxBuffer: 1 << 28 });
+  // queue row 2 item b: protected git; a trust refusal throws instead of reading as "no base tree"
+  const git = (...args: string[]) => gitSync(dir, args);
   const top = git("rev-parse", "--show-toplevel");
   const tree = git("ls-tree", "--full-tree", "-r", "-l", "-z", "HEAD");
   if (top.status !== 0 || tree.status !== 0 || typeof top.stdout !== "string" || typeof tree.stdout !== "string") return undefined;
@@ -355,7 +356,7 @@ function measureBytes(tree: BaseTree, rel: string): number | undefined {
 }
 
 function absentContextReason(root: string, path: string): "gitignored" | "untracked" | "absent" {
-  if (spawnSync("git", ["-C", root, "check-ignore", "-q", "--", path]).status === 0) return "gitignored";
+  if (gitSync(root, ["check-ignore", "-q", "--", path]).status === 0) return "gitignored";
   return existsSync(join(root, path)) ? "untracked" : "absent";
 }
 

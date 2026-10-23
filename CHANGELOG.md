@@ -2,6 +2,54 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v2.8.6 — the P0 batch: a proven base, decidable re-parks, protected operator git and a Codex grant that trusts only tickmarkr
+
+**v2.8.6** closes the four defects queued as SHIP P0. Its work comes from one `tickmarkr run`, plus two changes gated afterwards by
+`tickmarkr verify`:
+- run-20261022-173430-…1419 merged two tasks;
+- the operator-git change was verified after that run parked it;
+- the Codex grant was verified after a second run parked it on suite placement alone.
+
+Each passed build, lint, evidence, scope, its acceptance criteria, a cross-vendor review and the full suite.
+
+- **A spec's declared `base:` is proven before a run or a resume writes anything (queue row 220).** Compile parsed `base:` but nothing
+  enforced it, so a run silently started from whatever the checkout held.
+  - `run` and `resume` now prove the declared base against the run's starting commit (a resume against its recorded start, never
+    the current HEAD). A run that proceeds records the base and the proof method (ancestry or patch-id) on its start row.
+  - A drifted base is refused with every missing commit's id, subject and paths. An unresolvable one is refused with git's own
+    words. Either refusal leaves no journal row, worktree, branch or lock behind.
+- **A resumed run no longer turns an undecided review-cap park into one no decision can release (queue row 225).** A resume re-parked
+  the task with nothing in between, and the newer park lost its failed gate, so `approve --uphold`, `--waive` and `--recheck` were all
+  refused.
+  - A newer gate-fail park now inherits its predecessor's failed gate when nothing happened in between: no dispatch, no gate result
+    and no approval, except one that a refusal voided. Only a gate-fail predecessor passes its gate on.
+  - `status`, `approve` and the cockpit offer and bind the same verbs. A restore row and `status` announce upheld feedback only when
+    a newer approval actually funds the attempt.
+- **Every git process an operator command starts runs through the protected path (queue row 2, D-1042).**
+  - `init`, `approve`, `compile` (native and GSD), `plan`'s model lints and `doctor`'s Codex commit probe ran raw git under the
+    operator's own config. A worker-planted `core.fsmonitor`, a per-worktree config file, an included config or a hook could
+    therefore run as the operator.
+  - They now run git with `core.fsmonitor=false` and `core.hooksPath=/dev/null` applied last, and with the trust check (pinned in a
+    linked checkout) on the directory git actually targets.
+  - A trust refusal now surfaces as the command's error instead of an empty answer.
+- **The Codex worker grant is computed by tickmarkr from the trusted git authority (queue row 2).**
+  - Before: the launch shell ran git in the task worktree. A worker could rewrite the worktree's `commondir` or gitfile to widen the
+    next attempt's writable roots into another repository, or re-point HEAD to a slashless branch to gain every branch.
+  - Now: the grant comes from the trusted common directory and the branch tickmarkr checked out, and is passed as literal,
+    shell-quoted roots, so the launch shell runs no git. Any refusal or foreign pointer grants nothing, and doctor's probe uses the
+    same renderer.
+  - The gate state directory and the gate-evidence subject read the trusted authority too.
+
+Declared, still open:
+- Queue row 2's item (c), the D-1046 reap test.
+- Its residuals: a `config.worktree` planted after the trust check, git older than 2.54 running unpinned with a warning, and the
+  daemon's object reads in a worker checkout.
+- Queue row 231: the worker-harvest rule can reap a live print-mode Claude worker mid model turn once the attempt has commits. It was
+  found in this release's own run and is scoped for 2.8.7.
+- Queue row 232: a gate red that follows an operator waive offers no repair verb.
+- Queue row 200: an attempt chain that spans two vendors can leave no frontier reviewer.
+- Queue row 224(b): a pinned task's funded repair is parked on its pin. It is scoped for 2.8.7.
+
 ## v2.8.5 — tickmarkr on a plain agent-session host: the Claude Desktop Code tab, linked session worktrees and seats that no longer inherit their launcher's session
 
 **v2.8.5** makes tickmarkr work from a host with neither herdr nor Orca, such as the Claude Desktop Code tab, and closes the defects a

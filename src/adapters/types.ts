@@ -408,6 +408,9 @@ export class SettledTrailerTracker {
   }
 }
 
+/** Queue row 2 item a (D-2112, D-2114): context owned by the task dispatcher. */
+export interface WorkerLaunchContext { cwd: string; branch: string; repoRoot: string }
+
 export interface WorkerAdapter {
   id: string;
   vendor: string;
@@ -431,7 +434,7 @@ export interface WorkerAdapter {
   // first-liveness beat does not re-route it: the review ceiling bounds it instead (a dead launch costs that ceiling).
   paneReviewBuffersOutput?: boolean;
   // v1.2: launch the CLI's real interactive TUI with the prompt injected; null = adapter can't → print fallback
-  interactiveCommand(promptFile: string, model: string, effort?: Effort): string | null;
+  interactiveCommand(promptFile: string, model: string, effort?: Effort, ctx?: WorkerLaunchContext): string | null;
   // v1.69 T6: launch the real TUI without a prompt, wait for readiness, then inject one seed turn.
   // When present, the daemon uses this instead of the single-command interactiveCommand path.
   interactiveSeed?: InteractiveSeed;
@@ -446,7 +449,7 @@ export interface WorkerAdapter {
   // ONLY the contextTokens-known requirement at the daemon retry seam: a KNOWN over-threshold
   // context still dispatches fresh, and the escalation ladder bounds the resume chain.
   resumeUnknownContext?: boolean;
-  invoke(task: Task, cwd: string, a: Assignment, ctx: { promptFile: string }): Invocation;
+  invoke(task: Task, cwd: string, a: Assignment, ctx: { promptFile: string; branch?: string; repoRoot?: string }): Invocation;
   parse(output: string, nonce: string): WorkerResult;
   // v1.5 MODEL-01: non-interactive model-list surface; absent = adapter can't list (claude-code#12612).
   // Called ONLY by `tickmarkr doctor` — never probe/plan/run/daemon (zero-token tests, no dispatch blocking).

@@ -217,7 +217,7 @@ describe.skipIf(!existsSync(codebaseDocs))("docs-truth-stack", () => {
     const block = codexDocBlock(readFileSync(join(codebaseDocs, "INTEGRATIONS.md"), "utf8"));
     // v2.6.6 T9 (K): the grant is named, its roots listed, and the shipped common-root grant is gone;
     // v2.8.0 T1: the roots are the refs/heads leaf pair, and the closed forbidden set yields []
-    expect(block).toContain("`CODEX_GIT_GRANT`");
+    expect(block).toContain("`renderCodexGitGrant`");
     for (const root of ["`<common>/objects`", "`<common>/refs/heads/<D>`", "`<common>/logs/refs/heads/<D>`", "`[]`"]) expect(block).toContain(root);
     expect(block).not.toContain('writable_roots=[\\"$(git rev-parse --path-format=absolute --git-common-dir)\\"]');
     for (const status of ["`allowed`", "`protected`", "`escape`", "`unknown`"]) expect(block).toContain(status);
@@ -316,4 +316,21 @@ describe.skipIf(!existsSync(codebaseDocs))("docs-truth-stack", () => {
       expect(EXPORT_EXCLUDED_FILES).toContain(missing);
     }
   });
+});
+
+// Queue row 2 item a (D-2112, D-2114): documentation describes the literal authority-bound launch.
+test("Cite the changed codex rows of docs/codebase/INTEGRATIONS.md that describe the grant as literal roots rendered by tickmarkr from the trusted authority and the assigned branch, with the empty array on any refusal, and the named-residuals line no longer listing the grant lookup, versus a diff that still documents the shell fragment", () => {
+  const block = codexDocBlock(readFileSync(join(codebaseDocs, "INTEGRATIONS.md"), "utf8"));
+  expect(block).toContain("literal roots rendered by tickmarkr from the trusted authority");
+  expect(block).toContain("assigned branch supplied by the daemon");
+  expect(block).toContain("any trust refusal, foreign authority");
+  expect(block).toContain("yields the empty array `[]`");
+  expect(block).toContain("One `-c` argument is quoted with `shq`; the launch shell runs no git");
+  expect(block).not.toContain("$(git");
+  expect(block).not.toContain("$(tkr_common");
+  const residuals = block.split("\n").find(line => line.includes("NAMED RESIDUALS"))!;
+  expect(residuals).toContain("config.worktree");
+  expect(residuals).toContain("older than 2.54");
+  expect(residuals).not.toContain("grant discovery");
+  expect(residuals).not.toContain("grant lookup");
 });

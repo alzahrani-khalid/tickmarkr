@@ -1,4 +1,3 @@
-import { spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { basename, dirname, join, resolve } from "node:path";
 import { filesGlob } from "../graph/files-glob.js";
@@ -7,6 +6,7 @@ import {
   type AcceptanceItem, type Pin, GATE_NAMES, GRAPH_ROUTING_MODES, ORACLES, renderAcceptanceItem, SHAPES, TIERS,
   type RunGraph, type Task, validateGraph,
 } from "../graph/schema.js";
+import { gitSync } from "../run/git.js";
 import { criterionReadsOnly } from "./collateral.js";
 import { CompileError, inferShape, sha256 } from "./common.js";
 
@@ -22,7 +22,8 @@ import { CompileError, inferShape, sha256 } from "./common.js";
 // `ls-tree -r HEAD` enumerates that tree once; per-path `cat-file -e HEAD:<path>` is the same oracle
 // one path at a time, and one spawn beats N.
 function trackedAtHead(dir: string): { root: string; tracked: Set<string> } | undefined {
-  const git = (...args: string[]) => spawnSync("git", ["-C", dir, ...args], { encoding: "utf8", maxBuffer: 1 << 28 });
+  // queue row 2 item b: every compile git runs through the protected path; a trust refusal throws, never fails open
+  const git = (...args: string[]) => gitSync(dir, args);
   const top = git("rev-parse", "--show-toplevel");
   // --full-tree is load-bearing: without it `ls-tree` scopes to the CWD's subtree and prints paths
   // relative to it, so a spec in specs/ would see only specs/-relative names and misjudge every
@@ -133,7 +134,7 @@ function symlinkScopeWarnings(file: string, tasks: readonly Task[], base: string
     .map((task) => ({ id: task.id, match: filesGlob(task.files.map((entry) => entry.replace(/^\.\//, ""))) }));
   if (!scoped.length || !repositoryRoot(file)) return [];
   const tree = base ?? "HEAD";
-  const git = (...args: string[]) => spawnSync("git", ["-C", dirname(file), ...args], { encoding: "utf8", maxBuffer: 1 << 28 });
+  const git = (...args: string[]) => gitSync(dirname(file), args);
   const failed = (r: ReturnType<typeof git>) => r.error || r.signal || r.status !== 0 || typeof r.stdout !== "string";
   const why = (r: ReturnType<typeof git>) => r.signal ? `signal ${r.signal}` : r.status === null ? "git did not run" : `git exit ${r.status}`;
   const advisory = (what: string, r: ReturnType<typeof git>) =>
@@ -288,11 +289,7 @@ function repositoryRoot(file: string): string | undefined {
 function testsAtHead(root: string): HeadTest[] {
   const cached = headTestCache.get(root);
   if (cached) return cached;
-  const grep = spawnSync(
-    "git",
-    ["-C", root, "grep", "-I", "-n", "-e", "", "HEAD", "--", "tests/*.test.ts", "tests/**/*.test.ts"],
-    { encoding: "utf8", maxBuffer: 1 << 25 },
-  );
+  const grep = gitSync(root, ["grep", "-I", "-n", "-e", "", "HEAD", "--", "tests/*.test.ts", "tests/**/*.test.ts"]);
   if (grep.status !== 0 || typeof grep.stdout !== "string") {
     headTestCache.set(root, []);
     return [];
@@ -420,11 +417,7 @@ function criterionScopeFinding(
 // 20-task spec compiled in seconds and the committed-spec corpus test timed out. Fail-open like
 // testsAtHead: no git answer means no corpus, and the lint stays quiet rather than wrong.
 function repoFileList(root: string): string[] {
-  const ls = spawnSync(
-    "git",
-    ["-C", root, "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
-    { encoding: "utf8", maxBuffer: 1 << 25 },
-  );
+  const ls = gitSync(root, ["ls-files", "-z", "--cached", "--others", "--exclude-standard"]);
   if (ls.status !== 0 || typeof ls.stdout !== "string") return [];
   return ls.stdout.split("\0").filter(Boolean).sort();
 }
@@ -998,7 +991,8 @@ acceptance is required on every task (a nested list of observable outcomes).
     mode: partner-led | risk-based | staff-led — this engagement's routing mode
           (loses only to an explicit \`run --mode\` flag)
     base: commit-or-ref — optional declared source base; the declaration must begin at column zero
-                          (runtime enforcement happens before a run)
+                          (proven against the run's starting commit at run and resume start; a drifted
+                          or unresolvable base is refused before anything is written)
 
   Fields available per task:
     goal:        outcome the task must achieve (defaults to the title if omitted)

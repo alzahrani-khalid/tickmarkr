@@ -375,7 +375,8 @@ test("the fable alias stamp reads claude-fable-5-1 with a dated comment and the 
     // consult and the model probe carry no writable_roots; workers keep the grant through invoke().
     // 2026-10-12 (v2.8.0 T1, rows 17/18): repinned when CODEX_GIT_GRANT became the TOML-safe leaf
     // (gitdir when distinct, common objects, the refs/heads/<D> ref and reflog pair; [] on refusal).
-    codex: "d1dc7f84e0868d73c043e1b0d00c17c15ec4b1caf28e9540dcac331cab3b2888",
+    // Queue row 2 (D-2112, D-2114): absent launch context renders a literal empty grant.
+    codex: "0fe97fadb49908a977eddd4c4969772e2697f17582f28decfae0b0829983df39",
     "cursor-agent": "b7ce2cbb18f5ccb2749739ffcc80c2d036b72193554189e4f07eff11ce16d8de",
     opencode: "15ce06482a58b5096642974bf4f9a1c3031b62b4aa4de46e6d8038f6cb94ad82",
     pi: "d8c6ab42a4052ee982ead3e119d02d4df8734429b36a129a9e926cf1c2f8c3b7",

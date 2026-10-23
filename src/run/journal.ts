@@ -150,15 +150,36 @@ export function recordedBinding(value: unknown): DecisionBinding | undefined {
   return typeof line === "number" && Number.isSafeInteger(line) && line > 0 && typeof ts === "string" ? { line, ts } : undefined;
 }
 
-/** The newest failed gate before a park row — the gate a waive of that park would satisfy. */
+/**
+ * The newest failed gate before a park row — the gate a waive of that park would satisfy.
+ * Queue row 225 (D-2111): a gate-fail park with no task-dispatch, gate-result (passing or failing) or
+ * unvoided task-approved row of its task since its previous task-human — a resume's re-park at the same
+ * review round cap — inherits that park's failed gate, the walk continuing past it. A task-approved row
+ * an approval-refused row of the task voids before the newer park (its lines name it, or it names none)
+ * does not end the walk; refusals are read here directly, never through foldDecisions (which calls this).
+ */
 export function failedGateBeforePark(events: readonly JournalEvent[], taskId: string, parkIndex: number): GateName | undefined {
+  let inherits = events[parkIndex]?.data.kind === "gate-fail";
+  let refused: Set<unknown> | "all" = new Set();
   for (let i = parkIndex - 1; i >= 0; i -= 1) {
     const event = events[i]!;
     if (event.taskId !== taskId) continue;
-    if (event.event === "task-approved" || event.event === "task-human" || event.event === "task-dispatch") return undefined;
-    if (event.event === "gate-result" && event.data.pass === false
-        && typeof event.data.gate === "string" && (GATE_NAMES as readonly string[]).includes(event.data.gate)) {
-      return event.data.gate as GateName;
+    if (event.event === "task-human") {
+      // Only a gate-fail predecessor has a failed gate to hand down; any other kind ends the walk as today.
+      if (!inherits || event.data.kind !== "gate-fail") return undefined;
+      // The walk now reads the previous park's own span, under that park's own refusals.
+      refused = new Set();
+    } else if (event.event === APPROVAL_REFUSED) {
+      if (refused !== "all") refused = Array.isArray(event.data.lines) ? new Set([...refused, ...event.data.lines]) : "all";
+    } else if (event.event === "task-approved") {
+      if (!inherits || (refused !== "all" && !refused.has(physicalLine(events, i)))) return undefined;
+    } else if (event.event === "task-dispatch") {
+      return undefined;
+    } else if (event.event === "gate-result") {
+      if (event.data.pass === false && typeof event.data.gate === "string" && (GATE_NAMES as readonly string[]).includes(event.data.gate)) {
+        return event.data.gate as GateName;
+      }
+      inherits = false; // a passing gate-result keeps the park's own span
     }
   }
   return undefined;
@@ -367,6 +388,17 @@ export function upheldFeedbackByTask(events: JournalEvent[]): Map<string, string
     }
   }
   return upheld;
+}
+
+/**
+ * Queue row 225 (D-2111): a restore names upheld feedback only when it is FUNDED — the task carries an
+ * active uphold brief AND an effective task-approved row newer than its newest task-human. A restore
+ * that only re-parks at the same cap announces nothing, so a spent uphold is never re-announced.
+ * `decided` is already read through the decision fold (effectiveEvents).
+ */
+export function restoresUpheldFeedback(decided: JournalEvent[], taskId: string): boolean {
+  const newest = (event: string): number => decided.reduce((at, e, i) => e.taskId === taskId && e.event === event ? i : at, -1);
+  return newest("task-approved") > newest("task-human") && upheldFeedbackByTask(decided).has(taskId);
 }
 
 // v1.85 T3 (ruling R4 identity): one blocking finding, identified by CLASS + canonical PATH + stable
@@ -2170,7 +2202,7 @@ export class Journal {
           const folded = !decisionRow && data.fatal === true ? [...priorEvents, { ts: new Date().toISOString(), event, data }] : priorEvents;
           return decisionRow ? reduced : { ...reduced, owedChecks: foldOwedChecks(folded, join(this.dir, "..", "..", "..")) };
         })()
-      : event === "resume-restore" && rowTaskId && upheldFeedbackByTask(effectiveEvents(priorEvents)).has(rowTaskId)
+      : event === "resume-restore" && rowTaskId && restoresUpheldFeedback(effectiveEvents(priorEvents), rowTaskId)
         ? {
             ...inputData,
             upheldFeedbackRestoredFor: rowTaskId,

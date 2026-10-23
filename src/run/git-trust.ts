@@ -117,7 +117,7 @@ const stampOf = (path: string): string | undefined => {
 const isSymlink = (path: string): boolean => { try { return lstatSync(path).isSymbolicLink(); } catch { return false; } };
 
 /** The checked authority for `cwd` (see assertGitTrust), with the canonical worktree root the gitfile sits in. */
-function checkedAuthority(cwd: string): (Authority & { worktree: string; stamp?: string }) | undefined {
+export function checkedAuthority(cwd: string): (Authority & { worktree: string; stamp?: string }) | undefined {
   const dotGit = dotGitOf(cwd);
   if (!dotGit) return undefined;
   const { gitdir, common, linked } = authorityOf(dotGit);

@@ -2,10 +2,10 @@ import { execFileSync } from "node:child_process";
 import { chmodSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
-import { CODEX_GIT_GRANT, codex } from "../../src/adapters/codex.js";
+import { renderCodexGitGrant, codex } from "../../src/adapters/codex.js";
 import { type CodexSandbox, codexCommitHeadline, codexSandbox, codexSandboxFor, recordCodexCommit } from "../../src/adapters/codex-commit-check.js";
 import * as registry from "../../src/adapters/registry.js";
-import type { AuthHealth, WorkerAdapter } from "../../src/adapters/types.js";
+import type { AuthHealth, WorkerAdapter, WorkerLaunchContext } from "../../src/adapters/types.js";
 import { statusRow } from "../../src/brand.js";
 import { doctor } from "../../src/cli/commands/doctor.js";
 import { plan } from "../../src/cli/commands/plan.js";
@@ -19,7 +19,12 @@ import { authedModels, makeRepo, makeTestTempDir } from "../helpers/tmprepo.js";
 // common-root grant and D-910's rejected [common, gitdir]. LOGS_DENIED is the grant minus its reflog leaf (v2.8.0 T1).
 const SHIPPED = `-c "sandbox_workspace_write.writable_roots=[\\"$(git rev-parse --path-format=absolute --git-common-dir)\\"]"`;
 const D910 = `-c "sandbox_workspace_write.writable_roots=[\\"$(git rev-parse --path-format=absolute --git-common-dir)\\",\\"$(git rev-parse --absolute-git-dir)\\"]"`;
-const LOGS_DENIED = CODEX_GIT_GRANT.replace(`,"%s/%s","%s/logs/%s"' "$tkr_common" "$tkr_leaf" "$tkr_common" "$tkr_leaf"`, `,"%s/%s"' "$tkr_common" "$tkr_leaf"`);
+const sandboxWithoutLogs: CodexSandbox = (p) => {
+  const grant = renderCodexGitGrant({ cwd: p.worktree, branch: p.branch, repoRoot: p.commonDir });
+  const mutant = grant.replace(`,"${p.commonDir}/logs/refs/heads"`, "");
+  expect(mutant).not.toBe(grant);
+  return codexSandboxFor(mutant)(p);
+};
 
 // A token-free stand-in for `codex` (no model, no network). The builders' launches only log argv. `codex
 // sandbox` models workspace-write explicitly: every path under the git common dir that no granted writable
@@ -69,8 +74,8 @@ afterEach(() => {
 });
 
 const git = (cwd: string, ...args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
-const workerHeadless = (prompt: string, model = "fixture-model") =>
-  codex.invoke({} as never, "/wt", { model, channel: "sub", tier: "mid" }, { promptFile: prompt }).command;
+const workerHeadless = (prompt: string, model = "fixture-model", ctx?: WorkerLaunchContext) =>
+  codex.invoke({} as never, ctx?.cwd ?? "/wt", { model, channel: "sub", tier: "mid" }, { promptFile: prompt, ...ctx }).command;
 const loggedArgv = (): string[] => JSON.parse(readFileSync(argvLog, "utf8")) as string[];
 const grantedRoots = (): string[] => {
   const grants = (JSON.parse(readFileSync(argvLog, "utf8")) as string[]).filter((a) => a.startsWith("sandbox_workspace_write.writable_roots="));
@@ -85,7 +90,6 @@ test("both production Codex builders expand exactly the minimal linked grant ver
   git(repo, "worktree", "add", "-q", "-b", "task", linked, "HEAD");
   const prompt = join(makeTestTempDir("codex-prompt-"), "prompt.md");
   writeFileSync(prompt, "fixture prompt");
-  expect(LOGS_DENIED).not.toBe(CODEX_GIT_GRANT);
 
   // v2.8.0 T1: both branches ("task", "main") hold no slash, so their leaf is refs/heads itself
   const objectsRefsLogs = [`${common}/objects`, `${common}/refs/heads`, `${common}/logs/refs/heads`];
@@ -97,16 +101,18 @@ test("both production Codex builders expand exactly the minimal linked grant ver
   ];
   for (const { cwd, minimal, d910 } of rows) {
     // v2.6.7 T4 (D-1046): the two WORKER builders — invoke()'s headless worker form and the interactive TUI
-    const builders = [workerHeadless(prompt), codex.interactiveCommand(prompt, "fixture-model")!];
+    const ctx = { cwd, branch: cwd === linked ? "task" : "main", repoRoot: repo };
+    const grant = renderCodexGitGrant(ctx);
+    const builders = [workerHeadless(prompt, "fixture-model", ctx), codex.interactiveCommand(prompt, "fixture-model", undefined, ctx)!];
     for (const command of builders) {
-      expect(command).toContain(CODEX_GIT_GRANT);
+      expect(command).toContain(grant);
       execFileSync("sh", ["-c", command], { cwd });
       expect(grantedRoots(), command).toEqual(minimal);
       expect(grantedRoots()).not.toContain(common);
       // the same builder bytes carrying the shipped or D-910 fragment expand the broad sets this grant replaces
-      execFileSync("sh", ["-c", command.replace(CODEX_GIT_GRANT, SHIPPED)], { cwd });
+      execFileSync("sh", ["-c", command.replace(grant, SHIPPED)], { cwd });
       expect(grantedRoots()).toEqual([common]);
-      execFileSync("sh", ["-c", command.replace(CODEX_GIT_GRANT, D910)], { cwd });
+      execFileSync("sh", ["-c", command.replace(grant, D910)], { cwd });
       expect(grantedRoots()).toEqual(d910);
     }
   }
@@ -152,7 +158,7 @@ test("doctor worker-grant probe discriminates the allowed protected escape unkno
   }
 
   // protected: without common/logs the real branch commit fails on its reflog; the controls stay readable
-  const logsDenied = await doctorProbe(codexSandboxFor(LOGS_DENIED));
+  const logsDenied = await doctorProbe(sandboxWithoutLogs);
   expect(logsDenied.codexCommit).toBe("protected");
   expect(logsDenied.note).toContain("linked-worktree git metadata protected — the sandbox wrote an ordinary worktree file but denied the linked-worktree commit");
   expect(snapshot()).toEqual(before);
@@ -262,12 +268,6 @@ test("production Codex commands satisfy the closed role-access table G1 G3 versu
     ["headlessCommand (judge/review/consult/probe-model)", codex.headlessCommand(prompt, "fixture-model")],
     ["documented Headless", documented("Headless")],
   ];
-  const worker = [
-    ["invoke().command", workerHeadless(prompt)],
-    ["documented Worker headless", documented("Worker headless \\(`invoke\\(\\)`\\)")],
-    ["interactiveCommand", codex.interactiveCommand(prompt, "fixture-model")!],
-    ["documented Interactive", documented("Interactive")],
-  ];
   for (const [cwd, expected] of [[linked, [gitdir, ...objectsRefsLogs]], [repo, objectsRefsLogs]] as const) {
     for (const [name, command] of nonWorker) {
       const argv = launch(command!, cwd);
@@ -276,6 +276,15 @@ test("production Codex commands satisfy the closed role-access table G1 G3 versu
       // the documented rows are the zero-config rendering; the production builder adds per-server suppression
       if (!name!.startsWith("documented")) expect(argv, name).toContain("mcp_servers.fixture-mcp.enabled=false");
     }
+    const ctx = { cwd, branch: cwd === linked ? "task" : "main", repoRoot: repo };
+    const grant = renderCodexGitGrant(ctx);
+    const withGrant = (command: string) => command.replace(renderCodexGitGrant(), grant);
+    const worker = [
+      ["invoke().command", workerHeadless(prompt, "fixture-model", ctx)],
+      ["documented Worker headless", withGrant(documented("Worker headless \\(`invoke\\(\\)`\\)"))],
+      ["interactiveCommand", codex.interactiveCommand(prompt, "fixture-model", undefined, ctx)!],
+      ["documented Interactive", withGrant(documented("Interactive"))],
+    ];
     for (const [name, command] of worker) {
       const argv = launch(command!, cwd);
       expect(grants(argv), name).toHaveLength(1);
@@ -287,8 +296,8 @@ test("production Codex commands satisfy the closed role-access table G1 G3 versu
     }
   }
   // the grant-bearing non-worker form this release removes would expand the worker grant: the check discriminates
-  const grantBearing = codex.headlessCommand(prompt, "fixture-model").replace(" --model ", ` ${CODEX_GIT_GRANT} --model `);
-  expect(grantBearing).toBe(workerHeadless(prompt));
+  const grantBearing = codex.headlessCommand(prompt, "fixture-model").replace(" --model ", ` ${renderCodexGitGrant({ cwd: linked, branch: "task", repoRoot: repo })} --model `);
+  expect(grantBearing).toBe(workerHeadless(prompt, "fixture-model", { cwd: linked, branch: "task", repoRoot: repo }));
   expect(grants(launch(grantBearing, linked))).toHaveLength(1);
 
   // G3: read-only linked gitdir — judge/review read verbs equal the writable control; git add fails on index.lock

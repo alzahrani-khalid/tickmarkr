@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import { DEFAULT_CONFIG } from "../../src/config/config.js";
 import { claudeCode } from "../../src/adapters/claude-code.js";
-import { CODEX_GIT_GRANT, codex, codexMcpSuppressionFlags } from "../../src/adapters/codex.js";
+import { renderCodexGitGrant, codex, codexMcpSuppressionFlags } from "../../src/adapters/codex.js";
 import { cursorAgent } from "../../src/adapters/cursor-agent.js";
 import { grok } from "../../src/adapters/grok.js";
 import { kimi } from "../../src/adapters/kimi.js";
@@ -64,15 +64,15 @@ describe("real adapters", () => {
     expect(cxInteractive).toMatch(/^codex -a never -s workspace-write --dangerously-bypass-hook-trust /);
     expect(cxInteractive).toContain(`-c 'mcp_servers={}'`);
     expect(cxInteractive).toContain("--disable plugins");
-    // v2.6.6 T9 (K): both forms carry the one minimal git grant fragment, never the shipped common-root grant
-    expect(cxInteractive).toContain(CODEX_GIT_GRANT);
+    // Queue row 2 (D-2112): without launch context both worker forms carry a literal empty grant.
+    expect(cxInteractive).toContain(renderCodexGitGrant());
     expect(cxInteractive).not.toContain('writable_roots=[\\"$(git rev-parse --path-format=absolute --git-common-dir)\\"]');
     expect(cxInteractive).toMatch(/--model 'gpt-5.2' "\$\(cat '\/p'\)"$/);
     expect(cxInteractive).not.toContain(" exec ");
     // v2.6.7 T4 (D-1046): the headless form judge/review/consult launch is grantless; the worker's invoke() keeps the grant
     expect(cxHeadless).not.toContain("writable_roots");
     const cxWorker = codex.invoke({} as never, "/wt", { model: "gpt-5.2", channel: "sub", tier: "mid" }, { promptFile: "/p" }).command;
-    expect(cxWorker).toBe(cxHeadless.replace(" --model ", ` ${CODEX_GIT_GRANT} --model `));
+    expect(cxWorker).toBe(cxHeadless.replace(" --model ", ` ${renderCodexGitGrant()} --model `));
     expect(cxHeadless).not.toContain("--full-auto");
     // OBS-125: codex 0.144.x per-worktree "Hooks need review" gate — bypass hook trust so the operator's
     // own trusted hooks run without stalling; the workspace-write sandbox stays (NOT the sandbox bypass).
@@ -91,7 +91,7 @@ describe("real adapters", () => {
       // v2.6.7 T4 (D-1046): codex's worker invoke() is its grantless headless form plus the worker grant
       const headless = ad.headlessCommand("/p", "x");
       expect(ad.invoke(task, "/w", { ...a, adapter: ad.id }, { promptFile: "/p" }).command).toBe(
-        ad.id === "codex" ? headless.replace(" --model ", ` ${CODEX_GIT_GRANT} --model `) : headless,
+        ad.id === "codex" ? headless.replace(" --model ", ` ${renderCodexGitGrant()} --model `) : headless,
       );
     }
   });

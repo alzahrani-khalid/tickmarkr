@@ -1,5 +1,4 @@
 import { createHash, randomUUID } from "node:crypto";
-import { execFileSync } from "node:child_process";
 import { type EvidenceArtifact, type GateEvidenceReceipt, type ShellReceipt } from "../run/protocol.js";
 import { EVICTION_TOMBSTONE_LIMIT, EVICTION_TOMBSTONES_FILE, type EvictionTombstone, parseEvictionTombstones } from "../run/receipt-resolver.js";
 import { existsSync, readFileSync, mkdirSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync, rmdirSync } from "node:fs";
@@ -7,7 +6,7 @@ import { availableParallelism, loadavg, tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { DEFAULT_EVIDENCE_QUOTA_BYTES, type TickmarkrConfig } from "../config/config.js";
 import type { AcceptanceItem } from "../graph/schema.js";
-import { dependencyLinkRefusal, DEFAULT_SHELL_TIMEOUT_MS, describeCapacity, type RunCapacity, sameCapacity, sh, type ShellOptions, type ShResult } from "../run/git.js";
+import { dependencyLinkRefusal, gitSync, DEFAULT_SHELL_TIMEOUT_MS, describeCapacity, type RunCapacity, sameCapacity, sh, type ShellOptions, type ShResult } from "../run/git.js";
 import { executionSignal } from "../run/execution-budget.js";
 import type { GateOutcome } from "../run/outcome.js";
 import type { GateResult } from "./types.js";
@@ -145,7 +144,10 @@ export function beginGateEvidence(cwd: string, gate: string, command: string, op
   let artifactId = /^[a-zA-Z0-9-]+$/.test(invocationId) ? invocationId : createHash("sha256").update(invocationId).digest("hex");
   let subjectCommit = opts.subjectCommit ?? null;
   if (!subjectCommit) {
-    try { subjectCommit = execFileSync("git", ["rev-parse", "HEAD"], { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim(); } catch { /* unknown subject */ }
+    try {
+      const result = gitSync(cwd, ["rev-parse", "HEAD"]);
+      if (result.status === 0 && result.stdout.trim()) subjectCommit = result.stdout.trim();
+    } catch { /* unknown subject */ }
   }
   const root = opts.artifactDir ?? join(tmpdir(), "tickmarkr-gate-evidence", createHash("sha256").update(cwd).digest("hex"));
   const inheritedEnv = { ...process.env };

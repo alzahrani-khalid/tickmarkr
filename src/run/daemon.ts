@@ -38,7 +38,7 @@ import { executionSignal, remainingExecutionMs, withExecutionBudget, withoutExec
 import { repairSelectionDecision, repairSelectionEnabled } from "./repair-selection.js";
 import { failureDisposition, reserveInfrastructureRetry } from "./recovery.js";
 import { runEnvironment } from "./environment.js";
-import { addDetachedWorktree, changeRepresented, cleanupRunWorktrees, deriveForkCap, FORK_CAP_ENV, gitHead, linkNodeModules, npmDependencyInstallCommand, npmDependencyManifestChanged, PRESERVE_COMMIT_SUBJECT, PRESERVE_PRODUCER_TRAILER, preserveWorktree, type PreserveProducer, producerFields, reflogWitness, removeWorktree, resolvedCapacity, runWithForkBudget, runWithVerificationBudget, type RunCapacity, sameCapacity, sameVerification, sh, shell, shGit, SUITE_PARENT_ENV, verificationProtocol, WORKTREE_LAYOUT_CONTRACT, WORKTREES_DIR, worktreePath } from "./git.js";
+import { addDetachedWorktree, changeRepresented, cleanupRunWorktrees, declaredBaseContainment, deriveForkCap, FORK_CAP_ENV, gitHead, linkNodeModules, npmDependencyInstallCommand, npmDependencyManifestChanged, PRESERVE_COMMIT_SUBJECT, PRESERVE_PRODUCER_TRAILER, preserveWorktree, type PreserveProducer, producerFields, reflogWitness, removeWorktree, resolvedCapacity, runWithForkBudget, runWithVerificationBudget, type RunCapacity, sameCapacity, sameVerification, sh, shell, shGit, SUITE_PARENT_ENV, verificationProtocol, WORKTREE_LAYOUT_CONTRACT, WORKTREES_DIR, worktreePath } from "./git.js";
 import { MASK } from "./redact.js";
 import { runInteractiveSeed, type InteractiveSeedResult } from "./interactive-seed.js";
 import { classifyRepairDisposition, resolveScopeHints } from "./repair-disposition.js";
@@ -1292,6 +1292,45 @@ export function integrationAnchor(events: readonly JournalEvent[]): { anchor: st
   return { anchor: merge.data.commit };
 }
 
+/**
+ * Queue row 220 (D-2111): prove the spec's declared base against the commit this run starts from — the
+ * checkout HEAD for a fresh run (recorded as its run-start baseRef), the recorded run-start baseRef for a
+ * resume, never the checkout's current HEAD: a resume never re-bases, and no run rebases onto the declared
+ * ref. Drift and an unresolvable answer throw; runDaemon calls this before it writes anything.
+ */
+async function proveDeclaredBase(repoRoot: string, runId: string, ref: string, resume: boolean):
+    Promise<{ ref: string; via: "ancestry" | "patch-id"; start: string }> {
+  const action = resume ? `resume ${runId}` : "run";
+  const remedy = `Remedy: check out a branch that contains ${ref}, or correct base: in the spec and recompile.`;
+  const unresolvable = (against: string, why: string) =>
+    new Error(`refusing to ${action}: declared base ${ref} is unresolvable against ${against} — ${why}. ${remedy}`);
+  let start: string;
+  let against: string;
+  if (resume) {
+    const recorded = Journal.open(repoRoot, runId).read().find((e) => e.event === "run-start")?.data.baseRef;
+    if (typeof recorded !== "string" || !recorded) throw unresolvable("the recorded run-start base", "the journal's run-start records no baseRef");
+    start = recorded;
+    against = `the recorded run-start base ${short(start)}`;
+  } else {
+    const head = await shGit("git rev-parse --verify HEAD^{commit}", repoRoot);
+    if (head.code !== 0) throw unresolvable("HEAD", `git said for HEAD: ${(head.stderr || head.stdout).trim()}`);
+    start = head.stdout.trim();
+    against = `HEAD ${short(start)}`;
+  }
+  const probe = await declaredBaseContainment(repoRoot, ref, start);
+  if (probe.result === "contained") return { ref, via: probe.via, start };
+  if (probe.result === "unresolvable") throw unresolvable(against, `git said for ${probe.ref}: ${probe.evidence}`);
+  const lines = await Promise.all(probe.missing.map(async (m) => {
+    const subject = await shGit(`git log -1 --format=%s ${shq(m.commit)}`, repoRoot);
+    // a drift refusal must name the subject: an unreadable one refuses as unresolvable, quoting git
+    if (subject.code !== 0) throw unresolvable(against, `git said for missing commit ${short(m.commit)}: ${(subject.stderr || subject.stdout).trim()}`);
+    return `  ${short(m.commit)} ${subject.stdout.trim()}${m.merge ? " (merge)" : ""}`
+      + ` — ${m.paths.length > 0 ? m.paths.join(", ") : "no paths"}`;
+  }));
+  throw new Error(`refusing to ${action}: declared base ${ref} has drifted from ${against} — `
+    + `${probe.missing.length} declared commit(s) missing:\n${lines.join("\n")}\n${remedy}`);
+}
+
 /** The ref legs' details: the leg, both commits, the symbolic target and the repair text. */
 export function identityDetails(leg: IntegrationLeg, state: IntegrationRefState, branch: string, runId: string, expected: string | undefined): string {
   const found = state.kind === "regular" || state.kind === "symbolic" ? state.commit : undefined;
@@ -2279,6 +2318,12 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
   let baselineFailed = false;
   try {
   graph = loadGraph(repoRoot);
+  // Queue row 220 (D-2111): a declared base is proven HERE — before any journal row (lock-reclaimed and
+  // exit-cause included), the resume anchor checks, a worktree, the integration ref or baseline capture —
+  // so a refusal leaves nothing; the finally releases the lock and repository claim. No base: unchanged.
+  const declaredBase = graph.spec.base === undefined ? undefined
+    : await proveDeclaredBase(repoRoot, runId, graph.spec.base, opts.resume === true);
+  const declaredBaseRow = declaredBase ? { declaredBase: { ref: declaredBase.ref, via: declaredBase.via } } : {};
   // One bounded snapshot supplies every dispatch. On resume the current journal still participates
   // in the fold so its task-done/ordinary-approval events can retire older evidence, but findings it
   // produced are suppressed: same-run feedback already replays those bytes and must not deliver them
@@ -3050,6 +3095,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       ...(replayedExclusions.size > 0 ? { excludedChannels: [...replayedExclusions].sort() } : {}),
       ...(opts.retryFailed ? { retryFailed: true } : {}),
       ...(opts.graphChanged ? { graphChanged: true } : {}), // OBS-1073: the release is the engagement's
+      ...declaredBaseRow,
     });
     runStarted = true;
     await placeBoard();
@@ -3093,7 +3139,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       void baselineCapture.catch(() => { baselineFailed = true; });
     }
   } else {
-    baseRef = await gitHead(repoRoot);
+    baseRef = declaredBase?.start ?? await gitHead(repoRoot); // row 220: the proven commit is the run's base
     journal.append("baseline-start", undefined, { baseRef, commands, capacity: resolvedCapacity() });
     await placeBoard();
     baselinePending = true;
@@ -3131,6 +3177,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       branch, graphDefinitionHash: graphDefinitionHash(graph),
       integrationAnchor: "journal", // 2.8.1 T2: this run creates its branch at baseRef and journals every publication with `from`
       ...(prior ? { supersedes: prior.runId } : {}),
+      ...declaredBaseRow,
     }); // graphDefinitionHash: T3 engagement identity (status+resume share it); pid: v1.13 (VIS-11) liveness; mode/modeSource: v1.51 T2; supersedes: v1.53 T5
     runStarted = true;
     // v1.53 T5: mark the prior run AFTER this run's run-start exists, so the prior journal never
@@ -5270,7 +5317,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       const icmd = retryMode === "resume"
         ? adapter.resumeCommand!(sessionId, promptFile, assignment.model, assignment.effort)
         : cfg.visibility.worker === "interactive" && driver.interactive
-          ? adapter.interactiveCommand(promptFile, assignment.model, assignment.effort)
+          ? adapter.interactiveCommand(promptFile, assignment.model, assignment.effort, { cwd: wt, branch: taskBranch, repoRoot })
           : null;
       // v1.69 T6: adapters that declare interactiveSeed launch the real TUI and inject the prompt as a
       // user turn; they do NOT need the argv-seeding surface that interactiveCommand represents.
@@ -5288,7 +5335,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       // timing can never interleave a `$(…)` with what follows it (the codex corruption class).
       const workerCmd = interactive
         ? (hasSeed ? ":" : icmd)
-        : adapter.invoke(t, wt, assignment, { promptFile }).command;
+        : adapter.invoke(t, wt, assignment, { promptFile, branch: taskBranch, repoRoot }).command;
       const dispatchScript = promptFile.replace(/\.md$/, ".sh");
       // Approval can reset the attempt counter while the old pane remains retained.
       // Its ownership claim must survive a new engagement reusing the script path.

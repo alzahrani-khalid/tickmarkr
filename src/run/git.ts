@@ -3,7 +3,7 @@ import { observeVerificationReceipt, observeVerificationSpawn, verificationJobEn
 import { executionSignal, withoutExecutionBudget } from "./execution-budget.js";
 import { commandLeaseEnvironment, repositoryLeaseEnvironment, registerRepositoryChild, withCommandLease } from "./lease.js";
 import { AsyncLocalStorage } from "node:async_hooks";
-import { execFile, execFileSync, spawn } from "node:child_process";
+import { execFile, execFileSync, spawn, spawnSync, type SpawnSyncReturns } from "node:child_process";
 import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, readlinkSync, realpathSync, rmdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { availableParallelism, homedir, tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
@@ -643,6 +643,25 @@ export async function shGitOk(cmd: string, cwd: string, own: OwnGitOptions = {})
   const r = await shGit(cmd, cwd, DEFAULT_SHELL_TIMEOUT_MS, own);
   if (r.code !== 0) throw new Error(`command failed (${r.code}): ${cmd}\n${r.stderr || r.stdout}`);
   return r.stdout;
+}
+
+/**
+ * Queue row 2 item b (D-1042, D-2112, D-2114): the SYNCHRONOUS own-git entry for operator commands — argv, no shell.
+ * It applies what shGit's own-git entry applies, from the same sources: the uncached trust check and, in a linked
+ * checkout, ownGitPin's pin, post-exit recheck and ref-view release, each derived from `dir` — the directory git
+ * targets (a site's -C directory), never the caller's cwd — and protectedGitEnv's forced core.fsmonitor=false and
+ * inert core.hooksPath appended last. A trust refusal throws GitTrustRefusal naming the path (before the spawn, or
+ * after it for a commondir changed while the child ran); every other outcome is spawnSync's own result, so a caller's
+ * fail-open answer for an ordinary git failure is unchanged.
+ */
+export function gitSync(dir: string, args: readonly string[], { env = process.env }: { env?: NodeJS.ProcessEnv } = {}): SpawnSyncReturns<string> {
+  const forced = protectedGitEnv(env);
+  const pin = ownGitPin(dir, forced);
+  try {
+    const r = spawnSync("git", args, { cwd: dir, env: pin?.env ?? forced, encoding: "utf8", maxBuffer: 1 << 28, stdio: ["ignore", "pipe", "pipe"] });
+    pin?.recheck();
+    return pin && typeof r.stdout === "string" ? { ...r, stdout: pin.unview(r.stdout), stderr: pin.unview(r.stderr) } : r;
+  } finally { pin?.release(); }
 }
 
 /**

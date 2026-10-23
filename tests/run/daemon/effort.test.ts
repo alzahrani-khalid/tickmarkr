@@ -35,12 +35,12 @@ class RecordingSeat extends FakeAdapter {
   override channels(cfg: TickmarkrConfig): BillingChannel[] {
     return channelsFromConfig(this.id, cfg);
   }
-  override invoke(task: Task, cwd: string, a: Assignment, ctx: { promptFile: string }): Invocation {
+  override invoke(task: Task, cwd: string, a: Assignment, ctx: Parameters<WorkerAdapter["invoke"]>[3]): Invocation {
     this.launches.push({ task: task.id, transport: "headless", command: this.real.invoke(task, cwd, a, ctx).command });
     return super.invoke(task, cwd, a, ctx);
   }
-  override interactiveCommand(promptFile: string, model: string, effort?: Effort): string | null {
-    this.launches.push({ task: taskOf(promptFile), transport: "interactive", command: this.real.interactiveCommand(promptFile, model, effort)! });
+  override interactiveCommand(promptFile: string, model: string, effort?: Effort, ctx?: Parameters<WorkerAdapter["interactiveCommand"]>[3]): string | null {
+    this.launches.push({ task: taskOf(promptFile), transport: "interactive", command: this.real.interactiveCommand(promptFile, model, effort, ctx)! });
     return super.interactiveCommand(promptFile, model);
   }
   override resumeCommand(sessionId: string, promptFile: string, model: string, effort?: Effort): string {

@@ -1,4 +1,3 @@
-import { execFileSync } from "node:child_process";
 import { appendFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -11,7 +10,8 @@ import { LEGACY_PREFIX, specTemplate } from "../../compile/native.js";
 import { BANNER, kvRow, legend, rule, statusRow, title } from "../../brand.js";
 import { stateDirName, tickmarkrDir } from "../../graph/graph.js";
 import { orcaHostDetected } from "../../drivers/index.js";
-import { WORKTREES_DIR } from "../../run/git.js";
+import { gitSync, WORKTREES_DIR } from "../../run/git.js";
+import { GitTrustRefusal } from "../../run/git-trust.js";
 import { Journal, type JournalEvent } from "../../run/journal.js";
 import { runLockOwner, runLockRunId, runStatusLine } from "../../run/lock.js";
 import { doctor } from "./doctor.js";
@@ -261,12 +261,8 @@ function packageName(cwd: string): string | null {
 function gitTracked(cwd: string, path: string): boolean {
   const rel = relative(cwd, path);
   if (rel.startsWith("..")) return false;
-  try {
-    execFileSync("git", ["ls-files", "--error-unmatch", "--", rel], { cwd, stdio: "ignore" });
-    return true;
-  } catch {
-    return false;
-  }
+  // queue row 2 item b: protected git; a trust refusal throws, an ordinary failure still reads as untracked
+  return gitSync(cwd, ["ls-files", "--error-unmatch", "--", rel]).status === 0;
 }
 
 async function installAgentFiles(cwd: string, force: boolean, docs: boolean, notes: string[]): Promise<void> {
@@ -383,19 +379,27 @@ function isPathInside(parentDir: string, candidatePath: string): boolean {
 
 /**
  * The ONLY way the --remove path runs git: GIT_DIR, GIT_WORK_TREE and GIT_COMMON_DIR are stripped so the repository acted on
- * is always cwd's own, and LC_ALL=C keeps stderr parseable. Throws execFileSync's error (status, stderr) unchanged.
+ * is always cwd's own, and LC_ALL=C keeps stderr parseable. Queue row 2 item b: it runs through the protected path (gitSync),
+ * whose GitTrustRefusal propagates unchanged; a failed git throws an error carrying its status and stderr.
  */
 function removeGit(cwd: string, args: string[]): string {
   const { GIT_DIR: _dir, GIT_WORK_TREE: _workTree, GIT_COMMON_DIR: _commonDir, ...env } = process.env;
-  return execFileSync("git", args, { cwd, env: { ...env, LC_ALL: "C" }, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+  const r = gitSync(cwd, args, { env: { ...env, LC_ALL: "C" } });
+  if (r.error) throw r.error;
+  if (r.status !== 0) throw Object.assign(new Error(`git ${args.join(" ")} failed (${r.status ?? r.signal})`), { status: r.status, stderr: r.stderr });
+  return r.stdout;
 }
+
+/** A trust refusal is never one of the --remove path's fail-open answers. */
+const rethrowRefusal = (error: unknown): void => { if (error instanceof GitTrustRefusal) throw error; };
 
 function isLinkedWorktree(cwd: string): boolean {
   try {
     const gitDir = removeGit(cwd, ["rev-parse", "--git-dir"]).trim();
     const gitCommonDir = removeGit(cwd, ["rev-parse", "--git-common-dir"]).trim();
     return resolve(cwd, gitDir) !== resolve(cwd, gitCommonDir);
-  } catch {
+  } catch (error) {
+    rethrowRefusal(error);
     return false;
   }
 }
@@ -412,7 +416,8 @@ function checkLiveLock(cwd: string): { pid?: number; live: boolean } | undefined
       const mainOwner = runLockOwner(mainRepo);
       if (mainOwner?.live) return mainOwner;
     }
-  } catch {
+  } catch (error) {
+    rethrowRefusal(error);
     // not a git repo
   }
 
@@ -428,6 +433,7 @@ function isGitRepo(cwd: string): boolean {
     removeGit(cwd, ["rev-parse", "--is-inside-work-tree"]);
     return true;
   } catch (err) {
+    rethrowRefusal(err);
     const e = err as { status?: unknown; stderr?: unknown; message?: string };
     const stderr = String(e.stderr ?? "").trim();
     if (e.status === 128 && stderr.startsWith("fatal: not a git repository (or any of the parent directories)")) return false;
@@ -440,6 +446,7 @@ function git(cwd: string, args: string[], message: string): string {
   try {
     return removeGit(cwd, args);
   } catch (err) {
+    rethrowRefusal(err);
     const stderr = String((err as { stderr?: unknown }).stderr ?? "").trim();
     throw new Error(stderr ? `${message}: ${stderr}` : message);
   }
@@ -539,16 +546,16 @@ function handleRemove(cwd: string): string {
   try {
     const out = removeGit(cwd, ["for-each-ref", "--format=%(refname:short)", "refs/heads/tickmarkr/"]);
     branches = out.split("\n").map((b) => b.trim()).filter(Boolean);
-  } catch {
-    // ignore
+  } catch (error) {
+    rethrowRefusal(error);
   }
 
   let preservedRefs: string[] = [];
   try {
     const out = removeGit(cwd, ["for-each-ref", "--format=%(refname)", "refs/tickmarkr/preserved/"]);
     preservedRefs = out.split("\n").map((r) => r.trim()).filter(Boolean);
-  } catch {
-    // ignore
+  } catch (error) {
+    rethrowRefusal(error);
   }
 
   for (const b of branches) {

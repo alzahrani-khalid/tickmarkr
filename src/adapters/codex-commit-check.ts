@@ -4,9 +4,10 @@ import { existsSync, mkdtempSync, readFileSync, rmdirSync, rmSync } from "node:f
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { promisify } from "node:util";
-import { assertGitTrust, GitTrustRefusal, protectedGitEnv } from "../run/git-trust.js";
+import { assertGitTrust, GitTrustRefusal } from "../run/git-trust.js";
+import { shGitOk, type OwnGitOptions } from "../run/git.js";
 import { withoutHostSession } from "../drivers/host-env.js";
-import { CODEX_GIT_GRANT, codex } from "./codex.js";
+import { renderCodexGitGrant, codex } from "./codex.js";
 import { type AuthHealth, type CodexCommitStatus, shq, type WorkerAdapter } from "./types.js";
 
 export type { CodexCommitStatus };
@@ -14,8 +15,8 @@ export type { CodexCommitStatus };
 // v2.6.5 T3 (B) → v2.6.6 T9 (K, D-912): does the Codex launch grant let a sandboxed seat commit in a tickmarkr
 // worktree — and nothing more? A linked worktree keeps its index under the MAIN repo's .git/worktrees/<name>.
 // This probe runs `codex sandbox` — a local sandboxed shell, no model call, zero tokens — through `sh` at a
-// throwaway linked worktree of the repo, carrying the EXACT worker grant bytes (CODEX_GIT_GRANT, expanded by
-// that shell at that cwd; never a rebuilt twin). Inside it: an ordinary-file write (the positive control, so
+// throwaway linked worktree of the repo, carrying the shared renderer's literal grant (queue row 2, D-2112).
+// Inside it: an ordinary-file write (the positive control, so
 // "the sandbox never ran" can never read as "protected"), a real commit on a unique fixture branch (its
 // slash-free name puts it in the refs/heads leaf: common/refs/heads and common/logs/refs/heads), and two unique
 // NON-hook files — one in <common>/hooks, one in the common root — that the grant must deny. Never a real hook or the real config. The closed table:
@@ -26,21 +27,20 @@ export type { CodexCommitStatus };
 // Advisory for routing: the verdict rides doctor.json, doctor and plan name it; routing never reads it.
 export interface CodexCommitProbe {
   worktree: string; commonDir: string; branch: string; control: string; lock: string;
-  hostileHook: string; hostileRoot: string; token: string; signal?: AbortSignal;
+  hostileHook: string; hostileRoot: string; token: string; signal?: AbortSignal; repoRoot?: string;
 }
 /** Runs the probe script inside the Codex sandbox and resolves its stdout. Injected in tests. */
 export type CodexSandbox = (probe: CodexCommitProbe) => Promise<string>;
 export interface CodexCommitResult { status: CodexCommitStatus; detail: string }
 
 const exec = promisify(execFile);
-const git = async (cwd: string, ...args: string[]) => (await exec("git", args, { cwd })).stdout.trim();
-// v2.6.7 T4: host git after the sandbox has had the fixture — validation and cleanup — runs the uncached trust
-// check and the forced child config on every call, so seat-rewritten metadata can neither run a config program
-// nor answer for the probe's commit.
-const hostGit = async (cwd: string, ...args: string[]) => {
-  assertGitTrust(cwd);
-  return (await exec("git", args, { cwd, env: protectedGitEnv(process.env) })).stdout.trim();
-};
+// v2.6.7 T4 → queue row 2 item b (D-2112): every fixture git — setup, validation and cleanup — is tickmarkr's own git
+// (shGitOk): the uncached trust check, the forced inert fsmonitor and hooks and, in a linked checkout, the pin, so
+// seat-rewritten metadata can neither run a config program or hook nor answer for the probe's commit. A trust refusal
+// rejects with GitTrustRefusal naming the path and is reported as an unknown verdict, never folded into another answer.
+const hostGit = async (cwd: string, args: string[], own?: OwnGitOptions) => (await shGitOk(["git", ...args].map(shq).join(" "), cwd, own)).trim();
+/** An ordinary git failure is `fallback`; a trust refusal propagates. */
+const unlessRefused = <T>(fallback: T) => (error: unknown): T => { if (error instanceof GitTrustRefusal) throw error; return fallback; };
 /** The fixture checkout's trust after the sandbox returned or threw: a refusal is reported with its path. */
 const fixtureRefusal = (worktree: string): CodexCommitResult | undefined => {
   try { assertGitTrust(worktree); return undefined; } catch (e) {
@@ -57,15 +57,15 @@ git add -- "$1" && git -c core.hooksPath=/dev/null -c core.logAllRefUpdates=true
 (set -C; printf %s "$2" > "$3") 2>/dev/null && echo hook=written || echo hook=denied
 (set -C; printf %s "$2" > "$4") 2>/dev/null && echo root=written || echo root=denied`;
 
-/** The `sh` argv production runs at the fixture worktree: `codex sandbox` under the worker grant fragment. */
-export const codexSandboxArgs = (p: CodexCommitProbe, grant = CODEX_GIT_GRANT): string[] => [
+/** Queue row 2 (D-2112, D-2114): the fixture uses the same literal grant as a worker. */
+export const codexSandboxArgs = (p: CodexCommitProbe, grant = renderCodexGitGrant({ cwd: p.worktree, branch: p.branch, repoRoot: p.repoRoot ?? p.commonDir })): string[] => [
   "-c",
   `codex sandbox -c 'sandbox_mode="workspace-write"' ${grant} -- sh -c ${shq(SCRIPT)} sh ${[p.control, p.token, p.hostileHook, p.hostileRoot].map(shq).join(" ")}`,
 ];
-/** A sandbox executing `grant`; production is CODEX_GIT_GRANT. Tests pass a mutant grant to prove discrimination. */
-export const codexSandboxFor = (grant: string): CodexSandbox => async (p) =>
+/** Queue row 2 (D-2112): tests may supply a mutant; production renders each fixture. */
+export const codexSandboxFor = (grant?: string): CodexSandbox => async (p) =>
   (await exec("sh", codexSandboxArgs(p, grant), { cwd: p.worktree, timeout: 20_000, signal: p.signal, env: withoutHostSession() })).stdout;
-export const codexSandbox: CodexSandbox = codexSandboxFor(CODEX_GIT_GRANT);
+export const codexSandbox: CodexSandbox = codexSandboxFor();
 
 const holds = (path: string, token: string): boolean => {
   try { return readFileSync(path, "utf8") === token; } catch { return false; }
@@ -86,16 +86,26 @@ const contradictory = (out: string): boolean => {
   return false;
 };
 const tipOf = async (repo: string, ref: string): Promise<string | undefined> =>
-  hostGit(repo, "rev-parse", "--verify", "--quiet", `${ref}^{commit}`).catch(() => undefined);
+  hostGit(repo, ["rev-parse", "--verify", "--quiet", `${ref}^{commit}`]).catch(unlessRefused(undefined));
 // This probe's commit and nothing else: one parent (the fixture base), its token in the subject and the control.
 const isProbeCommit = async (repo: string, commit: string, base: string, token: string): Promise<boolean> => {
   try {
-    return await hostGit(repo, "log", "-1", "--format=%P %s", commit) === `${base} tickmarkr-probe ${token}`
-      && await hostGit(repo, "cat-file", "blob", `${commit}:${CONTROL}`) === token;
-  } catch { return false; }
+    return await hostGit(repo, ["log", "-1", "--format=%P %s", commit]) === `${base} tickmarkr-probe ${token}`
+      && await hostGit(repo, ["cat-file", "blob", `${commit}:${CONTROL}`]) === token;
+  } catch (e) { return unlessRefused(false)(e); }
 };
 
 export async function probeCodexCommit(repoRoot: string, sandbox: CodexSandbox = codexSandbox, signal?: AbortSignal): Promise<CodexCommitResult> {
+  // queue row 2 item b: cleanup stays best effort for ordinary git failures, but a trust refusal there is never
+  // folded into the verdict already reached — it is reported as unknown naming its path (an escape still dominates)
+  let refusal: GitTrustRefusal | undefined;
+  const result = await probeFixture(repoRoot, sandbox, signal, (e) => { refusal ??= e; });
+  return refusal && result.status !== "escape" ? unknown(`fixture git refused (${(refusal as GitTrustRefusal).message})`) : result;
+}
+
+async function probeFixture(repoRoot: string, sandbox: CodexSandbox, signal: AbortSignal | undefined, refused: (e: GitTrustRefusal) => void): Promise<CodexCommitResult> {
+  /** A cleanup git's ordinary failure is `fallback`; its trust refusal is reported to the caller, then `fallback`. */
+  const cleanup = <T>(fallback: T) => (e: unknown): T => { if (e instanceof GitTrustRefusal) refused(e); return fallback; };
   const token = randomUUID();
   const parent = mkdtempSync(join(tmpdir(), "tickmarkr-codex-commit-"));
   // git names the fixture's metadata directory after the checkout's basename; a unique one makes that
@@ -108,18 +118,19 @@ export async function probeCodexCommit(repoRoot: string, sandbox: CodexSandbox =
   let hostile: string[] = [];
   let sandboxed = false;
   try {
-    const commonDir = await git(repoRoot, "rev-parse", "--path-format=absolute", "--git-common-dir");
+    const commonDir = await hostGit(repoRoot, ["rev-parse", "--path-format=absolute", "--git-common-dir"]);
     lock = join(commonDir, "worktrees", basename(worktree), "index.lock");
     const hostileHook = join(commonDir, "hooks", branch), hostileRoot = join(commonDir, branch);
     hostile = [hostileHook, hostileRoot];
     if (hostile.some((m) => existsSync(m))) return unknown("a foreign file already holds a hostile probe path");
-    base = await git(repoRoot, "rev-parse", "--verify", "HEAD^{commit}");
-    await git(repoRoot, "worktree", "add", "-b", branch, worktree, base);
-    if (join(await git(worktree, "rev-parse", "--absolute-git-dir"), "index.lock") !== lock) return unknown("the fixture worktree metadata is not where git was expected to put it");
+    base = await hostGit(repoRoot, ["rev-parse", "--verify", "HEAD^{commit}"]);
+    // the add declares the branch capability: a result refused after its child ran is rolled back (checkout and branch)
+    await hostGit(repoRoot, ["worktree", "add", "-b", branch, worktree, base], { createsWorktree: "branch", rollback: { dir: worktree, branch: { name: branch } } });
+    if (join(await hostGit(worktree, ["rev-parse", "--absolute-git-dir"]), "index.lock") !== lock) return unknown("the fixture worktree metadata is not where git was expected to put it");
     const control = join(worktree, CONTROL);
     if (existsSync(lock)) return unknown("a foreign index.lock already holds the fixture worktree");
     sandboxed = true;
-    const out = await sandbox({ worktree, commonDir, branch, control, lock, hostileHook, hostileRoot, token, signal });
+    const out = await sandbox({ worktree, commonDir, branch, control, lock, hostileHook, hostileRoot, token, signal, repoRoot });
     // An escape on disk dominates; every other verdict needs consistent receipts AND disk — and trusted metadata.
     const escape = escaped(hostile, token);
     if (escape) return escape;
@@ -149,6 +160,7 @@ export async function probeCodexCommit(repoRoot: string, sandbox: CodexSandbox =
     if (escape) return escape;
     const refused = sandboxed ? fixtureRefusal(worktree) : undefined;
     if (refused) return refused;
+    if (e instanceof GitTrustRefusal) return unknown(`fixture git refused (${e.message})`);
     return unknown(signal?.aborted ? "probe cancelled" : `probe did not run (${(e instanceof Error ? e.message : String(e)).split("\n")[0]})`);
   } finally {
     // only files holding this probe's token are ours to remove; a foreign occupant is never touched
@@ -159,7 +171,7 @@ export async function probeCodexCommit(repoRoot: string, sandbox: CodexSandbox =
     // prune — that would take an earlier probe's preserved foreign lock (or anyone's prunable worktree).
     const foreign = lock !== undefined && existsSync(lock);
     if (lock && !foreign) {
-      await hostGit(repoRoot, "worktree", "remove", "--force", worktree).catch(() => undefined);
+      await hostGit(repoRoot, ["worktree", "remove", "--force", worktree]).catch(cleanup(undefined));
       // a failed `worktree add` leaves metadata git no longer removes by path: drop this probe's own directory
       rmSync(dirname(lock), { recursive: true, force: true });
       try { rmdirSync(dirname(dirname(lock))); } catch { /* other worktrees live there */ }
@@ -167,9 +179,9 @@ export async function probeCodexCommit(repoRoot: string, sandbox: CodexSandbox =
     // The fixture branch and its reflog go only while the tip is still this probe's (the base or its own
     // commit), and update-ref's old-value check refuses if anyone moves it between this read and the delete.
     // Metadata preserved for a foreign lock keeps its branch too: that checkout's HEAD still names it.
-    const tip = base === undefined || foreign ? undefined : await tipOf(repoRoot, ref);
-    if (tip && base && (tip === base || await isProbeCommit(repoRoot, tip, base, token))) {
-      await hostGit(repoRoot, "update-ref", "-d", ref, tip).catch(() => undefined);
+    const tip = base === undefined || foreign ? undefined : await tipOf(repoRoot, ref).catch(cleanup(undefined));
+    if (tip && base && (tip === base || await isProbeCommit(repoRoot, tip, base, token).catch(cleanup(false)))) {
+      await hostGit(repoRoot, ["update-ref", "-d", ref, tip]).catch(cleanup(undefined));
     }
     rmSync(parent, { recursive: true, force: true });
   }

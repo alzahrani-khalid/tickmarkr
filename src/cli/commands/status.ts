@@ -34,7 +34,7 @@ import {
   recordedTaskFailureKind,
   runHasEnded,
   type TaskPhase,
-  upheldFeedbackByTask,
+  restoresUpheldFeedback,
   visibleControls,
 } from "../../run/journal.js";
 import { isPidLive, runLockRunId, runStatusLine } from "../../run/lock.js";
@@ -1270,16 +1270,17 @@ const renderFrame = (
     : [];
 
   // OBS-738: recovery facts stay on the journal's two established reducers. The prefix fold keeps an
-  // older journal equally readable by asking upheldFeedbackByTask what was active at that exact
+  // older journal equally readable by asking restoresUpheldFeedback what was funded at that exact
   // restore boundary; current resume-restore rows additionally carry the same task for narration.
   // OBS-1178: both folds read decisions through the one decision fold over the whole journal.
+  // Queue row 225 (D-2111): only each task's NEWEST restore speaks — never a historical set.
   const decided = effectiveEvents(events);
   const preservedRefs = preservedRefsByTask(events);
-  const restoredUpheldFeedback = new Set(decided.flatMap((event, index) =>
-    event.event === "resume-restore" && event.taskId
-      && upheldFeedbackByTask(decided.slice(0, index)).has(event.taskId)
-      ? [event.taskId]
-      : []));
+  const newestRestores = new Map<string, number>();
+  decided.forEach((event, index) => { if (event.event === "resume-restore" && event.taskId) newestRestores.set(event.taskId, index); });
+  const restoredUpheldFeedback = new Set([...newestRestores]
+    .filter(([taskId, index]) => restoresUpheldFeedback(decided.slice(0, index), taskId))
+    .map(([taskId]) => taskId));
   // OBS-1178: a failed task's newest task-failed row is the token its recheck binds to. Only an
   // effective decision consumes it — a refused or unsound recheck leaves the task failed and the token shown.
   const failureTokens = new Map<string, string>();

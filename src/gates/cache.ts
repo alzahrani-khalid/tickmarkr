@@ -1,5 +1,4 @@
 import { createHash } from "node:crypto";
-import { execSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname, join, relative, resolve } from "node:path";
 import { tmpdir } from "node:os";
@@ -7,6 +6,7 @@ import type { Baseline } from "./baseline.js";
 import type { GateResult } from "./types.js";
 import { checkoutIncarnation, describeCapacity, inventoryDependencyLinks, type RunCapacity, resolvedCapacity, shGit, type VerificationProtocol, verificationProtocol } from "../run/git.js";
 import { shq } from "../adapters/types.js";
+import { trustedCommonDir } from "../run/git-trust.js";
 import { titleEnvironment } from "../run/title-environment.js";
 
 export const DEFAULT_VERDICT_CACHE_BOUND = 128;
@@ -346,9 +346,7 @@ export function resolveStateDir(worktree: string, artifactDir?: string): string 
     return join(worktree, ".tickmarkr");
   }
   try {
-    const commonDir = execSync("git rev-parse --git-common-dir", { cwd: worktree, encoding: "utf8" }).trim();
-    const resolved = resolve(worktree, commonDir);
-    const commonRoot = realpathSync(dirname(resolved));
+    const commonRoot = realpathSync(dirname(trustedCommonDir(worktree)));
     if (existsSync(join(commonRoot, ".tickmarkr"))) {
       return join(commonRoot, ".tickmarkr");
     }
