@@ -134,6 +134,9 @@ async function runGrokTrust(surface: "orca" | "pane", modal: "present" | "absent
   };
   const worker: WorkerAdapter = {
     ...getAdapter("grok", allAdapters()),
+    // D-2137 add.1: no shell probe of a real grok binary. probeAll would replace this fixture's probe with one, and a host
+    // without grok (CI) would then read the pinned channel as unavailable and route the task elsewhere.
+    hardcodedFlags: undefined,
     probe: async () => ({ installed: true, authed: true, version: "fixture", models: ["grok-4.5"], modelAuth: authedModels(["grok-4.5"]) }),
     channels: () => [{ adapter: "grok", vendor: "xai", model: "grok-4.5", channel: "sub", tier: "frontier" }],
     interactiveCommand: (promptFile) => {

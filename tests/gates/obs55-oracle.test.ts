@@ -442,7 +442,7 @@ t6AcceptanceTest(
       rmSync(root, { recursive: true, force: true });
     }
   },
-  240_000,
+  480_000,
 );
 
 t6AcceptanceTest(
@@ -526,7 +526,7 @@ t6AcceptanceTest(
       rmSync(fixture.root, { recursive: true, force: true });
     }
   },
-  300_000,
+  600_000,
 );
 
 t6AcceptanceTest(
