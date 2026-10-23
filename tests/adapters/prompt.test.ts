@@ -3,7 +3,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import { buildTaskPrompt, classifyDeadChannel, classifyTransientCapacity, NO_TRAILER_SUMMARY, parseWorkerResult, trailerPattern, UNPARSEABLE_TRAILER_SUMMARY, writePrompt } from "../../src/adapters/prompt.js";
-import { validateGraph } from "../../src/graph/schema.js";
+import { renderAcceptanceItem, validateGraph, type AcceptanceItem, type Task } from "../../src/graph/schema.js";
+import { makeTestTempDir } from "../helpers/tmprepo.js";
 
 const N = "testnonce"; // fixed nonce for direct-call tests; the daemon uses a random per-run one
 
@@ -88,6 +89,58 @@ describe("buildTaskPrompt", () => {
     expect(p).toContain("behaves under load");
     expect(p).toContain("plain criterion");
     expect(p).not.toContain("[object Object]");
+  });
+
+  // Queue row 234 (D-2130 add.1, D-2131): suite guidance belongs to every worker engagement.
+  test("test: a task with two test oracles in two distinct suites gets, in both its first brief and a feedback-built repair brief, every oracle as its shared line followed by the suite marker and its own path, plus one note that the title precedes the marker and tests must pass there, so annotating one oracle or only first briefs fails", () => {
+    const suited: Task = { ...task, acceptance: [
+      { oracle: "test", test: "refreshes once", landing: "tests/auth/refresh.test.ts" },
+      { oracle: "test", test: "stores credentials", text: "declared credential criterion", landing: "tests/auth/storage.test.ts" },
+    ] };
+    const shared = suited.acceptance.map(renderAcceptanceItem);
+    const annotated = [
+      "test: refreshes once | suite: tests/auth/refresh.test.ts",
+      "declared credential criterion | suite: tests/auth/storage.test.ts",
+    ];
+    const note = "For test criteria with ` | suite: `, the test title is the text before the marker, and the test must pass in the named file.";
+    const block = annotated.map((line) => `- ${line}`).join("\n") + `\n\n${note}`;
+    const dir = makeTestTempDir("tickmarkr-prompt-suites-");
+    for (const [attempt, feedback] of ["", "acceptance gate failed: refresh oracle is missing", "review gate failed: fix credential storage"].entries()) {
+      const brief = buildTaskPrompt(suited, feedback, N);
+      expect(readFileSync(writePrompt(dir, suited, attempt, feedback, N), "utf8")).toBe(brief);
+      expect(brief).toContain(block);
+      expect(brief.split(note)).toHaveLength(2);
+      const unannotated = buildTaskPrompt({ ...suited, acceptance: shared }, feedback, N);
+      expect(brief.replace(block, shared.map((line) => `- ${line}`).join("\n"))).toBe(unannotated);
+      if (feedback) expect(brief).toContain(`## Previous attempt failed gates — fix these specifically\n${feedback}\n`);
+    }
+  });
+
+  test("test: in one brief a test oracle without a suite, a command oracle, a judge oracle and a plain criterion each render byte-equal to their shared criterion line, and a brief with no suited oracle carries no suite note, so a change to any line but the suited oracle's fails", () => {
+    const unchanged: AcceptanceItem[] = [
+      { oracle: "test", test: "unsuited oracle" },
+      { oracle: "test", test: "unsuited declared oracle", text: "declared test criterion" },
+      { oracle: "command", command: "npm run lint" },
+      { oracle: "command", command: "npm run build", text: "declared command criterion" },
+      { oracle: "judge", text: "behaves under load" },
+      "plain criterion",
+    ];
+    const suited: AcceptanceItem = { oracle: "test", test: "lands in refresh", landing: "tests/auth/refresh.test.ts" };
+    const shared = unchanged.map(renderAcceptanceItem);
+    for (const feedback of ["", "acceptance gate failed: repair the oracle"]) {
+      for (const acceptance of [[suited, ...unchanged], unchanged]) {
+        const brief = buildTaskPrompt({ ...task, acceptance }, feedback, N);
+        const lines = brief.split("## Acceptance criteria (you will be judged against these, verbatim)\n")[1]!.split("\n\n")[0]!.split("\n");
+        expect(lines).toEqual(acceptance === unchanged
+          ? shared.map((line) => `- ${line}`)
+          : ["- test: lands in refresh | suite: tests/auth/refresh.test.ts", ...shared.map((line) => `- ${line}`)]);
+        if (acceptance === unchanged) {
+          expect(brief).not.toContain("For test criteria with");
+          expect(brief).not.toContain(" | suite: ");
+          expect(brief).toBe(buildTaskPrompt({ ...task, acceptance: shared }, feedback, N));
+        }
+      }
+    }
   });
 
   // v1.87 T5: the prompt used to say an out-of-scope edit fails "unless the operator's config

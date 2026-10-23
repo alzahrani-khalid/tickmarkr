@@ -185,6 +185,17 @@ export const CODEX_TRUST_PANE = [
 // v1.22 T5 / OBS-19, cursor-agent's per-worktree dialog.
 export const CURSOR_TRUST_PANE = "Workspace Trust Required\nTrust this folder?";
 
+// Queue row 215 (D-2118 add.1, D-2125): quoted from the recorded Grok Build 1.0.62 modal in
+// tests/fixtures/grok-trust/grok-1.0.62.screen.txt; 1.0.67 renders these same modal rows centered.
+export const GROK_TRUST_PANE = [
+  "Do you trust the contents of this directory?",
+  "/Users/…/repo",
+  "Grok Build may run or modify contents in this directory,",
+  "posing security risks.",
+  "Yes, proceed                 y",
+  "No, quit                     n",
+].join("\n");
+
 // Queue row 198, kimi 2.2.0's folder-trust modal on a fresh task worktree (run 1394 T3, read off the
 // Orca screen before its one Enter). The worktree path is shortened as above; every other row is as
 // rendered. 2.2.0 renamed the selected option, so the 0.29.0 fingerprint below never matched it and the
@@ -221,6 +232,7 @@ export const KIMI_MCP_TRUST_PANE = [
 
 export const RECORDED_TRUST_PANES: readonly string[] = [
   CLAUDE_TRUST_PANE, CODEX_TRUST_PANE, CURSOR_TRUST_PANE, KIMI_TRUST_PANE, KIMI_TRUST_PANE_029, KIMI_MCP_TRUST_PANE,
+  GROK_TRUST_PANE,
 ];
 
 // v1.89 T1 / OBS-414 round 4 — EXACT, not "leading bytes of a recorded line". Round 3 accepted any
@@ -241,6 +253,7 @@ export const APPROVED_TRUST_FINGERPRINTS: readonly string[] = [
   "Workspace Trust Required", // cursor-agent, OBS-19
   "❯ Trust this folder", // kimi 0.29.0, OBS-358 + OBS-406 — the cursor glyph is load-bearing
   "❯ Trust and continue", // kimi 2.2.0, queue row 198 — the same gate with its option renamed
+  "Grok Build may run or modify contents in this directory", // queue row 215, D-2125
 ];
 
 const isApprovedFingerprint = (fingerprint: string): boolean =>

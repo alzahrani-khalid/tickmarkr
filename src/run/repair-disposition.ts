@@ -45,8 +45,8 @@ export interface RepairDispositionInput {
 const failed = (g: GateResult) => !(g.pass || g.meta?.skipped === true) || g.meta?.infra === true;
 const REFUSAL_RE = /outside|out.of.scope|allowlist|scope expansion|not (?:in|own)|unowned/i;
 
-/** Lexing never starts in the middle of a word (same lexer as the daemon's scope-red disposition). */
-export const namedPaths = (text: string): string[] => [...text.matchAll(/(?:^|[\s`'"])((?:[A-Za-z0-9_@.()[\]-]+\/)+[A-Za-z0-9_@.[\]-]+|[A-Za-z0-9_@-]+(?:\.[A-Za-z0-9_-]+)+)(?=$|[\s`'"),:;.!?])/g)]
+/** Queue row 230: tsc's position, numeric or baseline-normalized (#), ends a path; named parentheses stay. */
+export const namedPaths = (text: string): string[] => [...text.matchAll(/(?:^|[\s`'"])((?:[A-Za-z0-9_@.()[\]-]+\/)+(?:[A-Za-z0-9_@.[\]-]|\([A-Za-z0-9_@.[\]-]*\))+|(?:[A-Za-z0-9_@-]|\([A-Za-z0-9_@.[\]-]*\))+(?:\.(?:[A-Za-z0-9_-]|\([A-Za-z0-9_@.[\]-]*\))+)+)(?=$|[\s`'"),:;.!?]|\((?:\d+|#),\s*(?:\d+|#)\))/g)]
   .map((match) => match[1]!.replace(/^\.\//, "").replace(/\.$/, ""))
   .filter((path) => !path.split("/").includes(".."));
 

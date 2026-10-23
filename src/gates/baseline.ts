@@ -529,11 +529,32 @@ export function classifyFailureOutput(output: string): FailureClassification | u
 // (dist/chunks/index.*.js, `headerText`). The stripper knew only the first form.
 const VITEST_ECHO_BLOCK_RE = /^\s*std(?:out|err)\s+\|\s+(?:unknown test\s*$|\d+_[\d_]+\s*$|\S+\.(?:test|spec)\.[cm]?[jt]sx?(?:\s*$|\s+>\s+\S))/;
 
-/** Keep runner output while omitting Vitest's echoed test-owned stdout/stderr diagnostic blocks. */
+// Queue row 211 (D-2118): only Jest's complete, column-zero recovery warning is noise. A missing
+// neighbour, changed hint, indented copy or multi-line Watchman error remains failure evidence.
+const JEST_WATCHMAN_HEADER = "jest-haste-map: Watchman crawl failed. Retrying once with node crawler.";
+const JEST_WATCHMAN_HINT = "  Usually this happens when watchman isn't running. Create an empty `.watchmanconfig` file in your project's root folder or initialize a git or hg repository in your project.";
+const JEST_WATCHMAN_ERROR_RE = /^ {2}Error: Watchman error: [^\r\n]+\. Make sure watchman is running for this project\. See https:\/\/facebook\.github\.io\/watchman\/docs\/troubleshooting\.$/;
+
+/** Queue row 211 (D-2118): display readers retain raw Vitest echo lines while dropping this warning. */
+const withoutJestWatchmanBlocks = (output: string): string[] => {
+  const kept: string[] = [];
+  const lines = output.split("\n");
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]!;
+    if (line === JEST_WATCHMAN_HEADER && lines[i + 1] === JEST_WATCHMAN_HINT && JEST_WATCHMAN_ERROR_RE.test(lines[i + 2] ?? "")) {
+      i += 2;
+      continue;
+    }
+    kept.push(line);
+  }
+  return kept;
+};
+
+/** Queue row 211 (D-2118): omit the recovered Jest warning alongside Vitest's test-owned echo blocks. */
 const withoutVitestEchoBlocks = (output: string): string[] => {
   const outside: string[] = [];
   let inVitestEchoBlock = false;
-  for (const line of output.split("\n")) {
+  for (const line of withoutJestWatchmanBlocks(output)) {
     const clean = line.replace(ANSI_RE, "");
     const runnerLine = stripTurboPrefix(clean) ?? clean;
     if (inVitestEchoBlock) {
@@ -723,8 +744,7 @@ function fingerprintOccurrences(output: string): Occurrence[] {
 // The diagnostic channel for a runner we cannot read: raw output lines, never fingerprints, never a
 // verdict. They exist so the operator sees SOMETHING when a green command turns red unrecognizably.
 const unrecognizedEvidence = (raw: string): string =>
-  raw
-    .split("\n")
+  withoutJestWatchmanBlocks(raw)
     .map((l) => l.replace(ANSI_RE, "").trimEnd())
     .filter((l) => VOCAB_RE.test(l))
     .slice(0, 10)
@@ -1173,11 +1193,29 @@ export async function detectVacuousOracles(
 // drop a FAIL line that fingerprint-collides with baseline noise). No headline anchors → byte-identical
 // fallback to today's text (non-vitest runners lose nothing). RED-pinned by tests/gates/baseline.test.ts
 // "HYG-08: details headlines the failing test, not the noise".
+// Queue row 224(a) (D-2118): Jest identities and their first message are display-only; Console and
+// column-zero validation bullets are not identities. Keep the existing metadata extraction separate.
+const JEST_IDENTITY_RE = /^ {2}● (?!Console\s*$)\S.*$/;
+
 function headlineDetails(raw: string, fresh: string[], freshLines: string[]): { details: string; meta?: { failingTests: string[] } } {
-  const headlines = raw
+  const namedHeadlines = raw
     .split("\n")
     .map((l) => l.replace(ANSI_RE, ""))
     .filter((l) => namesFailureEitherForm(l) || SUMMARY_FAIL_RE.test(l));
+  const outputLines = withoutJestWatchmanBlocks(raw).map((l) => l.replace(ANSI_RE, ""));
+  let inVitestEchoBlock = false;
+  const headlines = outputLines.flatMap((line, index) => {
+    const runnerLine = stripTurboPrefix(line) ?? line;
+    const echoed = inVitestEchoBlock || VITEST_ECHO_BLOCK_RE.test(runnerLine);
+    if (inVitestEchoBlock) {
+      if (runnerLine.trim() === "") inVitestEchoBlock = false;
+    } else if (echoed) inVitestEchoBlock = true;
+    // Queue row 224(a) (D-2118): preserve raw FAIL/summary headlines; only Jest identities exclude echoes.
+    if (namesFailureEitherForm(line) || SUMMARY_FAIL_RE.test(line)) return [line];
+    if (echoed || !JEST_IDENTITY_RE.test(line)) return [];
+    const message = withoutVitestEchoBlocks(outputLines.slice(index + 1).join("\n")).find((l) => l.trim() !== "");
+    return message === undefined ? [line] : [line, message];
+  });
   // S22: the ORIGINAL runner lines behind v2 comparison keys are the diagnostic; the keys are secondary.
   // A legacy entry's lines ARE its keys, so its details stay byte-identical.
   const lines = [...new Set(freshLines)].join("\n");
@@ -1186,7 +1224,7 @@ function headlineDetails(raw: string, fresh: string[], freshLines: string[]): { 
   if (!headlines.length) return { details: same ? `new failures vs baseline:\n${lines}` : `new failures vs baseline:\n${lines}\n\n${keys}` };
   return {
     details: `failing tests:\n${headlines.join("\n")}\n\n${same ? "" : `new failure lines vs baseline:\n${lines}\n\n`}${keys}`,
-    meta: { failingTests: headlines.filter(namesFailureEitherForm) },
+    ...(namedHeadlines.length ? { meta: { failingTests: namedHeadlines.filter(namesFailureEitherForm) } } : {}),
   };
 }
 
@@ -1373,7 +1411,7 @@ export async function compareToBaseline(
     if (classification === "infra") {
       const evidence = failingLines.length
         ? failingLines.slice(0, 10).join("\n")
-        : unrecognizedEvidence(raw) || raw.trim().split("\n").slice(0, 10).join("\n");
+        : unrecognizedEvidence(raw) || withoutJestWatchmanBlocks(raw).join("\n").trim().split("\n").slice(0, 10).join("\n");
       record({
         gate: name,
         pass: false,

@@ -22,7 +22,36 @@ export function distFingerprint(dir = distDir): string {
   return hash.digest("hex");
 }
 
-export async function version(argv: string[] = [], dir = distDir): Promise<string> {
+export async function version(argv: string[] = [], dir = distDir, cwd = process.cwd()): Promise<string> {
   const { version: v } = JSON.parse(readFileSync(pkgPath, "utf8")) as { version: string };
-  return argv.includes("--dist") ? `${v} dist:${resolve(dir)} fingerprint:${distFingerprint(dir)}` : v;
+  const stamp = argv.includes("--dist") ? `${v} dist:${resolve(dir)} fingerprint:${distFingerprint(dir)}` : v;
+  if (!argv.includes("--check")) return stamp;
+
+  let manifest: { name?: string; version?: string } | undefined;
+  try { manifest = JSON.parse(readFileSync(join(cwd, "package.json"), "utf8")); } catch { /* no source manifest — consumer guidance check */ }
+  if (manifest?.name === "tickmarkr") {
+    const repoVersion = manifest.version ?? "missing";
+    const equal = v === repoVersion;
+    const out = `tickmarkr binary ${stamp}: compared tickmarkr source repository package.json version ${repoVersion} — ${equal ? "entire version matches" : "versions differ; update or link the correct binary"}`;
+    if (!equal) throw new Error(out);
+    return out;
+  }
+
+  const { docsDrift, installedAgentGuidance, skillDrift } = await import("./init.js");
+  const installed = installedAgentGuidance(cwd);
+  if (!installed.length) return `tickmarkr binary ${stamp}: no installed agent guidance to compare`;
+  const drift = [
+    ...skillDrift(cwd).flatMap(({ dir: skillDir, missing, modified }) => [
+      ...missing.map((file) => `missing ${relative(cwd, join(skillDir, file))}`),
+      ...modified.map((file) => `modified ${relative(cwd, join(skillDir, file))}`),
+    ]),
+    ...docsDrift(cwd).map((file) => `stale agent-docs block in ${relative(cwd, file)}`),
+  ];
+  const out = [
+    `tickmarkr binary ${stamp}: compared installed agent guidance with this binary's packaged block and skills:`,
+    ...installed.map((file) => `  ${relative(cwd, file)}`),
+    ...(drift.length ? [...drift, "refresh: tickmarkr init --agent --force"] : ["installed guidance matches"]),
+  ].join("\n");
+  if (drift.length) throw new Error(out);
+  return out;
 }

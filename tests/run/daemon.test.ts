@@ -1,3 +1,5 @@
+import { afterEach } from "vitest";
+import { setAttemptHardTimeoutMsForTests, resetAttemptHardTimeoutMsForTests } from "../../src/run/daemon.js";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 // The daemon suite is partitioned across this file and tests/run/daemon/*.test.ts so the runner,
 // which schedules by file, stops serialising the whole suite behind one 400s+ file. This file keeps
@@ -220,6 +222,7 @@ describe("daemon integration (fake adapter, zero tokens)", () => {
   });
 
   test("a timed-out subprocess is dead before its retry recreates the worktree", async () => {
+    setAttemptHardTimeoutMsForTests(60_000); // Queue row 233 (D-2130): isolate inactivity from the hard deadline.
     const pidFile = join(mkdtempSync(join(tmpdir(), "tickmarkr-timeout-")), "prior.pid");
     const { repo, fake } = setupRepo(
       [T("T1")],
@@ -1635,3 +1638,6 @@ function reviewOnlySeat(repo: string, scriptPath: string): FakeAdapter {
   };
   return seat;
 }
+
+// Queue row 233 (D-2130): each small-window fixture owns its deadline seam.
+afterEach(resetAttemptHardTimeoutMsForTests);

@@ -13,13 +13,23 @@ import { CAPACITY_RE, type WorkerResult } from "./types.js";
 // and the allowlist stays exactly as immutable during a run as it was before this text changed.
 export function buildTaskPrompt(task: Task, feedback = "", nonce = ""): string {
   const list = (xs: string[]) => xs.map((x) => `- ${x}`).join("\n");
+  // Queue row 234 (D-2130 add.1, D-2131): only the worker brief carries the suite;
+  // the judge and the review brief keep the shared criterion text byte-equal.
+  const criteria = task.acceptance.map((item) =>
+    typeof item !== "string" && item.oracle === "test" && item.landing !== undefined
+      ? `${renderAcceptanceItem(item)} | suite: ${item.landing}`
+      : renderAcceptanceItem(item),
+  );
+  const suiteNote = task.acceptance.some((item) => typeof item !== "string" && item.oracle === "test" && item.landing !== undefined)
+    ? '\n\nFor test criteria with ` | suite: `, the test title is the text before the marker, and the test must pass in the named file.'
+    : "";
   return `You are an autonomous coding worker dispatched by tickmarkr into an isolated git worktree.
 
 ## Task ${task.id}: ${task.title}
 Goal: ${task.goal}
 
 ## Acceptance criteria (you will be judged against these, verbatim)
-${list(task.acceptance.map(renderAcceptanceItem))}
+${list(criteria)}${suiteNote}
 ${task.files.length ? `\n## File scope — touch ONLY paths matching:\n${list(task.files)}\n` : ""}${task.context.length ? `\n## Context (read these first)\n${list(task.context)}\n` : ""}${task.outOfScope?.length ? `\n## Out of scope\nStay within the task’s declared bounds; do not pursue these items:\n${list(task.outOfScope)}\n` : ""}
 ## Rules
 - Work only inside the current directory (your isolated worktree). Never push. Never switch branches.

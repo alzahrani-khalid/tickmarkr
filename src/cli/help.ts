@@ -173,9 +173,12 @@ export const COMMAND_HELP = {
     ],
   },
   version: {
-    usage: "version [--dist]", description: "Print the installed package version. Top-level aliases: --version and -v.",
-    options: { "--dist": "Also print the resolved build directory and distribution fingerprint." },
-    examples: ["version", "version --dist"],
+    usage: "version [--dist] [--check]", description: "Print the installed package version. Top-level aliases: --version and -v.",
+    options: {
+      "--dist": "Also print the resolved build directory and distribution fingerprint.",
+      "--check": "Compare the entire source version when package.json is named tickmarkr; otherwise check installed agent guidance against this binary. Exit non-zero on drift; no installed guidance exits zero.",
+    },
+    examples: ["version", "version --dist", "version --check"],
   },
   verify: {
     usage: "verify [--base <ref>] [--criteria <file> | --task <id>] [options]",

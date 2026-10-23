@@ -1,3 +1,5 @@
+import { afterEach } from "vitest";
+import { setAttemptHardTimeoutMsForTests, resetAttemptHardTimeoutMsForTests } from "../../../src/run/daemon.js";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import { existsSync, mkdirSync, readdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -983,6 +985,7 @@ describe("v1.25 trust-auto-answer journal (fake adapter, zero tokens)", () => {
 // v1.39 OBS-37b: per-task timeoutMinutes overrides config taskTimeoutMinutes for that task only.
 describe("per-task timeout override (OBS-37b)", () => {
   test("shorter task override times out before the config default would", async () => {
+    setAttemptHardTimeoutMsForTests(60_000); // Queue row 233 (D-2130): isolate inactivity from the hard deadline.
     const { repo, fake } = setupRepo(
       [T("T1", { timeoutMinutes: 0.02 })],
       { tasks: { T1: [{ shell: "sleep 30" }] }, consult: { action: "human", notes: "stalled" } },
@@ -1009,6 +1012,7 @@ describe("per-task timeout override (OBS-37b)", () => {
   }, 30_000);
 
   test("tasks without override keep config-default timeout behavior", async () => {
+    setAttemptHardTimeoutMsForTests(60_000); // Queue row 233 (D-2130): isolate inactivity from the hard deadline.
     const { repo, fake } = setupRepo(
       [T("T1", { timeoutMinutes: 0.02 }), T("T2")],
       {
@@ -1106,6 +1110,7 @@ describe("per-task timeout override (OBS-37b)", () => {
   });
 
   test("OBS-58: a brief premise asserting a commit that the fresh worktree lacks is corrected before dispatch", async () => {
+    setAttemptHardTimeoutMsForTests(60_000); // Queue row 233 (D-2130): isolate inactivity from the hard deadline.
     // 2.8.1 T2: the conflicting integration change is a sibling task's own publication (T0), landed after T1's first
     // attempt was dispatched on the earlier tip and before its retry — never a commit in an integration checkout.
     const { repo, fake } = setupRepo(
@@ -2991,3 +2996,6 @@ function reviewOnlySeat(repo: string, scriptPath: string): FakeAdapter {
   };
   return seat;
 }
+
+// Queue row 233 (D-2130): each small-window fixture owns its deadline seam.
+afterEach(resetAttemptHardTimeoutMsForTests);

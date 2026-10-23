@@ -1,7 +1,8 @@
+import { setRowRearmTokenFlatMsForTests, resetRowRearmTokenFlatMsForTests } from "../../../src/run/stall.js";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 import { extractPromptNonce } from "../../../src/gates/llm.js";
 import { writeBashEnvFixture } from "../../helpers/bash-env.js";
-import { chmodSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomBytes } from "node:crypto";
@@ -155,6 +156,221 @@ describe("harvest: finished work is gated, never redispatched (OBS-264)", () => 
       resetHarvestCpuFlatMsForTests();
     }
   };
+
+  // Queue row 231 (D-2119): a recording PATH stand-in observes an owned connector child. Real
+  // loopback sockets run wherever permitted; only EPERM/EACCES uses the managed sandbox fallback.
+  // CPU is pinned independently so connection cases cannot pass by accidentally burning CPU.
+  const connectionCase = async (mode: "held" | "none" | "close" | "child-gone" | "error" | "hang", options: {
+    interactive?: boolean; burning?: boolean; commits?: boolean;
+  } = {}) => {
+    const dir = makeTestTempDir("tickmarkr-connections-");
+    const state = join(dir, "state.json"), control = join(dir, "control"), calls = join(dir, "calls.jsonl");
+    const worker = join(dir, "worker.cjs");
+    const runId = "run-connection-harvest";
+    const { repo, fake } = setupRepo([T("T1", { timeoutMinutes: 2 })], {
+      consult: { action: "human", notes: "queue row 231 (D-2119): connection fixture" },
+      tasks: { T1: [{
+        shell: `${options.commits === false ? "true" : `echo connection > c.txt && ${COMMIT} c`} && ${shq(process.execPath)} ${shq(worker)}`,
+        result: { ok: true, summary: "queue row 231 (D-2119): natural worker exit" },
+      }] },
+    });
+    const prompts = join(tickmarkrDir(repo), "runs", runId, "prompts");
+    const connector = `
+      const net = require('node:net');
+      let socket;
+      if (process.argv[1] === 'sandbox') process.send('connected');
+      else { socket = net.connect(Number(process.argv[1]), '127.0.0.1', () => process.send('connected'));
+        socket.on('close', () => process.send('disconnected')); }
+      process.on('message', () => { if (socket) socket.destroy(); else process.send('disconnected'); });
+      setTimeout(() => process.exit(), 30000);
+    `;
+    writeFileSync(worker, `
+      const fs = require('node:fs'), net = require('node:net'), {spawn} = require('node:child_process');
+      const state = ${JSON.stringify(state)}, control = ${JSON.stringify(control)};
+      let child, connected = false, accepted;
+      const server = net.createServer(socket => { accepted = socket; });
+      const save = () => { fs.writeFileSync(state + '.next', JSON.stringify({connected, pid: child?.pid, parent: process.pid}));
+        fs.renameSync(state + '.next', state); };
+      const finish = () => { if (child && child.exitCode === null) child.kill('SIGKILL');
+        accepted?.destroy(); server.close(); setTimeout(() => process.exit(), 50); };
+      const start = port => {
+        if (${JSON.stringify(mode)} === 'none' || ${options.commits === false}) { save(); return; }
+        child = spawn(process.execPath, ['-e', ${JSON.stringify(connector)}, String(port)], {stdio:['ignore','ignore','inherit','ipc']});
+        child.on('message', message => { connected = message === 'connected'; save(); });
+        child.on('exit', () => { connected = false; save(); });
+      };
+      server.on('error', error => { if (!['EPERM','EACCES'].includes(error.code)) throw error; start('sandbox'); });
+      server.listen(0, '127.0.0.1', () => start(server.address().port));
+      setInterval(() => {
+        let command; try { command = fs.readFileSync(control, 'utf8'); } catch {}
+        if (command === 'exit') finish();
+        if (command === 'close' && connected) child.send('close');
+        if (command === 'child-gone' && connected) child.kill('SIGKILL');
+        ${options.burning ? "const until = Date.now() + 20; while (Date.now() < until) {}" : ""}
+      }, 40);
+      setTimeout(finish, ${options.commits === false ? 1600 : 30000});
+    `);
+    const lsof = join(dir, "lsof");
+    writeFileSync(lsof, `#!${process.execPath}
+      const fs = require('node:fs');
+      const args = process.argv.slice(2);
+      // Queue row 231 (D-2119): preserve census cwd reads without counting them as
+      // harvest connection probes. Only this exact unrelated query bypasses the recorder.
+      if (args.length === 6 && args[0] === '-a' && args[1] === '-p' && /^\\d+(?:,\\d+)*$/.test(args[2])
+          && args[3] === '-d' && args[4] === 'cwd' && args[5] === '-Fn') {
+        const child = require('node:child_process').spawn('lsof', args, {
+          env: {...process.env, PATH: ${JSON.stringify(process.env.PATH ?? "")}}, stdio: 'inherit',
+          timeout: 10_000, killSignal: 'SIGKILL',
+        });
+        child.on('error', () => process.exit(2));
+        child.on('exit', code => process.exit(code ?? 2));
+        return;
+      }
+      const prompts = ${JSON.stringify(prompts)};
+      const groupFile = fs.readdirSync(prompts).find(name => name.endsWith('.pgid'));
+      const group = groupFile && fs.readFileSync(require('node:path').join(prompts, groupFile), 'utf8').trim();
+      const record = {args, group, pid:process.pid, at:Date.now()};
+      fs.appendFileSync(${JSON.stringify(calls)}, JSON.stringify(record) + '\\n');
+      if (!group || !args.includes('-a') || args[args.indexOf('-g') + 1] !== group
+          || !args.includes('-iTCP') || !args.includes('-sTCP:ESTABLISHED')) process.exit(2);
+      const count = fs.readFileSync(${JSON.stringify(calls)}, 'utf8').trim().split('\\n').length;
+      const mode = ${JSON.stringify(mode)};
+      if (mode === 'hang') {
+        process.on('SIGTERM', () => {});
+        fs.writeFileSync(${JSON.stringify(control)}, 'exit-at-deadline');
+        setInterval(() => {}, 1000);
+      } else {
+        const value = JSON.parse(fs.readFileSync(${JSON.stringify(state)}, 'utf8'));
+        if (['held','error'].includes(mode) && count >= 2) fs.writeFileSync(${JSON.stringify(control)}, 'exit');
+        if (mode === 'error') { process.stderr.write('queue row 231 (D-2119): denied'); process.exit(2); }
+        if (!value.connected) process.exit(1);
+        process.stdout.write('p' + value.pid + '\\nf3\\n');
+      }
+    `);
+    chmodSync(lsof, 0o755);
+    const priorPath = process.env.PATH, priorBashEnv = process.env.BASH_ENV;
+    const cpuStart = vi.spyOn(stall.WorkerTreeCpuAccountant.prototype, "start").mockResolvedValue();
+    const cpuStop = vi.spyOn(stall.WorkerTreeCpuAccountant.prototype, "stop").mockResolvedValue();
+    let cpuMs = 0;
+    const cpuRead = vi.spyOn(stall.WorkerTreeCpuAccountant.prototype, "read").mockImplementation(() => ({
+      cpu: { ms: options.burning ? ++cpuMs : 42, resolutionMs: 10 }, gaps: 0,
+    }));
+    let sandboxReap: ReturnType<typeof vi.spyOn> | undefined;
+    try {
+      execFileSync("ps", ["-o", "pgid=", "-p", String(process.pid)], { stdio: "pipe" });
+    } catch {
+      // Queue row 231 (D-2119): ps is denied in the managed sandbox. Only its group marker and
+      // cleanup census are substituted; the dispatch, PATH execFile and timeout remain real.
+      const bashEnv = join(dir, "bash-env");
+      writeBashEnvFixture(bashEnv, `ps() { if [ "$1" = -o ] && [ "$2" = pgid= ]; then if [ "$4" = ${process.pid} ]; then echo 90000001; else echo 90000002; fi; else command ps "$@"; fi; }\n`);
+      process.env.BASH_ENV = bashEnv;
+      sandboxReap = vi.spyOn(stall.workerReapHost, "snapshot").mockResolvedValue([]);
+    }
+    const inner = new SubprocessDriver();
+    let workerSlot: Slot | undefined;
+    const driver = hdriver({
+      interactive: options.interactive ?? false, useRealRead: true,
+      run: async (slot: Slot, command: string) => {
+        workerSlot = slot;
+        await inner.run(slot, command);
+        const deadline = Date.now() + 5000;
+        while (!existsSync(state) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 20));
+        if (!existsSync(state)) throw new Error("queue row 231 (D-2119): worker did not start");
+      },
+      slot: inner.slot.bind(inner), read: inner.read.bind(inner), close: inner.close.bind(inner),
+      waitOutput: async (slot: Slot, pattern: string, timeout: number, opts: { regex?: boolean }) => {
+        const held = evsOf(repo, runId).some(event => event.event === "worker-harvest-held");
+        if (held && ["close", "child-gone"].includes(mode)) writeFileSync(control, mode);
+        if (options.interactive && !options.burning && options.commits !== false && existsSync(state)) {
+          expect(JSON.parse(readFileSync(state, "utf8")).connected).toBe(true);
+        }
+        return inner.waitOutput(slot, pattern, Math.min(timeout, 100), opts);
+      },
+    });
+    let heartbeat = 0;
+    const timer = setInterval(() => {
+      heartbeat++;
+      if (existsSync(control) && readFileSync(control, "utf8") === "exit-at-deadline") {
+        const first = JSON.parse(readFileSync(calls, "utf8").trim().split("\n")[0]!);
+        if (Date.now() - first.at >= 14_500) writeFileSync(control, "exit");
+      }
+      if (options.burning && existsSync(state) && heartbeat >= 35) writeFileSync(control, "exit");
+    }, 100);
+    process.env.PATH = `${dir}:${priorPath ?? ""}`;
+    try {
+      await withSeams(mode === "hang" ? 3_000 : 150, 100, async () => runDaemon(repo, { adapters: [fake], runId, driver }).then(() => {}));
+      return {
+        events: evsOf(repo, runId), heartbeat,
+        calls: existsSync(calls) ? readFileSync(calls, "utf8").trim().split("\n").map(line => JSON.parse(line) as {args: string[]; group: string; pid: number; at: number}) : [],
+      };
+    } finally {
+      clearInterval(timer);
+      if (workerSlot) await inner.close(workerSlot);
+      cpuStart.mockRestore(); cpuStop.mockRestore(); cpuRead.mockRestore(); sandboxReap?.mockRestore();
+      if (priorPath === undefined) delete process.env.PATH; else process.env.PATH = priorPath;
+      if (priorBashEnv === undefined) delete process.env.BASH_ENV; else process.env.BASH_ENV = priorBashEnv;
+    }
+  };
+
+  test("test: a headless worker that committed early and then holds an open TCP connection while silent past the harvest gate with flat CPU is never concluded and journals one harvest-held row, so a harvest that reaps a live worker waiting on its provider fails", async () => {
+    const { events, calls } = await connectionCase("held");
+    expect(events.filter(event => event.event === "worker-harvest")).toHaveLength(0);
+    expect(events.filter(event => event.event === "worker-harvest-held")).toHaveLength(1);
+    expect(calls.length).toBeGreaterThanOrEqual(2);
+    expect(events.find(event => event.event === "worker-result")?.data.finished).toBe(true);
+  }, 60_000);
+
+  test("test: the same headless worker holding no connection is still harvested, one that drops its connection by closing the socket or losing its connector child while staying silent and flat is harvested on a later fresh reading after one held row, and one with no commits is never harvested, so a cached connection verdict fails", async () => {
+    for (const mode of ["none", "close", "child-gone"] as const) {
+      const { events, calls } = await connectionCase(mode);
+      expect(events.filter(event => event.event === "worker-harvest")).toHaveLength(1);
+      expect(events.filter(event => event.event === "worker-harvest-held")).toHaveLength(mode === "none" ? 0 : 1);
+      if (mode !== "none") expect(calls.length).toBeGreaterThanOrEqual(2);
+      expect(events.find(event => event.event === "worker-result")?.data.finished).toBe(false);
+    }
+    const uncommitted = await connectionCase("held", { commits: false });
+    expect(uncommitted.events.filter(event => event.event === "worker-harvest")).toHaveLength(0);
+    expect(uncommitted.calls).toHaveLength(0);
+  }, 60_000);
+
+  test("test: a headless committed silent worker whose connection reading fails, the lsof stand-in exiting with an error, is never concluded and journals harvest-unmeasurable naming the connection reading, so an unreadable reading taken as no connection fails", async () => {
+    const { events, calls } = await connectionCase("error");
+    expect(calls.length).toBeGreaterThanOrEqual(2);
+    expect(events.filter(event => event.event === "worker-harvest")).toHaveLength(0);
+    const unreadable = events.filter(event => event.event === "worker-harvest-unmeasurable");
+    expect(unreadable).toHaveLength(1);
+    expect(unreadable[0]!.data.reason).toMatch(/connection reading/);
+  }, 60_000);
+
+  test("test: with an lsof stand-in that never returns, each reading is one asynchronous query reading no environment, selecting the owned process group or its complete pid set intersected by -a with established TCP, timed out as unreadable by a deadline counted from invocation, and the wait still ends at the worker's exit, so a broad, synchronous or unbounded reading fails", async () => {
+    const { events, calls, heartbeat } = await connectionCase("hang");
+    expect(calls).toHaveLength(1);
+    expect(calls[0]!.args).toEqual(["-nP", "-a", "-g", calls[0]!.group, "-iTCP", "-sTCP:ESTABLISHED", "-Fp"]);
+    expect(heartbeat).toBeGreaterThan(140);
+    const unreadable = events.find(event => event.event === "worker-harvest-unmeasurable");
+    expect(unreadable?.data.reason).toMatch(/connection reading/);
+    const elapsed = Date.parse(unreadable!.ts) - calls[0]!.at;
+    expect(elapsed).toBeGreaterThanOrEqual(14_000);
+    expect(elapsed).toBeLessThan(18_000);
+    expect(() => process.kill(calls[0]!.pid, 0)).toThrow();
+    expect(events.filter(event => event.event === "worker-harvest")).toHaveLength(0);
+    expect(events.find(event => event.event === "worker-result")?.data.finished).toBe(true);
+    const source = readFileSync(new URL("../../../src/run/daemon.ts", import.meta.url), "utf8");
+    expect(source).not.toMatch(/(?:ps\s+eww|\/proc\/[^\n]*\/environ)/);
+  }, 60_000);
+
+  test("test: an interactive committed silent worker with flat CPU holding an open connection is still harvested, and an interactive worker burning CPU is still not concluded, so a connection leg applied to pane workers or a weakened CPU leg fails", async () => {
+    const flat = await connectionCase("held", { interactive: true });
+    expect(flat.events.filter(event => event.event === "worker-harvest")).toHaveLength(1);
+    expect(flat.calls).toHaveLength(0);
+    const burning = await connectionCase("held", { interactive: true, burning: true });
+    expect(burning.events.filter(event => event.event === "worker-harvest")).toHaveLength(0);
+    expect(burning.calls).toHaveLength(0);
+    expect(burning.events.find(event => event.event === "worker-result")?.data.finished).toBe(true);
+    const uncommitted = await connectionCase("none", { interactive: true, commits: false });
+    expect(uncommitted.events.filter(event => event.event === "worker-harvest")).toHaveLength(0);
+    expect(uncommitted.calls).toHaveLength(0);
+  }, 60_000);
 
   test("the flat-CPU window is sized against the host's own CPU-clock quantum", () => {
     // darwin `ps` prints hundredths, linux whole seconds. Equality across a window shorter than the
@@ -1770,3 +1986,151 @@ describe("resume harvest: an interrupted finished attempt is gated, never redisp
     }
   }, 180_000);
 });
+
+// Queue row 233 (D-2130): the FIFO writer belongs to the test, outside the worker's tree;
+// the worker only relays it with cat. CPU and connections cannot conceal a broken output signal.
+type PrintByteOptions = {
+  channel: "stdout" | "stderr"; stream: "below" | "rows" | "buffer";
+  committed: boolean; ending: "trailer" | "silent" | "deadline";
+  windowMs?: number; durationMs?: number; hardMs?: number | null; metered?: boolean;
+};
+async function printByteCase(options: PrintByteOptions) {
+  const { channel, stream, committed, ending, windowMs = 1200, durationMs = 2800, hardMs = 12_000 } = options;
+  const dir = makeTestTempDir("tickmarkr-print-bytes-");
+  const fifo = join(dir, "stream"), stateFile = join(dir, "state.json");
+  execFileSync("mkfifo", [fifo]);
+  const priorPath = process.env.PATH, priorBashEnv = process.env.BASH_ENV;
+  const bashEnv = join(dir, "bash-env"), lsof = join(dir, "lsof");
+  // Queue row 233 (D-2130): flatten only CPU reads; dispatch still needs its real group marker.
+  let groupProbe = "";
+  let sandboxReap: ReturnType<typeof vi.spyOn> | undefined;
+  try {
+    execFileSync("ps", ["-o", "pgid=", "-p", String(process.pid)], { stdio: "pipe" });
+  } catch {
+    // Queue row 233 (D-2130): a denied host census uses the existing cleanup seam;
+    // SubprocessDriver.close still kills the actual worker group, including the FIFO relay.
+    groupProbe = `if [ "$1" = -o ] && [ "$2" = pgid= ]; then if [ "$4" = ${process.pid} ]; then echo 90000001; else echo 90000002; fi; return; fi; `;
+    sandboxReap = vi.spyOn(stall.workerReapHost, "snapshot").mockResolvedValue([]);
+  }
+  writeBashEnvFixture(bashEnv, `ps() { ${groupProbe}if [ "$1" = -Awwo ] && [ "$2" = pid=,ppid=,pgid=,time=,command= ]; then echo '1 1 1 0:00.00 unrelated-process'; else command ps "$@"; fi; }\n`);
+  writeFileSync(lsof, `#!/bin/sh\ncase "$*" in *-iTCP*) exit 1;; esac\nPATH=${shq(priorPath ?? "")} exec lsof "$@"\n`);
+  chmodSync(lsof, 0o755);
+  const { repo, fake } = setupRepo([T("T1", { timeoutMinutes: windowMs / 60_000 })], {
+    consult: { action: "human", notes: "queue row 233 (D-2130): print wait concluded" },
+    tasks: { T1: [{
+      shell: `${committed ? `echo ready > work.txt && ${COMMIT} ready && ` : ""}cat ${shq(fifo)}${channel === "stderr" ? " >&2" : ""}`
+        + (ending === "trailer" && !committed ? ` && echo ready > work.txt && ${COMMIT} ready` : ""),
+      result: { ok: true, summary: "queue row 233 (D-2130): own trailer" },
+    }] },
+  }, "visibility:\n  worker: print\n");
+  const writer = spawn(process.execPath, ["-e", `
+    const fs = require('node:fs');
+    const out = fs.createWriteStream(${JSON.stringify(fifo)});
+    const state = {firstAt: 0, lastAt: 0, finalAt: 0, bytes: 0, writes: 0};
+    const save = () => { fs.writeFileSync(${JSON.stringify(stateFile)} + '.next', JSON.stringify(state));
+      fs.renameSync(${JSON.stringify(stateFile)} + '.next', ${JSON.stringify(stateFile)}); };
+    const send = (text, final = false) => out.write(text, () => {
+      state.firstAt ||= Date.now(); state.lastAt = Date.now(); state.bytes += Buffer.byteLength(text); state.writes++;
+      if (final) state.finalAt = state.lastAt;
+      save();
+      if (final && ${JSON.stringify(ending)} === 'trailer') out.end();
+    });
+    out.on('error', () => process.exit());
+    out.on('open', () => {
+      const prefix = ${JSON.stringify(stream)} === 'buffer' ? ('x'.repeat(255) + '\\n').repeat(9000)
+        : ${JSON.stringify(stream)} === 'rows' ? 'prefix\\n'.repeat(800) : 'prefix\\n';
+      send(prefix);
+      const started = Date.now();
+      const timer = setInterval(() => {
+        if (${JSON.stringify(ending)} !== 'deadline' && Date.now() - started >= ${durationMs}) {
+          clearInterval(timer); send('queue-row-233-final\\n', true);
+        } else send(${JSON.stringify(stream)} === 'below' ? '⠋\\r' : 'streaming\\n');
+      }, 50);
+    });
+    setTimeout(() => process.exit(), 30_000);
+  `], { cwd: dir, stdio: "ignore" });
+  const writerDone = new Promise<void>((resolve) => writer.once("exit", () => resolve()));
+  let attemptStart = 0, stoppedAt = 0;
+  const collect = fake.collectUsage.bind(fake);
+  fake.collectUsage = (cwd, since) => { attemptStart ||= since; return collect(cwd, since); };
+  if (options.metered) fake.contextUsage = () => ({ tokens: 500 });
+  class RecordingPrintDriver extends SubprocessDriver {
+    override async close(slot: Slot) {
+      if (slot.name.includes("-worker-") && !stoppedAt) stoppedAt = Date.now();
+      await super.close(slot);
+    }
+  }
+  process.env.BASH_ENV = bashEnv;
+  process.env.PATH = `${dir}:${priorPath ?? ""}`;
+  setHarvestSilentMsForTests(400);
+  setHarvestCpuFlatMsForTests(100);
+  if (hardMs === null) resetAttemptHardTimeoutMsForTests(); else setAttemptHardTimeoutMsForTests(hardMs);
+  if (options.metered) setRowRearmTokenFlatMsForTests(350);
+  try {
+    const runId = "run-print-received-bytes";
+    const summary = await runDaemon(repo, { adapters: [fake], runId, driver: new RecordingPrintDriver() });
+    const events = Journal.open(repo, runId).read();
+    if (!existsSync(stateFile)) throw new Error(JSON.stringify({ summary, events }));
+    const state = JSON.parse(readFileSync(stateFile, "utf8")) as {
+      firstAt: number; lastAt: number; finalAt: number; bytes: number; writes: number;
+    };
+    expect(state.writes).toBeGreaterThan(3);
+    if (stream === "buffer") expect(state.bytes).toBeGreaterThan(2 * 1024 * 1024);
+    return { summary, events, state, attemptStart, stoppedAt };
+  } finally {
+    writer.kill("SIGKILL");
+    await writerDone;
+    sandboxReap?.mockRestore();
+    if (priorPath === undefined) delete process.env.PATH; else process.env.PATH = priorPath;
+    if (priorBashEnv === undefined) delete process.env.BASH_ENV; else process.env.BASH_ENV = priorBashEnv;
+    resetAttemptHardTimeoutMsForTests();
+    resetHarvestSilentMsForTests();
+    resetHarvestCpuFlatMsForTests();
+    resetRowRearmTokenFlatMsForTests();
+  }
+}
+
+test("test: a committed print-mode worker whose CPU reads flat and that keeps streaming, on stdout or on stderr, past the 500-line read or past the 2 MB retained buffer, is never harvested while it streams and ends on its own trailer, so a progress measure read from the bounded tail, the retained buffer or one channel fails", async () => {
+  for (const channel of ["stdout", "stderr"] as const) {
+    for (const stream of ["rows", "buffer"] as const) {
+      const result = await printByteCase({ channel, stream, committed: true, ending: "trailer" });
+      expect(result.summary.done).toEqual(["T1"]);
+      expect(result.state.finalAt - result.state.firstAt).toBeGreaterThan(1200);
+      expect(result.events.filter(e => e.event === "worker-harvest" || e.event === "worker-result-harvested")).toEqual([]);
+      expect(result.events.find(e => e.event === "worker-result")?.data).toMatchObject({
+        finished: true, ok: true, summary: "queue row 233 (D-2130): own trailer",
+      });
+    }
+    for (const stream of ["below", "rows", "buffer"] as const) {
+      const hardMs = 2200;
+      const result = await printByteCase({ channel, stream, committed: true, ending: "deadline", windowMs: 700, hardMs });
+      expect(result.events.filter(e => e.event === "worker-harvest" || e.event === "worker-hard-timeout")).toEqual([]);
+      expect(result.state.finalAt).toBe(0);
+      expect(result.stoppedAt - result.attemptStart).toBeGreaterThanOrEqual(hardMs);
+      expect(result.stoppedAt - result.attemptStart).toBeLessThanOrEqual(hardMs + 1500);
+      expect(result.events.find(e => e.event === "worker-result")?.data.cause).toBe("stall-timeout");
+      expect(result.events.find(e => e.event === "worker-reaped-before-harvest")?.data.cause).toBe("stall-timeout");
+      expect(result.events.filter(e => e.event === "worker-result-harvested")).toHaveLength(1);
+    }
+  }
+}, 120_000);
+
+test("test: a committed print-mode worker with flat CPU that streams below the 500-line read is never harvested, while one that streams past it and then falls silent is harvested exactly once and only after its last streamed line, so a fix that disables the harvest or still concludes mid-stream fails", async () => {
+  for (const channel of ["stdout", "stderr"] as const) {
+    const active = await printByteCase({ channel, stream: "below", committed: true, ending: "trailer" });
+    expect(active.summary.done).toEqual(["T1"]);
+    expect(active.events.filter(e => e.event === "worker-harvest" || e.event === "worker-result-harvested")).toEqual([]);
+    expect(active.events.find(e => e.event === "worker-result")?.data.finished).toBe(true);
+    for (const stream of ["below", "rows", "buffer"] as const) {
+      const quiet = await printByteCase({ channel, stream, committed: true, ending: "silent", windowMs: 2400 });
+      const harvests = quiet.events.filter(e => e.event === "worker-harvest");
+      expect(quiet.state.finalAt).toBeGreaterThan(quiet.state.firstAt);
+      expect(harvests).toHaveLength(1);
+      expect(Date.parse(harvests[0]!.ts) - quiet.state.finalAt).toBeGreaterThanOrEqual(400);
+      expect(harvests[0]!.data.silentMs).toBeGreaterThanOrEqual(400);
+      expect(harvests[0]!.data.cpuMs).toBe(0);
+      expect(quiet.events.filter(e => e.event === "worker-result-harvested")).toHaveLength(1);
+      expect(quiet.summary.done).toEqual(["T1"]);
+    }
+  }
+}, 120_000);

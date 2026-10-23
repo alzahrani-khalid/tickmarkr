@@ -2,6 +2,53 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v2.8.7 — consumer repositories: honest jest reading, a pinned repair that runs, serialized worktree admin, grok's trust modal, consumer guidance, a harvest that waits for a live worker, print-mode progress past the read window, and briefs that name each oracle's suite
+
+**v2.8.7** closes the consumer-repository P1s and two defects found while building it. Its work comes from two `tickmarkr run`
+engagements plus one change gated by `tickmarkr verify`:
+- run-20261023-030344-…1588 merged two tasks;
+- the pinned-repair change was verified after that run parked it on the very defect it fixes;
+- run-20261023-064933-…1709 merged the rest.
+
+Each change passed build, lint, evidence, scope, its acceptance criteria, a cross-vendor review and the full suite.
+
+- **Jest's recovered Watchman warning is never failure evidence (queue rows 211, 224(a)).** jest-haste-map's crawl-retry block is a
+  warning jest recovers from.
+  - One closed signature is now excluded from fingerprints, classification and headlines; a FAILED retry stays red.
+  - The test gate headlines jest's own failure identities, each with its first message line.
+- **A pinned task's funded repair runs on its pin (queue row 224(b)).** A pinned task's second owned red that funded a repair used to
+  park "pin held" in the same instant, so the repair never ran.
+  - The funded repair now runs on the pinned channel.
+  - The first owned red after it that funds nothing parks pin held, so a pinned task is never escalated off its pin.
+  - The repair scope hint reads tsc's `path(line,col):` form as the path (queue row 230).
+- **Worktree admin is serialized (queue row 223).** Every add, remove and prune of git's worktree admin directory in the daemon runs
+  behind one lock. A sibling-admin race is retried a bounded number of times and then parks as infra, never task-failed.
+- **grok's trust modal is answered on every driver (queue row 215).** The recorded Grok Build modal is declared and answered with Enter,
+  including when the driver reports an unknown status.
+- **Consumer guidance names consumer facts (queue rows 210, 221, 217).**
+  - The version preflight is one command, `tickmarkr version --check`. It compares the binary with package.json only in the
+    tickmarkr source repository, and with the installed guidance everywhere else.
+  - The scaffolded block gains a Seat-hygiene section.
+  - Seat labels name the mission or run.
+- **The worker harvest never concludes a headless worker still waiting on its provider (queue row 231).**
+  - A print-mode worker that holds an established provider connection is held, never concluded.
+  - An unreadable reading is never concluded.
+- **A print-mode worker that keeps streaming is progress (queue row 233).** Past 500 lines of output the daemon used to read a
+  streaming worker as silent; it then harvested it on any CPU lull and stall-killed it while it still streamed.
+  - Progress now reads a monotonic received-output measure from the driver, on both stdout and stderr.
+  - Print mode gains the interactive loop's hard deadline.
+- **The worker brief names each test oracle's required suite (queue row 234(a)).** Every test oracle with a declared suite shows that
+  suite beside its title, in the first brief and in every repair brief. The judge and reviewer keep the shared criterion text.
+
+Declared, still open:
+- Queue row 234(b): the acceptance gate reports one failing oracle per round (2.8.8).
+- Queue row 235: the repair-disposition lexer reads paths from free text (2.8.8).
+- Queue row 232(a, b): a post-approval red offers no repair verb, and a recheck forgets an earlier waive.
+- Queue row 237: compile's ownership lint does not see tests that read a source file's text.
+- Queue row 187(b): a missing doctor record reads as "no reviewer".
+- Queue row 236: liveness readers ignore the repository claim.
+- Queue row 238: a waived scope gate's owed check can never be discharged once the task later fixes the cause. This release's second run records one such debt, on a T3 commit that never merged. Every shipped change passed its full battery, but that run reads not green on record.
+
 ## v2.8.6 — the P0 batch: a proven base, decidable re-parks, protected operator git and a Codex grant that trusts only tickmarkr
 
 **v2.8.6** closes the four defects queued as SHIP P0. Its work comes from one `tickmarkr run`, plus two changes gated afterwards by

@@ -79,6 +79,23 @@ describe("SubprocessDriver", () => {
     await d.close(slot);
   });
 
+  test("queue row 233 (D-2130): received bytes count both streams beyond retention and across slot reuse", async () => {
+    const d = new SubprocessDriver();
+    const slot = await d.slot("/tmp", "received-bytes");
+    try {
+      for (const channel of ["stdout", "stderr"] as const) {
+        const before = (await d.transportState(slot)).bytes!;
+        const size = MAX_BUF + 4096;
+        await d.run(slot, `node -e 'process.${channel}.write(Buffer.alloc(${size}, 120)); process.${channel}.write("⠋\\r${channel}-end")'`);
+        expect(await d.waitOutput(slot, `${channel}-end`, 10_000)).toBe(true);
+        expect((await d.transportState(slot)).bytes! - before).toBe(size + Buffer.byteLength(`⠋\r${channel}-end`));
+        expect((await d.read(slot, 10_000_000)).length).toBeLessThanOrEqual(MAX_BUF);
+      }
+    } finally {
+      await d.close(slot);
+    }
+  });
+
   test("HARD-05: a worker that reads stdin reaches its trailer (no stdin hang)", async () => {
     const d = new SubprocessDriver();
     const slot = await d.slot("/tmp", "stdin-victim");

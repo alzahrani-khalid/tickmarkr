@@ -1,7 +1,7 @@
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
-import { filterLlmTranscript, normalizeStallSnapshot, PANE_READ_ROWS, stallSnapshotBannerRows, stallSnapshotTail, StallProgressTracker } from "../../src/run/stall.js";
+import { filterLlmTranscript, normalizeStallSnapshot, PANE_READ_ROWS, ROW_REARM_TOKEN_FLAT_MS, stallSnapshotBannerRows, stallSnapshotTail, StallProgressTracker } from "../../src/run/stall.js";
 import { quotaSignal } from "../../src/adapters/types.js";
 
 // OBS-82 fixture: consecutive HerdrDriver.read(slot, 1000) snapshots of a live wedged codex pane
@@ -13,6 +13,23 @@ const frames: string[] = readdirSync(FIXTURE_DIR)
   .filter((f) => /^frame-\d+\.txt$/.test(f))
   .sort()
   .map((f) => readFileSync(join(FIXTURE_DIR, f), "utf8"));
+
+test("queue row 233 (D-2130): received bytes replace rows, including spinner bytes, under seed and token rules", () => {
+  const tracker = new StallProgressTracker();
+  const t0 = 1_000_000;
+  expect(tracker.observe({ paneText: "", receivedBytes: 0, seedSubmitted: true }, t0)).toBe(true);
+  expect(tracker.observe({ paneText: "⠋\r", receivedBytes: 4 }, t0 + 1)).toBe(true);
+  expect(tracker.observe({ paneText: "row 1\nrow 2", receivedBytes: 4 }, t0 + 2)).toBe(false);
+  expect(tracker.observe({ paneText: "", receivedBytes: 3_000_000, contextTokens: 5 }, t0 + 3)).toBe(true);
+  const pastCap = t0 + 3 + ROW_REARM_TOKEN_FLAT_MS;
+  expect(tracker.observe({ paneText: "", receivedBytes: 3_000_100, contextTokens: 5 }, pastCap)).toBe(false);
+  expect(tracker.observe({ paneText: "", receivedBytes: 3_000_200, contextTokens: 6 }, pastCap + 1)).toBe(true);
+  expect(tracker.observe({ paneText: "", receivedBytes: 3_000_300, contextTokens: 2 }, pastCap + 2)).toBe(true);
+  const fallback = new StallProgressTracker();
+  expect(fallback.observe({ paneText: "row 1" }, t0)).toBe(true);
+  expect(fallback.observe({ paneText: "row 2" }, t0 + 1)).toBe(false);
+  expect(fallback.observe({ paneText: "row 2\nrow 3" }, t0 + 2)).toBe(true);
+});
 
 describe("stall normalizer", () => {
   test("ansi escape sequences are stripped before comparison", () => {

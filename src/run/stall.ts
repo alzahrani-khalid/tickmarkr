@@ -30,6 +30,7 @@ export function normalizeStallSnapshot(text: string): string {
 
 export interface StallProgressSample {
   paneText: string;
+  receivedBytes?: number;
   seedSubmitted?: boolean;
   contextTokens?: number;
 }
@@ -571,6 +572,7 @@ export const PANE_READ_ROWS = 1000;
  */
 export class StallProgressTracker {
   private transcriptRows = 0; // non-empty high-water over the bounded read — the growth signal
+  private receivedBytes = 0;
   private rawWindowLines = 0; // raw-line high-water — the SATURATION signal (see the getter)
   private seedSubmitted = false;
   private contextTokens: number | undefined;
@@ -614,6 +616,14 @@ export class StallProgressTracker {
       rowsAdvanced = true;
       this.rowGrowthAt = now; // raw signal — advances even when the report below is suppressed
     }
+    // Queue row 233 (D-2130): print-mode progress is the driver's received-byte count, never a
+    // row high-water over the bounded tail. A driver reporting no count keeps the row measure.
+    const bytes = sample.receivedBytes;
+    let outputAdvanced = rowsAdvanced;
+    if (bytes !== undefined && Number.isFinite(bytes) && bytes >= 0) {
+      outputAdvanced = bytes > this.receivedBytes;
+      this.receivedBytes = Math.max(this.receivedBytes, bytes);
+    }
     let seedAdvanced = false;
     if (sample.seedSubmitted && !this.seedSubmitted) {
       this.seedSubmitted = true;
@@ -631,10 +641,9 @@ export class StallProgressTracker {
       this.contextTokens = tokens;
     }
     if (tokensAdvanced || seedAdvanced) return true;
-    if (rowsAdvanced) {
-      // T1: row growth past the flat-token cap is cosmetic — the paid-work counter has not moved,
-      // so the inactivity window must NOT re-arm on it. A tracker that never sees a token sample
-      // (unmetered adapter) keeps the old row-growth behavior.
+    if (outputAdvanced) {
+      // Queue row 233 (D-2130): both output measures obey the existing flat-token cap;
+      // an unmetered adapter can keep re-arming on output indefinitely, up to its hard deadline.
       if (this.lastTokenGrowthAt !== undefined && now - this.lastTokenGrowthAt >= rowRearmTokenFlatMs) return false;
       return true;
     }

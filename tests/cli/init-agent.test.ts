@@ -44,6 +44,73 @@ describe("tickmarkr init --agent skills location (T3)", () => {
 
 });
 
+describe("consumer preflight and seat hygiene (queue rows 210, 221; D-2118)", () => {
+  test("test: the block an agent init writes into a consumer tells its reader to run the version check and stop on a non-zero exit, keeps the whole-version stop for the tickmarkr source repository and the graph-lock check, and every guidance file at this repository root carries it byte for byte, so a preflight comparing the app manifest fails", async () => {
+    vi.spyOn(registry, "allAdapters").mockReturnValue([]);
+    const repo = makeRepo({ "CLAUDE.md": "App instructions\n", "package.json": '{"name":"consumer-app","version":"99.0.0"}' });
+    await runInit(repo, "--agent", "--docs");
+    const block = agentDocsSection(repo);
+    const preflight = versionPreflight(block);
+    expect(preflight).toContain("run `tickmarkr version --check` and stop on a non-zero exit");
+    expect(preflight).toContain("tickmarkr source repository (`package.json` named `tickmarkr`)");
+    expect(preflight).toContain("must agree on the entire version");
+    expect(preflight).toContain("binary `2.1.0` versus repository `2.1.1` is a stop");
+    expect(preflight).toContain("never the app's manifest version");
+    expect(preflight).toContain("tickmarkr init --agent --force");
+    expect(preflight).toContain(".tickmarkr/graph.lock");
+    expect(preflight).toContain("kill -0 <pid>");
+    expect(preflight).toContain("resolve every candidate's own cwd");
+    expect(preflight).toContain("whose cwd is this repository root");
+    expect(preflight).not.toContain("read `package.json` version");
+    expect(agentDocsSection(repo, "CLAUDE.md")).toBe(block);
+    for (const doc of ["CLAUDE.md", "AGENTS.md"].filter((name) => existsSync(join(ROOT, name)))) {
+      expect(agentDocsSection(ROOT, doc)).toBe(block);
+    }
+  });
+
+  test("test: the installed loop and auto skills' preflights run the version check and stop on non-zero while keeping the whole-version sentence, and every installed skill defines its seat-label placeholder as the mission or run outside the tickmarkr source repository, no label still naming the version, so a consumer seat named by binary version fails", async () => {
+    vi.spyOn(registry, "allAdapters").mockReturnValue([]);
+    const repo = makeRepo({ "keep.txt": "x" });
+    await runInit(repo, "--agent", "--docs");
+    for (const name of ["tickmarkr-loop", "tickmarkr-auto", "tickmarkr-overseer"]) {
+      const installed = readFileSync(join(repo, ".agents/skills", name, "SKILL.md"), "utf8");
+      expect(installed).toContain("`<label>` means the version only in the tickmarkr source repository (`package.json` named `tickmarkr`); elsewhere it means the mission or run, never the installed binary version.");
+      expect(installed.match(/`<label>` means/g)).toHaveLength(1);
+      expect(installed).toContain("ORCH · <label>");
+      expect(installed).toContain("OVERSEER · <label>");
+      expect(installed).not.toContain("<version>");
+      if (name === "tickmarkr-overseer") continue;
+      const preflight = installed.split("## Binary preflight (before compile or run)")[1].split("### No run may be live")[0];
+      expect(preflight).toContain("Run `tickmarkr version --check` and **stop immediately on a non-zero exit**");
+      expect(preflight).toContain("Only in the tickmarkr source repository (`package.json` named `tickmarkr`)");
+      expect(preflight).toContain("If the binary and repository do not **agree on the entire version** (including the patch; e.g. binary `2.1.0` vs repo `2.1.1`), **stop immediately**");
+      expect(preflight).toContain("never the app's manifest version");
+      expect(preflight).not.toContain("Read the `version` field from the repository's `package.json`");
+    }
+  });
+
+  test("test: an agent init's block carries a Seat hygiene section where tiers clear each other at half context or more, a new spec or run is a mission boundary, every brief and handoff carries the duty and a single-tier plain host asks the operator, and the installed overseer brief list opens with it, so guidance without the duty fails", async () => {
+    vi.spyOn(registry, "allAdapters").mockReturnValue([]);
+    const repo = makeRepo({ "keep.txt": "x" });
+    await runInit(repo, "--agent", "--docs");
+    const hygiene = agentDocsSection(repo).split("### Seat hygiene\n\n")[1].split("\n### ")[0];
+    expect(hygiene).toContain("In a multi-tier session, the tiers clear each other at 50% context or more");
+    expect(hygiene).toContain("after writing a handoff");
+    expect(hygiene).toContain("A new spec or run is a mission boundary");
+    expect(hygiene).toContain("clear before taking the next mission");
+    expect(hygiene).toContain("Copy this duty into every brief and handoff");
+    expect(hygiene).toContain("On a single-tier plain host, write your handoff and ask the operator to clear the session");
+    const installed = readFileSync(join(repo, ".agents/skills/tickmarkr-overseer/SKILL.md"), "utf8");
+    const brief = installed.split("The brief MUST contain: ")[1].split("\n")[0];
+    expect(brief.startsWith("**Seat hygiene — ")).toBe(true);
+    expect(brief).toContain("tiers clear each other at 50% context or more after writing a handoff");
+    expect(brief).toContain("new spec or run is a mission boundary");
+    expect(brief).toContain("copy this duty into every brief and handoff");
+    expect(brief).toContain("single-tier plain host write your handoff and ask the operator to clear the session");
+    expect(brief.indexOf("Seat hygiene")).toBeLessThan(brief.indexOf("then the mission"));
+  });
+});
+
 describe("tickmarkr init --agent supervision skill mandates (SK-1)", () => {
   test("test: the overseer skill a fresh tickmarkr init installs states that on any restart the overseer re-announces its pane id to every live seat and re-arms every watcher with it, that briefs take the address from the handoff and never hardcode it, and that orchestrator artifacts live inside the orchestrator's sandbox root, so an installed skill that lets a seat keep a pre-restart pane id fails", async () => {
     vi.spyOn(registry, "allAdapters").mockReturnValue([]);

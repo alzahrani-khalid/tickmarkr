@@ -46,7 +46,7 @@ export function herdrSealShellPrefix(env: NodeJS.ProcessEnv = process.env): stri
 
 /** Queue row 108 (D-1622): ONE invocation's own stream state, written only by that invocation's process listeners. */
 interface Invocation { closed: boolean; exitCode: number | null; signal: string | null }
-interface SlotState { buf: string; proc?: ChildProcess; exited: boolean; invocation?: Invocation }
+interface SlotState { buf: string; receivedBytes: number; proc?: ChildProcess; exited: boolean; invocation?: Invocation }
 
 export class SubprocessDriver implements ExecutorDriver {
   id = "subprocess";
@@ -58,7 +58,7 @@ export class SubprocessDriver implements ExecutorDriver {
 
   async slot(cwd: string, name: string): Promise<Slot> {
     const id = `sp-${++this.n}`;
-    this.slots.set(id, { buf: "", exited: false });
+    this.slots.set(id, { buf: "", receivedBytes: 0, exited: false });
     return { id, name, cwd };
   }
 
@@ -82,8 +82,13 @@ export class SubprocessDriver implements ExecutorDriver {
       detached: true,
     });
     s.proc = p;
-    p.stdout.on("data", (d) => (s.buf = (s.buf + d).slice(-MAX_BUF)));
-    p.stderr.on("data", (d) => (s.buf = (s.buf + d).slice(-MAX_BUF)));
+    // Queue row 233 (D-2130): count both received streams before retention truncates the tail.
+    const receive = (d: Buffer) => {
+      s.receivedBytes += d.length;
+      s.buf = (s.buf + d).slice(-MAX_BUF);
+    };
+    p.stdout.on("data", receive);
+    p.stderr.on("data", receive);
     p.on("close", () => (s.exited = true));
     p.on("error", (e) => { s.buf = (s.buf + `\n[tickmarkr subprocess error] ${e}\n`).slice(-MAX_BUF); s.exited = true; });
     // Queue row 108 (D-1622): THIS run's transport state. The slot's `exited` outlives an invocation (a reused slot) and
@@ -127,7 +132,7 @@ export class SubprocessDriver implements ExecutorDriver {
   async transportState(slot: Slot): Promise<TransportState> {
     const s = this.state(slot);
     const run = s.invocation;
-    return { closed: run?.closed ?? false, bytes: Buffer.byteLength(s.buf), exitCode: run?.exitCode ?? null, signal: run?.signal ?? null };
+    return { closed: run?.closed ?? false, bytes: s.receivedBytes, exitCode: run?.exitCode ?? null, signal: run?.signal ?? null };
   }
 
   async read(slot: Slot, lines: number): Promise<string> {

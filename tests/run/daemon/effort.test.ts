@@ -1,3 +1,5 @@
+import { afterEach } from "vitest";
+import { setAttemptHardTimeoutMsForTests, resetAttemptHardTimeoutMsForTests } from "../../../src/run/daemon.js";
 // OBS-1182 launch: the daemon hands each worker transport the routed seat's effort. A recording seat
 // wears a real adapter's id and renders the REAL adapter's command from exactly what the daemon passed,
 // while the scripted fake shell does the work — so every assertion reads a real CLI's argv, zero tokens.
@@ -132,6 +134,7 @@ class ProseConsultSeat extends RecordingSeat {
 
 describe("OBS-1182 consult invocation journal", () => {
   test("the consult-verdict row journals every launched consult seat with its effort, a failed preferred seat included", async () => {
+    setAttemptHardTimeoutMsForTests(60_000); // Queue row 233 (D-2130): isolate inactivity from the hard deadline.
     const { repo, scriptPath } = setupRepo(
       [T("T1", { routingHints: { pin: { via: "fake", model: "fake-1" } } })],
       // no trailer: the worker exits without a completion marker, so the stall consult runs
@@ -159,3 +162,6 @@ describe("OBS-1182 consult invocation journal", () => {
     expect("effort" in verdicts[0]!.data).toBe(false);
   }, 60_000);
 });
+
+// Queue row 233 (D-2130): each small-window fixture owns its deadline seam.
+afterEach(resetAttemptHardTimeoutMsForTests);

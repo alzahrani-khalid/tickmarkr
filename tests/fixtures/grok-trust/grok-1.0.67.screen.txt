@@ -1,0 +1,40 @@
+
+  /p/t/c/-/2/s/grok-modal/tm-enter
+
+
+
+
+                                                     ⠀⠀⠀⠀⠀⠀⣀⣀⡀⠀⠀⠀⢀⠄
+                                                     ⠀⠀⠀⣠⣾⠿⠛⠛⠛⠛⢀⡴⠁⠀
+                                                     ⠀⠀⣼⡟⠁⠀⠀⠀⢀⡴⠻⣿⡀⠀
+                                                     ⠀⠀⣿⡇⠀⠀⠀⠔⠁⠀⠀⣿⡇⠀
+                                                     ⠀⠀⢹⣷⠀⠀⠀⠀⠀⢀⣴⡿⠀⠀
+                                                     ⠀⢀⠞⠁⠠⢶⣶⣶⣶⠿⠋⠀⠀⠀
+                                                     ⠐⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+
+
+                                      Do you trust the contents of this directory?
+/Users/…/repo
+
+                                Grok Build may run or modify contents in this directory,
+                                                 posing security risks.
+
+                                             Yes, proceed                 y
+                                             No, quit                     n
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                    Grok Build  1.0.67
+

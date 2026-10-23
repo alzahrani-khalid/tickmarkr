@@ -1,8 +1,13 @@
+import { chmodSync, existsSync } from "node:fs";
+import { execFileSync, spawn } from "node:child_process";
+import { shq } from "../../../src/adapters/types.js";
+import { setHarvestSilentMsForTests, resetHarvestSilentMsForTests, setHarvestCpuFlatMsForTests, resetHarvestCpuFlatMsForTests } from "../../../src/run/daemon.js";
+import { setAttemptHardTimeoutMsForTests, resetAttemptHardTimeoutMsForTests } from "../../../src/run/daemon.js";
 import { writeBashEnvFixture } from "../../helpers/bash-env.js";
 import { readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, beforeEach, describe, expect, test } from "vitest";
+import { afterEach, beforeEach, describe, expect, test, vi } from "vitest";
 import { DEFAULT_CONFIG } from "../../../src/config/config.js";
 import { SubprocessDriver } from "../../../src/drivers/subprocess.js";
 import { type ExecutorDriver, type Slot } from "../../../src/drivers/types.js";
@@ -10,7 +15,7 @@ import { tickmarkrDir } from "../../../src/graph/graph.js";
 import { EARLY_LAUNCH_LIVENESS_MS, NUDGEABLE_ADAPTERS, resetContactUnreadableDeadlineMsForTests, resetDeadChannelFastKillMsForTests, resetEarlyLaunchLivenessMsForTests, resetNudgeTimingForTests, resetPageRepeatMsForTests, resetQuotaBannerSilentMsForTests, runDaemon, setContactUnreadableDeadlineMsForTests, setDeadChannelFastKillMsForTests, setEarlyLaunchLivenessMsForTests, setNudgeTimingForTests, setPageRepeatMsForTests, setQuotaBannerSilentMsForTests, WORKER_NUDGE_MESSAGE } from "../../../src/run/daemon.js";
 import { Journal } from "../../../src/run/journal.js";
 import { shGit } from "../../../src/run/git.js";
-import { PANE_READ_ROWS, resetRowRearmTokenFlatMsForTests, setRowRearmTokenFlatMsForTests } from "../../../src/run/stall.js";
+import { PANE_READ_ROWS, resetRowRearmTokenFlatMsForTests, setRowRearmTokenFlatMsForTests, workerReapHost } from "../../../src/run/stall.js";
 import { COMMIT, makeTestTempDir, setupRepo, T } from "../../helpers/tmprepo.js";
 
 
@@ -35,6 +40,7 @@ describe("OBS-82 spinner-blind stall, headless site (fake adapter, zero tokens)"
   // frame (glyph + elapsed-time repaint) that normalizes constant, so the headless inactivity
   // budget must expire. Only the worker slot is scripted — consult reads stay real.
   test("spinner only repaints do not reset the headless stall clock", async () => {
+    setAttemptHardTimeoutMsForTests(60_000); // Queue row 233 (D-2130): isolate inactivity from the hard deadline.
     const { repo, fake } = setupRepo(
       [T("T1")],
       { tasks: { T1: [{ shell: "sleep 30" }] }, consult: { action: "human", notes: "spinner wedge" } },
@@ -68,6 +74,7 @@ describe("OBS-82 spinner-blind stall, headless site (fake adapter, zero tokens)"
 
 describe("v1.76 progress-based stall watchdog (fake adapter, zero tokens)", () => {
   test("test: a worker pane emitting only cursor and status-bar repaints past the stall threshold triggers the stall escalation", async () => {
+    setAttemptHardTimeoutMsForTests(60_000); // Queue row 233 (D-2130): isolate inactivity from the hard deadline.
     const { repo, fake } = setupRepo(
       [T("T1")],
       { tasks: { T1: [{ shell: "sleep 30" }] }, consult: { action: "human", notes: "repaint-only pane" } },
@@ -110,6 +117,7 @@ describe("v1.76 progress-based stall watchdog (fake adapter, zero tokens)", () =
   }, 30_000);
 
   test("test: a worker making real transcript progress at the same cadence does not trigger it", async () => {
+    setAttemptHardTimeoutMsForTests(60_000); // Queue row 233 (D-2130): isolate inactivity from the hard deadline.
     const { repo, fake } = setupRepo(
       [T("T1")],
       { tasks: { T1: [{
@@ -957,3 +965,155 @@ describe("T1 stall detection (OBS-262/263, fake adapter, zero tokens)", () => {
     expect((await shGit(`git rev-parse --verify '${parked?.data.ref}^{commit}'`, repo)).code).toBe(0);
   }, 30_000);
 });
+
+// Queue row 233 (D-2130): each small-window fixture owns its deadline seam.
+afterEach(resetAttemptHardTimeoutMsForTests);
+
+// Queue row 233 (D-2130): the FIFO writer belongs to the test, outside the worker's tree;
+// the worker only relays it with cat. CPU and connections cannot conceal a broken output signal.
+type PrintByteOptions = {
+  channel: "stdout" | "stderr"; stream: "below" | "rows" | "buffer";
+  committed: boolean; ending: "trailer" | "silent" | "deadline";
+  windowMs?: number; durationMs?: number; hardMs?: number | null; metered?: boolean;
+};
+async function printByteCase(options: PrintByteOptions) {
+  const { channel, stream, committed, ending, windowMs = 1200, durationMs = 2800, hardMs = 12_000 } = options;
+  const dir = makeTestTempDir("tickmarkr-print-bytes-");
+  const fifo = join(dir, "stream"), stateFile = join(dir, "state.json");
+  execFileSync("mkfifo", [fifo]);
+  const priorPath = process.env.PATH, priorBashEnv = process.env.BASH_ENV;
+  const bashEnv = join(dir, "bash-env"), lsof = join(dir, "lsof");
+  // Queue row 233 (D-2130): flatten only CPU reads; dispatch still needs its real group marker.
+  let groupProbe = "";
+  let sandboxReap: ReturnType<typeof vi.spyOn> | undefined;
+  try {
+    execFileSync("ps", ["-o", "pgid=", "-p", String(process.pid)], { stdio: "pipe" });
+  } catch {
+    // Queue row 233 (D-2130): a denied host census uses the existing cleanup seam;
+    // SubprocessDriver.close still kills the actual worker group, including the FIFO relay.
+    groupProbe = `if [ "$1" = -o ] && [ "$2" = pgid= ]; then if [ "$4" = ${process.pid} ]; then echo 90000001; else echo 90000002; fi; return; fi; `;
+    sandboxReap = vi.spyOn(workerReapHost, "snapshot").mockResolvedValue([]);
+  }
+  writeBashEnvFixture(bashEnv, `ps() { ${groupProbe}if [ "$1" = -Awwo ] && [ "$2" = pid=,ppid=,pgid=,time=,command= ]; then echo '1 1 1 0:00.00 unrelated-process'; else command ps "$@"; fi; }\n`);
+  writeFileSync(lsof, `#!/bin/sh\ncase "$*" in *-iTCP*) exit 1;; esac\nPATH=${shq(priorPath ?? "")} exec lsof "$@"\n`);
+  chmodSync(lsof, 0o755);
+  const { repo, fake } = setupRepo([T("T1", { timeoutMinutes: windowMs / 60_000 })], {
+    consult: { action: "human", notes: "queue row 233 (D-2130): print wait concluded" },
+    tasks: { T1: [{
+      shell: `${committed ? `echo ready > work.txt && ${COMMIT} ready && ` : ""}cat ${shq(fifo)}${channel === "stderr" ? " >&2" : ""}`
+        + (ending === "trailer" && !committed ? ` && echo ready > work.txt && ${COMMIT} ready` : ""),
+      result: { ok: true, summary: "queue row 233 (D-2130): own trailer" },
+    }] },
+  }, "visibility:\n  worker: print\n");
+  const writer = spawn(process.execPath, ["-e", `
+    const fs = require('node:fs');
+    const out = fs.createWriteStream(${JSON.stringify(fifo)});
+    const state = {firstAt: 0, lastAt: 0, finalAt: 0, bytes: 0, writes: 0};
+    const save = () => { fs.writeFileSync(${JSON.stringify(stateFile)} + '.next', JSON.stringify(state));
+      fs.renameSync(${JSON.stringify(stateFile)} + '.next', ${JSON.stringify(stateFile)}); };
+    const send = (text, final = false) => out.write(text, () => {
+      state.firstAt ||= Date.now(); state.lastAt = Date.now(); state.bytes += Buffer.byteLength(text); state.writes++;
+      if (final) state.finalAt = state.lastAt;
+      save();
+      if (final && ${JSON.stringify(ending)} === 'trailer') out.end();
+    });
+    out.on('error', () => process.exit());
+    out.on('open', () => {
+      const prefix = ${JSON.stringify(stream)} === 'buffer' ? ('x'.repeat(255) + '\\n').repeat(9000)
+        : ${JSON.stringify(stream)} === 'rows' ? 'prefix\\n'.repeat(800) : 'prefix\\n';
+      send(prefix);
+      const started = Date.now();
+      const timer = setInterval(() => {
+        if (${JSON.stringify(ending)} !== 'deadline' && Date.now() - started >= ${durationMs}) {
+          clearInterval(timer); send('queue-row-233-final\\n', true);
+        } else send(${JSON.stringify(stream)} === 'below' ? '⠋\\r' : 'streaming\\n');
+      }, 50);
+    });
+    setTimeout(() => process.exit(), 30_000);
+  `], { cwd: dir, stdio: "ignore" });
+  const writerDone = new Promise<void>((resolve) => writer.once("exit", () => resolve()));
+  let attemptStart = 0, stoppedAt = 0;
+  const collect = fake.collectUsage.bind(fake);
+  fake.collectUsage = (cwd, since) => { attemptStart ||= since; return collect(cwd, since); };
+  if (options.metered) fake.contextUsage = () => ({ tokens: 500 });
+  class RecordingPrintDriver extends SubprocessDriver {
+    override async close(slot: Slot) {
+      if (slot.name.includes("-worker-") && !stoppedAt) stoppedAt = Date.now();
+      await super.close(slot);
+    }
+  }
+  process.env.BASH_ENV = bashEnv;
+  process.env.PATH = `${dir}:${priorPath ?? ""}`;
+  setHarvestSilentMsForTests(400);
+  setHarvestCpuFlatMsForTests(100);
+  if (hardMs === null) resetAttemptHardTimeoutMsForTests(); else setAttemptHardTimeoutMsForTests(hardMs);
+  if (options.metered) setRowRearmTokenFlatMsForTests(350);
+  try {
+    const runId = "run-print-received-bytes";
+    const summary = await runDaemon(repo, { adapters: [fake], runId, driver: new RecordingPrintDriver() });
+    const events = Journal.open(repo, runId).read();
+    if (!existsSync(stateFile)) throw new Error(JSON.stringify({ summary, events }));
+    const state = JSON.parse(readFileSync(stateFile, "utf8")) as {
+      firstAt: number; lastAt: number; finalAt: number; bytes: number; writes: number;
+    };
+    expect(state.writes).toBeGreaterThan(3);
+    if (stream === "buffer") expect(state.bytes).toBeGreaterThan(2 * 1024 * 1024);
+    return { summary, events, state, attemptStart, stoppedAt };
+  } finally {
+    writer.kill("SIGKILL");
+    await writerDone;
+    sandboxReap?.mockRestore();
+    if (priorPath === undefined) delete process.env.PATH; else process.env.PATH = priorPath;
+    if (priorBashEnv === undefined) delete process.env.BASH_ENV; else process.env.BASH_ENV = priorBashEnv;
+    resetAttemptHardTimeoutMsForTests();
+    resetHarvestSilentMsForTests();
+    resetHarvestCpuFlatMsForTests();
+    resetRowRearmTokenFlatMsForTests();
+  }
+}
+
+test("test: an uncommitted print-mode worker streaming on stdout or stderr past the 500-line read or 2 MB buffer longer than its stall window ends on its trailer, one falling silent ends by stall-timeout, one still streaming at its default four-window or seamed deadline ends by stall-timeout no earlier than it, within a polling allowance, so a tail-keyed or unbounded wait fails", async () => {
+  for (const channel of ["stdout", "stderr"] as const) {
+    for (const stream of ["below", "rows", "buffer"] as const) {
+      const active = await printByteCase({ channel, stream, committed: false, ending: "trailer" });
+      expect(active.state.finalAt - active.state.firstAt).toBeGreaterThan(1200);
+      expect(active.summary.done).toEqual(["T1"]);
+      expect(active.events.find(e => e.event === "worker-result")?.data).toMatchObject({ finished: true, ok: true });
+      expect(active.events.filter(e => e.event === "worker-harvest" || e.event === "worker-result-harvested")).toEqual([]);
+      const quiet = await printByteCase({ channel, stream, committed: false, ending: "silent" });
+      expect(quiet.summary.human).toEqual(["T1"]);
+      expect(quiet.state.finalAt).toBeGreaterThan(quiet.state.firstAt);
+      expect(quiet.stoppedAt - quiet.state.finalAt).toBeGreaterThanOrEqual(1200);
+      expect(quiet.stoppedAt - quiet.state.finalAt).toBeLessThanOrEqual(1200 + 1500);
+      expect(quiet.events.find(e => e.event === "worker-result")?.data.cause).toBe("stall-timeout");
+      expect(quiet.events.filter(e => e.event === "worker-harvest" || e.event === "worker-result-harvested")).toEqual([]);
+      // Queue row 233 (D-2130): every stream shape exercises both the unseamed formula and the existing seam.
+      for (const hardMs of [null, 2200]) {
+        const windowMs = 350, deadlineMs = hardMs ?? windowMs * 4;
+        const deadline = await printByteCase({ channel, stream, committed: false, ending: "deadline", windowMs, hardMs });
+        expect(deadline.state.finalAt).toBe(0);
+        expect(deadline.stoppedAt - deadline.state.lastAt).toBeLessThan(500);
+        expect(deadline.stoppedAt - deadline.attemptStart).toBeGreaterThanOrEqual(deadlineMs);
+        expect(deadline.stoppedAt - deadline.attemptStart).toBeLessThanOrEqual(deadlineMs + 1500);
+        expect(deadline.events.find(e => e.event === "worker-result")?.data.cause).toBe("stall-timeout");
+        expect(deadline.events.find(e => e.event === "worker-reaped-before-harvest")?.data.cause).toBe("stall-timeout");
+        expect(deadline.events.filter(e => e.event === "worker-hard-timeout" || e.event === "worker-result-harvested")).toEqual([]);
+        expect(deadline.summary.human).toEqual(["T1"]);
+      }
+    }
+  }
+}, 180_000);
+
+test("test: a metered print-mode worker whose token count stays flat past the flat-token cap still ends by stall-timeout while it streams past the 500-line read, so received-byte growth that bypasses the flat-token rule fails", async () => {
+  for (const channel of ["stdout", "stderr"] as const) {
+    const result = await printByteCase({ channel, stream: "rows", committed: false, ending: "deadline", metered: true, hardMs: 10_000 });
+    expect(result.summary.human).toEqual(["T1"]);
+    expect(result.state.finalAt).toBe(0);
+    expect(result.stoppedAt - result.state.lastAt).toBeLessThan(500);
+    expect(result.stoppedAt - result.attemptStart).toBeGreaterThanOrEqual(1200);
+    expect(result.stoppedAt - result.attemptStart).toBeLessThan(4500);
+    expect(result.events.find(e => e.event === "worker-result")?.data.cause).toBe("stall-timeout");
+    expect(result.events.find(e => e.event === "worker-reaped-before-harvest")?.data.cause).toBe("stall-timeout");
+    expect(result.events.filter(e => e.event === "worker-hard-timeout" || e.event === "worker-result-harvested")).toEqual([]);
+  }
+}, 30_000);

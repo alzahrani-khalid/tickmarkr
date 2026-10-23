@@ -1,3 +1,5 @@
+import { afterEach } from "vitest";
+import { setAttemptHardTimeoutMsForTests, resetAttemptHardTimeoutMsForTests } from "../../src/run/daemon.js";
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
@@ -333,6 +335,7 @@ describe("daemon v1.2 interactive workers (fake adapter, zero tokens)", () => {
   }, 30_000);
 
   test("print workers also reset the stall window from output", async () => {
+    setAttemptHardTimeoutMsForTests(60_000); // Queue row 233 (D-2130): isolate inactivity from the hard deadline.
     const { repo, fake } = setupRepo(
       [T("T1")],
       { tasks: { T1: [{
@@ -772,3 +775,6 @@ test("interactive capture waits through busy frames and two clear trailer sample
   expect(row?.data.finished).toBe(true);
   expect(row?.data.summary).toContain("and added it.");
 });
+
+// Queue row 233 (D-2130): each small-window fixture owns its deadline seam.
+afterEach(resetAttemptHardTimeoutMsForTests);

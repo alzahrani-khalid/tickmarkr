@@ -1,7 +1,7 @@
 import { HOST_PROBE_SAMPLE_MS, HOST_PROBE_SAMPLES, HostDegradedError, hostDegraded, observeHost, type HostObservation } from "./host-health.js";
 import { runWithInterruptionSink, VITEST_CACHE_ENV, worktreeVitestCache, type HostInterruption } from "../gates/test-manifest.js";
 import { COMMAND_LEASE_TOKEN_ENV, commandLeaseEnvironment, CommandLeases, currentCommandLeaseToken, isRunnerCommand, runWithCommandLease, withCommandLease } from "./lease.js";
-import { execFileSync, spawn } from "node:child_process";
+import { execFile, execFileSync, spawn } from "node:child_process";
 import { createHash, type Hash, randomBytes } from "node:crypto";
 import { shq } from "../adapters/types.js";
 import { appendFileSync, closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, readlinkSync, readSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
@@ -38,10 +38,10 @@ import { executionSignal, remainingExecutionMs, withExecutionBudget, withoutExec
 import { repairSelectionDecision, repairSelectionEnabled } from "./repair-selection.js";
 import { failureDisposition, reserveInfrastructureRetry } from "./recovery.js";
 import { runEnvironment } from "./environment.js";
-import { addDetachedWorktree, changeRepresented, cleanupRunWorktrees, declaredBaseContainment, deriveForkCap, FORK_CAP_ENV, gitHead, linkNodeModules, npmDependencyInstallCommand, npmDependencyManifestChanged, PRESERVE_COMMIT_SUBJECT, PRESERVE_PRODUCER_TRAILER, preserveWorktree, type PreserveProducer, producerFields, reflogWitness, removeWorktree, resolvedCapacity, runWithForkBudget, runWithVerificationBudget, type RunCapacity, sameCapacity, sameVerification, sh, shell, shGit, SUITE_PARENT_ENV, verificationProtocol, WORKTREE_LAYOUT_CONTRACT, WORKTREES_DIR, worktreePath } from "./git.js";
+import { addDetachedWorktree, changeRepresented, cleanupRunWorktrees, declaredBaseContainment, deriveForkCap, FORK_CAP_ENV, gitHead, linkNodeModules, npmDependencyInstallCommand, npmDependencyManifestChanged, PRESERVE_COMMIT_SUBJECT, PRESERVE_PRODUCER_TRAILER, preserveWorktree, type PreserveProducer, producerFields, reflogWitness, removeWorktree, resolvedCapacity, runWithForkBudget, runWithVerificationBudget, type RunCapacity, sameCapacity, sameVerification, sh, shell, shGit, SUITE_PARENT_ENV, verificationProtocol, WorktreeAdminRaceError, WORKTREE_LAYOUT_CONTRACT, WORKTREES_DIR, worktreePath } from "./git.js";
 import { MASK } from "./redact.js";
 import { runInteractiveSeed, type InteractiveSeedResult } from "./interactive-seed.js";
-import { classifyRepairDisposition, resolveScopeHints } from "./repair-disposition.js";
+import { classifyRepairDisposition, namedPaths, resolveScopeHints } from "./repair-disposition.js";
 import { applyScopeAmendments, activeRetryBan, interruptedAttempt, RESUME_HARVEST_SOURCE, resumeHarvestAuthor, approvalAction, APPROVAL_REFUSED, bindingToken, effectiveEvents, foldDecisions, physicalLine, staleApprovals, classifyTaskFailure, classifyWorkerResultCause, deferredReviewFindings, engagementComparable, formatPriorFindingEvidence, GATE_FINGERPRINT_CAP, GATE_SATISFIED_RELEASE, identicalGateFailures, isDeferredFinding, journaledFailureBrief, Journal, loadRoutingProfile, newRunId, normalizeGateFailure, outstandingConsultGuidance, readableExcerpt, receiptOrigin, outstandingReviewFindings, pendingApprovalActions, pendingRechecks, pendingRepairFindings, phaseForGate, priorJudgments, readPriorRunEvidence, recordedTaskFailureKind, reraisedReviewChains, RECHECK_RELEASE, renderStructuredReviewFinding, repairReachSinceApproval, repairsSinceApproval, reviewRoundsSinceApproval, runHasEnded, standingRulings, structuredFindings, upheldFeedbackByTask, type CurrentAttemptGateReplay, type JournalEvent, type ParkKind, type ResumeState, type RetryMode, type StructuredFinding } from "./journal.js";
 import { carriedAuthorVendors, gateReviewerFloor, isDiffCapPark, isGarbageReview, pickReviewer } from "../gates/review.js";
 import { acquireApprovalSerialization, acquireRunLock, isPidLive, releaseRunLock } from "./lock.js";
@@ -980,7 +980,11 @@ export function resetDeadChannelFastKillMsForTests(): void {
 // monotonic-tracker silence — CONCLUDES the wait. Conclude, never kill: the pane is harvested by
 // the same tail a window expiry uses, and the carried worktree goes straight to gates. Set at the
 // fast-kill's window on purpose (the OBS-264 arithmetic is "a ~36m stall + ~15m redo becomes a
-// ~5m gate pass"); a worker that is merely thinking still burns CPU and is never concluded here.
+// ~5m gate pass"). Queue row 231 (D-2119): a headless worker waiting on its remote provider can be
+// silent with flat CPU. Print mode also requires a fresh reading of no ESTABLISHED TCP connection
+// in its owned process group; connected or unreadable holds the harvest. Interactive workers keep
+// the triad: an idle pane holds connections too. Residual (D-2125): a truly hung headless worker
+// holding a connection rides the stall window instead.
 const HARVEST_SILENT_MS = 5 * 60_000;
 let harvestSilentMs = HARVEST_SILENT_MS;
 /** Test seam — shrink the harvest silence gate without minute-long sleeps. */
@@ -3329,11 +3333,6 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     return `${identity} — release with ${commands.map((command) => `\`${command}\``).join(" or ")}`;
   };
 
-  // Lexing never starts in the middle of a word. Resolution is separate so missing hints
-  // remain visible evidence without becoming executable approval advice.
-  const namedPaths = (text: string): string[] => [...text.matchAll(/(?:^|[\s`'"])((?:[A-Za-z0-9_@.()[\]-]+\/)+[A-Za-z0-9_@.[\]-]+|[A-Za-z0-9_@-]+(?:\.[A-Za-z0-9_-]+)+)(?=$|[\s`'"),:;.!?])/g)]
-    .map((match) => match[1]!.replace(/^\.\//, "").replace(/\.$/, ""))
-    .filter((path) => !path.split("/").includes(".."));
   const diffPaths = async (base: string, wt: string): Promise<Set<string>> => {
     const out = await shGit(`git diff --name-only -z ${shq(base)}..HEAD`, wt);
     return new Set(out.code === 0 ? out.stdout.split("\0").filter(Boolean) : []);
@@ -3618,7 +3617,17 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       const producer = producerNow();
       const ref = await preserveWorktree(priorWt, producer);
       if (ref) journal.append("worktree-preserved", t.id, { ref, ...producerFields(producer) });
-      return driver.worktree(repoRoot, taskBranch, taskBase);
+      // Queue row 223 (D-2118): only this typed add race buys retries, with three adds total.
+      const addWorktree = () => {
+        return driver.worktree(repoRoot, taskBranch, taskBase);
+      };
+      for (let attempt = 1; ; attempt++) {
+        try { return await addWorktree(); }
+        catch (error) {
+          if (!(error instanceof WorktreeAdminRaceError) || attempt >= 3) throw error;
+          journal.append("worktree-add-retry", t.id, { attempt, nextAttempt: attempt + 1, evidence: error.evidence });
+        }
+      }
     };
 
     // A dead worker with a clean checkout still needs a durable recovery handle: there may be no
@@ -5394,16 +5403,18 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       let cpuFlat: { ms: number; since: number } | undefined;
       let cpuAccountant: WorkerTreeCpuAccountant | undefined;
       let cpuGapCount = 0;
-      let unmeasurableNoted = false;
-      // One line per attempt, whichever way the CPU leg turns out to be unmeasurable. A triad that
+      const unmeasurableNoted = new Set<string>();
+      // Queue row 231 (D-2119): one line per reading per attempt, including the connection leg.
+      // One CPU line per attempt, whichever way that leg turns out to be unmeasurable. A triad that
       // can never conclude is this feature silently ABSENT — on a host whose `ps` the probe cannot
       // read, every stall would ride its whole window out again with nothing saying why. Named once
       // per attempt, not per slice: the condition is structural, and a per-slice line would bury it.
-      const noteUnmeasurable = (reason: string) => {
-        if (unmeasurableNoted) return;
-        unmeasurableNoted = true;
+      const noteUnmeasurable = (reason: string, reading = "cpu") => {
+        if (unmeasurableNoted.has(reading)) return;
+        unmeasurableNoted.add(reading);
         journal.append("worker-harvest-unmeasurable", t.id, { slot: slot.name, attempt, reason });
       };
+      let harvestHeldNoted = false;
       // OBS-548: ONE instrument, TWO readers. The harvest triad asks this accountant whether a
       // COMMITTED worker is at rest; the dead-channel fast-kill asks whether a SILENT worker is
       // alive at all — and until v1.97 the kill asked nothing, so a tree holding 219,290 ms of
@@ -5472,6 +5483,35 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         if (leg.state !== "flat") return false;
         const carried = await commitsAheadOf(taskBase, wt);
         if (carried.length === 0) return false; // nothing landed: not this branch's population
+        if (!interactive) {
+          // Queue row 231 (D-2119): query afresh only after the other legs hold. lsof ORs selections
+          // without -a; -g includes connector children in the owned group, not just the CLI root.
+          // No environment inspection. One async PATH lookup, bounded from invocation like the
+          // reap census (15 s); SIGKILL also retires a probe that ignores SIGTERM.
+          const group = readOwnedProcessGroup(groupFile);
+          const connection = group === undefined ? "unreadable" : await new Promise<"connected" | "none" | "unreadable">((resolve) => {
+            try {
+              execFile("lsof", ["-nP", "-a", "-g", String(group), "-iTCP", "-sTCP:ESTABLISHED", "-Fp"],
+                { encoding: "utf8", timeout: 15_000, killSignal: "SIGKILL", maxBuffer: 4 * 1024 * 1024 },
+                (error, stdout, stderr) => {
+                  if (!error && stdout.trim()) resolve("connected");
+                  else if (error && error.code === 1 && !stdout && !stderr) resolve("none");
+                  else resolve("unreadable");
+                });
+            } catch { resolve("unreadable"); }
+          });
+          if (connection === "unreadable") {
+            noteUnmeasurable("the worker ESTABLISHED TCP connection reading could not be read", "connection");
+            return false;
+          }
+          if (connection === "connected") {
+            if (!harvestHeldNoted) {
+              harvestHeldNoted = true;
+              journal.append("worker-harvest-held", t.id, { slot: slot.name, attempt, reason: "established-tcp-connection", processGroup: group });
+            }
+            return false;
+          }
+        }
         journal.append("worker-harvest", t.id, {
           slot: slot.name, attempt, commits: carried.length,
           silentMs, cpuMs: leg.cpu.ms, cpuResolutionMs: leg.cpu.resolutionMs,
@@ -5923,13 +5963,17 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
               lastStatus = st;
               journal.append("worker-status", t.id, { slot: slot.name, status: st, attempt });
             }
-            if (st === "blocked" || st === "idle") {
+            // Queue row 215 (D-2118 add.1): an unhooked CLI can report unknown at its startup modal.
+            // Bound that status to worker-launch's startup window, including time spent reading.
+            const withinTrustStartup = () => workerLaunchedAt !== undefined
+              && Date.now() - workerLaunchedAt <= workerStartupWindowMs;
+            if (st === "blocked" || st === "idle" || (st === "unknown" && withinTrustStartup())) {
               // T5: once-per-slot auto-answer when the adapter declares a trust dialog and the pane
               // text matches. tickmarkr created the worktree from the operator's own repo — safe by construction.
               if (!trustAnswered && adapter.trustDialog && driver.sendKey) {
                 try {
-                  const paneText = await workerTransport.read(slot, 80);
-                  if (matchesTrustDialog(paneText, adapter.trustDialog)) {
+                  const paneText = await (slot.readScreen ? slot.readScreen() : workerTransport.read(slot, 80));
+                  if ((st !== "unknown" || withinTrustStartup()) && matchesTrustDialog(paneText, adapter.trustDialog)) {
                     trustAnswered = true;
                     trustAnsweredSlots.add(slot.id);
                     // v1.25 T1: audit trail for live runs — prove the dialog appeared and was answered.
@@ -6144,9 +6188,9 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
             }
             // OBS-548: the FOURTH leg, and the one the daemon already measured. The three legs above
             // are all channel-side: they say a pane stopped talking. The tree's CPU says whether
-            // anything is still WORKING, and the harvest triad forty lines up refuses exactly this
-            // conclusion without it — "a worker that is merely thinking still burns CPU and is never
-            // concluded here". A live CPU delta is a live worker, by construction; an UNMEASURABLE
+            // anything is still WORKING, and the harvest triad forty lines up refuses this
+            // conclusion without it. Queue row 231 (D-2119): print-mode harvest additionally checks
+            // connections because a remote model turn can have flat CPU. An UNMEASURABLE
             // reading keeps the fail-open contract the probe already states (undefined is never
             // evidence a worker stopped), so on a host whose `ps` cannot be read the fast-kill stands
             // down and the fixed attempt ceiling bounds the hold.
@@ -6318,13 +6362,15 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         }
         await noteLaunched();
         // OBS-54: headless workers have the same output-inactivity budget as visible panes.
-        // v1.76: same monotonic-progress measure as the interactive site; harvest stays raw.
+        // Queue row 233 (D-2130): print progress is the driver's received-byte count, never a row
+        // high-water over the bounded tail; a driver reporting no count keeps the row measure.
         const stallWindowMs = taskTimeoutMinutes * 60_000;
+        const hardDeadline = attemptStart + (attemptHardTimeoutMs ?? stallWindowMs * 4);
         const initialPane = await workerTransport.read(slot, 500);
         startupFailure = startupFailureInWindow(initialPane, workerLaunchedAt);
         let everHadOutput = initialPane.length > 0;
         const stallProgress = new StallProgressTracker();
-        stallProgress.observe({ paneText: initialPane, seedSubmitted: true, contextTokens });
+        stallProgress.observe({ paneText: initialPane, receivedBytes: (await workerTransport.transportState?.(slot))?.bytes, seedSubmitted: true, contextTokens });
         let lastProgressAt = Date.now();
         finished = false;
         // T2 review (material): the exit marker proves the PROCESS EXITED, never that the worker
@@ -6334,10 +6380,10 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         // worker-result-harvested row. The interactive site has always kept them apart (`finished`
         // there is the trailer regex; the exit marker only sets exitCode), and the cause taxonomy
         // already names this shape "clean-exit-no-trailer" — unreachable in print mode until now.
-        while (!startupFailure && Date.now() - lastProgressAt < stallWindowMs) {
+        while (!startupFailure && Date.now() - lastProgressAt < stallWindowMs && Date.now() < hardDeadline) {
           fatalStop.signal.throwIfAborted();
           executionSignal()?.throwIfAborted();
-          const remaining = stallWindowMs - (Date.now() - lastProgressAt);
+          const remaining = Math.min(stallWindowMs - (Date.now() - lastProgressAt), hardDeadline - Date.now());
           let slice = Math.min(BLOCKED_POLL_MS, Math.max(100, Math.min(stallWindowMs / 2, remaining)));
           const startupLeft = workerLaunchedAt === undefined
             ? 0
@@ -6365,10 +6411,9 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
             break;
           }
           await sampleContext();
-          if (stallProgress.observe({ paneText, contextTokens })) lastProgressAt = Date.now();
-          // T2 (OBS-264): the same liveness triad the interactive loop runs. A headless worker that
-          // committed and went quiet is finished work too, and before this it rode the entire
-          // window out before anything looked at its commits.
+          if (stallProgress.observe({ paneText, receivedBytes: (await workerTransport.transportState?.(slot))?.bytes, contextTokens })) lastProgressAt = Date.now();
+          // Queue row 231 (D-2119): print mode adds a fresh owned-group connection reading to the
+          // silence/commits/CPU triad; a quiet remote model turn can hold a connection with flat CPU.
           // No nudge hold here, deliberately: print mode has no nudge surface at all (no pane to
           // steer, driver.nudge is never consulted on this path), so there is no pending daemon
           // action for the triad to preempt — the asymmetry with the interactive call site above is
@@ -6382,7 +6427,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         // without one is finished:false with a non-null exitCode — the harvest synthesis then owns
         // it when the worktree carries work, and classifyWorkerResultCause names it otherwise.
         finished = new RegExp(trailerPattern(nonce)).test(output);
-        timedOut = !processExited && !finished && Date.now() - lastProgressAt >= stallWindowMs;
+        timedOut = !processExited && !finished && (Date.now() - lastProgressAt >= stallWindowMs || Date.now() >= hardDeadline);
       }
       } finally {
         await cpuAccountant?.stop();
@@ -7116,7 +7161,8 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       // same-channel fix retry is exactly the round the budget just declared too expensive to repeat.
       const repairExhausted = repairable && !repair;
 
-      if (repair && !capStep) {
+      const fundedRepair = repair && !capStep;
+      if (fundedRepair) {
         journal.append("repair-attempt", t.id, {
           repair: repairHistory.length + 1, charge: repairsDrawn + 1, of: MAX_REPAIRS,
           gates: failing.map((g) => g.gate),
@@ -7142,8 +7188,13 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         await driver.notify(`tickmarkr ${runId}: ${t.id} escalation: ${step}`, { tier: "attention" });
       }
 
+      // Queue row 224(b) (D-2118): pinned tasks park on the first unfunded owned deterministic red
+      // at or after the second, so this climb fires at most once. Unpinned tasks climb on exactly
+      // the second owned deterministic red, even when it funds a repair.
       const climbCause = repairExhausted ? "repair-exhausted"
-        : deterministic && ownedGateFailures === 2 ? "gate-fail" : undefined;
+        : deterministic && (t.routingHints?.pin
+          ? ownedGateFailures >= 2 && !fundedRepair
+          : ownedGateFailures === 2) ? "gate-fail" : undefined;
       if (climbCause) {
         const climbed = await climb(climbCause, deterministic ?? failing[0]!, attempt + 1);
         if (climbed === "parked") return;
@@ -7243,6 +7294,11 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
             }
             if (fatalStop.signal.aborted) return;
             const cleanupEvidence = cleanupErrors.length ? { cleanupErrors } : {};
+            if (err instanceof WorktreeAdminRaceError) {
+              await park(t, err.message, "infra", null, 0, Date.now(), 0, 0, undefined, 0, "fresh",
+                { evidence: err.evidence, ...cleanupEvidence });
+              return;
+            }
             if (err instanceof HostDegradedError) {
               await park(t, err.message, "infra", null, 0, Date.now(), 0, 0, undefined, 0, "fresh",
                 { disposition: "host-degraded", ...cleanupEvidence });

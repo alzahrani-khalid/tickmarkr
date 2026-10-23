@@ -664,6 +664,36 @@ export function gitSync(dir: string, args: readonly string[], { env = process.en
   } finally { pin?.release(); }
 }
 
+// Queue row 223 (D-2118): one process-wide administration queue; recreation and rollback retain
+// their caller's hold, including trust rechecks and branch restoration, without queuing behind it.
+let worktreeAdminTail: Promise<void> = Promise.resolve();
+const worktreeAdminHold = new AsyncLocalStorage<boolean>();
+async function withWorktreeAdmin<T>(operation: () => Promise<T>): Promise<T> {
+  if (worktreeAdminHold.getStore()) return operation();
+  const prior = worktreeAdminTail;
+  let release!: () => void;
+  worktreeAdminTail = new Promise<void>((done) => { release = done; });
+  await prior;
+  try { return await worktreeAdminHold.run(true, operation); }
+  finally { release(); }
+}
+
+/** Queue row 223 (D-2118): git could not read a sibling's partially written admin file during add. */
+export class WorktreeAdminRaceError extends Error {
+  constructor(readonly evidence: string) {
+    super(`worktree add encountered a sibling admin read race (queue row 223, D-2118): ${evidence}`);
+    this.name = "WorktreeAdminRaceError";
+  }
+}
+
+const siblingAdminReadFailed = (stderr: string): boolean => {
+  for (const line of stderr.split("\n")) {
+    const read = /^(?:fatal: |error: )?failed to read (?:'([^'\r\n]+)'|"([^"\r\n]+)"|([^:\r\n]+))(?::|$)/.exec(line);
+    if (read && /(?:^|\/)worktrees\/[^/\r\n]+\/(?:commondir|gitdir|HEAD)$/.test(read[1] ?? read[2] ?? read[3]!)) return true;
+  }
+  return false;
+};
+
 /**
  * v2.6.8 T2: the DETACHED worktree capability, declared by calling it (the daemon's baseline recapture and standalone
  * verify's base worktree). Under the ref-store pin git stubs a detached add's new HEAD as `ref: refs/heads/.invalid`
@@ -676,6 +706,10 @@ export function gitSync(dir: string, args: readonly string[], { env = process.en
  * back through the trusted common directory derived here once (dropWorktree), even while that commondir stays hostile.
  */
 export async function addDetachedWorktree(cwd: string, dir: string, commitish: string, timeoutMs = DEFAULT_SHELL_TIMEOUT_MS, { logHead = false } = {}): Promise<ShResult> {
+  return withWorktreeAdmin(() => addDetachedWorktreeHeld(cwd, dir, commitish, timeoutMs, logHead));
+}
+
+async function addDetachedWorktreeHeld(cwd: string, dir: string, commitish: string, timeoutMs: number, logHead: boolean): Promise<ShResult> {
   // 2.8.1 T1 (ANL-023 §7.1): `logHead` writes the new checkout's HEAD reflog whatever the repository's
   // core.logAllRefUpdates says, so a later HEAD move by any command is appended to an established witness.
   const git = logHead ? "git -c core.logAllRefUpdates=always" : "git";
@@ -721,6 +755,10 @@ function rollbackFailed(error: unknown, failure: unknown): Error {
  * step bounded by `timeoutMs`; every step is tried, and any that failed is thrown, never swallowed.
  */
 async function dropWorktree(store: string, { dir, branch }: WorktreeRollback, timeoutMs = DEFAULT_SHELL_TIMEOUT_MS): Promise<void> {
+  return withWorktreeAdmin(() => dropWorktreeHeld(store, { dir, branch }, timeoutMs));
+}
+
+async function dropWorktreeHeld(store: string, { dir, branch }: WorktreeRollback, timeoutMs: number): Promise<void> {
   const failed = await withoutExecutionBudget(async () => {
     const run = async (cmd: string): Promise<string | undefined> => {
       try {
@@ -910,13 +948,22 @@ export function checkoutIncarnation(worktree: string): string | undefined {
 }
 
 export async function createWorktree(repo: string, branch: string, baseRef: string): Promise<string> {
+  return withWorktreeAdmin(() => createWorktreeHeld(repo, branch, baseRef));
+}
+
+async function createWorktreeHeld(repo: string, branch: string, baseRef: string): Promise<string> {
   branch = await resolveTaskBranch(repo, branch);
   const dir = join(tickmarkrDir(repo), WORKTREES_DIR, sanitize(branch));
   if (existsSync(dir)) await removeWorktree(repo, dir);
   // the worktree capability: a branch add, whose symbolic HEAD keeps the ref-store pin (see OwnGitCapability); a raced
   // add is rolled back, its branch restored to the value read here or deleted when it is new
   const prior = (await shGit(`git rev-parse --verify -q ${shq(`refs/heads/${branch}`)}`, repo)).stdout.trim() || undefined;
-  await shGitOk(`git worktree add -B ${shq(branch)} ${shq(dir)} ${shq(baseRef)}`, repo, { createsWorktree: "branch", rollback: { dir, branch: { name: branch, prior } } });
+  const cmd = `git worktree add -B ${shq(branch)} ${shq(dir)} ${shq(baseRef)}`;
+  const added = await shGit(cmd, repo, DEFAULT_SHELL_TIMEOUT_MS, { createsWorktree: "branch", rollback: { dir, branch: { name: branch, prior } } });
+  if (added.code !== 0) {
+    if (siblingAdminReadFailed(added.stderr)) throw new WorktreeAdminRaceError(added.stderr.trim());
+    throw new Error(`command failed (${added.code}): ${cmd}\n${added.stderr || added.stdout}`);
+  }
   linkNodeModules(repo, dir);
   return dir;
 }

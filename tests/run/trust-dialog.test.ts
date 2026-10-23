@@ -12,7 +12,7 @@ import { pi } from "../../src/adapters/pi.js";
 import type { CliEntry } from "../../src/adapters/catalog.js";
 import { allAdapters, getAdapter } from "../../src/adapters/registry.js";
 import {
-  CLAUDE_TRUST_PANE, CODEX_TRUST_PANE, CURSOR_TRUST_PANE, KIMI_MCP_TRUST_PANE, KIMI_TRUST_PANE, KIMI_TRUST_PANE_029,
+  APPROVED_TRUST_FINGERPRINTS, CLAUDE_TRUST_PANE, CODEX_TRUST_PANE, CURSOR_TRUST_PANE, GROK_TRUST_PANE, KIMI_MCP_TRUST_PANE, KIMI_TRUST_PANE, KIMI_TRUST_PANE_029,
   matchesTrustDialog, RECORDED_TRUST_PANES, TRUST_DIALOG_BLANK_MESSAGE, TRUST_DIALOG_UNRECORDED_MESSAGE,
   type InteractiveSeed, type TrustDialog, type WorkerAdapter,
 } from "../../src/adapters/types.js";
@@ -50,7 +50,6 @@ const RECORDED_CAPTURES = [
 const NO_DIALOG_ADAPTERS = [
   { id: "opencode", file: "opencode.ts", adapter: opencode },
   { id: "pi", file: "pi.ts", adapter: pi },
-  { id: "grok", file: "grok.ts", adapter: grok },
 ] as const;
 
 // Resolved from this file, never the working directory — the recorded kimi capture above contains a
@@ -312,9 +311,9 @@ test("every adapter the registry can build carries a trust declaration that is e
     } else {
       expect(declaration.fingerprint.trim().length, adapter.id).toBeGreaterThan(0);
       expect(declaration.key.length, adapter.id).toBeGreaterThan(0);
-      // A capture is only a capture if it names the gate it claims to answer AND is bytes some
-      // recorded pane actually contains — the corpus, not the word, is the evidence.
-      expect(declaration.fingerprint, adapter.id).toMatch(/trust/i);
+      // Queue row 215 (D-2125): approved recorded bytes establish a capture, including grok's
+      // distinctive warning line, which contains no word "trust".
+      expect(APPROVED_TRUST_FINGERPRINTS, adapter.id).toContain(declaration.fingerprint);
       expect(RECORDED_TRUST_PANES.some((pane) => pane.includes(declaration.fingerprint)), adapter.id).toBe(true);
     }
   }
@@ -323,6 +322,44 @@ test("every adapter the registry can build carries a trust declaration that is e
   // field cannot reach this list at all, so this test cannot stay green while one exists.
   expect(() => allAdapters({ cliEntries: [nativeEntry("late-adapter", undefined)] }))
     .toThrow(/trust declaration/i);
+});
+
+test("test: the registry-built grok declaration matches both recorded Grok Build screens with the Enter key and matches no routine output and no recorded claude, codex, cursor or kimi pane, while those declarations keep matching their own recorded panes, so a prose fingerprint, the shared question sentence or a moved declaration fails", () => {
+  const adapters = allAdapters();
+  const built = getAdapter("grok", adapters);
+  const dialog = built.trustDialog;
+  expect(dialog).toBe(grok.trustDialog);
+  expect(dialog).toEqual({ fingerprint: "Grok Build may run or modify contents in this directory", key: "Enter" });
+  if (dialog.kind === "none") throw new Error("Queue row 215: grok must declare its recorded modal");
+  expect(adapterSource("grok.ts")).toContain(`fingerprint: "${dialog.fingerprint}"`);
+  expect(RECORDED_TRUST_PANES).toContain(GROK_TRUST_PANE);
+  for (const version of ["1.0.62", "1.0.67"]) {
+    const screen = readFileSync(join(import.meta.dirname, `../fixtures/grok-trust/grok-${version}.screen.txt`), "utf8");
+    expect(matchesTrustDialog(screen, dialog), version).toBe(true);
+    if (version === "1.0.62") expect(screen).toContain(GROK_TRUST_PANE);
+  }
+  for (const pane of [
+    CLAUDE_TRUST_PANE, CODEX_TRUST_PANE, CURSOR_TRUST_PANE, KIMI_TRUST_PANE, KIMI_TRUST_PANE_029, KIMI_MCP_TRUST_PANE,
+    "Grok Build is working on the requested change.",
+    "I reviewed workspace trust handling and the tests pass.",
+    "Do you trust the contents of this directory?",
+    "The grok workspace trust dialog needs an Enter.",
+    OPENCODE_PERMISSION_CAPTURE,
+    'TICKMARKR_RESULT_nonce {"ok":true,"summary":"trust support","deviations":[]}',
+  ]) expect(matchesTrustDialog(pane, dialog), pane).toBe(false);
+  for (const { id, dialog: ownDialog, panes } of RECORDED_CAPTURES) {
+    const other = getAdapter(id, adapters).trustDialog;
+    expect(other, id).toBe(ownDialog);
+    for (const pane of panes) expect(matchesTrustDialog(pane, other), id).toBe(true);
+  }
+  expect(APPROVED_TRUST_FINGERPRINTS).toEqual([
+    "Quick safety check: Is this a project you created or one you trust?",
+    "Do you trust the contents of this directory?",
+    "Workspace Trust Required",
+    "❯ Trust this folder",
+    "❯ Trust and continue",
+    dialog.fingerprint,
+  ]);
 });
 
 test("the trust-dialog schema used by production registry construction rejects fingerprints \"\" and \" \" with the trust-dialog operator message and accepts the recorded kimi capture, constructing all three through the registry path so a length-only schema or test-local validator cannot pass", () => {

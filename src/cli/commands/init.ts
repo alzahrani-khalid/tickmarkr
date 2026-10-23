@@ -109,7 +109,11 @@ Outside multi-agent environments, run the loop directly.
 
 ### Version preflight
 
-Before \`tickmarkr compile\` or \`tickmarkr run\`: run \`tickmarkr version\`, read \`package.json\` version, and stop if the versions differ anywhere (major, minor, or patch); the binary and repository must agree on the entire version, so binary \`2.1.0\` versus repository \`2.1.1\` is a stop. Tell the operator to update or link the correct binary. Never proceed on hope — stale binaries silently skip daemon gates. Also verify no run is live in this repository before starting one: lead with this repository's \`.tickmarkr/graph.lock\`, read its holder pid, and treat it as live until \`kill -0 <pid>\` proves that holder dead. Never require a machine-wide process pattern to be empty: a lawful run in another repository — or the probing shell's own argv — can match. If you use a process probe as secondary evidence, exclude the probing process, resolve every candidate's own cwd (for example with \`lsof -a -p <pid> -d cwd\`), and count only candidates whose cwd is this repository root.
+Before \`tickmarkr compile\` or \`tickmarkr run\`: run \`tickmarkr version --check\` and stop on a non-zero exit. In the tickmarkr source repository (\`package.json\` named \`tickmarkr\`), stop if the versions differ anywhere (major, minor, or patch); the binary and repository must agree on the entire version, so binary \`2.1.0\` versus repository \`2.1.1\` is a stop. In a consumer repository, the check compares installed agent guidance with this binary's packaged block and skills, never the app's manifest version; refresh drifted guidance with \`tickmarkr init --agent --force\`. Tell the operator to update or link the correct binary when the source version differs. Never proceed on hope — stale binaries silently skip daemon gates. Also verify no run is live in this repository before starting one: lead with this repository's \`.tickmarkr/graph.lock\`, read its holder pid, and treat it as live until \`kill -0 <pid>\` proves that holder dead. Never require a machine-wide process pattern to be empty: a lawful run in another repository — or the probing shell's own argv — can match. If you use a process probe as secondary evidence, exclude the probing process, resolve every candidate's own cwd (for example with \`lsof -a -p <pid> -d cwd\`), and count only candidates whose cwd is this repository root.
+
+### Seat hygiene
+
+In a multi-tier session, the tiers clear each other at 50% context or more, after writing a handoff. A new spec or run is a mission boundary: write the handoff and clear before taking the next mission. Copy this duty into every brief and handoff. On a single-tier plain host, write your handoff and ask the operator to clear the session.
 
 ### Tip-verify-before-green
 
@@ -191,7 +195,7 @@ interface SkillDrift { skill: string; dir: string; missing: string[]; modified: 
 
 // Drift is only computed for skills that ARE installed. A skill never installed is not drift — `--agent`
 // installs it and says so, and nagging about it would bury the case this exists for.
-function skillDrift(cwd: string): SkillDrift[] {
+export function skillDrift(cwd: string): SkillDrift[] {
   const drifted: SkillDrift[] = [];
   for (const { skillsDir } of hostTargets(cwd)) {
     for (const skill of AGENT_SKILLS) {
@@ -219,7 +223,7 @@ function skillDrift(cwd: string): SkillDrift[] {
 // superseded preflight rules (patch-version drift tolerated, a machine-wide process match required)
 // through the very release that fixed the tracked copy, and a consultation was launched under the stale
 // text with nobody able to see it. Same rule as skillDrift: a doc that was never written is not drift.
-const docsDrift = (cwd: string): string[] =>
+export const docsDrift = (cwd: string): string[] =>
   hostTargets(cwd).map(({ docPath }) => docPath).filter((docPath) => {
     if (!existsSync(docPath)) return false;
     const current = readFileSync(docPath, "utf8");
@@ -229,6 +233,13 @@ const docsDrift = (cwd: string): string[] =>
     if (end < 0) return true; // a truncated block is stale by definition
     return current.slice(begin, end + DOCS_END.length) !== AGENT_DOCS.trimEnd();
   });
+
+export function installedAgentGuidance(cwd: string): string[] {
+  return hostTargets(cwd).flatMap(({ skillsDir, docPath }) => [
+    ...AGENT_SKILLS.map((skill) => join(skillsDir, skill, "SKILL.md")).filter((path) => existsSync(path)),
+    ...(existsSync(docPath) && readFileSync(docPath, "utf8").includes(DOCS_BEGIN) ? [docPath] : []),
+  ]);
+}
 
 const describeDrift = (d: SkillDrift) => [
   d.missing.length ? `missing ${d.missing.join(", ")}` : "",

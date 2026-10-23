@@ -1,3 +1,4 @@
+import { setAttemptHardTimeoutMsForTests, resetAttemptHardTimeoutMsForTests } from "../../src/run/daemon.js";
 import { execSync } from "node:child_process";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
@@ -158,6 +159,7 @@ test("test: a worker whose envelope decodes to a no-auth API failure journals wo
 }, 30_000);
 
 test("test: a stall-timeout harvest reaps the still-running worker before it reads the tree so a commit the worker would have made two seconds later never lands and the journal carries one worker-reaped-before-harvest row and no tip-moved row whereas a harvest that reads the tree with the worker alive fails", async () => {
+  setAttemptHardTimeoutMsForTests(60_000); // Queue row 233 (D-2130): isolate inactivity from the hard deadline.
   const { repo, fake } = setupRepo(
     [T("T1")],
     { tasks: { T1: [{ shell: `echo first > late.txt && ${COMMIT} first && sleep 2 && echo late >> late.txt && ${COMMIT} late` }] } },
@@ -179,6 +181,7 @@ test("test: a stall-timeout harvest reaps the still-running worker before it rea
 }, 30_000);
 
 test("test: a worker whose driver cannot stop it at harvest parks stall naming the failure instead of gating a moving tip and a task's second dispatch sweeps its first attempt's pane before the new worker launches whereas a daemon that gates the unstopped tree or leaves the superseded pane until task-done fails", async () => {
+  setAttemptHardTimeoutMsForTests(60_000); // Queue row 233 (D-2130): isolate inactivity from the hard deadline.
   const stuck = setupRepo(
     [T("T1")],
     { tasks: { T1: [{ shell: `echo first > partial.txt && ${COMMIT} partial && sleep 30` }] } },
@@ -355,3 +358,6 @@ test("test: a pane whose first tool output echoes model-not-found twenty seconds
     expect(scrolled.sample('model-not-found', start)).toBeUndefined();
   } finally { clock.mockRestore(); }
 }, 30_000);
+
+// Queue row 233 (D-2130): each small-window fixture owns its deadline seam.
+afterEach(resetAttemptHardTimeoutMsForTests);
