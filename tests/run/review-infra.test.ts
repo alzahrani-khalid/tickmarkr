@@ -7,11 +7,19 @@ import { graphDefinitionHash, loadGraph } from "../../src/graph/graph.js";
 import { runDaemon } from "../../src/run/daemon.js";
 import { gitHead } from "../../src/run/git.js";
 import { Journal, journaledFailureBrief, outstandingReviewFindings } from "../../src/run/journal.js";
-import { authedModels, COMMIT, setupRepo, T } from "../helpers/tmprepo.js";
+import { authedModels, COMMIT, setupRepo as baseSetupRepo, T } from "../helpers/tmprepo.js";
+
+// Queue row 34(a) (D-2134 R5): an independent judge below these fixtures' review floor.
+function setupRepo(...args: Parameters<typeof baseSetupRepo>) {
+  const fixture = baseSetupRepo(...args);
+  const config = join(fixture.repo, ".tickmarkr", "config.yaml");
+  writeFileSync(config, readFileSync(config, "utf8").replace("judge: { adapter: fake, model: fake-1 }", "judge: { adapter: fake, model: fake-2 }"));
+  return fixture;
+}
 
 class Author extends FakeAdapter {
   judges = 0;
-  override channels(): BillingChannel[] { return super.channels().slice(0, 1); }
+  override channels(): BillingChannel[] { return [super.channels()[0]!, { ...super.channels()[1]!, tier: "cheap" }]; }
   override headlessCommand(file: string, model: string): string {
     if (readFileSync(file, "utf8").startsWith("TICKMARKR-JUDGE")) this.judges++;
     return super.headlessCommand(file, model);
@@ -124,7 +132,7 @@ describe("review infrastructure recovery", () => {
     const { repo, scriptPath } = setupRepo([T("T1")], { tasks: { T1: [work("T1")] } },
       `concurrency: 1\nrouting:\n  escalateTier: "off"\n  floors: { implement: cheap }\nreview: { required: true, prefer: [seat-b, seat-a], timeoutMs: 1000 }\n`);
     class CheapAuthor extends FakeAdapter {
-      override channels(): BillingChannel[] { return [{ ...super.channels()[0]!, tier: "cheap" }]; }
+      override channels(): BillingChannel[] { return [{ ...super.channels()[0]!, tier: "cheap" }, { ...super.channels()[1]!, tier: "cheap" }]; }
     }
     const seatA = new Seat(scriptPath, "seat-a", "good", "frontier");
     const seatB = new Seat(scriptPath, "seat-b", "good", "mid");

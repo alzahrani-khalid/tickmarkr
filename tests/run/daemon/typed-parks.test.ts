@@ -1,5 +1,6 @@
+import { join } from "node:path";
 // v2.5.6 T5 (OBS-1006, OBS-1007 add.4/5, OBS-1013): pages that stop repeating, parks whose kind tells the truth.
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { describe, expect, test } from "vitest";
 import { FakeAdapter } from "../../../src/adapters/fake.js";
 import type { BillingChannel } from "../../../src/adapters/types.js";
@@ -9,7 +10,15 @@ import type { ExecutorDriver } from "../../../src/drivers/types.js";
 import { runDaemon, resetPageRepeatMsForTests, setPageRepeatMsForTests } from "../../../src/run/daemon.js";
 import { Journal, PARK_KINDS, type JournalEvent } from "../../../src/run/journal.js";
 import { deriveRunDecisions } from "../../../src/tui/cockpit/decision-actions.js";
-import { authedModels, COMMIT, setupRepo, T } from "../../helpers/tmprepo.js";
+import { authedModels, COMMIT, setupRepo as baseSetupRepo, T } from "../../helpers/tmprepo.js";
+
+// Queue row 34(a) (D-2134 R5): an independent judge below these fixtures' review floor.
+function setupRepo(...args: Parameters<typeof baseSetupRepo>) {
+  const fixture = baseSetupRepo(...args);
+  const config = join(fixture.repo, ".tickmarkr", "config.yaml");
+  writeFileSync(config, readFileSync(config, "utf8").replace("judge: { adapter: fake, model: fake-1 }", "judge: { adapter: fake, model: fake-2 }"));
+  return fixture;
+}
 
 const of = (evs: JournalEvent[], event: string) => evs.filter((e) => e.event === event && e.taskId === "T1");
 const rows = (repo: string, runId: string) => Journal.open(repo, runId).read();
@@ -39,7 +48,7 @@ class Seat extends FakeAdapter {
   override headlessCommand(): string { this.calls++; return "printf 'SEAT HARNESS'; sleep 2"; }
 }
 class Author extends FakeAdapter {
-  override channels(): BillingChannel[] { return super.channels().slice(0, 1); }
+  override channels(): BillingChannel[] { return [super.channels()[0]!, { ...super.channels()[1]!, tier: "cheap" }]; }
 }
 
 describe("v2.5.6 T5 — honest pages and typed parks", () => {

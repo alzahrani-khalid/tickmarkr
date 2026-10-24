@@ -14,10 +14,18 @@ import { graphDefinitionHash, loadGraph, saveGraph, setStatus } from "../../src/
 import { decisiveReviewRounds, runDaemon } from "../../src/run/daemon.js";
 import { gitHead } from "../../src/run/git.js";
 import { Journal, reviewRoundsSinceApproval, type JournalEvent } from "../../src/run/journal.js";
-import { authedModels, COMMIT, makeTestTempDir, setupRepo, T } from "../helpers/tmprepo.js";
+import { authedModels, COMMIT, makeTestTempDir, setupRepo as baseSetupRepo, T } from "../helpers/tmprepo.js";
+
+// Queue row 34(a) (D-2134 R5): an independent judge below these fixtures' review floor.
+function setupRepo(...args: Parameters<typeof baseSetupRepo>) {
+  const fixture = baseSetupRepo(...args);
+  const config = join(fixture.repo, ".tickmarkr", "config.yaml");
+  writeFileSync(config, readFileSync(config, "utf8").replace("judge: { adapter: fake, model: fake-1 }", "judge: { adapter: fake, model: fake-2 }"));
+  return fixture;
+}
 
 class Author extends FakeAdapter {
-  override channels(): BillingChannel[] { return super.channels().slice(0, 1); }
+  override channels(): BillingChannel[] { return [super.channels()[0]!, { ...super.channels()[1]!, tier: "cheap" }]; }
 }
 
 type Reply = "red" | "approve" | "silent" | "throw";

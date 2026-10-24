@@ -1,11 +1,20 @@
-import { readFileSync } from "node:fs";
+import { join } from "node:path";
+import { readFileSync, writeFileSync } from "node:fs";
 import { expect, test } from "vitest";
 import { FakeAdapter } from "../../../src/adapters/fake.js";
 import { shq, type BillingChannel } from "../../../src/adapters/types.js";
 import { extractPromptNonce } from "../../../src/gates/llm.js";
 import { runDaemon } from "../../../src/run/daemon.js";
 import { Journal } from "../../../src/run/journal.js";
-import { authedModels, COMMIT, setupRepo, T } from "../../helpers/tmprepo.js";
+import { authedModels, COMMIT, setupRepo as baseSetupRepo, T } from "../../helpers/tmprepo.js";
+
+// Queue row 34(a) (D-2134 R5): an independent judge below these fixtures' review floor.
+function setupRepo(...args: Parameters<typeof baseSetupRepo>) {
+  const fixture = baseSetupRepo(...args);
+  const config = join(fixture.repo, ".tickmarkr", "config.yaml");
+  writeFileSync(config, readFileSync(config, "utf8").replace("judge: { adapter: fake, model: fake-1 }", "judge: { adapter: fake, model: fake-2 }"));
+  return fixture;
+}
 
 class ReviewSeat extends FakeAdapter {
   calls = 0;
@@ -34,7 +43,8 @@ test("review recovery retains live exclusions when only a below-floor alternativ
   })], {
     tasks: { T1: [{ shell: `echo work > t1.txt && ${COMMIT} work`, result: { ok: true, summary: "work" } }] },
   }, "review: { required: true, floor: frontier, prefer: [seat-a, seat-c] }\n");
-  fake.channels = () => [{ adapter: "fake", model: "fake-1", vendor: fake.vendor, channel: "sub", tier: "cheap" }];
+  fake.channels = () => [{ adapter: "fake", model: "fake-1", vendor: fake.vendor, channel: "sub", tier: "cheap" },
+    { adapter: "fake", model: "fake-2", vendor: "fake-b", channel: "api", tier: "cheap" }];
   const frontier = new ReviewSeat(scriptPath, "seat-a", "frontier");
   const cheap = new ReviewSeat(scriptPath, "seat-c", "cheap");
   const runId = "run-live-review-exclusions";

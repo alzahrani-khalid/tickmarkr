@@ -20,7 +20,15 @@ import type { GateContext } from "../../../src/gates/run-gates.js";
 import { outsideScopeRed, runDaemon } from "../../../src/run/daemon.js";
 import { identicalGateFailures, Journal, normalizeGateFailure, recordedTaskFailureKind, type JournalEvent } from "../../../src/run/journal.js";
 import { failureDisposition } from "../../../src/run/recovery.js";
-import { authedModels, COMMIT, setupRepo, T } from "../../helpers/tmprepo.js";
+import { authedModels, COMMIT, setupRepo as baseSetupRepo, T } from "../../helpers/tmprepo.js";
+
+// Queue row 34(a) (D-2134 R5): an independent judge below these fixtures' review floor.
+function setupRepo(...args: Parameters<typeof baseSetupRepo>) {
+  const fixture = baseSetupRepo(...args);
+  const config = join(fixture.repo, ".tickmarkr", "config.yaml");
+  writeFileSync(config, readFileSync(config, "utf8").replace("judge: { adapter: fake, model: fake-1 }", "judge: { adapter: fake, model: fake-2 }"));
+  return fixture;
+}
 
 afterEach(() => vi.restoreAllMocks());
 
@@ -57,10 +65,10 @@ class Seat extends FakeAdapter {
   }
 }
 class Author extends FakeAdapter {
-  override channels(): BillingChannel[] { return super.channels().slice(0, 1); }
+  override channels(): BillingChannel[] { return [super.channels()[0]!, { ...super.channels()[1]!, tier: "cheap" }]; }
 }
 class MidAuthor extends FakeAdapter {
-  override channels(): BillingChannel[] { return [{ ...super.channels()[0]!, tier: "mid" }]; }
+  override channels(): BillingChannel[] { return [{ ...super.channels()[0]!, tier: "mid" }, { ...super.channels()[1]!, tier: "cheap" }]; }
 }
 
 // ---- scripted gate rounds: the closed exit table at the daemon's own publication seam ----------------

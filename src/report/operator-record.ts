@@ -46,13 +46,14 @@ export function formatRateBasis(row: ChannelCost): string | undefined {
 export function formatChannelMoney(row: ChannelCost): { readonly prices: string[]; readonly bases: string[] } {
   const prices: string[] = [];
   const bases: string[] = [];
-  if (row.apiUsd !== undefined) prices.push(`price: $${row.apiUsd.toFixed(6)}`);
+  const floor = row.partialMetering ? "≥ " : "";
+  if (row.apiUsd !== undefined) prices.push(`price: ${floor}$${row.apiUsd.toFixed(6)}`);
   if (row.amortizedUsd !== undefined && row.subPlan !== undefined) {
     const [low, high] = row.amortizedUsd;
-    prices.push(`price: $${low.toFixed(6)}–$${high.toFixed(6)} amortized`);
+    prices.push(`price: ${floor}$${low.toFixed(6)}–$${high.toFixed(6)} amortized`);
     bases.push(`${n(row.attempts)} windows × $${row.subPlan.planMonthly}/month ÷ ${row.subPlan.windowsPerMonthHigh}–${row.subPlan.windowsPerMonthLow} windows/month`);
   }
-  if (row.counterfactualUsd !== undefined) prices.push(`API-equivalent: $${row.counterfactualUsd.toFixed(6)}`);
+  if (row.counterfactualUsd !== undefined) prices.push(`API-equivalent: ${floor}$${row.counterfactualUsd.toFixed(6)}`);
   const basis = formatRateBasis(row);
   if (basis) bases.push(basis);
   if (!prices.length) prices.push("price: not measurable");

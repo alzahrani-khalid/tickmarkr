@@ -1,7 +1,9 @@
+import { createHash } from "node:crypto";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
+import { report } from "../../src/cli/commands/report.js";
 import {
   BUNDLE_SCHEMA_VERSION,
   buildProofBundle,
@@ -9,8 +11,9 @@ import {
   type ProofBundle,
 } from "../../src/report/bundle.js";
 import type { RunEnvironment } from "../../src/run/environment.js";
-import type { JournalEvent } from "../../src/run/journal.js";
+import { Journal, type JournalEvent } from "../../src/run/journal.js";
 import { MASK } from "../../src/run/redact.js";
+import { makeRepo } from "../helpers/tmprepo.js";
 
 // v1.70 T4: report --bundle pure surface — schema-versioned proof packet with
 // task outcomes, judge evidence citations, environment identity, content hashes,
@@ -82,6 +85,50 @@ const eventsWithJudge = (secretInDetails?: string): JournalEvent[] => {
 };
 
 describe("report --bundle proof packet (v1.70 T4)", () => {
+  test("test: the written proof bundle carries schema version three, a held screen as not passed and held, every session's environment, and a stated limit naming the serialization of parsed events it hashes rather than journal bytes, so a bundle keeping the old schema or the old limit fails", async () => {
+    const repo = makeRepo({ "keep.txt": "proof\n" });
+    const a = env({ configHash: "config-a" });
+    const b = env({ configHash: "config-b" });
+    for (const [id, stamps, aggregate] of [
+      ["equal", [a, a, a], a],
+      ["mixed", [a, b, a], undefined],
+      ["unbound", [a, undefined, a], undefined],
+    ] as const) {
+      const journal = Journal.create(repo, `run-bundle-${id}`);
+      const source: JournalEvent[] = [
+        ...stamps.map((environment, i) => ({
+          ts: `2026-10-24T00:00:0${i}.000Z`, event: i ? "run-resume" : "run-start",
+          data: environment ? { environment } : {},
+        })),
+        { ts: "2026-10-24T00:00:03.000Z", event: "gate-result", taskId: "T1", data: { gate: "test", pass: true, selectedTests: ["tests/report/bundle.test.ts"], details: "screen" } },
+        { ts: "2026-10-24T00:00:04.000Z", event: "gate-result", taskId: "T1", data: { gate: "test", pass: true, selectedTests: ["tests/report/bundle.test.ts"], fullSuite: true, details: "full suite" } },
+        { ts: "2026-10-24T00:00:05.000Z", event: "gate-result", taskId: "T1", data: { gate: "review", skipped: true, details: "declined by policy" } },
+        { ts: "2026-10-24T00:00:06.000Z", event: "run-end", data: { done: ["T1"], failed: [], human: [] } },
+      ];
+      const rawJournal = source.map((e) => `  ${JSON.stringify(e)}  `).join("\n\n") + "\n";
+      writeFileSync(join(journal.dir, "journal.jsonl"), rawJournal);
+      const path = join(journal.dir, "proof.json");
+      await report([`run-bundle-${id}`, "--bundle", path], repo);
+      const packet = JSON.parse(readFileSync(path, "utf8")) as ProofBundle;
+      expect(BUNDLE_SCHEMA_VERSION).toBe(3);
+      expect(packet.schemaVersion).toBe(3);
+      expect(packet.tasks[0].gates).toEqual([
+        { gate: "test", pass: false, held: true, details: "screen" },
+        { gate: "test", pass: true, details: "full suite" },
+        { gate: "review", pass: false, declined: true, details: "declined by policy" },
+      ]);
+      expect(packet.environment).toEqual(aggregate);
+      expect(packet.environments).toEqual(stamps.map((environment, i) => ({
+        event: i ? "run-resume" : "run-start", ts: source[i].ts, ...(environment ? { environment } : {}),
+      })));
+      expect(packet.contentHashes.journal).toBe(createHash("sha256").update(JSON.stringify(source)).digest("hex"));
+      expect(packet.contentHashes.journal).not.toBe(createHash("sha256").update(rawJournal).digest("hex"));
+      const limit = packet.knownLimits.find((line) => line.startsWith("Content hashes"));
+      expect(limit).toMatch(/serialization of parsed journal events/);
+      expect(limit).not.toContain("journal bytes");
+    }
+  });
+
   test("test: the written bundle carries a schema version field a future reader can check before parsing the rest", () => {
     const packet = buildProofBundle("run-bundle-schema", eventsWithJudge());
     // Field is present at the top level and is a positive integer a reader can branch on first.

@@ -54,8 +54,8 @@ describe("GATE-09 judge-flake attribution (daemon level, fake adapter, zero toke
     // no secondUnparseable: the retry produced a parseable pass (only double-garbage sets the flag)
     expect(jr[0].data).toMatchObject({
       gate: "acceptance",
-      flaked: "fake:fake-1",
-      retried: "fake:fake-2",
+      flaked: "fake:fake-2",
+      retried: "fake:fake-1",
       transcript: expect.stringContaining("judge output garbage — not a verdict"),
     });
     // ordering pin: attribution precedes the verdict in the stream (judge-retry BEFORE acceptance gate-result)
@@ -198,8 +198,8 @@ describe("GATE-09 judge-flake attribution (daemon level, fake adapter, zero toke
 
     const rows = Journal.open(repo, "run-judge-telemetry").readJudgeTelemetry();
     expect(rows).toEqual([
-      expect.objectContaining({ taskId: "T1", channel: "fake:fake-1", outcome: "failed" }),
-      expect.objectContaining({ taskId: "T1", channel: "fake:fake-2", outcome: "done" }),
+      expect.objectContaining({ taskId: "T1", channel: "fake:fake-2", outcome: "failed" }),
+      expect.objectContaining({ taskId: "T1", channel: "fake:fake-1", outcome: "done" }),
     ]);
   });
 }, 120000);

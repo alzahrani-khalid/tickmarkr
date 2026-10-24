@@ -7,12 +7,14 @@ import type { EvidenceCitation } from "../gates/acceptance.js";
 import type { RunEnvironment } from "../run/environment.js";
 import type { JournalEvent } from "../run/journal.js";
 import { redactSecrets } from "../run/redact.js";
-import { recordedEnvironment } from "./compare.js";
+import { normalizeGateOutcome } from "../run/outcome.js";
+import { recordedEnvironment, recordedEnvironments, type SessionEnvironment } from "./compare.js";
 
 // Bump when the packet shape changes in a way a future reader must branch on before parsing.
 // 2 (T11): gates gained `declined`, and `pass` narrowed from "the gate did not fail" to "the gate
 // ran and passed" — a schema-1 reader would read a decline as a plain failure.
-export const BUNDLE_SCHEMA_VERSION = 2;
+// Queue 35 (D-2134 R6): held gates and session environments change the packet's meaning.
+export const BUNDLE_SCHEMA_VERSION = 3;
 
 // T11: the one predicate every decline surface shares — the record, the text tickmark rate, the
 // comparison metrics and this packet must agree on what "never ran" means. Modern runs journal
@@ -26,7 +28,7 @@ export const gateDeclined = (data: Record<string, unknown>): boolean =>
 export const KNOWN_LIMITS: readonly string[] = [
   "This packet is a portable snapshot of journaled run facts, not an independent re-verification of the work or its gates.",
   "Judge evidence citations are copied from the journal as the judge recorded them; this packet does not re-validate citations against the judged diff.",
-  "Content hashes bind this packet to the journal bytes used to build it; they do not prove the underlying gates, merges, or tip verification were correct.",
+  "Content hashes bind this packet to the JSON.stringify serialization of parsed journal events used to build it; they do not prove the underlying gates, merges, or tip verification were correct.",
   "Secret-shaped strings are redacted by local pattern matching only; redaction is not a formal security audit.",
   "Producing this packet never contacts a network and never uploads anything.",
 ];
@@ -47,6 +49,7 @@ export interface BundleGateResult {
   /** T11: true when the gate declined to run (journaled skipped:true, e.g. review below its
    * complexity threshold) — neither a pass nor a fail; the details carry the reason. */
   declined?: boolean;
+  held?: boolean;
   details: string;
 }
 
@@ -59,7 +62,7 @@ export interface BundleTask {
 }
 
 export interface BundleContentHashes {
-  /** sha256 of the canonical JSON of the source journal events used to build this packet. */
+  /** Queue 35 (D-2134 R6): sha256 of JSON.stringify of the parsed source events. */
   journal: string;
   /** graphDefinitionHash from run-start when recorded. */
   graphDefinitionHash?: string;
@@ -70,6 +73,7 @@ export interface ProofBundle {
   schemaVersion: number;
   runId: string;
   environment?: RunEnvironment;
+  environments: SessionEnvironment[];
   contentHashes: BundleContentHashes;
   tasks: BundleTask[];
   /** Plain-language known limits — this is not an unconditional proof of correctness. */
@@ -181,11 +185,13 @@ export function buildProofBundle(runId: string, events: JournalEvent[]): ProofBu
     const judgeCriteria: BundleJudgeCriterion[] = [];
     for (const g of gateEvents) {
       const gate = typeof g.data.gate === "string" ? g.data.gate : "unknown";
-      // T11: a declined gate never ran — flagged declined, never a pass.
+      // Queue 35 (D-2134 R6): a passing screen remains held until its full suite speaks.
       const declined = gateDeclined(g.data);
-      const pass = g.data.pass === true && !declined;
+      const outcome = normalizeGateOutcome(g.data);
+      const held = outcome.kind === "held";
+      const pass = outcome.kind === "passed" && !declined;
       const details = typeof g.data.details === "string" ? g.data.details : "";
-      gates.push({ gate, pass, ...(declined ? { declined: true } : {}), details });
+      gates.push({ gate, pass, ...(declined ? { declined: true } : {}), ...(held ? { held: true } : {}), details });
       if (gate === "acceptance") {
         for (const c of parseJudgeCriteria(g.data)) judgeCriteria.push(c);
       }
@@ -202,6 +208,7 @@ export function buildProofBundle(runId: string, events: JournalEvent[]): ProofBu
     schemaVersion: BUNDLE_SCHEMA_VERSION,
     runId,
     ...(environment ? { environment } : {}),
+    environments: recordedEnvironments(events),
     contentHashes: {
       journal: journalHash,
       ...(gHash ? { graphDefinitionHash: gHash } : {}),

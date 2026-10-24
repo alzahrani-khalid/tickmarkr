@@ -2,6 +2,53 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v2.8.8 — gate integrity: every oracle in one red, repair hints from structured fields only, a carried tip green bound to its environment, compile that reads every file, durable discharges, an independent acceptance judge, and a record that states only what was proven
+
+**v2.8.8** closes the gate-integrity P1s. Its work comes from one `tickmarkr run` engagement
+(run-20261023-204319-…1926), in which six tasks each passed build, lint, evidence, scope, their acceptance criteria, a
+cross-vendor review and the full suite.
+
+- **Every deterministic oracle reports in one red (queue row 234(b)).** The acceptance gate used to stop at the first failing
+  command or test oracle, so a worker that misplaced several oracles learned about one per round.
+  - Every deterministic oracle now runs in declaration order, and one red lists each failing oracle with its own output.
+  - Any unverified oracle makes the red infra.
+- **A repair hint never comes from the criterion text (queue row 235).** The repair-disposition lexer used to read paths from
+  free text, including a criterion title, and a title naming `package.json` parked a task as a false authoring defect.
+  - Hints now come from structured fields only: an oracle's landing, its readable output, and the judge's unmet evidence paths.
+- **A carried tip green needs the same runner and environment (queue row 24).** The tip-verify cycle carried the last green
+  whenever the tip, command and capacity matched, even after a Node or tickmarkr upgrade, a changed `PATH`, `NODE_OPTIONS` or
+  `TZ`, or an npm link.
+  - Every tip-verify row now carries an environment stamp, and a green carries only under the same stamp.
+  - A missing, malformed or unknown-lifecycle stamp re-verifies once.
+  - A dependency folder that cannot be inventoried is refused as infra, never a crash.
+- **Compile walks every code file, reads large files, and fails loud on what it cannot read (queue row 27).**
+  - The collateral walk no longer stops at 400 files per root and no longer skips files over 512 KiB.
+  - The blocking source-scope check refuses on an unreadable source file.
+  - A test-corpus read that git cannot finish refuses the compile, where it used to cache an empty corpus in silence.
+- **A recorded discharge's proof lives in its run directory (queue row 31).** `verify --record` used to point its discharge at a
+  temporary file, so a reboot or the macOS temp sweep turned a green run's `outstanding 0` into `outstanding unknown`.
+  - The proof is now copied into the run directory, recorded by a relative path, and hash-checked on every read.
+  - Legacy absolute paths read as before.
+- **The acceptance judge is never an author's vendor when an independent seat exists (queue row 34(a)).** The configured judge
+  used to grade work its own model wrote.
+  - The primary judge, its retry and the adjudicator now skip every lifetime author's vendor while another seat remains.
+  - A verdict from a non-independent seat is recorded as `judgeIndependent: false`, and `tickmarkr status` names it.
+- **The record states only what was proven (queue row 35).**
+  - A selected-test screen that passed without its full suite reads held, never a pass, in the Markdown report, the plain
+    report's tickmark rate, the proof bundle and the run comparison.
+  - Partly metered prices print as floors.
+  - A run resumed under a different environment compares as mixed sessions.
+  - The record's lead line reads mixed for a tip proof of fresh and reused gates.
+  - The proof bundle moves to schema version 3.
+  - An acceptance row without an independent judge prints that independence was not established.
+
+Declared, still open:
+- Queue row 24's residual: `node_modules` content drift under an equal lockfile and equal links still carries, as per-gate
+  reuse does.
+- Queue row 247: a task whose full suite has passed can wait a whole other task's suite before it records the pass.
+- Queue rows 236 (liveness readers ignore the repository claim), 237 (the ownership lint misses source-text tests),
+  238 (a waived scope debt on a never-merged head cannot be discharged), 232(a, b), 187(b) and 246.
+
 ## v2.8.7 — consumer repositories: honest jest reading, a pinned repair that runs, serialized worktree admin, grok's trust modal, consumer guidance, a harvest that waits for a live worker, print-mode progress past the read window, and briefs that name each oracle's suite
 
 **v2.8.7** closes the consumer-repository P1s and two defects found while building it. Its work comes from two `tickmarkr run`

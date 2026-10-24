@@ -78,7 +78,7 @@ function fakeBWith(extra: object): FakeAdapterB {
   return new FakeAdapterB(p);
 }
 
-const author: Assignment = { adapter: "fake", model: "fake-1", channel: "sub", tier: "frontier" };
+const author: Assignment = { adapter: "author", model: "author", channel: "sub", tier: "frontier" };
 // two-adapter fleet: fake-1 (fake) + fake-2 (fake-b) — cross-adapter judge failover by construction
 const CH_TWO_ADAPTERS: BillingChannel[] = [
   { adapter: "fake", vendor: "fake-a", model: "fake-1", channel: "sub", tier: "frontier" },
@@ -111,7 +111,7 @@ async function ctxFor(
     result: noResult,
     commands: {} as Record<string, string>,
     baseline: await captureBaseline(repo, {}),
-    channels: opts.channels ?? CH_TWO_ADAPTERS,
+    channels: [{ ...author, vendor: "author-vendor" }, ...(opts.channels ?? CH_TWO_ADAPTERS)],
     ...(opts.omitJudgePool ? {} : { judgeChannels: opts.judgeChannels ?? opts.channels ?? CH_TWO_ADAPTERS }),
     adapters, cfg,
   };

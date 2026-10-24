@@ -1165,6 +1165,16 @@ const recordedTasks = (graph: RunGraph, rows: Map<string, TaskRow>): Task[] =>
 const recordedDone = (tasks: readonly Task[], rows: Map<string, TaskRow>): number =>
   tasks.filter((task) => graphTaskStatus(rows.get(task.id)?.state, task.status) === "done").length;
 
+const judgeIndependenceNotes = (events: readonly JournalEvent[]): string[] => {
+  // Queue row 34(a) (D-2134 R5): only the newest acceptance row owns this note.
+  const acceptance = new Map<string, JournalEvent>();
+  for (const event of events) {
+    if (event.taskId && event.event === "gate-result" && event.data.gate === "acceptance") acceptance.set(event.taskId, event);
+  }
+  return [...acceptance].filter(([, event]) => event.data.judgeIndependent === false)
+    .map(([id]) => `${sanitizeTaskText(id)} judge not independent`);
+};
+
 const renderFrame = (
   cwd: string,
   // No default: the version is the binary's, resolved once by its caller, and a frame that had to
@@ -1180,6 +1190,7 @@ const renderFrame = (
   const record = readRunRecord(cwd, g, namedRunId);
   const runId = record?.runId;
   const events = record?.events ?? [];
+  const judgeNotes = judgeIndependenceNotes(events);
   const runLine = runId && record ? runStatusLine(cwd, runId, events) : null;
   // The header and every live-phase consumer share this exact process reading. Proved death retires
   // stale phase markers; unknown identity deliberately does not, preserving pre-identity journals.
@@ -1374,7 +1385,7 @@ const renderFrame = (
     // At its machine width and wider the plain print keeps each machine row whole — one row per task and
     // its evidence line after it, which consumers parse. A configured width narrower than that holds for
     // EVERY row: one that overflows wraps beneath its own indent, its identity kept on the first.
-    const body = [header, legendLine, `  ${supervisionText(supervision, divider)}`, ...rows];
+    const body = [header, legendLine, `  ${supervisionText(supervision, divider)}`, ...rows, ...judgeNotes.map((note) => `  ${note}`)];
     const wrapRow = (line: string): string[] => wrapCells(line, width, { continuationPrefix: `${/^ */u.exec(line)![0]}  ` });
     return {
       content: [
@@ -1599,6 +1610,7 @@ const renderFrame = (
         "",
         ...tableRows(),
         ...recoverySection,
+        ...judgeNotes.flatMap((note) => wrapCells(`    ${note}`, boardColumns, { continuationPrefix: "      " })),
         gatesLegend,
         "",
         rule(boardColumns),
@@ -1654,7 +1666,7 @@ const oneLine = (cwd: string, namedRunId?: string): string => {
   // A fatal run-end leads right after the run id: no completion fraction or verify state reads first.
   const crash = fatalRunEndCause(events);
   return sanitizeTaskText([
-    record.runId, ...(crash ? [`run crashed — ${crash}`] : []), ...claims, firstPassText(endToEndFirstPass(events)), wallText(events), needsYouText(events, currentOwed(events, cwd)),
+    record.runId, ...(crash ? [`run crashed — ${crash}`] : []), ...claims, firstPassText(endToEndFirstPass(events)), wallText(events), needsYouText(events, currentOwed(events, cwd)), ...judgeIndependenceNotes(events),
   ].join(" · "));
 };
 

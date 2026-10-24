@@ -2,7 +2,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, rmdirSync } from "node:fs";
-import { join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import { z } from "zod";
 import { channelKey, shq, TokenUsageSchema, type Assignment } from "../adapters/types.js";
 import type { TickmarkrConfig } from "../config/config.js";
@@ -2915,7 +2915,16 @@ function dischargeProblem(row: JournalEvent, o: OwedCheck, events: readonly Jour
   if (!exact && !integration) return "discharge range does not bind the obligation";
   let artifact: { head?: unknown; mergeBase?: unknown; green?: unknown; files?: unknown; criteria?: unknown; gateRows?: unknown };
   try {
-    const bytes = readFileSync(String(d.artifactPath));
+    let artifactPath = String(d.artifactPath);
+    if (!isAbsolute(artifactPath)) {
+      // Queue row 31 / D-2134: resolve within the obligation's own run, with common-root fallback
+      // only when that run is absent locally; legacy absolute paths keep their original meaning.
+      const id = parseRunId(o.runId);
+      const localRun = join(runsDir(cwd), id);
+      const runDir = existsSync(localRun) ? localRun : join(runsDir(dirname(trustedCommonDir(cwd))), id);
+      artifactPath = join(runDir, artifactPath);
+    }
+    const bytes = readFileSync(artifactPath);
     if (createHash("sha256").update(bytes).digest("hex") !== d.artifactSha256) return "artifact hash mismatch";
     artifact = JSON.parse(bytes.toString("utf8")) ?? {};
   } catch {

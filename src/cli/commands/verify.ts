@@ -374,8 +374,8 @@ export async function verify(argv: string[], cwd = process.cwd(), options: { evi
 
   // Baseline: --baseline file > cached capture for this merge-base > fresh capture on a detached
   // temp worktree of the merge-base (so pre-existing failures on base are forgiven, exactly as a run).
-  // ALL verify state (cache, base worktree, artifacts) lives OUTSIDE the repo: verify gates the repo
-  // root itself, so any file it wrote there would trip the battery's own dirty-worktree refusal.
+  // Queue row 31 / D-2134: gate-time state lives outside the repo; a validated discharge's durable
+  // proof is copied into its run only after the battery's final dirty-worktree check.
   // ponytail: tmpdir means the baseline cache dies on reboot/cleanup — worst case is one re-capture.
   const stateDir = verifyStateDir(cwd);
   mkdirSync(stateDir, { recursive: true });
@@ -585,6 +585,7 @@ export async function verify(argv: string[], cwd = process.cwd(), options: { evi
     console.error(`verify: evidence capture failed for ${artifactPath}`);
   }
   const review = reviewRows.at(-1);
+  let recordedArtifactPath = artifactPath;
   // C1: ONE discharge row names what the fold re-reads — the artifact by hash, the range mapping, the
   // criteria and each resolved channel — and it is appended only when the fold, the single decider,
   // already accepts it: verify never writes a proof that would turn known debt into unknown debt.
@@ -606,7 +607,27 @@ export async function verify(argv: string[], cwd = process.cwd(), options: { evi
     if (!green) dischargeRefusal = "the verdict is not green";
     else if (!candidate) dischargeRefusal = "the results artifact is unavailable";
     else if (!candidate.known || !owed.every((o) => candidate.discharged.includes(o.id))) dischargeRefusal = candidate.unknown.at(-1)?.reason ?? "the proof does not discharge the check";
-    else recordJournal.append(OWED_DISCHARGE_EVENT, values.task, data);
+    else {
+      // Queue row 31 / D-2134: validate before writing under the run, then retain the exact bytes.
+      // Exclusive creation accepts an identical existing proof, never overwrites different bytes.
+      const relativePath = join("discharges", `${artifactSha256}.json`);
+      const durablePath = join(recordJournal.dir, relativePath);
+      try {
+        mkdirSync(dirname(durablePath), { recursive: true });
+        try {
+          writeFileSync(durablePath, artifactBytes, { flag: "wx" });
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+          if (!readFileSync(durablePath).equals(artifactBytes)) throw new Error("existing durable proof has different bytes");
+        }
+      } catch {
+        dischargeRefusal = "durable results artifact unavailable or has different bytes";
+      }
+      if (!dischargeRefusal) {
+        recordedArtifactPath = relativePath;
+        recordJournal.append(OWED_DISCHARGE_EVENT, values.task, { ...data, artifactPath: recordedArtifactPath });
+      }
+    }
   }
   const owedAfter = recordJournal ? foldOwedChecks(recordJournal.read(), cwd) : undefined;
   const code = green && !dischargeRefusal ? 0 : 2;
@@ -614,7 +635,7 @@ export async function verify(argv: string[], cwd = process.cwd(), options: { evi
     ? [...(dischargeRefusal ? [`verify --record refused discharge: ${dischargeRefusal}`] : []), debtLine(owedAfter)] : [];
   if (recordJournal && review) {
     recordJournal.append("review-leg2", values.task ?? "VERIFY", {
-      base: baseTip, head, mergeBase, author: channelKey(author), artifactPath, artifactSha256, artifactAvailability,
+      base: baseTip, head, mergeBase, author: channelKey(author), artifactPath: recordedArtifactPath, artifactSha256, artifactAvailability,
       ...review,
     });
   }

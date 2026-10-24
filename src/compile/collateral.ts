@@ -6,6 +6,7 @@ import {
   type TickmarkrConfig,
 } from "../config/config.js";
 import { renderAcceptanceItem, type Task } from "../graph/schema.js";
+import { CompileError } from "./common.js";
 
 // Advisory scan (OBS-12/13/14/21, OBS-76). NEVER expands files[] or fails compile — a warning the
 // author acts on. Plain-text (no AST), capped + sorted for DISPLAY only.
@@ -14,12 +15,8 @@ import { renderAcceptanceItem, type Task } from "../graph/schema.js";
 // against it — the prediction never causes a refusal, it only says whether a red the gate already
 // found was foreseeable (authoring defect) or not (chargeable quality failure).
 
-/** Max files walked per root (sorted walk; rest ignored). */
-const MAX_WALK_FILES = 400;
 /** Max collateral test paths listed per task. */
 const MAX_HITS_PER_TASK = 20;
-/** Skip giant fixtures / snapshots. */
-const MAX_READ_BYTES = 512 * 1024;
 const EXPORT_MANIFEST_TEST = "tests/repo/export-manifest.test.ts";
 
 const SRC_EXT = /\.(ts|tsx|js|jsx|mts|cts)$/;
@@ -42,7 +39,6 @@ function walkCode(repoRoot: string, subdir: string): string[] {
   const root = join(repoRoot, subdir);
   const out: string[] = [];
   const walk = (dir: string) => {
-    if (out.length >= MAX_WALK_FILES) return;
     let entries;
     try {
       entries = readdirSync(dir, { withFileTypes: true });
@@ -52,7 +48,6 @@ function walkCode(repoRoot: string, subdir: string): string[] {
     // deterministic order
     entries.sort((a, b) => a.name.localeCompare(b.name));
     for (const e of entries) {
-      if (out.length >= MAX_WALK_FILES) return;
       if (e.name === "node_modules" || e.name === ".git" || e.name.startsWith(".")) continue;
       const full = join(dir, e.name);
       if (e.isDirectory()) {
@@ -81,20 +76,21 @@ function mentions(content: string, needles: string[]): boolean {
 }
 
 // cache file bodies (one read per path)
-function makeReader(repoRoot: string): (rel: string) => string | null {
+function makeReader(repoRoot: string, failClosed = false): (rel: string) => string | null {
   const body = new Map<string, string | null>();
   return (rel) => {
     if (body.has(rel)) return body.get(rel)!;
     try {
-      const st = statSync(join(repoRoot, rel));
-      if (st.size > MAX_READ_BYTES) {
-        body.set(rel, null);
-        return null;
-      }
       const text = readFileSync(join(repoRoot, rel), "utf8");
       body.set(rel, text);
       return text;
     } catch {
+      if (failClosed) {
+        throw new CompileError(
+          `${rel} is unreadable, so the source-scope scan is incomplete — restore read access `
+          + `or remove the path and recompile (queue row 27, D-2134).`,
+        );
+      }
       body.set(rel, null);
       return null;
     }
@@ -540,6 +536,7 @@ export interface SourceScopeFinding {
 export function sourceScopeFindings(
   tasks: ReadonlyArray<Pick<Task, "id" | "files" | "acceptance">>,
   repoRoot: string,
+  options: { failClosed?: boolean } = {},
 ): SourceScopeFinding[] {
   const perTask = tasks
     .map((t) => ({ t, needles: criteriaSymbols(t.acceptance) }))
@@ -548,7 +545,7 @@ export function sourceScopeFindings(
   const srcFiles = walkCode(repoRoot, "src");
   if (!srcFiles.length) return [];
 
-  const read = makeReader(repoRoot);
+  const read = makeReader(repoRoot, options.failClosed);
   const findings: SourceScopeFinding[] = [];
   for (const { t, needles } of perTask) {
     // OBS-22: scopeGate accepts picomatch globs; advisory warnings must agree.

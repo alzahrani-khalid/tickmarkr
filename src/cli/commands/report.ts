@@ -26,6 +26,7 @@ import {
   baselineProvenanceOf, fingerprintsOf, forgivenFingerprints, forgivenGateRow, formatBaselineProvenance, formatFingerprints,
   formatForgiven, formatTipProof, runEndTipProof,
 } from "../../run/daemon.js";
+import { normalizeGateOutcome } from "../../run/outcome.js";
 import { formatSpan, WALL_PRIORITY, WALL_PRIORITY_TEXT, wallBudget, wallBudgetFacts } from "../../run/wall-budget.js";
 import { deriveRunCockpitData } from "../../tui/cockpit/derive.js";
 import { cellWidth, wrapCells } from "../../tui/cockpit/width.js";
@@ -381,7 +382,7 @@ const outcomeFor = (events: JournalEvent[], taskId: string, runEnd?: JournalEven
  * and surfaces it as the `tip-verify` status item, in three states — pass, fail, and absent — so a
  * second implementation cannot drift from the surface the operator watches live.
  */
-type Verification = "passed" | "cached" | "failed" | "absent";
+type Verification = "passed" | "cached" | "mixed" | "failed" | "absent";
 
 const tipStatusItem = (runId: string, events: JournalEvent[]) => {
   try {
@@ -414,12 +415,13 @@ const verificationOf = (runId: string, events: JournalEvent[]): Verification => 
   const tip = tipStatusItem(runId, cycle);
   if (tip?.state === "fail") return "failed";
   if (tip?.state !== "pass") return "absent";
-  // A cached green is a verified green of an EARLIER tip (daemon.ts verifyIntegrationTipCached
-  // stamps `cached` on every gate it replays), so the record names it instead of folding it into a
-  // plain pass. Still no second window: the cockpit reports "pass" only when the closed cycle
-  // carried verdicts, so the last `tip-verify` IN THAT CYCLE is the one it passed on.
-  const last = [...cycle].reverse().find((e) => e.event === "tip-verify");
-  return last?.data.cached === true ? "cached" : "passed";
+  // Queue 35 (D-2134 R6): the same per-gate proof names both the lead and verification line.
+  const proof = runEndTipProof(cycle);
+  if (proof.gates?.length) {
+    if (proof.gates.every(({ kind }) => kind === "reused")) return "cached";
+    if (proof.gates.some(({ kind }) => kind === "reused")) return "mixed";
+  }
+  return "passed";
 };
 
 // Absent is a state to render, never a zero to invent — and no reading here calls a run green.
@@ -429,6 +431,7 @@ const verificationOf = (runId: string, events: JournalEvent[]): Verification => 
 const VERIFICATION_READING: Record<Verification, string> = {
   passed: "passed — tickmarkr verified this run's integration tip",
   cached: "cached — carried forward from an earlier verified tip, not re-run for this one",
+  mixed: "mixed — some tip gates ran fresh and others were carried forward",
   failed: "FAILED — the run did not verify its own tip",
   absent: "absent — no tip verification recorded: neither passed nor failed",
 };
@@ -441,9 +444,9 @@ function forgivenLines(events: JournalEvent[]): string[] {
 function verificationReading(runId: string, events: JournalEvent[]): string {
   const state = verificationOf(runId, events);
   const proof = runEndTipProof(closedCycle(events));
-  if ((state === "passed" || state === "cached") && proof.gates?.length) {
-    const allCarried = proof.gates.every(({ kind }) => kind === "reused");
-    return `${allCarried ? "cached" : "passed"} — ${formatTipProof(proof)}`;
+  if ((state === "passed" || state === "cached" || state === "mixed") && proof.gates?.length) {
+    // Queue 35 (D-2134 R6): mixed describes the lead's provenance; per-gate details retain it here.
+    return `${state === "mixed" ? "passed" : state} — ${formatTipProof(proof)}`;
   }
   return VERIFICATION_READING[state];
 }
@@ -555,9 +558,13 @@ export function renderMarkdownRecord(runId: string, events: JournalEvent[], pric
     lines.push("- **tickmarks:**");
     if (gates.length) {
       for (const g of gates) {
-        // T11: a declined gate never ran — report it as declined, never as a pass.
-        let pass = gateDeclined(g.data) ? "declined" : g.data.pass === true ? "pass" : g.data.pass === false ? "fail" : EM;
+        // Queue 35 (D-2134 R6): only held changes the existing tickmark vocabulary.
+        let pass = normalizeGateOutcome(g.data).kind === "held" ? "held"
+          : gateDeclined(g.data) ? "declined" : g.data.pass === true ? "pass" : g.data.pass === false ? "fail" : EM;
         const gate = typeof g.data.gate === "string" ? g.data.gate : EM;
+        if (gate === "acceptance" && g.data.judgeIndependent === false) {
+          pass += " (independence not established)";
+        }
         if (gate === "review" && pass === "pass") {
           const reviewer = reviewerIdentity(g.data);
           const before = events.slice(0, events.indexOf(g) + 1).reverse()
@@ -652,7 +659,7 @@ function textReport(runId: string, events: JournalEvent[], rows: TelemetryRow[],
   // T11: gates that declined never ran — out of both the pass count and the rate base.
   const declinedCount = gateResults.filter((e) => gateDeclined(e.data)).length;
   const gateRan = gateResults.length - declinedCount;
-  const gatePass = gateResults.filter((e) => e.data.pass && !gateDeclined(e.data)).length;
+  const gatePass = gateResults.filter((e) => normalizeGateOutcome(e.data).kind === "passed" && !gateDeclined(e.data)).length;
   const escalations = events.filter((e) => e.event === "escalation").length;
   const consults = events.filter((e) => e.event === "consult-verdict").length;
   const failovers = events.filter((e) => e.event === "quota-failover").length;

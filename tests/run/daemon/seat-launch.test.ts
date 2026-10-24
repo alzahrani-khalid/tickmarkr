@@ -1,7 +1,8 @@
+import { join } from "node:path";
 // T7 (OBS-1168(b)(c), OBS-1196): a judge or reviewer seat that cannot launch, or that delivers a malformed
 // verdict, is a seat problem — recovered on another seat or parked infra, never charged to the worker —
 // and the round's other semantic gate is settled before the engagement closes, with or without a policy.
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { describe, expect, test } from "vitest";
 import { FakeAdapter } from "../../../src/adapters/fake.js";
 import { shq, type BillingChannel } from "../../../src/adapters/types.js";
@@ -9,7 +10,15 @@ import { SubprocessDriver } from "../../../src/drivers/subprocess.js";
 import type { Slot } from "../../../src/drivers/types.js";
 import { runDaemon } from "../../../src/run/daemon.js";
 import { Journal, type JournalEvent } from "../../../src/run/journal.js";
-import { authedModels, COMMIT, setupRepo, T } from "../../helpers/tmprepo.js";
+import { authedModels, COMMIT, setupRepo as baseSetupRepo, T } from "../../helpers/tmprepo.js";
+
+// Queue row 34(a) (D-2134 R5): an independent judge below these fixtures' review floor.
+function setupRepo(...args: Parameters<typeof baseSetupRepo>) {
+  const fixture = baseSetupRepo(...args);
+  const config = join(fixture.repo, ".tickmarkr", "config.yaml");
+  writeFileSync(config, readFileSync(config, "utf8").replace("judge: { adapter: fake, model: fake-1 }", "judge: { adapter: fake, model: fake-2 }"));
+  return fixture;
+}
 
 const PANE = "visibility:\n  llm: pane\n  keepPanes: run\n";
 const work = (id: string, file = "work.txt") => ({ shell: `echo ${id} > ${file} && ${COMMIT} ${id}`, result: { ok: true, summary: id } });
@@ -44,7 +53,7 @@ const role = (name: string, r: "judge" | "review", attempt?: number) =>
   name.startsWith(`tickmarkr:${r}:`) && (attempt === undefined || name.split(":")[3] === String(attempt));
 
 class Author extends FakeAdapter {
-  override channels(): BillingChannel[] { return super.channels().slice(0, 1); }
+  override channels(): BillingChannel[] { return [super.channels()[0]!, { ...super.channels()[1]!, tier: "cheap" }]; }
 }
 
 type Reply = "malformed" | "red" | "approve" | "slow";
@@ -180,7 +189,7 @@ describe("semantic seat delivery (production daemon, fake adapters, zero tokens)
       const s = await runDaemon(repo, { adapters: [fake], runId: "run-judge-reroute", driver });
       expect(s.done).toEqual(["T1"]);
       const rows = rowsOf(repo, "run-judge-reroute");
-      expect(taskRows(rows, "judge-retry").map((row) => row.data)).toEqual([expect.objectContaining({ flaked: "fake:fake-1", retried: "fake:fake-2" })]);
+      expect(taskRows(rows, "judge-retry").map((row) => row.data)).toEqual([expect.objectContaining({ flaked: "fake:fake-2", retried: "fake:fake-1" })]);
       expect(taskRows(rows, "task-dispatch")).toHaveLength(1);
       expect(rows.filter((row) => row.event === "task-failed")).toEqual([]);
     }

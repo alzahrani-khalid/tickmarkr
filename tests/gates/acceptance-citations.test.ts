@@ -252,9 +252,9 @@ async function gated(judge: unknown[], prior?: { met: boolean }) {
   cfg.judge.model = "fake-1";
   const trace: GateEvent[] = [];
   const { results } = await runGates(task, {
-    worktree: repo, baseRef: base, author: { adapter: "fake", model: "fake-1", channel: "sub", tier: "frontier" },
+    worktree: repo, baseRef: base, author: { adapter: "author", model: "author", channel: "sub", tier: "frontier" },
     result: { ok: true, summary: "", deviations: [], raw: "" }, commands: {}, baseline: await captureBaseline(repo, {}),
-    channels: CHANNELS, judgeChannels: CHANNELS, adapters: [new FakeAdapter(scriptWith(judge))], cfg,
+    channels: [{ adapter: "author", model: "author", vendor: "author-vendor", channel: "sub", tier: "frontier" }, ...CHANNELS], judgeChannels: CHANNELS, adapters: [new FakeAdapter(scriptWith(judge))], cfg,
     onGate: (e: GateEvent) => { trace.push(e); },
     ...(prior ? { priorJudgments: [{ commit: head, judge: "fake:fake-9",
       criteria: [{ id: "c1", key: judgmentSubjectKey(task, renderAcceptanceItem(task.acceptance[0]!)), met: prior.met, paths: ["a.txt"] }] }] } : {}),

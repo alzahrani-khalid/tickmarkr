@@ -1290,7 +1290,22 @@ export async function runGates(
         invocations: [],
       };
     }
-    const judgeAdapter = getAdapter(ctx.cfg.judge.adapter, ctx.adapters);
+    // Queue row 34(a) (D-2134 R5): resolve every lifetime author through both role pools.
+    const channels = [...(ctx.judgeChannels ?? []), ...ctx.channels];
+    const authors = ctx.carriedAuthors?.length ? ctx.carriedAuthors : [channelKey(ctx.author)];
+    const authorVendors = carriedAuthorVendors(channels, authors);
+    const independent = (seat: BillingChannel) => !!seat.vendor
+      && !authorVendors.has(seat.vendor) && !authors.includes(channelKey(seat));
+    const judgePool = () => (ctx.judgeChannels ?? []).filter((c) => disallowedBy(c, ctx.cfg.routing, "judge") === null);
+    const rankJudges = (pool: BillingChannel[]) => [...pool]
+      .sort((x, y) => TIER_RANK[y.tier] - TIER_RANK[x.tier] || marginalCostRank(x) - marginalCostRank(y));
+    const pickJudge = (pool: BillingChannel[], adapter: string) =>
+      rankJudges(pool.filter((c) => c.adapter !== adapter))[0] ?? rankJudges(pool)[0];
+    const configured = channels.find((c) => channelKey(c) === channelKey(ctx.cfg.judge));
+    const primary = authors.includes(channelKey(ctx.cfg.judge)) || (configured && authorVendors.has(configured.vendor))
+      ? pickJudge(judgePool().filter(independent), ctx.cfg.judge.adapter) ?? ctx.cfg.judge
+      : ctx.cfg.judge;
+    const judgeAdapter = getAdapter(primary.adapter, ctx.adapters);
     const jvia = via
       ? { driver: via.driver, keep: via.keep, onSlot: via.onSlot, name: via.nameFor("judge", judgeAdapter.id), label: via.labelFor("judge") }
       : undefined;
@@ -1336,11 +1351,11 @@ export async function runGates(
           ...(unparseable ? { transcript: output } : {}),
         });
       }
-      return captured.value;
+      const result = captured.value;
+      const seat = channels.find((c) => channelKey(c) === result.meta?.judge);
+      return typeof result.meta?.judge === "string" && result.meta.unparseable !== true && (!seat || !independent(seat))
+        ? { ...result, meta: { ...result.meta, judgeIndependent: false } } : result;
     };
-    const judgePool = () => (ctx.judgeChannels ?? []).filter((c) => disallowedBy(c, ctx.cfg.routing, "judge") === null);
-    const rankJudges = (pool: BillingChannel[]) => [...pool]
-      .sort((x, y) => TIER_RANK[y.tier] - TIER_RANK[x.tier] || marginalCostRank(x) - marginalCostRank(y));
     // OBS-1151 (+add.1): the fresh judgment always stands on its own reading — a prior PASS is never
     // reused. Only a criterion that REVERSES the newest prior ruling on the same subject key over
     // identical cited blobs needs a second, distinct judge; agreement stands (a sound FAIL included),
@@ -1363,16 +1378,18 @@ export async function runGates(
       const disputed = await judgeContradictions(ctx.worktree, commit, criteria, ctx.priorJudgments);
       if (!disputed.length) return stamped;
       await ctx.onGate?.({ phase: "note", gate: "acceptance", name: "judge-disagreement", payload: { primary, commit, disputed } });
+      let notIndependent = fresh.meta?.judgeIndependent === false;
+      const independence = () => notIndependent ? { judgeIndependent: false } : {};
       const park = (why: string, adjudicator?: string): GateResult => ({
         gate: "acceptance", pass: false,
         details: `judge disagreement on ${disputed.map((d) => d.id).join(", ")}: ${primary} reverses an earlier ruling over identical cited blobs (${[...new Set(disputed.flatMap((d) => d.paths))].join(", ")}) — ${why}; parked for an operator ruling, no worker charge`,
-        meta: { classification: "infra", infra: true, retryable: false, cause: "judge-disagreement", judge: primary,
+        meta: { classification: "infra", infra: true, retryable: false, cause: "judge-disagreement", judge: primary, ...independence(),
           judgeDisagreement: { primary, ...(adjudicator ? { adjudicator } : {}), disputed, outcome: why } },
       });
       const primaryAdapter = primary.slice(0, primary.indexOf(":"));
       // One DISTINCT seat: never the primary channel, a different adapter when the pool has one.
       const pool = judgePool().filter((c) => channelKey(c) !== primary);
-      const seat = rankJudges(pool.filter((c) => c.adapter !== primaryAdapter))[0] ?? rankJudges(pool)[0];
+      const seat = pickJudge(pool.filter(independent), primaryAdapter) ?? pickJudge(pool, primaryAdapter);
       if (!seat) return park("no distinct eligible judge is available");
       const adjudicator = channelKey(seat);
       const seatAdapter = getAdapter(seat.adapter, ctx.adapters);
@@ -1382,12 +1399,13 @@ export async function runGates(
       const subjectPark = (leg: AdjudicationSubjectLeg, found: string, ran?: string): GateResult => ({
         gate: "acceptance", pass: false,
         details: `the adjudication subject ${SUBJECT_LEG_TEXT[leg]}: sampled ${commit.slice(0, 12)}, found ${found.slice(0, 12)} (${leg}); parked for an operator ruling, no worker charge`,
-        meta: { classification: "infra", infra: true, retryable: false, cause: "subject-moved", judge: primary,
+        meta: { classification: "infra", infra: true, retryable: false, cause: "subject-moved", judge: primary, ...independence(),
           adjudication: { primary, ...(ran ? { adjudicator: ran } : {}), sampled: commit, found, leg } },
       });
       const s0 = await openSubjectWitness(ctx.worktree, commit);
       if ("leg" in s0) return subjectPark(s0.leg, s0.leg === "unreadable" ? "unreadable" : commit);
       const second = await invokeJudge(seatAdapter, seat.model, seatVia, configuredEffort(ctx.cfg, seat));
+      notIndependent ||= second.meta?.judgeIndependent === false;
       const changed = await adjudicationSubjectChange(ctx.worktree, commit, s0);
       if (changed) return subjectPark(changed.leg, changed.found, adjudicator);
       const rulings = Array.isArray(second.meta?.judgment) ? second.meta.judgment as JudgedCriterion[] : undefined;
@@ -1396,10 +1414,10 @@ export async function runGates(
       if (second.meta?.unparseable === true || !rulings) return park("the adjudicating judge returned no readable verdict", adjudicator);
       const agreed = disputed.every((d) => rulings.some((r) => r.id === d.id && r.met === d.met && r.paths.length > 0));
       if (!agreed) return park("the adjudicating judge split from the fresh ruling", adjudicator);
-      return { ...stamped, meta: { ...stamped.meta, adjudication: { primary, adjudicator, criteria: disputed.map((d) => d.id), agreed: true } } };
+      return { ...stamped, meta: { ...stamped.meta, ...independence(), adjudication: { primary, adjudicator, criteria: disputed.map((d) => d.id), agreed: true } } };
     };
     // OBS-1182: every judge seat launches at its OWN configured effort, never the worker's.
-    let a = await invokeJudge(judgeAdapter, ctx.cfg.judge.model, jvia, configuredEffort(ctx.cfg, ctx.cfg.judge));
+    let a = await invokeJudge(judgeAdapter, primary.model, jvia, configuredEffort(ctx.cfg, primary));
     // GATE-09: an unparseable judge verdict retries the JUDGE exactly once on a failover channel — never
     // the worker (run-20260711-185020 P43-03 L70-72 billed a judge flake as a worker attempt). The flaked
     // first verdict NEVER enters results (no false gate-result journal event, no operator notify, no stale
@@ -1416,18 +1434,10 @@ export async function runGates(
     if (!cancelled && a.meta?.unparseable === true && typeof a.meta.judge === "string") {
       const flakedKey = a.meta.judge;
       const flakedAdapter = flakedKey.slice(0, flakedKey.indexOf(":"));
-      const pick = (pool: BillingChannel[]) => pool
-        // pickReviewer's sort (review.ts:37): TIER_RANK desc, marginalCostRank asc — proven ordering; both
-        // symbols already imported by a sibling gate file.
-        .sort((x, y) => TIER_RANK[y.tier] - TIER_RANK[x.tier] || marginalCostRank(x) - marginalCostRank(y))[0];
-      // v1.87 T2: the failover seat obeys the same policy the primary judge just passed — a denied
-      // channel is refused here too, never reached by falling through the exclusion arms below.
-      const judgePool = (ctx.judgeChannels ?? []).filter((c) => disallowedBy(c, ctx.cfg.routing, "judge") === null);
-      const crossAdapter = pick(judgePool.filter((c) => c.adapter !== flakedAdapter));
-      const sameAdapter = pick(judgePool.filter((c) => c.adapter === flakedAdapter && channelKey(c) !== flakedKey));
-      // Prefer a different adapter; if the fleet only has one adapter, retry on a different channel of
-      // that adapter; if the fleet has only one channel, fall back to the original judge config.
-      const retry = crossAdapter ?? sameAdapter ?? judgeSeat;
+      // Queue row 34(a) (D-2134 R5): keep GATE-09's exclusions and fallback when independence is unavailable.
+      const pool = judgePool().filter((c) => channelKey(c) !== flakedKey);
+      const retry = pickJudge(pool.filter(independent), flakedAdapter)
+        ?? pickJudge(pool, flakedAdapter) ?? judgeSeat;
       const retryAdapter = getAdapter(retry.adapter, ctx.adapters);
       const retryJvia = via
         // unconditional -r1 suffix: under keepPanes:forever a same-channel retry cannot collide with the

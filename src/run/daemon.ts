@@ -26,7 +26,7 @@ import { herdrSealShellPrefix, MAX_BUF, SubprocessDriver } from "../drivers/subp
 import { formatOwnedName, type ExecutorDriver, type Slot } from "../drivers/types.js";
 import { type Baseline, type BaselineProvenance, captureBaseline, detectGateCommands, detectVacuousOracles, type GateEvidenceOptions } from "../gates/baseline.js";
 import { reobserveTestFiles, runGates, type GateContext, type GateEvent } from "../gates/run-gates.js";
-import { getVerdictStore, isInfraResult, resolveStateDir } from "../gates/cache.js";
+import { environmentFingerprint, getVerdictStore, isInfraResult, resolveStateDir } from "../gates/cache.js";
 import { RUNNER_INFRA_DIAGNOSTIC_RE, timeoutShaped } from "../gates/timeout-shaped.js";
 import type { GateResult } from "../gates/types.js";
 import { filesGlob } from "../graph/files-glob.js";
@@ -38,7 +38,7 @@ import { executionSignal, remainingExecutionMs, withExecutionBudget, withoutExec
 import { repairSelectionDecision, repairSelectionEnabled } from "./repair-selection.js";
 import { failureDisposition, reserveInfrastructureRetry } from "./recovery.js";
 import { runEnvironment } from "./environment.js";
-import { addDetachedWorktree, changeRepresented, cleanupRunWorktrees, declaredBaseContainment, deriveForkCap, FORK_CAP_ENV, gitHead, linkNodeModules, npmDependencyInstallCommand, npmDependencyManifestChanged, PRESERVE_COMMIT_SUBJECT, PRESERVE_PRODUCER_TRAILER, preserveWorktree, type PreserveProducer, producerFields, reflogWitness, removeWorktree, resolvedCapacity, runWithForkBudget, runWithVerificationBudget, type RunCapacity, sameCapacity, sameVerification, sh, shell, shGit, SUITE_PARENT_ENV, verificationProtocol, WorktreeAdminRaceError, WORKTREE_LAYOUT_CONTRACT, WORKTREES_DIR, worktreePath } from "./git.js";
+import { addDetachedWorktree, changeRepresented, cleanupRunWorktrees, declaredBaseContainment, dependencyLinkRefusal, deriveForkCap, FORK_CAP_ENV, gitHead, linkNodeModules, npmDependencyInstallCommand, npmDependencyManifestChanged, PRESERVE_COMMIT_SUBJECT, PRESERVE_PRODUCER_TRAILER, preserveWorktree, type PreserveProducer, producerFields, reflogWitness, removeWorktree, resolvedCapacity, runWithForkBudget, runWithVerificationBudget, type RunCapacity, sameCapacity, sameVerification, sh, shell, shGit, SUITE_PARENT_ENV, verificationProtocol, WorktreeAdminRaceError, WORKTREE_LAYOUT_CONTRACT, WORKTREES_DIR, worktreePath } from "./git.js";
 import { MASK } from "./redact.js";
 import { runInteractiveSeed, type InteractiveSeedResult } from "./interactive-seed.js";
 import { classifyRepairDisposition, namedPaths, resolveScopeHints } from "./repair-disposition.js";
@@ -1012,12 +1012,10 @@ export function commandsHash(commands: Record<string, string>): string {
 }
 
 /**
- * T7: a cycle also carries EVERY capacity its own rows recorded — the start row's and each verdict
- * row's, one entry per row, never a single value the start row speaks for. A start row states the
- * world the cycle INTENDED to run in; the row that carries a green is the one that measured it, and
- * a cycle whose rows disagree (or whose verdict row is malformed) is not a cycle whose green anyone
- * can carry forward. A pre-T7 cycle contributes `undefined`s, which is why an older journal keeps
- * carrying its green forward exactly as it does today.
+ * Queue row 24 (D-2134): collect the start row's and EVERY verdict row's capacity and environment
+ * stamp, one entry per row. The start states the world the cycle intended to run in; each verdict
+ * must agree before its green can carry forward. An absent environment stamp is incompatible,
+ * including on a cycle predating capacity stamps; the legacy capacity comparison itself is unchanged.
  */
 interface VerifyCycle {
   tip: string;
@@ -1026,7 +1024,31 @@ interface VerifyCycle {
   failed: boolean;
   forgiven: boolean;
   capacities: unknown[];
+  tipEnvironments: unknown[];
   evidenceByGate: Map<string, JournalEvent["data"]>;
+}
+
+type TipEnvironment = ReturnType<typeof environmentFingerprint>;
+
+// Queue row 24 (D-2134): refuse links before npm probes; an unreadable identity stays absent for the battery's infra row.
+function measureTipEnvironment(worktree: string, capacity: RunCapacity): TipEnvironment | undefined {
+  if (dependencyLinkRefusal(worktree)) return undefined;
+  try { return environmentFingerprint({ worktree, scope: "tip", capacity }); }
+  catch { return undefined; }
+}
+
+// Queue row 24 (D-2134): validate the parts too; a matching fingerprint alone cannot rescue a malformed stamp.
+function sameTipEnvironment(recorded: unknown, current: TipEnvironment | undefined): boolean {
+  if (!current || !recorded || typeof recorded !== "object" || Array.isArray(recorded)) return false;
+  const { fingerprint, parts } = recorded as Record<string, unknown>;
+  if (fingerprint !== current.fingerprint || !parts || typeof parts !== "object" || Array.isArray(parts)) return false;
+  const p = parts as Record<string, unknown>;
+  const verification = p.verification as Record<string, unknown> | undefined;
+  return p.nodeRuntime === current.parts.nodeRuntime && p.runner === current.parts.runner
+    && p.lockfile === current.parts.lockfile && p.selectedSet === undefined
+    && p.capacity !== undefined && sameCapacity(p.capacity, current.parts.capacity)
+    && !!verification && (verification.source === "explicit" || verification.source === "npm-config")
+    && sameVerification(verification, current.parts.verification);
 }
 
 /**
@@ -1050,7 +1072,7 @@ function lastVerifyCycle(events: JournalEvent[]): VerifyCycle | undefined {
     if (e.event === "tip-verify-start") {
       const { tip, cmdHash } = e.data;
       cur = typeof tip === "string" && typeof cmdHash === "string"
-        ? { tip, cmdHash, gates: new Set(), failed: false, forgiven: false, capacities: [e.data.capacity], evidenceByGate: new Map() }
+        ? { tip, cmdHash, gates: new Set(), failed: false, forgiven: false, capacities: [e.data.capacity], tipEnvironments: [e.data.tipEnvironment], evidenceByGate: new Map() }
         : undefined;
       afterRunEnd = false;
       continue;
@@ -1071,7 +1093,7 @@ function lastVerifyCycle(events: JournalEvent[]): VerifyCycle | undefined {
       continue;
     }
     if (!cur || afterRunEnd || cur.tip !== tip || cur.cmdHash !== cmdHash) {
-      cur = { tip, cmdHash, gates: new Set(), failed: false, forgiven: false, capacities: [], evidenceByGate: new Map() };
+      cur = { tip, cmdHash, gates: new Set(), failed: false, forgiven: false, capacities: [], tipEnvironments: [], evidenceByGate: new Map() };
     }
     afterRunEnd = false;
     // T7: EVERY verdict row's own capacity, not just the start row's. The start row is a statement of
@@ -1079,6 +1101,7 @@ function lastVerifyCycle(events: JournalEvent[]): VerifyCycle | undefined {
     // these rows, so a row whose capacity differs from the session's — or which is malformed — has to
     // be able to sink the cycle by itself.
     cur.capacities.push(e.data.capacity);
+    cur.tipEnvironments.push(e.data.tipEnvironment);
     if (e.event === "tip-verify-failed") cur.failed = true;
     else {
       cur.gates.add(gate);
@@ -1265,7 +1288,7 @@ export interface TipIdentity { repo: string; branch: string; expected?: string }
 export type IdentityLeg = IntegrationLeg | "setup" | "witness" | "checkout";
 type DeferredVerdict = NonNullable<TipVerifyResult["deferredVerdict"]>;
 /** One close under an identity: `expected` is what the closing check must find; `identityFailed` skips it. */
-export interface TipClose { failed: boolean; expected?: string; identityFailed: boolean; deferred: DeferredVerdict[] }
+export interface TipClose { failed: boolean; expected?: string; identityFailed: boolean; deferred: DeferredVerdict[]; tipEnvironment?: TipEnvironment }
 interface TipVerifyOptions { lastMergedTask?: string; baseline?: Baseline; signal?: AbortSignal; evidence?: GateEvidenceOptions }
 
 const short = (commit: string | undefined) => commit ? commit.slice(0, 12) : "none";
@@ -1349,15 +1372,15 @@ export function identityDetails(leg: IntegrationLeg, state: IntegrationRefState,
  */
 export function appendIdentityFailure(journal: Journal, f: {
   started: boolean; branch: string; expected?: string; leg: IdentityLeg; details: string;
-  state?: IntegrationRefState; cmdHash: string; capacity: RunCapacity; infra?: boolean;
+  state?: IntegrationRefState; cmdHash: string; capacity: RunCapacity; tipEnvironment?: TipEnvironment; infra?: boolean;
 }): void {
-  if (!f.started) journal.append("tip-verify-start", undefined, { tip: f.expected, cmdHash: f.cmdHash, capacity: f.capacity, gates: [], cached: false });
+  if (!f.started) journal.append("tip-verify-start", undefined, { tip: f.expected, cmdHash: f.cmdHash, capacity: f.capacity, tipEnvironment: f.tipEnvironment, gates: [], cached: false });
   const found = f.state?.kind === "regular" || f.state?.kind === "symbolic" ? f.state.commit : undefined;
   journal.append("tip-verify-failed", undefined, {
     gate: "integration", cmd: "", exitCode: 1, fingerprints: [], details: f.details, ...(f.infra ? { infra: true } : {}),
     integration: { branch: f.branch, expected: f.expected ?? null, found: found ?? null, leg: f.leg,
       ...(f.state?.kind === "symbolic" ? { target: f.state.target } : {}) },
-    tip: f.expected, cmdHash: f.cmdHash, capacity: f.capacity,
+    tip: f.expected, cmdHash: f.cmdHash, capacity: f.capacity, tipEnvironment: f.tipEnvironment,
   });
 }
 
@@ -1414,9 +1437,9 @@ async function checkoutChange(dir: string, expected: string, h0: string[]): Prom
 /**
  * OBS-34's strict tip verify, but it stops re-paying for an unmoved tip (~334m corpus-wide; 69.5m in
  * one park-heavy run whose 18 resume cycles merged nothing new). The verify journals the SHA it
- * verified and the hash of the command set, so a later run-end can recognize the same verified state:
- * the expected commit equals the LAST green verified SHA and the commands are unchanged → journal
- * `tip-verify-cached` and skip, with no checkout. ANY doubt — moved tip, changed commands, a gate
+ * verified and the hash of the command set, so a later run-end can recognize the same verified state.
+ * Queue row 24 (D-2134): the last green also binds every row's stamped runner and environment identity
+ * and capacity before `tip-verify-cached` can skip with no checkout. ANY doubt — moved tip, changed commands, a gate
  * missing from that cycle's green set, a failure recorded in it, a cycle older than the last one —
  * runs the full verify. 2.8.1 T1 (ANL-023 §7.1): with `identity` (the daemon always passes it) run end
  * verifies a fresh detached checkout of the expected commit under a validated HEAD reflog, never the
@@ -1443,16 +1466,12 @@ export async function verifyIntegrationTipCached(
   opts.signal?.throwIfAborted();
   const cmdHash = commandsHash(commands);
   const { identity } = opts;
-  // T7: the capacity this session's verify children WOULD run under — the third thing a carried
-  // green must match, beside the tip and the command set. A cached verdict is the one place a green
-  // crosses a session boundary with nothing re-run, and a session resumed at a different capacity
-  // divides the machine by a different number: that green was established in another world, so it is
-  // not carried forward and the commands run again. A pre-T7 cycle records no capacity and keeps
-  // exactly the behaviour it has today.
+  // Queue row 24 (D-2134): measure once against the repository whose installed packages the verifier receives.
   const capacity = resolvedCapacity();
-  const identityFailure = (f: Omit<Parameters<typeof appendIdentityFailure>[1], "branch" | "cmdHash" | "capacity">): TipClose => {
-    appendIdentityFailure(journal, { ...f, branch: identity!.branch, cmdHash, capacity });
-    return { failed: true, identityFailed: true, deferred: [] };
+  const tipEnvironment = measureTipEnvironment(identity?.repo ?? intWt, capacity);
+  const identityFailure = (f: Omit<Parameters<typeof appendIdentityFailure>[1], "branch" | "cmdHash" | "capacity" | "tipEnvironment">): TipClose => {
+    appendIdentityFailure(journal, { ...f, branch: identity!.branch, cmdHash, capacity, tipEnvironment });
+    return { failed: true, identityFailed: true, deferred: [], tipEnvironment };
   };
   let tip: string;
   let clean = true; // with `identity` the battery runs in a fresh checkout and K checks tracked content
@@ -1468,25 +1487,30 @@ export async function verifyIntegrationTipCached(
   const last = lastVerifyCycle(journal.read());
   const gates = Object.keys(commands).filter((g) => g !== "tipTest");
   if (!gates.includes("test") && commands.tipTest) gates.push("test");
+  // Queue row 24 (D-2134 R2/Q6/Q7): carry requires tip, commands, every gate and capacity AND the stamped runner
+  // and environment identity with a measured lifecycle on every row. An unstamped cycle re-verifies once.
+  // Package content drift under equal lockfile and links is the declared residual, as in per-gate reuse.
   const cached = last !== undefined && !last.failed && !last.forgiven && last.tip === tip && last.cmdHash === cmdHash
     && gates.every((g) => last.gates.has(g))
-    && last.capacities.every((recorded) => sameCapacity(recorded, capacity));
+    && last.capacities.every((recorded) => sameCapacity(recorded, capacity))
+    && last.tipEnvironments.every((recorded) => sameTipEnvironment(recorded, tipEnvironment))
+    && !dependencyLinkRefusal(identity?.repo ?? intWt);
   // A pair can be verified red and then green without either SHA or command hash changing (for
   // example, an external service or ignored fixture recovers). Delimit attempts explicitly so that
   // the earlier red cannot remain latched into the later complete green cycle.
-  journal.append("tip-verify-start", undefined, { tip, cmdHash, capacity, gates, cached: clean && cached });
+  journal.append("tip-verify-start", undefined, { tip, cmdHash, capacity, tipEnvironment, gates, cached: clean && cached });
   opts.signal?.throwIfAborted();
   if (clean && cached) {
-    journal.append("tip-verify-cached", undefined, { tip, cmdHash, capacity, gates });
+    journal.append("tip-verify-cached", undefined, { tip, cmdHash, capacity, tipEnvironment, gates });
     // The skip must not read as a red. Every surface derives the tip's verdict from this cycle's
     // `tip-verify` events (cockpit derive.ts tipVerificationPassed: a run-end claiming "passed" with
     // ZERO events is fail-closed to FALSE), so a carried-forward green still journals its per-gate
     // pass — `cached: true` keeps it honest about not having re-run the command.
     for (const gate of gates) {
       const cmd = gate === "test" && commands.tipTest ? commands.tipTest : commands[gate]!;
-      journal.append("tip-verify", undefined, { ...reusedTipEvidence(last.evidenceByGate.get(gate) ?? {}), gate, cmd, pass: true, exitCode: 0, cached: true, tip, cmdHash, capacity });
+      journal.append("tip-verify", undefined, { ...reusedTipEvidence(last.evidenceByGate.get(gate) ?? {}), gate, cmd, pass: true, exitCode: 0, cached: true, tip, cmdHash, capacity, tipEnvironment });
     }
-    return identity ? { failed: false, expected: tip, identityFailed: false, deferred: [] } : false;
+    return identity ? { failed: false, expected: tip, identityFailed: false, deferred: [], tipEnvironment } : false;
   }
   const battery = async (dir: string): Promise<{ tipFailed: boolean; deferred: DeferredVerdict[] }> => {
     let tipFailed = false;
@@ -1508,7 +1532,7 @@ export async function verifyIntegrationTipCached(
       };
       if (r.pass) {
         // Q121s: a forgiven pass journals its fingerprints — honest about what was carried, never a silent green.
-        journal.append("tip-verify", undefined, { ...evidence, gate: r.gate, cmd: r.cmd, pass: true, exitCode: r.exitCode, details: r.details, ...(r.reused ? { cached: true } : {}), ...(r.forgiven ? { forgiven: true, fingerprints: r.fingerprints, ...(r.baselineProvenance ? { baselineProvenance: r.baselineProvenance } : {}) } : {}), tip, cmdHash, capacity: measuredCapacity });
+        journal.append("tip-verify", undefined, { ...evidence, gate: r.gate, cmd: r.cmd, pass: true, exitCode: r.exitCode, details: r.details, ...(r.reused ? { cached: true } : {}), ...(r.forgiven ? { forgiven: true, fingerprints: r.fingerprints, ...(r.baselineProvenance ? { baselineProvenance: r.baselineProvenance } : {}) } : {}), tip, cmdHash, capacity: measuredCapacity, tipEnvironment });
       } else {
         journal.append("tip-verify-failed", undefined, {
           ...evidence,
@@ -1522,6 +1546,7 @@ export async function verifyIntegrationTipCached(
           tip,
           cmdHash,
           capacity: measuredCapacity,
+          tipEnvironment,
         });
         tipFailed = true;
       }
@@ -1536,7 +1561,7 @@ export async function verifyIntegrationTipCached(
     const { tipFailed, deferred } = await battery(opened.dir);
     const changed = await checkoutChange(opened.dir, tip, opened.h0);
     if (changed) return identityFailure({ started: true, expected: tip, leg: "checkout", details: `verification checkout changed during the battery: ${changed}` });
-    return { failed: tipFailed, expected: tip, identityFailed: false, deferred };
+    return { failed: tipFailed, expected: tip, identityFailed: false, deferred, tipEnvironment };
   } finally {
     if (checkout) await removeWorktree(identity.repo, checkout);
   }
@@ -3479,7 +3504,12 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     const worker = journal.read().reverse().find((e) => e.taskId === t.id && e.event === "worker-result");
     const disposition = classifyRepairDisposition({
       // OBS-1072 add.2: hints are lexed from the readable excerpt, never from terminal control bytes.
-      results: results.map((g) => ({ ...g, details: readableExcerpt(g.details) })), files: t.files, inventory: changed,
+      results: results.map((g) => ({ ...g, details: readableExcerpt(g.details),
+        // Queue row 235 (D-2134): oracle output has the same readable boundary as gate details.
+        ...(Array.isArray(g.meta?.oracles) ? { meta: { ...g.meta, oracles: g.meta.oracles.map((oracle) =>
+          oracle && typeof oracle === "object" && typeof oracle.output === "string"
+            ? { ...oracle, output: readableExcerpt(oracle.output) } : oracle) } } : {}),
+      })), files: t.files, inventory: changed,
       refusalSummary: worker?.data.ok === false && typeof worker.data.summary === "string" ? worker.data.summary : undefined,
     });
     for (const diagnostic of disposition.diagnostics) {
@@ -3970,8 +4000,8 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           ...(typeof g.meta.producerAttempt === "number" ? { producerAttempt: g.meta.producerAttempt } : {}),
         } : {}),
         ...((cfg.executionPolicy || repairSelection) && !g.pass ? { disposition: failureDisposition(g) } : {}),
-        ...Object.fromEntries(["runnerInfraRerun", "hostStarvedRerun", "recoveryBlocked", "failingFiles", "selectionDecision", "failureEvidence",
-          "forgivenFingerprints", "freshFingerprints", "baselineProvenance", "judgment", "adjudication", "judgeDisagreement", "interruptions"]
+        ...Object.fromEntries(["runnerInfraRerun", "judgeIndependent", "hostStarvedRerun", "recoveryBlocked", "failingFiles", "selectionDecision", "failureEvidence",
+          "forgivenFingerprints", "freshFingerprints", "baselineProvenance", "oracles", "judgment", "adjudication", "judgeDisagreement", "interruptions"]
           .filter((key) => g.meta?.[key] !== undefined).map((key) => [key, g.meta![key]])),
         // OBS-540: preserve terminal-vs-retryable infra exactly. normalizeGateOutcome deliberately
         // defaults a legacy infra row to retryable, so dropping an explicit false here reverses the
@@ -7462,8 +7492,10 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         // Exactly one proof per close: no cycle ran for THIS close, and an earlier one is not inherited.
         summary.tipProof = { kind: "incomplete" };
       } else {
-        appendIdentityFailure(journal, { started: false, branch, ...opened, cmdHash: commandsHash(commands), capacity: resolvedCapacity() });
-        tipClose = { failed: true, identityFailed: true, deferred: [] };
+        const capacity = resolvedCapacity();
+        const tipEnvironment = measureTipEnvironment(repoRoot, capacity);
+        appendIdentityFailure(journal, { started: false, branch, ...opened, cmdHash: commandsHash(commands), capacity, tipEnvironment });
+        tipClose = { failed: true, identityFailed: true, deferred: [], tipEnvironment };
         summary.tipVerify = "failed";
         summary.tipProof = runEndTipProof(journal.read());
       }
@@ -7498,8 +7530,10 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     if (!tipClose.identityFailed && tipClose.expected !== undefined) {
       const closing = await checkIntegrationIdentity(repoRoot, branch, tipClose.expected);
       if (!closing.ok) {
+        const capacity = resolvedCapacity();
+        const tipEnvironment = tipStarted ? tipClose.tipEnvironment : measureTipEnvironment(repoRoot, capacity);
         appendIdentityFailure(journal, { started: tipStarted, branch, expected: tipClose.expected, leg: closing.leg, state: closing.state,
-          details: identityDetails(closing.leg, closing.state, branch, runId, tipClose.expected), cmdHash: commandsHash(commands), capacity: resolvedCapacity() });
+          details: identityDetails(closing.leg, closing.state, branch, runId, tipClose.expected), cmdHash: commandsHash(commands), capacity, tipEnvironment });
         summary.tipVerify = "failed";
         summary.tipProof = runEndTipProof(journal.read());
       } else {

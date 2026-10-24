@@ -12,7 +12,15 @@ import { approve } from "../../../src/cli/commands/approve.js";
 import { extractPromptNonce } from "../../../src/gates/llm.js";
 import { runDaemon } from "../../../src/run/daemon.js";
 import { journaledFailureBrief, Journal } from "../../../src/run/journal.js";
-import { authedModels, COMMIT, setupRepo, T } from "../../helpers/tmprepo.js";
+import { authedModels, COMMIT, setupRepo as baseSetupRepo, T } from "../../helpers/tmprepo.js";
+
+// Queue row 34(a) (D-2134 R5): an independent judge below these fixtures' review floor.
+function setupRepo(...args: Parameters<typeof baseSetupRepo>) {
+  const fixture = baseSetupRepo(...args);
+  const config = join(fixture.repo, ".tickmarkr", "config.yaml");
+  writeFileSync(config, readFileSync(config, "utf8").replace("judge: { adapter: fake, model: fake-1 }", "judge: { adapter: fake, model: fake-2 }"));
+  return fixture;
+}
 
 // A review-only seat with its own adapter id and vendor. `prose` seats never emit a trailer.
 class ReviewSeat extends FakeAdapter {
@@ -43,7 +51,8 @@ test("Leg-2 (OBS-1052): a seat with no verdict on rounds 1 and 2 is absent from 
     { tasks: { T1: work("t1"), T2: work("t2"), T3: work("t3") } },
     "review: { required: true, prefer: [seat-a, seat-b] }\nrouting: { deny: { workers: { adapters: [seat-a, seat-b] } } }\n",
   );
-  fake.channels = () => [{ adapter: "fake", model: "fake-1", vendor: fake.vendor, channel: "sub", tier: "frontier" }];
+  fake.channels = () => [{ adapter: "fake", model: "fake-1", vendor: fake.vendor, channel: "sub", tier: "frontier" },
+    { adapter: "fake", model: "fake-2", vendor: "fake-b", channel: "api", tier: "cheap" }];
   const flaky = new ReviewSeat(scriptPath, "seat-a", "vendor-a", true);
   const steady = new ReviewSeat(scriptPath, "seat-b", "vendor-b");
   const runId = "run-leg2-two-strike";
@@ -70,7 +79,8 @@ test("test: the daemon keeps every approval reason out of the released attempt's
     ] } },
     "review: { required: true, prefer: [seat-a, seat-b, seat-c] }\nrouting: { deny: { workers: { adapters: [seat-a, seat-b, seat-c] } } }\n",
   );
-  fake.channels = () => [{ adapter: "fake", model: "fake-1", vendor: fake.vendor, channel: "sub", tier: "frontier" }];
+  fake.channels = () => [{ adapter: "fake", model: "fake-1", vendor: fake.vendor, channel: "sub", tier: "frontier" },
+    { adapter: "fake", model: "fake-2", vendor: "fake-b", channel: "api", tier: "cheap" }];
   const runId = "run-operator-review-context";
   const journal = () => Journal.open(repo, runId);
   const briefs: { seat: string; text: string; dispatches: number }[] = [];
@@ -173,7 +183,8 @@ test("test: production worker briefs retain A before B after an intervening laun
     ] } },
     `review: { required: true, prefer: [seat-a] }\nrouting: { deny: { workers: { adapters: [seat-a] } } }\ngates: { test: ${JSON.stringify(red)} }\n`,
   );
-  fake.channels = () => [{ adapter: "fake", model: "fake-1", vendor: fake.vendor, channel: "sub", tier: "frontier" }];
+  fake.channels = () => [{ adapter: "fake", model: "fake-1", vendor: fake.vendor, channel: "sub", tier: "frontier" },
+    { adapter: "fake", model: "fake-2", vendor: "fake-b", channel: "api", tier: "cheap" }];
   const workerBriefs: string[] = [];
   const invoke = fake.invoke.bind(fake);
   fake.invoke = (task, cwd, a, ctx) => {
@@ -238,7 +249,8 @@ test("test: the production daemon repair brief at the second reraise requires a 
     { tasks: { T1: [1, 2, 3, 4].map(attempt) } },
     "review: { required: true, prefer: [seat-a] }\nrouting: { deny: { workers: { adapters: [seat-a] } } }\n",
   );
-  fake.channels = () => [{ adapter: "fake", model: "fake-1", vendor: fake.vendor, channel: "sub", tier: "frontier" }];
+  fake.channels = () => [{ adapter: "fake", model: "fake-1", vendor: fake.vendor, channel: "sub", tier: "frontier" },
+    { adapter: "fake", model: "fake-2", vendor: "fake-b", channel: "api", tier: "cheap" }];
   const workerBriefs: string[] = [];
   const invoke = fake.invoke.bind(fake);
   fake.invoke = (task, cwd, a, ctx) => {

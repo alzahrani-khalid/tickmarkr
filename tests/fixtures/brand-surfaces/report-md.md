@@ -1,4 +1,4 @@
-- finished 1/1 done · tip verify cached · end-to-end first pass 1/1
+- finished 1/1 done · tip verify mixed · end-to-end first pass 1/1
 - time 1m 30s wall, each instant once: residual 1m 30s
 - needs you: outstanding 0 · 0 parked · 0 failed
 

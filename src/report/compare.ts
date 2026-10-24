@@ -5,47 +5,63 @@
 // as apples-to-apples when their recorded environments disagree.
 import type { RunEnvironment } from "../run/environment.js";
 import type { JournalEvent, TelemetryRow } from "../run/journal.js";
+import { normalizeGateOutcome } from "../run/outcome.js";
 import { estimateCosts, type CostConfig } from "./cost.js";
 
 // Shape twin of EngagementCompare in journal.ts — one notion of "comparable", not a second.
 export type EnvironmentCompare =
   | { comparable: true; recorded: string }
-  | { comparable: false; reason: "mismatch"; recorded: string }
+  | { comparable: false; reason: "mismatch"; recorded: string; mixedSessions?: true }
   | { comparable: false; reason: "unbound" };
 
 export function hasRunStart(events: JournalEvent[]): boolean {
   return events.some((e) => e.event === "run-start");
 }
 
-// First run-start's environment, fail-closed on a missing or malformed stamp.
-export function recordedEnvironment(events: JournalEvent[]): RunEnvironment | undefined {
-  for (const e of events) {
-    if (e.event !== "run-start") continue;
-    const env = e.data.environment;
-    if (!env || typeof env !== "object" || Array.isArray(env)) return undefined;
-    const o = env as Record<string, unknown>;
-    if (typeof o.tickmarkrVersion !== "string" || typeof o.configHash !== "string") return undefined;
-    if (!o.adapterVersions || typeof o.adapterVersions !== "object" || Array.isArray(o.adapterVersions)) return undefined;
-    const adapterVersions: Record<string, string> = {};
-    for (const [k, v] of Object.entries(o.adapterVersions as Record<string, unknown>)) {
-      if (typeof v !== "string") return undefined;
-      adapterVersions[k] = v;
-    }
-    // Capacity arrived in v2.0 as a pair. Two absent fields are an honest older record; one without
-    // the other is a malformed new record and fails closed instead of being compared as legacy.
-    const hasCores = Object.hasOwn(o, "cores");
-    const hasForkCap = Object.hasOwn(o, "forkCap");
-    if (hasCores !== hasForkCap) return undefined;
-    if (hasCores && (typeof o.cores !== "number" || !Number.isFinite(o.cores) || o.cores <= 0
-      || typeof o.forkCap !== "number" || !Number.isFinite(o.forkCap) || o.forkCap <= 0)) return undefined;
-    return {
-      tickmarkrVersion: o.tickmarkrVersion,
-      configHash: o.configHash,
-      adapterVersions,
-      ...(hasCores ? { cores: o.cores as number, forkCap: o.forkCap as number } : {}),
-    };
+// Queue 35 (D-2134 R6): validate each session's stamp before folding the run's identity.
+function parseEnvironment(env: unknown): RunEnvironment | undefined {
+  if (!env || typeof env !== "object" || Array.isArray(env)) return undefined;
+  const o = env as Record<string, unknown>;
+  if (typeof o.tickmarkrVersion !== "string" || !o.tickmarkrVersion.trim()
+    || typeof o.configHash !== "string" || !o.configHash.trim()) return undefined;
+  if (!o.adapterVersions || typeof o.adapterVersions !== "object" || Array.isArray(o.adapterVersions)) return undefined;
+  const adapterVersions: Record<string, string> = {};
+  for (const [k, v] of Object.entries(o.adapterVersions as Record<string, unknown>)) {
+    if (typeof v !== "string") return undefined;
+    adapterVersions[k] = v;
   }
-  return undefined;
+  // Capacity arrived in v2.0 as a pair. Two absent fields are an honest older record; one without
+  // the other is a malformed new record and fails closed instead of being compared as legacy.
+  const hasCores = Object.hasOwn(o, "cores");
+  const hasForkCap = Object.hasOwn(o, "forkCap");
+  if (hasCores !== hasForkCap) return undefined;
+  if (hasCores && (typeof o.cores !== "number" || !Number.isFinite(o.cores) || o.cores <= 0
+    || typeof o.forkCap !== "number" || !Number.isFinite(o.forkCap) || o.forkCap <= 0)) return undefined;
+  return {
+    tickmarkrVersion: o.tickmarkrVersion,
+    configHash: o.configHash,
+    adapterVersions,
+    ...(hasCores ? { cores: o.cores as number, forkCap: o.forkCap as number } : {}),
+  };
+}
+
+export interface SessionEnvironment {
+  event: "run-start" | "run-resume";
+  ts: string;
+  environment?: RunEnvironment;
+}
+
+export function recordedEnvironments(events: JournalEvent[]): SessionEnvironment[] {
+  return events.flatMap((e) => e.event === "run-start" || e.event === "run-resume"
+    ? [{ event: e.event, ts: e.ts, environment: parseEnvironment(e.data.environment) }]
+    : []);
+}
+
+export function recordedEnvironment(events: JournalEvent[]): RunEnvironment | undefined {
+  const sessions = recordedEnvironments(events);
+  const first = sessions[0]?.environment;
+  return first && sessions.every(({ environment }) => environment && envEqual(first, environment))
+    ? first : undefined;
 }
 
 // Canonical identity string for the `recorded` field — configHash is the axis the acceptance
@@ -86,6 +102,7 @@ export interface RunMetrics {
   gateFail: number;
   gateTotal: number;
   costUsd: number | undefined;
+  costPartial: boolean;
   tokensTotal: number | undefined;
 }
 
@@ -99,13 +116,15 @@ export function runMetrics(events: JournalEvent[], rows: TelemetryRow[] = [], co
     if (Number.isFinite(from) && Number.isFinite(to) && to >= from) durationMs = to - from;
   }
   const gates = events.filter((e) => e.event === "gate-result");
-  const gatePass = gates.filter((e) => e.data.pass === true).length;
-  const gateFail = gates.filter((e) => e.data.pass === false).length;
+  const gatePass = gates.filter((e) => normalizeGateOutcome(e.data).kind === "passed").length;
+  const gateFail = gates.filter((e) => normalizeGateOutcome(e.data).kind === "failed").length;
 
   let costUsd: number | undefined;
   let costSum = 0;
   let hasCost = false;
-  for (const p of estimateCosts(rows, cost)) {
+  const prices = estimateCosts(rows, cost);
+  const costPartial = prices.some((p) => p.partialMetering);
+  for (const p of prices) {
     if (p.apiUsd !== undefined) {
       costSum += p.apiUsd;
       hasCost = true;
@@ -127,13 +146,14 @@ export function runMetrics(events: JournalEvent[], rows: TelemetryRow[] = [], co
   }
   if (hasTokens) tokensTotal = tokenSum;
 
-  return { durationMs, gatePass, gateFail, gateTotal: gates.length, costUsd, tokensTotal };
+  return { durationMs, gatePass, gateFail, gateTotal: gates.length, costUsd, costPartial, tokensTotal };
 }
 
 export interface RunDelta {
   durationMs: number | undefined;
   gateFail: number;
   costUsd: number | undefined;
+  costPartial: boolean;
   tokensTotal: number | undefined;
 }
 
@@ -201,6 +221,9 @@ function comparabilityLine(
   if (cmp.reason === "unbound") {
     return "comparability caveat — one or both runs lack a recorded environment identity; not apples-to-apples";
   }
+  if (cmp.mixedSessions) {
+    return "comparability caveat — environment identity disagrees across mixed sessions; not apples-to-apples";
+  }
   const base = baselineEnv?.configHash ?? EM;
   const cur = currentEnv?.configHash ?? EM;
   return `comparability caveat — environment identity disagrees (baseline configHash=${base} ≠ current configHash=${cur}; recorded baseline ${cmp.recorded}); not apples-to-apples`;
@@ -232,7 +255,7 @@ export function renderComparison(opts: {
     `| duration | ${fmtDuration(baseline.durationMs)} | ${fmtDuration(current.durationMs)} | ${fmtSignedDuration(delta.durationMs)} |`,
     `| gate failures | ${fmtInt(baseline.gateFail)} | ${fmtInt(current.gateFail)} | ${fmtSignedInt(delta.gateFail)} |`,
     `| gate pass rate | ${baseline.gateTotal ? `${baseline.gatePass}/${baseline.gateTotal}` : EM} | ${current.gateTotal ? `${current.gatePass}/${current.gateTotal}` : EM} | ${EM} |`,
-    `| cost | ${fmtUsd(baseline.costUsd)} | ${fmtUsd(current.costUsd)} | ${fmtSignedUsd(delta.costUsd)} |`,
+    `| cost | ${fmtUsd(baseline.costUsd)}${baseline.costPartial ? " (partial)" : ""} | ${fmtUsd(current.costUsd)}${current.costPartial ? " (partial)" : ""} | ${fmtSignedUsd(delta.costUsd)}${delta.costPartial ? " (partial)" : ""} |`,
     `| tokens | ${fmtInt(baseline.tokensTotal)} | ${fmtInt(current.tokensTotal)} | ${fmtSignedInt(delta.tokensTotal)} |`,
     "",
   ];
@@ -271,12 +294,18 @@ export function compareRuns(opts: {
 
   const baselineEnv = recordedEnvironment(opts.baselineEvents);
   const currentEnv = recordedEnvironment(opts.events);
-  const comparability = environmentComparable(baselineEnv, currentEnv);
+  const sessions = [...recordedEnvironments(opts.baselineEvents), ...recordedEnvironments(opts.events)];
+  const comparability: EnvironmentCompare = sessions.some((s) => !s.environment)
+    ? { comparable: false, reason: "unbound" }
+    : !baselineEnv || !currentEnv
+      ? { comparable: false, reason: "mismatch", recorded: baselineEnv?.configHash ?? "mixed sessions", mixedSessions: true }
+      : environmentComparable(baselineEnv, currentEnv);
 
   const baseline = runMetrics(opts.baselineEvents, opts.baselineRows ?? [], opts.cost ?? {});
   const current = runMetrics(opts.events, opts.rows ?? [], opts.cost ?? {});
 
   const delta: RunDelta = {
+    costPartial: current.costPartial || baseline.costPartial,
     durationMs:
       current.durationMs !== undefined && baseline.durationMs !== undefined
         ? current.durationMs - baseline.durationMs

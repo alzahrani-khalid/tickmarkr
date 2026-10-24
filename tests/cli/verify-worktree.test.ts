@@ -660,7 +660,7 @@ test("verify record after run-end discharges a matching integration-range review
   g(`worktree add -q --detach ${linked} ${merge}`);
   expect(foldOwedChecks(reopened().read(), linked)).toMatchObject({ known: true, debt: 0, discharged: [obligation.id] });
 
-  const artifactPath = String(discharge.data.artifactPath);
+  const artifactPath = join(journal.dir, String(discharge.data.artifactPath));
   const artifactBytes = readFileSync(artifactPath);
   const path = join(journal.dir, "journal.jsonl");
   const original = readFileSync(path, "utf8");

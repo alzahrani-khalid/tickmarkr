@@ -9,7 +9,7 @@ export type RepairDispositionKind = "fund-repair" | "scope-request" | "authoring
 
 export interface RepairDisposition {
   kind: RepairDispositionKind;
-  /** validated inventory paths only — the sole paths a caller may put in an executable command */
+  /** Queue row 235 (D-2134): validated inventory paths or explicitly declared oracle landings. */
   paths: string[];
   reason: string;
   /** which evidence decided: a gate name, "worker" for a refusal, absent for the ordinary disposition */
@@ -90,13 +90,41 @@ export function classifyRepairDisposition(input: RepairDispositionInput): Repair
     return { paths: r.resolved.filter((path) => !allowed(path)), diagnostics: r.diagnostics };
   };
   const owned = (text: string) => resolveScopeHints(namedPaths(text), inventory).resolved.some(allowed);
+  // Queue row 235 (D-2134): acceptance prose quotes declarations; only execution and typed evidence
+  // attribute a repair. A misplaced declared landing is authoritative even when it was never written.
+  const acceptanceEvidence = (g: GateResult): { paths: string[]; landings: string[] } => {
+    if (Array.isArray(g.meta?.oracles)) {
+      const paths: string[] = [];
+      const landings: string[] = [];
+      for (const oracle of g.meta.oracles) {
+        if (!oracle || typeof oracle !== "object") continue;
+        if (typeof oracle.output === "string") paths.push(...namedPaths(oracle.output));
+        if (["absent", "elsewhere", "untitled"].includes(oracle.failure) && typeof oracle.landing === "string" && !allowed(oracle.landing)) {
+          landings.push(oracle.landing);
+        }
+      }
+      return { paths, landings };
+    }
+    const judgment = g.meta?.judgment;
+    const criteria = Array.isArray(judgment) ? judgment
+      : judgment && typeof judgment === "object" && "criteria" in judgment ? judgment.criteria : undefined;
+    const paths = Array.isArray(criteria) ? criteria.flatMap((row) =>
+      row?.met === false && Array.isArray(row.paths) ? row.paths.filter((path: unknown) => typeof path === "string") : []) : [];
+    return { paths, landings: [] };
+  };
 
   const refusal = input.refusalSummary !== undefined && REFUSAL_RE.test(input.refusalSummary)
     ? unowned(input.refusalSummary) : { paths: [], diagnostics: [] };
   // A test gate names where the ASSERTION lives — a detection site, not the code that needs fixing.
   const sites = reds.filter((g) => g.gate === "test").map((g) => unowned(g.details));
   const others = reds.filter((g) => g.gate !== "test");
-  const hints = others.map((g) => unowned(g.details));
+  const evidence = others.map((g) => g.gate === "acceptance" ? acceptanceEvidence(g) : undefined);
+  const hints = others.map((g, i) => {
+    const e = evidence[i];
+    if (!e) return unowned(g.details);
+    const r = resolveScopeHints(e.paths.filter((path) => !allowed(path)), inventory);
+    return { paths: [...e.landings, ...r.resolved.filter((path) => !allowed(path))], diagnostics: r.diagnostics };
+  });
   const diagnostics = [refusal, ...sites, ...hints].flatMap((r) => r.diagnostics)
     .filter((d, i, all) => all.findIndex((o) => o.candidate === d.candidate) === i);
   const uniq = (rs: { paths: string[] }[]) => [...new Set(rs.flatMap((r) => r.paths))].sort();
@@ -106,7 +134,8 @@ export function classifyRepairDisposition(input: RepairDispositionInput): Repair
       reason: `worker refusal names unowned paths: ${refusal.paths.join(", ")}` };
   }
   const repair = uniq(hints);
-  if (repair.length && !others.some((g) => owned(g.details))) {
+  if (repair.length && !others.some((g, i) => evidence[i]
+    ? resolveScopeHints(evidence[i]!.paths, inventory).resolved.some(allowed) : owned(g.details))) {
     const review = others.some((g) => g.gate === "review");
     return { kind: review ? "scope-request" : "authoring", paths: repair, source: others[0]!.gate, diagnostics,
       reason: `files[] repair hint: ${repair.join(", ")}` };

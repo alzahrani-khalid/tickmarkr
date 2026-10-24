@@ -1081,10 +1081,11 @@ test("test: a historical cached result without a receipt reuses as absent eviden
   expect(hit!.evidenceReceipts).toBeUndefined();
   expect(hit!.originRunRoot).toBeUndefined();
 
-  // Seed an actual pre-receipt cycle; both repeated cycle reuse and persisted reuse are covered.
+  // Queue row 24 (D-2134 Q6): stamp the pre-receipt cycle so this still isolates absent evidence on reuse.
   const tip = await gitHead(repo);
   const cmdHash = commandsHash(commands);
-  journal.append("tip-verify", undefined, { gate: "build", cmd: commands.build, pass: true, exitCode: 0, tip, cmdHash });
+  const tipEnvironment = environmentFingerprint({ worktree: repo, scope: "tip", capacity: resolvedCapacity() });
+  journal.append("tip-verify", undefined, { gate: "build", cmd: commands.build, pass: true, exitCode: 0, tip, cmdHash, tipEnvironment });
   expect(cacheEvidenceBytes(store.dir)).toEqual(beforeStore);
   store.clear(); // Only the historical cycle can answer now; executing would create calls.log.
   for (let cycle = 0; cycle < 2; cycle++) {

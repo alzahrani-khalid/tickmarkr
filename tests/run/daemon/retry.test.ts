@@ -377,7 +377,13 @@ describe("v1.23 session hygiene on retry (fake adapter, zero tokens)", () => {
     // cursor models are both `sub` so channel-level nextChannel prefers composer-2.5 over fake (`api`)
     // — that is the OBS-20 failure mode the exclusion must prevent.
     const cursor = new NamedFake(scriptPath, "cursor-agent", ["composer", "composer-2.5"], "cursor", "sub");
-    const fake = new NamedFake(fakeScript, "fake", ["fake-1"], "fake-a", "api");
+    const fake = new NamedFake(fakeScript, "fake", ["fake-1", "fake-2"], "fake-a", "api");
+    fake.channels = () => [
+      { adapter: "fake", vendor: "fake-a", model: "fake-1", channel: "api", tier: "frontier" },
+      { adapter: "fake", vendor: "judge-vendor", model: "fake-2", channel: "api", tier: "cheap" },
+    ];
+    const config = join(tickmarkrDir(repo), "config.yaml");
+    writeFileSync(config, readFileSync(config, "utf8").replace("judge: { adapter: fake, model: fake-1 }", "judge: { adapter: fake, model: fake-2 }"));
     const s = await runDaemon(repo, { adapters: [cursor, fake], runId: "run-obs20-excl" });
     expect(s.done).toEqual(["T1"]);
 
@@ -430,7 +436,13 @@ describe("v1.23 session hygiene on retry (fake adapter, zero tokens)", () => {
     }));
 
     const cursor = new NamedFake(scriptPath, "cursor-agent", ["composer", "composer-2.5"], "cursor", "sub");
-    const fake = new NamedFake(fakeScript, "fake", ["fake-1"], "fake-a", "api");
+    const fake = new NamedFake(fakeScript, "fake", ["fake-1", "fake-2"], "fake-a", "api");
+    fake.channels = () => [
+      { adapter: "fake", vendor: "fake-a", model: "fake-1", channel: "api", tier: "frontier" },
+      { adapter: "fake", vendor: "judge-vendor", model: "fake-2", channel: "api", tier: "cheap" },
+    ];
+    const config = join(tickmarkrDir(repo), "config.yaml");
+    writeFileSync(config, readFileSync(config, "utf8").replace("judge: { adapter: fake, model: fake-1 }", "judge: { adapter: fake, model: fake-2 }"));
     const s = await runDaemon(repo, { adapters: [cursor, fake], runId: "run-excl-scope", concurrency: 1 });
     expect(s.done).toEqual(["T1", "T2"]);
 

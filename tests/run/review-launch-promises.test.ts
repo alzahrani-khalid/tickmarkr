@@ -25,7 +25,15 @@ import { Journal, type JournalEvent } from "../../src/run/journal.js";
 import { normalizeGateOutcome } from "../../src/run/outcome.js";
 import type { ShResult } from "../../src/run/git.js";
 import { FakeOrca, pacedReadExec, steppedTime, withheldProofExec } from "../helpers/fake-orca.js";
-import { authedModels, COMMIT, makeRepo, setupRepo, T } from "../helpers/tmprepo.js";
+import { authedModels, COMMIT, makeRepo, setupRepo as baseSetupRepo, T } from "../helpers/tmprepo.js";
+
+// Queue row 34(a) (D-2134 R5): an independent judge below these fixtures' review floor.
+function setupRepo(...args: Parameters<typeof baseSetupRepo>) {
+  const fixture = baseSetupRepo(...args);
+  const config = join(fixture.repo, ".tickmarkr", "config.yaml");
+  writeFileSync(config, readFileSync(config, "utf8").replace("judge: { adapter: fake, model: fake-1 }", "judge: { adapter: fake, model: fake-2 }"));
+  return fixture;
+}
 
 const PANE = "visibility:\n  llm: pane\n  keepPanes: run\n";
 const reviewCfg = (seats: string[]) => `${PANE}review: { required: true, prefer: [${seats.join(", ")}], timeoutMs: 5000 }\n`;
@@ -79,7 +87,7 @@ class Seat extends FakeAdapter {
   }
 }
 class Author extends FakeAdapter {
-  override channels(): BillingChannel[] { return super.channels().slice(0, 1); }
+  override channels(): BillingChannel[] { return [super.channels()[0]!, { ...super.channels()[1]!, tier: "cheap" }]; }
 }
 
 /** A real SubprocessDriver observing every review-seat launch in order (`launches`, failed ones included).
@@ -827,7 +835,7 @@ describe("review-seat launch never retires a seat (production, zero tokens)", { 
       const demotedReviewers = new Set<string>();
       const events: [string, GateEvent][] = [];
       const baseline = await captureBaseline(repo, {});
-      const cfg = { ...DEFAULT_CONFIG, judge: { ...DEFAULT_CONFIG.judge, adapter: "fake", model: "fake-1" },
+      const cfg = { ...DEFAULT_CONFIG, judge: { ...DEFAULT_CONFIG.judge, adapter: "fake", model: "fake-2" },
         review: { ...DEFAULT_CONFIG.review, required: true, prefer: ["seat-a", "seat-b"], timeoutMs: 5000 } };
       let t2: Awaited<ReturnType<typeof runGates>> | undefined;
       const round = (id: string) => runGates(validateGraph({ version: 1, spec: { source: "prd", paths: ["p"], hash: "h" },

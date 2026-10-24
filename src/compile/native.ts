@@ -290,6 +290,13 @@ function testsAtHead(root: string): HeadTest[] {
   const cached = headTestCache.get(root);
   if (cached) return cached;
   const grep = gitSync(root, ["grep", "-I", "-n", "-e", "", "HEAD", "--", "tests/*.test.ts", "tests/**/*.test.ts"]);
+  if (grep.error || grep.signal || grep.status === null) {
+    const reason = grep.error?.message ?? (grep.signal ? `signal ${grep.signal}` : "no exit status");
+    throw new CompileError(
+      `cannot complete the test corpus read (git grep HEAD tests) in ${root}: ${reason} — `
+      + `restore the corpus read and recompile (queue row 27, D-2134).`,
+    );
+  }
   if (grep.status !== 0 || typeof grep.stdout !== "string") {
     headTestCache.set(root, []);
     return [];
@@ -414,8 +421,8 @@ function criterionScopeFinding(
 // OBS-898: the fence lint's corpus is listed ONCE per compile by git (tracked plus untracked-not-ignored,
 // the same set a checkout walk sees minus the ignored trees) and filtered per task. The walk it replaces
 // descended every dot-directory (.tickmarkr/runs alone held 3 799 files here) once PER TASK, so a
-// 20-task spec compiled in seconds and the committed-spec corpus test timed out. Fail-open like
-// testsAtHead: no git answer means no corpus, and the lint stays quiet rather than wrong.
+// 20-task spec compiled in seconds and the committed-spec corpus test timed out.
+// Queue row 27 (D-2134): this advisory listing keeps its empty answer on git failure.
 function repoFileList(root: string): string[] {
   const ls = gitSync(root, ["ls-files", "-z", "--cached", "--others", "--exclude-standard"]);
   if (ls.status !== 0 || typeof ls.stdout !== "string") return [];

@@ -96,10 +96,20 @@ function rawCitationsWellFormed(raw: Record<string, unknown>): boolean {
 
 // v1.19 (T2): deterministic oracles run mechanically, fail-closed, BEFORE any LLM judge dispatch.
 // A judge verdict can NEVER override a failed command/test — the judge simply does not run if one failed
-// (the gate returns on the first deterministic failure, below the only runLlm call). Plain-string
+// (queue row 234(b), D-2134: the gate collects deterministic failures before the only runLlm call). Plain-string
 // acceptance items are the read-old/write-new compat form of a judge oracle (schema.ts §2).
 type CommandOracle = Extract<AcceptanceItem, { oracle: "command" }>;
 type TestOracle = Extract<AcceptanceItem, { oracle: "test" }>;
+// Queue rows 234(b)/235 (D-2134): execution evidence stays separate from the declared criterion.
+export interface OracleFailure {
+  index: number;
+  kind: "command" | "test";
+  criterion: string;
+  landing?: string;
+  failure: "absent" | "elsewhere" | "untitled" | "red" | "unverified" | "no-runner";
+  output: string;
+}
+interface OracleRun { result: GateResult; failure?: OracleFailure["failure"]; output: string }
 const isCommand = (a: AcceptanceItem): a is CommandOracle => typeof a === "object" && a.oracle === "command";
 const isTest = (a: AcceptanceItem): a is TestOracle => typeof a === "object" && a.oracle === "test";
 const isJudge = (a: AcceptanceItem) => typeof a === "string" || (typeof a === "object" && a.oracle === "judge");
@@ -308,7 +318,7 @@ function tail(out: string, n = 8): string {
  * prose says. As in baseline classification, a named regression remains a verdict even if teardown
  * later exits through a signal.
  */
-function oracleExecutionFailure(label: string, code: number, stdout: string, stderr: string): GateResult {
+function oracleExecutionFailure(label: string, code: number, stdout: string, stderr: string): OracleRun {
   const output = [stderr, stdout].filter((part) => part.length > 0).join("\n");
   const classification = classifyFailureOutput(output);
   const signalName = code === 143 ? "SIGTERM" : code === 137 ? "SIGKILL" : undefined;
@@ -319,28 +329,28 @@ function oracleExecutionFailure(label: string, code: number, stdout: string, std
   const zeroRun = testsRan(output) === 0 && classification !== "regression";
   const zeroRunEvidence = zeroRun ? "the runner reported zero tests run and no failure identity; " : "";
   if (classification === "infra" || signalKilled || zeroRun) {
-    return {
+    return { failure: "unverified", output, result: {
       gate: "acceptance",
       pass: false,
       details: `oracle failed: ${label} (exit ${code}) — ${signalEvidence || zeroRunEvidence}infrastructure blocked execution before a verdict; this oracle verified nothing${tail(output)}`,
       meta: { cause: "oracle-execution", classification: "infra", infra: true, retryable: false },
-    };
+    } };
   }
-  return {
+  return { failure: "red", output, result: {
     gate: "acceptance",
     pass: false,
     details: `oracle failed: ${label} (exit ${code})${tail(stderr || stdout)}`,
-  };
+  } };
 }
 
 // today's rule for a test oracle's run: exit 0 AND a positive printed run count (OBS-55: a zero-match run is vacuous).
-function countedTestRun(label: string, filter: string, r: { code: number; stdout: string; stderr: string }): GateResult | undefined {
+function countedTestRun(label: string, filter: string, r: { code: number; stdout: string; stderr: string }): OracleRun | undefined {
   if (r.code !== 0) return oracleExecutionFailure(label, r.code, r.stdout, r.stderr);
   const out = (r.stderr || "") + "\n" + (r.stdout || "");
   const ran = testsRan(out);
   if (ran === null || ran < 1) {
-    return { gate: "acceptance", pass: false,
-      details: `oracle failed: ${label} — name filter matched zero tests (filter: ${filter})${tail(out)}` };
+    return { failure: "untitled", output: out, result: { gate: "acceptance", pass: false,
+      details: `oracle failed: ${label} — name filter matched zero tests (filter: ${filter})${tail(out)}` } };
   }
   return undefined;
 }
@@ -359,19 +369,20 @@ function countedTestRun(label: string, filter: string, r: { code: number; stdout
  * Other runner: L as its file argument before the title filter, today's run-count rule. Declared residual: such a
  *    runner gives no per-file evidence, so a test of the title in a path containing L can still satisfy it there.
  */
-async function landedTestOracle(testCmd: string, title: string, landing: string, worktree: string): Promise<GateResult> {
+async function landedTestOracle(testCmd: string, title: string, landing: string, worktree: string): Promise<OracleRun> {
   const label = `test "${title}" in ${landing}`;
-  const passed: GateResult = { gate: "acceptance", pass: true, details: `✓ test: ${title} (exit 0) in ${landing}` };
-  const work = (why: string): GateResult => ({ gate: "acceptance", pass: false, details: `oracle failed: ${label} — ${why}` });
-  const unverified = (why: string): GateResult => ({ gate: "acceptance", pass: false,
+  const passed: OracleRun = { output: "", result: { gate: "acceptance", pass: true, details: `✓ test: ${title} (exit 0) in ${landing}` } };
+  const work = (failure: OracleFailure["failure"], why: string, output = ""): OracleRun =>
+    ({ failure, output, result: { gate: "acceptance", pass: false, details: `oracle failed: ${label} — ${why}` } });
+  const unverified = (why: string, output = ""): OracleRun => ({ failure: "unverified", output, result: { gate: "acceptance", pass: false,
     details: `oracle failed: ${label} — ${why}; unverified, failing closed`,
-    meta: { cause: "oracle-execution", classification: "infra", infra: true, retryable: false } });
+    meta: { cause: "oracle-execution", classification: "infra", infra: true, retryable: false } } });
   const path = resolve(worktree, landing);
   const within = relative(worktree, path);
   let regular = false;
   try { regular = !within.startsWith("..") && !isAbsolute(within) && lstatSync(path).isFile(); }
   catch { /* absent */ }
-  if (!regular) return work(`suite file ${landing} is absent from the worktree or is not a regular file; the test command never started`);
+  if (!regular) return work("absent", `suite file ${landing} is absent from the worktree or is not a regular file; the test command never started`);
   if (!isVitestTestCommand(testCmd, worktree)) {
     return countedTestRun(label, title, await sh(fileFiltered(npmForwarded(testCmd), landing, title), worktree)) ?? passed;
   }
@@ -391,14 +402,15 @@ async function landedTestOracle(testCmd: string, title: string, landing: string,
       { env: { ...manifestChildEnv(worktree), TICKMARKR_TEST_REPORT: reportPath, TICKMARKR_TEST_NONCE: nonce } });
     const raw = readTestReport(reportPath);
     const report = raw?.nonce === nonce ? raw : undefined;
+    const output = [r.stderr, r.stdout].filter(Boolean).join("\n");
     if (r.code !== 0) {
       // the reporter replaces the runner's own output: its failure identities are the evidence of a red.
       const named = report ? [...Object.values(report.completed).flatMap((c) => c.failures ?? []), ...(report.certificate?.diagnostics ?? [])] : [];
       return oracleExecutionFailure(label, r.code, r.stdout, [r.stderr, ...named].filter(Boolean).join("\n"));
     }
-    if (!raw) return unverified("the runner exited 0 but wrote no per-file report");
-    if (!report) return unverified(`the per-file report carries nonce "${raw.nonce}", not this invocation's`);
-    if (report.certificate?.exitCode !== 0) return unverified("the per-file report never reached its run-end certificate with exit 0");
+    if (!raw) return unverified("the runner exited 0 but wrote no per-file report", output);
+    if (!report) return unverified(`the per-file report carries nonce "${raw.nonce}", not this invocation's`, output);
+    if (report.certificate?.exitCode !== 0) return unverified("the per-file report never reached its run-end certificate with exit 0", output);
     const key = toManifestPath(within, worktree);
     // a module completed more than once (one path in several projects) keeps only its LAST counters, so its record
     // cannot show that no earlier completion ran a body: it counts as run.
@@ -407,8 +419,8 @@ async function landedTestOracle(testCmd: string, title: string, landing: string,
       const t = report.completed[file]?.tests;
       return file !== key && (repeated.has(file) || !t || t.passed + t.failed > 0);
     }).sort();
-    if (elsewhere.length) return work(`the runner's per-file report shows a test body run outside ${landing}, in ${elsewhere.join(", ")} — only ${landing} can satisfy this criterion`);
-    if (!((report.completed[key]?.tests?.passed ?? 0) > 0)) return work(`the runner's per-file report shows no passing test of that title in ${landing}`);
+    if (elsewhere.length) return work("elsewhere", `the runner's per-file report shows a test body run outside ${landing}, in ${elsewhere.join(", ")} — only ${landing} can satisfy this criterion`, output);
+    if (!((report.completed[key]?.tests?.passed ?? 0) > 0)) return work("untitled", `the runner's per-file report shows no passing test of that title in ${landing}`, output);
     return passed;
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -522,36 +534,48 @@ export async function acceptanceGate(
   via?: LlmVia,
   opts: AcceptanceGateOpts = {},
 ): Promise<GateResult> {
-  // 1. deterministic oracles — exit code decides, fail-closed, zero LLM calls (spec §2, T2).
-  //    A failure returns here, before any runLlm() call: a judge can never override it.
+  // Queue row 234(b) (D-2134): measure every deterministic oracle in declaration order before judging.
   const passedDet: string[] = [];
-  for (const a of task.acceptance) {
+  const failures: Array<{ run: OracleRun; oracle: OracleFailure }> = [];
+  const record = (index: number, a: CommandOracle | TestOracle, run: OracleRun) => {
+    if (run.result.pass) passedDet.push(run.result.details);
+    else failures.push({ run, oracle: {
+      index, kind: a.oracle, criterion: isCommand(a) ? a.command : a.test,
+      ...(isTest(a) && a.landing !== undefined ? { landing: a.landing } : {}),
+      failure: run.failure!, output: run.output,
+    } });
+  };
+  for (const [index, a] of task.acceptance.entries()) {
     if (isCommand(a)) {
       const r = await sh(a.command, worktree);
       if (r.code !== 0) {
-        return oracleExecutionFailure(`$ ${a.command}`, r.code, r.stdout, r.stderr);
-      }
-      passedDet.push(`✓ $ ${a.command} (exit 0)`);
+        record(index, a, oracleExecutionFailure(`$ ${a.command}`, r.code, r.stdout, r.stderr));
+      } else passedDet.push(`✓ $ ${a.command} (exit 0)`);
     } else if (isTest(a)) {
       if (!opts.testCmd) {
-        return { gate: "acceptance", pass: false,
-          details: `oracle failed: test "${a.test}" — no test command configured to run it (failing closed)` };
+        record(index, a, { failure: "no-runner", output: "", result: { gate: "acceptance", pass: false,
+          details: `oracle failed: test "${a.test}" — no test command configured to run it (failing closed)` } });
+        continue;
       }
       // queue row 179: a declared suite file is the only file that can satisfy its criterion.
       if (a.landing !== undefined) {
-        const landed = await landedTestOracle(opts.testCmd, a.test, a.landing, worktree);
-        if (!landed.pass) return landed;
-        passedDet.push(landed.details);
+        record(index, a, await landedTestOracle(opts.testCmd, a.test, a.landing, worktree));
         continue;
       }
       // OBS-55: exit 0 alone is vacuous when the name filter matched zero tests — fail closed.
       const red = countedTestRun(`test "${a.test}"`, a.test, await sh(testFiltered(opts.testCmd, a.test), worktree));
-      if (red) return red;
-      passedDet.push(`✓ test: ${a.test} (exit 0)`);
+      if (red) record(index, a, red);
+      else passedDet.push(`✓ test: ${a.test} (exit 0)`);
     }
   }
+  if (failures.length) {
+    const first = failures[0]!.run.result;
+    const infra = failures.find(({ run }) => run.result.meta?.infra === true)?.run.result.meta;
+    return { ...first, details: failures.map(({ run }) => run.result.details).join("\n"),
+      meta: { ...first.meta, ...infra, oracles: failures.map(({ oracle }) => oracle) } };
+  }
 
-  // 2. judge items — only after every deterministic oracle passed (a failed one returned above).
+  // Queue row 234(b) (D-2134): only an entirely green deterministic round reaches the judge.
   const judgeItems = task.acceptance.filter(isJudge);
   const detBlock = passedDet.length ? passedDet.join("\n") + "\n" : "";
   if (!judgeItems.length) {

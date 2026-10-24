@@ -79,7 +79,7 @@ export async function compile(argv: string[], cwd = process.cwd(), harnessFrom: 
       (plan) => plan,
       { strict: values.strict },
     );
-    const sourceFindings = sourceScopeFindings(g.tasks, cwd);
+    const sourceFindings = sourceScopeFindings(g.tasks, cwd, { failClosed: g.spec.source === "native" });
     const scopeLints = [
       ...collateralLints(g.tasks, cwd),
       ...sourceScopeLints(g.tasks, cwd, sourceFindings),

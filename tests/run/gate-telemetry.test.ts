@@ -298,7 +298,7 @@ describe("gate-result telemetry (v2.0 T2, fake adapter, zero tokens)", () => {
       judge: ["not-a-verdict", { pass: true, criteria: [{ criterion: "c1", met: true, reason: "ok" }] }],
     });
     const delayedJudge = new DelayedFake(judged.scriptPath, {
-      judge: { "fake-1": JUDGE_PRIMARY_MS, "fake-2": JUDGE_RETRY_MS },
+      judge: { "fake-2": JUDGE_PRIMARY_MS, "fake-1": JUDGE_RETRY_MS },
     });
     await daemon(judged.repo, { adapters: [delayedJudge], runId: "run-telemetry-judge-invocations" });
     const acceptance = gateRows(judged.repo, "run-telemetry-judge-invocations").find((r) => r.gate === "acceptance")!;
@@ -306,8 +306,8 @@ describe("gate-result telemetry (v2.0 T2, fake adapter, zero tokens)", () => {
       .filter((e) => e.event === "judge-retry")).toHaveLength(1); // the retry really happened
     expect(acceptance.pass).toBe(true); // and the retry's verdict is what decided the gate
     assertInvocations(acceptance, [
-      { channel: "fake:fake-1", delayMs: JUDGE_PRIMARY_MS },
-      { channel: "fake:fake-2", delayMs: JUDGE_RETRY_MS },
+      { channel: "fake:fake-2", delayMs: JUDGE_PRIMARY_MS },
+      { channel: "fake:fake-1", delayMs: JUDGE_RETRY_MS },
     ]);
 
     // review: the declared leaf path makes reviewGate perform changed-path promotion before each
