@@ -131,7 +131,7 @@ describe("v2.5.6 T5 — zero-spend verbs and honest counters", () => {
     }
     // ---- (a2) a stale preservation never displaces a task branch advanced by a later attempt ------
     {
-      const { repo, fake } = setupRepo([T("T1")], { tasks: { T1: [{ shell: `echo old > t1.txt && ${COMMIT} old`, result: { ok: true, summary: "old" } }] } });
+      const { repo, fake } = setupRepo([T("T1")], { tasks: { T1: [{ shell: `echo old > t1.txt && ${COMMIT} old`, result: { ok: true, summary: "old" } }] } }, "visibility: { keepPanes: forever }\n");
       const runId = "run-recheck-stale-preserved";
       const first = await runDaemon(repo, { adapters: [fake], runId, driver: wedgedAfterWork() });
       expect(first.failed).toEqual(["T1"]);

@@ -110,6 +110,16 @@ function normJournal(events: JournalEvent[], repo: string, runId: string, baseRe
       expect(typeof row.data.durationMs).toBe("number");
       row = { ...row, data: maskMeasured(row.data) };
     }
+    // Queue row 240 (D-2138): cleanup hashes and paths vary by fixture, while every recovery row remains compared.
+    if (row.event === "worktree-preserved" || row.event === "worktree-removed") {
+      expect(row.data.ref).toMatch(/^refs\/tickmarkr\/preserved\/[a-f0-9]{40}$/);
+      row = { ...row, data: { ...row.data, ref: "refs/tickmarkr/preserved/<HASH>" } };
+      if (row.event === "worktree-removed") {
+        expect(row.data.head).toMatch(/^[a-f0-9]{40}$/);
+        expect(row.data.dir).toBe(worktreePath(repo, `tickmarkr/${runId}--${row.data.task}`));
+        row = { ...row, data: { ...row.data, head: "<HASH>", dir: "<WORKTREE>" } };
+      }
+    }
     row = swapPrefix(row, repo, "<REPO>");
     row = row.event === "gate-result"
       ? { ...row, data: Object.fromEntries(Object.entries(row.data).map(([k, v]) =>

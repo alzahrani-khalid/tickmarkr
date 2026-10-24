@@ -30,6 +30,7 @@ async function reParkScenario(): Promise<RePark> {
       review: { approve: false, issues: ["stat tile mislabeled"] },
       tasks: { T1: [{ shell: `echo v >> f.txt && ${COMMIT} v`, result: { ok: true, summary: "v" } }] },
     },
+    "visibility: { keepPanes: forever }\n",
   );
   expect((await runDaemon(repo, { adapters: [fake], runId })).human).toEqual(["T1"]);
   // The status reset: a pending graph.json edit beats the replayed park, so the resume restores T1 undecided.

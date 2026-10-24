@@ -2,6 +2,34 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v2.8.9 — cleanup: a missing task checkout is rebuilt from its recorded work, task worktrees never outlive their run, seats are closed by the mission that opened them, and hand-made checkouts get a home, a ledger and a removal step
+
+**v2.8.9** makes cleanup automatic (queue row 240). Its work comes from one `tickmarkr run` engagement
+(run-20261024-041840-…2176), in which four tasks each passed build, lint, evidence, scope, their acceptance criteria, a
+cross-vendor review and the full suite.
+
+- **A resume rebuilds a missing task checkout from its recorded work, never from nothing.**
+  - A parked task whose checkout is gone is rebuilt from the newest recorded removal or preservation ref, or else from a task branch that descends from its journaled base. Its committed work reaches the next attempt.
+  - Before, a missing checkout could reset the branch to base, a silent loss of work.
+  - A waived-gate replay, an interrupted attempt's harvest and a parked task's recheck all gate the rebuilt work.
+- **Task worktrees never outlive their run.**
+  - Run end removes every task checkout of the run, not only the merged ones. Before removing one, it preserves the bytes under a recovery ref and journals the removal.
+  - A run start sweeps the leftover checkouts of other runs whose daemon is dead and whose engagement ended.
+  - A checkout holding staged bytes its preservation missed, or whose preservation fails, is kept and journaled, never deleted.
+  - Gate-command litter refused as dirt is never carried into a later attempt.
+  - `visibility.keepPanes: forever` keeps everything, as before.
+- **The mission that opened a seat closes it, with the exact command on Orca and on herdr.**
+  - The shipped skills name each seat's teardown.
+  - The artifact watcher closes a delivered seat only once its stand-down for the current mission is read back and its live title and checkout match its spawn record. On Orca it then proves the handle and its owned tab are gone.
+  - It never closes on a timeout, a recycled handle, a title-only match or its own launching terminal.
+- **Hand-made checkouts get a home, a ledger and a mission-end removal step.** The overseer skill names where a seat's own checkouts live on each host, appends one ledger line per checkout, and removes clean ones at mission end. A dirty checkout, or one with a keep reason, is kept.
+
+Declared, still open:
+- Queue row 247: a task whose full suite has passed can wait a whole other task's suite before it records the pass.
+- Queue rows 248, 249 and 139: load- and timing-dependent test races in gate-fingerprint, fleet-reach and test-manifest.
+- Queue row 250: a global upgrade during a live run swaps the harness that run spawns.
+- Queue rows 236, 237, 238, 232(a, b), 187(b) and 246.
+
 ## v2.8.8 — gate integrity: every oracle in one red, repair hints from structured fields only, a carried tip green bound to its environment, compile that reads every file, durable discharges, an independent acceptance judge, and a record that states only what was proven
 
 **v2.8.8** closes the gate-integrity P1s. Its work comes from one `tickmarkr run` engagement

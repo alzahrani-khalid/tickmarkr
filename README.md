@@ -441,6 +441,28 @@ The daemon reconciles at every safe point:
 unavailable, a pane vanished mid-sweep) do not replace gate verdicts; unconfirmed board
 cleanup is journaled and reported.
 
+### Worktree lifecycle
+
+Queue row 240 (D-2138): at run end, every journaled task checkout is removed once its
+recovery ref is recorded, including parked and failed tasks. Clean merged checkouts
+are removed silently. Dirty work is preserved under `refs/tickmarkr/preserved/`;
+unmerged clean heads are pinned there too. The journal records the recovery ref and
+removed checkout, and resume rebuilds from that work. Task branches and refs remain.
+
+A crash or SIGTERM leaves checkouts until the next daemon start in the same checkout.
+After its lifecycle row and reconciliation, that start sweeps other runs in this
+checkout's runs directory only when their newest lifecycle row records a proven dead
+pid, regardless of how they ended. Recovery and removal rows go into the owning run's
+journal and name the sweeping run; outstanding checks and measured wall windows stay unchanged.
+Only journaled task checkouts are touched: there is no worktree directory listing or
+in-use check. Live or unrecorded pids, this run's checkouts, verification checkouts,
+hand-made directories and sibling linked checkouts remain untouched; a refused start
+sweeps nothing. `visibility.keepPanes: forever` disables both removal boundaries.
+
+Staged bytes missing from the recovery tree, preservation failures and deletion failures
+keep the checkout and journal a run-level removal failure in the current run. Cleanup
+never changes the run's outcome or adds another run end.
+
 ### Workspace trust
 
 tickmarkr creates fresh git worktrees for change isolation. That is separate from each CLI's own

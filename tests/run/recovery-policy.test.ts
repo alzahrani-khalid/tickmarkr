@@ -44,13 +44,13 @@ test("task execution ceiling terminates its sleeping worker, preserves edits, pa
     expect(rows.filter((e) => e.event === "worker-launch")).toHaveLength(1);
     expect(rows.filter((e) => e.event === "merge")).toHaveLength(0);
     const wt = worktreePath(repo, "tickmarkr/run-budget-owned--T1");
-    expect(existsSync(join(wt, "unfinished.txt"))).toBe(true);
-    const pid = Number(readFileSync(join(wt, "worker.pid"), "utf8"));
+    expect(existsSync(wt)).toBe(false);
+    const ref = rows.find((e) => e.event === "worktree-preserved")?.data.ref;
+    const pid = Number(await shGitOk(`git show ${ref}:worker.pid`, repo));
     expect(() => process.kill(pid, 0)).toThrow();
-    const child = Number(readFileSync(join(wt, "child.pid"), "utf8"));
+    const child = Number(await shGitOk(`git show ${ref}:child.pid`, repo));
     expect(() => process.kill(child, 0)).toThrow();
     expect(() => process.kill(foreign.pid!, 0)).not.toThrow();
-    const ref = rows.find((e) => e.event === "worktree-preserved")?.data.ref;
     expect(typeof ref).toBe("string");
     expect(await shGitOk(`git show ${ref}:unfinished.txt`, repo)).toContain("preserved");
   } finally { foreign.kill("SIGKILL"); }

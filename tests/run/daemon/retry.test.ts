@@ -109,6 +109,8 @@ const runWorktreeDirs = (repo: string, branch: string): string[] => {
 };
 
 
+const removalFor = (events: JournalEvent[], task: string) => events.find((e) => e.event === "worktree-removed" && e.data.task === task);
+
 const interactiveDriver = () => {
   const inner = new SubprocessDriver();
   return {
@@ -336,7 +338,8 @@ describe("v1.23 session hygiene on retry (fake adapter, zero tokens)", () => {
     expect(dispatches).toHaveLength(2);
     expect(dispatches.map((d) => d.data.workerDispatchOrdinal)).toEqual([0, 1]);
     for (const d of dispatches) {
-      expect(Object.keys(d.data).sort()).toEqual(["assignment", "attempt", "excludedChannels", "exclusionReasons", "provenance", "retryMode", "routingHints", "workerDispatchOrdinal"]);
+      expect(Object.keys(d.data).sort()).toEqual(["assignment", "attempt", "base", "excludedChannels", "exclusionReasons", "provenance", "retryMode", "routingHints", "workerDispatchOrdinal"]);
+      expect(d.data.base).toBe(evs.find((e) => e.event === "run-start")!.data.baseRef);
       expect(d.data.excludedChannels).toEqual([]);
       expect(d.data.retryMode).toBe("fresh");
     }
@@ -782,7 +785,7 @@ describe("v1.25 trust-auto-answer journal (fake adapter, zero tokens)", () => {
       expect(existsSync(worktreePath(repo, `${s.branch}--T1`))).toBe(true);
     });
 
-    test("a run ending with a failed/blocked task keeps that task's worktree and removes only merged-done ones", async () => {
+    test("a run ending with a parked task removes its checkout with a recovery ref beside the merged-done cleanup", async () => {
       const pair = sameBasePair("wt-partial", "T1", "T2");
       const { repo, fake } = setupRepo(
         [T("T1"), T("T2")],
@@ -803,10 +806,12 @@ describe("v1.25 trust-auto-answer journal (fake adapter, zero tokens)", () => {
       expect(s.human).toHaveLength(1);
       const doneId = s.done[0]!;
       const parkedId = s.human[0]!;
-      expect(runWorktreeDirs(repo, s.branch)).toEqual([`${sanitizeBranch(s.branch)}--${parkedId}`]);
+      expect(runWorktreeDirs(repo, s.branch)).toEqual([]);
       expect(existsSync(worktreePath(repo, s.branch))).toBe(false); // 2.8.1 T2: no integration checkout exists
       expect(existsSync(worktreePath(repo, `${s.branch}--${doneId}`))).toBe(false);
-      expect(existsSync(worktreePath(repo, `${s.branch}--${parkedId}`))).toBe(true);
+      expect(existsSync(worktreePath(repo, `${s.branch}--${parkedId}`))).toBe(false);
+      const removed = removalFor(Journal.open(repo, s.runId).read(), parkedId);
+      expect(removed?.data.ref).toMatch(/^refs\/tickmarkr\/preserved\//);
     });
 
     // OBS-1128 (absorbing OBS-1095): this fixture and the runId-isolation one below raced their two
@@ -853,7 +858,7 @@ describe("v1.25 trust-auto-answer journal (fake adapter, zero tokens)", () => {
       expect(runWorktreeDirs(repo, resumed.branch)).toEqual([]);
     });
 
-    test("only worktrees recorded for THIS run id are touched with the earlier finishing worker merged first and never another run's", async () => {
+    test("only journaled task checkouts are removed, including a dead prior run at start, while an undispatched directory is untouched", async () => {
       const pair = sameBasePair("wt-keep", "T1", "T2");
       const { repo, fake } = setupRepo(
         [T("T1"), T("T2")],
@@ -866,6 +871,7 @@ describe("v1.25 trust-auto-answer journal (fake adapter, zero tokens)", () => {
             T2: [{ shell: `${pair.loser.hold} && echo B > shared.txt && ${COMMIT} tb`, result: { ok: true, summary: "tb" } }],
           },
         },
+        "visibility:\n  keepPanes: forever\n",
       );
       const partial = await runDaemon(repo, { adapters: [fake], runId: "run-wt-keep", narrate: pair.narrate() }).finally(pair.release);
       expect(pair.violations(Journal.open(repo, "run-wt-keep").read())).toEqual([]);
@@ -877,6 +883,9 @@ describe("v1.25 trust-auto-answer journal (fake adapter, zero tokens)", () => {
         .toBeLessThan(partialRows.findIndex((e) => e.event === "merge-conflict" && e.taskId === "T2"));
       const keptDirs = runWorktreeDirs(repo, partial.branch);
       expect(keptDirs.length).toBeGreaterThan(0);
+      const manual = await new SubprocessDriver().worktree(repo, `${partial.branch}--undispatched`, "HEAD");
+      Journal.open(repo, partial.runId).append("run-resume", undefined, { pid: 2_000_000_000 });
+      writeFileSync(join(tickmarkrDir(repo), "config.yaml"), "judge: { adapter: fake, model: fake-1 }\nconsult: { adapter: fake, model: fake-1 }\n");
 
       saveGraph(repo, validateGraph({
         version: 1,
@@ -886,7 +895,9 @@ describe("v1.25 trust-auto-answer journal (fake adapter, zero tokens)", () => {
       const green = await runDaemon(repo, { adapters: [fake], runId: "run-wt-clean" });
       expect(green.done).toEqual(["T1"]);
       expect(runWorktreeDirs(repo, green.branch)).toEqual([]);
-      expect(runWorktreeDirs(repo, partial.branch)).toEqual(keptDirs);
+      expect(runWorktreeDirs(repo, partial.branch)).toEqual([`${sanitizeBranch(partial.branch)}--undispatched`]);
+      expect(existsSync(manual)).toBe(true);
+      expect(removalFor(Journal.open(repo, partial.runId).read(), "T2")?.data.by).toBe(green.runId);
     });
 
   });
@@ -1214,8 +1225,8 @@ describe("OBS-1107 carry verification reads content, not hashes (fake adapter, z
       // second bounded repair instead of tripping the fingerprint cap
       expect(evs.filter((e) => e.event === "repair-dispatch"), variant).toHaveLength(2);
 
-      const taskWt = worktreePath(repo, `tickmarkr/${runId}--T1`);
-      const [shared, own, empty] = (await shOk("git log --reverse --format=%H HEAD~3..HEAD", taskWt)).trim().split("\n");
+      const taskRef = `tickmarkr/${runId}--T1`;
+      const [shared, own, empty] = (await shOk(`git log --reverse --format=%H ${taskRef}~3..${taskRef}`, repo)).trim().split("\n");
       expect(await shOk(`git diff --quiet ${empty}^ ${empty} && echo empty`, repo), variant).toBe("empty\n");
       // A sibling lands shared.txt's exact bytes on the integration tip; in the missing variant it also
       // lands other own.txt bytes, so own's nonempty change can neither apply nor be represented.
@@ -1745,7 +1756,7 @@ describe("T3 retry economics (fake adapter, zero tokens)", () => {
     expect(rungs[2]!.data.fingerprintCap).toBe(true);    // the cap took rung 1 (escalate) and spent it
     expect(rungs[3]!.data.repair).toBe(2);               // the second and last funded repair
     // then the ladder's own end, on its own budget — the cap bought nothing extra
-    expect(evs.filter((e) => e.taskId === "T1" && e.event !== "worker-process-reaped").at(-1)!.event).toBe("task-human");
+    expect(evs.filter((e) => e.taskId === "T1" && e.event !== "worker-process-reaped" && !(e.event === "worktree-preserved" && e.data.by)).at(-1)!.event).toBe("task-human");
 
     // ── and the rerouted retry still knows WHY the last attempt failed ──
     // The consult's guidance is ADDED to the brief the journal already holds, never swapped for it:

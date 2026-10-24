@@ -26,7 +26,7 @@ When working in a multi-agent terminal environment (herdr or Orca), decide your 
 
 - **Orchestrator:** your session was started to execute the mission. Rename your own tab/pane `ORCH · <label>` (short labels: ≤20 chars, `ROLE · token`) and run the loop below.
 - **Supervisor with a live orchestrator:** do not start a second run. Relay the mission to the existing orchestrator with a [verified handoff](#verified-handoffs-agent-to-agent-messaging), then supervise it as OVERSEER.
-- **Primary session without an orchestrator:** rename your own tab `OVERSEER · <label>` and your agent `overseer`, spawn one child orchestration session with your host's launch form, label its tab `ORCH · <label>` and name its agent, give it the mission and these rules verbatim, then supervise it. Do not drive a duplicate single-tier run yourself. Before spawning, confirm any PREVIOUS orchestrator has stood down (monitors stopped, input box empty — dim ghost-text suggestions are UI, not queued input; ANSI-verify before alarming) and close its tab — the journal, records, and ledger hold the story; scrollback is disposable.
+- **Primary session without an orchestrator:** rename your own tab `OVERSEER · <label>` and your agent `overseer`, spawn one child orchestration session with your host's launch form, label its tab `ORCH · <label>` and name its agent, give it the mission and these rules verbatim, then supervise it. Do not drive a duplicate single-tier run yourself. Before spawning, retire any PREVIOUS orchestrator through [mission-end teardown](#mission-end-teardown-queue-row-240-d-2138-add1-r3-add4).
   - **On herdr (`HERDR_ENV=1`)**: **spawning on current herdr is two-step** — the one-shot `agent start --cwd/--tab/--no-focus` form was removed in the herdr CLI redesign and now fails with `unknown option` (OBS-138). First create the pane: `herdr tab create --workspace <ws> --cwd <repo> --label "ORCH · <label>"` (tab create does not steal focus unless `--focus` is passed; parse `result.root_pane.pane_id` from its JSON), then start the agent in it:
     - **Claude Code:** `herdr agent start orchestrator --kind claude --pane <root-pane-id> -- --permission-mode bypassPermissions`
     - **Codex:** `herdr agent start orchestrator --kind codex --pane <root-pane-id> -- --dangerously-bypass-approvals-and-sandbox` — the unsandboxed flag is REQUIRED, not optional: codex's `workspace-write` sandbox keeps `.git` refs read-only, so a sandboxed orchestrator's `tickmarkr run` dies at integration-branch creation (`git worktree add` cannot lock the ref). Do not downgrade this flag; the herdr pane and repo scope are the containment.
@@ -69,7 +69,62 @@ agent session that owns no panes (queue row 192; D-2102). The role check above d
 
 ## Stand-down (mission end and retirement)
 
-On each mission's terminal state, after the record commit and operator notification: the orchestrator stops every monitor and background task it started, sweeps the heartbeat/beat files its watchers wrote (a stale beat beside a live one reads as coverage to whoever globs the directory), prints one final stand-down line, and leaves nothing queued in its input box. A finished session with an armed watcher or pre-filled input is a loaded gun.
+At each terminal state (green, failed, or parked), finish the execution record beside the source spec.
+The ORCH's artifact is this execution record. Append its named terminal marker BEFORE the record commit
+(queue row 240; D-2138 add.1 R3): `printf '\n<!-- tickmarkr:orch-end %s -->\n' "<runId>" >> "<execution-record>"`.
+Verify the final line is `<!-- tickmarkr:orch-end <runId> -->`, then commit that record when tracked
+and notify the operator. Stop every monitor and background task you started, sweep your watcher
+heartbeat/beat files, print a final stand-down line, and leave nothing queued in your input box.
+After that stand-down, write `pids/<seat>.stood-down` with `mission=<mission>` as the brief requires.
+The supervisor reads back the stand-down and exactly that execution record's end marker, then closes
+the retired ORCH at its recorded address using the host's exact command and ownership proof below;
+a plain host has no spawned terminal to close. Ghost-text suggestions are UI, not queued input.
+
+## Mission-end teardown (queue row 240; D-2138 add.1 R3, add.4)
+
+**The spawner closes the seat it created.** Manual closes and watcher closes follow this same law:
+close only once its artifact and terminal marker are on disk, its stand-down is read back, and no
+next mission is named for it. An agent's `done` signal, a bare handle, or a title alone is never enough.
+The ORCH's artifact is the execution record ending in `<!-- tickmarkr:orch-end <runId> -->`;
+the supervisor reads exactly that record and that run's marker before retiring the orchestrator.
+Keep a reused seat only with its next mission named and a `/clear` at the mission boundary.
+Keep the latest settled consult round only while the mission continues; at mission end apply this
+same close or reuse rule. A dedicated consultant tab may outlive the orchestrator tab during that
+continuing mission, never indefinitely after the mission ends.
+
+**Record ownership at spawn**, beside watcher pids under `<state-dir>/overseer/pids/<seat>.handle`:
+write `host`, `address`, `title`, `checkout`, and `mission`, one `key=value` per line, from the create
+receipt; use the actual tab title and checkout. This is the spawn ledger, not a list reconstructed
+from titles. Record an owned tab as `tab=<tab-id>` when the seat owns it. Every spawned seat's brief
+ends with: after stand-down, write `pids/<seat>.stood-down` containing `mission=<mission>`.
+On every new assignment, including named-next-mission reuse, rewrite the ledger's `mission` and
+delete the old stood-down file BEFORE that mission starts (D-2138 add.6 V01). Read back the stood-down
+file and require its mission to equal the ledger's current mission; an earlier mission's stand-down
+never retires the reused seat.
+
+**Before every close, first match the spawn record against the live tab title and checkout**, at its
+recorded address. A mismatch closes nothing. Never close a tab you did not create, a recycled handle
+now showing an operator's terminal, a seat matched by title alone, or your own launching terminal.
+A stale or mismatched Orca handle permits read-only re-resolution by title and checkout to read the
+seat; never close the replacement by title, never rewrite ownership from a title-only match.
+
+- **On herdr (`HERDR_ENV=1`)**: verify `herdr pane list`: the recorded address equals `pane_id`,
+  the recorded title equals `label`, and the recorded checkout equals `cwd` (filesystem identity).
+  Only then use `herdr pane close <pane>` at the recorded address. Prove the pane absent from
+  `herdr pane list`; for a seat owning its tab, use `herdr tab close <tab>` at its recorded tab id
+  after the final owned pane closes, and prove the tab absent from `herdr tab list`. A shared tab
+  with a pending sibling stays open. Never assume emptied tabs disappear without checking.
+- **On Orca (`TERM_PROGRAM=Orca` and non-empty `ORCA_TERMINAL_HANDLE`)**: verify ownership with
+  `orca terminal list --include-visual-layouts --json`: the spawn record's address is the leaf handle,
+  its title is the live TAB title (never the shell's pane title), and its checkout matches the layout
+  worktree and terminal row. An unbound checkout or truncated listing is unverifiable and closes nothing.
+  Only then use `orca terminal close --terminal <handle> --json` with the recorded handle. Require
+  `result.close.handle` equal to that handle, or the documented live-terminal refusal
+  `ok:false`, `error.code:runtime_error`, `error.message:tab_not_found` from that same runtime.
+  Prove the handle absent from `orca terminal list --json` AND its owned tab absent from
+  `orca terminal list --include-visual-layouts --json` after its final terminal closes, in the same
+  runtime as the pre-close listing. A surviving owned tab is a spec question, never permission to
+  close by title. The Orca smoke e2e asserts this tab leg; a receipt alone is no close proof.
 
 ## Invariants
 
@@ -132,7 +187,7 @@ Never report "briefed" or "relayed" without the confirmation your host gives:
    - **On herdr (`HERDR_ENV=1`)**: the consumer is the shipped watcher — `.claude/skills/tickmarkr-overseer/scripts/watch-journal.sh <state-dir>/runs 20 28800`, which grades the run-end summary's execution clauses for you, `EXECUTION COMPLETE` or `NOT GREEN`, never green — or a foreground `until grep` on the run's terminal events; ensure it is re-armed at most every twenty minutes.
    - **On Orca (`TERM_PROGRAM=Orca` and non-empty `ORCA_TERMINAL_HANDLE`)**: the consumer is that same shipped journal watcher or a foreground `until grep` on the run's terminal events; ensure it is re-armed at most every twenty minutes.
 5. **Verify and consolidate** — continue only after a green run. A run is green when the run-end event exists in the journal, the tip verify is not "failed", the summary's `failed`, `human`, `blocked` and `pending` buckets are all empty, and CURRENT `tickmarkr status <runId>` reads its owed checks outstanding empty AND known (`outstanding 0`) — a run with a parked task is partial, not green. Empty execution buckets alone are not green either (D-660): every bucket empty and the tip passed, but an operator waived one review, leaves one accepted-risk review check owed — status reads `outstanding 1 (T7 review)` and `run`/`resume` still exit 0 on execution alone, so the run is execution complete, not green. It turns green only when a `tickmarkr verify --record <runId>` discharge moves CURRENT status to `outstanding 0`, including a discharge landing after run-end — the historical run-end record keeps the old count, so never read debt from it; `outstanding unknown` is never green. Tickmarkr consolidates accepted work on `tickmarkr/<runId>` and never signs off to the main branch. A human controls any later release merge.
-6. **Record** — `tickmarkr report <runId> --md` prints Markdown to stdout; redirect explicitly beside the spec (for example `tickmarkr report <runId> --md > feature.record.md`) and commit the execution record when the repository tracks those records.
+6. **Record** — `tickmarkr report <runId> --md` prints Markdown to stdout; redirect explicitly beside the spec (for example `tickmarkr report <runId> --md > feature.record.md`) then follow [stand-down](#stand-down-mission-end-and-retirement) to append the ORCH end marker before committing the execution record when tracked.
 7. **Continue** — move to the next requested target. If a target fails or is parked, stop with the journal evidence rather than silently skipping it.
 
 ## Host-owned daemon and detached beats

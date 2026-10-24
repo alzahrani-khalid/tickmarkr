@@ -125,7 +125,8 @@ function refState(repo: string, branch: string): string {
   return commit.status === 0 ? `loose:${commit.stdout.trim()}` : "missing";
 }
 
-const lastCycle = (events: JournalEvent[]) => events.slice(events.map((e) => e.event).lastIndexOf("tip-verify-start"));
+const lastCycle = (events: JournalEvent[]) => events.slice(events.map((e) => e.event).lastIndexOf("tip-verify-start"))
+  .filter((e) => e.event !== "worktree-removed" && e.event !== "worktree-removal-failed" && !(e.event === "worktree-preserved" && e.data.by));
 const integrationRows = (events: JournalEvent[]) => events.filter((e) => e.event === "tip-verify-failed" && e.data.gate === "integration");
 
 function expectNoCheckoutLeft(c: Close): void {

@@ -1,63 +1,11 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, test } from "vitest";
 
-type Scope = { parent?: Scope; host?: "herdr" | "orca"; children: Scope[]; line: number; kind: "root" | "heading" | "bullet"; depth: number };
-const hostOf = (text: string): Scope["host"] => /^On (herdr|Orca)\b/.exec(text.replace(/^[*_]+/, ""))?.[1]?.toLowerCase() as Scope["host"];
-const herdrOnly = /\bherdr\s+(?:agent|pane|notification|tab)\b|\bwatch-(?:\*|[\w-]+)\.sh\b|\bTKR_ARMING_SEAT\b|\bTKR_CLOSE_PANES\b|FIVE-TAB CANON|FOUR[ -]watchers/;
-// Concatenated so this source cannot co-match HYG-06 R2 (cwd-call + state-dir literal).
+import { hostOf, herdrOnly, hostViolations } from "./helpers/skill-reading.js";
 const runtimeDir = "." + "tickmarkr";
 
 function readShippedSkill(): string {
   return readFileSync(new URL("../skills/tickmarkr-overseer/SKILL.md", import.meta.url), "utf8");
-}
-
-function hostViolations(markdown: string): string[] {
-  const root: Scope = { children: [], line: 0, kind: "root", depth: -1 };
-  const headings: Scope[] = [root];
-  const bullets: Scope[] = [];
-  const violations: string[] = [];
-  let fence: string | undefined;
-  const inherited = (node: Scope | undefined): Scope["host"] => node && (node.host ?? inherited(node.parent));
-  const add = (parent: Scope, kind: Scope["kind"], depth: number, text: string, line: number) => {
-    const node: Scope = { parent, kind, depth, host: hostOf(text), line, children: [] };
-    parent.children.push(node);
-    return node;
-  };
-  for (const [index, line] of markdown.split("\n").entries()) {
-    const trimmed = line.trimStart();
-    const indent = line.length - trimmed.length;
-    if (!fence) {
-      const heading = /^(#{1,6})\s+(.+)$/.exec(line);
-      const bullet = /^(\s*)(?:[-+*]|\d+[.)])\s+(.+)$/.exec(line);
-      if (heading) {
-        bullets.length = 0;
-        while (headings.at(-1)!.depth >= heading[1].length) headings.pop();
-        headings.push(add(headings.at(-1)!, "heading", heading[1].length, heading[2], index + 1));
-      } else if (bullet) {
-        while (bullets.length && bullets.at(-1)!.depth >= indent) bullets.pop();
-        bullets.push(add(bullets.at(-1) ?? headings.at(-1)!, "bullet", indent, bullet[2], index + 1));
-      } else if (trimmed) {
-        while (bullets.length && indent <= bullets.at(-1)!.depth) bullets.pop();
-      }
-    }
-    const scope = bullets.at(-1) ?? headings.at(-1)!;
-    if (herdrOnly.test(line) && inherited(scope) !== "herdr") violations.push(`line ${index + 1}: ${trimmed}`);
-    const marker = /^(`{3,}|~{3,})/.exec(trimmed)?.[1];
-    if (marker && (!fence || marker[0] === fence[0] && marker.length >= fence.length)) fence = fence ? undefined : marker;
-  }
-  const siblings = (node: Scope) => {
-    for (const [i, child] of node.children.entries()) {
-      if (child.host === "herdr" && inherited(node) !== "herdr") {
-        const adjacent = [node.children[i - 1], node.children[i + 1]];
-        if (!adjacent.some((other) => other?.kind === child.kind && other.host === "orca")) {
-          violations.push(`line ${child.line}: On herdr scope has no adjacent On Orca sibling`);
-        }
-      }
-      siblings(child);
-    }
-  };
-  siblings(root);
-  return violations;
 }
 
 describe("overseer skill host neutrality (HD-1 / OBS-1003)", () => {
@@ -123,7 +71,7 @@ describe("overseer skill host neutrality (HD-1 / OBS-1003)", () => {
 });
 
 test("host scope parser rejects escaped commands, fences, mandates and missing sibling branches", () => {
-  for (const token of ["herdr agent wait", "herdr pane run", "herdr notification show", "watch-panes.sh", "watch-artifacts.sh", "watch-*.sh", "TKR_ARMING_SEAT", "watch-new-instrument.sh", "TKR_CLOSE_PANES", "FIVE-TAB CANON", "FOUR watchers"]) {
+  for (const token of ["herdr agent wait", "herdr pane run", "herdr notification show", "watch-panes.sh", "watch-*.sh", "TKR_ARMING_SEAT", "watch-new-instrument.sh", "TKR_CLOSE_PANES", "FIVE-TAB CANON", "FOUR watchers"]) {
     expect(hostViolations(`On herdr applies everywhere.\n\n## Universal\n\`${token}\``)).not.toEqual([]);
     expect(hostViolations(`## On herdr\n\n## On Orca\n\n\`\`\`bash\n${token}\n\`\`\``)).not.toEqual([]);
     expect(hostViolations(`- On herdr: safe\n  \`${token}\`\n- On Orca: files\n- Universal: \`${token}\``)).not.toEqual([]);
@@ -462,5 +410,16 @@ test("test: a plain-host reading of each shipped skill, following every universa
       : skill.replace(/^With neither herdr nor Orca there is no role to decide.*$/m, "Outside a multi-agent terminal environment, run the loop directly.");
     expect(stops, name).not.toBe(skill);
     expect(plainHostFindings(name, stops), `${name}: stops`).toContain("the host or role check does not route a plain host to its scope");
+  }
+});
+
+// Queue row 240; D-2138 add.1 R3 supersedes the artifact watcher's herdr-only token pin.
+test("test: the host scope law admits the artifact watcher in an On Orca scope while the herdr pane close variable, every herdr command and the other watcher scripts stay herdr-only, and the shipped overseer skill has no host violation, so a law that still bans the watcher from Orca or admits a herdr command outside herdr fails", () => {
+  expect(hostViolations("## On Orca\nwatch-artifacts.sh")).toEqual([]);
+  expect(hostViolations(readShippedSkill())).toEqual([]);
+  for (const token of ["TKR_CLOSE_PANES", "herdr pane close <pane>", "herdr tab close <tab>", "herdr agent wait", "herdr notification show", "watch-panes.sh", "watch-context.sh", "watch-journal.sh", "watch-pending-input.sh", "watch-contamination.sh", "watch-launch.sh", "watch-new-instrument.sh", "watch-*.sh", "FIVE-TAB CANON"]) {
+    expect(hostViolations(`## On Orca\n${token}`), token).not.toEqual([]);
+    expect(hostViolations(`## Universal\n${token}`), token).not.toEqual([]);
+    expect(hostViolations(`## On herdr\n${token}\n## On Orca\nfiles`), token).toEqual([]);
   }
 });

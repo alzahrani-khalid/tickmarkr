@@ -145,7 +145,7 @@ test("the production daemon retains the known producing attempt of preserved wor
       { shell: "echo 'usage limit reached for this model'; exit 1" }, // no trailer + quota text → channel failover
       { shell: "true", result: { ok: true, summary: "carried nothing" } },
     ] },
-  });
+  }, "visibility: { keepPanes: forever }\n");
   twoVendors(fake);
   const runId = "run-preserved-producer";
   expect((await runDaemon(repo, { adapters: [fake], runId, driver: wedgedThirdWorker() })).failed).toEqual(["T1"]);

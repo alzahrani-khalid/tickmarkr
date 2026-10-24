@@ -319,7 +319,7 @@ const UNREADABLE = "its journal names no readable published tip (the newest merg
 
 test("test: through the approve command a marked run's recheck and waive take the branch from run-start and the base from the anchor after a prefix change or a moved ref and an unreadable anchor refuses the recheck appending nothing and records the waive's obligation unknown versus an unmarked run keeping the by-name behaviour (R-P5 P6 P7 P8 R-F10 F11)", async () => {
   // ---- --recheck on failed tasks whose commits landed on their task branches (a recheck releases its failure) -------
-  const rf = fixture("run-r-recheck", [T("T1"), T("T2"), T("T3"), T("T4")], { T1: [work("one")], T2: [work("two")], T3: [work("three")], T4: [work("four")] });
+  const rf = fixture("run-r-recheck", [T("T1"), T("T2"), T("T3"), T("T4")], { T1: [work("one")], T2: [work("two")], T3: [work("three")], T4: [work("four")] }, "visibility: { keepPanes: forever }\n");
   expect((await run(rf, false, wedgedAfterWork())).summary.failed).toEqual(["T1", "T2", "T3", "T4"]);
   const recheck = (id: string) => approve([rf.runId, id, "--recheck", "--by", "op"], rf.repo);
   const approvals = () => rows(rf).filter((e) => e.event === "task-approved");

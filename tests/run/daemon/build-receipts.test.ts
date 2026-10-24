@@ -182,7 +182,7 @@ test("test: the production daemon rechecking a recreated same-path same-commit c
     const { repo, fake } = setupRepo([T("T1", { gates: ["build", "test", "lint", "evidence", "scope"] })], {
       consult: { action: "human", notes: "operator recheck" },
       tasks: { T1: [{ shell: `echo work > work.txt; ${COMMIT} work`, result: { ok: true, summary: "landed" } }] },
-    }, `gates: ${JSON.stringify(commands)}\n`);
+    }, `gates: ${JSON.stringify(commands)}\nvisibility: { keepPanes: forever }\n`);
     writeFileSync(join(repo, ".gitignore"), ".tickmarkr/\ndist/\n");
     await shOk(`${COMMIT} ignore-build-output`, repo);
     const runId = "run-recreated-build";

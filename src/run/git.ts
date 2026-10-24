@@ -850,15 +850,48 @@ export const worktreePath = (repo: string, branch: string) =>
   join(tickmarkrDir(repo), WORKTREES_DIR, sanitize(branch));
 
 /**
- * OBS-28: remove this run's recorded task worktrees; tolerates already-gone paths. 2.8.1 T2: a run keeps no
- * integration checkout, and a 2.8.0 run's legacy one is never removed here (it may hold the only view of a merge).
+ * Queue row 240 (D-2138): remove only journaled task checkouts, after preserving their recovery tree.
+ * There is no in-use check. Branches and recovery refs remain; a failed operation keeps the checkout.
  */
 export async function cleanupRunWorktrees(
   repo: string,
   branch: string,
-  opts: { removeTaskIds: string[] },
+  opts: {
+    removeTaskIds: string[];
+    run: string;
+    by: string;
+    producer: (task: string) => PreserveProducer;
+    append: (event: string, task: string | undefined, data: Record<string, unknown>) => void;
+    failed: (data: Record<string, unknown>) => void;
+  },
 ): Promise<void> {
-  for (const id of opts.removeTaskIds) await removeWorktree(repo, worktreePath(repo, `${branch}--${id}`));
+  for (const task of new Set(opts.removeTaskIds)) {
+    const dir = worktreePath(repo, `${branch}--${task}`);
+    if (!existsSync(dir)) continue;
+    try {
+      const head = await gitHead(dir);
+      const producer = opts.producer(task);
+      let ref = await preserveWorktree(dir, producer);
+      if (!ref) {
+        const merged = await shGit(`git merge-base --is-ancestor ${shq(head)} ${shq(`refs/heads/${branch}`)}`, repo);
+        if (merged.code !== 0 && merged.code !== 1) throw new Error(merged.stderr || merged.stdout || "ancestry comparison failed");
+        if (merged.code === 1) {
+          ref = `refs/tickmarkr/preserved/${head}`;
+          await shGitOk(`git update-ref ${shq(ref)} ${shq(head)}`, repo);
+        }
+      }
+      // Queue row 240 (D-2138 add.4): a disposable preservation index never sees staged-only bytes.
+      const staged = await shGit(`git diff-index --cached --name-only --diff-filter=ACMRT -z ${shq(ref ?? head)} --`, dir);
+      if (staged.code !== 0 || staged.stdout.length) throw new Error(staged.stderr || "staged bytes are absent from the recovery tree");
+      if (ref) opts.append("worktree-preserved", task, { ref, ...producerFields(producer), by: opts.by });
+      if (ref) opts.append("worktree-removed", undefined, { task, dir, head, ref, by: opts.by });
+      // Queue row 240 (D-2138): unlike rollback, a refused deletion must never fall through to rm -rf.
+      await withWorktreeAdmin(() => shGitOk(`git worktree remove --force ${shq(dir)}`, repo));
+    } catch (error) {
+      try { opts.failed({ run: opts.run, task, dir, error: error instanceof Error ? error.message : String(error) }); }
+      catch { /* Queue row 240 (D-2138): cleanup never replaces the run's outcome, even with an unwritable journal. */ }
+    }
+  }
 }
 
 

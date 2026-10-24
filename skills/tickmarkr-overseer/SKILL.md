@@ -71,6 +71,53 @@ the answer took session-file archaeology). The flip from the engine (P89, journa
 GSD legs (P92) had been RULED NOWHERE — no ledger entry decides it — and then propagated for six phases
 through brief lineage. **An executor choice nobody made is still an executor choice, and it compounds.**
 
+## Hand-made checkout law (queue row 240; D-2138 add.1 R4, add.4; gap G7)
+
+This one law applies on herdr, on Orca and on a plain host, to EVERY hand-made checkout:
+integration snapshots, SCOPER, REF, oracle and any other manually created worktree. `<repo>` is the
+repository's primary root, never a task checkout. Its seats-directory home is `<repo>-seats/<name>`,
+a sibling of the repository root; on Orca an Orca-managed worktree is also allowed. Never create one
+inside `.tickmarkr/worktrees.noindex`, or under `/private/tmp` (including the `/tmp` alias): a reboot
+wipes that temporary root. Product-journaled task checkouts, Orca-managed run checkouts and throwaway
+clones retain their existing lifecycle; this is the creating seat's duty, never a product cleanup sweep.
+
+**Creation and ledger.** Before creation, make the seats directory and `<repo>/.tickmarkr/overseer/`
+if absent. Immediately after each successful creation, before using the checkout, append one line to
+`<repo>/.tickmarkr/overseer/checkouts.ledger` (the repository's `.tickmarkr/overseer/checkouts.ledger`):
+
+```text
+path=<repo>-seats/<name> | purpose=<snapshot/scoper/REF/oracle/...> | owner=<seat> | remove-when=mission <mission> ends | keep=none | state=open
+```
+
+For an Orca-managed checkout, record its actual path instead. Use a stable owner seat identity even on
+a plain host; a successor never silently adopts another seat's lines. Each refresh closes the old
+checkout's line and appends a new line for the newly created checkout. A keep reason is recorded as
+`keep=<reason>; owner=<seat>; until=<condition>`, never inferred from a directory's name.
+
+**Mission-end removal, per owned ledger line.** At mission end (green, failed or parked), after users
+of the checkout have stood down, read only open lines whose `owner` is THIS seat. Use each line's exact
+`path`: an unledgered checkout or another seat's checkout is untouched. Never discover removal targets
+by directory glob, directory sweep or worktree-list inventory. For each owned line:
+
+1. Run `git -C <dir> status --porcelain` at that exact ledger path; require successful exit and capture
+   the entire output. Nonempty means **dirty → kept**: record `state=kept` and report its status and path.
+2. A recorded keep reason means **kept**, even if clean: record `state=kept`, the reason, owner seat and
+   condition for eventual removal, and report them. A dirty checkout with a keep reason records both.
+3. Only a clean checkout with no keep reason can proceed. Before ANY such removal (including a snapshot
+   refresh), determine whether HEAD is detached with `git -C <dir> symbolic-ref -q HEAD` (exit 1 means
+   detached). Resolve its exact head with `git -C <dir> rev-parse --verify HEAD`. For a detached head,
+   prove it reachable from a retained named ref using
+   `git -C <repo> for-each-ref --contains <sha> --format='%(refname)'`. Record the retained ref on the
+   ledger line and retain it after removal; HEAD and a reflog are not named refs. A successful query
+   with no retained named ref means **pin first**: run
+   `git -C <repo> update-ref refs/tickmarkr/preserved/<sha> <sha>`, verify that ref resolves to `<sha>`,
+   and write `preserved=refs/tickmarkr/preserved/<sha>` on THIS checkout's ledger line BEFORE removal.
+   Keep that recovery ref after removal. A failed status, HEAD/ref query, pin or ledger write means
+   kept and reported, never permission to continue.
+4. Then use `git worktree remove <dir>` from `<repo>`, **without force, never `--force` or `-f`**.
+   Only successful removal closes that ledger line (`state=closed`); a refusal leaves it open/kept
+   and is reported. Never delete the directory directly or override a dirty/locked refusal.
+
 ## On a plain host (neither herdr nor Orca)
 
 Neither `HERDR_ENV=1` nor the Orca markers are set: the Claude Desktop Code tab, a plain terminal, any
@@ -197,7 +244,8 @@ replaces the two-tier setup.
        (own tab, or a shared WORKERS tab), never the ORCH tab.
      - `CONSULT · <topic>` — ONE shared tab for ALL consultants of a round, side-by-side splits; never one
        tab per consultant; do NOT auto-close after adjudication (operator, 2026-08-09 — keep the round's
-       panes until the thread is confirmed finished or a successor round supersedes them).
+       panes while the mission continues or until a successor round supersedes them; at mission end apply
+       mission-end teardown, queue row 240; D-2138 add.1 R3).
      - `REVIEW <task>` — reviewer panes.
      Never multiply beyond these without asking. **Tabs you did not create are the OPERATOR'S — provenance
      decides: never close, rename, reuse, or send input to one, however idle it looks.** An "idle
@@ -249,8 +297,8 @@ replaces the two-tier setup.
   **Handles do not survive an Orca restart (OBS-1050, three gates lost to it in v2.5.6).** The restart
   re-issues every terminal handle; a recorded one answers `terminal_handle_stale` and any watcher or gate
   keyed to it is already dead. So: record every seat's handle in `pids/<seat>.handle` beside its title at
-  spawn; on `terminal_handle_stale`, re-list terminals and re-resolve the seat by TITLE, then rewrite the
-  handle file; and treat a stale handle as a dead seat until the read-back of the new handle proves
+  spawn with host, address, title, checkout and mission; on `terminal_handle_stale`, re-list terminals
+  and re-resolve by title and checkout for READS ONLY, never rewrite the spawn record from title alone; and treat a stale handle as a dead seat until the read-back of the new handle proves
   otherwise — a gate that was running in that seat has to be re-launched, never assumed to continue.
   When briefing a seat on either host, take its current address from the handoff file; never hardcode a pane id
   or terminal handle in a brief or command template.
@@ -343,7 +391,8 @@ Kimi `-y`, artifact plus terminal marker, and verified file-brief delivery. Flee
   into it (measured 2026-09-20: `terminal create` timed out on an unmanaged spec worktree, the overseer
   split instead, and the run had to be re-seated before GO). Before delivering the brief, prove the seat
   is in its own tab: `orca terminal list --json`, the new handle's `tabId` must differ from the
-  overseer's; if it does not, close the seat and create it again the lawful way. `split` is for seats
+  overseer's; if it does not, withhold the brief and report the misplaced seat; never treat the
+  launching tab as owned (queue row 240; D-2138 add.4). `split` is for seats
   that BELONG beside another seat (consultant pairs, a reviewer beside its surgeon), never for the
   orchestrator or a gate seat.
   **Seat names on Orca are TAB titles, and a tab title HOLDS; the pane title is the agent's and drifts.**
@@ -551,8 +600,15 @@ journal tail to decide what happens next, or sweeping orphans — you have taken
      branch name alone, which moves while you are reading it;
    - **the operator view of that branch** — a live run has NO integration checkout: the daemon publishes
      each merge onto `tickmarkr/<runId>` by compare-and-swap from the repository root. View it through a
-     detached snapshot (`git worktree add --detach <dir> tickmarkr/<runId>`), refreshed by removing it
-     (`git worktree remove <dir>`) and re-adding it; check the branch out attached only with the daemon
+     detached snapshot in the seats-directory home `<repo>-seats/<name>`:
+     `git worktree add --detach <repo>-seats/<name> tickmarkr/<runId>`. Append its path, snapshot purpose,
+     owner seat and mission-end removal condition to `.tickmarkr/overseer/checkouts.ledger` before use.
+     Follow the hand-made checkout law (queue row 240; D-2138 add.1 R4, add.4): before refresh or
+     mission-end removal, prove a clean detached HEAD reachable from a retained named ref with
+     `git for-each-ref --contains <sha>`; otherwise pin `refs/tickmarkr/preserved/<sha>` and write that
+     handle on its ledger line first. Refresh only through that law's clean/no-keep check and
+     `git worktree remove <repo>-seats/<name>` without force, close its line, then re-add and append a
+     new line; dirty or kept snapshots stay and are reported. Check the branch out attached only with the daemon
      stopped (no live `graph.lock`) — an attached checkout taken while the run is live goes stale at the next
      publication, and any write to the ref parks the next merge infra. Run `tickmarkr verify` and `report`
      from the main checkout or a snapshot;
@@ -1526,43 +1582,87 @@ orchestrator turn boundary.
 
 At seat spawn, arm file/journal watchers for artifact completion, run events, missing progress and context evidence. Record each watcher owner and bounded expiry; renew on every wake and stop on stand-down. Read `orca terminal read --terminal <handle> --screen --json` on each wake to detect blocked or pending input. For a human gate, write a checkpoint evidence file and announce it through verified terminal send; the moment a successor opens that file (or any other cited file) back, log the open per CITE-IS-NOT-READ (`opened <path>` appended to `.tickmarkr/overseer/opened-files.log`). Use Orca notifications only when the installed host advertises a notification capability; the current CLI has no `notification` command, so the file and terminal receipt remain the delivery path. A notification or accepted input alone never proves delivery or completion. A seat-liveness watcher on the ORCHESTRATOR handle is mandatory, not optional: poll `orca terminal read --terminal <handle> --screen --json` on a bounded interval and key liveness on `result.terminal.status === "running"` — never on the envelope's own `ok`. `ok: true` proves only that the READ command executed; a closed seat's read still returns that same `ok: true` with `result.terminal.status: "exited"`, and a matcher keyed on `ok` reads that exited seat as alive and never fires (OBS-1087). Treat `result.terminal.status !== "running"`, `terminal_handle_stale`, or a missing terminal as seat death, and re-resolve by title before re-arming (OBS-1050 — the orchestrator seat exited silently and the daemon ran unsupervised to a PARTIAL run-end).
 
+The artifact watcher is available on Orca (queue row 240; D-2138 add.4):
+`TKR_CLOSE_TERMINALS="<handle>,<handle>" bash skills/tickmarkr-overseer/scripts/watch-artifacts.sh <MARKER> <cap-s> <poll-s> <file>...`.
+Supply one recorded address per artifact in argument order; a length mismatch is refused at arm time.
+Both all-complete and wake-on-any exits close only each completed artifact's stood-down seat after
+matching the spawn ledger to its live tab title, leaf handle and layout checkout. Pending siblings,
+missing markers, missing/current-mission-mismatched stand-downs and timeouts close nothing.
+The verified close uses `orca terminal close --terminal <handle> --json`, checks the handle receipt
+or documented live refusal, then handle absence from the terminal list and owned-tab absence from
+visual layouts. A stale handle permits read-only re-resolution by title; it never licenses a close.
+Do not arm closure for the latest settled consult round while its mission continues.
+
+## Mission-end teardown (queue row 240; D-2138 add.1 R3, add.4)
+
+**The spawner closes the seat it created.** Manual closes and watcher closes follow this same law:
+close only once its artifact and terminal marker are on disk, its stand-down is read back, and no
+next mission is named for it. An agent's `done` signal, a bare handle, or a title alone is never enough.
+The ORCH's artifact is the execution record ending in `<!-- tickmarkr:orch-end <runId> -->`;
+the supervisor reads exactly that record and that run's marker before retiring the orchestrator.
+Keep a reused seat only with its next mission named and a `/clear` at the mission boundary.
+Keep the latest settled consult round only while the mission continues; at mission end apply this
+same close or reuse rule. A dedicated consultant tab may outlive the orchestrator tab during that
+continuing mission, never indefinitely after the mission ends.
+
+**Record ownership at spawn**, beside watcher pids under `<state-dir>/overseer/pids/<seat>.handle`:
+write `host`, `address`, `title`, `checkout`, and `mission`, one `key=value` per line, from the create
+receipt; use the actual tab title and checkout. This is the spawn ledger, not a list reconstructed
+from titles. Record an owned tab as `tab=<tab-id>` when the seat owns it. Every spawned seat's brief
+ends with: after stand-down, write `pids/<seat>.stood-down` containing `mission=<mission>`.
+On every new assignment, including named-next-mission reuse, rewrite the ledger's `mission` and
+delete the old stood-down file BEFORE that mission starts (D-2138 add.6 V01). Read back the stood-down
+file and require its mission to equal the ledger's current mission; an earlier mission's stand-down
+never retires the reused seat.
+
+**Before every close, first match the spawn record against the live tab title and checkout**, at its
+recorded address. A mismatch closes nothing. Never close a tab you did not create, a recycled handle
+now showing an operator's terminal, a seat matched by title alone, or your own launching terminal.
+A stale or mismatched Orca handle permits read-only re-resolution by title and checkout to read the
+seat; never close the replacement by title, never rewrite ownership from a title-only match.
+
+- **On herdr (`HERDR_ENV=1`)**: verify `herdr pane list`: the recorded address equals `pane_id`,
+  the recorded title equals `label`, and the recorded checkout equals `cwd` (filesystem identity).
+  Only then use `herdr pane close <pane>` at the recorded address. Prove the pane absent from
+  `herdr pane list`; for a seat owning its tab, use `herdr tab close <tab>` at its recorded tab id
+  after the final owned pane closes, and prove the tab absent from `herdr tab list`. A shared tab
+  with a pending sibling stays open. Never assume emptied tabs disappear without checking.
+- **On Orca (`TERM_PROGRAM=Orca` and non-empty `ORCA_TERMINAL_HANDLE`)**: verify ownership with
+  `orca terminal list --include-visual-layouts --json`: the spawn record's address is the leaf handle,
+  its title is the live TAB title (never the shell's pane title), and its checkout matches the layout
+  worktree and terminal row. An unbound checkout or truncated listing is unverifiable and closes nothing.
+  Only then use `orca terminal close --terminal <handle> --json` with the recorded handle. Require
+  `result.close.handle` equal to that handle, or the documented live-terminal refusal
+  `ok:false`, `error.code:runtime_error`, `error.message:tab_not_found` from that same runtime.
+  Prove the handle absent from `orca terminal list --json` AND its owned tab absent from
+  `orca terminal list --include-visual-layouts --json` after its final terminal closes, in the same
+  runtime as the pre-close listing. A surviving owned tab is a spec question, never permission to
+  close by title. The Orca smoke e2e asserts this tab leg; a receipt alone is no close proof.
+
 ## Specialist pipeline rules
 
 ### On herdr (`HERDR_ENV=1`) — specialist panes
 
-- **Dedicated consultant tab**: Consultants (agents spawned to gather synthesis input for decisions like SCOPER analysis or architectural reviews) must run in a DEDICATED tab separate from the ORCHESTRATOR tab. When the orchestrator stands down, the consultant panes should persist so their assessments remain available for review and reference.
-- **Scoper worktree rule**: The SCOPER (or any worktree-based specialist synthesizing into the spec pipeline) must do ALL git operations in a dedicated worktree (e.g., `git worktree add /private/tmp/tkr-scoper-v155 -b spec/...`), never switching the main checkout's branch. This prevents race conditions between the specialist's branch operations and the orchestrator's shipping logic.
+- **Dedicated consultant tab**: Consultants (agents spawned to gather synthesis input for decisions like SCOPER analysis or architectural reviews) must run in a DEDICATED tab separate from the ORCHESTRATOR tab. The dedicated consultant tab persists beyond an orchestrator retirement only while the mission continues; the latest settled round follows mission-end teardown at that mission's end (queue row 240; D-2138 add.1 R3).
+- **Scoper worktree rule**: The SCOPER (or any worktree-based specialist synthesizing into the spec pipeline) must do ALL git operations in a dedicated worktree in the seats-directory home `<repo>-seats/<name>` (e.g., `git worktree add -b spec/<mission> <repo>-seats/scoper-<mission>`), never switching the main checkout's branch. Append its path, scoper purpose, owner seat and mission-end removal condition to `.tickmarkr/overseer/checkouts.ledger` before use. The hand-made checkout law (queue row 240; D-2138 add.1 R4, add.4) governs it: at mission end remove only a clean owned checkout with no keep reason using `git worktree remove <repo>-seats/scoper-<mission>` without force and close its line; dirty or kept checkouts stay and are reported. Before removing a detached HEAD, prove reachability from a retained named ref with `git for-each-ref --contains <sha>`, otherwise pin `refs/tickmarkr/preserved/<sha>` and write that handle on its ledger line first. This prevents race conditions between the specialist's branch operations and the orchestrator's shipping logic.
 - **One fresh pane per consult ROUND** (operator rule, 2026-08-04): every consult round spawns a NEW pane in
   the consult tab rather than re-prompting the seat that answered last round — unless there is a stated
   reason to reuse. Two payoffs: each round starts with a clean context window instead of inheriting the
   previous round's, which is what fills a long mission's seats and forces mid-mission `/clear`; and the
   prior round's pane persists as a readable record of what that seat actually saw and said. Reuse only when
   continuity of the seat's own reasoning is the point, and say so when you do.
-- **CLOSE WHAT YOU SPAWNED** (operator observation, 2026-08-04: *"orch doesn't auto close the panes that he
-  created when no more needed"*). Panes accumulate silently — one mission reached **15 panes and 10 tabs**,
-  ten of them holding live agent sessions for work that had been on disk and fully consumed for hours.
-  Neither seat cleaned up, because neither had been told to.
-  - **Whoever spawns a pane owns closing it.** The orchestrator closes its workers; the overseer closes the
-    consultants and sweeps it spawned. The overseer sweeps whatever is left at mission end.
-  - **Verify the deliverable is ON DISK before closing** — a pane is the only place an unwritten finding
-    exists, and an agent that rendered "Done" without writing its artifact did not deliver (the
-    trust-disk-over-transcripts rule — cited by NAME, because a renumbered list orphans a "rule N").
-    **Non-empty is the FLOOR, not the test: completeness is the artifact's own TERMINAL MARKER.** One
-    consult verdict was 10KB on disk while its seat still read `working` — size proved it had started, and
-    only the closing `VERDICT:` line proved it had finished. Require the terminal marker a report is
-    supposed to end with, per seat, then close.
-  - **A pane is not an archive; the report is.** Once a worker's findings are written and synthesized, its
-    transcript adds nothing the report does not.
-  - **KEEP: the active seat, and the most recent SETTLED consult round.** That last one earns its place —
-    re-prompting the seat that found a defect to confirm its own fix is cheaper and stricter than briefing
-    a fresh one, which is the stated-reason exception above. Close consult rounds only once a later round
-    has re-derived their findings.
-  - Emptied tabs disappear on their own; do not close tabs by hand.
-  - **CLOSE IT AUTOMATICALLY, because remembering is what fails.** `watch-artifacts.sh` already fires on
-    the one signal that means a seat is finished — the artifact plus its terminal marker — so hand it the
-    panes too: `TKR_CLOSE_PANES="w1:p1,w1:p2" watch-artifacts.sh …`. It closes them on completion and
-    **never on timeout**, where the seats are still working. Closing on the marker cannot reap a seat
-    mid-write, which is exactly why `done` would be the wrong trigger.
+- **CLOSE WHAT YOU SPAWNED**: apply the universal mission-end teardown, including the spawn record
+  ownership check and current mission's stand-down. The spawner is responsible for closure.
+  Keep the active seat and latest settled consult round while the mission continues; at its end close
+  or name the next mission and clear before reuse (queue row 240; D-2138 add.1 R3, add.4).
+  - For a seat owning its tab, after verified `herdr pane close <pane>`, explicitly use
+    `herdr tab close <tab>` at the recorded tab id and prove absence from `herdr tab list`; shared tabs
+    stay while a pending sibling owns a pane. The spawn record must match live label and checkout first.
+  - **Automatic closure**: `TKR_CLOSE_PANES="w1:p1,w1:p2" watch-artifacts.sh …` supplies one recorded
+    pane address per artifact, in argument order. Both all-complete and wake-on-any exits close only
+    completed artifacts with current-mission stood-down files and verified ledger identity, never
+    pending siblings or timeout. No ledger record means a reported refusal and an open pane.
+    Do not arm closure for the latest settled consult round while its mission continues.
 
 - **MEASURE BEFORE EVERY SPLIT, AND JOIN *DOWN* WHEN A RIGHT-SPLIT WOULD GO UNDER THE FLOOR.**
   **Operator-observed 2026-08-06, with a screenshot:** five consult panes in one tab rendered **14 columns
@@ -1593,7 +1693,7 @@ At seat spawn, arm file/journal watchers for artifact completion, run events, mi
 
 ### On Orca (`TERM_PROGRAM=Orca` and non-empty `ORCA_TERMINAL_HANDLE`) — specialist terminals
 
-Create specialist seats using `orca terminal create --worktree path:<repo> --command "<agent-cmd>" --json` and record each returned handle. For a deliberate split use `orca terminal split --terminal <owned-handle> --direction horizontal --command "<agent-cmd>" --json`, retaining the child receipt. Deliver briefs with `terminal send --enter --wait-submit 15`, verify observed submission (`result.send.prompt.stages.includes("turn_started")`), and collect files beside `orca terminal read --terminal <handle> --screen --json`. File/journal completion watchers close only recorded seats after the terminal artifact marker; timeout never authorizes closure.
+Create specialist seats using `orca terminal create --worktree path:<repo> --command "<agent-cmd>" --json` and record each returned handle. For a deliberate split use `orca terminal split --terminal <owned-handle> --direction horizontal --command "<agent-cmd>" --json`, retaining the child receipt. Deliver briefs with `terminal send --enter --wait-submit 15`, verify observed submission (`result.send.prompt.stages.includes("turn_started")`), and collect files beside `orca terminal read --terminal <handle> --screen --json`. Completion watchers use the universal mission-end teardown: artifact plus terminal marker, current-mission stand-down read back, and spawn ledger matched to the live tab title and checkout before closing the recorded handle with `orca terminal close --terminal <handle> --json`; require the handle receipt or documented live refusal, handle absence and final owned-tab absence. Timeout never authorizes closure (queue row 240; D-2138 add.4).
 
 ## Non-negotiable rules
 

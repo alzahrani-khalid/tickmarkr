@@ -286,7 +286,7 @@ describe("gate fingerprint — copied evidence is one occurrence (OBS-1106)", ()
   const occurrences = (evs: JournalEvent[], red: JournalEvent) =>
     identicalGateFailures(evs, "T1", "test", normalizeGateFailure(String(red.data.details)));
   /** Worker steps: the first lands t1.txt, every later one lands `later` (nothing, or a new commit). */
-  const repoWith = (red: string, later: (i: number) => string) => setupRepo(
+  const repoWith = (red: string, later: (i: number) => string, extraCfg = "") => setupRepo(
     [T("T1", { gates: ["build", "test", "lint", "evidence", "scope", "acceptance"] })],
     {
       consult: { action: "human", notes: "operator decides" },
@@ -295,7 +295,7 @@ describe("gate fingerprint — copied evidence is one occurrence (OBS-1106)", ()
         ...Array.from({ length: 8 }, (_, i) => ({ shell: later(i), result: { ok: true, summary: `step ${i}` } })),
       ] },
     },
-    stringify({ gates: { build: "true", test: `[ ! -f t1.txt ] || { ${red}; }`, lint: "true" } }),
+    stringify({ gates: { build: "true", test: `[ ! -f t1.txt ] || { ${red}; }`, lint: "true" } }) + extraCfg,
   );
 
   test("test: the production daemon counts cache or journal copies as one failure across resume and forces a fresh execution after a no-commit timeout repair versus counting an independent repeated red as two, so copied evidence buying a fingerprint-cap escalation fails", async () => {
@@ -387,7 +387,8 @@ describe("gate fingerprint — copied evidence is one occurrence (OBS-1106)", ()
     // inside its forced battery before the test row, still owes that one fresh execution -------------
     for (const cut of ["after-repair-result", "inside-forced-battery"] as const) {
       const runId = `run-timeout-fresh-crash-${cut}`;
-      const { repo, fake } = repoWith(TIMEOUT, () => "true");
+      // Queue row 240 (D-2138): truncating a completed journal simulates a crash only while its checkout survives.
+      const { repo, fake } = repoWith(TIMEOUT, () => "true", "visibility: { keepPanes: forever }\n");
       await runDaemon(repo, { adapters: [fake], runId });
       const journal = Journal.open(repo, runId);
       const lived = journal.read();

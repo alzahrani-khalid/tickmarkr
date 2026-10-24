@@ -2299,6 +2299,43 @@ function endedRunIdsForReconcile(repoRoot: string): Set<string> {
   return ended;
 }
 
+// Queue row 240 (D-2138): ownership comes only from dispatch rows in this checkout's runs directory.
+async function removeJournaledTaskWorktrees(repo: string, owner: Journal, current: Journal, activeBranch?: string): Promise<void> {
+  let events: JournalEvent[];
+  try { events = owner.read(); }
+  catch { return; } // Queue row 240 (D-2138): unreadable ownership proves no task checkout.
+  const branch = activeBranch ?? events.find((e) => e.event === "run-start")?.data.branch;
+  if (typeof branch !== "string") return;
+  await cleanupRunWorktrees(repo, branch, {
+    removeTaskIds: events.flatMap((e) => e.event === "task-dispatch" && e.taskId ? [e.taskId] : []),
+    run: owner.runId, by: current.runId,
+    producer: (task) => knownProducer(events, task),
+    append: (event, task, data) => {
+      // Queue row 240 (D-2138): the recovery handle retains its terminal task reason without reopening the decision.
+      const terminal = task && [...events].reverse().find((e) => e.taskId === task
+        && ["task-human", "task-failed", "task-done", "task-dispatch"].includes(e.event));
+      const reason = terminal && terminal.data.reason;
+      owner.append(event, task, { ...data, ...(typeof reason === "string" ? { reason } : {}) });
+    },
+    failed: (data) => current.append("worktree-removal-failed", undefined, data),
+  });
+}
+
+async function sweepDeadRunWorktrees(repo: string, current: Journal): Promise<void> {
+  let runs: string[];
+  try { runs = readdirSync(join(tickmarkrDir(repo), "runs")); } catch { return; }
+  for (const run of runs) {
+    if (run === current.runId) continue;
+    try {
+      const owner = Journal.open(repo, run);
+      const lifecycle = [...owner.read()].reverse().find((e) => e.event === "run-start" || e.event === "run-resume");
+      const pid = lifecycle?.data.pid;
+      if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0 || isPidLive(pid)) continue;
+      await removeJournaledTaskWorktrees(repo, owner, current);
+    } catch { /* Queue row 240 (D-2138): unreadable ownership proves nothing and never refuses a start. */ }
+  }
+}
+
 export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promise<RunSummary> {
   // OBS-1045: a daemon launched from inside a leased command (a nested runner, an operator's test
   // shell) inherits its ancestor's lease token through the environment, and every gate it ran would
@@ -3305,6 +3342,8 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
   // every live or unknown run remains spared.
   await reconcile();
 
+  if (!keepForever) await sweepDeadRunWorktrees(repoRoot, journal);
+
   // v1.4 self-reference guard: a random nonce on the worker trailer AND exit marker. Displayed
   // source/diffs (e.g. a worker editing tickmarkr's own prompt.ts/daemon.ts) can't know it, so an echoed
   // TICKMARKR_RESULT/TICKMARKR_EXIT literal can never premature-harvest the worker. Quote-split keeps the
@@ -3643,6 +3682,57 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     // row is deliberately written before the later worktree-recreation row so the journal cannot
     // describe only the commits it carried while omitting uncommitted work the removal destroyed.
     const producerNow = (): PreserveProducer => knownProducer(journal.read(), t.id);
+    // Queue row 240 (D-2138): absence of a directory says nothing about its recorded work.
+    type TaskWork = { head?: string; commits: string[]; snapshot?: string; rebuiltFrom?: "removal" | "branch"; error?: string };
+    const readTaskWork = async (taskBase: string, priorWt: string, events = journal.read()): Promise<TaskWork> => {
+      if (existsSync(priorWt)) return { head: await gitHead(priorWt), commits: await commitsAheadOf(taskBase, priorWt) };
+      const taskBranch = `${branch}--${t.id}`;
+      try {
+        const read = async (command: string): Promise<string> => {
+          const result = await shGit(command, repoRoot);
+          if (result.code !== 0) throw new Error(result.stderr || result.stdout || `git exited ${result.code}`);
+          return result.stdout.trim();
+        };
+        const ahead = async (head: string) => (await read(`git log --reverse --format=%H ${shq(taskBase)}..${shq(head)}`)).split("\n").filter(Boolean);
+        const ancestor = async (base: string, head: string): Promise<boolean> => {
+          const result = await shGit(`git merge-base --is-ancestor ${shq(base)} ${shq(head)}`, repoRoot);
+          if (result.code !== 0 && result.code !== 1) throw new Error(result.stderr || result.stdout || `ancestry exited ${result.code}`);
+          return result.code === 0;
+        };
+        const branchRef = `refs/heads/${taskBranch}`;
+        const exists = await shGit(`git show-ref --verify --quiet ${shq(branchRef)}`, repoRoot);
+        if (exists.code !== 0 && exists.code !== 1) throw new Error(exists.stderr || exists.stdout || `branch read exited ${exists.code}`);
+        const tip = exists.code === 0 ? await read(`git rev-parse --verify ${shq(`${branchRef}^{commit}`)}`) : undefined;
+        const removalAt = events.map((e) => e.event === "worktree-removed" && e.data.task === t.id).lastIndexOf(true);
+        const removal = events[removalAt];
+        if (removal && !events.slice(removalAt + 1).some((e) => e.event === "worktree-recreation" && e.taskId === t.id)
+          && typeof removal.data.head === "string") {
+          const resolved = await shGit(`git rev-parse --verify ${shq(`${removal.data.head}^{commit}`)}`, repoRoot);
+          const head = resolved.stdout.trim();
+          if (resolved.code === 0 && head && (!tip || await ancestor(tip, head))) {
+            const commits = await ahead(head);
+            let snapshot: string | undefined;
+            if (typeof removal.data.ref === "string") {
+              const pinned = await read(`git rev-parse --verify ${shq(`${removal.data.ref}^{commit}`)}`);
+              if (pinned !== head) snapshot = removal.data.ref;
+            }
+            return { head, commits, snapshot, rebuiltFrom: "removal" };
+          }
+        }
+        if (!tip) return { commits: [] };
+        const commits = await ahead(tip);
+        if (commits.length === 0) return { commits: [] };
+        const dispatch = [...events].reverse().find((e) => e.event === "task-dispatch" && e.taskId === t.id);
+        const base = dispatch?.data.base === undefined ? events.find((e) => e.event === "run-start")?.data.baseRef : dispatch.data.base;
+        if (typeof base !== "string" || !await ancestor(base, tip)) throw new Error("tip does not descend from its recorded dispatch base");
+        const ref = `refs/tickmarkr/preserved/${tip}`;
+        await read(`git update-ref ${shq(ref)} ${shq(tip)}`);
+        journal.append("worktree-preserved", t.id, { ref, ...producerFields(producerNow()) });
+        return { head: tip, commits, rebuiltFrom: "branch" };
+      } catch (error) {
+        return { commits: [], error: `Queue row 240 (D-2138): cannot rebuild task branch ${taskBranch}: ${error instanceof Error ? error.message : String(error)}` };
+      }
+    };
     const recreateTaskWorktree = async (taskBranch: string, taskBase: string, priorWt: string) => {
       const producer = producerNow();
       const ref = await preserveWorktree(priorWt, producer);
@@ -4417,7 +4507,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     // unfinished attempt, a pane holding another attempt's trailer, or cleanup that cannot be proven
     // is declined onto the ordinary recovery path. A harvest an earlier resume recorded is gated again,
     // never recorded twice.
-    const harvestInterruptedAttempt = async (): Promise<Assignment | undefined> => {
+    const harvestInterruptedAttempt = async (): Promise<Assignment | "parked" | undefined> => {
       const found = interruptedAttempt(journal.read(), t.id);
       if (!found || (!found.launch && !found.result)) return found?.assignment;
       const { attempt } = found;
@@ -4457,7 +4547,12 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           const uncertain = await reapOwned(found.launch.slot, found.launch);
           if (uncertain) return decline(uncertain);
         }
-        const commits = existsSync(wt) ? await commitsAheadOf(published, wt) : [];
+        const work = await readTaskWork(published, wt);
+        if (work.error) {
+          await park(t, work.error, "infra", found.assignment, rs?.attempts ?? 0, startMs, gateFails, consults, tokens, metered, retryMode);
+          return "parked";
+        }
+        const commits = work.commits;
         if (!found.result.finished && commits.length === 0) return decline("unfinished");
         recordHarvest(commits, found.result.finished, found.result.summary);
         return found.assignment;
@@ -4506,6 +4601,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       return found.assignment;
     };
     const harvestAuthor = rs && !satisfiedGate && !replayedGates && !recheck ? await harvestInterruptedAttempt() : undefined;
+    if (harvestAuthor === "parked") return;
     // OBS-1202: a recheck bound to a stall park that recorded a reapFailure re-verifies the parked
     // attempt's owned census through the same reapWorker a live harvest uses, BEFORE any gate reads
     // its tree. Only a complete, empty census releases the harvested commits to the battery; an
@@ -4557,7 +4653,12 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       const preservedRef = recheck
         ? effectiveEvents(journal.read()).reverse().find((e) => e.taskId === t.id && e.event === "task-approved" && e.data.release === RECHECK_RELEASE)?.data.recheckedRef as string | undefined
         : undefined;
-      if (!existsSync(priorWt) && !preservedRef) {
+      const work = preservedRef ? undefined : await readTaskWork(taskBase, priorWt);
+      if (work?.error) {
+        await park(t, work.error, "infra", assignment, rs?.attempts ?? 0, startMs, gateFails, consults, tokens, metered, retryMode);
+        return;
+      }
+      if (!work?.head && !preservedRef) {
         if (satisfiedGate || recheck) throw new Error(`${recheck ? "recheck" : `approved gate ${satisfiedGate}`} cannot resume: task worktree is missing`);
         // Observed passes are an optimization, never authority: without the task worktree there is no
         // commit to compare and no landed work to gate, so fall through to the ordinary worker path.
@@ -4571,9 +4672,14 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           : satisfiedGate
             ? `approved gate ${satisfiedGate}`
             : `recorded gates on ${replayedGates!.commit.slice(0, 10)}`;
-      const priorTaskTip = preservedRef ? (await shGit(`git rev-parse ${shq(preservedRef)}`, repoRoot)).stdout.trim() : await gitHead(priorWt);
-      const priorTaskSubject = await gateCommitSubject(taskBase, priorTaskTip, preservedRef ? repoRoot : priorWt);
-      const commitsToCarry = preservedRef ? await commitsAheadOfRef(taskBase, priorTaskTip, repoRoot) : await commitsAheadOf(taskBase, priorWt);
+      const priorTaskTip = preservedRef ? (await shGit(`git rev-parse ${shq(preservedRef)}`, repoRoot)).stdout.trim() : work!.head!;
+      const priorTaskSubject = await gateCommitSubject(taskBase, priorTaskTip, preservedRef || work?.rebuiltFrom ? repoRoot : priorWt);
+      const commitsToCarry = preservedRef ? await commitsAheadOfRef(taskBase, priorTaskTip, repoRoot) : [...work!.commits];
+      // Queue row 240 (D-2138): rechecking a dirt refusal gates the committed work as a present checkout did.
+      // The refused bytes remain recoverable; an explicitly checked ref still selects its exact tree.
+      const dirtRecheck = recheck && [...journal.read()].reverse()
+        .find((e) => e.taskId === t.id && e.event === "gate-result")?.data.dirtyWorktree === true;
+      if (work?.snapshot && !dirtRecheck) commitsToCarry.push(work.snapshot);
       // 2.8.1 T2 (ANL-023 §7.2): a task with a recorded merge whose prior tip is PROVEN in E (`merge-base --is-ancestor`
       // exit 0 — an empty or failed history read is no proof) keeps that tip as its gated subject — recreated on E it
       // would be gated AT E, and a sibling's publication since its merge would hide the recorded merge. Nothing is gated
@@ -4606,6 +4712,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         satisfiedGate = journal.replaySatisfiedGates(new Map([[t.id, currentTaskSubject]])).get(t.id);
       }
       journal.append("worktree-recreation", t.id, {
+        ...(work?.rebuiltFrom ? { rebuiltFrom: work.rebuiltFrom } : {}),
         attempted: commitsToCarry, carried: carriedCommits, ...(accountedCommits.length > 0 ? { accounted: accountedCommits } : {}),
       });
       // OBS-212: same fail-closed rule as the dispatch path — but this path is worse, because it runs
@@ -5166,6 +5273,15 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         });
       }
       lastContextTokens = undefined;
+      const taskBase = published; // deps are merged → visible to this task (E, never the ref as it stands)
+      const taskBranch = `${branch}--${t.id}`;
+      const priorWt = worktreePath(repoRoot, taskBranch);
+      const recreating = existsSync(priorWt);
+      const work = await readTaskWork(taskBase, priorWt, journaledSoFar);
+      if (work.error) {
+        await park(t, work.error, "infra", assignment, attempt, startMs, gateFails, consults, tokens, metered, retryMode);
+        return;
+      }
       graph = setStatus(graph, t.id, "running");
       saveGraph(repoRoot, graph);
       await trackedDriver.project?.(t.id, "in-progress");
@@ -5176,6 +5292,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       const workerDispatchOrdinal = nextWorkerDispatchOrdinal++;
       vendorEscalated.delete(channelKey(assignment)); // dispatched now: from here on it IS tried
       journal.append("task-dispatch", t.id, {
+        base: taskBase,
         ...(scopeApproval?.data.release === "scope-request" ? { files: t.files, graphDefinitionHash: graphDefinitionHash(graph) } : {}),
         assignment, attempt, workerDispatchOrdinal, provenance: dispatchProvenance([
           channelKey(assignment) === channelKey(r.assignment) ? r.provenance
@@ -5194,16 +5311,17 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       });
       journal.phaseStart(t.id, "worker", { attempt, assignment });
 
-      const taskBase = published; // deps are merged → visible to this task (E, never the ref as it stands)
-
       taskBases.set(t.id, taskBase);
-      const taskBranch = `${branch}--${t.id}`; // "--": a ref can't nest under the existing integration branch (locked decision 10)
-      const priorWt = worktreePath(repoRoot, taskBranch);
-      const recreating = existsSync(priorWt);
-      // Carry the interrupted worker's snapshot, never incidental files created by later gates.
-      const preserved = recreating ? reapedWorktreeRef : undefined;
+      // Queue row 240 (D-2138): read a missing checkout like a present one: its recorded removal first,
+      // with its preserved snapshot carried as a reaped worker's is; else a task branch proven by its
+      // journaled dispatch base or the run-start base; else nothing. Never reset a branch holding commits unproven.
+      // Queue row 240 (D-2138): like recheck, a dispatch after a dirt refusal carries committed work only;
+      // the refused bytes remain recoverable from their ref, as when the prior checkout was present.
+      const dirtRefusal = [...journaledSoFar].reverse()
+        .find((e) => e.taskId === t.id && (e.event === "gate-result" || e.event === "task-dispatch"))?.data.dirtyWorktree === true;
+      const preserved = recreating ? reapedWorktreeRef : dirtRefusal ? undefined : work.snapshot;
       reapedWorktreeRef = undefined;
-      const commitsToCarry = recreating ? await commitsAheadOf(taskBase, priorWt) : [];
+      const commitsToCarry = [...work.commits];
       if (preserved) commitsToCarry.push(preserved);
       const wt = await recreateTaskWorktree(taskBranch, taskBase, priorWt);
       // OBS-58: quota-failover and every retry recreate the task worktree from the integration tip —
@@ -5211,8 +5329,9 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       // orphan work a consult already verified as landed.
       const { carried: carriedCommits, accounted: accountedCommits } = commitsToCarry.length > 0
         ? await cherryPickCommits(wt, commitsToCarry) : { carried: [], accounted: [] };
-      if (recreating) {
+      if (recreating || work.rebuiltFrom) {
         journal.append("worktree-recreation", t.id, {
+          ...(work.rebuiltFrom ? { rebuiltFrom: work.rebuiltFrom } : {}),
           attempted: commitsToCarry, carried: carriedCommits, ...(accountedCommits.length > 0 ? { accounted: accountedCommits } : {}),
         });
       }
@@ -7543,8 +7662,10 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     }
     journal.append("run-end", undefined, { ...summary });
     await reconcile(); // run-end boundary: nothing in flight — full sweep (empty desired set)
-    // OBS-28: lingering worktrees starve CLI probes; keepPanes:forever is the debug override.
-    if (!keepForever) await cleanupRunWorktrees(repoRoot, branch, { removeTaskIds: summary.done });
+    // Queue row 240 (D-2138): every task checkout of this run is removed once its recovery ref is recorded,
+    // unless keepPanes is forever. A dead run's leftovers go at the next daemon start in the same checkout.
+    // Only journaled task checkouts are touched; no directory listing or in-use check exists.
+    if (!keepForever) await removeJournaledTaskWorktrees(repoRoot, journal, journal, branch);
     // VIS-02: name each blocked subtree by its nearest parked/failed root, e.g. "3 blocked behind P40-02".
     const attribution = [...attributeBlocked(graph).entries()]
       .sort(([a], [b]) => a.localeCompare(b))

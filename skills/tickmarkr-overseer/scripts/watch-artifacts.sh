@@ -15,10 +15,9 @@
 #
 # Prints one wake reason and EXITS. Re-arm after every wake.
 #
-# TKR_CLOSE_PANES="w1:p1,w1:p2" closes those panes when every artifact completes — the answer to panes
-# accumulating because nobody was watching for "this seat is finished". It fires ONLY on completion,
-# never on timeout. Operator-observed 2026-08-06: five consult panes in one tab left each 14 columns
-# wide and unreadable, because closing was a step someone had to remember.
+# Queue row 240; D-2138 add.1 R3, add.4: optional close lists carry ONE recorded address per
+# artifact, in argument order. Completion wakes on delivery; closure additionally requires the
+# current mission's stand-down and live identity matching the spawn ledger. Never close on timeout.
 set -u
 # macOS ships bash 3.2, where `set -u` makes "${arr[@]}" on an EMPTY array a fatal unbound-variable
 # error. Every expansion below therefore uses the ${arr[@]+"${arr[@]}"} guard. Caught by the timeout
@@ -38,6 +37,19 @@ POLL="${3:?}"
 shift 3
 [ "$#" -gt 0 ] || { echo "watch-artifacts: no files given" >&2; exit 2; }
 
+# Refuse ambiguous arming before watching anything; preserve empty fields for count validation.
+CLOSE_HOST=""
+CLOSE_ADDRESSES="${TKR_CLOSE_TERMINALS:-${TKR_CLOSE_PANES:-}}"
+if [ -n "${TKR_CLOSE_TERMINALS:-}" ] && [ -n "${TKR_CLOSE_PANES:-}" ]; then
+  echo "watch-artifacts: choose one host close list" >&2; exit 2
+fi
+if [ -n "$CLOSE_ADDRESSES" ]; then
+  if [ -n "${TKR_CLOSE_TERMINALS:-}" ]; then CLOSE_HOST=orca; else CLOSE_HOST=herdr; fi
+  node -e 'const a=process.argv[1].split(","); if(a.length!==Number(process.argv[2]) || a.some(x=>!x.trim())) process.exit(2)' "$CLOSE_ADDRESSES" "$#" || {
+    echo "watch-artifacts: close list requires one recorded address per artifact in argument order" >&2; exit 2;
+  }
+fi
+
 # OBS-848: ownership is a pid-file fact, never an argv/path pattern. Two tiers intentionally watch
 # the same artifacts, so the journal/file argument cannot identify which watcher a seat may retire.
 PID_DIR="${TKR_STATE_DIR:-.tickmarkr}/overseer/pids"
@@ -55,7 +67,7 @@ trap clear_pid EXIT
 # two that happened to be in view at the time. Class, not instance.
 END=$((SECONDS + CAP))
 
-# A file is DONE when the marker appears in its last few lines AND the file has stopped growing.
+# Queue row 240; D-2138 add.4: DONE requires the marker on the final line and stable content.
 #
 # Anchored to the tail on purpose: a report that merely *mentions* its own marker mid-body has not
 # finished, and grepping the whole file would call that done. This brief tells seats to end the file with
@@ -110,7 +122,7 @@ done
 done_file() {                  # $1 = index into "$@", $2 = path
   local i="$1" f="$2" sig
   [ -s "$f" ] || return 1
-  tail -5 "$f" 2>/dev/null | grep -qF -- "$MARKER" || return 1
+  tail -n 1 "$f" 2>/dev/null | grep -qF -- "$MARKER" || return 1
   # CONTENT HASH, not size+mtime. The first version of this used `stat` size and mtime and the drill
   # killed it on the incident's own shape: the correction that cost a ruling was `23 WEAK · 19 SOUND`
   # -> `25 WEAK · 17 SOUND`, which is **byte-identical in length**, and mtime is whole seconds. A
@@ -124,12 +136,136 @@ done_file() {                  # $1 = index into "$@", $2 = path
   return 1
 }
 
+# Queue row 240; D-2138 add.4 U04/U05/U08/U09, add.6 V01: both completion exits use
+# this path. A bare address, title alone or old mission's stand-down never licenses a close.
+close_completed() {
+  [ -n "$CLOSE_HOST" ] || return 0
+  node - "$PID_DIR" "$CLOSE_HOST" "$CLOSE_ADDRESSES" ${READY_INDEXES[@]+"${READY_INDEXES[@]}"} <<'NODE'
+const fs = require("fs");
+const path = require("path");
+const { spawnSync } = require("child_process");
+const [dir, host, addresses, ...ready] = process.argv.slice(2);
+const canonical = p => { try { return fs.realpathSync(p); } catch { return path.resolve(p); } };
+const field = (o) => typeof o === "string" && o ? o : undefined;
+const checkout = o => field(o.worktree) || field(o.worktreePath) || field(o.worktree_path)
+  || field(o.worktree?.path) || (field(o.worktreeId)?.split("::").slice(1).join("::"))
+  || field(o.path) || field(o.cwd);
+const same = (a, b) => !!a && !!b && canonical(a) === canonical(b);
+function record(file) {
+  const raw = fs.readFileSync(file, "utf8");
+  const entries = raw.trim().split("\n").map(line => { const i = line.indexOf("="); return [line.slice(0, i), line.slice(i + 1)]; });
+  if (entries.some(([k]) => !k) || new Set(entries.map(([k]) => k)).size !== entries.length) throw Error("malformed spawn/stand-down record");
+  return { raw, values: Object.fromEntries(entries) };
+}
+function call(args, refusal = false) {
+  const r = spawnSync(host, args, { encoding: "utf8", timeout: 10000 });
+  if (r.error || r.signal) throw Error("host call unreadable or timed out");
+  let body; try { body = JSON.parse(r.stdout); } catch { throw Error("host response is not JSON"); }
+  if (refusal && r.status === 1 && body.ok === false && body.error?.code === "runtime_error" && body.error?.message === "tab_not_found") return body;
+  if (r.status !== 0 || body.ok === false || !body.result) throw Error("host call refused");
+  return body;
+}
+function orcaList(visual = true) {
+  const body = call(["terminal", "list", ...(visual ? ["--include-visual-layouts"] : []), "--limit", "10000", "--json"]);
+  if (body.ok !== true || !body._meta?.runtimeId || body._meta.runtimeId === "none" || body.result.truncated === true
+    || !Array.isArray(body.result.terminals) || (visual && !Array.isArray(body.result.visualLayouts))) throw Error("unverifiable terminal list");
+  return body;
+}
+function tabs(node, out = []) {
+  if (Array.isArray(node)) node.forEach(n => tabs(n, out));
+  else if (node && typeof node === "object") {
+    if (Array.isArray(node.tabs)) out.push(...node.tabs);
+    tabs(node.first, out); tabs(node.second, out);
+  }
+  return out;
+}
+function leaves(node, out = []) {
+  if (Array.isArray(node)) node.forEach(n => leaves(n, out));
+  else if (node && typeof node === "object") {
+    if (node.type === "terminal" && field(node.handle)) out.push(node.handle);
+    else { leaves(node.panes, out); leaves(node.first, out); leaves(node.second, out); }
+  }
+  return out;
+}
+function liveTabs(body) {
+  return body.result.visualLayouts.flatMap(layout => tabs(layout.root).map(tab => ({ tab, checkout: checkout(layout), handles: leaves(tab.panes) })));
+}
+function paneList() {
+  const result = call(["pane", "list"]).result;
+  if (!Array.isArray(result.panes)) throw Error("unverifiable pane list");
+  return result.panes;
+}
+for (const index of ready) {
+  let attempted = false;
+  const address = addresses.split(",")[Number(index)];
+  try {
+    if (address === process.env.ORCA_TERMINAL_HANDLE || address === process.env.HERDR_PANE_ID) throw Error("own launching terminal");
+    const matches = fs.readdirSync(dir).filter(n => n.endsWith(".handle")).map(n => ({ file: path.join(dir, n), seat: n.slice(0, -7), ...record(path.join(dir, n)) }))
+      .filter(r => r.values.address === address && r.values.host === host);
+    if (matches.length !== 1) throw Error("no unique spawn ledger record names address");
+    const r = matches[0], v = r.values;
+    if (!v.title || !v.checkout || !v.mission) throw Error("incomplete spawn ledger");
+    if (r.seat === process.env.TKR_ARMING_SEAT) throw Error("own arming seat");
+    if (v.next_mission || v["next-mission"]) throw Error("named next mission keeps seat open until clear and reassignment");
+    const stood = path.join(dir, `${r.seat}.stood-down`);
+    const stoodDown = () => {
+      if (record(r.file).raw !== r.raw) throw Error("spawn ledger changed during verification");
+      if (record(stood).values.mission !== v.mission) throw Error("stand-down does not name current mission");
+    };
+    stoodDown();
+    if (host === "orca") {
+      const before = orcaList();
+      const rows = before.result.terminals.filter(t => t.handle === address);
+      const allTabs = liveTabs(before);
+      const owned = allTabs.filter(t => t.tab.title === v.title && same(t.checkout, v.checkout) && t.handles.includes(address));
+      if (rows.length !== 1 || !same(checkout(rows[0]), v.checkout) || owned.length !== 1) {
+        // Read-only re-resolution by title. Never substitute this candidate into a close command.
+        const candidates = allTabs.filter(t => t.tab.title === v.title && same(t.checkout, v.checkout)).flatMap(t => t.handles);
+        for (const handle of candidates) call(["terminal", "read", "--terminal", handle, "--screen", "--json"]);
+        throw Error("live tab title and checkout mismatch or stale handle; read-only re-resolution by title");
+      }
+      const tab = owned[0], tabId = tab.tab.id ?? tab.tab.tabId ?? rows[0].tabId;
+      if (!tabId) throw Error("owned tab id is unverifiable");
+      const finalTerminal = tab.handles.length === 1;
+      stoodDown();
+      attempted = true;
+      const receipt = call(["terminal", "close", "--terminal", address, "--json"], true);
+      if (receipt._meta?.runtimeId !== before._meta.runtimeId) throw Error("runtime changed at close");
+      if (receipt.ok !== false && (receipt.ok !== true || receipt.result?.close?.handle !== address)) throw Error("close receipt does not name recorded handle");
+      const after = orcaList(false), layoutAfter = orcaList();
+      if (after._meta.runtimeId !== before._meta.runtimeId || layoutAfter._meta.runtimeId !== before._meta.runtimeId
+        || after.result.terminals.some(t => t.handle === address)
+        || (finalTerminal && liveTabs(layoutAfter).some(t => (t.tab.id ?? t.tab.tabId) === tabId || (t.tab.title === v.title && same(t.checkout, v.checkout))))
+        || (!finalTerminal && tab.handles.filter(h => h !== address).some(h => !after.result.terminals.some(t => t.handle === h)))) throw Error("handle or final owned tab survives close, sibling disappeared, or runtime changed; spec question, never close by title");
+      console.log(`  CLOSED ${address}: receipt ${receipt.ok === false ? "runtime_error: tab_not_found" : receipt.result.close.handle}; handle absent from terminal list; ${finalTerminal ? `owned tab ${tabId} absent from visual layout` : `shared tab ${tabId} kept for sibling terminals`}`);
+    } else {
+      const before = paneList(), rows = before.filter(p => p.pane_id === address);
+      if (rows.length !== 1 || rows[0].label !== v.title || !same(rows[0].cwd, v.checkout)) throw Error("live pane label and checkout mismatch");
+      stoodDown();
+      attempted = true;
+      call(["pane", "close", address]);
+      const after = paneList();
+      if (after.some(p => p.pane_id === address)) throw Error("pane survives close");
+      // A shared consultant tab belongs to several seats. Only a recorded sole owner reaps its tab.
+      if (v.tab && rows[0].tab_id === v.tab && !after.some(p => p.tab_id === v.tab)) {
+        call(["tab", "close", v.tab]);
+        const listed = call(["tab", "list"]).result.tabs;
+        if (!Array.isArray(listed) || listed.some(t => (t.tab_id ?? t.id) === v.tab)) throw Error("owned tab survives close");
+      }
+      console.log(`  CLOSED ${address}: spawn record matched label and cwd; pane absent from pane list`);
+    }
+  } catch (error) { console.log(`  ${attempted ? "CLOSE UNPROVEN" : "LEFT OPEN"} ${address}: ${error.code === "ENOENT" ? "missing spawn or stand-down record" : error.message}`); }
+}
+NODE
+}
+
 while :; do
   pending=()
   ready=()
+  READY_INDEXES=()
   i=0
   for f in "$@"; do
-    if done_file "$i" "$f"; then ready+=("$f"); else pending+=("$f"); fi
+    if done_file "$i" "$f"; then ready+=("$f"); READY_INDEXES+=("$i"); else pending+=("$f"); fi
     i=$((i + 1))
   done
 
@@ -152,6 +288,7 @@ while :; do
       if [ -s "$f" ]; then echo "  PARTIAL     $(wc -c <"$f" | tr -d ' ') bytes, no marker yet  $f  last-line: $(tail -n 1 "$f" | tr -d '\0' | cut -c1-72)"
       else echo "  NOT STARTED $f  <- check whether that seat is BLOCKED; a stalled seat writes nothing"; fi
     done
+    close_completed
     exit 0
   fi
 
@@ -161,17 +298,7 @@ while :; do
     echo "  RE-HASH BEFORE YOU QUOTE IT. The marker means the file ENDS with '$MARKER', never that its"
     echo "  author has stopped: a rewrite-in-place keeps the marker terminal at every instant. If shasum"
     echo "  now differs from the value above, you are reading a superseded file."
-    # A seat whose artifact is COMPLETE has nothing left to give: the report is the archive, the pane is
-    # not. Closing here is safe precisely because the marker — not `done`, not a size — is the trigger,
-    # so this can never reap a seat mid-write. Only on the COMPLETE path: on a timeout the seats are
-    # still working and closing one would destroy the work being waited for.
-    if [ -n "${TKR_CLOSE_PANES:-}" ]; then
-      for pane in ${TKR_CLOSE_PANES//,/ }; do
-        # `herdr pane close` exits 0 even for a pane that is already gone, so report the body rather
-        # than the status — an exit code here would claim a close that may never have happened.
-        printf '  CLOSED %s -> %s\n' "$pane" "$(herdr pane close "$pane" 2>&1 | head -c 80)"
-      done
-    fi
+    close_completed
     exit 0
   fi
 

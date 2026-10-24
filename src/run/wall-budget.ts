@@ -43,9 +43,10 @@ const bucketOf = (gate: string): WallBucket =>
 // Rows another process writes around a restart — the operator's approval, the resuming daemon's
 // reclaim and rehash audit — so the prior engagement's own last row is the one before them.
 // ponytail: a closed list; a new out-of-engagement writer lengthens the interruption it precedes.
-const OUTSIDE_ENGAGEMENT = new Set(["task-approved", "graph-rehash", "lock-reclaimed", "superseded"]);
+const OUTSIDE_ENGAGEMENT = new Set(["task-approved", "graph-rehash", "lock-reclaimed", "superseded", "worktree-removed", "worktree-removal-failed"]);
 const outsideEngagement = (e: JournalEvent): boolean =>
-  OUTSIDE_ENGAGEMENT.has(e.event) || (e.event === "exit-cause" && e.data.cause === "unclean");
+  OUTSIDE_ENGAGEMENT.has(e.event) || (e.event === "worktree-preserved" && e.data.by !== undefined)
+  || (e.event === "exit-cause" && e.data.cause === "unclean");
 
 const WORKER_END = new Set(["worker-result", "worker-dead", "worker-hard-timeout"]);
 
@@ -63,8 +64,10 @@ export function wallBudget(events: readonly JournalEvent[]): WallBudget | undefi
   const lastEnd = lastOf("run-end");
   const lastResume = lastOf("run-resume");
   const from = at(events[first]!);
-  // A closed engagement ends at its run-end; an open or crashed one at its newest row.
-  const to = at(events[lastEnd > lastResume ? lastEnd : events.length - 1]!);
+  // Queue row 240 (D-2138): cleanup by another daemon cannot lengthen an open or crashed engagement.
+  let newestInside = events.length - 1;
+  while (newestInside > first && outsideEngagement(events[newestInside]!)) newestInside--;
+  const to = at(events[lastEnd > lastResume ? lastEnd : newestInside]!);
   if (!Number.isFinite(from) || !Number.isFinite(to) || to < from) return undefined;
 
   const spans: Array<{ bucket: WallBucket; from: number; to: number }> = [];

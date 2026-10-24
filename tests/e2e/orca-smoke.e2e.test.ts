@@ -17,7 +17,8 @@ import { Journal } from "../../src/run/journal.js";
  * receipt binds to the TRACKED worktree enclosing the checkout the smoke made (OBS-1004: Orca never
  * tracks a daemon-added checkout, so the terminal is created on the enclosing clone with its
  * command cd'ed into the checkout, and the terminal's own proof line names that checkout), real
- * cursor-paged reads carry the trailer back byte-exact, and the real close removes the terminal.
+ * cursor-paged reads carry the trailer back byte-exact, and the real close removes the terminal
+ * and its owned tab from visual layouts (queue row 240; D-2138 add.4 U05).
  *
  * Fail-closed by construction: `smokeVerdict` is the ONLY place a green is minted, and it mints one
  * only from observations that were actually made. A missing observation is a failure, never a
@@ -95,6 +96,12 @@ interface SmokeObservations {
   closedRuntimeId?: string;
   /** after close(), orca no longer lists the created handle for the smoke's worktree */
   terminalClosed: boolean;
+  /** The owned tab was present with this leaf before its final terminal closed. */
+  ownedTabBeforeClose?: string;
+  /** The same tab is absent from a complete visual layout listing on the same runtime. */
+  ownedTabClosed?: boolean;
+  visualBeforeRuntimeId?: string;
+  visualAfterRuntimeId?: string;
   /** the ONE documented refusal (tab_not_found) orca 1.4.186 answers a live close with, recorded
    *  rather than hidden; every other close failure is a smoke failure, never a tolerated one */
   closeRefused?: string;
@@ -129,6 +136,10 @@ export function smokeVerdict(o: SmokeObservations): { status: SmokeStatus; reaso
     reasons.push("orca never listed the created terminal before the close attempt — a later absence proves no close");
   }
   if (!o.terminalClosed) reasons.push("terminal was not closed");
+  if (!o.ownedTabBeforeClose) reasons.push("owned tab was not observed in visual layouts before close");
+  if (o.ownedTabClosed !== true) reasons.push("owned tab survives close or its absence from visual layouts is unproven (spec question)");
+  if (!o.createRuntimeId || o.visualBeforeRuntimeId !== o.createRuntimeId || o.visualAfterRuntimeId !== o.createRuntimeId)
+    reasons.push("owned tab visual evidence spans runtimes or is missing");
   // Handles are runtime-scoped: a restart between the two listings retires every handle the old
   // runtime held, so the post-close absence would be unanimous whether or not anything was closed.
   // Both listings must come from the identity that minted the handle, or the close is unproven.
@@ -275,6 +286,39 @@ async function listsHandle(exec: OrcaExec, cwd: string, worktree: string, handle
   };
 }
 
+/** Queue row 240; D-2138 add.4 U05: tab identity comes from the visual layout, never row titles. */
+export async function listsOwnedTab(exec: OrcaExec, cwd: string, worktree: string, identity: { handle?: string; title?: string; tabId?: string }): Promise<{ tabId?: string; present: boolean; runtimeId: string }> {
+  const r = await exec(["terminal", "list", "--include-visual-layouts", "--limit", "10000", "--json"], cwd);
+  if (r.code !== 0 || r.timedOut) throw new Error("visual layout listing failed");
+  const env = parseEnvelope("list", r.stdout);
+  if (env.result.truncated === true || !Array.isArray(env.result.visualLayouts)) throw new Error("visual layout listing is missing or truncated");
+  const tabs: Record<string, unknown>[] = [];
+  const collectTabs = (node: unknown) => {
+    if (Array.isArray(node)) { node.forEach(collectTabs); return; }
+    if (!node || typeof node !== "object") return;
+    const o = node as Record<string, unknown>;
+    if (Array.isArray(o.tabs)) tabs.push(...o.tabs);
+    collectTabs(o.first); collectTabs(o.second);
+  };
+  const leaves = (node: unknown): string[] => {
+    if (Array.isArray(node)) return node.flatMap(leaves);
+    if (!node || typeof node !== "object") return [];
+    const o = node as Record<string, unknown>;
+    return o.type === "terminal" && typeof o.handle === "string" ? [o.handle] : [o.panes, o.first, o.second].flatMap(leaves);
+  };
+  for (const layout of env.result.visualLayouts) {
+    if (layout && typeof layout === "object" && terminalWorktree(layout) !== undefined
+      && canonicalWorktreePath(terminalWorktree(layout)!) === canonicalWorktreePath(worktree)) collectTabs(layout.root);
+  }
+  const matches = tabs.filter(tab => identity.tabId !== undefined
+    ? (tab.id ?? tab.tabId) === identity.tabId
+    : tab.title === identity.title && identity.handle !== undefined && leaves(tab.panes).length === 1 && leaves(tab.panes).includes(identity.handle));
+  if (matches.length > 1) throw new Error("owned tab is ambiguous in visual layouts");
+  const id = matches[0]?.id ?? matches[0]?.tabId;
+  if (matches.length && typeof id !== "string") throw new Error("owned tab has no tab id");
+  return { present: matches.length === 1, tabId: typeof id === "string" ? id : undefined, runtimeId: env.runtimeId };
+}
+
 /**
  * One smoke run. `gate` and `probeRuntime` are seams so the skip paths are exercisable without an
  * orca — nothing else is faked: the driver, the CLI, the worktree and the terminal are real.
@@ -361,6 +405,10 @@ export async function runOrcaSmoke(opts: {
     const before = await listsHandle(exec, cwd, tracked, receipt.handle);
     observations.listedBeforeClose = before.listed;
     observations.listedBeforeRuntimeId = before.runtimeId;
+    const tabBefore = await listsOwnedTab(exec, cwd, tracked, { handle: receipt.handle, title: slot.name });
+    observations.ownedTabBeforeClose = tabBefore.tabId;
+    observations.visualBeforeRuntimeId = tabBefore.runtimeId;
+    if (!tabBefore.present || !tabBefore.tabId) throw new Error("owned tab was not present before its final terminal closed");
     // Orca answers a LIVE terminal's close with a tab_not_found refusal while still removing it, so
     // that one documented response is tolerated and recorded — matched on the envelope's exact
     // refusal CODE, from the very runtime that minted the handle. Anything else — a different
@@ -378,6 +426,9 @@ export async function runOrcaSmoke(opts: {
     const after = await listsHandle(exec, cwd, tracked, receipt.handle);
     observations.terminalClosed = !after.listed;
     observations.closedRuntimeId = after.runtimeId;
+    const tabAfter = await listsOwnedTab(exec, cwd, tracked, { tabId: observations.ownedTabBeforeClose });
+    observations.ownedTabClosed = !tabAfter.present;
+    observations.visualAfterRuntimeId = tabAfter.runtimeId;
   } catch (e) {
     failures.push(`smoke threw: ${(e as Error).message}`);
   } finally {
@@ -441,6 +492,8 @@ export async function liveLeg(ctx: SkipChannel, smoke: SmokeResult): Promise<"sk
   expect(smoke.observations.createReceiptWorktree).toBe(smoke.observations.trackedWorktree);
   expect(smoke.observations.listedBeforeClose).toBe(true);
   expect(smoke.observations.terminalClosed).toBe(true);
+  expect(smoke.observations.ownedTabBeforeClose).toBeTruthy();
+  expect(smoke.observations.ownedTabClosed).toBe(true);
   expect(smoke.observations.listedBeforeRuntimeId).toBe(smoke.observations.createRuntimeId);
   expect(smoke.observations.closedRuntimeId).toBe(smoke.observations.createRuntimeId);
   return "ran";
@@ -473,6 +526,10 @@ describe("e2e: orca driver smoke", () => {
       listedBeforeClose: true,
       closedRuntimeId: "rt-1",
       terminalClosed: true,
+      ownedTabBeforeClose: "tab-smoke",
+      ownedTabClosed: true,
+      visualBeforeRuntimeId: "rt-1",
+      visualAfterRuntimeId: "rt-1",
     };
     expect(smokeVerdict(green).status).toBe("passed");
     expect(smokeVerdict({ ...green, trailerObserved: false }).status).toBe("failed");
@@ -513,6 +570,8 @@ describe("e2e: orca driver smoke", () => {
       expect(smoke.observations.createReceiptWorktree).toBe(smoke.observations.trackedWorktree);
       expect(smoke.observations.listedBeforeClose).toBe(true);
       expect(smoke.observations.terminalClosed).toBe(true);
+  expect(smoke.observations.ownedTabBeforeClose).toBeTruthy();
+  expect(smoke.observations.ownedTabClosed).toBe(true);
       expect(smoke.observations.listedBeforeRuntimeId).toBe(smoke.observations.createRuntimeId);
       expect(smoke.observations.closedRuntimeId).toBe(smoke.observations.createRuntimeId);
     }
@@ -565,6 +624,10 @@ describe("e2e: orca driver smoke", () => {
       elapsedWaitExercised: true,
       listedBeforeClose: true,
       terminalClosed: true,
+      ownedTabBeforeClose: "tab-smoke",
+      ownedTabClosed: true,
+      visualBeforeRuntimeId: "rt-1",
+      visualAfterRuntimeId: "rt-1",
     };
     expect(smokeVerdict(claimsGreen).status).toBe("skipped");
     expect(smokeVerdict({ ...claimsGreen, gate: true }).status).toBe("skipped");
@@ -612,4 +675,31 @@ describe("e2e: orca driver smoke", () => {
     expect(offersOrca(USAGE)).toBe(true);
     expect(offersOrca("  run  execute the graph (--concurrency N --driver auto|herdr|subprocess --route-strict)")).toBe(false);
   });
+});
+
+test("test: the Orca smoke verdict is green only when the closed terminal's owned tab, present in the visual layout listing before its final terminal closed, is absent from that listing after, and an observation whose tab survives the close reads as not green with its reason named, so a smoke proof that stops at the terminal list fails", async () => {
+  const green: SmokeObservations = {
+    gate: true, reachable: true, smokeWorktree: "/tmp/smoke", trackedWorktree: "/tmp/smoke", createReceiptWorktree: "/tmp/smoke",
+    trailerObserved: true, trackedWorktreeResolved: true, checkoutObserved: true, screenReadExercised: true, elapsedWaitExercised: true,
+    createRuntimeId: "rt-1", listedBeforeRuntimeId: "rt-1", closedRuntimeId: "rt-1", listedBeforeClose: true, terminalClosed: true,
+    ownedTabBeforeClose: "tab-1", ownedTabClosed: true, visualBeforeRuntimeId: "rt-1", visualAfterRuntimeId: "rt-1",
+  };
+  expect(smokeVerdict(green)).toEqual({ status: "passed", reasons: [] });
+  for (const patch of [{ ownedTabClosed: false }, { ownedTabClosed: undefined }, { ownedTabBeforeClose: undefined }, { visualAfterRuntimeId: "rt-2" }]) {
+    const verdict = smokeVerdict({ ...green, ...patch });
+    expect(verdict.status).toBe("failed");
+    expect(verdict.reasons.join(" ")).toMatch(/owned tab/);
+  }
+  const listing = (keepTab: boolean, handles: string[] = []): OrcaExec => async () => ({ code: 0, stderr: "", stdout: JSON.stringify({ ok: true, _meta: { runtimeId: "rt-1" }, result: {
+    terminals: [], visualLayouts: [{ worktreePath: "/tmp/smoke", root: { tabs: keepTab ? [{ id: "tab-1", title: "ORCH smoke", panes: handles.map(handle => ({ type: "terminal", handle })) }] : [] } }],
+  } }) });
+  expect(await listsOwnedTab(listing(true, ["mine"]), "/tmp", "/tmp/smoke", { handle: "mine", title: "ORCH smoke" }))
+    .toEqual({ present: true, tabId: "tab-1", runtimeId: "rt-1" });
+  expect((await listsOwnedTab(listing(false), "/tmp", "/tmp/smoke", { handle: "mine", title: "ORCH smoke" })).present).toBe(false);
+  expect((await listsOwnedTab(listing(true, ["foreign"]), "/tmp", "/tmp/smoke", { handle: "mine", title: "ORCH smoke" })).present).toBe(false);
+  expect((await listsOwnedTab(listing(true, ["mine", "sibling"]), "/tmp", "/tmp/smoke", { handle: "mine", title: "ORCH smoke" })).present).toBe(false);
+  const survived = await listsOwnedTab(listing(true), "/tmp", "/tmp/smoke", { tabId: "tab-1" });
+  expect(smokeVerdict({ ...green, ownedTabClosed: !survived.present }).status).toBe("failed");
+  const gone = await listsOwnedTab(listing(false), "/tmp", "/tmp/smoke", { tabId: "tab-1" });
+  expect(smokeVerdict({ ...green, ownedTabClosed: !gone.present }).status).toBe("passed");
 });
