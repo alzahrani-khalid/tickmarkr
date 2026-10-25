@@ -1,6 +1,6 @@
 import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { describe, expect, test, vi } from "vitest";
 import { parkToken } from "../src/cli/commands/approve.js";
 import { dispatch } from "../src/cli/index.js";
@@ -13,6 +13,7 @@ import { foldOwedChecks, Journal } from "../src/run/journal.js";
 import { readOperatorState } from "../src/run/operator-state.js";
 import { applyDecisionKey, decisionConfirmLines, decisionReceiptLines, deriveRunDecisions, executeDecision, initialDecisionSession, previewDecision, withDecisionPreview } from "../src/tui/cockpit/decision-actions.js";
 import { complete, graph, partial, resumed } from "./fixtures/operator-state/fixture.js";
+import { skillCorpus } from "./helpers/skill-reading.js";
 
 const repoRoot = join(import.meta.dirname, "..");
 const readmeFile = join(repoRoot, "README.md");
@@ -79,7 +80,7 @@ test("Changed README and canonical skill prose walk the recorded partial-human-p
   // These are the shipped instructions being reviewed, not private design/capture dependencies.
   const docs = [readmeFile, join(repoRoot, "skills/tickmarkr-loop/SKILL.md")];
   for (const file of docs) {
-    const prose = readFileSync(file, "utf8");
+    const prose = file === readmeFile ? readFileSync(file, "utf8") : skillCorpus(dirname(file));
     for (const phrase of ["1 Home, 4 Run, 5 Evidence", "Fleet/Bootstrap and Plan/Health", "follow-ons",
       "1/3 merged", "T2", "T3", "PARTIAL", "before dispatch", "Only `y`", "Enter never confirms",
       "task-approved", "approved; resume required", "tickmarkr resume <runId>",

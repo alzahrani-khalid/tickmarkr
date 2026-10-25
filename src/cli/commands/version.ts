@@ -37,20 +37,34 @@ export async function version(argv: string[] = [], dir = distDir, cwd = process.
     return out;
   }
 
-  const { docsDrift, installedAgentGuidance, skillDrift } = await import("./init.js");
+  const { agentSkillEvidence, docsDrift, installedAgentGuidance, skillDrift } = await import("./init.js");
+  const evidence = agentSkillEvidence(cwd);
   const installed = installedAgentGuidance(cwd);
   if (!installed.length) return `tickmarkr binary ${stamp}: no installed agent guidance to compare`;
+  const skillChanges = skillDrift(cwd);
+  const docsChanges = docsDrift(cwd);
+  const modifiedPaths = new Set(skillChanges.flatMap(({ dir: skillDir, modified }) => modified.map((file) => join(skillDir, file))));
+  const refresh = (path: string) => `refresh ${relative(cwd, path)} with tickmarkr init --agent --force`;
   const drift = [
-    ...skillDrift(cwd).flatMap(({ dir: skillDir, missing, modified }) => [
-      ...missing.map((file) => `missing ${relative(cwd, join(skillDir, file))}`),
-      ...modified.map((file) => `modified ${relative(cwd, join(skillDir, file))}`),
+    ...evidence.links.map((path) => `kept ${relative(cwd, path)} (symbolic link); move ${relative(cwd, path)} to a regular, unlinked location`),
+    ...evidence.skills.flatMap((skill) => [
+      ...(!skill.current && skill.removable ? [skill.dir] : []).concat(skill.leftovers)
+        .map((path) => `leftover ${relative(cwd, path)}; ${skill.current && skill.removable
+          ? `${refresh(skill.dir)} to remove ${relative(cwd, path)}`
+          : `remove ${relative(cwd, path)} with tickmarkr init --agent`}`),
+      ...skill.unproven.map((path) => `unproven ${relative(cwd, path)}; ${modifiedPaths.has(path)
+        ? refresh(path) : `move ${relative(cwd, path)} out of the skill directory before refreshing`}`),
     ]),
-    ...docsDrift(cwd).map((file) => `stale agent-docs block in ${relative(cwd, file)}`),
+    ...skillChanges.flatMap(({ dir: skillDir, missing, modified }) => [
+      ...missing.map((file) => `missing ${relative(cwd, join(skillDir, file))}; ${refresh(join(skillDir, file))}`),
+      ...modified.map((file) => `modified ${relative(cwd, join(skillDir, file))}; ${refresh(join(skillDir, file))}`),
+    ]),
+    ...docsChanges.map((file) => `stale agent-docs block in ${relative(cwd, file)}; ${refresh(file)}`),
   ];
   const out = [
     `tickmarkr binary ${stamp}: compared installed agent guidance with this binary's packaged block and skills:`,
     ...installed.map((file) => `  ${relative(cwd, file)}`),
-    ...(drift.length ? [...drift, "refresh: tickmarkr init --agent --force"] : ["installed guidance matches"]),
+    ...(drift.length ? [...drift, ...(skillChanges.length || docsChanges.length ? ["refresh: tickmarkr init --agent --force"] : [])] : ["installed guidance matches"]),
   ].join("\n");
   if (drift.length) throw new Error(out);
   return out;

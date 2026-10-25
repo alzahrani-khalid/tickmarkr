@@ -1,5 +1,6 @@
 import { execFileSync, execSync, spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { chmodSync, cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import * as registry from "../../src/adapters/registry.js";
@@ -8,10 +9,122 @@ import { COMMAND_HELP, commandHelp } from "../../src/cli/help.js";
 import { dispatch } from "../../src/cli/index.js";
 import { specTemplate } from "../../src/compile/native.js";
 import { tickmarkrDir } from "../../src/graph/graph.js";
-import { createWorktree, gitHead } from "../../src/run/git.js";
+import { createWorktree, gitHead, gitSync } from "../../src/run/git.js";
 import { makeTestTempDir } from "../helpers/tmprepo.js";
+import { SHIPPED_DIGESTS, SHIPPED_RELEASES, SHIPPED_SNAPSHOTS } from "../../src/cli/shipped-skill-files.js";
+
+vi.mock("../../src/cli/shipped-skill-files.js", async (original) => {
+  const real = await original<typeof import("../../src/cli/shipped-skill-files.js")>();
+  return { ...real, SHIPPED_DIGESTS: [...real.SHIPPED_DIGESTS], SHIPPED_SNAPSHOTS: { ...real.SHIPPED_SNAPSHOTS } };
+});
 
 afterEach(() => vi.restoreAllMocks());
+
+const REPO_ROOT = join(import.meta.dirname, "../..");
+// The shipped-bytes rows read released files with `git show <tag>:…`. A tagless or shallow checkout (the public export,
+// public CI) holds no release objects, so each such row runs where its release tags are present and is skipped by name
+// elsewhere: the provenance check's own advisory rule for a tagless checkout (queue row 244; D-2155).
+const RETIRED_SCRIPT_TAG = Object.keys(SHIPPED_RELEASES).find((tag) => {
+  const index = SHIPPED_RELEASES[tag]!["tickmarkr-overseer"];
+  return index !== undefined && SHIPPED_SNAPSHOTS["tickmarkr-overseer"]![index]!["scripts/classify-vitest-log.sh"] !== undefined;
+})!;
+const tagged = (...tags: string[]): boolean =>
+  tags.every((tag) => gitSync(REPO_ROOT, ["rev-parse", "-q", "--verify", `refs/tags/${tag}^{commit}`]).status === 0);
+
+// Queue row 244 (D-2141; D-2152): historical bytes and whole-tree negative controls.
+test.skipIf(!tagged(RETIRED_SCRIPT_TAG, "v2.8.8"))("test: an init remove deletes every skill directory whose tree equals one shipped snapshot at both host locations, a current marked install, a pristine unmarked earlier install and a pristine retired skill alike, after sweeping proven retired files, and keeps and reports a modified unmarked install, a mixed-release tree, an empty or SKILL.md-less tree, a malformed and a foreign skill occupying a reserved name and a marked one holding an unproven file, so a remove that deletes by reserved name alone or keeps a pristine earlier install fails", async () => {
+  const source = join(import.meta.dirname, "../..");
+  const skillNames = ["tickmarkr-loop", "tickmarkr-auto", "tickmarkr-overseer"];
+  const retired = "tickmarkr-retired-removal";
+  const hash = (bytes: string | Buffer) => createHash("sha256").update(bytes).digest("hex");
+  const marker = `---\nname: ${retired}\nmetadata:\n  installed-by: tickmarkr\n---\n`;
+  const releases = [
+    { "SKILL.md": marker + "one\n", "scripts/old.sh": "release one\n" },
+    { "SKILL.md": `---\nname: ${retired}\n---\ntwo\n`, "scripts/old.sh": "release two\n" },
+  ];
+  const count = SHIPPED_DIGESTS.length;
+  (SHIPPED_SNAPSHOTS as Record<string, Record<string, number>[]>)[retired] = releases.map((files) => Object.fromEntries(
+    Object.entries(files).map(([path, bytes]) => [path, (SHIPPED_DIGESTS as string[]).push(hash(bytes)) - 1]),
+  ));
+  const put = (root: string, path: string, bytes: string | Buffer) => {
+    mkdirSync(dirname(join(root, path)), { recursive: true });
+    writeFileSync(join(root, path), bytes);
+  };
+  const snapshot = (root: string): Record<string, string> => {
+    const result: Record<string, string> = {};
+    const walk = (dir: string, prefix = "") => {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const rel = `${prefix}${entry.name}`;
+        if (entry.isDirectory()) { result[rel] = "directory"; walk(join(dir, entry.name), `${rel}/`); }
+        else result[rel] = readFileSync(join(dir, entry.name)).toString("base64");
+      }
+    };
+    walk(root);
+    return result;
+  };
+  const oldFile = (skill: string, path: string) => {
+    const tag = path === "scripts/classify-vitest-log.sh" ? Object.keys(SHIPPED_RELEASES).find((release) => {
+      const index = SHIPPED_RELEASES[release]![skill];
+      return index !== undefined && SHIPPED_SNAPSHOTS[skill]![index]![path] !== undefined;
+    })! : "v2.8.8";
+    const result = gitSync(source, ["show", `${tag}:skills/${skill}/${path}`]);
+    expect(result.status, result.stderr).toBe(0);
+    const old = SHIPPED_SNAPSHOTS[skill]![SHIPPED_RELEASES[tag]![skill]!]!;
+    expect(hash(result.stdout)).toBe(SHIPPED_DIGESTS[old[path]!]);
+    return result.stdout;
+  };
+  try {
+    for (const shape of ["current", "earlier", "retired marked", "retired unmarked", "sweep then remove",
+      "modified unmarked", "mixed", "empty", "no SKILL.md", "malformed", "foreign", "added user file", "retired beside user"]) {
+      const repo = makeWorkspaceRepo(makeTestTempDir("remove-proof-"), { "keep.txt": "consumer\n" });
+      const removable = ["current", "earlier", "retired marked", "retired unmarked", "sweep then remove"].includes(shape);
+      const dirs: string[] = [];
+      for (const host of [".agents", ".claude"]) {
+        const names = shape === "current" || shape === "earlier" ? skillNames : [shape.startsWith("retired ") && shape !== "retired beside user" || shape === "mixed" ? retired : "tickmarkr-overseer"];
+        for (const name of names) {
+          const dir = join(repo, host, "skills", name);
+          dirs.push(dir);
+          mkdirSync(dir, { recursive: true });
+          if (shape === "earlier") {
+            const old = SHIPPED_SNAPSHOTS[name]![SHIPPED_RELEASES["v2.8.8"]![name]!]!;
+            for (const path of Object.keys(old)) put(dir, path, oldFile(name, path));
+            expect(readFileSync(join(dir, "SKILL.md"), "utf8")).not.toContain("installed-by: tickmarkr");
+          } else if (name === retired) {
+            const files = shape === "retired unmarked" ? releases[1]! : releases[0]!;
+            for (const [path, bytes] of Object.entries(files)) put(dir, path, bytes);
+            if (shape === "mixed") put(dir, "scripts/old.sh", releases[1]!["scripts/old.sh"]);
+          } else if (shape !== "empty") {
+            cpSync(join(source, "skills", name), dir, { recursive: true });
+            if (shape === "modified unmarked") put(dir, "SKILL.md", readFileSync(join(dir, "SKILL.md"), "utf8").replace("metadata:\n  installed-by: tickmarkr\n", "") + "user modification\n");
+            if (shape === "no SKILL.md") rmSync(join(dir, "SKILL.md"));
+            if (shape === "malformed") put(dir, "SKILL.md", "---\nmetadata: [unterminated\n---\n");
+            if (shape === "foreign") put(dir, "SKILL.md", "---\nmetadata:\n  installed-by: another-installer\n---\n");
+            if (shape === "added user file" || shape === "retired beside user") put(dir, "user.txt", "user-owned bytes\n");
+            if (shape === "sweep then remove" || shape === "retired beside user") put(dir, "scripts/classify-vitest-log.sh", oldFile(name, "scripts/classify-vitest-log.sh"));
+          }
+        }
+      }
+      const before = dirs.map(snapshot);
+      const out = await init(["--remove"], repo);
+      for (const [i, dir] of dirs.entries()) {
+        if (removable) {
+          expect(existsSync(dir), shape).toBe(false);
+          expect(out).toContain(`removed leftover ${dir}`);
+        } else {
+          const expected = { ...before[i] };
+          if (shape === "retired beside user") delete expected["scripts/classify-vitest-log.sh"];
+          expect(snapshot(dir), shape).toEqual(expected);
+          expect(out).toContain(`kept ${dir}`);
+          expect(out).toContain("(unproven)");
+        }
+        if (shape === "sweep then remove" || shape === "retired beside user") expect(out).toContain(`removed leftover ${join(dir, "scripts/classify-vitest-log.sh")}`);
+      }
+    }
+  } finally {
+    delete (SHIPPED_SNAPSHOTS as Record<string, unknown>)[retired];
+    (SHIPPED_DIGESTS as string[]).length = count;
+  }
+});
 
 function makeWorkspaceRepo(root: string, files: Record<string, string> = {}): string {
   const dir = join(root, "repo");

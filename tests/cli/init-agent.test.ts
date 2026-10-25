@@ -5,6 +5,7 @@ import { afterEach, describe, expect, test, vi } from "vitest";
 import * as registry from "../../src/adapters/registry.js";
 import { init } from "../../src/cli/commands/init.js";
 import { makeRepo } from "../helpers/tmprepo.js";
+import { skillCorpus, skillReading } from "../helpers/skill-reading.js";
 
 const ROOT = join(import.meta.dirname, "../..");
 const skill = (name: string) => readFileSync(join(ROOT, "skills", name, "SKILL.md"));
@@ -20,12 +21,23 @@ const agentDocsSection = (repo: string, doc = "AGENTS.md") => {
   return text.slice(begin, end + "<!-- tickmarkr:agent-docs end -->".length);
 };
 
-const versionPreflight = (agentDocs: string) => {
-  const begin = agentDocs.indexOf("### Version preflight");
-  const end = agentDocs.indexOf("### Tip-verify-before-green", begin);
-  expect(begin).toBeGreaterThanOrEqual(0);
-  expect(end).toBeGreaterThan(begin);
-  return agentDocs.slice(begin, end);
+// Queue row 241 (D-2141; D-2152): pin the retired block's bytes at their new owners.
+const SEAT = "In a multi-tier session, the tiers clear each other at 50% context or more, after writing a handoff. A new spec or run is a mission boundary: write the handoff and clear before taking the next mission. Copy this duty into every brief and handoff. On a single-tier plain host, write your handoff and ask the operator to clear the session.";
+const GREEN = "A run is green only when ALL of these hold: the run-end event exists in the journal and is not fatal, tip verify is not \"failed\", the run-end summary's `failed`, `human`, `blocked` and `pending` buckets are every one of them empty, AND the owed checks in CURRENT `tickmarkr status <runId>` are outstanding empty AND known (`outstanding 0`; `outstanding unknown` is never empty). The shorter \"run-end plus tip verify\" form is NOT sufficient: a run ending `done=[T1,T3,T4] human=[T2] tipVerify=passed` is a closed PARTIAL run — three of four delivered, one parked — and calling it green is how a park becomes invisible. Empty execution buckets are not sufficient either (D-660): a run ending with every execution bucket empty and `tipVerify=passed` after an operator waived one review still owes that accepted-risk review check — status reads `outstanding 1 (T7 review)`, and `tickmarkr run` and `resume` exit 0 on execution alone — so it is execution complete, not green. Read the debt from CURRENT status, never from the run-end record: a `tickmarkr verify --record <runId>` discharge that lands after run-end moves current status to `outstanding 0` while the historical run-end row still carries 1, and only then is that run green; a legacy waiver without a recorded obligation reads `outstanding unknown` and is never green. A fatal run-end is never green either: the crash record (`fatal: true`) names its phase and error, every task it left running or gated sits in `pending` or `blocked`, and even with every bucket empty status and report lead with the crash and read `outstanding unknown` until the run is resumed; from then on the resumed engagement owns the debt. Never report green to the operator, tab titles, or records until every clause holds; when one does not, name the bucket that is not empty, the outstanding checks, or the unknown debt.";
+const READBACK = "Confirm delivery by reading the TARGET composer afterward; if the sent text still sits unsubmitted after ~15 s, retry the Enter only when that composer read shows the staged text and no permission prompt or numbered choice holds focus — an Enter sent onto an active prompt approves it or picks a choice instead of submitting the message (OBS-1119). Under that guard, send-keys enter to that pane once and read again (OBS-975); when a prompt or choice holds focus instead, resolve it first and re-read before retrying. Never report \"relayed\" without read-back.";
+const SPEC = "**Spec-authoring law ships in the spec template** that `tickmarkr init` writes: the hard bounds and which\n  direction each moves, what makes a criterion real, and why an absence or a source-text grep is never a\n  criterion. Read it before authoring or repairing acceptance items.";
+const VERIFY = "- `tickmarkr verify --base <ref>` — run the gate battery standalone against merge-base(base, HEAD)..HEAD: no daemon, no retries, one fail-closed verdict (`--criteria <file>` or `--task <id>` adds the semantic gates; `--no-review` for deterministic-only)";
+const PREFLIGHT = "Before `tickmarkr compile` or `tickmarkr run`, run `tickmarkr version --check` and stop on a non-zero exit.";
+const SHORT_GREEN = "A run is green only when run-end is not fatal, every bucket but done is empty, tip verify did not fail and current `tickmarkr status` reads outstanding 0; the loop skill holds the full rule.";
+const ROUTING = "Drive runs through the `tickmarkr-loop` skill (one spec) or the `tickmarkr-auto` skill (several specs); they carry the role check, the live-run check, verified handoffs and the green rule. Supervise a run with the `tickmarkr-overseer` skill.";
+const MEMORY = "Before starting, on every host including a plain one (herdr, Orca or neither), read and follow the PROJECT MEMORY duty under [the `tickmarkr-overseer` skill's Setup](../tickmarkr-overseer/SKILL.md#setup).";
+const GATES = "- **The gates are the product.** Seven, defined in `src/graph/schema.ts`:\n  `build test lint evidence scope acceptance review`. **That is DECLARATION order, not execution order.**\n  The cheap checks run first and stop at their first red: `build`, `lint`, then `evidence` and `scope`.\n  A fresh or semantic-repair candidate then runs `acceptance` ‖ `review` CONCURRENTLY (`run-gates.ts`,\n  *\"judge ‖ review\"*) before any test payload: a decisive semantic red ends the round with zero diagnostic\n  or full test-gate runs (a required acceptance oracle still executes); otherwise ONE full verification job\n  follows, with no selected screen. Only an attributed behavioral test-red repair may buy one diagnostic\n  first — every required failing file plus conservatively selected tests reaching the diff — admitted only\n  on comparable harness timing with ratio <= 0.15 AND estimated cost <= 60000 ms; its behavioral red stops\n  the round before semantics, otherwise semantics precede the full job. Disabled, unsupported, over-cap or\n  unknown-cost selection skips the diagnostic instead of running a full suite before semantics, and a\n  killed diagnostic is never green. A seatless or no-verdict review lets acceptance finish and publish and\n  the full job run in-round, and stays unsatisfied until review-only recovery; a seatless acceptance\n  cancels its sibling, records the unrun test (`testOwed`) and every enabled gate still owed (an unrecorded\n  review included), cannot merge and parks infra; an actual cancellation or throw awaits cleanup and leaves\n  no mergeable partial set. Test-only verification and an explicit full recheck keep their full scope with\n  no invented semantics and no diagnostic. Nothing merges until the FULL suite has passed on the exact\n  merge-candidate commit; an exact full green answers only after identity, environment, cleanliness and\n  current complete-manifest checks. The first five are MANDATORY; only `acceptance` and\n  `review` may be omitted per task. Implementations are in `src/gates/` — `baseline.ts` (build/test/lint,\n  diffed against a recorded baseline so pre-existing failures are forgiven), `evidence.ts`, `scope.ts`,\n  `acceptance.ts` (its judge reads the DIFF and every criterion must cite a changed hunk), `review.ts`\n  (cross-vendor). `run-gates.ts` drives them. **A declared gate is not a passed gate, and a gate that\n  returned zero findings is not the same as a gate that ran.**";
+const MIXED = "**And `skills/` (canonical) versus `.claude/skills/` (installed) is a MIXED tree — symlinks for some\nfiles, independent copies for others — so a blanket rule in EITHER direction is wrong** (OBS-809). It\ncuts both ways: for a **shared inode**, an edit in `skills/` reaches into the running process; for a\n**copy**, a fix in `skills/` does **not** reach the running watcher at all, so a repaired watcher keeps\nrunning the old bytes while the tree says it is fixed. Sync both trees or `skills-single-source.test.ts`\nreds.\n\n⚠ **PROBE IT WITH `readlink` AND `stat -L`. NEVER BARE `stat -f %i`: on macOS that reports the SYMLINK'S\nOWN inode, not its target's**, so every symlink reads as a separate file. Measured 2026-08-31 — one seat\nprobed **one** file that way, got differing inodes, and wrote *\"they are all copies, editing them cannot\ncorrupt the running watchers\"* into a seat brief as a blanket rule; following it would have silently\nkilled the watcher then handing a milestone's spec to its orchestrator. A second seat's first pass\nreturned **seven** false *\"separate file\"* verdicts before it re-probed.\n\n```bash\n# Identity, correctly. It must compare the TWO TREES: pointed at either one alone it renders nothing,\n# because the canonical files are all real files and the links live on the installed side.\ncd <repo>\nfor f in $(cd skills && find . -type f -o -type l | sed 's|^\\./||' | sort); do\n  a=\"skills/$f\"; b=\".claude/skills/$f\"\n  [ -e \"$b\" ] || { printf '%-52s CANON-ONLY\\n' \"$f\"; continue; }\n  ia=$(stat -L -f %i \"$a\"); ib=$(stat -L -f %i \"$b\")   # -L: resolve, or symlinks read as separate files\n  [ \"$ia\" = \"$ib\" ] \\\n    && printf '%-52s SHARED INODE %s  -> mv-replace ONLY; a live reader is on these bytes\\n' \"$f\" \"$ia\" \\\n    || printf '%-52s copies (%s/%s)  -> a fix in skills/ does NOT reach the running copy\\n' \"$f\" \"$ia\" \"$ib\"\ndone\n```\n\n**Two failures worth separating, and the second is the durable one:** *a probe that cannot render the\nevidence cannot fail* — rule 11 aimed at your own instrument; and **a narrow verified fact was generalised\nto a population it was never sampled over.** One file checked, seven ruled on. **The generalisation ran in\nthe REASSURING direction, which is worse than the alarming one: an alarming overclaim gets challenged, a\nreassuring one gets acted on.**";
+
+const skillSection = (text: string, heading: string) => {
+  const marker = `## ${heading}\n\n`;
+  expect(text).toContain(marker);
+  return text.split(marker)[1].split("\n## ")[0];
 };
 
 afterEach(() => vi.restoreAllMocks());
@@ -45,27 +57,51 @@ describe("tickmarkr init --agent skills location (T3)", () => {
 });
 
 describe("consumer preflight and seat hygiene (queue rows 210, 221; D-2118)", () => {
-  test("test: the block an agent init writes into a consumer tells its reader to run the version check and stop on a non-zero exit, keeps the whole-version stop for the tickmarkr source repository and the graph-lock check, and every guidance file at this repository root carries it byte for byte, so a preflight comparing the app manifest fails", async () => {
+  test("test: the installed loop and auto skills each carry the role check, the standalone verify command, the whole-version and graph-lock preflight, the seat hygiene duty, the herdr handoff read-back with its staged-text and no-prompt Enter guard, the green rule with its fatal run-end clause, the spec-template pointer and, on herdr, on Orca and on a plain host alike, the pointer to the overseer's project memory duty, so a diet that leaves a rule the block gave up in neither skill or unread on one host fails", async () => {
     vi.spyOn(registry, "allAdapters").mockReturnValue([]);
     const repo = makeRepo({ "CLAUDE.md": "App instructions\n", "package.json": '{"name":"consumer-app","version":"99.0.0"}' });
     await runInit(repo, "--agent", "--docs");
-    const block = agentDocsSection(repo);
-    const preflight = versionPreflight(block);
-    expect(preflight).toContain("run `tickmarkr version --check` and stop on a non-zero exit");
-    expect(preflight).toContain("tickmarkr source repository (`package.json` named `tickmarkr`)");
-    expect(preflight).toContain("must agree on the entire version");
-    expect(preflight).toContain("binary `2.1.0` versus repository `2.1.1` is a stop");
-    expect(preflight).toContain("never the app's manifest version");
-    expect(preflight).toContain("tickmarkr init --agent --force");
-    expect(preflight).toContain(".tickmarkr/graph.lock");
-    expect(preflight).toContain("kill -0 <pid>");
-    expect(preflight).toContain("resolve every candidate's own cwd");
-    expect(preflight).toContain("whose cwd is this repository root");
-    expect(preflight).not.toContain("read `package.json` version");
-    expect(agentDocsSection(repo, "CLAUDE.md")).toBe(block);
-    for (const doc of ["CLAUDE.md", "AGENTS.md"].filter((name) => existsSync(join(ROOT, name)))) {
-      expect(agentDocsSection(ROOT, doc)).toBe(block);
+    const copies: Record<string, string[]> = {};
+    for (const root of [".agents/skills", ".claude/skills"]) {
+      for (const name of ["tickmarkr-loop", "tickmarkr-auto"]) {
+        const installed = readFileSync(join(repo, root, name, "SKILL.md"), "utf8");
+        const role = skillSection(installed, "Two-tier by default — role check before the loop");
+        for (const label of ["**Orchestrator:**", "**Supervisor with a live orchestrator:**", "**Primary session without an orchestrator:**"]) expect(role).toContain(label);
+        expect(role).toContain(SEAT);
+        const preflight = skillSection(installed, "Binary preflight (before compile or run)");
+        expect(preflight).toContain("Run `tickmarkr version --check` and **stop immediately on a non-zero exit**");
+        expect(preflight).toContain("agree on the entire version");
+        expect(preflight).toContain("binary `2.1.0` vs repo `2.1.1`");
+        expect(preflight).toContain("never the app's manifest version");
+        expect(preflight).toContain("tickmarkr init --agent --force");
+        expect(preflight).toContain(".tickmarkr/graph.lock");
+        expect(preflight).toContain("kill -0 <pid>");
+        expect(preflight.indexOf(".tickmarkr/graph.lock")).toBeLessThan(preflight.indexOf("machine-wide process pattern"));
+        expect(preflight).toContain("candidate's own working directory");
+        expect(preflight).toContain("whose cwd is **this repository root**");
+        expect(preflight).toContain(SPEC);
+        // Read each host's actual scope, rather than accepting a pointer hidden in a herdr bullet.
+        for (const host of ["herdr", "orca", "plain"] as const) {
+          expect(skillSection(skillReading(installed, host), "Binary preflight (before compile or run)")).toContain(MEMORY);
+        }
+        const handoffs = skillSection(installed, "Verified handoffs (agent-to-agent messaging)");
+        expect(handoffs).toContain(READBACK);
+        expect(handoffs).toContain("never use bare send-text");
+        expect(handoffs).toContain('`herdr pane run <pane> "<message>"`');
+        expect(handoffs).toContain('`herdr notification show "<message>"`');
+        expect(handoffs).toContain("cross-session message tool, confirmed by the peer's reply");
+        expect(handoffs).toContain("turn_started");
+        const steps = skillSection(installed, name === "tickmarkr-loop" ? "The loop" : "Per-spec loop");
+        const verify = steps.split("5. **Verify and consolidate**")[1].split("6. **Record**")[0];
+        expect(verify).toContain(GREEN);
+        expect(verify).toContain(VERIFY);
+        for (const command of ["tickmarkr compile", "tickmarkr plan", "tickmarkr run", "tickmarkr status <runId>", "tickmarkr resume <runId>", "tickmarkr approve <runId> <taskId>", "tickmarkr report <runId> --md"]) expect(installed).toContain(command);
+        copies[name] = [role, preflight, handoffs, skillSection(installed, "Stand-down (mission end and retirement)")];
+      }
+      expect(copies["tickmarkr-loop"]).toEqual(copies["tickmarkr-auto"]);
     }
+    const overseer = readFileSync(join(repo, ".agents/skills/tickmarkr-overseer/SKILL.md"), "utf8");
+    expect(skillSection(overseer, "Setup")).toContain("**Read your host's PROJECT MEMORY before starting.**");
   });
 
   test("test: the installed loop and auto skills' preflights run the version check and stop on non-zero while keeping the whole-version sentence, and every installed skill defines its seat-label placeholder as the mission or run outside the tickmarkr source repository, no label still naming the version, so a consumer seat named by binary version fails", async () => {
@@ -73,7 +109,7 @@ describe("consumer preflight and seat hygiene (queue rows 210, 221; D-2118)", ()
     const repo = makeRepo({ "keep.txt": "x" });
     await runInit(repo, "--agent", "--docs");
     for (const name of ["tickmarkr-loop", "tickmarkr-auto", "tickmarkr-overseer"]) {
-      const installed = readFileSync(join(repo, ".agents/skills", name, "SKILL.md"), "utf8");
+      const installed = skillCorpus(join(repo, ".agents/skills", name));
       expect(installed).toContain("`<label>` means the version only in the tickmarkr source repository (`package.json` named `tickmarkr`); elsewhere it means the mission or run, never the installed binary version.");
       expect(installed.match(/`<label>` means/g)).toHaveLength(1);
       expect(installed).toContain("ORCH · <label>");
@@ -89,18 +125,14 @@ describe("consumer preflight and seat hygiene (queue rows 210, 221; D-2118)", ()
     }
   });
 
-  test("test: an agent init's block carries a Seat hygiene section where tiers clear each other at half context or more, a new spec or run is a mission boundary, every brief and handoff carries the duty and a single-tier plain host asks the operator, and the installed overseer brief list opens with it, so guidance without the duty fails", async () => {
+  test("test: the installed driving skills' role checks carry the Seat hygiene duty where tiers clear each other at half context or more, a new spec or run is a mission boundary, every brief and handoff carries the duty and a single-tier plain host asks the operator, and the installed overseer brief list opens with it, so guidance without the duty fails", async () => {
     vi.spyOn(registry, "allAdapters").mockReturnValue([]);
     const repo = makeRepo({ "keep.txt": "x" });
     await runInit(repo, "--agent", "--docs");
-    const hygiene = agentDocsSection(repo).split("### Seat hygiene\n\n")[1].split("\n### ")[0];
-    expect(hygiene).toContain("In a multi-tier session, the tiers clear each other at 50% context or more");
-    expect(hygiene).toContain("after writing a handoff");
-    expect(hygiene).toContain("A new spec or run is a mission boundary");
-    expect(hygiene).toContain("clear before taking the next mission");
-    expect(hygiene).toContain("Copy this duty into every brief and handoff");
-    expect(hygiene).toContain("On a single-tier plain host, write your handoff and ask the operator to clear the session");
-    const installed = readFileSync(join(repo, ".agents/skills/tickmarkr-overseer/SKILL.md"), "utf8");
+    for (const name of ["tickmarkr-loop", "tickmarkr-auto"]) {
+      expect(skillSection(skillCorpus(join(repo, ".agents/skills", name)), "Two-tier by default — role check before the loop")).toContain(SEAT);
+    }
+    const installed = skillCorpus(join(repo, ".agents/skills/tickmarkr-overseer"));
     const brief = installed.split("The brief MUST contain: ")[1].split("\n")[0];
     expect(brief.startsWith("**Seat hygiene — ")).toBe(true);
     expect(brief).toContain("tiers clear each other at 50% context or more after writing a handoff");
@@ -116,7 +148,7 @@ describe("tickmarkr init --agent supervision skill mandates (SK-1)", () => {
     vi.spyOn(registry, "allAdapters").mockReturnValue([]);
     const repo = makeRepo({ "keep.txt": "x" });
     await runInit(repo, "--agent", "--docs");
-    const installed = readFileSync(join(repo, ".agents/skills/tickmarkr-overseer/SKILL.md"), "utf8");
+    const installed = skillCorpus(join(repo, ".agents/skills/tickmarkr-overseer"));
 
     expect(installed).toMatch(/ANY restart[\s\S]*re-announce[\s\S]*every live seat[\s\S]*re-arm[\s\S]*every watcher/);
     expect(installed).toMatch(/(?:must never keep|never keep) a pre-restart overseer pane id/);
@@ -130,7 +162,7 @@ describe("tickmarkr init --agent supervision skill mandates (SK-1)", () => {
     vi.spyOn(registry, "allAdapters").mockReturnValue([]);
     const repo = makeRepo({ "keep.txt": "x" });
     await runInit(repo, "--agent", "--docs");
-    const installed = readFileSync(join(repo, ".agents/skills/tickmarkr-overseer/SKILL.md"), "utf8");
+    const installed = skillCorpus(join(repo, ".agents/skills/tickmarkr-overseer"));
 
     expect(installed).toMatch(/agent start[\s\S]*wait for and read the model banner[\s\S]*brief with `pane run`[\s\S]*read the transcript back[\s\S]*first words[\s\S]*before.*deadline/);
     expect(installed).toMatch(/brief absent from the transcript was not sent/);
@@ -143,7 +175,7 @@ describe("tickmarkr init --agent supervision skill mandates (SK-1)", () => {
     vi.spyOn(registry, "allAdapters").mockReturnValue([]);
     const repo = makeRepo({ "keep.txt": "x" });
     await runInit(repo, "--agent", "--docs");
-    const installed = readFileSync(join(repo, ".agents/skills/tickmarkr-overseer/SKILL.md"), "utf8");
+    const installed = skillCorpus(join(repo, ".agents/skills/tickmarkr-overseer"));
 
     expect(installed).toMatch(/Every Claude[\s\S]*--effort high[\s\S]*banner read/);
     expect(installed).toMatch(/Inventories retain the \*\*full suite log\*\*/);
@@ -159,7 +191,7 @@ describe("tickmarkr init --agent supervision skill mandates (SK-1)", () => {
     await runInit(repo, "--agent", "--docs");
 
     for (const name of ["tickmarkr-overseer", "tickmarkr-auto", "tickmarkr-loop"]) {
-      const installed = readFileSync(join(repo, ".agents/skills", name, "SKILL.md"), "utf8");
+      const installed = skillCorpus(join(repo, ".agents/skills", name));
       expect(installed).toMatch(/watch ending the seat's turn is no watch/);
       expect(installed).toMatch(/blocking journal consumer/);
       expect(installed).toMatch(/re-arm(?:ed|ing)? (?:it )?at most every twenty minutes/);
@@ -171,7 +203,7 @@ describe("tickmarkr init --agent supervision skill mandates (SK-1)", () => {
     vi.spyOn(registry, "allAdapters").mockReturnValue([]);
     const repo = makeRepo({ "keep.txt": "x" });
     await runInit(repo, "--agent", "--docs");
-    const installed = readFileSync(join(repo, ".agents/skills/tickmarkr-overseer/SKILL.md"), "utf8");
+    const installed = skillCorpus(join(repo, ".agents/skills/tickmarkr-overseer"));
 
     expect(installed).toMatch(/pane run[\s\S]*read(?:ing)? the pane back/);
     expect(installed).toMatch(/Claude or Grok seat/);
@@ -278,38 +310,28 @@ describe("tickmarkr init --agent multi-host install (T10)", () => {
 });
 
 describe("tickmarkr init --agent portable docs (T3)", () => {
-  test("emits the invariants, command crib, role check, tip-verify, version preflight, and handoff rule", async () => {
+  test("test: an agent init into a scratch consumer writes a guidance block whose only headings are the tickmarkr title and Invariants and whose bullets are the five invariants, the version check stop, the one-line green rule and the routing line naming the loop, auto and overseer skills with no slash and no claude path, so a block still carrying a command crib, role check, live-run check, handoff mechanics, seat hygiene or orientation fails", async () => {
     vi.spyOn(registry, "allAdapters").mockReturnValue([]);
-    const repo = makeRepo({ "AGENTS.md": "# Repo agents\n" });
-
+    const repo = makeRepo({ "AGENTS.md": "# Repo agents\n", "CLAUDE.md": "# Consumer instructions\n" });
     await runInit(repo, "--agent", "--docs");
-
-    const section = agentDocsSection(repo);
-    expect(section).toMatch(/Never run two tickmarkr runs/);
-    expect(section).toMatch(/Never let tickmarkr merge work to main/);
-    expect(section).toMatch(/Do not edit compiled graphs/);
-    expect(section).toMatch(/never trust a worker's completion claim/i);
-    expect(section).toMatch(/Treat missing or unparseable/);
-    expect(section).toMatch(/tickmarkr compile <spec>/);
-    expect(section).toMatch(/tickmarkr plan/);
-    expect(section).toMatch(/tickmarkr run/);
-    expect(section).toMatch(/tickmarkr status <runId>/);
-    expect(section).toMatch(/tickmarkr resume <runId>/);
-    expect(section).toMatch(/tickmarkr approve <runId> <taskId>/);
-    expect(section).toMatch(/tickmarkr report <runId> --md/);
-    expect(section).toMatch(/Role check/);
-    expect(section).toMatch(/Orchestrator:/);
-    expect(section).toMatch(/Supervisor with a live orchestrator/);
-    expect(section).toMatch(/Version preflight/);
-    expect(section).toMatch(/tickmarkr version/);
-    expect(section).toMatch(/Tip-verify-before-green/);
-    expect(section).toMatch(/tip verify is not "failed"/);
-    expect(section).toMatch(/Verified handoffs/);
-    expect(section).toMatch(/never use bare send-text/);
-    expect(section).toMatch(/herdr pane run/);
-    expect(section).not.toMatch(/EVERY fix gets a ship\/no-ship decision/);
-    expect(section).not.toMatch(/\/tickmarkr-loop/);
-    expect(section).not.toMatch(/\.claude/);
+    const block = agentDocsSection(repo);
+    const bullets = [
+      "Never run two tickmarkr runs in the same repository concurrently.",
+      "Never let tickmarkr merge work to main; new runs consolidate on `tickmarkr/<runId>`.",
+      "Do not edit compiled graphs to force outcomes; fix source specs and recompile.",
+      "Gates verify commits, diffs, acceptance criteria, and reviews independently — never trust a worker's completion claim.",
+      "Treat missing or unparseable machine results and verdicts as failures.",
+      PREFLIGHT, SHORT_GREEN, ROUTING,
+    ];
+    expect(block).toBe([
+      "<!-- tickmarkr:agent-docs begin -->", "## tickmarkr", "",
+      "tickmarkr compiles repository specs into isolated, independently verified agent work.", "",
+      "### Invariants", "", ...bullets.map(line => `- ${line}`), "<!-- tickmarkr:agent-docs end -->",
+    ].join("\n"));
+    expect(block.match(/^#+ .+$/gm)).toEqual(["## tickmarkr", "### Invariants"]);
+    expect(block.match(/^- /gm)).toHaveLength(8);
+    expect(block).not.toMatch(/\.claude|(?:^|[\s`(])\/(?:tickmarkr|tkr)[\w-]*/m);
+    expect(agentDocsSection(repo, "CLAUDE.md")).toBe(block);
   });
 
   test("a repo that already has the agent-docs block still receives corrections to it under --force", async () => {
@@ -332,7 +354,7 @@ describe("tickmarkr init --agent portable docs (T3)", () => {
     expect(section).not.toMatch(/ancient guidance/);
     expect(section).toMatch(/Never run two tickmarkr runs/);
     // canonical guidance is only useful if a stale copy can be corrected in place
-    expect(section).toMatch(/Orient before you act/);
+    expect(section).toContain(ROUTING);
     // ...without collateral damage to the parts a human wrote
     const text = readFileSync(join(repo, "AGENTS.md"), "utf8");
     expect(text).toMatch(/keep me above/);
@@ -340,109 +362,57 @@ describe("tickmarkr init --agent portable docs (T3)", () => {
     expect(text.match(/tickmarkr:agent-docs begin/g)).toHaveLength(1);
   });
 
-  test("the scaffolded verified-handoffs rule states the staged-text-and-no-prompt guard and resolve-first path, citing the changed init.ts lines", async () => {
-    vi.spyOn(registry, "allAdapters").mockReturnValue([]);
-    const repo = makeRepo({ "AGENTS.md": "# Repo agents\n" });
-
-    await runInit(repo, "--agent", "--docs");
-
-    const section = agentDocsSection(repo);
-    const begin = section.indexOf("### Verified handoffs");
-    const end = section.indexOf("### Orient before you act", begin);
-    expect(begin).toBeGreaterThanOrEqual(0);
-    expect(end).toBeGreaterThan(begin);
-    const handoffs = section.slice(begin, end);
-
-    // src/cli/commands/init.ts:118-120 (OBS-1119): the retry Enter is gated on BOTH the composer
-    // showing the staged text AND no prompt/choice holding focus — a read where a permission prompt
-    // holds focus beneath the staged text fails the second half of that AND, so the rule's own retry
-    // clause never fires for it.
-    expect(handoffs).toContain(
-      "retry the Enter only when that composer read shows the staged text and no permission prompt or numbered choice holds focus",
-    );
-    expect(handoffs).toContain(
-      "an Enter sent onto an active prompt approves it or picks a choice instead of submitting the message (OBS-1119)",
-    );
-    expect(handoffs).toContain("when a prompt or choice holds focus instead, resolve it first and re-read before retrying");
-
-  });
-
-  test("test: init with agent docs in a scratch repository renders a Verified handoffs paragraph that keeps the herdr form with its read-back guard and adds the plain-host form, a cross-session message confirmed by the peer's reply, while the block names no .claude path and no skill slash command, and every guidance file present at this repository's root carries that rendered block byte for byte, so a paragraph without the plain form or a stale CLAUDE.md block fails", async () => {
+  test("the installed driving skills keep the staged-text-and-no-prompt Enter guard and guarded retry verbatim", async () => {
     vi.spyOn(registry, "allAdapters").mockReturnValue([]);
     const repo = makeRepo({ "keep.txt": "x" });
     await runInit(repo, "--agent", "--docs");
-    const block = agentDocsSection(repo);
-
-    // queue row 192: the herdr form keeps its read-back guard; a plain host hands off by a cross-session message the
-    // peer answers. The block itself stays host-path- and slash-command-free.
-    const findings = (rendered: string) => {
-      const begin = rendered.indexOf("### Verified handoffs");
-      const handoffs = rendered.slice(begin, rendered.indexOf("### Orient before you act", begin));
-      const out: string[] = [];
-      if (begin < 0 || !handoffs.includes('Use `herdr pane run <pane> "<message>"`')
-        || !handoffs.includes("an Enter sent onto an active prompt approves it or picks a choice instead of submitting the message (OBS-1119)")
-        || !handoffs.includes('Never report "relayed" without read-back.')) out.push("herdr form");
-      if (!handoffs.includes("On a plain host (neither herdr nor Orca)") || !/cross-session message tool/.test(handoffs)
-        || !/confirmed only by the peer's reply/.test(handoffs)) out.push("plain form");
-      if (/\.claude/.test(rendered) || /(?:^|[\s`(])\/(?:tickmarkr|tkr)[\w-]*/m.test(rendered)) out.push("host path or skill slash command");
-      return out;
-    };
-    expect(findings(block)).toEqual([]);
-
-    // Wrong discriminators: the paragraph without its plain form — the shape a stale CLAUDE.md block still carries —
-    // and a block that names a skill slash command.
-    const stale = block.replace(/ On a plain host \(neither herdr nor Orca\)[^\n]*peer's reply\./, "");
-    expect([stale === block, findings(stale)]).toEqual([false, ["plain form"]]);
-    expect(findings(block.replace("### Orient before you act", "Then run /tickmarkr-loop.\n\n### Orient before you act"))).toEqual(["host path or skill slash command"]);
-
-    // Every guidance file present at this repository's root carries the rendered block byte for byte. The export ships
-    // none, so there the subject is its absence (the same positive discriminator as the preflight test below).
-    if (!existsSync(join(ROOT, "scripts/export-public.sh"))) {
-      for (const doc of ["CLAUDE.md", "AGENTS.md"]) expect(existsSync(join(ROOT, doc))).toBe(false);
-      return;
-    }
-    const present = ["CLAUDE.md", "AGENTS.md"].filter((doc) => existsSync(join(ROOT, doc)));
-    expect(present.length).toBeGreaterThan(0);
-    for (const doc of present) {
-      const rendered = agentDocsSection(ROOT, doc);
-      expect(rendered, doc).toBe(block);
-      expect(rendered, doc).not.toBe(stale);
+    for (const name of ["tickmarkr-loop", "tickmarkr-auto"]) {
+      const handoffs = skillSection(skillCorpus(join(repo, ".agents/skills", name)), "Verified handoffs (agent-to-agent messaging)");
+      expect(handoffs).toContain(READBACK);
+      expect(handoffs).toContain("staged text and no permission prompt or numbered choice holds focus");
+      expect(handoffs).toContain("(OBS-1119)");
+      expect(handoffs).toContain("Under that guard, send-keys enter to that pane once and read again (OBS-975)");
+      expect(handoffs).toContain("resolve it first and re-read before retrying");
     }
   });
 });
 
 describe("tickmarkr init --agent preflight authority (T3)", () => {
-  test("test: the scaffolded agent-docs block leads its live-run check with this repository's own graph lock so a tickmarkr run executing elsewhere does not read as live here while scaffolded text checking a machine-wide process pattern fails", async () => {
+  test("test: each installed driving skill leads its live-run check with this repository's own graph lock so a tickmarkr run executing elsewhere does not read as live here while scaffolded text checking a machine-wide process pattern fails", async () => {
     vi.spyOn(registry, "allAdapters").mockReturnValue([]);
     const repo = makeRepo({ "keep.txt": "x" });
 
     await runInit(repo, "--agent", "--docs");
 
-    const preflight = versionPreflight(agentDocsSection(repo));
-    const lock = preflight.indexOf(".tickmarkr/graph.lock");
-    const machineWideProbe = preflight.indexOf("machine-wide process pattern");
-    expect(lock).toBeGreaterThanOrEqual(0);
-    expect(machineWideProbe).toBeGreaterThan(lock);
-    expect(preflight).toMatch(/read its holder pid/);
-    expect(preflight).toContain("kill -0 <pid>");
-    expect(preflight).toMatch(/lawful run in another repository/);
-    expect(preflight).toMatch(/probing shell's own argv/);
-    expect(preflight).toMatch(/resolve every candidate's own cwd/);
-    expect(preflight).toMatch(/whose cwd is this repository root/);
-    expect(preflight).not.toContain('pgrep -f "tickmarkr (run|resume)"` must be empty');
+    for (const name of ["tickmarkr-loop", "tickmarkr-auto"]) {
+      const preflight = skillSection(skillCorpus(join(repo, ".agents/skills", name)), "Binary preflight (before compile or run)");
+      const lock = preflight.indexOf(".tickmarkr/graph.lock");
+      const machineWideProbe = preflight.indexOf("machine-wide process pattern");
+      expect(lock).toBeGreaterThanOrEqual(0);
+      expect(machineWideProbe).toBeGreaterThan(lock);
+      expect(preflight).toMatch(/Read its recorded holder pid/);
+      expect(preflight).toContain("kill -0 <pid>");
+      expect(preflight).toMatch(/lawful run in another repository/);
+      expect(preflight).toMatch(/probing shell's own argv/);
+      expect(preflight).toMatch(/resolve every\s+candidate's own working directory/);
+      expect(preflight).toContain("whose cwd is **this repository root**");
+      expect(preflight).not.toContain('pgrep -f "tickmarkr (run|resume)"` must be empty');
+    }
   });
 
-  test("test: the scaffolded agent-docs block requires binary and repository to agree on the entire version so a binary trailing by one patch stops the loop while scaffolded text comparing only major and minor fails", async () => {
+  test("test: each installed driving skill requires binary and repository to agree on the entire version so a binary trailing by one patch stops the loop while scaffolded text comparing only major and minor fails", async () => {
     vi.spyOn(registry, "allAdapters").mockReturnValue([]);
     const repo = makeRepo({ "keep.txt": "x" });
 
     await runInit(repo, "--agent", "--docs");
 
-    const preflight = versionPreflight(agentDocsSection(repo));
-    expect(preflight).toMatch(/versions differ anywhere \(major, minor, or patch\)/);
-    expect(preflight).toMatch(/must agree on the entire version/);
-    expect(preflight).toMatch(/binary `2\.1\.0` versus repository `2\.1\.1` is a stop/);
-    expect(preflight).not.toMatch(/older on major\.minor/);
+    for (const name of ["tickmarkr-loop", "tickmarkr-auto"]) {
+      const preflight = skillSection(skillCorpus(join(repo, ".agents/skills", name)), "Binary preflight (before compile or run)");
+      expect(preflight).toContain("agree on the entire version");
+      expect(preflight).toContain("binary `2.1.0` vs repo `2.1.1`");
+      expect(preflight).toContain("**stop immediately**");
+      expect(preflight).not.toMatch(/older on major\.minor/);
+    }
   });
 
   test("both driving skills carrying their own version preflight state the same whole-version stop rule so a patch-level gap stops them while a skill still telling the operator to stop only when the binary is older on major and minor fails", () => {
@@ -450,45 +420,36 @@ describe("tickmarkr init --agent preflight authority (T3)", () => {
       + "(including the patch; e.g. binary `2.1.0` vs repo `2.1.1`), **stop immediately**";
 
     for (const name of ["tickmarkr-auto", "tickmarkr-loop"]) {
-      const text = skill(name).toString("utf8");
+      const text = skillCorpus(join(ROOT, "skills", name));
       expect(text).toContain(wholeVersionRule);
       expect(text).not.toMatch(/older on major\.minor/);
     }
   });
 
-  test("this repository's own rendered guidance files carry both the repository-scoped live-run check and the whole-version stop rule while a change fixing only the scaffold a new repository would receive fails", async () => {
+  test("test: every guidance file at this repository root carries the rendered block byte for byte while this repository's own guidance above the markers carries the gate execution order and the skills mixed-tree law, so a stale root block or a source-repo rule deleted with the block fails", async () => {
     vi.spyOn(registry, "allAdapters").mockReturnValue([]);
     const repo = makeRepo({ "keep.txt": "x" });
     await runInit(repo, "--agent", "--docs");
     const scaffolded = agentDocsSection(repo);
-
-    // ROOT carries rendered guidance only in the private dev repo; the export deliberately ships no
-    // guidance file, so this assertion has no subject there and threw ENOENT on every public CI run.
-    // Discriminate POSITIVELY on the export script (present privately, absent in the export) and assert
-    // the export's own contract instead, so this never silently skips in either context.
+    // Public exports deliberately omit repository guidance; keep that contract explicit.
     if (!existsSync(join(ROOT, "scripts/export-public.sh"))) {
       for (const doc of ["CLAUDE.md", "AGENTS.md"]) expect(existsSync(join(ROOT, doc))).toBe(false);
       return;
     }
-    // EVERY guidance file present at ROOT must carry the identical generated block. Asserting only
-    // CLAUDE.md is how AGENTS.md — gitignored, so invisible to `git status` — kept both pre-2.1.2
-    // preflight defects after the tracked copy was fixed, and launched a consult under the stale text.
-    const present = ["CLAUDE.md", "AGENTS.md"].filter((doc) => existsSync(join(ROOT, doc)));
-    expect(present.length).toBeGreaterThan(0);
-    for (const doc of present) {
-      const rendered = agentDocsSection(ROOT, doc);
-      expect(rendered).toBe(scaffolded);
-      const preflight = versionPreflight(rendered);
-      expect(preflight.indexOf(".tickmarkr/graph.lock"))
-        .toBeLessThan(preflight.indexOf("machine-wide process pattern"));
-      expect(preflight).toMatch(/resolve every candidate's own cwd/);
-      expect(preflight).toMatch(/must agree on the entire version/);
-      expect(preflight).toMatch(/binary `2\.1\.0` versus repository `2\.1\.1` is a stop/);
-      expect(preflight).not.toMatch(/older on major\.minor/);
-      // the two-clause green rule recorded run 2119 (human=[T2]) as GREEN; the daemon's own predicate
-      // also requires failed/human/blocked/pending all empty. Reverting to the short form fails here.
-      expect(rendered).toMatch(/`failed`, `human`, `blocked` and `pending` buckets are every one of them empty/);
+    const present = ["CLAUDE.md", "AGENTS.md"].filter(doc => existsSync(join(ROOT, doc)));
+    expect(present).toContain("CLAUDE.md");
+    for (const doc of present) expect(agentDocsSection(ROOT, doc), doc).toBe(scaffolded);
+    const ownGuidancePath = join(ROOT, "CLAUDE.md");
+    // This file is absent from the exported tree; source-repo presence remains required above.
+    if (existsSync(ownGuidancePath)) {
+      const guidance = readFileSync(ownGuidancePath, "utf8");
+      const ownGuidance = guidance.split("<!-- tickmarkr:agent-docs begin -->")[0];
+      expect(ownGuidance).toContain(GATES);
+      expect(ownGuidance).toContain(MIXED);
+      expect(ownGuidance).toContain("**Editing `src/gates/`, `src/compile/` or `src/graph/`?**");
+      expect(guidance).not.toContain("These same bytes");
     }
+    expect(scaffolded).not.toContain("src/");
   });
 });
 

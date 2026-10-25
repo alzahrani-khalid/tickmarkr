@@ -13,6 +13,26 @@ import * as registry from "../../src/adapters/registry.js";
 import * as fixtures from "../../src/eval/fixtures.js";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../..");
+
+test("Cite the changed README consent rules and init help lines naming the shipped-bytes proof, the kept and reported unproven content and the no-follow boundary, versus a diff that still calls every init write additive or never names what a removal touched", async () => {
+  const readme = readFileSync(join(ROOT, "README.md"), "utf8");
+  const consent = readme.slice(readme.indexOf("Consent rules"), readme.indexOf("## Monitor and supervise"));
+  expect(consent).not.toContain("every write is additive");
+  for (const phrase of ["one complete shipped snapshot", "path for path and byte for byte", "marker alone never proves ownership",
+    "removed leftover <path>", "Unproven content is kept byte for byte and reported", "no-follow boundary",
+    "dangling links", "kept <path> (symbolic link)", "leftovers are the only installed guidance", "Move an added file out of the skill directory",
+    "queue row 244; D-2141; D-2152"]) expect(consent.replace(/\s+/g, " ")).toContain(phrase);
+  const result = await dispatch("init", ["--help"]);
+  expect(result.code).toBe(0);
+  for (const flag of ["--agent", "--force", "--remove"]) expect(result.out).toContain(`${flag}  ${COMMAND_HELP.init.options[flag]}`);
+  expect(COMMAND_HELP.init.options["--agent"]).toContain("shipped-bytes proof");
+  expect(consent.replace(/\s+/g, " ")).toContain("A complete earlier snapshot stays intact when its refresh is skipped");
+  expect(COMMAND_HELP.init.options["--agent"]).toContain("Keep complete earlier snapshots intact until a forced or consented refresh is applied");
+  expect(COMMAND_HELP.init.options["--agent"]).toContain("linked host ancestors");
+  expect(COMMAND_HELP.init.options["--remove"]).toContain("one complete shipped snapshot");
+  expect(COMMAND_HELP.init.options["--remove"]).toContain("Name removals; keep and report unproven content and symbolic links");
+  expect(COMMAND_HELP.init.options["--force"]).toContain("keep added files");
+});
 const put = (root: string, path: string, bytes: string) => {
   mkdirSync(dirname(join(root, path)), { recursive: true });
   writeFileSync(join(root, path), bytes);

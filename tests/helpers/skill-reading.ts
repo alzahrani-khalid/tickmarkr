@@ -1,3 +1,6 @@
+import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
+import { join } from "node:path";
+
 export type Scope = { parent?: Scope; host?: "herdr" | "orca"; children: Scope[]; line: number; kind: "root" | "heading" | "bullet"; depth: number };
 export const hostOf = (text: string): Scope["host"] => /^On (herdr|Orca)\b/.exec(text.replace(/^[*_]+/, ""))?.[1]?.toLowerCase() as Scope["host"];
 export const herdrOnly = /\bherdr\s+(?:agent|pane|notification|tab)\b|\bwatch-(?!artifacts\.sh\b)(?:\*|[\w-]+)\.sh\b|\bTKR_ARMING_SEAT\b|\bTKR_CLOSE_PANES\b|FIVE-TAB CANON|FOUR[ -]watchers/;
@@ -81,4 +84,51 @@ export function skillReading(markdown: string, host: "herdr" | "orca" | "plain")
     if (marker && (!fence || marker[0] === fence[0] && marker.length >= fence.length)) fence = fence ? undefined : marker;
   }
   return result.join("\n");
+}
+
+/** Only direct markdown references belong to a skill; each file starts a fresh scope tree. */
+function skillFiles(dir: string): string[] {
+  const references = join(dir, "references");
+  return ["SKILL.md", ...(existsSync(references) ? readdirSync(references).filter(name => name.endsWith(".md") && statSync(join(references, name)).isFile())
+    .sort().map(name => join("references", name)) : [])];
+}
+
+export function skillCorpus(dir: string): string {
+  return skillFiles(dir).map(file => readFileSync(join(dir, file), "utf8")).join("\n");
+}
+
+export function skillDirViolations(dir: string): string[] {
+  return skillFiles(dir).flatMap(file => hostViolations(readFileSync(join(dir, file), "utf8"))
+    .map(finding => `${file}: ${finding}`));
+}
+
+export function skillDirReading(dir: string, host: "herdr" | "orca" | "plain"): string {
+  return skillFiles(dir).map(file => skillReading(readFileSync(join(dir, file), "utf8"), host)).join("\n");
+}
+
+const orcaCommand = /(?<![\w-])orca\s+(?:terminal|worktree)\s+[a-z]/;
+const closedList = [
+  /the daemon-placed board is the live surface/,
+  /treat that as a daemon\/run liveness fault/,
+  /interactive TUI[^.]*never headless/i,
+  /say so and stop/,
+  /foreground\s+`?until\s+grep/i,
+  /at most every twenty minutes/i,
+];
+
+/** Sweep one file's plain-host reading; routing and required plain scope live in SKILL.md. */
+export function plainLineFindings(markdown: string): string[] {
+  const lines = skillReading(markdown, "plain").split("\n");
+  const findings: string[] = [];
+  for (const line of lines) {
+    if (herdrOnly.test(line)) findings.push(`herdr-only token: ${line.trim()}`);
+    if (orcaCommand.test(line)) findings.push(`Orca command: ${line.trim()}`);
+  }
+  // Mandates can wrap within a file, but never across files.
+  const reading = lines.join("\n").replace(/\s+/g, " ");
+  for (const mandate of closedList) {
+    const hit = mandate.exec(reading);
+    if (hit) findings.push(`plain-host-impossible mandate: ${hit[0]}`);
+  }
+  return findings;
 }

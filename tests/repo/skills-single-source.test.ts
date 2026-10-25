@@ -12,9 +12,11 @@ import {
   writeFileSync,
 } from "node:fs";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { tmpdir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { describe, expect, test } from "vitest";
+import { skillCorpus } from "../helpers/skill-reading.js";
 
 const REPO = join(import.meta.dirname, "../..");
 const CANONICAL = join(REPO, "skills");
@@ -202,7 +204,47 @@ const suiteName = skipReason
   ? `OBS-35 skills single-source (skills/ canonical) — ${skipReason}`
   : "OBS-35 skills single-source (skills/ canonical)";
 
-const OVERSEER_FILES = ["SKILL.md", join("scripts", "watch-panes.sh")];
+const OVERSEER_FILES = ["SKILL.md", join("scripts", "watch-panes.sh"),
+  ...["pane-mechanics", "watchers", "specialist-pipeline", "security-briefing", "evidence-discipline", "release-proof", "context-supervision"].map(name => join("references", `${name}.md`))];
+
+// Queue row 242; D-2141, D-2152: byte measurements beside fixed caps; 128 bytes reserve
+// the ownership marker. Round size + headroom up to a 4096-byte boundary, never scripts.
+const SKILL_SIZE_CAPS: Record<string, number> = {
+  "tickmarkr-auto/SKILL.md": 32768, // 30858 bytes
+  "tickmarkr-loop/SKILL.md": 32768, // 30536 bytes
+  "tickmarkr-loop/references/cockpit.md": 12288, // 8879 bytes
+  "tickmarkr-overseer/SKILL.md": 98304, // 94402 bytes
+  "tickmarkr-overseer/references/context-supervision.md": 20480, // 16553 bytes
+  "tickmarkr-overseer/references/evidence-discipline.md": 45056, // 41385 bytes
+  "tickmarkr-overseer/references/pane-mechanics.md": 16384, // 13303 bytes
+  "tickmarkr-overseer/references/release-proof.md": 16384, // 12559 bytes
+  "tickmarkr-overseer/references/security-briefing.md": 4096, // 1218 bytes
+  "tickmarkr-overseer/references/specialist-pipeline.md": 8192, // 6942 bytes
+  "tickmarkr-overseer/references/watchers.md": 24576, // 20909 bytes
+};
+
+function shippedMarkdown(root: string): string[] {
+  return skillNames(root).flatMap(name => skillFiles(join(root, name))
+    .filter(file => file === "SKILL.md" || /^references\/[^/]+\.md$/.test(file))
+    .map(file => join(name, file))).sort();
+}
+
+function skillSizeViolations(root: string, caps = SKILL_SIZE_CAPS): Violation[] {
+  const files = shippedMarkdown(root);
+  const violations: Violation[] = [];
+  for (const name of files) {
+    const size = readFileSync(join(root, name)).byteLength;
+    const cap = caps[name];
+    const expected = Math.ceil((size + 128) / 4096) * 4096;
+    if (cap === undefined) violations.push({ name, reason: "missing size cap" });
+    else if (size > cap) violations.push({ name, reason: `${size} bytes exceeds size cap ${cap}` });
+    else if (cap !== expected) violations.push({ name, reason: `size cap ${cap} must be ${expected} for ${size} bytes + 128 bytes headroom` });
+  }
+  for (const name of Object.keys(caps)) {
+    if (!files.includes(name)) violations.push({ name, reason: "size cap names no shipped markdown file" });
+  }
+  return violations;
+}
 
 describe("T9 overseer skill packaging (canonical tree)", () => {
   test("the canonical overseer skill carries its pane watcher script beside its instructions", () => {
@@ -211,6 +253,65 @@ describe("T9 overseer skill packaging (canonical tree)", () => {
     const watcher = join(dir, "scripts", "watch-panes.sh");
     expect(readFileSync(watcher, "utf8").startsWith("#!/usr/bin/env bash")).toBe(true);
     expect(lstatSync(watcher).mode & 0o111, "watcher must stay executable").not.toBe(0);
+  });
+
+  test("test: each shipped skill file and reference file has a size cap at least its size and at most one four-kilobyte step plus the headroom above it, and a copy of a file grown past its cap fails the guard naming it, so a skill that regrows silently or a cap set far above its file fails", () => {
+    expect(skillSizeViolations(CANONICAL)).toEqual([]);
+    const root = mkdtempSync(join(tmpdir(), "skills-size-caps-"));
+    try {
+      for (const name of shippedMarkdown(CANONICAL)) {
+        const path = join(root, name);
+        mkdirSync(dirname(path), { recursive: true });
+        writeFileSync(path, readFileSync(join(CANONICAL, name)));
+      }
+      expect(skillSizeViolations(root)).toEqual([]);
+      for (const [name, cap] of Object.entries(SKILL_SIZE_CAPS)) {
+        const path = join(root, name);
+        const original = readFileSync(path);
+        writeFileSync(path, Buffer.concat([original, Buffer.alloc(cap + 1 - original.byteLength, 0x78)]));
+        expect(skillSizeViolations(root), name).toEqual([{ name, reason: `${cap + 1} bytes exceeds size cap ${cap}` }]);
+        writeFileSync(path, original);
+        expect(skillSizeViolations(root, { ...SKILL_SIZE_CAPS, [name]: cap + 4096 }), name)
+          .toEqual([{ name, reason: `size cap ${cap + 4096} must be ${cap} for ${original.byteLength} bytes + 128 bytes headroom` }]);
+        const missingCap = { ...SKILL_SIZE_CAPS };
+        delete missingCap[name];
+        expect(skillSizeViolations(root, missingCap), name).toEqual([{ name, reason: "missing size cap" }]);
+      }
+      writeFileSync(join(root, "tickmarkr-loop/references/new.md"), "new reference\n");
+      expect(skillSizeViolations(root)).toEqual([{ name: "tickmarkr-loop/references/new.md", reason: "missing size cap" }]);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("Cite the deleted loop canonical-tree sentence and the deleted mixed-tree law of the watcher reference, the path-neutral run watcher lines and their placeholder definition in loop and auto, and each cap literal beside its file's measured size, versus a diff that keeps source-repo tree prose in a shipped file or sets a cap far above its file", () => {
+    // Queue row 242; D-2141, D-2152: the removed loop tail and watcher law delimit the exact cuts.
+    const deletedLoop = "Keep this skill's canonical identity `tickmarkr-loop`; sibling skills link to this\nwalkthrough. In this repository `skills/` is canonical and installed `.claude/skills/`\nfiles resolve to it; change the canonical source, never create a second help skill.\n";
+    const lawStart = "**And `skills/` (canonical) versus";
+    const lawEnd = "reassuring one gets acted on.**";
+    const treeProse = /In this repository `skills\/`|`skills\/` \(canonical\) versus|installed links to canonical `skills\/`|Sync both trees|SHARED INODE|CANON-ONLY|change the canonical source|canonical files are all real files/;
+    const assertNoTreeProse = (text: string, name: string) => expect(text, name).not.toMatch(treeProse);
+    for (const name of shippedMarkdown(CANONICAL)) {
+      assertNoTreeProse(readFileSync(join(CANONICAL, name), "utf8"), name);
+    }
+    for (const prose of [deletedLoop, lawStart, lawEnd + "\nSync both trees", "Keep the installed links to canonical `skills/` intact."]) {
+      expect(() => assertNoTreeProse(prose, "mutated shipped file")).toThrow();
+    }
+    const watchers = readFileSync(join(CANONICAL, "tickmarkr-overseer/references/watchers.md"), "utf8");
+    expect(watchers).not.toContain(lawStart);
+    expect(watchers).not.toContain(lawEnd);
+    // The only watcher cut is the 2319-byte law plus its trailing blank line (34 lines).
+    // Its SHA-256 was 3f15b0b17916652462d19765eb16cab79eb96102f3e456e994da21f2f78ad479.
+    expect(createHash("sha256").update(watchers.replaceAll("<skill-dir>/scripts/", ".claude/skills/tickmarkr-overseer/scripts/")).digest("hex"))
+      .toBe("7af00694f3aacb2f40b674f30863a5b791a98ceacf3b4b73dcce0509c444fa62");
+    for (const name of ["loop", "auto"]) {
+      const text = readFileSync(join(CANONICAL, `tickmarkr-${name}/SKILL.md`), "utf8");
+      expect(text).toContain("`<skills-dir>` is the skills directory holding this skill.");
+      expect(text).toContain("`<skills-dir>/tickmarkr-overseer/scripts/watch-journal.sh <state-dir>/runs 20 28800`");
+      expect(text).not.toContain(".claude/skills/");
+      expect(text).not.toContain(deletedLoop);
+    }
+    expect(skillSizeViolations(CANONICAL)).toEqual([]);
   });
 });
 
@@ -225,7 +326,7 @@ describe.skipIf(skipReason !== undefined)(suiteName, () => {
       if (name === "tickmarkr-loop") {
         // The installed twin is mode 120000: its unchanged link exposes canonical edits.
         for (const path of [canonical, installed]) {
-          const text = readFileSync(path, "utf8");
+          const text = skillCorpus(dirname(path));
           expect(text).toContain("`--recheck --park <line>@<ts>`");
           expect(text).toContain("explicitly recorded empty survivors array (`[]`)");
           expect(text).toContain("plain approve dispatches a worker");
@@ -266,10 +367,6 @@ describe.skipIf(skipReason !== undefined)(suiteName, () => {
         name: "tickmarkr-overseer",
         reason: "scripts/journal-pretty.sh: installed-only file requires an explicit decision",
       },
-      ...["tkr", "tkr-doctor", "tkr-help", "tkr-init", "tkr-loop"].map((name) => ({
-        name,
-        reason: "installed-only skill requires an explicit decision",
-      })),
     ];
     // A gitignored installed skill is an operator-local install (e.g. a context-graph tool wired into
     // .claude/skills by its own installer), not an orphan of the shipped tree: the exported tree never

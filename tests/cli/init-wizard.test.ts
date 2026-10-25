@@ -163,6 +163,16 @@ describe("init wizard act 1", () => {
     if (outcome.kind === "continue") expect(outcome.installSkills).toBe(false);
   });
 
+  // Queue row 243 (D-2141; D-2152): inspect the rendered skills description at its row.
+  test("test: the init wizard's skills row describes copying the packaged tickmarkr skills and guidance and names no slash command skill, so a wizard still offering the wrapper skills fails", async () => {
+    const { result, io } = run(fields(), [KEYS.tab, KEYS.escape], makeFrameIO());
+    expect(await result).toEqual({ kind: "quit" });
+    const frames = strip(io.writes.join(""));
+    expect(frames).toContain("Install agent skills");
+    expect(frames).toContain("copy the packaged tickmarkr skills + AGENTS.md guidance into this repo");
+    expect(frames).not.toMatch(/(?:^|[\s`])\/(?:tkr|tickmarkr)[\w-]*/m);
+  });
+
   test("docs toggle flips installDocs on and is independent of the skills default", async () => {
     const { result } = run(fields(), [
       KEYS.down, KEYS.down, KEYS.down, KEYS.down, KEYS.space, KEYS.down, KEYS.enter,

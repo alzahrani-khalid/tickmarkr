@@ -7,6 +7,7 @@ import { parse as parseYaml } from "yaml";
 import { makeRepo } from "../helpers/tmprepo.js";
 import { candidateCheckout, childEnv, greenArtifacts, recordedRun, recordedRuns, RUN_ID } from "../fixtures/ci/recorded-run.js";
 import { ownedFailures, runOwned } from "../helpers/owned-process.js";
+import { skillCorpus } from "../helpers/skill-reading.js";
 
 const ROOT = execSync("git rev-parse --show-toplevel", { encoding: "utf8" }).trim();
 const RELEASING_MD = join(ROOT, "RELEASING.md");
@@ -205,25 +206,26 @@ describe("release documentation", () => {
     });
 
     test.skipIf(OVERSEER_SKILL_TWIN_SKIP_REASON !== undefined)("the overseer skill names the no-vitest-probe-while-live law the runner-name-never-in-argv law the files-versus-oracle pin sweep the verify-base gate for mid-run fixes the record grading at run-end bound to the mirror head the idle send with read-back and the registry re-read and RELEASING.md's steps 3 to 5 name lint in the proof the grader bound to the mirror head and the registry re-read as the diff shows in both skill twins and the release guide", () => {
-      const skill = readFile(OVERSEER_SKILL);
-      expect(skill).toContain("files[]-versus-oracle pin sweep");
-      expect(skill).toMatch(/run is live[\s\S]*no `vitest` probe of any size/i);
-      expect(skill).toContain("runner's name never enters a shell argv");
-      expect(skill).toContain("tickmarkr verify --base <main>");
-      expect(skill).toMatch(/GRADE PUBLIC CI FROM ITS RUN RECORD AND PROOF GROUPS AT RUN-END ONLY/);
-      expect(skill).toContain("`scripts/grade-ci.sh <run-id> <mirror HEAD sha> <mirror clone> <tag>`");
-      // v2.8.2 T3: the grader recomputes the tracked set from the commit, so no hand-derived count remains
-      expect(skill).not.toContain("<expected-count>");
-      expect(skill).toMatch(
-        /seat-send to a WORKING seat leaves a DRAFT[\s\S]*idle[\s\S]*dim-only[\s\S]*read back activity or an ACK/
-      );
-      expect(skill).toMatch(/RE-READ THE REGISTRY BEFORE RULING/);
-
       expect(
         existsSync(OVERSEER_SKILL_TWIN),
         "the installed overseer skill twin must exist in the private tree"
       ).toBe(true);
-      expect(readFile(OVERSEER_SKILL_TWIN)).toBe(skill);
+      for (const dir of [dirname(OVERSEER_SKILL), dirname(OVERSEER_SKILL_TWIN)]) {
+        const skill = skillCorpus(dir);
+        expect(skill).toContain("files[]-versus-oracle pin sweep");
+        expect(skill).toMatch(/run is live[\s\S]*no `vitest` probe of any size/i);
+        expect(skill).toContain("runner's name never enters a shell argv");
+        expect(skill).toContain("tickmarkr verify --base <main>");
+        expect(skill).toMatch(/GRADE PUBLIC CI FROM ITS RUN RECORD AND PROOF GROUPS AT RUN-END ONLY/);
+        expect(skill).toContain("`scripts/grade-ci.sh <run-id> <mirror HEAD sha> <mirror clone> <tag>`");
+        // v2.8.2 T3: the grader recomputes the tracked set from the commit, so no hand-derived count remains
+        expect(skill).not.toContain("<expected-count>");
+        expect(skill).toMatch(
+          /seat-send to a WORKING seat leaves a DRAFT[\s\S]*idle[\s\S]*dim-only[\s\S]*read back activity or an ACK/
+        );
+        expect(skill).toMatch(/RE-READ THE REGISTRY BEFORE RULING/);
+      }
+      expect(readFile(OVERSEER_SKILL_TWIN)).toBe(readFile(OVERSEER_SKILL));
 
       const steps = perReleaseSteps();
       const step3 = steps.match(/(?:^|\n)3\. ([\s\S]*?)(?=\n4\. )/)?.[1] ?? "";
@@ -246,7 +248,7 @@ describe("release documentation", () => {
       const runbook = step4.split("\n").map((line) => line.trim()).filter((line) => line.includes("grade-ci.sh") && line.startsWith("bash "));
       expect(runbook).toHaveLength(1);
       expect(runbook[0]).toMatch(/^bash skills\/tickmarkr-overseer\/scripts\/grade-ci\.sh <run-id> "\$MIRROR_COMMIT" \/path\/to\/tickmarkr-public-mirror v\d+\.\d+\.\d+$/);
-      const law = [...readFile(OVERSEER_SKILL).matchAll(/`([^`\n]*grade-ci\.sh[^`\n]*)`/g)].map((match) => match[1]!);
+      const law = [...skillCorpus(join(ROOT, "skills/tickmarkr-overseer")).matchAll(/`([^`\n]*grade-ci\.sh[^`\n]*)`/g)].map((match) => match[1]!);
       expect(law).toEqual(["scripts/grade-ci.sh <run-id> <mirror HEAD sha> <mirror clone> <tag>"]);
 
       const canonical = join(ROOT, "skills/tickmarkr-overseer/scripts/grade-ci.sh");
@@ -965,7 +967,7 @@ test("test: the verdict command the release runbook and the overseer law print f
   const steps = perReleaseSteps();
   const runbook = steps.slice(steps.indexOf("\n6. ")).split("\n").map((line) => line.trim())
     .filter((line) => /^TICKMARKR_CI_RECORD=|cli\.ts verdict /.test(line));
-  const law = [...readFile(OVERSEER_SKILL).matchAll(/`((?:TICKMARKR_CI_RECORD=|npx --no-install tsx scripts\/ci\/cli\.ts verdict )[^`\n]*)`/g)].map((match) => match[1]!);
+  const law = [...skillCorpus(join(ROOT, "skills/tickmarkr-overseer")).matchAll(/`((?:TICKMARKR_CI_RECORD=|npx --no-install tsx scripts\/ci\/cli\.ts verdict )[^`\n]*)`/g)].map((match) => match[1]!);
   expect([...law].sort()).toEqual([...runbook].sort());
   const commands = Object.entries(leaf).map(([file, name]) => {
     const run = runbook.filter((line) => line.includes(` vitest run ${file}`));

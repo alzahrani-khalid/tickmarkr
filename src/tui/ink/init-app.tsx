@@ -75,7 +75,7 @@ function buildRows(offerSkills: boolean, driver: Driver, host: DetectedHost): Ro
       id: "skills",
       section: "Skills",
       label: "Install agent skills",
-      desc: "copy the packaged /tkr skills + AGENTS.md guidance into this repo",
+      desc: "copy the packaged tickmarkr skills + AGENTS.md guidance into this repo",
     });
     rows.push({
       id: "docs",

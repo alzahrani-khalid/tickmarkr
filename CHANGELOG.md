@@ -2,6 +2,54 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v2.9.0 — skills and guidance diet: a 1.2 KB managed block, a lean overseer core with on-demand references, the GSD section retired, the tkr wrapper knowledge in the CLI, and an init that removes only the skill content tickmarkr provably shipped
+
+**v2.9.0** cuts what every consumer repository loads in every session (queue rows 241–244). It is a minor release because it
+restructures what `init` installs and what each agent reads. Its work comes from one `tickmarkr run` engagement
+(run-20261024-124447-…2369, resumed three times), in which twelve tasks each passed build, lint, evidence, scope, their
+acceptance criteria, a cross-vendor review and the full suite. One test-only fix followed, checked by `tickmarkr verify`: the four tests that read released skill
+files from git tags now skip by name in a tagless checkout (the public export and CI) instead of failing (queue row 255).
+
+- **The managed agent block shrinks from about 10 KB to about 1.2 KB (queue row 241).** The block `init --agent` writes into
+  CLAUDE.md and AGENTS.md now keeps only the rules an agent must obey without opening a skill:
+  - never run two runs in one repository;
+  - never merge to main;
+  - run `tickmarkr version --check` before compile or run;
+  - drive runs through the loop and auto skills;
+  - a one-line green rule.
+
+  The procedures moved into the loop and auto skills, which gained each one before the block dropped it.
+- **The overseer skill is a lean core plus references read on demand (queue row 242).**
+  - SKILL.md drops from about 210 KB to about 94 KB.
+  - Pane mechanics, watchers, the specialist pipeline, the security briefing, evidence discipline, the release proof and
+    context supervision move byte-for-byte into `references/*.md`. The core names each reference and when to read it.
+  - The retired GSD section is gone; its still-binding seat rules were rescued verbatim.
+  - The loop cockpit moves to a reference too.
+  - A per-file size cap keeps every skill file from regrowing silently.
+- **The tkr wrapper knowledge lives in the CLI (queue row 243).**
+  - `init`'s footer no longer claims to install `/tkr` skills.
+  - A non-interactive `init` prints how to finish.
+  - `doctor` notes that a probe timeout on a large repository may be a false negative, beside the rows it explains. The
+    stale note about a retired auto-prefer mechanism is gone.
+- **`init` removes only the skill content tickmarkr provably shipped (queue row 244).**
+  - Packaged skills carry an `installed-by: tickmarkr` marker.
+  - A generated table records every file any release shipped, by version, path and content.
+  - `init --agent` and `--remove` delete a skill directory only when it equals one shipped release's complete tree byte
+    for byte. They sweep a single retired file only when its bytes were shipped at that path.
+  - Anything modified, unknown, partial or mixed is kept and reported by `version --check`. The marker alone never proves
+    ownership.
+  - Nothing is ever copied, written or deleted through a symbolic link. A dangling link at a skill path used to crash
+    `init` with a native abort; it no longer does.
+
+Declared, still open:
+- Queue row 251: a review park whose only remedy is a files[] extension has no verb that grants it.
+- Queue row 252: after a `resume --graph-changed`, a later plain `resume` is refused without naming the flag that releases it.
+- Queue row 254: after a crashed run is resumed to a passing tip verify, the status header still shows the old crash.
+- Queue row 253: four minor edges of the new skill check (a mirrored skills root, an unreadable file in a reserved skill, two note wordings).
+- Queue rows 247, 248, 249, 139 and 250, and rows 236, 237, 238, 232(a, b), 187(b) and 246.
+- Follow-ons from this release's scope: overseer core Option B (about 60 KB), and shared references for the teardown,
+  daemon and role sections the three skills duplicate.
+
 ## v2.8.9 — cleanup: a missing task checkout is rebuilt from its recorded work, task worktrees never outlive their run, seats are closed by the mission that opened them, and hand-made checkouts get a home, a ledger and a removal step
 
 **v2.8.9** makes cleanup automatic (queue row 240). Its work comes from one `tickmarkr run` engagement

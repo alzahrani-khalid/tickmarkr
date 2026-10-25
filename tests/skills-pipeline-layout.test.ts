@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import * as fs from 'fs'
 import * as path from 'path'
+import { skillCorpus } from './helpers/skill-reading.js'
 
 const claudePath = path.join(process.cwd(), '.claude')
 const claudeSkillsExist = fs.existsSync(claudePath)
@@ -8,21 +9,21 @@ const claudeSkillsExist = fs.existsSync(claudePath)
 describe.skipIf(!claudeSkillsExist)('skills-pipeline-layout', () => {
   it('the overseer skill names the dedicated consultant tab rule', () => {
     const overseerPath = path.join(process.cwd(), '.claude', 'skills', 'tickmarkr-overseer', 'SKILL.md')
-    const content = fs.readFileSync(overseerPath, 'utf-8')
+    const content = skillCorpus(path.dirname(overseerPath))
     expect(content).toContain('Dedicated consultant tab')
     expect(content).toMatch(/consultant[s]? .*[p|t]ab/)
   })
 
   it('the overseer skill names the scoper worktree rule', () => {
     const overseerPath = path.join(process.cwd(), '.claude', 'skills', 'tickmarkr-overseer', 'SKILL.md')
-    const content = fs.readFileSync(overseerPath, 'utf-8')
+    const content = skillCorpus(path.dirname(overseerPath))
     expect(content).toContain('Scoper worktree rule')
     expect(content).toMatch(/scoper|worktree/)
   })
 
   it('the loop skill names the dedicated consultant tab rule', () => {
     const loopPath = path.join(process.cwd(), 'skills', 'tickmarkr-loop', 'SKILL.md')
-    const content = fs.readFileSync(loopPath, 'utf-8')
+    const content = skillCorpus(path.dirname(loopPath))
     expect(content).toContain('Dedicated consultant tab rule')
     expect(content).toMatch(/consultant[s]? .*[p|t]ab/)
   })
@@ -41,8 +42,8 @@ describe.skipIf(!claudeSkillsExist)('skills-pipeline-layout', () => {
     const overseerPath = path.join(process.cwd(), '.claude', 'skills', 'tickmarkr-overseer', 'SKILL.md')
     const loopPath = path.join(process.cwd(), 'skills', 'tickmarkr-loop', 'SKILL.md')
 
-    const overseerContent = fs.readFileSync(overseerPath, 'utf-8')
-    const loopContent = fs.readFileSync(loopPath, 'utf-8')
+    const overseerContent = skillCorpus(path.dirname(overseerPath))
+    const loopContent = skillCorpus(path.dirname(loopPath))
 
     // Check that both skills mention the dedicated tab outliving the orchestrator
     expect(overseerContent).toMatch(/dedicated.*tab.*(?:persist|outliv|surviv)/i)
@@ -53,8 +54,8 @@ describe.skipIf(!claudeSkillsExist)('skills-pipeline-layout', () => {
     const loopPath = path.join(process.cwd(), 'skills', 'tickmarkr-loop', 'SKILL.md')
     const autoPath = path.join(process.cwd(), 'skills', 'tickmarkr-auto', 'SKILL.md')
 
-    const loopContent = fs.readFileSync(loopPath, 'utf-8')
-    const autoContent = fs.readFileSync(autoPath, 'utf-8')
+    const loopContent = skillCorpus(path.dirname(loopPath))
+    const autoContent = skillCorpus(path.dirname(autoPath))
 
     // Both should mention both claude and codex
     expect(loopContent).toMatch(/(?:claude|claude code)/i)
@@ -70,7 +71,7 @@ describe.skipIf(!claudeSkillsExist)('skills-pipeline-layout', () => {
 
   it('the overseer skill\'s orchestrator spawn instructions name both a claude and a codex launch form instead of one hardcoded agent binary', () => {
     const overseerPath = path.join(process.cwd(), '.claude', 'skills', 'tickmarkr-overseer', 'SKILL.md')
-    const content = fs.readFileSync(overseerPath, 'utf-8')
+    const content = skillCorpus(path.dirname(overseerPath))
 
     // Should not have the old hardcoded "-- claude"
     expect(content).not.toMatch(/-- claude[`"']?\s*\(pin/)
@@ -85,9 +86,9 @@ describe.skipIf(!claudeSkillsExist)('skills-pipeline-layout', () => {
     const loopPath = path.join(process.cwd(), 'skills', 'tickmarkr-loop', 'SKILL.md')
     const autoPath = path.join(process.cwd(), 'skills', 'tickmarkr-auto', 'SKILL.md')
 
-    const overseerContent = fs.readFileSync(overseerPath, 'utf-8')
-    const loopContent = fs.readFileSync(loopPath, 'utf-8')
-    const autoContent = fs.readFileSync(autoPath, 'utf-8')
+    const overseerContent = skillCorpus(path.dirname(overseerPath))
+    const loopContent = skillCorpus(path.dirname(loopPath))
+    const autoContent = skillCorpus(path.dirname(autoPath))
 
     // Workers keep workspace-write via the codex adapter (proven across runs), but
     // ORCHESTRATOR sessions that launch tickmarkr run must be unsandboxed per OBS-99.
@@ -98,7 +99,7 @@ describe.skipIf(!claudeSkillsExist)('skills-pipeline-layout', () => {
 
   it('the shipped overseer skill states that a standing instruction records the premise whose falsification revokes it, and the pipeline layout test asserts that section is present so the rule cannot be dropped silently', () => {
     const overseerPath = path.join(process.cwd(), 'skills', 'tickmarkr-overseer', 'SKILL.md')
-    const content = fs.readFileSync(overseerPath, 'utf-8')
+    const content = skillCorpus(path.dirname(overseerPath))
 
     expect(content).toContain('A standing instruction carries its revocation premise')
     expect(content).toMatch(/standing rule[\s\S]*states the premise that makes it true/i)
@@ -107,7 +108,7 @@ describe.skipIf(!claudeSkillsExist)('skills-pipeline-layout', () => {
 
   it('the shipped overseer skill directs a tier liveness read at beat freshness and a loop liveness read at the process payload, so neither is read from a recorded pid', () => {
     const overseerPath = path.join(process.cwd(), 'skills', 'tickmarkr-overseer', 'SKILL.md')
-    const content = fs.readFileSync(overseerPath, 'utf-8')
+    const content = skillCorpus(path.dirname(overseerPath))
 
     expect(content).toMatch(/tier's liveness is read from beat freshness/i)
     expect(content).toMatch(/loop's liveness is read from the live process payload/i)

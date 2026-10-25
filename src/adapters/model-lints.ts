@@ -87,7 +87,6 @@ const TTY_LINT_CAP = 3;
 const DEFAULT_STATE_DIR = ".tickmarkr";
 const doctorJsonRef = (stateDir: string) => ` — see ${stateDir}/doctor.json`;
 const DECLARED_SEED_PREFER_DISPOSITION = "no declared preference overrides it";
-const LEGACY_DOCTOR_SEED_PREFER_DISPOSITION = "auto-prefer is routing around it";
 
 export const ttyVisual = () => process.stdout.isTTY === true && process.env.NO_COLOR === undefined;
 
@@ -690,13 +689,8 @@ export function modelLints(
       if (days >= MODEL_STALE_DAYS) lints.push(`${id}: model knowledge is ${days} days old — rerun tickmarkr doctor`);
     }
   }
-  // v1.34 T3 byte-pins non-TTY doctor output. Doctor consumers are the ones that provide stateDir;
-  // keep that machine-facing compatibility surface stable while plan and direct lint callers state
-  // the current declared-preference mechanism truthfully.
-  const seedDisposition = opts?.stateDir !== undefined && opts.tty !== true
-    ? LEGACY_DOCTOR_SEED_PREFER_DISPOSITION
-    : DECLARED_SEED_PREFER_DISPOSITION;
-  lints.push(...collectSeedPreferLints(cfg, health, adapters, opts?.overlayPreferShapes ?? new Set(), seedDisposition));
+  // Queue row 243 (D-2141; D-2152): every surface uses the declared-preference disposition.
+  lints.push(...seedPreferLints(cfg, health, adapters, opts?.overlayPreferShapes ?? new Set()));
   lints.push(...deadPoolLints(cfg, health, adapters));
   return lints;
 }

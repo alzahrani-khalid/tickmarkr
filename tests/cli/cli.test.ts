@@ -399,7 +399,7 @@ describe("tickmarkr init", () => {
       "the full cockpit — every worker, judge, and consult is a visible pane you can watch and unblock · https://herdr.dev",
     );
     expect(out).toContain(
-      "tickmarkr init --agent installs the /tkr skills + AGENTS.md so Claude Code (or any agent CLI) drives the loop natively",
+      "tickmarkr init --agent installs the tickmarkr-loop, tickmarkr-auto and tickmarkr-overseer skills + AGENTS.md so Claude Code (or any agent CLI) drives the loop natively",
     );
     expect(out).toContain("no herdr? same fail-closed gates, headless subprocess driver");
     const retired = ["dro", "vr"].join("");

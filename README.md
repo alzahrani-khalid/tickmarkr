@@ -91,25 +91,50 @@ green tasks land on `tickmarkr/<runId>` — merge to your mainline is your decis
 ## Agent-ready repos: `tickmarkr init --agent`
 
 `tickmarkr init --agent` composes with the base `init` above and additionally installs the
-consumer-facing skills (`tickmarkr-loop`, `tickmarkr-auto`) that ship in the npm tarball, so a
+consumer-facing skills (`tickmarkr-loop`, `tickmarkr-auto`, `tickmarkr-overseer`) that ship in the npm tarball, so a
 coding agent working in your repo knows how to drive tickmarkr without reading its source:
 
 ```bash
-tickmarkr init --agent            # installs .claude/skills/tickmarkr-{loop,auto}, offers CLAUDE.md/AGENTS.md notes
+tickmarkr init --agent            # installs host skills, offers CLAUDE.md/AGENTS.md notes
 tickmarkr init --agent --force    # also overwrite skill files that already exist
 tickmarkr init --agent --docs     # also append the agent-docs section without an interactive prompt
 ```
 
-Consent rules — every write is additive, never destructive:
+Consent rules (queue row 244; D-2141; D-2152):
 
-- an existing `.claude/skills/tickmarkr-{loop,auto}/SKILL.md` is left untouched unless you answer
+- an existing currently shipped host skill file (`tickmarkr-loop`, `tickmarkr-auto` or `tickmarkr-overseer`) is left untouched unless you answer
   yes to a per-file prompt, or pass `--force`
-- a short "tickmarkr" section (the loop commands + the invariants above) is appended to `CLAUDE.md`
-  — or `AGENTS.md` if that exists and `CLAUDE.md` doesn't — only after you say yes, or pass `--docs`;
-  it's wrapped in `<!-- tickmarkr:agent-docs begin/end -->` markers and never inserted twice
+- `--agent` removes retired skill directories only when their complete, nonempty tree,
+  including a regular `SKILL.md` and no extra directory, equals one complete shipped snapshot
+  path for path and byte for byte. This shipped-bytes proof works with or without the ownership
+  marker; a marker alone never proves ownership. Inside today's skills it also removes retired
+  files whose bytes were shipped at that same skill path. A complete earlier snapshot stays intact
+  when its refresh is skipped; its retired files are removed only after a forced or consented
+  refresh is applied. Each deletion says `removed leftover <path>`.
+- `--remove` sweeps those proven retired files before removing skill directories with the same
+  complete-snapshot proof at both host locations. Unproven content is kept byte for byte and reported
+  by path under reserved names or with the exact `metadata.installed-by: tickmarkr` marker;
+  unmarked user skills outside reserved names stay untouched and unlisted. Today's reserved names
+  keep the install and `--force` refresh behavior above; refresh preserves added files.
+- the no-follow boundary covers linked host roots and their ancestors within the consumer,
+  skill entries, files and nested directories, including dangling links. Nothing is read, copied,
+  written or deleted through them; each is named as `kept <path> (symbolic link)`.
+  `tickmarkr version --check` names every `leftover <path>` and `unproven <path>`, including when
+  leftovers are the only installed guidance, and exits non-zero with a remedy naming each path.
+  Move an added file out of the skill directory; modified or missing shipped files use
+  `tickmarkr init --agent --force`.
+- a short "tickmarkr" block contains only the five invariants, the version check stop, the one-line
+  green rule and the routing line naming the loop, auto and overseer skills. It is appended to each
+  applicable host's guidance (`AGENTS.md`, plus `CLAUDE.md` when the repo uses Claude) only after
+  you say yes, or pass `--docs`; it is wrapped in `<!-- tickmarkr:agent-docs begin/end -->` markers
+  and never inserted twice. The loop and auto skills hold the commands, role check, preflight, seat
+  hygiene, verified handoffs, full green rule and spec-template pointer; both point every host to
+  the overseer skill's PROJECT MEMORY duty under Setup (queue row 241; D-2141; D-2152)
 - declining a prompt still lets the rest of `init` complete
-- non-interactive shells (no TTY) never prompt: missing skills are installed, everything else is
-  skipped, and the summary names exactly what was skipped and which flag would enable it
+- non-interactive shells (no TTY) never prompt: missing skills are installed, eligible proven leftovers
+  are removed, and existing shipped files needing overwrite consent are skipped with their complete
+  earlier snapshots intact; use `--force` to refresh them. The summary names
+  what was removed, kept or skipped and which flag would enable a refresh
 
 ## Monitor and supervise
 

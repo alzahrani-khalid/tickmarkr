@@ -5,7 +5,7 @@ import { existsSync, readFileSync, readdirSync, realpathSync } from "node:fs";
 import { extname, join, normalize, resolve } from "node:path";
 import { detectPackageManager, turboContinueFindings } from "../../gates/baseline.js";
 import { version } from "./version.js";
-import { allAdapters, binaryShadowWarnings, detectCandidateClis, doctorAgeMs, flagDriftWarnings, modelAliasExclusions, modelAliasLine, probeAll, probeModels, readDoctor, resolveShellBinary, servableExclusions, servabilityLine, writeDoctor } from "../../adapters/registry.js";
+import { allAdapters, binaryShadowWarnings, detectCandidateClis, doctorAgeMs, flagDriftWarnings, formatDoctorProbeTimeoutNote, modelAliasExclusions, modelAliasLine, probeAll, probeModels, readDoctor, resolveShellBinary, servableExclusions, servabilityLine, writeDoctor } from "../../adapters/registry.js";
 import { CLAUDE_ALIAS_IDENTITY_STAMPS, claudeCode, type ClaudeAlias, resolveClaudeAliasIdentity } from "../../adapters/claude-code.js";
 import { shq } from "../../adapters/types.js";
 import { BANNER, compactTokens, dim, fail, kvRow, legend, ok, rule, statusRow, title } from "../../brand.js";
@@ -1703,6 +1703,7 @@ export async function doctor(
     if (!models.length && !unclassified.length) return [];
     const w = Math.max(8, ...models.map((m) => m.length));
     const rows: string[] = [`  ${dim(a.id)}`];
+    let timeoutNotePrinted = false;
     for (const m of models) {
       const v = h.modelAuth?.[m];
       // probe wall clock (ProbedModelAuth.durationMs) — pre-v1.91 doctor.json rows lack it
@@ -1723,6 +1724,11 @@ export async function doctor(
         ? ` ${(window !== undefined ? compactTokens(window) : "—").padEnd(5)}`
         : "";
       rows.push(`    ${m.padEnd(w)} ${classified[m].padEnd(8)}${windowCol} ${auth}  ${dim("denied=")}${denied}  ${dim("prefer=")}${pref}`);
+      const timeoutNote = !timeoutNotePrinted && formatDoctorProbeTimeoutNote(a, v);
+      if (timeoutNote) {
+        rows.push(timeoutNote);
+        timeoutNotePrinted = true;
+      }
     }
     if (unclassified.length) {
       // Keep the historical count as an index, but it is no longer the whole report: every model gets

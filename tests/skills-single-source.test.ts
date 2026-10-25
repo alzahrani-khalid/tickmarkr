@@ -1,11 +1,19 @@
 import { existsSync, lstatSync, readFileSync, realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import { expect, test } from "vitest";
+import { skillCorpus } from "./helpers/skill-reading.js";
 
 const canonicalRoot = resolve("skills/tickmarkr-overseer");
 const installedRoot = resolve(".claude/skills/tickmarkr-overseer");
 const trackedFiles = [
   "SKILL.md",
+  "references/pane-mechanics.md",
+  "references/watchers.md",
+  "references/specialist-pipeline.md",
+  "references/security-briefing.md",
+  "references/evidence-discipline.md",
+  "references/release-proof.md",
+  "references/context-supervision.md",
   "scripts/seat-send.sh",
   "scripts/watch-pending-input.sh",
   "scripts/watch-artifacts.sh",
@@ -28,7 +36,7 @@ test.skipIf(!existsSync(installedRoot))("the overseer skill's tracked copies are
 });
 
 test("the overseer skill states in both tracked copies that a seat retires only watchers it armed by recorded pid never by pattern that a same-process clear keeps every background task alive so the re-arm is kill-by-pid then arm verified by two process-table reads that a fire-and-exit watcher's re-arm is the same act as handling its wake with the new pid named that a stand-down order lists the partner's watchers armed on the ordering seat that must survive it that the duplicate-id check prints nothing new against a committed baseline and carries the five method laws cite-is-not-read executing-form probe resume-aware contamination the queue-inheritance diff and re-run a premise as the diff shows in the changed skill lines", () => {
-  const skill = readFileSync(resolve(canonicalRoot, "SKILL.md"), "utf8");
+  const skill = skillCorpus(canonicalRoot);
   expect(skill).toMatch(/A seat retires only watchers it armed,[\s\S]*exact recorded pids; it never uses `pkill -f`, `pgrep -f`, or[\s\S]*pattern/);
   expect(skill).toMatch(/same-process `?\/clear`?[\s\S]{0,80}keeps every background task alive/);
   expect(skill).toMatch(/kill-by-pid, arm the replacement,[\s\S]{0,120}two process-table reads/);
@@ -57,7 +65,7 @@ test("the overseer skill states in both tracked copies that a seat retires only 
 test("T14: both tracked copies key Orca liveness on result.terminal.status, log cited opens under .tickmarkr/overseer, and arm the beat loop through --new-arm/--loop (OBS-1087, OBS-1102, OBS-1050 (1))", () => {
   for (const root of [canonicalRoot, installedRoot]) {
     if (!existsSync(root)) continue;
-    const skill = readFileSync(resolve(root, "SKILL.md"), "utf8");
+    const skill = skillCorpus(root);
     expect(skill, `${root} SKILL.md`).toContain(
       'key liveness on `result.terminal.status === "running"` — never on the envelope\'s own `ok`',
     );

@@ -780,6 +780,13 @@ export function initDoctorReuse(repoRoot: string, fresh: boolean): { reuse: bool
   return { reuse, ageMs, health: reuse ? health : null };
 }
 
+// Queue row 243 (D-2141; D-2152): render from the raw verdict, before either report truncates it.
+// Each renderer emits this beneath only the adapter's first timed-out model row.
+export function formatDoctorProbeTimeoutNote(adapter: Pick<WorkerAdapter, "probeCwd">, verdict: ModelAuth | undefined): string | undefined {
+  if (adapter.probeCwd === "neutral" || verdict?.authed !== false || !verdict.reason?.startsWith("probe timed out")) return undefined;
+  return "      note: probed from this repository's root — a timeout here may be a false negative on a large repository (OBS-31); re-run tickmarkr doctor";
+}
+
 // Report body shared by init's cached-doctor path — mirrors doctor.ts formatting without probing.
 export function formatDoctorReport(cwd: string, cfg: TickmarkrConfig, health: Record<string, AuthHealth>, adapters: WorkerAdapter[], opts: { wrote?: boolean } = {}): string {
   const rows = adapters.map((a) => {
@@ -838,6 +845,7 @@ export function formatDoctorReport(cwd: string, cfg: TickmarkrConfig, health: Re
     if (!models.length && !unclassified.length) return [];
     const w = Math.max(8, ...models.map((m) => m.length));
     const statusRows: string[] = [`  ${a.id}`];
+    let timeoutNotePrinted = false;
     for (const m of models) {
       const v = h.modelAuth?.[m];
       const auth = !v ? "unknown" : v.authed ? "authed" : `unauthed: ${trunc(v.reason ?? "probe failed", 40)} (${dateOf(v.probedAt)})`;
@@ -845,6 +853,11 @@ export function formatDoctorReport(cwd: string, cfg: TickmarkrConfig, health: Re
       const denied = d?.by === "deny" ? d.entry : "—";
       const pref = preferRanks({ adapter: a.id, model: m }, cfg).map((p) => `${p.shape}#${p.rank}`).join(",") || "—";
       statusRows.push(`    ${m.padEnd(w)} ${classified[m].padEnd(8)} ${auth}  denied=${denied}  prefer=${pref}`);
+      const timeoutNote = !timeoutNotePrinted && formatDoctorProbeTimeoutNote(a, v);
+      if (timeoutNote) {
+        statusRows.push(timeoutNote);
+        timeoutNotePrinted = true;
+      }
     }
     if (unclassified.length) statusRows.push(`    (${unclassified.length} more listed, unclassified)`);
     return statusRows;

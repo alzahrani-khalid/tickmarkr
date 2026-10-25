@@ -1,19 +1,148 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync, existsSync, statSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { fileURLToPath } from "node:url";
+import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 
-import { hostOf, herdrOnly, hostViolations } from "./helpers/skill-reading.js";
+import { hostOf, hostViolations, skillCorpus, skillDirViolations, skillReading, plainLineFindings } from "./helpers/skill-reading.js";
+const overseerDir = fileURLToPath(new URL("../skills/tickmarkr-overseer", import.meta.url));
+const readShippedCorpus = () => skillCorpus(overseerDir);
 const runtimeDir = "." + "tickmarkr";
 
 function readShippedSkill(): string {
   return readFileSync(new URL("../skills/tickmarkr-overseer/SKILL.md", import.meta.url), "utf8");
 }
 
+const SEATS_HEADING = "#### Seats are visible, independent and closed on stdin (both hosts; queue row 242)";
+function rescuedSeats(markdown: string): string {
+  const start = markdown.indexOf(SEATS_HEADING);
+  const end = markdown.indexOf("## Host-owned daemon and detached beats", start);
+  expect(start).toBeGreaterThan(markdown.indexOf("### Seat-spawn and Leg-2 recipes"));
+  expect(start).toBeGreaterThan(markdown.indexOf("For Leg-2 (both hosts)"));
+  expect(end).toBeGreaterThan(start);
+  return markdown.slice(start, end);
+}
+
+// Queue row 242; D-2141, D-2152: read the shipped rules through each host's actual scopes.
+test("the shipped overseer skill carries no section, ledger or dispatch for a retired GSD leg, while every rule that section held for any seat, namely invisible subagents rejected on read, Fleet seat diversity at every dispatch and respawn, the codex worktree commit limit, the one-shot codex exec stdin close and the fix-leg battery laws, is read on herdr and on Orca, so a deletion that drops a rescued rule with the section fails", () => {
+  const skill = readShippedSkill();
+  expect(skill).not.toMatch(/^## Supervising GSD legs|Milestones that alternate GSD legs|seats\.jsonl|\/gsd:/m);
+  const requirements = [
+    "Every seat brief rejects invisible in-process subagents and teammates",
+    "parent seat's turn, invisible to every watcher tier",
+    "block its message queue until they return",
+    "unwatchable and unsteerable are the same defect",
+    "subagents is rejected on read",
+    "Buy seat diversity through Fleet, at every dispatch and respawn",
+    "tickmarkr fleet --pick consult",
+    "tickmarkr fleet --pick review --exclude-vendor <author-vendor>",
+    "adding every applicable vendor exclusion under the Fleet selection contract",
+    "Consume the successful JSON adapter/model before using the visible-seat recipes; never select directly from doctor data",
+    "A codex seat inside a git WORKTREE cannot commit and cannot write outside the worktree",
+    "report INSIDE the worktree and to commit nothing",
+    "Every one-shot `codex exec` from an agent shell closes stdin (D-307-pre)",
+    "Run it as `codex exec … < /dev/null`",
+    "Gate every exec lane with the shipped battery, not hand-rolled greps",
+    "tickmarkr verify --base <ref> --criteria <file>",
+    "one fail-closed verdict, no daemon, no retries",
+    "One command per lane, named in the lane's own brief",
+    "A `test:` criterion for a fix leg is written FROM the landed test's title, verbatim, never before the test exists",
+    "Every fix-leg verify carries `--author <the seat that wrote it>`",
+    "A grader change is proved on a recorded run",
+    "never on a synthetic job log: the grader reads no log text at all",
+    "A public-CI red is classified in a throttled Linux container first (`docker run --cpus=2 node:22`)",
+    "starvation on the base tree is not a defect on the branch",
+  ];
+  const assertRescue = (markdown: string) => {
+    for (const host of ["herdr", "orca"] as const) {
+      const reading = rescuedSeats(skillReading(markdown, host)).replace(/\s+/g, " ");
+      for (const requirement of requirements) expect(reading, `${host}: ${requirement}`).toContain(requirement);
+    }
+  };
+  assertRescue(skill);
+  for (const requirement of [requirements[0], requirements[5], requirements[10], requirements[12], requirements[14]]) {
+    expect(() => assertRescue(skill.replace(requirement, "DELETED")), requirement).toThrow();
+  }
+  const herdr = rescuedSeats(skillReading(skill, "herdr"));
+  expect(herdr).toContain("subagents run as visible herdr panes in per-task tabs (`herdr agent start …`)");
+  expect(herdr).toContain("independent seat uses its Fleet-selected adapter kind and model");
+  const orca = rescuedSeats(skillReading(skill, "orca"));
+  expect(orca).toContain("visible terminals created with the Orca seat-spawn recipe");
+  expect(orca).toContain("it uses the Orca terminal-create");
+});
+
+test("the rescued interactive-seat rule is read on herdr and on Orca and never on a plain host, whose reading still meets none of the plain-impossible mandates, so a rescue that leaves the never-headless mandate universal fails", () => {
+  const skill = readShippedSkill();
+  for (const host of ["herdr", "orca"] as const) {
+    const reading = rescuedSeats(skillReading(skill, host)).replace(/\s+/g, " ");
+    expect(reading, host).toMatch(/Seats are interactive TUI,\s*(?:\*\*\s*)?never headless `-p`/);
+  }
+  const plain = skillReading(skill, "plain");
+  expect(rescuedSeats(plain)).toContain("reviews and judges run headless");
+  expect(plain).not.toContain("never headless");
+  expect(plainHostFindings("overseer", skill)).toEqual([]);
+  expect(skillDirViolations(overseerDir)).toEqual([]);
+  const universal = skill.replace(
+    "   - **On herdr (`HERDR_ENV=1`)**: **Seats are interactive TUI, never headless `-p`.**",
+    "   **Seats are interactive TUI, never headless `-p`.**",
+  );
+  expect(universal).not.toBe(skill);
+  expect(plainLineFindings(universal)).toContainEqual(expect.stringContaining("plain-host-impossible mandate"));
+});
+
+test("the overseer skill's setup opens with the project memory rule on herdr, on Orca and on a plain host, naming the per-project state directory, the method and discipline entries and the search by concept, so a skill read without the rule the managed block carried fails", () => {
+  // Queue row 241; D-2141; D-2152: pin the retired block's rule independently of its new owner.
+  const memory = "- **Read your host's PROJECT MEMORY before starting.** Hosts that keep one store it under a per-project\n"
+    + "  state directory keyed by the absolute working-directory path; find it and read its index plus every entry\n"
+    + "  whose name concerns METHOD or DISCIPLINE. It holds rules that cost real defects to learn. Entries may\n"
+    + "  predate a project rename, so **search by CONCEPT, not by the current product name.** A memory nobody opens\n"
+    + "  is worse than none: every seat assumes the lesson is recorded somewhere and no seat looks.";
+  expect(memory).toContain("per-project\n  state directory keyed by the absolute working-directory path");
+  expect(memory).toContain("read its index plus every entry\n  whose name concerns METHOD or DISCIPLINE");
+  expect(memory).toContain("search by CONCEPT, not by the current product name");
+  for (const host of ["herdr", "orca", "plain"] as const) {
+    const reading = skillReading(readShippedSkill(), host);
+    expect(reading, host).toContain(`## Setup\n\n${memory}\n\n0. **Adopt before you build.**`);
+  }
+});
+
+test("Cite the changed engine-default paragraph, worker tab line and brief list naming no GSD leg, and the rescued subsection whose items two to four are byte-identical to the deleted ones, versus a diff that rewraps a rescued line or leaves a reference to a deleted section", () => {
+  const skill = readShippedSkill();
+  // Queue row 242; D-2141, D-2152: these digests pin the original items, including numbers and three-space wraps.
+  const seats = rescuedSeats(skill);
+  const digests = [
+    "2bd2610bc3b024ef984e1a5ae915fec5de05c8dc9afcb0a3729c6dd30b85ce86",
+    "0e6ce44042ad45cadc27fc9d1c0ccc9762af22e29078f18528ce77961f4f3fd4",
+    "8fef3add55aedc7eee323f0a572290d6513bd7e2c4e6b4a0d6e751ffc03e7794",
+  ];
+  for (const [index, digest] of digests.entries()) {
+    const start = seats.indexOf(`\n${index + 2}. **`) + 1;
+    const end = index === 2 ? seats.length : seats.indexOf(`\n${index + 3}. **`) + 1;
+    expect(start).toBeGreaterThan(0);
+    expect(end).toBeGreaterThan(start);
+    expect(createHash("sha256").update(seats.slice(start, end)).digest("hex"), `item ${index + 2}`).toBe(digest);
+  }
+  expect(seats).toContain("   - **On herdr (`HERDR_ENV=1`)**, subagents run as visible herdr panes in per-task tabs (`herdr agent start …`);\n   - **On Orca (`TERM_PROGRAM=Orca` and non-empty `ORCA_TERMINAL_HANDLE`)**, they run as visible terminals created with the Orca seat-spawn recipe. A seat report whose work\n   was produced by invisible subagents is rejected on read.\n");
+  expect(skill).toContain('loop: `tickmarkr compile` → `plan` → `run` → `report`, and the JOURNAL is the record. `compile` ingests\nGSD phase plans (`src/compile/gsd.ts`), so *"this repo uses GSD"* is not a reason to bypass it. The\nengine may be bypassed only on an explicit operator order, recorded in\nthe brief WITH its costs named — no journal (so no per-task adapter/model record), no routing, no\nenforced gate battery, no enforced cross-vendor review; each is re-implemented by hand or silently lost.');
+  expect(skill).toContain("The P92→P98 GSD drift propagated\n   exactly this way");
+  expect(skill).toContain("     - Worker/seat tabs — tickmarkr opens ONE TAB PER TASK itself, never the ORCH tab.\n");
+  const briefStart = skill.indexOf("   The brief MUST contain: **Seat hygiene — ");
+  const briefEnd = skill.indexOf("   *method guards*", briefStart);
+  expect(briefStart).toBeGreaterThan(0);
+  expect(briefEnd).toBeGreaterThan(briefStart);
+  const brief = skill.slice(briefStart, briefEnd);
+  expect(brief).toContain("the pane mechanics in `references/pane-mechanics.md`, rules 1–2, and require a verbatim one-sentence\n   acknowledgment of the human-checkpoint rule before anything is dispatched.");
+  expect(brief).not.toMatch(/GSD|\/gsd:/);
+  expect(skill).not.toMatch(/supervised GSD flow \(below\)|GSD-leg rules|GSD-leg seats|## Supervising GSD legs/);
+});
+
 describe("overseer skill host neutrality (HD-1 / OBS-1003)", () => {
   test("the shipped overseer skill, read as an Orca launch from the host line through setup, seat spawn, brief delivery and evidence collection, reaches each step on an Orca branch — the host requirement names herdr by its host variable and Orca by its terminal-program marker and no longer requires the herdr variable alone, setup no longer loads the herdr skill and maps a herdr workspace unconditionally, seats spawn with terminal create on a path worktree selector with a command, briefs travel as a file announced by terminal send with enter and a submit wait whose receipt is read for observed submission rather than input acceptance, and evidence is files beside terminal read — while every retained herdr-only command, tab canon and watcher instruction is qualified as herdr-specific with the herdr branch preserved, cited to the changed owned skill lines in the diff, so an Orca recipe appended beneath universal herdr instructions fails", () => {
-    const skill = readShippedSkill();
+    const skill = readShippedCorpus();
+    const skillFile = readShippedSkill();
 
-    expect(skill).toContain("Requires a supported host: herdr (`HERDR_ENV=1`) or Orca (`TERM_PROGRAM=Orca` and non-empty `ORCA_TERMINAL_HANDLE`)");
-    expect(skill).not.toMatch(/^Requires `HERDR_ENV=1`; if unset, say so and stop\.$/m);
+    expect(skillFile).toContain("Requires a supported host: herdr (`HERDR_ENV=1`) or Orca (`TERM_PROGRAM=Orca` and non-empty `ORCA_TERMINAL_HANDLE`)");
+    expect(skillFile).not.toMatch(/^Requires `HERDR_ENV=1`; if unset, say so and stop\.$/m);
 
     expect(skill).toContain("Workspace setup (host-specific)");
     expect(skill).toContain("On herdr (`HERDR_ENV=1`)");
@@ -32,10 +161,10 @@ describe("overseer skill host neutrality (HD-1 / OBS-1003)", () => {
     expect(skill).toContain("Evidence collection");
     expect(skill).toContain("Evidence is files beside `terminal read`: read verdict files, journals, and pane state with `orca terminal read --terminal <handle> --limit <lines> --json`");
 
-    const setupHerdr = skill.indexOf("**On herdr (`HERDR_ENV=1`)**: Load the `herdr` skill");
-    const setupOrca = skill.indexOf("**On Orca (`TERM_PROGRAM=Orca` and non-empty `ORCA_TERMINAL_HANDLE`)**: Do not load the `herdr` skill");
-    const canon = skill.indexOf("FIVE-TAB CANON");
-    expect(skill.match(/FIVE-TAB CANON/g)).toHaveLength(1);
+    const setupHerdr = skillFile.indexOf("**On herdr (`HERDR_ENV=1`)**: Load the `herdr` skill");
+    const setupOrca = skillFile.indexOf("**On Orca (`TERM_PROGRAM=Orca` and non-empty `ORCA_TERMINAL_HANDLE`)**: Do not load the `herdr` skill");
+    const canon = skillFile.indexOf("FIVE-TAB CANON");
+    expect(skillFile.match(/FIVE-TAB CANON/g)).toHaveLength(1);
     expect(canon).toBeGreaterThan(setupHerdr);
     expect(canon).toBeLessThan(setupOrca);
 
@@ -44,13 +173,14 @@ describe("overseer skill host neutrality (HD-1 / OBS-1003)", () => {
     expect(go).toContain("**On herdr (`HERDR_ENV=1`) only:**");
     expect(go).toContain(`watch-launch.sh <worktree>/${runtimeDir}/graph.lock 900 <overseer-pane>`);
 
-    const herdrSpawn = skill.slice(skill.indexOf("2. **Orchestrator**"), skill.indexOf("- **On Orca", skill.indexOf("2. **Orchestrator**")));
+    const herdrSpawn = skillFile.slice(skillFile.indexOf("2. **Orchestrator**"), skillFile.indexOf("- **On Orca", skillFile.indexOf("2. **Orchestrator**")));
     expect(herdrSpawn).toContain("--settings '{\"promptSuggestionEnabled\":false}'");
     expect(herdrSpawn).toContain("For kimi, pass `-y`");
     expect(herdrSpawn).toContain("--sandbox read-only` CONTRADICTS");
     expect(herdrSpawn).toContain("The unsandboxed flag is REQUIRED");
 
-    const context = skill.slice(skill.indexOf("### Context is a supervised resource"), skill.indexOf("## Supervising GSD legs"));
+    expect(skill).toContain("### A GO has a deadline");
+    const context = skill.slice(skill.indexOf("### Context is a supervised resource"), skill.indexOf("### A GO has a deadline"));
     expect(context).toContain("**On herdr (`HERDR_ENV=1`) only**, use this protocol");
     expect(context).toContain("**On herdr (`HERDR_ENV=1`) only**, arm a context watcher");
     expect(context.match(/herdr pane run/g)?.length).toBeGreaterThan(0);
@@ -61,7 +191,7 @@ describe("overseer skill host neutrality (HD-1 / OBS-1003)", () => {
     expect(ownership).toContain("`watch-artifacts.sh`");
     expect(ownership).toContain("TKR_ARMING_SEAT");
     expect(ownership).toContain("**On Orca (`TERM_PROGRAM=Orca` and non-empty `ORCA_TERMINAL_HANDLE`)**");
-    expect(hostViolations(skill)).toEqual([]);
+    expect(skillDirViolations(overseerDir)).toEqual([]);
 
     const herdrIndex = skill.indexOf("On herdr (`HERDR_ENV=1`)");
     const orcaIndex = skill.indexOf("On Orca (`TERM_PROGRAM=Orca` and non-empty `ORCA_TERMINAL_HANDLE`)");
@@ -82,7 +212,7 @@ test("host scope parser rejects escaped commands, fences, mandates and missing s
 });
 
 test("replaying the recorded Orca screen read receipts exited beside ok true versus running against the changed seat liveness procedure declares the first dead plus the second live from result.terminal.status rather than the envelope ok, citing the changed skill lines", () => {
-  const skill = readShippedSkill();
+  const skill = readShippedCorpus();
   expect(skill).toMatch(/key liveness on `result\.terminal\.status === "running"` — never on the envelope's own `ok`/);
   expect(skill).toMatch(/a closed seat's read still returns that same `ok: true` with `result\.terminal\.status: "exited"`/);
   expect(skill).toContain("a matcher keyed on `ok` reads that exited seat as alive and never fires (OBS-1087)");
@@ -90,7 +220,7 @@ test("replaying the recorded Orca screen read receipts exited beside ok true ver
 });
 
 test("the read-first procedure on both hosts appends one opened line per cited file to an append-only log under .tickmarkr/overseer and names that log as the record a later handoff is measured against, citing the changed lines", () => {
-  const skill = readShippedSkill();
+  const skill = readShippedCorpus();
   // Universal law (CITE-IS-NOT-READ), the herdr handoff protocol, and the Orca instruments each cite the log.
   expect(skill.match(/\.tickmarkr\/overseer\/opened-files\.log/g)?.length).toBeGreaterThanOrEqual(3);
   expect(skill).toMatch(/On BOTH hosts, log the open:\*\*\s*\n\s*append one line, `opened <path>`, to the append-only log `\.tickmarkr\/overseer\/opened-files\.log`/);
@@ -102,7 +232,7 @@ test("the read-first procedure on both hosts appends one opened line per cited f
 });
 
 test("the beat recipe arms through the explicit new-arm and loop verbs and names the legacy wrapper loop as the unsafe form that re-armed after a stand-down, citing the changed lines", () => {
-  const skill = readShippedSkill();
+  const skill = readShippedCorpus();
   expect(skill).toContain("it arms through two explicit verbs, `--new-arm` and `--loop` —\nnever a bare invocation");
   expect(skill).toContain("cd <repo> && tickmarkr beat start overseer --seat <overseer-agent-or-pane>");
   expect(skill).toContain("Never launch it by hand: `beat start` runs it detached and owns it");
@@ -120,14 +250,14 @@ test("the beat recipe arms through the explicit new-arm and loop verbs and names
 });
 
 test("D-265: the pre-arm beat sweep matches the legacy wrapper — the pgrep pattern never regains a --loop qualifier, because a --loop self-retires on a new arm and the wrapper is the writer that survives it", () => {
-  const skill = readShippedSkill();
+  const skill = readShippedCorpus();
   expect(skill).toContain('(`pgrep -f "tickmarkr beat <tier>"`, **read twice and intersected**');
   expect(skill).toContain("**The PRIMARY target is the legacy\n  `while … tickmarkr beat <tier>` wrapper**");
   expect(skill).not.toMatch(/pgrep -f "tickmarkr beat <tier>[^"]*--loop/);
 });
 
 test("the overseer skill's briefing recipe states the staged-text-and-no-prompt guard, resolve-first path, and post-Enter read-back, citing the changed skill lines", () => {
-  const skill = readShippedSkill();
+  const skill = readShippedCorpus();
 
   // skills/tickmarkr-overseer/SKILL.md:826-833 (OBS-1119): the herdr "Verified send protocol" no
   // longer fires `send-keys Enter` blind after the sleep — it reads back first and only retries the
@@ -159,24 +289,27 @@ test("the overseer skill's briefing recipe states the staged-text-and-no-prompt 
 
 test("replaying D-307-pre, a codex exec from an agent shell blocked on reading additional input from stdin, against the changed skill rule closes stdin, citing the changed lines", () => {
   const skill = readShippedSkill();
-  const rule = skill.slice(
-    skill.indexOf("**Every one-shot `codex exec` from an agent shell closes stdin (D-307-pre).**"),
-    skill.indexOf("4. **Gate every exec lane"),
-  );
-  // skills/tickmarkr-overseer/SKILL.md — the one-shot codex exec rule (D-307-pre / OBS-1134).
-  expect(rule.length).toBeGreaterThan(0);
-  expect(rule).toContain("closes stdin");
-  // The incident is historical. Present-tense "never closes stdin" contradicts the mandatory close.
-  expect(rule).toContain("the seat's ad-hoc one-shot\n   did not close stdin");
-  expect(rule).not.toMatch(/never closes stdin/);
-  expect(rule).not.toMatch(/still closes stdin/);
-  expect(rule).toMatch(/blocks on reading\s+additional input from stdin/);
-  expect(rule).toContain("Reading additional input from stdin…");
-  expect(rule).toContain("`codex exec … < /dev/null`");
+  for (const host of ["herdr", "orca"] as const) {
+    const seats = rescuedSeats(skillReading(skill, host));
+    const rule = seats.slice(
+      seats.indexOf("**Every one-shot `codex exec` from an agent shell closes stdin (D-307-pre).**"),
+      seats.indexOf("4. **Gate every exec lane"),
+    );
+    // Queue row 242; D-2141, D-2152: the rescued subsection's item 3 retains the D-307-pre stdin close.
+    expect(rule.length, host).toBeGreaterThan(0);
+    expect(rule).toContain("closes stdin");
+    // The incident is historical. Present-tense "never closes stdin" contradicts the mandatory close.
+    expect(rule).toContain("the seat's ad-hoc one-shot\n   did not close stdin");
+    expect(rule).not.toMatch(/never closes stdin/);
+    expect(rule).not.toMatch(/still closes stdin/);
+    expect(rule).toMatch(/blocks on reading\s+additional input from stdin/);
+    expect(rule).toContain("Reading additional input from stdin…");
+    expect(rule).toContain("`codex exec … < /dev/null`");
+  }
 });
 
 test("replaying D-302 add.3's orphaned home-wide recursive glob against the changed skill rule forbids the glob by name and binds the seat's background tasks to its life, citing the changed lines", () => {
-  const skill = readShippedSkill();
+  const skill = readShippedCorpus();
   const rule = skill.slice(
     skill.indexOf("**A seat's background tasks are bound to the seat's life (D-302 add.3).**"),
     skill.indexOf("**And EVERY process-table probe"),
@@ -191,7 +324,7 @@ test("replaying D-302 add.3's orphaned home-wide recursive glob against the chan
 });
 
 test("the liveness-reads bullet covers both the loop arm and the legacy wrapper forms, citing the changed lines", () => {
-  const skill = readShippedSkill();
+  const skill = readShippedCorpus();
   const bulletStart = skill.indexOf("- **Split the liveness reads.**");
   const bullet = skill.slice(bulletStart, skill.indexOf("- **At every adopt", bulletStart));
   // skills/tickmarkr-overseer/SKILL.md — the liveness-reads bullet (OBS-1136).
@@ -205,7 +338,7 @@ test("the liveness-reads bullet covers both the loop arm and the legacy wrapper 
 });
 
 test("replaying D-265 (4) against the changed beat section finds the stand-down command entering the repository root and the pre-arm pgrep probe reconciled with the recorded-pid ownership rule, citing the changed lines", () => {
-  const skill = readShippedSkill();
+  const skill = readShippedCorpus();
   const beat = skill.slice(
     skill.indexOf("**Arm your OWN tier first"),
     skill.indexOf("Arm the bundled watcher as its OWN Bash call"),
@@ -223,7 +356,7 @@ test("replaying D-265 (4) against the changed beat section finds the stand-down 
 
 
 test("The changed canonical overseer spawn/respawn contract requires every mapped seat purpose to consume a successful Fleet pick with the applicable vendor exclusions before using the existing visible-seat transport safeguards.", () => {
-  const skill = readShippedSkill();
+  const skill = readShippedCorpus();
   const contract = skill.slice(skill.indexOf("**Fleet selection contract (OBS-1165)"), skill.indexOf("- **On herdr", skill.indexOf("**Fleet selection contract (OBS-1165)")));
   for (const purpose of ["orchestrator", "records", "author (including planner, executor and scout)", "consultant", "lab-rater"]) {
     expect(contract).toContain(`| ${purpose} | consult |`);
@@ -250,6 +383,7 @@ test("The changed canonical overseer spawn/respawn contract requires every mappe
 test("D-837/D-838: loop, auto and overseer launch run and resume detached and logged at the ORCH address with no pane, detach idempotent seat beats, and stop them at run end", () => {
   for (const name of ["loop", "auto", "overseer"]) {
     const skill = readFileSync(new URL(`../skills/tickmarkr-${name}/SKILL.md`, import.meta.url), "utf8");
+    const prose = skillCorpus(fileURLToPath(new URL(`../skills/tickmarkr-${name}`, import.meta.url)));
     const recipe = skill.slice(skill.indexOf("## Host-owned daemon and detached beats"));
     const daemon = recipe.slice(0, recipe.indexOf("Detached beats are product-owned"));
     for (const anchor of ['ORCA_TERMINAL_HANDLE="<ORCH handle>"', 'HERDR_PANE_ID="<ORCH pane id>"']) {
@@ -272,9 +406,9 @@ test("D-837/D-838: loop, auto and overseer launch run and resume detached and lo
     expect(recipe).toContain("Include a run-end `beat stop` item for every beat started, also\non failure, park or handoff");
     expect(recipe).toContain("Keep only watchers that must WAKE the seat in the harness");
     expect(recipe).toContain("their harness cap");
-    expect(skill).not.toContain('the repo root as its own `run_in_background` Bash call');
-    if (name !== "overseer") expect(skill).toMatch(/4\. \*\*Run\*\* — launch .*\[detached launch\]/);
-    else expect(hostViolations(skill)).toEqual([]);
+    expect(prose).not.toContain('the repo root as its own `run_in_background` Bash call');
+    if (name !== "overseer") expect(prose).toMatch(/4\. \*\*Run\*\* — launch .*\[detached launch\]/);
+    else expect(skillDirViolations(overseerDir)).toEqual([]);
   }
 });
 
@@ -295,8 +429,8 @@ test("LEG A REPAIR: overseer fallback launches use the recorded ORCH handle or p
   const recipe = skill.slice(skill.indexOf("## Host-owned daemon and detached beats"));
   expect(recipe).toContain("Only when the ORCH\n  launches its own daemon");
   expect(recipe).toContain("substitute the ORCH handle recorded\n  at seat creation");
-  expect(hostViolations(skill)).toEqual([]);
-  const loop = readFileSync(new URL("../skills/tickmarkr-loop/SKILL.md", import.meta.url), "utf8");
+  expect(skillDirViolations(overseerDir)).toEqual([]);
+  const loop = skillCorpus(fileURLToPath(new URL("../skills/tickmarkr-loop", import.meta.url)));
   expect(loop).toContain("with the same detached launch above");
   expect(loop).not.toContain("host-owned split form");
 });
@@ -305,16 +439,6 @@ test("LEG A REPAIR: overseer fallback launches use the recorded ORCH handle or p
 // headed for it, every On herdr and On Orca scope skipped — over the same tree walk hostViolations uses.
 const PLAIN_HEADING = "On a plain host (neither herdr nor Orca)";
 const PLAIN_LINK = `[${PLAIN_HEADING}](#on-a-plain-host-neither-herdr-nor-orca)`;
-const orcaCommand = /(?<![\w-])orca\s+(?:terminal|worktree)\s+[a-z]/;
-const closedList = [
-  /the daemon-placed board is the live surface/,
-  /treat that as a daemon\/run liveness fault/,
-  /interactive TUI[^.]*never headless/i,
-  /say so and stop/,
-  /foreground\s+`?until\s+grep/i,
-  /at most every twenty minutes/i,
-];
-
 function plainReading(markdown: string): { lines: string[]; scope: string[]; scopes: number } {
   type Node = { parent?: Node; host?: "herdr" | "orca" | "plain"; depth: number };
   const hostOfPlain = (text: string): Node["host"] => text.replace(/^[*_]+/, "").startsWith(PLAIN_HEADING) ? "plain" : hostOf(text);
@@ -357,7 +481,7 @@ function plainReading(markdown: string): { lines: string[]; scope: string[]; sco
 
 /** What a plain host meets that it cannot follow, or misses that it needs; empty means the skill routes it. */
 function plainHostFindings(name: string, markdown: string): string[] {
-  const { lines, scope, scopes } = plainReading(markdown);
+  const { scope, scopes } = plainReading(markdown);
   const findings: string[] = [];
   if (scopes !== 1) findings.push(`${scopes} scopes headed ${PLAIN_HEADING}`);
   if (!markdown.includes(`\n## ${PLAIN_HEADING}\n`)) findings.push("no heading the route's anchor resolves to");
@@ -377,17 +501,7 @@ function plainHostFindings(name: string, markdown: string): string[] {
     ["the non-stalling permission mode", /permission mode that never stalls per command/i.test(text)],
   ];
   for (const [what, ok] of needs) if (!ok) findings.push(`the plain scope lacks ${what}`);
-  for (const line of lines) {
-    if (herdrOnly.test(line)) findings.push(`herdr-only token: ${line.trim()}`);
-    if (orcaCommand.test(line)) findings.push(`Orca command: ${line.trim()}`);
-  }
-  // A mandate may wrap across lines, so the closed list is read over the whole reading.
-  const reading = lines.join("\n").replace(/\s+/g, " ");
-  for (const mandate of closedList) {
-    const hit = mandate.exec(reading);
-    if (hit) findings.push(`plain-host-impossible mandate: ${hit[0]}`);
-  }
-  return findings;
+  return [...findings, ...plainLineFindings(markdown)];
 }
 
 test("test: a plain-host reading of each shipped skill, following every universal scope and the scope headed On a plain host (neither herdr nor Orca) and skipping every On herdr and On Orca scope, reaches that scope from the host or role check, finds there the single-tier orchestrator, the background wait under the ten-minute cap, the status command with its plain watch view and the headless reviews, and meets no herdr-only token, no Orca command and none of the closed list of plain-host-impossible mandates, so a skill that still stops on a plain host or leaves a board or seat mandate universal fails", () => {
@@ -395,7 +509,16 @@ test("test: a plain-host reading of each shipped skill, following every universa
     const skill = readFileSync(new URL(`../skills/tickmarkr-${name}/SKILL.md`, import.meta.url), "utf8");
     expect(plainHostFindings(name, skill), name).toEqual([]);
     // The herdr walk stays whole beside it: herdr-only tokens only in herdr scopes, every herdr scope beside an Orca one.
-    expect(hostViolations(skill), name).toEqual([]);
+    const dir = fileURLToPath(new URL(`../skills/tickmarkr-${name}`, import.meta.url));
+    expect(skillDirViolations(dir), name).toEqual([]);
+    const references = join(dir, "references");
+    if (existsSync(references)) {
+      for (const file of readdirSync(references).sort()) {
+        if (file.endsWith(".md") && statSync(join(references, file)).isFile()) {
+          expect(plainLineFindings(readFileSync(join(references, file), "utf8")), `${name}/references/${file}`).toEqual([]);
+        }
+      }
+    }
 
     // Wrong discriminators: each closed-list mandate left universal, and the old stop (or no route) in the check.
     const universal = (mandate: string) => `${skill}\n## Appended universally\n\n${mandate}\n`;
@@ -416,7 +539,7 @@ test("test: a plain-host reading of each shipped skill, following every universa
 // Queue row 240; D-2138 add.1 R3 supersedes the artifact watcher's herdr-only token pin.
 test("test: the host scope law admits the artifact watcher in an On Orca scope while the herdr pane close variable, every herdr command and the other watcher scripts stay herdr-only, and the shipped overseer skill has no host violation, so a law that still bans the watcher from Orca or admits a herdr command outside herdr fails", () => {
   expect(hostViolations("## On Orca\nwatch-artifacts.sh")).toEqual([]);
-  expect(hostViolations(readShippedSkill())).toEqual([]);
+  expect(skillDirViolations(overseerDir)).toEqual([]);
   for (const token of ["TKR_CLOSE_PANES", "herdr pane close <pane>", "herdr tab close <tab>", "herdr agent wait", "herdr notification show", "watch-panes.sh", "watch-context.sh", "watch-journal.sh", "watch-pending-input.sh", "watch-contamination.sh", "watch-launch.sh", "watch-new-instrument.sh", "watch-*.sh", "FIVE-TAB CANON"]) {
     expect(hostViolations(`## On Orca\n${token}`), token).not.toEqual([]);
     expect(hostViolations(`## Universal\n${token}`), token).not.toEqual([]);

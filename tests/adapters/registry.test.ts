@@ -16,8 +16,11 @@ import * as registry from "../../src/adapters/registry.js";
 import { discoverChannels, flagDriftWarnings, missingDeclaredFlags, modelAuthExclusions, probeAll, probeModels, readDoctor, writeDoctor } from "../../src/adapters/registry.js";
 import { modelLints } from "../../src/adapters/model-lints.js";
 import { DEFAULT_CONFIG, loadConfig } from "../../src/config/config.js";
-import { modelAuthed, shq, type WorkerAdapter } from "../../src/adapters/types.js";
+import { channelsFromConfig, modelAuthed, shq, type WorkerAdapter } from "../../src/adapters/types.js";
 import { doctor } from "../../src/cli/commands/doctor.js";
+import { plan } from "../../src/cli/commands/plan.js";
+import { saveGraph } from "../../src/graph/graph.js";
+import { validateGraph } from "../../src/graph/schema.js";
 import { makeRepo } from "../helpers/tmprepo.js";
 
 const stub = (id: string) =>
@@ -47,9 +50,9 @@ attention (8):
   ! cursor-agent: no model-list surface — seeds stamped 2026-07-09; verify manually
   ! opencode: no model-list surface — seeds stamped 2026-07-09; verify manually
   ! pi: no model-list surface — seeds stamped 2026-07-09; verify manually
-  ! routing seed names dead adapter 'cursor-agent' for shape 'implement' — auto-prefer is routing around it
-  ! routing seed names dead adapter 'codex' for shape 'implement' — auto-prefer is routing around it
-  ! routing seed names dead adapter 'opencode' for shape 'tests' — auto-prefer is routing around it
+  ! routing seed names dead adapter 'cursor-agent' for shape 'implement' — no declared preference overrides it
+  ! routing seed names dead adapter 'codex' for shape 'implement' — no declared preference overrides it
+  ! routing seed names dead adapter 'opencode' for shape 'tests' — no declared preference overrides it
 model status:
   claude-code
     fable    frontier unauthed: headless probe unavailable (2026-07-15)  denied=—  prefer=—
@@ -783,7 +786,7 @@ describe("v1.34 T3 probe progress", () => {
     }
   });
 
-  test("doctor's non-interactive output under a fixed environment with no host markers, no entry point and an en_US.UTF-8 LANG equals its pin with exactly the host row and the locale row added beside the herdr row and the attention count unchanged, so a row added elsewhere or a pin that reads the ambient environment fails", async () => {
+  const fixedDoctorReport = async (check?: (out: string, repo: string, adapters: WorkerAdapter[]) => Promise<void>) => {
     // The host and locale rows read the launching environment: fix every variable they consult.
     for (const key of ["HERDR_ENV", "TERM_PROGRAM", "ORCA_TERMINAL_HANDLE", "CLAUDE_CODE_ENTRYPOINT", "LC_ALL", "LC_CTYPE"]) {
       vi.stubEnv(key, undefined);
@@ -808,7 +811,8 @@ describe("v1.34 T3 probe progress", () => {
     Object.defineProperty(process.stderr, "isTTY", { configurable: true, value: false });
     Object.defineProperty(process.stdout, "isTTY", { configurable: true, value: false });
     try {
-      const out = await doctor(["--"], repo, ["claude-code", "codex", "cursor-agent", "opencode", "pi"].map(stub));
+      const adapters = ["claude-code", "codex", "cursor-agent", "opencode", "pi"].map(stub);
+      const out = await doctor(["--"], repo, adapters);
       expect(out).toBe(NON_TTY_DOCTOR_PIN);
       const stderr = stderrSpy.mock.calls.map((c) => c[0]).join("\n");
       expect(stderr).toContain("tickmarkr doctor — probe preflight:");
@@ -818,6 +822,7 @@ describe("v1.34 T3 probe progress", () => {
       expect(stderr).toContain("catalog-only alternative: tickmarkr doctor --refresh-catalog");
       expect(stderr.indexOf("probe preflight:")).toBeLessThan(stderr.indexOf("probing installed agent CLIs"));
       expect(out).not.toMatch(/fake:\S+ (ok|timeout|failed) \(\d+\.\ds\)/);
+      await check?.(out, repo, adapters);
     } finally {
       vi.unstubAllEnvs();
       stderrSpy.mockRestore();
@@ -828,7 +833,31 @@ describe("v1.34 T3 probe progress", () => {
       if (stdoutTTY) Object.defineProperty(process.stdout, "isTTY", stdoutTTY);
       else delete (process.stdout as { isTTY?: boolean }).isTTY;
     }
-  });
+  };
+
+  test("doctor's non-interactive output under a fixed environment with no host markers, no entry point and an en_US.UTF-8 LANG equals its pin with exactly the host row and the locale row added beside the herdr row and the attention count unchanged, so a row added elsewhere or a pin that reads the ambient environment fails", () => fixedDoctorReport());
+
+  // Queue row 243 (D-2141; D-2152): the re-pinned report agrees with interactive doctor and plan.
+  test("doctor's non-interactive report under a fixed environment states that no declared preference overrides a dead seed adapter, the disposition plan and an interactive doctor print, and never says auto-prefer routes around it, so a report naming the mechanism deleted in v1.86 fails", () => fixedDoctorReport(async (out, repo, adapters) => {
+    saveGraph(repo, validateGraph({
+      version: 1, spec: { source: "prd", paths: ["p"], hash: "h" },
+      tasks: [{ id: "T1", title: "t", goal: "g", shape: "chore", complexity: 2, acceptance: ["a"] }],
+    }));
+    const planningAdapters = adapters.map((adapter) => ({
+      ...adapter, channels: (cfg: typeof DEFAULT_CONFIG) => channelsFromConfig(adapter.id, cfg),
+    }));
+    const planned = await plan([], repo, planningAdapters);
+    Object.defineProperty(process.stdout, "isTTY", { configurable: true, value: true });
+    vi.stubEnv("NO_COLOR", undefined);
+    const interactive = await doctor([], repo, adapters, { banner: false });
+    const reused = registry.formatDoctorReport(repo, loadConfig(repo), readDoctor(repo)!, adapters, { wrote: false });
+    for (const report of [out, planned, interactive, reused]) {
+      for (const [adapter, shape] of [["cursor-agent", "implement"], ["codex", "implement"], ["opencode", "tests"]]) {
+        expect(report).toContain(`routing seed names dead adapter '${adapter}' for shape '${shape}' — no declared preference overrides it`);
+      }
+      expect(report).not.toContain("auto-prefer");
+    }
+  }));
 
   test("TTY probe progress lines go to stderr only, never stdout", async () => {
     const repo = mkdtempSync(join(tmpdir(), "tickmarkr-auth-progress-"));

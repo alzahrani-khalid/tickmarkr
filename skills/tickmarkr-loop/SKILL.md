@@ -1,11 +1,15 @@
 ---
 name: tickmarkr-loop
 description: 'Run one repository spec autonomously with tickmarkr. Triggers: "/tickmarkr-loop", "run this spec with tickmarkr", "tickmarkr the spec".'
+metadata:
+  installed-by: tickmarkr
 ---
 
 # tickmarkr-loop — run one spec autonomously
 
 Use this for any spec that `tickmarkr compile` accepts. It is SDD-agnostic: use the repository's requested spec format and keep the execution record beside that source spec.
+
+`<skills-dir>` is the skills directory holding this skill.
 
 ## Two-tier by default — role check before the loop
 
@@ -24,6 +28,8 @@ When working in a multi-agent terminal environment (herdr or Orca), decide your 
   - **Auxiliary agents you spawn (consultants, reviewers, scouts) follow the same forms.** Never launch a claude session in plan mode or default permission mode for autonomous work — both stall on per-command approval prompts nobody is watching; claude is always `--permission-mode bypassPermissions` (tickmarkr's own adapter uses exactly this for workers, judges, and consults). A read-only codex consultant may use `--sandbox read-only`; any codex session that must touch git needs the unsandboxed flag above.
 
 With neither herdr nor Orca there is no role to decide and no seat to spawn: follow [On a plain host (neither herdr nor Orca)](#on-a-plain-host-neither-herdr-nor-orca) and run the loop directly, single-tier.
+
+In a multi-tier session, the tiers clear each other at 50% context or more, after writing a handoff. A new spec or run is a mission boundary: write the handoff and clear before taking the next mission. Copy this duty into every brief and handoff. On a single-tier plain host, write your handoff and ask the operator to clear the session.
 
 ## On a plain host (neither herdr nor Orca)
 
@@ -71,6 +77,12 @@ Proceed through the loop without seeking routine confirmation. Stop only for a b
 
 ## Binary preflight (before compile or run)
 
+Before starting, on every host including a plain one (herdr, Orca or neither), read and follow the PROJECT MEMORY duty under [the `tickmarkr-overseer` skill's Setup](../tickmarkr-overseer/SKILL.md#setup).
+
+**Spec-authoring law ships in the spec template** that `tickmarkr init` writes: the hard bounds and which
+  direction each moves, what makes a criterion real, and why an absence or a source-text grep is never a
+  criterion. Read it before authoring or repairing acceptance items.
+
 Before `tickmarkr compile` or `tickmarkr run`:
 
 1. Run `tickmarkr version --check` and **stop immediately on a non-zero exit**.
@@ -105,7 +117,7 @@ Never report "briefed" or "relayed" without the confirmation your host gives:
   - `herdr pane run <pane> "<message>"` — text plus Enter in the target shell
   - `herdr notification show "<message>"` — OS-level delivery for the operator
 
-  After sending, **confirm delivery** by reading the target pane and verifying the message landed (input empty, agent status `working`, or notification acknowledged). Never report "briefed" or "relayed" without read-back confirmation.
+  Confirm delivery by reading the TARGET composer afterward; if the sent text still sits unsubmitted after ~15 s, retry the Enter only when that composer read shows the staged text and no permission prompt or numbered choice holds focus — an Enter sent onto an active prompt approves it or picks a choice instead of submitting the message (OBS-1119). Under that guard, send-keys enter to that pane once and read again (OBS-975); when a prompt or choice holds focus instead, resolve it first and re-read before retrying. Never report "relayed" without read-back.
 - **On Orca (`TERM_PROGRAM=Orca` and non-empty `ORCA_TERMINAL_HANDLE`)**: send with `orca terminal send --terminal <handle> --text "<message>" --enter --wait-submit 15 --json` and treat it as delivered only when `result.send.prompt.stages` carries a `turn_started` stage — `accepted: true` proves input acceptance, not a started turn.
 - With neither host, hand off through the host's cross-session message tool, confirmed by the peer's reply ([On a plain host (neither herdr nor Orca)](#on-a-plain-host-neither-herdr-nor-orca)).
 
@@ -177,10 +189,12 @@ seat; never close the replacement by title, never rewrite ownership from a title
 1. **Prepare** — start from the requested spec. Run the [binary preflight](#binary-preflight-before-compile-or-run). Check `git status`, confirm no tickmarkr run is active, and work from a non-main branch.
 2. **Compile** — run `tickmarkr compile <spec>`. Correct compilation errors in the spec, never in the generated graph.
 3. **Plan** — run `tickmarkr plan`. Review the routing table, capability-floor warnings, and every human gate, including work that each gate blocks.
+   - `tickmarkr approve <runId> <taskId>` — release a human gate
 4. **Run** — launch `tickmarkr run` using the [detached launch](#host-owned-daemon-and-detached-beats), and start detached beats with their run-end stop items. A watch ending the seat's turn is no watch: keep a **blocking journal consumer** alive for the run's terminal events, and never rely on a `Monitor`-only wake. Watch the run journal rather than polling agents: the consumer takes a line baseline at arm time, then wakes ONCE on `run-end`, `task-human`, `task-failed` or `consult-verdict`. A run-end record is history, never green; the debt clause is yours — read CURRENT `tickmarkr status <runId>` (step 5). Re-arm after every wake. ⛔ Never `tail -F | grep -m1` (run-end is the journal's last line, so tail never notices the broken pipe and the watcher hangs forever) and never a pane-level done wait (it fires on every agent turn end, not mission end). ⚠ A bare whole-file `grep -q '"event":"run-end"'` is the trap the watcher exists to avoid: on a resume it matches the PREVIOUS run's run-end and returns instantly, so a re-armed watcher reads as coverage that does not exist. Resolve blocked interactions in the agent session; do not turn them into proxy questions. The consumer is host-specific; with neither host it is the background wait of [On a plain host (neither herdr nor Orca)](#on-a-plain-host-neither-herdr-nor-orca).
-   - **On herdr (`HERDR_ENV=1`)**: the consumer is the shipped watcher — `.claude/skills/tickmarkr-overseer/scripts/watch-journal.sh <state-dir>/runs 20 28800`, which grades the run-end summary's execution clauses for you, `EXECUTION COMPLETE` or `NOT GREEN`, never green — or a foreground `until grep` on the run's terminal events; ensure it is re-armed at most every twenty minutes.
+   - **On herdr (`HERDR_ENV=1`)**: the consumer is the shipped watcher — `<skills-dir>/tickmarkr-overseer/scripts/watch-journal.sh <state-dir>/runs 20 28800`, which grades the run-end summary's execution clauses for you, `EXECUTION COMPLETE` or `NOT GREEN`, never green — or a foreground `until grep` on the run's terminal events; ensure it is re-armed at most every twenty minutes.
    - **On Orca (`TERM_PROGRAM=Orca` and non-empty `ORCA_TERMINAL_HANDLE`)**: the consumer is that same shipped journal watcher or a foreground `until grep` on the run's terminal events; ensure it is re-armed at most every twenty minutes.
-5. **Verify and consolidate** — accept only a green run. A run is green when the run-end event exists in the journal, the tip verify is not "failed", the summary's `failed`, `human`, `blocked` and `pending` buckets are all empty, and CURRENT `tickmarkr status <runId>` reads its owed checks outstanding empty AND known (`outstanding 0`) — a run with a parked task is partial, not green. Empty execution buckets alone are not green either (D-660): every bucket empty and the tip passed, but an operator waived one review, leaves one accepted-risk review check owed — status reads `outstanding 1 (T7 review)` and `run`/`resume` still exit 0 on execution alone, so the run is execution complete, not green. It turns green only when a `tickmarkr verify --record <runId>` discharge moves CURRENT status to `outstanding 0`, including a discharge landing after run-end — the historical run-end record keeps the old count, so never read debt from it; `outstanding unknown` is never green. Tickmarkr consolidates accepted task work on `tickmarkr/<runId>`; it never signs off to the main branch. A human may later merge that integration branch through the repository's normal release process.
+5. **Verify and consolidate** — accept only a green run. A run is green only when ALL of these hold: the run-end event exists in the journal and is not fatal, tip verify is not "failed", the run-end summary's `failed`, `human`, `blocked` and `pending` buckets are every one of them empty, AND the owed checks in CURRENT `tickmarkr status <runId>` are outstanding empty AND known (`outstanding 0`; `outstanding unknown` is never empty). The shorter "run-end plus tip verify" form is NOT sufficient: a run ending `done=[T1,T3,T4] human=[T2] tipVerify=passed` is a closed PARTIAL run — three of four delivered, one parked — and calling it green is how a park becomes invisible. Empty execution buckets are not sufficient either (D-660): a run ending with every execution bucket empty and `tipVerify=passed` after an operator waived one review still owes that accepted-risk review check — status reads `outstanding 1 (T7 review)`, and `tickmarkr run` and `resume` exit 0 on execution alone — so it is execution complete, not green. Read the debt from CURRENT status, never from the run-end record: a `tickmarkr verify --record <runId>` discharge that lands after run-end moves current status to `outstanding 0` while the historical run-end row still carries 1, and only then is that run green; a legacy waiver without a recorded obligation reads `outstanding unknown` and is never green. A fatal run-end is never green either: the crash record (`fatal: true`) names its phase and error, every task it left running or gated sits in `pending` or `blocked`, and even with every bucket empty status and report lead with the crash and read `outstanding unknown` until the run is resumed; from then on the resumed engagement owns the debt. Never report green to the operator, tab titles, or records until every clause holds; when one does not, name the bucket that is not empty, the outstanding checks, or the unknown debt. Tickmarkr consolidates accepted task work on `tickmarkr/<runId>`; it never signs off to the main branch. A human may later merge that integration branch through the repository's normal release process.
+   - `tickmarkr verify --base <ref>` — run the gate battery standalone against merge-base(base, HEAD)..HEAD: no daemon, no retries, one fail-closed verdict (`--criteria <file>` or `--task <id>` adds the semantic gates; `--no-review` for deterministic-only)
 6. **Record** — `tickmarkr report <runId> --md` prints Markdown to stdout. Redirect it explicitly beside the source spec (for example `tickmarkr report <runId> --md > feature.record.md`) then follow [stand-down](#stand-down-mission-end-and-retirement) to append the ORCH end marker before committing the execution record when tracked.
 
 ## Host-owned daemon and detached beats
@@ -276,111 +290,4 @@ their harness cap; daemon and beat lifetimes must not depend on that cap.
 
 ## Cockpit, parked decisions and printed twins
 
-The shipped cockpit is **1 Home, 4 Run, 5 Evidence**: `tickmarkr ui [runId]` defaults to
-Home on the latest journal, or empty Home with no run. `tickmarkr ui <runId> --view run`
-and `--view evidence` select delivered views; `tickmarkr ui --setup <runId>` opens Run
-Parks for that run. Fleet/Bootstrap and Plan/Health are follow-ons; keys 2/3/6 are not
-installed. Continue using `fleet`, `init`, `plan` and `doctor` as CLI workflows.
-
-Walk the recorded partial-human-park case before declaring green: **1/3 merged**, human
-T2, blocked T3, tip passed is **PARTIAL**. T2 is a `humanGate: true` park before dispatch.
-In Run select T2, press `a` Actions, choose Approve with Enter, then read the confirmation's
-run/task, original park `#L`, actor/reason, exact argv, consequence and enactor. Only `y`
-confirms; `n`/Esc cancel; Enter never confirms. Read the receipt's appended `task-approved`
-line and actor/reason back from the journal. Approval records permission, never dispatch,
-a passed gate or task completion. With no live owner it says **approved; resume required**:
-exit the observer and launch `tickmarkr resume <runId>` explicitly with the same detached launch above. A matching live daemon
-enacts at its next task boundary; if a different live run owns the repository lock, wait
-for that run to end before resuming this one.
-
-For a non-TTY decision, the same command is
-`tickmarkr approve <runId> T2 --park <line>@<ts> --by operator --reason 'ready to proceed'`,
-naming the park token `tickmarkr status <runId>` prints; check its receipt and explicitly
-resume. Every decision binds to one park (a waive also to its failed gate:
-`tickmarkr approve <runId> T2 --waive --park <line>@<ts> --gate review`); once a newer park
-opens, a stale token, unbound release or mismatched gate refuses — the daemon journals
-`approval-refused` and never waives the newer gate. A failed task keeps its recheck with its
-own bound failure token: status prints `failed — T3 — failure <line>@<ts>`, then
-`tickmarkr approve <runId> T3 --recheck --park <line>@<ts>` re-gates its landed commits. Preserve resume refusals and repair the named source/config issue
-(including deny/prefer conflicts); never edit the compiled graph to force a result. Resume
-makes CURRENT TIP PENDING; historical GATES RAN does not prove completion. The completed
-case has 3/3 recorded merges, a latest run-end, a nonfailed known tip result, empty
-`failed`, `human`, `blocked`, `pending` buckets, and CURRENT status reading `outstanding 0`
-— owed checks outstanding empty AND known. Replay D-660 before calling it green: the same
-3/3 with every bucket empty, after T2's review was waived, reads `outstanding 1 (T2 review)`;
-`resume` exits 0 and its final line says `execution complete; outstanding 1 (T2 review)`, not
-`verified`. It is green only once `tickmarkr verify --record <runId>` discharges that check and
-CURRENT status reads `outstanding 0` — even after run-end, whose record still carries 1.
-`outstanding unknown` (a legacy waiver) is never green. A mismatched graph is “not comparable.”
-
-Run offers only validated park verbs: human/attempt-cap/other non-gate parks allow approve;
-infra allows approve or `--recheck`; review gate-fail allows `--waive`, `--uphold` or
-`--recheck`; other gate-fail allows waive/recheck. Waive satisfies only the identified
-failed gate, uphold funds a fixed attempt carrying review findings, and recheck reruns the
-declared battery without satisfying a gate. A waive needs EXECUTED evidence: mark every
-out-of-band (OOB) read behind it `OOB: static` (diff and source read, nothing run) or
-`OOB: executed` (the finding's claim run at the task's head commit, exit code and log on file).
-Static CLEAN never backs a waive — a static read that missed an executed material defect looks
-like one that found none, and a static read relabelled executed is a false record. When the
-finding's reproduction, executed at the task head, fails, the ruling is uphold or recheck; waive
-only when it passes and the record names it, keeping the park/gate binding and the owed check
-(`outstanding 1 (T2 review)` until `tickmarkr verify --record <runId>`):
-`D-NNN WAIVE T2 review — park <line>@<ts> --gate review — OOB: executed — <reproduction> at <task-head-sha>: exit 0, log <path>`. A stall park that recorded a `reapFailure`
-(unreadable or surviving worker census) allows approve or `--recheck --park <line>@<ts>`:
-recheck re-verifies that attempt's owned census and gates its harvested commits with no
-worker only with an explicitly recorded empty survivors array (`[]`) — a missing,
-unreadable or surviving census
-re-parks the stall under a new token — while plain approve dispatches a worker. An
-ordinary stall park (no `reapFailure`) stays approve-only; `--recheck` refuses it. Attempt-cap approval resets the budget while
-retaining routing exclusions. Tombstones and failures without identified gate evidence
-are diagnostic-only. Decisions cannot be undone; stale or duplicate decisions refuse.
-
-Use `tickmarkr status <runId>` and `tickmarkr status <runId> --oneline` for preserved
-snapshots. `tickmarkr status <runId> --watch` opens Run on a TTY and uses line output on
-non-TTY; `--watch --plain` keeps the line/ANSI fallback even on a TTY. `--watch --events`
-replays and follows projected decision JSON documents on stdout; `--jsonl` and
-`--decision-events` are aliases. Keep stderr keepalives separate, never `2>&1`; raw
-`journal.jsonl` remains distinct. Webhooks require explicit opt-in. `report` retains text,
-learning preview and comparison warnings; `report --md` stays stdout, `--compare
-<baseline-runId>` compares records, `--bundle <path>` writes a proof bundle, and `stats`
-reports all runs without a run ID. Keep `fleet --print` and `fleet --why` separate.
-Absent usage/cost evidence remains “not measurable.”
-
-Manual UI keeps a receipt at run-end and observes a later resume of that same run. The
-daemon-owned board by default gracefully stops its own watch presence before closing its owned pane;
-unconfirmed cleanup is reported; `visibility.keepPanes: forever` preserves panes. It preserves Herdr grouping, short titles and placement
-beside the caller without taking focus. `q`, Ctrl-C and SIGTERM restore raw/pointer/title/
-alternate-screen state and release only this observer's presence. `?` opens shortcuts,
-Tab/Shift-Tab traverse visible focus, and Esc closes the deepest overlay. Text input keeps
-`q1?` literal. Evidence retains original `#L` pointers and full verdict paging with stable
-selection while Follow is off; Run's `o` focuses only a verified owned pane, otherwise
-showing its evidence diagnostic. Missing historical reviewer-floor metadata stays unknown.
-
-For inert guidance use `tickmarkr ui --help`, `tickmarkr eval --help`,
-`tickmarkr unlock --help` and `tickmarkr profile reset --help`. Before `--`, help returns
-without UI/probes/writes; after `--`, arguments are literal data. Displayed examples do
-not execute. Recovery uses `unlock <runId>` for a matching dead lock or `unlock --garbage`
-for malformed bytes, with confirmation (`--yes` for non-TTY) and identity recheck; live,
-inaccessible or changed holders refuse. `doctor --cached`, `--probe-preflight`,
-`--fix-only` and `--refresh-catalog` distinguish cached reads, budget disclosure, local
-repair and catalog refresh; default doctor and `--fix` still probe. `scope <intent-file>
---preview` performs no probes, model calls or writes; authoring requires confirmation or
-`--yes`. These actions remain CLI entries until their follow-on views ship.
-
-**macOS host failure: a launchservicesd restart (D-787/D-789).** If GUI apps suddenly read "The
-application … is not open anymore" during a local suite, launchservicesd crashed and respawned with an
-empty app registry. That was measured on 2026-09-30: `0x1000600b` Mach port exhaustion under node
-`process.title` check-ins, crash at 17:15:00Z and respawn at 17:15:09Z. `tickmarkr doctor` and standalone
-`tickmarkr verify` record the daemon's pid/start through the separate `src/run/launchservices-check.ts`
-module: one bounded `/bin/ps` read with a 5000 ms kill ceiling. doctor's wiring is five lines in
-`src/cli/commands/doctor.ts`. The identity lives on the first `doctor.json` record, and one advisory
-prints and persists when it changed. Unknown evidence keeps the prior identity, and verdicts and retries
-never change. Confirm the identity with `/bin/ps -o pid=,lstart= -p "$(pgrep -x launchservicesd)"`: it
-is young beside Dock and Finder. Confirm the log with `/usr/bin/log show --start '<that lstart minus two
-minutes>'`, looking for `0x1000600b` then `Successfully spawned launchservicesd`. Type the full path: a bare
-`log` is a zsh builtin that prints nothing. Then quit and relaunch the affected apps, or log out /
-restart once the run is stood down; a restart ends agent sessions and wipes `/private/tmp`.
-
-Keep this skill's canonical identity `tickmarkr-loop`; sibling skills link to this
-walkthrough. In this repository `skills/` is canonical and installed `.claude/skills/`
-files resolve to it; change the canonical source, never create a second help skill.
+Read [the cockpit walkthrough](references/cockpit.md) before operating the cockpit, deciding a park or reading a printed twin.

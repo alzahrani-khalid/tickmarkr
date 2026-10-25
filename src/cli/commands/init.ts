@@ -1,4 +1,5 @@
-import { appendFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { appendFileSync, copyFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createInterface, type Interface } from "node:readline/promises";
@@ -16,6 +17,7 @@ import { Journal, type JournalEvent } from "../../run/journal.js";
 import { runLockOwner, runLockRunId, runStatusLine } from "../../run/lock.js";
 import { doctor } from "./doctor.js";
 import { assembleFleetEditor } from "./fleet.js";
+import { SHIPPED_DIGESTS, SHIPPED_SNAPSHOTS } from "../shipped-skill-files.js";
 
 const SCAFFOLD_SPEC = "tickmarkr.spec.md";
 
@@ -26,7 +28,7 @@ const ENVIRONMENTS_FOOTER = [
   "environments:",
   "  herdr — the full cockpit — every worker, judge, and consult is a visible pane you can watch and unblock · https://herdr.dev · auto picks it first when HERDR_ENV=1",
   "  orca — visible terminals in the Orca app — auto picks it inside an Orca terminal after herdr and before subprocess; set driver: orca to force it · https://onorca.dev",
-  "  claude code — tickmarkr init --agent installs the /tkr skills + AGENTS.md so Claude Code (or any agent CLI) drives the loop natively; in Claude Desktop's Code tab (neither herdr nor Orca) one single-tier session runs the loop on the headless subprocess driver, watched with tickmarkr status --watch --plain",
+  "  claude code — tickmarkr init --agent installs the tickmarkr-loop, tickmarkr-auto and tickmarkr-overseer skills + AGENTS.md so Claude Code (or any agent CLI) drives the loop natively; in Claude Desktop's Code tab (neither herdr nor Orca) one single-tier session runs the loop on the headless subprocess driver, watched with tickmarkr status --watch --plain",
   "  anywhere — no herdr or Orca terminal? same fail-closed gates, headless subprocess driver (legacy: no herdr? same fail-closed gates, headless subprocess driver when Orca markers are absent)",
 ].join("\n");
 
@@ -85,84 +87,9 @@ tickmarkr compiles repository specs into isolated, independently verified agent 
 - Do not edit compiled graphs to force outcomes; fix source specs and recompile.
 - Gates verify commits, diffs, acceptance criteria, and reviews independently — never trust a worker's completion claim.
 - Treat missing or unparseable machine results and verdicts as failures.
-
-### Commands
-
-- \`tickmarkr compile <spec>\` — spec → RunGraph
-- \`tickmarkr plan\` — routing table and human gates
-- \`tickmarkr run\` — execute the graph
-- \`tickmarkr status <runId>\` — run progress
-- \`tickmarkr resume <runId>\` — continue a paused or failed run
-- \`tickmarkr approve <runId> <taskId>\` — release a human gate
-- \`tickmarkr report <runId> --md\` — execution record beside the spec
-- \`tickmarkr verify --base <ref>\` — run the gate battery standalone against merge-base(base, HEAD)..HEAD: no daemon, no retries, one fail-closed verdict (\`--criteria <file>\` or \`--task <id>\` adds the semantic gates; \`--no-review\` for deterministic-only)
-
-Loop: compile → plan → run → report. Watch the journal for run-end rather than polling workers.
-
-### Role check (multi-agent environments)
-
-- **Orchestrator:** run the loop in your session; do not start a second run.
-- **Supervisor with a live orchestrator:** relay the mission via verified handoff (below), then supervise — do not duplicate the loop.
-- **Primary session without an orchestrator:** spawn one child orchestration session, give it the mission and these rules, then supervise.
-
-Outside multi-agent environments, run the loop directly.
-
-### Version preflight
-
-Before \`tickmarkr compile\` or \`tickmarkr run\`: run \`tickmarkr version --check\` and stop on a non-zero exit. In the tickmarkr source repository (\`package.json\` named \`tickmarkr\`), stop if the versions differ anywhere (major, minor, or patch); the binary and repository must agree on the entire version, so binary \`2.1.0\` versus repository \`2.1.1\` is a stop. In a consumer repository, the check compares installed agent guidance with this binary's packaged block and skills, never the app's manifest version; refresh drifted guidance with \`tickmarkr init --agent --force\`. Tell the operator to update or link the correct binary when the source version differs. Never proceed on hope — stale binaries silently skip daemon gates. Also verify no run is live in this repository before starting one: lead with this repository's \`.tickmarkr/graph.lock\`, read its holder pid, and treat it as live until \`kill -0 <pid>\` proves that holder dead. Never require a machine-wide process pattern to be empty: a lawful run in another repository — or the probing shell's own argv — can match. If you use a process probe as secondary evidence, exclude the probing process, resolve every candidate's own cwd (for example with \`lsof -a -p <pid> -d cwd\`), and count only candidates whose cwd is this repository root.
-
-### Seat hygiene
-
-In a multi-tier session, the tiers clear each other at 50% context or more, after writing a handoff. A new spec or run is a mission boundary: write the handoff and clear before taking the next mission. Copy this duty into every brief and handoff. On a single-tier plain host, write your handoff and ask the operator to clear the session.
-
-### Tip-verify-before-green
-
-A run is green only when ALL of these hold: the run-end event exists in the journal and is not fatal, tip verify is not "failed", the run-end summary's \`failed\`, \`human\`, \`blocked\` and \`pending\` buckets are every one of them empty, AND the owed checks in CURRENT \`tickmarkr status <runId>\` are outstanding empty AND known (\`outstanding 0\`; \`outstanding unknown\` is never empty). The shorter "run-end plus tip verify" form is NOT sufficient: a run ending \`done=[T1,T3,T4] human=[T2] tipVerify=passed\` is a closed PARTIAL run — three of four delivered, one parked — and calling it green is how a park becomes invisible. Empty execution buckets are not sufficient either (D-660): a run ending with every execution bucket empty and \`tipVerify=passed\` after an operator waived one review still owes that accepted-risk review check — status reads \`outstanding 1 (T7 review)\`, and \`tickmarkr run\` and \`resume\` exit 0 on execution alone — so it is execution complete, not green. Read the debt from CURRENT status, never from the run-end record: a \`tickmarkr verify --record <runId>\` discharge that lands after run-end moves current status to \`outstanding 0\` while the historical run-end row still carries 1, and only then is that run green; a legacy waiver without a recorded obligation reads \`outstanding unknown\` and is never green. A fatal run-end is never green either: the crash record (\`fatal: true\`) names its phase and error, every task it left running or gated sits in \`pending\` or \`blocked\`, and even with every bucket empty status and report lead with the crash and read \`outstanding unknown\` until the run is resumed; from then on the resumed engagement owns the debt. Never report green to the operator, tab titles, or records until every clause holds; when one does not, name the bucket that is not empty, the outstanding checks, or the unknown debt.
-
-### Verified handoffs
-
-When relaying missions between agents, never use bare send-text (\`herdr agent send\` / pane send-text) — it omits Enter. Use \`herdr pane run <pane> "<message>"\` or \`herdr notification show "<message>"\`. Confirm delivery by reading the TARGET composer afterward; if the sent text still sits unsubmitted after ~15 s, retry the Enter only when that composer read shows the staged text and no permission prompt or numbered choice holds focus — an Enter sent onto an active prompt approves it or picks a choice instead of submitting the message (OBS-1119). Under that guard, send-keys enter to that pane once and read again (OBS-975); when a prompt or choice holds focus instead, resolve it first and re-read before retrying. Never report "relayed" without read-back. On a plain host (neither herdr nor Orca) there is no pane to read back: hand off through the host's cross-session message tool, and count the handoff confirmed only by the peer's reply.
-
-### Orient before you act — this block may be the ONLY guidance your host loaded
-
-These same bytes are written into EVERY repository guidance file this project has, because hosts disagree
-about which one they read: some load only \`AGENTS.md\`, some also load a repo-level guidance file, some load
-a user-level one instead. **Anything stated in only one file is invisible to some agent.** So do not assume
-you were handed the whole picture — list the repository root, open every guidance file present, and then:
-
-- **Read your host's PROJECT MEMORY before starting.** Hosts that keep one store it under a per-project
-  state directory keyed by the absolute working-directory path; find it and read its index plus every entry
-  whose name concerns METHOD or DISCIPLINE. It holds rules that cost real defects to learn. Entries may
-  predate a project rename, so **search by CONCEPT, not by the current product name.** A memory nobody opens
-  is worse than none: every seat assumes the lesson is recorded somewhere and no seat looks.
-- **The gates are the product.** Seven, defined in \`src/graph/schema.ts\`:
-  \`build test lint evidence scope acceptance review\`. **That is DECLARATION order, not execution order.**
-  The cheap checks run first and stop at their first red: \`build\`, \`lint\`, then \`evidence\` and \`scope\`.
-  A fresh or semantic-repair candidate then runs \`acceptance\` ‖ \`review\` CONCURRENTLY (\`run-gates.ts\`,
-  *"judge ‖ review"*) before any test payload: a decisive semantic red ends the round with zero diagnostic
-  or full test-gate runs (a required acceptance oracle still executes); otherwise ONE full verification job
-  follows, with no selected screen. Only an attributed behavioral test-red repair may buy one diagnostic
-  first — every required failing file plus conservatively selected tests reaching the diff — admitted only
-  on comparable harness timing with ratio <= 0.15 AND estimated cost <= 60000 ms; its behavioral red stops
-  the round before semantics, otherwise semantics precede the full job. Disabled, unsupported, over-cap or
-  unknown-cost selection skips the diagnostic instead of running a full suite before semantics, and a
-  killed diagnostic is never green. A seatless or no-verdict review lets acceptance finish and publish and
-  the full job run in-round, and stays unsatisfied until review-only recovery; a seatless acceptance
-  cancels its sibling, records the unrun test (\`testOwed\`) and every enabled gate still owed (an unrecorded
-  review included), cannot merge and parks infra; an actual cancellation or throw awaits cleanup and leaves
-  no mergeable partial set. Test-only verification and an explicit full recheck keep their full scope with
-  no invented semantics and no diagnostic. Nothing merges until the FULL suite has passed on the exact
-  merge-candidate commit; an exact full green answers only after identity, environment, cleanliness and
-  current complete-manifest checks. The first five are MANDATORY; only \`acceptance\` and
-  \`review\` may be omitted per task. Implementations are in \`src/gates/\` — \`baseline.ts\` (build/test/lint,
-  diffed against a recorded baseline so pre-existing failures are forgiven), \`evidence.ts\`, \`scope.ts\`,
-  \`acceptance.ts\` (its judge reads the DIFF and every criterion must cite a changed hunk), \`review.ts\`
-  (cross-vendor). \`run-gates.ts\` drives them. **A declared gate is not a passed gate, and a gate that
-  returned zero findings is not the same as a gate that ran.**
-- **Spec-authoring law ships in the spec template** that \`tickmarkr init\` writes: the hard bounds and which
-  direction each moves, what makes a criterion real, and why an absence or a source-text grep is never a
-  criterion. Read it before authoring or repairing acceptance items.
-- **Editing \`src/gates/\`, \`src/compile/\` or \`src/graph/\`?** Read \`docs/codebase/ARCHITECTURE.md\` first.
+- Before \`tickmarkr compile\` or \`tickmarkr run\`, run \`tickmarkr version --check\` and stop on a non-zero exit.
+- A run is green only when run-end is not fatal, every bucket but done is empty, tip verify did not fail and current \`tickmarkr status\` reads outstanding 0; the loop skill holds the full rule.
+- Drive runs through the \`tickmarkr-loop\` skill (one spec) or the \`tickmarkr-auto\` skill (several specs); they carry the role check, the live-run check, verified handoffs and the green rule. Supervise a run with the \`tickmarkr-overseer\` skill.
 ${DOCS_END}
 `;
 
@@ -171,11 +98,151 @@ ${DOCS_END}
 // .claude/skills + CLAUDE.md (applicable when the repo already shows claude usage).
 const hostTargets = (cwd: string) => {
   const targets = [{ skillsDir: join(cwd, ".agents", "skills"), docPath: join(cwd, "AGENTS.md") }];
-  if (existsSync(join(cwd, ".claude")) || existsSync(join(cwd, "CLAUDE.md")))
+  if (entryStat(join(cwd, ".claude")) || entryStat(join(cwd, "CLAUDE.md")))
     targets.push({ skillsDir: join(cwd, ".claude", "skills"), docPath: join(cwd, "CLAUDE.md") });
   return targets;
 };
 const packagedSkillDir = (skill: string) => fileURLToPath(new URL(`../../../skills/${skill}`, import.meta.url));
+
+// Queue row 244 (D-2141; D-2152): lstat, including dangling links, at every step from
+// the consumer boundary. Never inspect a descendant through a linked host ancestor.
+const entryStat = (path: string) => {
+  try { return lstatSync(path); } catch (error) {
+    if (["ENOENT", "ENOTDIR"].includes((error as NodeJS.ErrnoException).code ?? "")) return undefined;
+    throw error;
+  }
+};
+function guidanceLink(cwd: string, path: string): string | undefined {
+  let at = resolve(cwd);
+  if (entryStat(at)?.isSymbolicLink()) return at;
+  for (const part of relative(cwd, path).split(sep).filter(Boolean)) {
+    at = join(at, part);
+    if (entryStat(at)?.isSymbolicLink()) return at;
+  }
+  return undefined;
+}
+const digest = (bytes: Buffer) => createHash("sha256").update(bytes).digest("hex");
+const parentDirs = (files: string[]) => {
+  const dirs = new Set<string>();
+  for (const file of files) {
+    for (let dir = dirname(file); dir !== "."; dir = dirname(dir)) dirs.add(dir);
+  }
+  return dirs;
+};
+interface SkillTree {
+  files: Map<string, string>;
+  dirs: Set<string>;
+  links: string[];
+  other: string[];
+}
+function readSkillTree(root: string): SkillTree {
+  const tree: SkillTree = { files: new Map(), dirs: new Set(), links: [], other: [] };
+  const visit = (path: string, rel: string) => {
+    const stat = entryStat(path);
+    if (stat?.isSymbolicLink()) tree.links.push(path);
+    else if (stat?.isFile()) tree.files.set(rel, digest(readFileSync(path)));
+    else if (stat?.isDirectory()) {
+      if (rel) tree.dirs.add(rel);
+      for (const name of readdirSync(path).sort()) visit(join(path, name), rel ? `${rel}/${name}` : name);
+    } else tree.other.push(path);
+  };
+  visit(root, "");
+  return tree;
+}
+function tickmarkrMarked(dir: string): boolean {
+  try {
+    if (!entryStat(dir)?.isDirectory() || !entryStat(join(dir, "SKILL.md"))?.isFile()) return false;
+    const frontmatter = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(readFileSync(join(dir, "SKILL.md"), "utf8"));
+    return !!frontmatter && parseYaml(frontmatter[1])?.metadata?.["installed-by"] === "tickmarkr";
+  } catch { return false; }
+}
+interface SkillInspection {
+  skill: string;
+  dir: string;
+  tree: SkillTree;
+  removable: boolean;
+  current: boolean;
+  leftovers: string[];
+  unproven: string[];
+}
+export function agentSkillEvidence(cwd: string): { skills: SkillInspection[]; links: string[] } {
+  const skills: SkillInspection[] = [];
+  const links = new Set<string>();
+  for (const { skillsDir } of hostTargets(cwd)) {
+    const linked = guidanceLink(cwd, skillsDir);
+    if (linked) { links.add(linked); continue; }
+    if (!entryStat(skillsDir)?.isDirectory()) continue;
+    for (const skill of readdirSync(skillsDir).sort()) {
+      const dir = join(skillsDir, skill);
+      const snapshots = Object.hasOwn(SHIPPED_SNAPSHOTS, skill) ? SHIPPED_SNAPSHOTS[skill]! : [];
+      const current = AGENT_SKILLS.includes(skill);
+      const reserved = current || snapshots.length > 0;
+      // Queue row 244 (D-2141; D-2152): unrelated user trees stay unread and unlisted.
+      if (!reserved && !tickmarkrMarked(dir)) continue;
+      const tree = readSkillTree(dir);
+      for (const link of tree.links) links.add(link);
+      if (tree.links.includes(dir)) continue;
+      // ONE complete snapshot, including its implied directories. A subset, a union,
+      // an empty tree or a marker cannot prove directory ownership.
+      const removable = tree.files.has("SKILL.md") && !tree.links.length && !tree.other.length
+        && snapshots.some((snapshot) => {
+          const paths = Object.keys(snapshot);
+          const dirs = parentDirs(paths);
+          return paths.length > 0 && paths.length === tree.files.size && dirs.size === tree.dirs.size
+            && [...tree.dirs].every((path) => dirs.has(path))
+            && paths.every((path) => tree.files.get(path) === SHIPPED_DIGESTS[snapshot[path]!]);
+        });
+      const shipped = current ? skillFileList(packagedSkillDir(skill)) : [];
+      const currentDirs = parentDirs(shipped);
+      const leftovers = current ? [...tree.files].filter(([path, hash]) => !shipped.includes(path)
+        && snapshots.some((snapshot) => snapshot[path] !== undefined && SHIPPED_DIGESTS[snapshot[path]!] === hash))
+        .map(([path]) => join(dir, path)) : [];
+      const unproven: string[] = [];
+      if (!removable) {
+        if (!current || !tree.files.has("SKILL.md")) unproven.push(dir);
+        for (const [path, hash] of tree.files) {
+          const full = join(dir, path);
+          if (!leftovers.includes(full) && (!shipped.includes(path) || hash !== digest(readFileSync(join(packagedSkillDir(skill), path)))))
+            unproven.push(full);
+        }
+        for (const path of tree.dirs) if (!currentDirs.has(path)) unproven.push(join(dir, path));
+        unproven.push(...tree.other);
+      }
+      skills.push({ skill, dir, tree, removable, current, leftovers, unproven: [...new Set(unproven)] });
+    }
+  }
+  return { skills, links: [...links] };
+}
+const keptLink = (path: string) => `kept ${path} (symbolic link)`;
+function sweepAgentLeftovers(cwd: string, remove: boolean, notes: string[]): SkillInspection[] {
+  const evidence = agentSkillEvidence(cwd);
+  const deferred: SkillInspection[] = [];
+  notes.push(...evidence.links.map(keptLink));
+  for (const skill of evidence.skills) {
+    if (skill.removable && !skill.current) {
+      rmSync(skill.dir, { recursive: true });
+      notes.push(`removed leftover ${skill.dir}`);
+      continue;
+    }
+    // Queue row 244 (D-2141; D-2152): keep a complete earlier snapshot removable
+    // when its refresh is skipped. Sweep it only after the consented copy succeeds.
+    if (!remove && skill.removable) { deferred.push(skill); continue; }
+    for (const path of skill.leftovers) {
+      rmSync(path);
+      notes.push(`removed leftover ${path}`);
+    }
+    // Sweeping can turn a current tree plus retired files into a complete snapshot.
+    const refreshed = remove ? agentSkillEvidence(cwd).skills.find((s) => s.dir === skill.dir) : skill;
+    if (remove && (skill.removable || refreshed?.removable)) {
+      rmSync(skill.dir, { recursive: true });
+      notes.push(`removed leftover ${skill.dir}`);
+    } else {
+      notes.push(...skill.unproven.map((path) => `kept ${path} (unproven)`));
+      if (remove && !skill.unproven.length && !skill.tree.links.length) notes.push(`kept ${skill.dir} (unproven)`);
+    }
+  }
+  return deferred;
+}
 
 // Every file the package ships for a skill, DERIVED from the tree rather than listed. OBS-373: a script
 // was added to the shipped overseer skill long after repos had installed it, and because the SKILL.md
@@ -193,24 +260,21 @@ function skillFileList(root: string, prefix = ""): string[] {
 
 interface SkillDrift { skill: string; dir: string; missing: string[]; modified: string[] }
 
-// Drift is only computed for skills that ARE installed. A skill never installed is not drift — `--agent`
-// installs it and says so, and nagging about it would bury the case this exists for.
+// Reserved directories count as installed even when their skill file is missing or malformed.
+// An absent directory is not drift; --agent installs it and says so.
 export function skillDrift(cwd: string): SkillDrift[] {
   const drifted: SkillDrift[] = [];
-  for (const { skillsDir } of hostTargets(cwd)) {
-    for (const skill of AGENT_SKILLS) {
-      const dir = join(skillsDir, skill);
-      if (!existsSync(join(dir, "SKILL.md"))) continue;
-      const src = packagedSkillDir(skill);
-      const missing: string[] = [];
-      const modified: string[] = [];
-      for (const rel of skillFileList(src)) {
-        // readFileSync resolves symlinks, so a symlinked mirror compares equal to a copied one.
-        if (!existsSync(join(dir, rel))) missing.push(rel);
-        else if (!readFileSync(join(dir, rel)).equals(readFileSync(join(src, rel)))) modified.push(rel);
-      }
-      if (missing.length || modified.length) drifted.push({ skill, dir, missing, modified });
+  for (const { skill, dir, tree, current } of agentSkillEvidence(cwd).skills) {
+    if (!current) continue;
+    const src = packagedSkillDir(skill);
+    const missing: string[] = [];
+    const modified: string[] = [];
+    for (const rel of skillFileList(src)) {
+      if (guidanceLink(cwd, join(dir, rel))) continue;
+      if (!tree.files.has(rel)) missing.push(rel);
+      else if (tree.files.get(rel) !== digest(readFileSync(join(src, rel)))) modified.push(rel);
     }
+    if (missing.length || modified.length) drifted.push({ skill, dir, missing, modified });
   }
   return drifted;
 }
@@ -225,7 +289,7 @@ export function skillDrift(cwd: string): SkillDrift[] {
 // text with nobody able to see it. Same rule as skillDrift: a doc that was never written is not drift.
 export const docsDrift = (cwd: string): string[] =>
   hostTargets(cwd).map(({ docPath }) => docPath).filter((docPath) => {
-    if (!existsSync(docPath)) return false;
+    if (guidanceLink(cwd, docPath) || !entryStat(docPath)?.isFile()) return false;
     const current = readFileSync(docPath, "utf8");
     const begin = current.indexOf(DOCS_BEGIN);
     if (begin < 0) return false; // no block installed here — --docs writes one, that is not drift
@@ -235,10 +299,13 @@ export const docsDrift = (cwd: string): string[] =>
   });
 
 export function installedAgentGuidance(cwd: string): string[] {
-  return hostTargets(cwd).flatMap(({ skillsDir, docPath }) => [
-    ...AGENT_SKILLS.map((skill) => join(skillsDir, skill, "SKILL.md")).filter((path) => existsSync(path)),
-    ...(existsSync(docPath) && readFileSync(docPath, "utf8").includes(DOCS_BEGIN) ? [docPath] : []),
-  ]);
+  const evidence = agentSkillEvidence(cwd);
+  return [
+    ...evidence.skills.map(({ dir, tree }) => tree.files.has("SKILL.md") ? join(dir, "SKILL.md") : dir),
+    ...evidence.links,
+    ...hostTargets(cwd).map(({ docPath }) => docPath).filter((path) => !guidanceLink(cwd, path)
+      && entryStat(path)?.isFile() && readFileSync(path, "utf8").includes(DOCS_BEGIN)),
+  ];
 }
 
 const describeDrift = (d: SkillDrift) => [
@@ -250,7 +317,8 @@ const describeDrift = (d: SkillDrift) => [
 // should not be asked again just because a copy drifted. Staleness is a different question with a
 // different answer (`--agent --force`), and it is reported by name on every init path below.
 const skillsInstalled = (cwd: string) =>
-  hostTargets(cwd).every((t) => AGENT_SKILLS.every((s) => existsSync(join(t.skillsDir, s, "SKILL.md"))));
+  hostTargets(cwd).every((t) => AGENT_SKILLS.every((s) => !guidanceLink(cwd, join(t.skillsDir, s, "SKILL.md"))
+    && entryStat(join(t.skillsDir, s, "SKILL.md"))?.isFile()));
 export type DetectedHost = "herdr" | "orca" | "subprocess";
 
 export function detectedHost(env: NodeJS.ProcessEnv = process.env): DetectedHost {
@@ -291,28 +359,60 @@ async function installAgentFiles(cwd: string, force: boolean, docs: boolean, not
   };
 
   try {
+    const deferred = sweepAgentLeftovers(cwd, false, notes);
     const drift = skillDrift(cwd);
     for (const { skillsDir, docPath } of hostTargets(cwd)) {
       for (const skill of AGENT_SKILLS) {
         const dest = join(skillsDir, skill, "SKILL.md");
-        const exists = existsSync(dest);
+        const dir = join(skillsDir, skill);
+        // Queue row 244 (D-2141; D-2152): a linked SKILL.md exempts only itself;
+        // unlinked siblings still receive their consented refresh below.
+        const linked = guidanceLink(cwd, dir);
+        if (linked) { if (!notes.includes(keptLink(linked))) notes.push(keptLink(linked)); continue; }
+        if (entryStat(dir) && !entryStat(dir)?.isDirectory()) continue;
+        const destStat = entryStat(dest);
+        const exists = !!destStat;
         const stale = drift.find((d) => d.dir === join(skillsDir, skill));
+        const leftovers = deferred.find((s) => s.dir === dir)?.leftovers ?? [];
         // An install that already matches the package byte for byte needs no prompt and no write. Before
         // this, every re-init asked to overwrite a current skill and the answer meant nothing either way.
-        if (exists && !stale) {
-          notes.push(`kept current ${dest}`);
+        if (exists && !stale && !leftovers.length) {
+          if (!destStat?.isSymbolicLink()) notes.push(`kept current ${dest}`);
           continue;
         }
         const tracked = exists && gitTracked(cwd, dest);
-        if (exists && !force && !(await confirm(`Overwrite ${dest} (${describeDrift(stale!)})?`))) {
-          notes.push(`skipped existing ${tracked ? "tracked " : ""}${dest} — ${describeDrift(stale!)}; pass --force to overwrite it`);
+        const changes = stale ? describeDrift(stale) : "retired files";
+        if (exists && !force && !(await confirm(`Overwrite ${dest} (${changes})?`))) {
+          notes.push(`skipped existing ${tracked ? "tracked " : ""}${dest} — ${changes}; pass --force to overwrite it`);
+          notes.push(...leftovers.map((path) => `kept leftover ${path}; pass --force to refresh ${dir}`));
           continue;
         }
-        // whole skill dir, not just SKILL.md — the overseer ships its pane-watcher script
-        cpSync(fileURLToPath(new URL(`../../../skills/${skill}`, import.meta.url)), join(skillsDir, skill), { recursive: true });
-        notes.push(`${exists ? "overwrote" : "wrote"} ${tracked ? "tracked " : ""}${dest}`);
+        // Copy only regular shipped files after checking every destination component.
+        // cpSync can abort natively on a dangling destination, even with a filter.
+        for (const rel of skillFileList(packagedSkillDir(skill))) {
+          const path = join(dir, rel);
+          const link = guidanceLink(cwd, path);
+          if (link) { notes.push(keptLink(link)); continue; }
+          let blocked = false;
+          for (let parent = dirname(path); parent !== cwd && parent !== dirname(parent); parent = dirname(parent)) {
+            if (entryStat(parent) && !entryStat(parent)?.isDirectory()) { blocked = true; break; }
+          }
+          if (blocked || (entryStat(path) && !entryStat(path)?.isFile())) continue;
+          mkdirSync(dirname(path), { recursive: true });
+          copyFileSync(join(packagedSkillDir(skill), rel), path);
+          const kept = notes.indexOf(`kept ${path} (unproven)`);
+          if (kept >= 0) notes[kept] = `overwrote ${path}`;
+        }
+        for (const path of leftovers) {
+          rmSync(path);
+          notes.push(`removed leftover ${path}`);
+        }
+        if (!destStat?.isSymbolicLink()) notes.push(`${exists ? "overwrote" : "wrote"} ${tracked ? "tracked " : ""}${dest}`);
       }
 
+      const linkedDoc = guidanceLink(cwd, docPath);
+      if (linkedDoc) { notes.push(keptLink(linkedDoc)); continue; }
+      if (entryStat(docPath) && !entryStat(docPath)?.isFile()) continue;
       const current = existsSync(docPath) ? readFileSync(docPath, "utf8") : "";
       // The block is CANONICAL guidance ("stated once here, restated nowhere"), so a repo that has
       // run init once must still be able to receive corrections to it. Before v1.86 this branch only
@@ -362,7 +462,8 @@ async function runInitWizard(
       concurrency: DEFAULT_CONFIG.concurrency,
       visibilityLlm: DEFAULT_CONFIG.visibility.llm,
       offerSkills: !skillsInstalled(cwd),
-      skillsDefault: existsSync(join(cwd, ".claude", "skills")) && !skillsInstalled(cwd),
+      skillsDefault: !guidanceLink(cwd, join(cwd, ".claude", "skills"))
+        && entryStat(join(cwd, ".claude", "skills"))?.isDirectory() === true && !skillsInstalled(cwd),
       detectedHost: detectedHost(),
     },
     input,
@@ -506,20 +607,8 @@ function handleRemove(cwd: string): string {
     notes.push(`deleted state directory ${stateDir}`);
   }
 
-  // 3. Delete shipped skill directories at every host location
-  const targetSkillDirs = [
-    join(cwd, ".agents", "skills"),
-    join(cwd, ".claude", "skills"),
-  ];
-  for (const dir of targetSkillDirs) {
-    for (const skill of AGENT_SKILLS) {
-      const skillPath = join(dir, skill);
-      if (existsSync(skillPath)) {
-        rmSync(skillPath, { recursive: true, force: true });
-        notes.push(`deleted skill ${skillPath}`);
-      }
-    }
-  }
+  // Queue row 244 (D-2141; D-2152): remove only what shipped bytes prove.
+  sweepAgentLeftovers(cwd, true, notes);
 
   // 4. Delete marker-bounded guidance block in AGENTS.md and CLAUDE.md leaving every byte outside identical
   const marked = new RegExp(
@@ -528,7 +617,9 @@ function handleRemove(cwd: string): string {
   );
   for (const doc of ["AGENTS.md", "CLAUDE.md"]) {
     const docPath = join(cwd, doc);
-    if (existsSync(docPath)) {
+    const linked = guidanceLink(cwd, docPath);
+    if (linked) { notes.push(keptLink(linked)); continue; }
+    if (entryStat(docPath)?.isFile()) {
       const current = readFileSync(docPath, "utf8");
       const m = current.match(marked);
       if (m && m.index !== undefined) {
@@ -673,6 +764,13 @@ export async function init(argv: string[], cwd = process.cwd(), io: InitIO = {})
   // shape: the package moves, the installed copy does not, and nothing in the repo changes to hint at it.
   // --agent reports drift per skill below, so this only speaks when that path will not.
   if (!values.agent) {
+    const evidence = agentSkillEvidence(cwd);
+    notes.push(...evidence.links.map(keptLink));
+    for (const skill of evidence.skills) {
+      if (!skill.current && skill.removable) notes.push(`leftover ${skill.dir}; run tickmarkr init --agent to remove it`);
+      notes.push(...skill.leftovers.map((path) => `leftover ${path}; run tickmarkr init --agent${skill.removable ? " --force" : ""} to remove it`));
+      notes.push(...skill.unproven.map((path) => `kept ${path} (unproven)`));
+    }
     for (const d of skillDrift(cwd)) {
       notes.push(`stale ${join(d.dir, "SKILL.md")} — ${describeDrift(d)}; run tickmarkr init --agent --force to refresh it`);
     }
@@ -756,7 +854,11 @@ export async function init(argv: string[], cwd = process.cwd(), io: InitIO = {})
 
   if (values.agent) await installAgentFiles(cwd, values.force ?? false, values.docs ?? false, notes);
   const next = nextSteps(cwd, SCAFFOLD_SPEC);
-  if (!visual()) return `${notes.join("\n")}\n${doc}\n${next}\n${ENVIRONMENTS_FOOTER}`;
+  // Queue row 243 (D-2141; D-2152): explain skipped guidance after next steps on either surface.
+  const guidedSetupHint = !interactive && !values.yes
+    ? "guided setup skipped (no interactive terminal): run `! tkr init` yourself, or in a visible pane"
+    : null;
+  if (!visual()) return `${notes.join("\n")}\n${doc}\n${next}${guidedSetupHint ? `\n${guidedSetupHint}` : ""}\n${ENVIRONMENTS_FOOTER}`;
 
   const noteRows = notes.map((note) => `  ${statusRow(
     /^(?:wrote|overwrote|appended|rewrote)/.test(note) ? "pass" : note.startsWith("skipped") ? "warn" : "neutral",
@@ -776,6 +878,7 @@ export async function init(argv: string[], cwd = process.cwd(), io: InitIO = {})
     legend("· continue from the repository's current state"),
     rule(),
     kvRow("next", next.replace(/^next:\s*/, "")),
+    ...(guidedSetupHint ? [`  ${guidedSetupHint}`] : []),
     legend("environments:"),
     ...footerRows,
   ].join("\n");

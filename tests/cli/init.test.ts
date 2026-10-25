@@ -273,7 +273,8 @@ describe("tickmarkr init --agent", () => {
     expect(docs.startsWith(original)).toBe(true);
     expect(docs).toContain("<!-- tickmarkr:agent-docs begin -->");
     expect(docs).toContain("<!-- tickmarkr:agent-docs end -->");
-    expect(docs).toMatch(/tickmarkr compile.*tickmarkr plan.*tickmarkr run.*tickmarkr report/s);
+    expect(docs).toContain("Before `tickmarkr compile` or `tickmarkr run`, run `tickmarkr version --check` and stop on a non-zero exit.");
+    expect(docs).toContain("Drive runs through the `tickmarkr-loop` skill");
     expect(docs).toMatch(/Never run two tickmarkr runs/);
     expect(docs).toMatch(/never trust a worker's completion claim/i);
     expect(out).toContain("appended tickmarkr agent docs");
@@ -292,8 +293,8 @@ describe("tickmarkr init --agent", () => {
     expect(await runInit(repo)).not.toContain("does not match this version");
 
     const fresh = readFileSync(doc, "utf8");
-    expect(fresh).toContain("must agree on the entire version");
-    writeFileSync(doc, fresh.replace("must agree on the entire version", "may be older on major.minor"));
+    expect(fresh).toContain("Before `tickmarkr compile` or `tickmarkr run`, run `tickmarkr version --check` and stop on a non-zero exit.");
+    writeFileSync(doc, fresh.replace("Before `tickmarkr compile` or `tickmarkr run`, run `tickmarkr version --check` and stop on a non-zero exit.", "Skip the version check."));
 
     const stale = await runInit(repo);
     expect(stale).toContain("does not match this version");
@@ -304,7 +305,7 @@ describe("tickmarkr init --agent", () => {
     // that path: it governs only the append-a-missing-block case, so it must still report the drift.
     expect(await runInit(repo, "--docs")).toContain("does not match this version");
     expect(await runInit(repo, "--agent", "--force")).not.toContain("does not match this version");
-    expect(readFileSync(doc, "utf8")).toContain("must agree on the entire version");
+    expect(readFileSync(doc, "utf8")).toContain("Before `tickmarkr compile` or `tickmarkr run`, run `tickmarkr version --check` and stop on a non-zero exit.");
   });
 
   test("non-TTY keeps an existing skill and docs, installs the missing skill, and names opt-in flags", async () => {
@@ -723,7 +724,7 @@ describe("T4 init closing block", () => {
       "the full cockpit — every worker, judge, and consult is a visible pane you can watch and unblock · https://herdr.dev",
     );
     expect(out).toContain(
-      "tickmarkr init --agent installs the /tkr skills + AGENTS.md so Claude Code (or any agent CLI) drives the loop natively",
+      "tickmarkr init --agent installs the tickmarkr-loop, tickmarkr-auto and tickmarkr-overseer skills + AGENTS.md so Claude Code (or any agent CLI) drives the loop natively",
     );
     expect(out).toContain("no herdr or Orca terminal? same fail-closed gates, headless subprocess driver");
   });
@@ -736,7 +737,7 @@ describe("T4 init closing block", () => {
 
     const prefix = (label: string) => new RegExp(`^\\s*${label}\\s+— `);
     const row = (text: string, label: string) => text.split("\n").find((l) => prefix(label).test(l))?.replace(prefix(label), "");
-    const existing = "tickmarkr init --agent installs the /tkr skills + AGENTS.md so Claude Code (or any agent CLI) drives the loop natively";
+    const existing = "tickmarkr init --agent installs the tickmarkr-loop, tickmarkr-auto and tickmarkr-overseer skills + AGENTS.md so Claude Code (or any agent CLI) drives the loop natively";
     const unchanged: Record<string, string> = {
       herdr: "the full cockpit — every worker, judge, and consult is a visible pane you can watch and unblock · https://herdr.dev · auto picks it first when HERDR_ENV=1",
       orca: "visible terminals in the Orca app — auto picks it inside an Orca terminal after herdr and before subprocess; set driver: orca to force it · https://onorca.dev",
@@ -759,7 +760,7 @@ describe("T4 init closing block", () => {
     const line = out.split("\n").find((l) => prefix("claude code").test(l))!;
     const desktopForm = line.slice(line.indexOf(existing) + existing.length);
     expect(desktopForm.length).toBeGreaterThan(0);
-    expect(findings(out.replace(line, line.replace(existing, "the /tkr skills drive the loop")))).toContain("existing claude code text");
+    expect(findings(out.replace(line, line.replace(existing, "the tickmarkr skills drive the loop")))).toContain("existing claude code text");
     expect(findings(out.replace(line, line.replace(desktopForm, "")))).toEqual(["Desktop form"]);
   });
 
@@ -774,6 +775,82 @@ describe("T4 init closing block", () => {
     expect(herdrLine).toBeTruthy();
     expect(herdrLine).not.toMatch(/npm\s+i(?:nstall)?/i);
     expect(out).not.toMatch(/npm\s+i(?:nstall)?\s+[-g\s]*herdr/i);
+  });
+});
+
+describe("init guidance (queue row 243; D-2141; D-2152)", () => {
+  test("test: the environments footer an init prints names the tickmarkr loop, auto and overseer skills as what agent init installs and no slash command skill, on the plain and the visual surface alike, so a footer still promising the wrapper slash skills fails", async () => {
+    vi.spyOn(registry, "allAdapters").mockReturnValue([]);
+    vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    const expected = "tickmarkr init --agent installs the tickmarkr-loop, tickmarkr-auto and tickmarkr-overseer skills + AGENTS.md so Claude Code (or any agent CLI) drives the loop natively; in Claude Desktop's Code tab (neither herdr nor Orca) one single-tier session runs the loop on the headless subprocess driver, watched with tickmarkr status --watch --plain";
+
+    for (const render of [withoutTTY, withTTY]) {
+      await render(async () => {
+        const repo = makeRepo({ "keep.txt": "x" });
+        stampDoctor(repo, 5 * 60 * 1000);
+        const io = makeIO();
+        io.input.isTTY = false;
+        const out = strip(await init(
+          ["--global-dir", mkdtempSync(join(tmpdir(), "tickmarkr-init-global-"))], repo,
+          { input: io.input as unknown as NodeJS.ReadStream, output: io.output as unknown as NodeJS.WriteStream },
+        ));
+        const footer = out.slice(out.indexOf("environments:"));
+        const row = footer.split("\n").find((line) => /^\s*claude code\s+— /.test(line));
+        expect(row?.replace(/^\s*claude code\s+— /, "")).toBe(expected);
+        expect(footer).not.toMatch(/(?:^|[\s`])\/(?:tkr|tickmarkr)[\w-]*/m);
+      });
+    }
+  });
+
+  test("test: an init without an interactive terminal and without yes prints the guided-setup hint naming a visible pane after the next-steps line and before the environments footer on the plain and the visual surface, while the same init with yes, an interactive init and a remove print none, so a hint that leads the output, nags a yes run or never appears fails", async () => {
+    vi.spyOn(registry, "allAdapters").mockReturnValue([]);
+    vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    const hint = "guided setup skipped (no interactive terminal): run `! tkr init` yourself, or in a visible pane";
+    const cases = [
+      { inputTTY: false, outputTTY: false, args: [], showsHint: true },
+      { inputTTY: false, outputTTY: true, args: [], showsHint: true },
+      { inputTTY: true, outputTTY: false, args: [], showsHint: true },
+      { inputTTY: false, outputTTY: false, args: ["--yes"], showsHint: false },
+      { inputTTY: true, outputTTY: true, args: ["--yes"], showsHint: false },
+      { inputTTY: false, outputTTY: false, args: ["--remove"], showsHint: false },
+      { inputTTY: true, outputTTY: true, args: ["--remove"], showsHint: false },
+    ];
+
+    for (const [surface, render] of [["plain", withoutTTY], ["visual", withTTY]] as const) {
+      await render(async () => {
+        for (const scenario of cases) {
+          const repo = makeRepo({ "keep.txt": "x" });
+          stampDoctor(repo, 5 * 60 * 1000);
+          const gdir = mkdtempSync(join(tmpdir(), "tickmarkr-init-global-"));
+          const io = makeIO();
+          io.input.isTTY = scenario.inputTTY;
+          io.output.isTTY = scenario.outputTTY;
+          const out = strip(await init(["--global-dir", gdir, ...scenario.args], repo, {
+            input: io.input as unknown as NodeJS.ReadStream, output: io.output as unknown as NodeJS.WriteStream,
+          }));
+          if (scenario.showsHint) {
+            const lines = out.split("\n");
+            const next = lines.findIndex((line) => line.includes("edit tickmarkr.spec.md, then tickmarkr compile"));
+            expect(next).toBeGreaterThan(0);
+            expect(lines[next + 1]).toBe(surface === "plain" ? hint : `  ${hint}`);
+            expect(lines[next + 2]).toBe("environments:");
+            expect(out.split(hint)).toHaveLength(2);
+            const firstNote = `wrote ${join(gdir, "config.yaml")}`;
+            expect(out.indexOf(firstNote)).toBeGreaterThanOrEqual(0);
+            expect(out.indexOf(firstNote)).toBeLessThan(out.indexOf(hint));
+            if (surface === "plain") expect(lines[0]).toBe(firstNote);
+          } else {
+            expect(out).not.toContain("guided setup skipped");
+          }
+        }
+
+        const repo = makeRepo({ "keep.txt": "x" });
+        stampDoctor(repo, 5 * 60 * 1000);
+        const { out, io } = await driveInit(repo, KEY.down.repeat(9) + KEY.enter);
+        expect(io.writes.some((frame) => strip(frame).includes("Install agent skills"))).toBe(true);
+        expect(strip(out)).not.toContain("guided setup skipped");
+      });
+    }
   });
 });
 

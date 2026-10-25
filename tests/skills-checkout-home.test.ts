@@ -1,10 +1,14 @@
+import { fileURLToPath } from "node:url";
 import { readFileSync } from "node:fs";
 import { expect, test } from "vitest";
-import { hostViolations, skillReading } from "./helpers/skill-reading.js";
+import { skillCorpus, skillDirViolations, skillReading } from "./helpers/skill-reading.js";
 
 // Queue row 240; D-2138 add.1 R4, add.4; gap G7. These are text-only shipping guards.
 const skills = Object.fromEntries(["overseer", "loop", "auto"].map(name => [name,
   readFileSync(new URL(`../skills/tickmarkr-${name}/SKILL.md`, import.meta.url), "utf8"),
+]));
+const corpora = Object.fromEntries(["overseer", "loop", "auto"].map(name => [name,
+  skillCorpus(fileURLToPath(new URL(`../skills/tickmarkr-${name}`, import.meta.url))),
 ]));
 const overseer = skills.overseer!;
 const architecture = readFileSync(new URL("../docs/codebase/ARCHITECTURE.md", import.meta.url), "utf8");
@@ -103,11 +107,11 @@ function assertRecipe(recipe: string): void {
 }
 
 test("test: a reading of the shipped overseer skill on herdr, on Orca and on a plain host reaches one hand-made checkout law that places every hand-made checkout in the repository's sibling seats directory or an Orca-managed worktree, never inside the tickmarkr worktrees folder or under the temporary root a reboot wipes, and no example command in the three shipped skills places a checkout there, so a skill that still shows a temporary scoper path fails", () => {
-  expect(hostViolations(overseer)).toEqual([]);
+  expect(skillDirViolations(fileURLToPath(new URL("../skills/tickmarkr-overseer", import.meta.url)))).toEqual([]);
   for (const host of ["herdr", "orca", "plain"] as const) {
     assertHome(lawOf(skillReading(overseer, host)));
   }
-  for (const markdown of Object.values(skills)) {
+  for (const markdown of Object.values(corpora)) {
     assertNoForbiddenCheckoutExample(markdown);
     for (const forbidden of ["/private/tmp/tkr-scoper-v155", "/tmp/scoper", "<repo>/.tickmarkr/worktrees.noindex/REF"]) {
       expect(() => assertNoForbiddenCheckoutExample(`${markdown}\n\`git worktree add ${forbidden}\``)).toThrow();
@@ -152,15 +156,15 @@ test("test: before removing a clean detached checkout that law proves its head r
 test("test: the overseer skill's integration snapshot recipe and its scoper example, and the architecture page's operator view of a live run, name the seats-directory home and the ledger line, so a snapshot or scoper recipe left without a home fails", () => {
   const operator = architecture.match(/^- \*\*Operator view of a live run.*$/m)?.[0];
   expect(operator).toBeDefined();
-  for (const recipe of [snapshotOf(overseer), scoperOf(overseer), operator!]) {
+  for (const recipe of [snapshotOf(corpora.overseer!), scoperOf(corpora.overseer!), operator!]) {
     assertRecipe(recipe);
     for (const field of ["<repo>-seats/<name>", ".tickmarkr/overseer/checkouts.ledger"]) {
       expect(() => assertRecipe(recipe.replaceAll(field, "<dir>"))).toThrow();
     }
   }
   // Replaying the old scoper location must fail even beside the correct universal law.
-  const oldScoper = overseer.replace("git worktree add -b spec/<mission> <repo>-seats/scoper-<mission>",
+  const oldScoper = corpora.overseer!.replace("git worktree add -b spec/<mission> <repo>-seats/scoper-<mission>",
     "git worktree add /private/tmp/tkr-scoper-v155 -b spec/...");
-  expect(oldScoper).not.toBe(overseer);
+  expect(oldScoper).not.toBe(corpora.overseer);
   expect(() => assertNoForbiddenCheckoutExample(oldScoper)).toThrow();
 });

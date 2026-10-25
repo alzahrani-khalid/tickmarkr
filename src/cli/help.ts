@@ -9,12 +9,12 @@ export const COMMAND_HELP = {
     usage: "init [options]", description: "Set up repository/global config, a starter spec and adapter health.",
     options: {
       "--global-dir <path>": "Use this global configuration directory.",
-      "--agent": "Install agent skills; combine with --docs for guidance files.",
-      "--force": "Refresh existing managed agent skills/docs when installing them.",
+      "--agent": "Install skills; remove leftovers only with shipped-bytes proof (one complete snapshot for directories, same-path released bytes for retired files); name every removal. Keep complete earlier snapshots intact until a forced or consented refresh is applied. Keep and report unproven content; never follow links, dangling links or linked host ancestors (queue row 244; D-2141; D-2152).",
+      "--force": "Refresh existing reserved skill files/docs with consent; keep added files, report unproven paths and symbolic links, and never write through links (queue row 244; D-2141; D-2152).",
       "--docs": "Include agent guidance documents with --agent.",
       "--fresh": "Force fresh adapter probes instead of reusing recent health.",
       "--yes": "Skip the interactive setup wizard and use defaults.",
-      "--remove": "Reverse init without scaffolding: delete state, skills, docs block, unedited spec, and prune worktrees.",
+      "--remove": "Reverse init: delete state, docs block, unedited spec and prune worktrees; sweep proven retired files, then remove skills only with one complete shipped snapshot's path-and-byte proof, marker optional. Name removals; keep and report unproven content and symbolic links without following them (queue row 244; D-2141; D-2152).",
     }, examples: ["init --yes", "init --agent --force --docs", "init --remove"],
   },
   doctor: {

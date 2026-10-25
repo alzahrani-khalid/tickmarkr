@@ -1,7 +1,7 @@
-import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import { COMMANDS, dispatch, USAGE } from "../../src/cli/index.js";
+import { skillCorpus } from "../helpers/skill-reading.js";
 
 const retiredBanner = `${["dro", "vr"].join("")} —`;
 
@@ -58,7 +58,7 @@ describe("cli dispatch", () => {
     expect(r.out).toContain("tickmarkr beat:"); // reached the handler, not the usage fallback
     expect(r.code).toBe(1);
 
-    const skill = readFileSync(join(process.cwd(), "skills/tickmarkr-overseer/SKILL.md"), "utf8");
+    const skill = skillCorpus(join(process.cwd(), "skills/tickmarkr-overseer"));
     expect(skill).toMatch(/while :; do tickmarkr beat overseer; sleep 10; done/u);
     expect(skill).toContain("tickmarkr beat overseer --stand-down");
   });
