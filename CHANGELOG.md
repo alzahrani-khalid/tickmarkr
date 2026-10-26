@@ -6,7 +6,9 @@ This changelog documents breaking changes and major releases. **For per-release 
 
 **v2.9.1** makes the review loop converge instead of spending rounds (queue rows 42, 38, 39, 232, 187; riders 251, 252, 256,
 255). Its work comes from one `tickmarkr run` engagement (run-20261025-153549-…2850, resumed once after a spec fix), in which
-eleven tasks each passed build, lint, evidence, scope, their acceptance criteria, a cross-vendor review and the full suite.
+eleven tasks each passed build, lint, evidence, scope, their acceptance criteria, a cross-vendor review and the full suite. One fix followed, checked by `tickmarkr verify`: the shipped-skill-files provenance now also records the
+skill snapshots of the 36 release tags that exist only in the public repository npm ships from, so a pristine install
+from one of those releases (v2.1.7, for example) is recognised as shipped (queue row 259).
 
 - **A malformed review verdict is a protocol failure, not a charged round (queue row 42).**
   - A verdict whose rows leave nothing valid and blocking is asked for once more, on the same seat and subject.
