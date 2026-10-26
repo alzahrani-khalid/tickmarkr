@@ -2,7 +2,7 @@
 // run-gates' two-strike retirement (OBS-1025 add.2) is inert in production: a flaking seat is
 // re-asked on every task and the review-recovery spend is unbounded. Fake adapters, zero tokens.
 import { execSync } from "node:child_process";
-import { readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { expect, test } from "vitest";
 import { FakeAdapter } from "../../../src/adapters/fake.js";
@@ -172,7 +172,7 @@ test("test: the daemon keeps every approval reason out of the released attempt's
 // OBS-1150: an approval reason is a standing ruling on the task. Ruling A is spent by no launch, and a
 // waive's gate-satisfied boilerplate neither joins the rulings nor retires one. v2.6.8 T7: the rulings
 // are the worker's; no review brief carries them.
-test("test: production worker briefs retain A before B after an intervening launch across resume while review briefs carry neither, versus ignoring gate-satisfied boilerplate, so losing the standing A ruling fails", async () => {
+test("test: every production repair brief states the operator's standing rulings in their own block directly under the repair heading, oldest first, each exactly once and before the findings and the diff, for a review repair and for a test repair alike, so a ruling left after the diff or stated twice fails", async () => {
   const red = "test ! -f red.txt || { echo 'AssertionError: expected red.txt to be absent'; exit 1; }";
   const { repo, fake, scriptPath } = setupRepo(
     [T("T1", { ...pin, humanGate: true, files: ["t1.txt", "red.txt"], gates: ["build", "test", "lint", "evidence", "scope", "review"] })],
@@ -222,7 +222,14 @@ test("test: production worker briefs retain A before B after an intervening laun
   expect((await resume()).human).toEqual(["T1"]); // launches 2 and 3 under A then B; test red twice
   expect(journal().read().filter((e) => e.event === "worker-launch")).toHaveLength(3);
   expect(workerBriefs).toHaveLength(3);
-  for (const brief of workerBriefs.slice(1)) expect(inOrder(brief, `approval: ${A}`, `approval: ${B}`), brief).toBe(true);
+  expect(workerBriefs[1]).toContain("## Repair attempt — make the rule these findings name hold");
+  expect(workerBriefs[2]).toContain("## Repair attempt — fix ONLY what these findings name");
+  for (const brief of workerBriefs.slice(1)) {
+    expect(brief.slice(brief.indexOf("## Repair attempt")).split("\n").slice(1, 4))
+      .toEqual(["### Standing rulings", `approval: ${A}`, `approval: ${B}`]);
+    expect(inOrder(brief, `approval: ${A}`, `approval: ${B}`, "### Failing gate findings (verbatim)", "### The work under review"), brief).toBe(true);
+    for (const ruling of [A, B]) expect(brief.split(`approval: ${ruling}`)).toHaveLength(2);
+  }
   await approve([runId, "T1", "--waive", "--reason", W], repo);
   expect((await resume()).done).toEqual(["T1"]);
 
@@ -239,10 +246,106 @@ test("test: production worker briefs retain A before B after an intervening laun
   for (const brief of [...workerBriefs, ...reviewBriefs]) expect(brief).not.toContain(W);
 }, 180_000);
 
-// OBS-1019 add.2: a spot repair per round buys the next edge of the same class while every review
-// re-judges the accumulated diff. The class order is earned by a chain re-raised more than once — never
-// by a first finding, and never by a single reraise.
-test("test: the production daemon repair brief at the second reraise requires a closed table of consumers bridges operations and sequences within the task bounds whereas the first isolated finding remains bounded, so a smallest-edit-only order after a repeated chain fails", async () => {
+test("test: a funded lint repair and a funded oracle acceptance repair each record the instance contract and render fix only with no contract clause, while a review repair records the class contract, and a resumed run renders each from its journaled row, so a deterministic repair handed the class contract or a contract a resume loses fails", async () => {
+  // The closed funding table crosses both daemon funding sites: an ordinary completed battery,
+  // and a crash at gates followed by the resumed suffix. Each then stops before the repair launches.
+  const cases = [
+    { gate: "lint", contract: "instance" },
+    { gate: "acceptance", contract: "instance" },
+    { gate: "review", contract: "class" },
+  ] as const;
+  for (const { gate, contract } of cases) for (const resumedBattery of [false, true]) {
+    const { repo, fake, scriptPath } = setupRepo(
+      [T("T1", {
+        ...pin, files: ["t1.txt"], gates: ["build", "test", "lint", "evidence", "scope", "acceptance", "review"],
+        acceptance: [{ oracle: "command", command: gate === "acceptance" ? "grep -q fixed t1.txt" : "true" }],
+      })],
+      { tasks: { T1: [
+        { shell: `echo broken > t1.txt && ${COMMIT} broken`, result: { ok: true, summary: "broken" } },
+        { shell: `echo fixed > t1.txt && ${COMMIT} fixed`, result: { ok: true, summary: "fixed" } },
+      ] } },
+      "review: { required: true, prefer: [seat-a] }\nrouting: { deny: { workers: { adapters: [seat-a] } } }\n"
+        // Retain the interrupted attempt's checkout: a journal rewind cannot undo run-end cleanup.
+        + (resumedBattery ? "visibility: { keepPanes: forever }\n" : "")
+        + (gate === "lint" ? "gates: { lint: 'test ! -f t1.txt || grep -q fixed t1.txt' }\n" : ""),
+    );
+    fake.channels = () => [{ adapter: "fake", model: "fake-1", vendor: fake.vendor, channel: "sub", tier: "frontier" },
+      { adapter: "fake", model: "fake-2", vendor: "fake-b", channel: "api", tier: "cheap" }];
+    let green = gate !== "review";
+    const seat = new ReviewSeat(scriptPath, "seat-a", "vendor-a");
+    seat.headlessCommand = (file) => {
+      const text = readFileSync(file, "utf8");
+      const prior = [...text.matchAll(/^Fingerprint: (.+)$/gm)].map((m) => m[1]);
+      return `printf '%s\\n' ${shq(JSON.stringify({
+        nonce: extractPromptNonce(text), approve: green,
+        resolved: green ? prior : [], reraised: green ? [] : prior,
+        findings: green ? [] : [{ note: "t1.txt:1 — value() must preserve every row", severity: "material" }],
+      }))}`;
+    };
+    const workerBriefs: string[] = [];
+    let stopBeforeRepair = true;
+    const invoke = fake.invoke.bind(fake);
+    fake.invoke = (task, cwd, a, ctx) => {
+      const brief = readFileSync(ctx.promptFile, "utf8");
+      workerBriefs.push(brief);
+      if (stopBeforeRepair && brief.includes("## Repair attempt")) throw new Error("stop before repair launch");
+      return invoke(task, cwd, a, ctx);
+    };
+    const runId = `run-contract-${gate}-${resumedBattery}`;
+    const adapters = [fake, seat];
+    const journal = () => Journal.open(repo, runId);
+    const assertBrief = (brief: string, expected: "class" | "instance") => {
+      expect(brief).toContain(expected === "class"
+        ? "## Repair attempt — make the rule these findings name hold"
+        : "## Repair attempt — fix ONLY what these findings name");
+      expect(brief.includes("### Repair contract — the whole input class")).toBe(expected === "class");
+      expect(brief.includes("make the smallest change that resolves every finding, then commit.")).toBe(expected === "instance");
+      expect(brief.includes("6. `infeasible inside files[]: <path>` is a lawful report")).toBe(expected === "class");
+    };
+    expect((await runDaemon(repo, { adapters, runId })).failed).toEqual(["T1"]);
+    expect(journal().read().filter((e) => e.event === "repair-attempt").map((e) => [e.data.gates, e.data.contract]))
+      .toEqual([[[gate], contract]]);
+    assertBrief(workerBriefs.at(-1)!, contract);
+
+    if (resumedBattery) {
+      // Rewind the fixture to a crash immediately before gates. The landed commit and baseline
+      // remain real; runDaemon must measure the resumed battery and fund its own repair row.
+      const events = journal().read();
+      const atGates = events.findIndex((e) => e.event === "phase-start" && e.data.phase === "gates");
+      expect(atGates).toBeGreaterThan(0);
+      const launch = events.find((e) => e.event === "worker-launch")!;
+      expect(existsSync((launch.data.slot as { cwd: string }).cwd)).toBe(true);
+      writeFileSync(join(journal().dir, "journal.jsonl"), events.slice(0, atGates + 1).map((e) => JSON.stringify(e)).join("\n") + "\n");
+      expect((await runDaemon(repo, { adapters, runId, resume: true })).failed).toEqual(["T1"]);
+      const resumed = journal().read().slice(atGates + 1);
+      expect(resumed.filter((e) => e.event === "resume-harvest-declined" || e.event === "worker-launch")).toEqual([]);
+      expect(resumed.some((e) => e.event === "gate-result" && e.data.gate === gate && e.data.pass === false)).toBe(true);
+      expect(journal().read().filter((e) => e.event === "repair-attempt").map((e) => [e.data.gates, e.data.contract]))
+        .toEqual([[[gate], contract]]);
+      assertBrief(workerBriefs.at(-1)!, contract);
+    }
+
+    // An old funded review row has no contract. Its live review history must not upgrade it.
+    const legacy = gate === "review" && resumedBattery;
+    if (legacy) {
+      const events = journal().read().map((e) => {
+        if (e.event === "repair-attempt") delete e.data.contract;
+        return e;
+      });
+      writeFileSync(join(journal().dir, "journal.jsonl"), events.map((e) => JSON.stringify(e)).join("\n") + "\n");
+    }
+    const before = workerBriefs.length;
+    stopBeforeRepair = false;
+    green = true;
+    expect((await runDaemon(repo, { adapters, runId, resume: true, retryFailed: true })).done).toEqual(["T1"]);
+    expect(workerBriefs).toHaveLength(before + 1);
+    assertBrief(workerBriefs.at(-1)!, legacy ? "instance" : contract);
+    expect(journal().read().filter((e) => e.event === "repair-attempt")).toHaveLength(1);
+  }
+}, 180_000);
+
+// D-1355, ratified D-1366: the first material finding already funds the whole input class.
+test("test: the production daemon repair funded by a first material review finding opens with the class heading and the six contract clauses verbatim and not the fix-only order, and a chain re-raised once is listed with its count beneath the contract, so a first-finding repair that still orders the smallest edit fails", async () => {
   const attempt = (n: number) => ({ shell: `echo ${n} > t1.txt && ${COMMIT} a${n}`, result: { ok: true, summary: `a${n}` } });
   const { repo, fake, scriptPath } = setupRepo(
     [T("T1", { ...pin, files: ["t1.txt"], gates: ["build", "test", "lint", "evidence", "scope", "review"] })],
@@ -258,9 +361,17 @@ test("test: the production daemon repair brief at the second reraise requires a 
     return invoke(task, cwd, a, ctx);
   };
   const NOTE = "src/rows.ts:1 — rows() drops the last row of every page";
-  // The decided class sentence (D-576), pinned verbatim rather than read back from the module under test.
-  const CLASS_ORDER = "Before editing a chain reraised more than once, enumerate the in-scope consumers, bridges, operations"
-    + " and event sequences as a closed case table; repair every implicated member and verify the accumulated diff against that table.";
+  // Ratified D-1366 bytes, authored independently of the production renderer.
+  const CONTRACT = [
+    "### Repair contract — the whole input class",
+    "1. rule over the input class",
+    "2. land every `found:` item as an owned test whose assertion is the finding's CONSEQUENCE through the production entry under `searched:`",
+    "3. one bounded generalised test",
+    "4. prove the oracle fails pre-fix",
+    "5. redesign inside files[] allowed",
+    "6. `infeasible inside files[]: <path>` is a lawful report",
+    "The repair stays inside the task's declared write scope (files[]) and never narrows its goal or an acceptance criterion; the reviewer judges the accumulated diff.",
+  ].join("\n");
   let rounds = 0;
   const seat = new ReviewSeat(scriptPath, "seat-a", "vendor-a");
   seat.headlessCommand = (file) => {
@@ -279,7 +390,7 @@ test("test: the production daemon repair brief at the second reraise requires a 
   // Round 1 (first isolated finding) funds repair 1; round 2 (first reraise) funds repair 2 and parks at the round cap.
   expect((await runDaemon(repo, { adapters, runId })).human).toEqual(["T1"]);
   await approve([runId, "T1", "--uphold", "--review-rounds", "3"], repo);
-  // Attempt 3 carries repair 2; round 3 is the SECOND reraise and funds the class-table repair; round 4 passes.
+  // Attempt 3 resumes the pending class repair after ONE reraise; round 4 passes.
   expect((await runDaemon(repo, { adapters, runId, resume: true })).done).toEqual(["T1"]);
   const reviews = journal().read().filter((e) => e.event === "gate-result" && e.data.gate === "review");
   expect(reviews.map((e) => [e.data.pass, (e.data.reraised as unknown[] | undefined)?.length ?? 0])).toEqual([[false, 0], [false, 1], [false, 1], [true, 0]]);
@@ -288,17 +399,17 @@ test("test: the production daemon repair brief at the second reraise requires a 
   const [, afterFirstFinding, afterFirstReraise, afterSecondReraise] = workerBriefs as [string, string, string, string];
 
   const bounded = "make the smallest change that resolves every finding, then commit.";
-  for (const brief of [afterFirstFinding, afterFirstReraise]) {
-    expect(brief).toContain("## Repair attempt — fix ONLY what these findings name");
-    expect(brief).toContain(bounded);
+  for (const brief of [afterFirstFinding, afterFirstReraise, afterSecondReraise]) {
+    expect(brief).toContain("## Repair attempt — make the rule these findings name hold\n### Standing rulings");
+    expect(brief).toContain("make the rule these findings name hold under the contract below, then commit.");
+    expect(brief).toContain(CONTRACT);
     expect(brief).toContain(NOTE);
-    expect(brief).not.toContain(CLASS_ORDER);
+    expect(brief).not.toContain("## Repair attempt — fix ONLY");
+    expect(brief).not.toContain(bounded);
   }
-  expect(afterSecondReraise).toContain("## Repair attempt — repair the whole class these findings name");
-  expect(afterSecondReraise).toContain(CLASS_ORDER);
+  expect(afterFirstFinding).not.toContain("### Repeated review chains");
+  expect(afterFirstReraise.indexOf("- `review:material|src/rows.ts|rows` re-raised 1 times")).toBeGreaterThan(afterFirstReraise.indexOf(CONTRACT));
   expect(afterSecondReraise).toContain("- `review:material|src/rows.ts|rows` re-raised 2 times");
   expect(afterSecondReraise.split(NOTE)).toHaveLength(2); // the chain's prose is quoted once, not again in the table
-  expect(afterSecondReraise).toContain("The table stays inside the task's declared write scope (files[]) and never narrows its goal");
-  // The false-clean shape: a repeated chain still handed only the smallest-edit order.
-  expect(afterSecondReraise).not.toContain(bounded);
+  expect(journal().read().filter((e) => e.event === "repair-attempt").map((e) => e.data.contract)).toEqual(["class", "class", "class"]);
 }, 180_000);

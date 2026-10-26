@@ -11,7 +11,7 @@ import { describe, expect, test } from "vitest";
 import { DEFAULT_CONFIG } from "../../src/config/config.js";
 import { compareToBaseline } from "../../src/gates/baseline.js";
 import { runGates } from "../../src/gates/run-gates.js";
-import type { Task } from "../../src/graph/schema.js";
+import { GATE_NAMES, type GateName, type Task } from "../../src/graph/schema.js";
 import { gateSatisfied, runDaemon } from "../../src/run/daemon.js";
 import { Journal } from "../../src/run/journal.js";
 import { normalizeGateOutcome } from "../../src/run/outcome.js";
@@ -342,3 +342,119 @@ test("review waiver carry fails closed without a subject and ends on superseding
     expect(journal.replaySatisfiedGates(new Map([["T1", "subject"]])).has("T1")).toBe(false);
   }
 });
+
+test("test: each cell of the closed recheck carry table decides as ruled, a review, scope, evidence or acceptance waiver on the same subject carrying, a build, test or lint waiver never carrying, a changed subject carrying nothing and only the newer of two standing waivers carrying, so any cell decided otherwise fails", () => {
+  const carryable = new Set<GateName>(["review", "scope", "evidence", "acceptance"]);
+  for (const gate of GATE_NAMES) for (const changed of [false, true]) {
+    const journal = Journal.create(makeTestTempDir("tkr-carry-cell-"), `run-${gate}-${changed}`);
+    const waive = (name: GateName) => {
+      journal.append("gate-result", "T1", { gate: name, pass: false, commit: "subject" });
+      journal.append("task-human", "T1", { kind: "gate-fail" });
+      journal.append("task-approved", "T1", { release: "gate-satisfied", gate: name, park: journal.newestBinding("T1") });
+      expect(journal.replaySatisfiedGates().get("T1")).toBe(name);
+      journal.append("worktree-recreation", "T1", {});
+    };
+    const recheck = () => {
+      journal.append("task-human", "T1", { kind: "infra" });
+      journal.append("task-approved", "T1", { release: "recheck", park: journal.newestBinding("T1") });
+    };
+    waive(gate);
+    recheck();
+    expect(journal.replaySatisfiedGates(new Map([["T1", changed ? "changed" : "subject"]])).get("T1"), `${gate}, changed=${changed}`)
+      .toBe(!changed && carryable.has(gate) ? gate : undefined);
+    // Every ordered pair proves that an older carryable waiver cannot survive a newer tool waive.
+    for (const newer of GATE_NAMES) {
+      waive(gate);
+      waive(newer);
+      recheck();
+      expect(journal.replaySatisfiedGates(new Map([["T1", "subject"]])), `${gate} then ${newer}`)
+        .toEqual(carryable.has(newer) ? new Map([["T1", newer]]) : new Map());
+    }
+  }
+});
+
+async function recheckNonToolWaiver(gate: "scope" | "evidence" | "acceptance" | "review", change: "none" | "before-recreation" | "regate" = "none") {
+  const marker = join(makeTestTempDir("tkr-nontool-carry-"), "tools.log");
+  const commands = Object.fromEntries(["build", "test", "lint"].map((name) => [name,
+    `if [[ "$PWD" == *--T1 ]]; then echo ${name} >> ${shq(marker)}; fi`,
+  ]));
+  const { repo, fake } = setupRepo([T("T1", {
+    complexity: 8, files: ["work.ts"], gates: [...GATE_NAMES], acceptance: [{ oracle: "command", command: "true" }],
+  })], { tasks: {} }, stringify({ gates: commands }));
+  const runId = `run-nontool-${gate}-${change}`;
+  const baseRef = await gitHead(repo);
+  const git = (cwd: string, ...args: string[]) => execFileSync("git", args, { cwd, encoding: "utf8" });
+  const branch = `tickmarkr/${runId}`;
+  git(repo, "branch", branch, baseRef);
+  const wt = await createWorktree(repo, `${branch}--T1`, baseRef);
+  const commit = (value: number) => {
+    writeFileSync(join(wt, "work.ts"), `export const value = ${value};\n`);
+    git(wt, "add", "work.ts");
+    git(wt, "commit", "--no-gpg-sign", "-m", `value ${value}`);
+  };
+  commit(1);
+  const subject = createHash("sha256").update(git(wt, "log", "--reverse",
+    "--format=%T%x00%an%x00%ae%x00%cn%x00%ce%x00%B%x1e", `${baseRef}..HEAD`)).digest("hex");
+  const journal = Journal.create(repo, runId);
+  journal.append("run-start", undefined, { baseRef, branch, commands, graphDefinitionHash: graphDefinitionHash(loadGraph(repo)) });
+  journal.append("task-dispatch", "T1", { assignment: { adapter: "fake", model: "fake-1", channel: "sub", tier: "frontier" }, attempt: 0 });
+  journal.append("worker-result", "T1", { ok: true, summary: "landed", deviations: [] });
+  journal.append("gate-result", "T1", { gate, pass: false, commit: subject, details: "operator disputes this verdict" });
+  journal.append("task-human", "T1", { kind: "gate-fail" });
+  await approve([runId, "T1", "--waive"], repo);
+  journal.append("worktree-recreation", "T1", {});
+  journal.append("task-human", "T1", { kind: "infra" });
+  await approve([runId, "T1", "--recheck"], repo);
+  expect(journal.replaySatisfiedGates().get("T1")).toBe(gate);
+  if (change === "before-recreation") commit(2);
+  writeFileSync(join(journal.dir, "baseline.json"), JSON.stringify({
+    commands: Object.fromEntries(Object.keys(commands).map((name) => [name, { exitCode: 0, fingerprints: [] }])),
+  }));
+  const before = journal.read().length;
+  let moved = false;
+  let mutationError: unknown;
+  const summary = await runDaemon(repo, { adapters: [fake], runId, resume: true, narrate: (e) => {
+    // Move HEAD after this battery sampled its subject. Settlement must regate the new subject.
+    if (change === "regate" && !moved && e.taskId === "T1" && e.event === "recheck-battery") {
+      moved = true;
+      try { commit(2); } catch (error) { mutationError = error; }
+    }
+  } });
+  expect(mutationError).toBeUndefined();
+  expect(moved).toBe(change === "regate");
+  expect(summary.done).toEqual(["T1"]);
+  const events = journal.read().slice(before).filter((e) => e.taskId === "T1");
+  expect(events.filter((e) => e.event === "task-dispatch" || e.event === "worker-launch")).toEqual([]);
+  expect(readFileSync(marker, "utf8").trim().split("\n").sort())
+    .toEqual((change === "regate" ? ["build", "build", "lint", "lint", "test", "test"] : ["build", "lint", "test"]));
+  return { events, subject };
+}
+
+test("test: a recheck released on the same subject after a scope, evidence or acceptance waiver re-runs the tool gates but not the waived gate and journals that waiver as carried, so a recheck battery that re-runs the waived gate fails", async () => {
+  for (const gate of ["scope", "evidence", "acceptance"] as const) {
+    const { events, subject } = await recheckNonToolWaiver(gate);
+    expect(events.filter((e) => e.event === "gate-result").map((e) => e.data.gate).sort())
+      .toEqual(GATE_NAMES.filter((name) => name !== gate).sort());
+    expect(events.filter((e) => e.event === "gate-waiver-carried").map((e) => e.data))
+      .toEqual([{ gate, commit: subject, carried: true, release: "recheck" }]);
+  }
+}, 180_000);
+
+test("test: a scope, evidence or acceptance waiver carried by a recheck is dropped when the subject changes before the worktree is recreated, and any carried waiver is dropped when it changes during a regate of the recheck battery, so the next battery runs that gate and journals no carried waiver, so a waiver carried onto changed work fails", async () => {
+  for (const gate of ["scope", "evidence", "acceptance", "review"] as const) {
+    if (gate !== "review") {
+      const { events, subject } = await recheckNonToolWaiver(gate, "before-recreation");
+      expect(events.filter((e) => e.event === "gate-waiver-carried")).toEqual([]);
+      expect(events.find((e) => e.event === "gate-result" && e.data.gate === gate)?.data)
+        .toMatchObject({ pass: true, commit: expect.not.stringMatching(subject) });
+    }
+    const { events, subject } = await recheckNonToolWaiver(gate, "regate");
+    expect(events.filter((e) => e.event === "gate-waiver-carried").map((e) => e.data.commit)).toEqual([subject]);
+    const movedAt = events.findIndex((e) => e.event === "tip-moved");
+    expect(movedAt).toBeGreaterThan(-1);
+    const next = events.slice(movedAt + 1);
+    expect(next.filter((e) => e.event === "gate-waiver-carried")).toEqual([]);
+    expect(next.find((e) => e.event === "gate-result" && e.data.gate === gate)?.data.pass).toBe(true);
+    expect(next.find((e) => e.event === "gate-result" && e.data.gate === gate)?.data.commit).not.toBe(subject);
+  }
+}, 240_000);

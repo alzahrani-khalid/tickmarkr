@@ -1160,7 +1160,7 @@ describe("daemon integration (fake adapter, zero tokens)", () => {
     expect(refusals.every((event) => String(event.data.details).includes(reason))).toBe(true);
     expect(events.some((event) => event.event === "escalation" && event.taskId === "T1")).toBe(true);
     const row = telem(repo, "run-judge-prose-quality").find((entry) => entry.taskId === "T1")!;
-    expect(row.gateFails).toBe(1);
+    expect(row.gateFails).toBe(3); // the judged red funds two repairs before the fresh ladder
   });
 
   test("the journal row for an infra verdict carries its retryable field so a reader reconstructs the verdict as recorded, so a seam that forwards infra and drops retryable fails", async () => {

@@ -144,6 +144,7 @@ test("test: a task declaring no out of scope items renders delivered and saved r
     and marks its evidence executed (you ran the reproducer), static (you traced it by reading) or blocked (it
     could not run here). Blocked evidence never turns a finding into a pass, and a worker's own case table or
     enumeration never resolves a finding: judge the diff itself.
+    A material finding with executed evidence may also carry "reproducer": the exact command or test body you ran, at most 4096 bytes; it reaches the repair worker verbatim.
     Report the whole class in this one review, never only its first example. Each material finding's "note" is one
     line carrying the closed tuple "rule: <the goal clause, criterion or regressed behaviour violated> | found:
     <every counterexample you ACTUALLY FOUND inside the declared scope, each as path:line input → consequence,
@@ -330,6 +331,7 @@ test("test: a task whose files[] names no test file receives a brief that says n
     and marks its evidence executed (you ran the reproducer), static (you traced it by reading) or blocked (it
     could not run here). Blocked evidence never turns a finding into a pass, and a worker's own case table or
     enumeration never resolves a finding: judge the diff itself.
+    A material finding with executed evidence may also carry "reproducer": the exact command or test body you ran, at most 4096 bytes; it reaches the repair worker verbatim.
     Report the whole class in this one review, never only its first example. Each material finding's "note" is one
     line carrying the closed tuple "rule: <the goal clause, criterion or regressed behaviour violated> | found:
     <every counterexample you ACTUALLY FOUND inside the declared scope, each as path:line input → consequence,
@@ -2085,6 +2087,7 @@ test("test: a round given no operator context over identical task diff plus carr
     and marks its evidence executed (you ran the reproducer), static (you traced it by reading) or blocked (it
     could not run here). Blocked evidence never turns a finding into a pass, and a worker's own case table or
     enumeration never resolves a finding: judge the diff itself.
+    A material finding with executed evidence may also carry "reproducer": the exact command or test body you ran, at most 4096 bytes; it reaches the repair worker verbatim.
     Report the whole class in this one review, never only its first example. Each material finding's "note" is one
     line carrying the closed tuple "rule: <the goal clause, criterion or regressed behaviour violated> | found:
     <every counterexample you ACTUALLY FOUND inside the declared scope, each as path:line input → consequence,
@@ -2183,6 +2186,7 @@ test("test: a round given no operator context over identical task diff plus carr
     and marks its evidence executed (you ran the reproducer), static (you traced it by reading) or blocked (it
     could not run here). Blocked evidence never turns a finding into a pass, and a worker's own case table or
     enumeration never resolves a finding: judge the diff itself.
+    A material finding with executed evidence may also carry "reproducer": the exact command or test body you ran, at most 4096 bytes; it reaches the repair worker verbatim.
     Report the whole class in this one review, never only its first example. Each material finding's "note" is one
     line carrying the closed tuple "rule: <the goal clause, criterion or regressed behaviour violated> | found:
     <every counterexample you ACTUALLY FOUND inside the declared scope, each as path:line input → consequence,

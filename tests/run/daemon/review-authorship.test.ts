@@ -99,7 +99,11 @@ test("test: the same mixed subject in a fleet whose review pool holds only those
   const before = f.journal.read().length;
   expect((await runDaemon(f.repo, { adapters: [f.fake], runId: f.runId, resume: true })).human).toEqual(["T1"]);
   const rows = f.journal.read().slice(before);
-  expect(rows.filter((r) => ["repair-attempt", "consult-verdict", "merge"].includes(r.event))).toEqual([]);
+  expect(rows.filter((r) => r.event === "repair-attempt").map((r) => r.data)).toEqual([
+    expect.objectContaining({ repair: 1, charge: 1, gates: ["review"], contract: "class",
+      findings: "review: request changes: work.txt needs correction" }),
+  ]);
+  expect(rows.filter((r) => ["consult-verdict", "merge"].includes(r.event))).toEqual([]);
   expect(rows.find((r) => r.event === "gate-result" && r.data.gate === "review")?.data).toMatchObject({ pass: false, noEligibleReviewer: true });
   const park = rows.find((r) => r.event === "task-human")!;
   expect(park.data.kind).toBe("gate-fail");

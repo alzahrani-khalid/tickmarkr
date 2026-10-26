@@ -793,7 +793,7 @@ describe("OBS-1195 — current material rendered once, anchors retired only by e
     expect(afterRound3.filter((f) => f.note === anchorB)).toHaveLength(0);
     expect(afterRound3.filter((f) => f.note === B2)).toHaveLength(1);
     expect(afterRound3.filter((f) => f.class.startsWith("review:deferred")).map((f) => f.note)).toEqual([D, E, F2, B3]);
-    expect(resumed).toContain("## Repair attempt — fix ONLY what these findings name");
+    expect(resumed).toContain("## Repair attempt — make the rule these findings name hold");
     for (const note of [B2, C, C1, C2, F, F2, anchorLoose, anchorB, anchorW, D, E]) expect(count(resumed, note), note).toBe(1);
     for (const note of [B, A, anchorA, anchorResolved, anchorD, anchorC, anchorC2, anchorF]) expect(count(resumed, note), note).toBe(0);
     // The deferral is said once, under the only heading true of it.

@@ -106,8 +106,13 @@ function normJournal(events: JournalEvent[], repo: string, runId: string, baseRe
     if (row.event === "gate-result") {
       // Mask values only after proving the row carried one. Two equally missing durationMs fields
       // must fail this identity oracle rather than normalize into a false equality.
-      expect(Object.hasOwn(row.data, "durationMs")).toBe(true);
-      expect(typeof row.data.durationMs).toBe("number");
+      if (row.data.replayedFromAttempt !== undefined) {
+        // The newly funded repairs can replay an unchanged subject; replay measures no new gate.
+        expect(Object.hasOwn(row.data, "durationMs")).toBe(false);
+      } else {
+        expect(Object.hasOwn(row.data, "durationMs")).toBe(true);
+        expect(typeof row.data.durationMs).toBe("number");
+      }
       row = { ...row, data: maskMeasured(row.data) };
     }
     // Queue row 240 (D-2138): cleanup hashes and paths vary by fixture, while every recovery row remains compared.
@@ -209,7 +214,7 @@ describe("VIS-08 notify-identity oracle (D-07)", () => {
   test("gate-failing run: journal + telemetry stay identical and every attention event pings once", async () => {
     const captured = await identityPair(failScript, "fail");
     const messages = captured.filter((m) => !m.startsWith("sound:"));
-    expect(messages.filter((m) => /escalation:/.test(m))).toHaveLength(3);
+    expect(messages.filter((m) => /escalation:/.test(m))).toHaveLength(5);
     expect(messages.filter((m) => /: T1 consult verdict:/.test(m))).toHaveLength(1);
     expect(messages.filter((m) => /needs a human/.test(m))).toHaveLength(1);
     expect(messages.filter((m) => /integration branch/.test(m))).toHaveLength(1);

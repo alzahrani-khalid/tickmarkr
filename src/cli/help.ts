@@ -137,7 +137,7 @@ export const COMMAND_HELP = {
     options: {
       "--park <line>@<ts>": "Bind the decision to the park token status prints (a failed task's recheck binds its failure token); refused once a newer park opens.",
       "--gate <gate>": "Bind a waive to the park's failed gate; refused when the park failed another gate.",
-      "--files <glob,…>": "Extend files[] for a scope-request park with comma-separated repository-relative globs; required for scope approval.",
+      "--files <glob,…>": "Widen a scope-request park with comma-separated repository-relative globs, or grant exact recorded repair hint paths on a park released with --uphold or --recheck; required for scope approval.",
       "--by <name>": "Name the actor (default: current OS user).",
       "--reason <text>": "Record the decision reason.",
       "--waive": "Waive only the identified failed gate.",

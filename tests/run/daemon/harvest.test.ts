@@ -1430,7 +1430,7 @@ describe("harvest: finished work is gated, never redispatched (OBS-264)", () => 
 
       // ── the repair prompt carries the diff CONTENT and the findings VERBATIM ──
       const prompt = readFileSync(join(tickmarkrDir(repo), "runs", "run-repair-review", "prompts", "T1-a1.md"), "utf8");
-      expect(prompt).toContain("## Repair attempt — fix ONLY what these findings name");
+      expect(prompt).toContain("## Repair attempt — make the rule these findings name hold");
       expect(prompt).toContain(String(reviewFail.data.details)); // the journal's own bytes, unabridged
       expect(prompt).toContain("`renderRow` in src/ui/row.ts drops the last column");
       expect(prompt).toContain("diff --git"); // real diff content, not a hash manifest

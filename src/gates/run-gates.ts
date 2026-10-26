@@ -181,6 +181,8 @@ export interface GateContext {
   // v1.87 T2: the judge-role pool for the GATE-09 failover pick. Absent means no alternate seat;
   // the configured judge remains the only truthful fallback and review channels are never judges.
   judgeChannels?: BillingChannel[];
+  /** Registry exclusions, retained so an otherwise eligible unprobed review seat gets its own remedy. */
+  modelAuthExclusions?: readonly { key: string; reason: string }[];
   /** OBS-1186: doctor's cached verdict — the observed identity of the configured judge seat. Absent ⇒ unknown (conservative deny). */
   health?: Record<string, AuthHealth> | null;
   adapters: WorkerAdapter[];
@@ -194,8 +196,8 @@ export interface GateContext {
   excludeReviewers?: string[]; // v1.1: reviewer channels that produced garbage for this task (failover)
   // v2.6.8 T1: a SOFT preference only — a demoted seat ranks last and stays seatable (live or replayed on resume).
   demotedReviewers?: Set<string>;
-  // OBS-1025 add.2 / v2.6.8 T1: run-scoped REAL no-verdict causes per reviewer seat (a launch failure never
-  // enters it); a seat at two is RETIRED for the run — a hard exclusion read live at every pick, never soft.
+  // Run-scoped failed-delivery causes per reviewer seat, including malformed verdicts. Launch failures
+  // never enter it; closure mismatches still count as no-verdicts. Two strikes retire the seat.
   reviewNoVerdicts?: Map<string, string[]>;
   /** v2.6.8 T1: review seats whose one same-seat launch retry this candidate already spent (the daemon
    * replays them from the journal), so a resume or recheck never re-grants it by forgetting. */
@@ -1521,9 +1523,11 @@ export async function runGates(
         if (typeof rv.meta.reviewer === "string" && rv.meta.cause !== "seat-launch-failed") {
           const reviewer = rv.meta.reviewer;
           const cause = String(rv.meta.cause);
-          // OBS-1025 add.2: the run-scoped tally of REAL no-verdicts (silent, truncated, closure-mismatch,
-          // no nonce …); two of them retire the seat for the run — a hard exclusion, never a soft ranking.
-          const causes = rv.meta.noVerdict === true && ctx.reviewNoVerdicts
+          // Keep every no-verdict strike, including closure mismatches. Malformed deliveries and
+          // their re-emission also strike unless the delivered verdict breaks the closure protocol.
+          const strikes = rv.meta.noVerdict === true
+            || (rv.meta.unparseable === true && cause === "malformed-verdict" && rv.meta.closureInvalid !== true);
+          const causes = strikes && ctx.reviewNoVerdicts
             ? [...(ctx.reviewNoVerdicts.get(reviewer) ?? []), cause] : undefined;
           if (causes) ctx.reviewNoVerdicts!.set(reviewer, causes);
           // OBS-1039: a seat below the byte floor at the beat is silent — demoted like a zero-byte seat.
@@ -1565,7 +1569,7 @@ export async function runGates(
     const priorReviewers = [...(ctx.priorReviewers ?? []), ...(ctx.excludeReviewers ?? [])];
     const carriedAuthors = ctx.carriedAuthors ?? [];
     let exclusions = [...(ctx.excludeReviewers ?? []), ...retired];
-    let rv = await dispatch((adapters) => reviewGate(task, ctx.worktree, ctx.baseRef, ctx.author, ctx.channels, adapters, ctx.cfg, reviewVia, atPick(exclusions), ctx.artifactDir, ctx.reviewHistory, ctx.demotedReviewers, ctx.carriedFindings, priorReviewers, carriedAuthors, ctx.operatorContext));
+    let rv = await dispatch((adapters) => reviewGate(task, ctx.worktree, ctx.baseRef, ctx.author, ctx.channels, adapters, ctx.cfg, reviewVia, atPick(exclusions), ctx.artifactDir, ctx.reviewHistory, ctx.demotedReviewers, ctx.carriedFindings, priorReviewers, carriedAuthors, ctx.operatorContext, ctx.modelAuthExclusions));
     // OBS-193/574: an unparseable review verdict retries the REVIEW, preferring a different adapter. Only
     // a single-adapter eligible pool may fall back to another channel on the flaked adapter. The flaked
     // verdict never enters results; an exhausted pool preserves its cause.
@@ -1599,7 +1603,7 @@ export async function runGates(
         const others = ctx.channels.map(channelKey).filter((key) => key !== flaked);
         const again = retiredNow().includes(flaked) ? undefined : await dispatch((adapters) => reviewGate(
           task, ctx.worktree, ctx.baseRef, ctx.author, ctx.channels, adapters, ctx.cfg,
-          retryVia, atPick(others), ctx.artifactDir, ctx.reviewHistory, ctx.demotedReviewers, ctx.carriedFindings, retryPrior, carriedAuthors, ctx.operatorContext,
+          retryVia, atPick(others), ctx.artifactDir, ctx.reviewHistory, ctx.demotedReviewers, ctx.carriedFindings, retryPrior, carriedAuthors, ctx.operatorContext, ctx.modelAuthExclusions,
         ));
         if (again && again.meta?.noEligibleReviewer !== true) {
           // The relaunch that completes a malformed verdict's re-emission (the re-emission was what failed to
@@ -1625,7 +1629,7 @@ export async function runGates(
         const others = ctx.channels.map(channelKey).filter((key) => key !== flaked);
         const again = await dispatch((adapters) => reviewGate(
           task, ctx.worktree, ctx.baseRef, ctx.author, ctx.channels, adapters, ctx.cfg,
-          retryVia, atPick(others), ctx.artifactDir, ctx.reviewHistory, ctx.demotedReviewers, ctx.carriedFindings, retryPrior, carriedAuthors, ctx.operatorContext,
+          retryVia, atPick(others), ctx.artifactDir, ctx.reviewHistory, ctx.demotedReviewers, ctx.carriedFindings, retryPrior, carriedAuthors, ctx.operatorContext, ctx.modelAuthExclusions,
         ));
         if (again.meta?.noEligibleReviewer !== true) {
           await ctx.onGate?.({ phase: "note", gate: "review", name: "review-reemission", payload: { reviewer: flaked, cause: "malformed-verdict",
@@ -1661,7 +1665,7 @@ export async function runGates(
       exclusions = [...exclusions, ...(crossAdapter ? adapterExclusions : [flaked])];
       const second = await dispatch((adapters) => reviewGate(
         task, ctx.worktree, ctx.baseRef, ctx.author, ctx.channels, adapters, ctx.cfg,
-        retryVia, atPick(exclusions), ctx.artifactDir, ctx.reviewHistory, ctx.demotedReviewers, ctx.carriedFindings, retryPrior, carriedAuthors, ctx.operatorContext,
+        retryVia, atPick(exclusions), ctx.artifactDir, ctx.reviewHistory, ctx.demotedReviewers, ctx.carriedFindings, retryPrior, carriedAuthors, ctx.operatorContext, ctx.modelAuthExclusions,
       ));
       if (second.meta?.noEligibleReviewer !== true) {
         const retried = typeof second.meta?.reviewer === "string" ? second.meta.reviewer : "none";

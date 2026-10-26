@@ -13,7 +13,7 @@ import { shGitOk } from "../run/git.js";
 import { carryReviewFindings, isDeferredFinding, observedReviewFingerprints, reviewFingerprintMatches, structuredFindings, type StructuredFinding, UNIDENTIFIED } from "../run/journal.js";
 import { redactSecrets } from "../run/redact.js";
 import { rankPreferredChannels, reviewPreferenceTieBreak } from "../route/role-pick.js";
-import { modelProvider } from "../route/preference.js";
+import { disallowedBy, modelProvider } from "../route/preference.js";
 import { resolveStateDir } from "./cache.js";
 import { appendAnchoredReview, COMPLETION_FAKING_CHECKLIST, dewrapPaneVerdict, extractVerdictJson, generateVerdictNonce, type GateVia, parseAnchoredComments, runLlmDetailed, SeatLaunchError, verdictNonceLine } from "./llm.js";
 import type { GateResult } from "./types.js";
@@ -45,6 +45,8 @@ export interface ReviewFinding {
   severity: ReviewSeverity;
   defer?: boolean;
   rationale?: string;
+  /** Exact command or test body the reviewer executed. */
+  reproducer?: string;
   /** Copy an id from the top-level reraised list to identify this restatement. */
   reraised?: string;
 }
@@ -60,7 +62,16 @@ export interface ReviewVerdict {
   comments?: Array<{ path: string; line: number; body: string }>;
 }
 
-interface ReviewDecision { pass: boolean; headline: string; lines: string[] }
+interface ReviewDecision {
+  pass: boolean;
+  headline: string;
+  lines: string[];
+  findingLines: string[];
+  blocking: boolean;
+  inconsistent: boolean;
+  malformedRows: number;
+  reproducers: Array<{ note: string; text: string }>;
+}
 
 // legacy flat `issues` shape — every issue blocks; the approve flag must agree with the list.
 function classifyReviewIssues(approve: boolean, issues: unknown[]): ReviewDecision {
@@ -74,44 +85,75 @@ function classifyReviewIssues(approve: boolean, issues: unknown[]): ReviewDecisi
     inconsistencies.push("review verdict inconsistent: approve=false requires at least one issue");
   }
   const pass = approve === true && inconsistencies.length === 0;
-  const lines = issues.map((issue) => `- ${typeof issue === "string" ? issue : JSON.stringify(issue)}`);
+  const valid = issues.filter((issue): issue is string => typeof issue === "string");
+  const findingLines = valid.map((issue) => `- ${issue}`);
+  const lines = [...findingLines];
   lines.push(...inconsistencies);
-  return { pass, headline: pass ? "approved" : approve ? "approval rejected" : "requested changes", lines };
+  return { pass, headline: pass ? "approved" : approve ? "approval rejected" : "requested changes", lines,
+    findingLines, blocking: valid.length > 0, inconsistent: inconsistencies.length > 0, malformedRows: issues.length - valid.length, reproducers: [] };
 }
 
 // v1.70 T5: classified findings — only material (non-deferred) findings block approval. Deferred
-// findings carry their rationale into the details (never dropped). Malformed rows fail closed like any
-// other shape violation, so a garbage "findings" array can never fake an approval.
+// findings carry their rationale into the details (never dropped). A malformed row is diagnostic
+// evidence of a protocol failure, never blocking content or a finding to hand to a repair worker.
 function classifyReviewFindings(findings: unknown[]): ReviewDecision {
   const inconsistencies: string[] = [];
   const lines: string[] = [];
   let material = 0;
   let deferred = 0;
+  let malformedRows = 0;
+  const reproducers: ReviewDecision["reproducers"] = [];
   findings.forEach((f, i) => {
     if (!f || typeof f !== "object") {
       inconsistencies.push(`review finding inconsistent: findings[${i}] must be an object`);
+      malformedRows++;
       return;
     }
-    const { note, severity, defer, rationale } = f as Record<string, unknown>;
+    const before = inconsistencies.length;
+    const { note, severity, defer, rationale, reproducer } = f as Record<string, unknown>;
     if (typeof note !== "string") inconsistencies.push(`review finding inconsistent: findings[${i}].note must be a string`);
     if (severity !== "material" && severity !== "minor") inconsistencies.push(`review finding inconsistent: findings[${i}].severity must be "material" or "minor"`);
     if (defer !== undefined && typeof defer !== "boolean") inconsistencies.push(`review finding inconsistent: findings[${i}].defer must be a boolean`);
+    if ("reproducer" in f && typeof reproducer !== "string") inconsistencies.push(`review finding inconsistent: findings[${i}].reproducer must be a string`);
     const isDeferred = defer === true;
     if (isDeferred && (typeof rationale !== "string" || !rationale.trim())) {
       inconsistencies.push(`review finding inconsistent: deferred findings[${i}] requires a rationale`);
     }
-    if (severity === "material" && !isDeferred) material++;
+    if (inconsistencies.length > before) {
+      malformedRows++;
+      return;
+    }
+    if (severity === "material" && !isDeferred) {
+      material++;
+      if (typeof reproducer === "string" && reproducer.length) reproducers.push({ note: note as string, text: reproducer });
+    }
     if (isDeferred) deferred++;
     const label = isDeferred ? `deferred/${severity ?? "?"}` : String(severity ?? "?");
     const why = isDeferred && typeof rationale === "string" ? ` — rationale: ${rationale}` : "";
     lines.push(`- [${label}] ${typeof note === "string" ? note : JSON.stringify(note)}${why}`);
   });
   const pass = material === 0 && inconsistencies.length === 0;
+  const findingLines = [...lines];
   lines.push(...inconsistencies);
   const headline = pass
     ? deferred ? `approved (${deferred} deferred)` : "approved"
     : `requested changes (${material} material)`;
-  return { pass, headline, lines };
+  return { pass, headline, lines, findingLines, blocking: material > 0,
+    inconsistent: inconsistencies.length > 0, malformedRows, reproducers };
+}
+
+/** Keep the reviewer's bytes through the last complete Unicode character within the cap. */
+function cappedReproducer(text: string): string {
+  const bytes = Buffer.byteLength(text, "utf8");
+  if (bytes <= 4096) return text;
+  let prefix = "";
+  let used = 0;
+  for (const character of text) {
+    used += Buffer.byteLength(character, "utf8");
+    if (used > 4096) break;
+    prefix += character;
+  }
+  return `${prefix}\n… reproducer cut at 4096 of ${bytes} bytes`;
 }
 
 // OBS-48: cap on zero-context diff bytes (git diff -U0), not context-padded full diff — scattered
@@ -611,6 +653,7 @@ export async function reviewGate(
   // v2.6.8 T7: kept for compatible callers and read as empty. An approve reason is the repair worker's
   // standing instruction; a reviewer handed "the previous finding is resolved" graded the reason, not the diff.
   _operatorContext?: string,
+  modelAuthExclusions: readonly { key: string; reason: string }[] = [],
 ): Promise<GateResult> {
   // R3 (OBS-186): participation is keyed on PATHS. The compiler's assignment comes from the DECLARED
   // files[]; the operator's floor may RAISE it to full and can never lower it. `complexityThreshold` is
@@ -700,8 +743,23 @@ export async function reviewGate(
     authorVendors, authors,
   );
   if (!reviewer) {
-    const reason = `no cross-vendor reviewer available at or above ${reviewerFloor} floor (${reviewerFloorCause}; diversity rule); author vendors: ${[...authorVendors].sort().join(", ") || "unknown"}${unresolvedAuthors.length ? `; unresolved author channels: ${unresolvedAuthors.join(", ")}` : ""}`;
-    return { gate: "review", pass: false, details: `unreadable — ${reason}; operator approve --waive required to proceed`,
+    // Only missing probe data that prevented an otherwise lawful seat is a doctor remedy.
+    // Reuse the real picker so diversity, author identity, the floor and live exclusions all bind.
+    const unprobed = new Set(modelAuthExclusions
+      .filter((seat) => seat.reason === "no model auth verdict — run tickmarkr doctor").map((seat) => seat.key));
+    const missing = adapters.flatMap((adapter) => adapter.channels(cfg))
+      .filter((seat) => unprobed.has(channelKey(seat)) && disallowedBy(seat, cfg.routing, "review") === null)
+      .filter((seat) => {
+        const eligible = pickReviewer(author, [...channels, seat], excludeReviewers ?? [], [], reviewerFloor,
+          [], undefined, demotedReviewers, authorVendors, authors);
+        return eligible !== null && channelKey(eligible) === channelKey(seat);
+      })
+      .map(channelKey).sort();
+    const cause = missing.length
+      ? `${missing.join(", ")}: no model auth verdict — run tickmarkr doctor`
+      : `${reviewerFloorCause}; diversity rule`;
+    const reason = `no cross-vendor reviewer available at or above ${reviewerFloor} floor (${cause}); author vendors: ${[...authorVendors].sort().join(", ") || "unknown"}${unresolvedAuthors.length ? `; unresolved author channels: ${unresolvedAuthors.join(", ")}` : ""}`;
+    return { gate: "review", pass: false, details: `unreadable — ${reason}`,
       meta: { noEligibleReviewer: true, unreadable: true, findings: [], authorVendors: [...authorVendors].sort(), unresolvedAuthors, ...floorMeta } };
   }
   reviewHistory?.push(channelKey(reviewer));
@@ -770,6 +828,7 @@ acceptance criterion it violates (or to the regression this diff introduces), st
 and marks its evidence executed (you ran the reproducer), static (you traced it by reading) or blocked (it
 could not run here). Blocked evidence never turns a finding into a pass, and a worker's own case table or
 enumeration never resolves a finding: judge the diff itself.
+A material finding with executed evidence may also carry "reproducer": the exact command or test body you ran, at most 4096 bytes; it reaches the repair worker verbatim.
 Report the whole class in this one review, never only its first example. Each material finding's "note" is one
 line carrying the closed tuple "rule: <the goal clause, criterion or regressed behaviour violated> | found:
 <every counterexample you ACTUALLY FOUND inside the declared scope, each as path:line input → consequence,
@@ -918,13 +977,25 @@ ${responseRequirement}
   const decided = findings !== null
     ? classifyReviewFindings(findings)
     : classifyReviewIssues(v.approve as boolean, v.issues as unknown[]);
-  const ownLines = [...decided.lines];
+  const ownLines = [...decided.findingLines];
   const reraised = priorMaterials.filter((finding) =>
     v.reraised?.some((id) => matchClosureId(id, [finding])),
   );
   if (reraised.length) {
-    if (decided.pass) decided.headline = "requested changes";
+    if (!decided.blocking) decided.headline = "requested changes";
     decided.pass = false;
+  }
+  if (decided.inconsistent && !decided.blocking && !reraised.length) {
+    return {
+      gate: "review", pass: false,
+      details: `reviewer ${reviewer.adapter}:${reviewer.model} (vendor: ${reviewer.vendor}; provider: ${provider}): review verdict inconsistent — no valid blocking content\n${decided.lines.join("\n")}`,
+      meta: {
+        ...policyMeta, ...rotationMeta, ...floorMeta, reviewer: channelKey(reviewer), reviewerTier: reviewer.tier, vendor: reviewer.vendor, provider,
+        unparseable: true, cause: "malformed-verdict", malformedRows: decided.malformedRows,
+        ...(saved ? { rawPath: saved } : {}),
+        ...(savedBrief ? { briefPath: savedBrief } : {}),
+      },
+    };
   }
   // OBS-1195: an anchor leaves the blocking set only through an explicit, unambiguous parent
   // disposition: its own `finding` names a deferred entry of this verdict or a prior it resolved.
@@ -1003,12 +1074,17 @@ ${responseRequirement}
     const [parent] = parents;
     return parents.size === 1 && parent ? { ...finding, boundTo: parent } : finding;
   });
+  const reproducers = decided.reproducers.flatMap(({ note, text }) => {
+    const finding = carriedRows.find((row) => row.class === "review:material" && row.note === note);
+    return finding ? [{ fingerprint: finding.fingerprint, text: cappedReproducer(text) }] : [];
+  });
   return {
     gate: "review",
     pass: decided.pass,
     details,
     meta: {
       ...policyMeta, ...rotationMeta, ...floorMeta, reviewer: channelKey(reviewer), reviewerTier: reviewer.tier, vendor: reviewer.vendor, provider,
+      ...(decided.inconsistent ? { malformedRows: decided.malformedRows } : {}),
       // OBS-990 b: the verbatim ids plus ONE normalised copy of each list — never a third alias.
       ...(priorMaterials.length ? {
         resolved: v.resolved,
@@ -1017,6 +1093,7 @@ ${responseRequirement}
         reraisedMatches: (v.reraised ?? []).map((id) => matchClosureId(id, priorIds)).filter((id): id is string => id !== undefined),
       } : {}),
       ...(!decided.pass ? { findings: carriedRows } : {}),
+      ...(reproducers.length ? { reproducers } : {}),
       ...(settledAnchors.length ? { settledAnchors } : {}),
       ...(saved ? { rawPath: saved } : {}),
       ...(savedBrief ? { briefPath: savedBrief } : {}),

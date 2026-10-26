@@ -195,7 +195,7 @@ describe("review-seat launch never retires a seat (production, zero tokens)", { 
       expect(of(rowsOf(repo, "run-clean"), "review-infra-retry")).toEqual([]);
     }
     // A launch failure then malformed deliveries: the relaunch never grants a second malformed allowance —
-    // one relaunch plus the one fresh-nonce re-emission, then the park.
+    // one relaunch plus the one fresh-nonce re-emission retire A, then the retired-only pool parks.
     {
       const { repo, scriptPath } = setupRepo([T("T1")], { tasks: { T1: [work("e0")] } }, reviewCfg(["seat-a"]));
       const { driver, launches } = launchDriver((seat, n) => seat === "seat-a" && n === 1 ? refused() : undefined);
@@ -204,7 +204,14 @@ describe("review-seat launch never retires a seat (production, zero tokens)", { 
       expect(launches).toEqual(["seat-a", "seat-a", "seat-a"]);
       const rows = rowsOf(repo, "run-malformed");
       expect(of(rows, "review-reemission").map((row) => row.data)).toEqual([{ reviewer: A, cause: "malformed-verdict", delivered: false }]);
-      expect(of(rows, "review-infra-retry")).toHaveLength(1);
+      expect(of(rows, "review-pool-demotion").map((row) => row.data)).toEqual([
+        expect.objectContaining({ reviewer: A, cause: "malformed-verdict", causes: ["malformed-verdict", "malformed-verdict"] }),
+      ]);
+      expect(of(rows, "review-infra-retry").map((row) => row.data)).toEqual([
+        expect.objectContaining({ reviewer: A, cause: "seat-launch-failed", sameSeat: true }),
+        expect.objectContaining({ reviewer: A, cause: "retired", cannotSeat: true, causes: ["malformed-verdict", "malformed-verdict"] }),
+      ]);
+      parkedReviewsAreInfra(rows);
     }
     // A malformed verdict whose fresh-nonce re-emission fails to launch: A's one relaunch delivers, which publishes
     // the re-emission's delivery — A is a delivery flake, not a bad reviewer — so after the judge rejects, the
@@ -869,6 +876,8 @@ describe("review-seat launch never retires a seat (production, zero tokens)", { 
       // slot hold the one T1 pane, or the Orca transport T1's probe or lookup — until T2, a production runGates whose
       // nonceless A answer is A's second real no-verdict, has retired A. Whatever was picked before that
       // retirement, retired A is never launched for T1, at any of the four picks, under either policy.
+      // With a malformed T1 answer, that delivery itself supplies the second strike before the held
+      // re-route read: T2 then finds A already retired and never dispatches it.
       const poll = async (what: string, ok: () => boolean) => {
         for (let i = 0; i < 3000 && !ok(); i++) await new Promise((resolve) => setTimeout(resolve, 10));
         if (!ok()) throw new Error(`timed out waiting for ${what}`);
@@ -927,7 +936,7 @@ describe("review-seat launch never retires a seat (production, zero tokens)", { 
         const prefer = shape === "reroute" ? ["seat-b", "seat-a"] : ["seat-a", "seat-b"];
         const cfg = { ...DEFAULT_CONFIG, review: { ...DEFAULT_CONFIG.review, required: true, prefer, timeoutMs: 5000 } };
         // T1 is held at: the initial pick's read; the relaunch's read (armed by its review-infra-retry note); the
-        // re-emission's read (armed by the malformed answer's note); the re-route's read (armed by B's second refusal);
+        // malformed verdict's re-route read (armed by its note); the re-route's read (armed by B's second refusal);
         // the initial pick's pane creation (slot).
         if (shape === "initial") writeFileSync(arm, "");
         let t1Notes = 0;
@@ -962,7 +971,7 @@ describe("review-seat launch never retires a seat (production, zero tokens)", { 
           probe: ["seat-a/T2"],
           lookup: ["seat-a/T2"],
           launch: ["seat-a/T1", "seat-a/T2", "seat-b/T1"],
-          malformed: ["seat-a/T1", "seat-a/T2", "seat-b/T1"],
+          malformed: ["seat-a/T1", "seat-b/T1"],
           reroute: ["seat-b/T1", "seat-b/T1", "seat-a/T2"],
         }[shape]);
         expect(review(t1).pass === true && review(t1).meta?.reviewer === A, name).toBe(false);
@@ -974,7 +983,7 @@ describe("review-seat launch never retires a seat (production, zero tokens)", { 
         if (shape === "launch" || shape === "malformed") expect(review(t1), name).toMatchObject({ pass: true, meta: { reviewer: B } });
         if (shape === "reroute") expect(review(t1), name).toMatchObject({ pass: false, meta: { noVerdict: true, infra: true } });
         // Picked before it retired, refused at launch: the round says so.
-        if (policy === "full") expect(review(t1).details, name).toMatch(new RegExp(`withdrawn: ${A} was retired for the run`));
+        if (policy === "full" && shape !== "malformed") expect(review(t1).details, name).toMatch(new RegExp(`withdrawn: ${A} was retired for the run`));
       }
     }
   });

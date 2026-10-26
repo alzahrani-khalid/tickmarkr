@@ -37,7 +37,7 @@ type Workflow = {
   jobs?: Record<string, WorkflowJob>;
 };
 
-type WorkflowStep = { name?: string; if?: string; run?: string; uses?: string; with?: Record<string, string>; env?: Record<string, string> };
+type WorkflowStep = { name?: string; if?: string; run?: string; uses?: string; with?: Record<string, string | number>; env?: Record<string, string> };
 type WorkflowJob = { "runs-on"?: string; steps?: WorkflowStep[] };
 
 function jobsFor(path: string): Record<string, WorkflowJob> {
@@ -65,6 +65,19 @@ const testRunnerSteps = workflowPaths.flatMap((path) =>
 );
 
 describe("CI platform lanes", () => {
+  test("test: every checkout step of the public continuous integration workflow fetches the whole history with its tags, read from the parsed workflow, so a public job whose checkout keeps the default one-commit depth fails", () => {
+    const path = ".github/workflows/ci.public.yml";
+    const checkouts = Object.entries(jobsFor(path)).flatMap(([jobName, job]) =>
+      (job.steps ?? []).flatMap((step, stepIndex) =>
+        step.uses?.startsWith("actions/checkout@") ? [{ jobName, stepIndex, step }] : [],
+      ),
+    );
+    expect(checkouts, `${path} must contain checkout steps`).not.toHaveLength(0);
+    for (const { jobName, stepIndex, step } of checkouts) {
+      expect(step.with?.["fetch-depth"], `${path} job ${jobName} step ${stepIndex + 1} needs full history and tags`).toBe(0);
+    }
+  });
+
   test("test: both workflow definitions carry a lane for the second supported operating system running build and the full suite", () => {
     for (const path of workflowPaths) {
       const jobs = jobsFor(path);

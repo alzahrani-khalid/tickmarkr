@@ -110,6 +110,19 @@ function statesShippedFileTrigger(section: string): boolean {
   return /adding or removing a shipped file/i.test(section);
 }
 
+describe("spec template — task numbering", () => {
+  test("the spec template a fresh tickmarkr init writes states directly under its task heading format line that tasks are numbered from one in spec order, that the queue row belongs in the title or goal and never in the id, and that a split renumbers, so a template without the numbering rule fails", async () => {
+    const written = await initialisedSpec();
+    const headingFormat = 'Each task is a "## Tn: Title" heading with "- field: value" bullets.';
+    const numberingRule = "Number tasks T1..Tn in spec order; name the queue row in the title or goal, never in the id; a split renumbers.";
+    const statesTaskNumbering = (template: string): boolean =>
+      template.includes(`${headingFormat}\n${numberingRule}\n`);
+
+    expect(statesTaskNumbering(written)).toBe(true);
+    expect(statesTaskNumbering(written.replace(`${numberingRule}\n`, ""))).toBe(false);
+  });
+});
+
 describe("spec template — daemon surfaces and single-claim judges", () => {
   test("test: the spec template a fresh tickmarkr init writes states in its ordering law that a task changing what the daemon does must own every surface that tells the operator what the daemon does and states beside the judge oracle that a judge criterion carries one claim so a semicolon-joined criterion warns whereas a template missing either sentence fails", async () => {
     const written = await initialisedSpec();

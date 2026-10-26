@@ -12,7 +12,7 @@ import { fileURLToPath } from "node:url";
 import { batchedProcessProbes, runnerPids } from "./suite-census.js";
 import { stringify } from "yaml";
 import { BOOTSTRAP_FAILURE_RE, classifyDeadChannel, classifyTransientCapacity, trailerPattern, writePrompt } from "../adapters/prompt.js";
-import { allAdapters, getAdapter, probeAll, readDoctor, rolePools } from "../adapters/registry.js";
+import { allAdapters, getAdapter, modelAuthExclusions, probeAll, readDoctor, rolePools } from "../adapters/registry.js";
 import { type Assignment, SettledTrailerTracker, addUsage, CAPACITY_RE, channelKey, matchesInputBox, matchesTrustDialog, quotaSignal, type TokenUsage, type WorkerAdapter, type WorkerResult } from "../adapters/types.js";
 import { bannerShell, paneDispatchCommand } from "../brand.js";
 import { collateralHits, type ScopeCollateralVerdict } from "../compile/collateral.js";
@@ -43,6 +43,7 @@ import { MASK } from "./redact.js";
 import { runInteractiveSeed, type InteractiveSeedResult } from "./interactive-seed.js";
 import { classifyRepairDisposition, namedPaths, resolveScopeHints } from "./repair-disposition.js";
 import { applyScopeAmendments, activeRetryBan, interruptedAttempt, RESUME_HARVEST_SOURCE, resumeHarvestAuthor, approvalAction, APPROVAL_REFUSED, bindingToken, effectiveEvents, foldDecisions, physicalLine, staleApprovals, classifyTaskFailure, classifyWorkerResultCause, deferredReviewFindings, engagementComparable, formatPriorFindingEvidence, GATE_FINGERPRINT_CAP, GATE_SATISFIED_RELEASE, identicalGateFailures, isDeferredFinding, journaledFailureBrief, Journal, loadRoutingProfile, newRunId, normalizeGateFailure, outstandingConsultGuidance, readableExcerpt, receiptOrigin, outstandingReviewFindings, pendingApprovalActions, pendingRechecks, pendingRepairFindings, phaseForGate, priorJudgments, readPriorRunEvidence, recordedTaskFailureKind, reraisedReviewChains, RECHECK_RELEASE, renderStructuredReviewFinding, repairReachSinceApproval, repairsSinceApproval, reviewRoundsSinceApproval, runHasEnded, standingRulings, structuredFindings, upheldFeedbackByTask, type CurrentAttemptGateReplay, type JournalEvent, type ParkKind, type ResumeState, type RetryMode, type StructuredFinding } from "./journal.js";
+import { permittedDecisionVerbs, type DecisionPark } from "./decision-verbs.js";
 import { carriedAuthorVendors, gateReviewerFloor, isDiffCapPark, isGarbageReview, pickReviewer } from "../gates/review.js";
 import { acquireApprovalSerialization, acquireRunLock, isPidLive, releaseRunLock } from "./lock.js";
 import { checkIntegrationIdentity, ensureIntegration, integrationBranch, type IntegrationLeg, type IntegrationRefState, integrationRepairText, mergeTask, readIntegrationRef, reusedTipEvidence, type TipVerifyResult, verifyIntegrationTip } from "./merge.js";
@@ -598,17 +599,39 @@ const isDeterministicFailure = (g: GateResult) =>
   DETERMINISTIC_GATES.has(g.gate) || (g.gate === "acceptance" && isOracleFailure(g));
 
 /**
- * Is the failing battery narrow enough that a fix-only pass can close it? The ruling's three cases:
- * review-only, a single deterministic test/lint gate, or acceptance decided by a named oracle.
+ * A recorded unmet criterion with cited paths gives a judged red a repairable subject.
+ * A parsed but inconsistent verdict has no judgment and cannot fund a repair.
+ */
+function isJudgedAcceptanceFailure(g: GateResult): boolean {
+  const judgment = g.meta?.judgment;
+  if (g.gate !== "acceptance" || g.meta?.unparseable === true || !judgment || typeof judgment !== "object") return false;
+  const criteria = (judgment as { criteria?: unknown }).criteria;
+  return Array.isArray(criteria) && criteria.some((c) => c?.met === false && Array.isArray(c.paths)
+    && c.paths.some((path: unknown) => typeof path === "string" && path.trim().length > 0));
+}
+
+/** Keep review alongside acceptance, but preserve the serial battery for other failures. */
+function repairBatteryFor(failing: GateResult[]): GateResult[] {
+  return failing.some((g) => g.gate !== "review" && g.gate !== "acceptance")
+    ? failing.filter((g) => g.gate !== "review") : failing;
+}
+
+const repairContractFor = (battery: GateResult[]): "class" | "instance" =>
+  battery.some((g) => g.gate === "review" || isJudgedAcceptanceFailure(g)) ? "class" : "instance";
+
+/**
+ * Review-only, test/lint-only, acceptance-only, or exactly acceptance plus review.
  * Unparseable verdicts and diff-cap trips are excluded exactly as they are from the review-fix retry —
  * neither names anything a worker can fix.
  */
 function narrowRepairBattery(failing: GateResult[]): boolean {
+  if (failing.length === 2) return failing.some((g) => g.gate === "acceptance")
+    && failing.some((g) => g.gate === "review") && failing.every((g) => narrowRepairBattery([g]));
   if (failing.length !== 1) return false;
   const g = failing[0]!;
   if (g.gate === "review") return g.meta?.unparseable !== true && !isDiffCapPark(g);
   if (g.gate === "test" || g.gate === "lint") return true;
-  if (g.gate === "acceptance") return isOracleFailure(g) && g.meta?.unparseable !== true;
+  if (g.gate === "acceptance") return (isOracleFailure(g) || isJudgedAcceptanceFailure(g)) && g.meta?.unparseable !== true;
   return false;
 }
 
@@ -672,37 +695,62 @@ function repairDiffFilesCut(diff: Buffer, cap: number, names: readonly string[])
 function repairFindingsBrief(results: GateResult[]): string {
   return results.filter(gateFailed).map((g) => {
     const evidence = g.meta?.failureEvidence;
+    const reproducers = g.gate === "review" && Array.isArray(g.meta?.reproducers)
+      ? g.meta.reproducers.filter((row): row is { fingerprint: string; text: string } => row !== null
+        && typeof row === "object" && typeof row.fingerprint === "string" && typeof row.text === "string") : [];
     return `${g.gate}: ${readableExcerpt(g.details)}` + (Array.isArray(evidence) && evidence.length
-      ? `\nAssertion evidence:\n${JSON.stringify(evidence, null, 2)}` : "");
+      ? `\nAssertion evidence:\n${JSON.stringify(evidence, null, 2)}` : "")
+      + (reproducers.length ? "\n\n### Reviewer reproducers — replay these first; land each as an owned test\n"
+        + reproducers.map(({ fingerprint, text }) => `Reproducer for \`${fingerprint}\`:\n${text}`).join("\n\n") : "");
   }).join("\n\n");
 }
 
-// OBS-1019 add.2: the order a repeated review chain earns in place of the smallest-edit order.
-const REPAIR_CLASS_SENTENCE = "Before editing a chain reraised more than once, enumerate the in-scope consumers,"
-  + " bridges, operations and event sequences as a closed case table; repair every implicated member and verify"
-  + " the accumulated diff against that table.";
+/** Prose cleanup must never collapse whitespace or remove finding-like lines inside replay text. */
+function editFindingsProse(text: string, reproducers: readonly string[], edit: (prose: string) => string): string {
+  const protectedText: Array<{ token: string; original: string }> = [];
+  let prose = text;
+  for (const original of [...new Set(reproducers)].filter(Boolean).sort((a, b) => b.length - a.length)) {
+    if (!prose.includes(original)) continue;
+    let token = `\0reviewer-reproducer-${protectedText.length}\0`;
+    while (text.includes(token)) token += "\0";
+    prose = prose.replaceAll(original, token);
+    protectedText.push({ token, original });
+  }
+  return protectedText.reduce((edited, { token, original }) => edited.replaceAll(token, () => original), edit(prose));
+}
 
 /**
- * The fix-only contract: the findings verbatim, then the diff content of the work already landed.
- * OBS-1019 add.2: a first finding stays bounded to the smallest edit. A chain a review has re-raised
- * more than once was chased edge by edge while every round re-judged the accumulated diff, so it owes
- * the whole class instead: a closed case table inside the declared bounds, never beyond them.
+ * D-1355, ratified D-1366 (reversing D-576), scoped by D-2158: review and judged acceptance repairs owe the
+ * whole input class from the first finding. Test, lint and oracle-only repairs keep the instance order.
+ * The six ratified clauses below are verbatim; the funded row, not live review history, owns the order.
  */
-function repairBrief(findings: string, diff: string, baseRef: string, repeated: ReadonlyArray<{ finding: StructuredFinding; reraises: number }> = []): string {
+function repairBrief(findings: string, diff: string, baseRef: string, contract: "class" | "instance", rulings: readonly string[], repeated: ReadonlyArray<{ finding: StructuredFinding; reraises: number }> = []): string {
   const repair = { findings, diff };
+  const wholeClass = contract === "class";
   return [
-    repeated.length ? "## Repair attempt — repair the whole class these findings name" : "## Repair attempt — fix ONLY what these findings name",
+    wholeClass ? "## Repair attempt — make the rule these findings name hold" : "## Repair attempt — fix ONLY what these findings name",
+    "### Standing rulings",
+    ...rulings.map((ruling) => `approval: ${ruling}`),
+    "",
     "The commits from your prior attempt are already in this worktree and their diff is reproduced"
     + " below. Do NOT re-implement that work, do not start over, and do not revert it: "
-    + (repeated.length ? "resolve every member of the case table below, then commit." : "make the smallest change that resolves every finding, then commit."),
-    ...(repeated.length ? [
+    + (wholeClass ? "make the rule these findings name hold under the contract below, then commit." : "make the smallest change that resolves every finding, then commit."),
+    ...(wholeClass ? [
+      "",
+      "### Repair contract — the whole input class",
+      "1. rule over the input class",
+      "2. land every `found:` item as an owned test whose assertion is the finding's CONSEQUENCE through the production entry under `searched:`",
+      "3. one bounded generalised test",
+      "4. prove the oracle fails pre-fix",
+      "5. redesign inside files[] allowed",
+      "6. `infeasible inside files[]: <path>` is a lawful report",
+      "The repair stays inside the task's declared write scope (files[]) and never narrows its goal or an acceptance criterion; the reviewer judges the accumulated diff.",
+    ] : []),
+    ...(wholeClass && repeated.length ? [
       "",
       "### Repeated review chains — repair the class, not the next edge",
       // Fingerprint and count only: the finding's prose is already quoted once, below or under its heading.
       ...repeated.map(({ finding, reraises }) => `- \`${finding.fingerprint}\` re-raised ${reraises} times`),
-      REPAIR_CLASS_SENTENCE,
-      "The table stays inside the task's declared write scope (files[]) and never narrows its goal or an"
-      + " acceptance criterion; the reviewer judges the accumulated diff, not the table.",
     ] : []),
     "",
     "### Failing gate findings (verbatim)",
@@ -2659,10 +2707,14 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
   // journal's review-no-verdict rows — the same notes noteReviewEvent appends — so a resumed daemon keeps
   // the count; run-gates appends to it in place, exactly as it does demotedReviewers.
   // v2.6.8 T1: a launch failure never struck the live tally (run-gates), so a resume never seeds one.
+  // Keep all no-verdict strikes, including closure mismatches; malformed deliveries also strike
+  // unless they are delivered closure violations, matching the live tally.
   const reviewNoVerdicts = new Map<string, string[]>();
   for (const event of journal.read()) {
-    if (event.event !== "review-no-verdict" || event.data.noVerdict !== true || typeof event.data.reviewer !== "string") continue;
+    if (event.event !== "review-no-verdict" || typeof event.data.reviewer !== "string") continue;
     if (launchFailureNote(event.data)) continue;
+    if (event.data.noVerdict !== true
+      && !(event.data.unparseable === true && event.data.cause === "malformed-verdict" && event.data.closureInvalid !== true)) continue;
     reviewNoVerdicts.set(event.data.reviewer, [...(reviewNoVerdicts.get(event.data.reviewer) ?? []), String(event.data.cause)]);
   }
   const reviewHistory = journal.read()
@@ -3388,14 +3440,13 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
 
   // gateFails/consults are execTask-scoped counters passed in so a park row is a rich verified-failure
   // observation (e.g. ladder-exhausted + gateFails:4); every task-human row has a closed kind, never prose alone.
-  const gateFailApprovalReason = (taskId: string, identity: string, includeUphold = false): string => {
-    const commands = [
-      `tickmarkr approve ${runId} ${taskId} --waive`,
-      `tickmarkr approve ${runId} ${taskId} --recheck`,
-      ...(includeUphold ? [`tickmarkr approve ${runId} ${taskId} --uphold`] : []),
-    ];
+  const parkApprovalReason = (taskId: string, identity: string, park: DecisionPark): string => {
+    const commands = permittedDecisionVerbs(park).map((verb) =>
+      `tickmarkr approve ${runId} ${taskId}${verb === "approve" ? "" : ` --${verb}`}`);
     return `${identity} — release with ${commands.map((command) => `\`${command}\``).join(" or ")}`;
   };
+  const gateFailApprovalReason = (taskId: string, identity: string, includeUphold = false): string =>
+    parkApprovalReason(taskId, identity, { kind: "gate-fail", failedGate: includeUphold ? "review" : "other", tombstone: false });
 
   const diffPaths = async (base: string, wt: string): Promise<Set<string>> => {
     const out = await shGit(`git diff --name-only -z ${shq(base)}..HEAD`, wt);
@@ -3422,7 +3473,10 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       const inventory = existsSync(wt) ? await treeOrDiffPaths(taskBases.get(t.id) ?? "HEAD", wt) : new Set<string>();
       const paths = resolveScopeHints(namedPaths(worker.data.summary).filter((path) => !allowed(path)), inventory)
         .resolved.filter((path) => !allowed(path));
-      if (paths.length) reason += ` — files[] repair hint: ${paths.join(", ")}`;
+      if (paths.length) {
+        reason += ` — files[] repair hint: ${paths.join(", ")}`;
+        details = { ...details, repairHint: paths };
+      }
     }
     graph = setStatus(graph, t.id, "human");
     saveGraph(repoRoot, graph);
@@ -3980,6 +4034,11 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       // failure counters read one infrastructure outcome, and the infra park — not the gate-fail one — is
       // what the task gets.
       const retiredOnly = (r: GateResult): GateResult | undefined => {
+        // A malformed verdict and its failed re-emission already exhausted this round's recovery.
+        // Keep that terminal result unless a launch retry preceded it: that recovery still records
+        // the retired-only pool after its bounded relaunch, without dispatching the seat again.
+        if (r.meta?.cause === "malformed-verdict" && r.meta.unparseable === true && r.meta.reviewReemission !== undefined
+          && !launchRetried().includes(String(r.meta.reviewer))) return undefined;
         if (r.meta?.cannotSeat !== undefined || (r.meta?.noEligibleReviewer !== true && (r.meta?.noVerdict !== true
           || pick([...badReviewers, ...roundTimeouts, ...retiredSeats()])))) return undefined;
         const retired = retiredSeats();
@@ -4117,7 +4176,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         } : {}),
         ...(g.gate === "review" && typeof g.meta?.reviewer === "string" ? {
           reviewer: g.meta.reviewer,
-          ...Object.fromEntries(["cause", "seatAuthoredBytes", "bytes", "rawPath", "briefPath", "timeoutMs", "unparseable", "noVerdict", "resolved", "reraised", "settledAnchors", "reviewerFloor", "reviewerFloorCause", "reviewerTier"]
+          ...Object.fromEntries(["cause", "seatAuthoredBytes", "bytes", "rawPath", "briefPath", "timeoutMs", "unparseable", "noVerdict", "resolved", "reraised", "settledAnchors", "reproducers", "reviewerFloor", "reviewerFloorCause", "reviewerTier"]
             .filter((key) => g.meta?.[key] !== undefined).map((key) => [key, g.meta![key]])),
           ...(typeof g.meta.vendor === "string" ? { vendor: g.meta.vendor } : {}),
           ...(typeof g.meta.provider === "string" ? { provider: g.meta.provider } : {}),
@@ -4354,7 +4413,9 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       // OBS-1106: same predicate as classification — an infra replay is parked, never repaired.
       const infra = results.find((g) => gateFailed(g) && isInfraResult(g));
       if (infra) {
-        await parkAs(p.infraReason(infra), "infra");
+        await parkAs(infra.gate === "review"
+          ? parkApprovalReason(t.id, p.infraReason(infra), { kind: "infra", failedGate: "review", tombstone: false })
+          : p.infraReason(infra), "infra");
         return { kind: "parked" };
       }
       // OBS-1007: a cap trip is a typed park of its own — the diff cannot shrink by retrying and the
@@ -4707,7 +4768,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       // than against the stale worktree whose task-only history cannot see newly merged dependencies.
       const currentTaskTip = await gitHead(wt);
       const currentTaskSubject = await gateCommitSubject(taskBase, currentTaskTip, wt);
-      // Recheck carries only review authority for the exact subject being gated, never tool greens.
+      // Recheck carries the newest non-tool waiver for the exact subject being gated.
       if (recheck) {
         satisfiedGate = journal.replaySatisfiedGates(new Map([[t.id, currentTaskSubject]])).get(t.id);
       }
@@ -4889,12 +4950,12 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           // deterministic-fingerprint occurrence/review round for budget accounting.
           ...(!satisfiedGate && !recheck && !harvestAuthor ? { replayMeasurement: true as const } : {}),
         };
-        if (recheck && satisfiedGate === "review" && gateSubject.commit !== currentTaskSubject) {
+        if (recheck && satisfiedGate && gateSubject.commit !== currentTaskSubject) {
           satisfiedGate = undefined;
           resumedTask.gates = declaredGates;
         }
-        if (recheck && satisfiedGate === "review" && !resumedTask.gates.includes("review")) {
-          journal.append("gate-waiver-carried", t.id, { gate: "review", commit: gateSubject.commit, carried: true, release: RECHECK_RELEASE });
+        if (recheck && satisfiedGate && !resumedTask.gates.includes(satisfiedGate)) {
+          journal.append("gate-waiver-carried", t.id, { gate: satisfiedGate, commit: gateSubject.commit, carried: true, release: RECHECK_RELEASE });
         }
         await trackedDriver.project?.(t.id, "in-review");
         await waitForBaseline(t.id);
@@ -4950,7 +5011,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           carriedFindings: outstandingReviewFindings(journal.read(), t.id),
           operatorContext,
           worktree: wt, baseRef: taskBase, result: priorResult, author: gateAuthor,
-          commands, baseline, channels: pools.review, judgeChannels: pools.judge, health, adapters, cfg, artifactDir: journal.dir,
+          commands, baseline, channels: pools.review, modelAuthExclusions: modelAuthExclusions(cfg, adapters, health), judgeChannels: pools.judge, health, adapters, cfg, artifactDir: journal.dir,
           collateral: collateral.get(t.id) ?? [],
           // a recheck re-verifies a human's release: it never selects tests down, it runs the suite.
           via: cfg.visibility.llm === "pane"
@@ -5025,9 +5086,16 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         if (settled.kind === "red") {
           gateFails++;
           // Observed green gates are only measurements. If the resumed suffix is red, preserve that
-          // result in the journal and return to the ordinary attempt/consult ladder, which rebuilds
-          // feedback from those rows. Only an operator-authorized gate release parks on a new red.
-          if (!satisfiedGate || recheck) {
+          // result in the journal and return to the ordinary attempt/consult ladder. A post-waive
+          // worker red may buy that same bounded repair; review reds still require the operator.
+          const postWaive = satisfiedGate !== undefined && !recheck;
+          const failing = results.filter(gateFailed);
+          if (postWaive && failing.every((g) => g.gate === "test") && freshOutsideScopeRed(t, gateSubject.commit)) {
+            await park(t, outsideScopePark(t), "gate-fail", gateAuthor, rs?.attempts ?? 0,
+              startMs, gateFails, consults, tokens, metered, retryMode);
+            return;
+          }
+          if (!postWaive || !failing.some((g) => g.gate === "review")) {
             // OBS-1055: a recheck red funds a repair of the pin's own work. A pinned task's repair sits
             // on the pin (OBS-1034's exemption keeps the tried list from excluding it); a pin the fleet
             // cannot seat parks naming the pin — never the ladder.
@@ -5045,8 +5113,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
             // repair bounds here too; a restored red must fund the same findings-bearing dispatch.
             // Funding is durable intent only: repairReachSinceApproval charges it after launch
             // reaches a funded gate, and a restart before launch must not duplicate that intent.
-            const failing = results.filter(gateFailed);
-            const battery = failing.some((g) => g.gate !== "review") ? failing.filter((g) => g.gate !== "review") : failing;
+            const battery = repairBatteryFor(failing);
             const landed = await commitsAheadOf(taskBase, wt);
             const events = journal.read();
             const drawn = repairsSinceApproval(events, t.id);
@@ -5058,10 +5125,12 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
               journal.append("repair-attempt", t.id, {
                 repair: repairReachSinceApproval(events, t.id).length + 1, charge: drawn + 1, of: MAX_REPAIRS,
                 gates: failing.map((g) => g.gate), commits: landed.length,
+                contract: repairContractFor(battery),
                 findings: withCarriedEvidence(repairFindingsBrief(results)),
               });
+              break gateLoop;
             }
-            break gateLoop;
+            if (!postWaive) break gateLoop;
           }
           await park(t, gateFailApprovalReason(t.id, "post-approval gate failed", results.some((g) => g.gate === "review" && gateFailed(g))), "gate-fail", gateAuthor, rs?.attempts ?? 0,
             startMs, gateFails, consults, tokens, metered, retryMode);
@@ -5188,8 +5257,19 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       // fresh re-dispatches. Read from the JOURNAL, before this dispatch's own event lands: a run that
       // stopped between funding the repair and sending it resumes still carrying the findings.
       const journaledSoFar = journal.read(); // read BEFORE this dispatch's own event lands
+      const decided = effectiveEvents(journaledSoFar).filter((e) => e.taskId === t.id);
+      const approvalAt = decided.reduce((at, e, i) => e.event === "task-approved" ? i : at, -1);
+      const upheldRepair = decided[approvalAt]?.data.release === "review-upheld"
+        && !decided.slice(approvalAt + 1).some((e) => e.event === "worker-launch" || e.event === "repair-attempt")
+        && pendingRepairFindings(journaledSoFar, t.id) === undefined
+        ? upheldFeedbackByTask(decided).get(t.id) : undefined;
+      const reproducerQuotes = journaledSoFar.flatMap((row) => row.taskId === t.id && row.event === "gate-result"
+        && row.data.gate === "review" && Array.isArray(row.data.reproducers)
+        ? row.data.reproducers.flatMap((entry) => entry && typeof entry.fingerprint === "string" && typeof entry.text === "string"
+          ? [`Reproducer for \`${entry.fingerprint}\`:\n${entry.text}`] : []) : []);
       const operatorContext = approvalReviewContext(journaledSoFar, t.id);
-      let repairFindings = pendingRepairFindings(journaledSoFar, t.id);
+      let repairFindings = pendingRepairFindings(journaledSoFar, t.id)
+        ?? (upheldRepair ? `review: ${upheldRepair}` : undefined);
       // OBS-254, one layer below the upheld brief: the ordinary gate-fail brief was loop-local, so any
       // path that rebuilt this task's state (a resume, `--retry-failed`, a fresh daemon) dispatched a
       // retry that had forgotten why it was retrying. Re-derived from the journal here, at prompt-build
@@ -5219,16 +5299,16 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       //
       // The de-dup below is BLOCKING-ONLY on purpose. A review round's raw bytes quote every finding
       // it recorded, deferrals included, and those bytes ride into the very next dispatch under the
-      // repair brief's "fix ONLY what these findings name" — so on the ordinary immediate retry the
+      // repair brief's failing-findings heading — so on the ordinary immediate retry the
       // deferral is already stated, and stated AS BLOCKING. Suppressing its heading there because it
       // is "already quoted" leaves exactly the falsehood. A quoted BLOCKING finding is quoted
       // truthfully, so that one still de-dups; a deferral is instead CUT from the raw bytes and
       // restated once, under the only heading true of it.
       const deferredRows = outstandingFindings.filter(isDeferredFinding);
-      const withoutDeferrals = (text: string) => deferredRows.reduce(
+      const withoutDeferrals = (text: string) => editFindingsProse(text, reproducerQuotes, (prose) => deferredRows.reduce(
         (brief, finding) => brief.replaceAll(renderStructuredReviewFinding(finding), ""),
-        text,
-      ).replace(/\n{3,}/g, "\n\n").trim();
+        prose,
+      ).replace(/\n{3,}/g, "\n\n").trim());
       feedback = withoutDeferrals(feedback);
       if (repairFindings !== undefined) repairFindings = withoutDeferrals(repairFindings);
       const briefs: Array<[string, StructuredFinding[]]> = [
@@ -5291,25 +5371,30 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       fatalStop.signal.throwIfAborted();
       const workerDispatchOrdinal = nextWorkerDispatchOrdinal++;
       vendorEscalated.delete(channelKey(assignment)); // dispatched now: from here on it IS tried
-      journal.append("task-dispatch", t.id, {
-        base: taskBase,
-        ...(scopeApproval?.data.release === "scope-request" ? { files: t.files, graphDefinitionHash: graphDefinitionHash(graph) } : {}),
-        assignment, attempt, workerDispatchOrdinal, provenance: dispatchProvenance([
-          channelKey(assignment) === channelKey(r.assignment) ? r.provenance
-            : t.routingHints?.pin ? `pin ${t.routingHints.pin.via}:${t.routingHints.pin.model} not re-tried` : "ladder assignment",
-          `dispatch ${channelKey(assignment)}`, climbProvenance,
-        ].filter(Boolean).join(" · ")), retryMode,
-        routingHints: t.routingHints ?? {},
-        excludedChannels: [...new Set([...demotedChannels, ...tried, ...climbSkips])]
-          .filter((key) => key !== channelKey(assignment)).sort(),
-        exclusionReasons: Object.fromEntries([...new Set([...demotedChannels, ...tried, ...climbSkips])]
-          .filter((key) => key !== channelKey(assignment))
-          .map((key) => [key, demotedChannels.has(key) ? "demoted"
-            : vendorEscalated.get(key) ?? (tried.includes(key) ? "already tried" : "tier climb skipped")])),
-        ...(outstandingFindings.length > 0 ? { carriedFindings: outstandingFindings } : {}),
-        ...(carriedConsultGuidance ? { carriedConsultGuidance } : {}),
-      });
-      journal.phaseStart(t.id, "worker", { attempt, assignment });
+      const recordDispatch = () => {
+        journal.append("task-dispatch", t.id, {
+          base: taskBase,
+          ...(scopeApproval?.data.release === "scope-request" ? { files: t.files, graphDefinitionHash: graphDefinitionHash(graph) } : {}),
+          assignment, attempt, workerDispatchOrdinal, provenance: dispatchProvenance([
+            channelKey(assignment) === channelKey(r.assignment) ? r.provenance
+              : t.routingHints?.pin ? `pin ${t.routingHints.pin.via}:${t.routingHints.pin.model} not re-tried` : "ladder assignment",
+            `dispatch ${channelKey(assignment)}`, climbProvenance,
+          ].filter(Boolean).join(" · ")), retryMode,
+          routingHints: t.routingHints ?? {},
+          excludedChannels: [...new Set([...demotedChannels, ...tried, ...climbSkips])]
+            .filter((key) => key !== channelKey(assignment)).sort(),
+          exclusionReasons: Object.fromEntries([...new Set([...demotedChannels, ...tried, ...climbSkips])]
+            .filter((key) => key !== channelKey(assignment))
+            .map((key) => [key, demotedChannels.has(key) ? "demoted"
+              : vendorEscalated.get(key) ?? (tried.includes(key) ? "already tried" : "tier climb skipped")])),
+          ...(outstandingFindings.length > 0 ? { carriedFindings: outstandingFindings } : {}),
+          ...(carriedConsultGuidance ? { carriedConsultGuidance } : {}),
+        });
+        journal.phaseStart(t.id, "worker", { attempt, assignment });
+      };
+      // An uphold's new repair is funded only after its carry is measured below. Record its
+      // dispatch then too, so an incomplete carry honestly names a fresh dispatch.
+      if (!upheldRepair) recordDispatch();
 
       taskBases.set(t.id, taskBase);
       // Queue row 240 (D-2138): read a missing checkout like a present one: its recorded removal first,
@@ -5329,12 +5414,11 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       // orphan work a consult already verified as landed.
       const { carried: carriedCommits, accounted: accountedCommits } = commitsToCarry.length > 0
         ? await cherryPickCommits(wt, commitsToCarry) : { carried: [], accounted: [] };
-      if (recreating || work.rebuiltFrom) {
-        journal.append("worktree-recreation", t.id, {
-          ...(work.rebuiltFrom ? { rebuiltFrom: work.rebuiltFrom } : {}),
-          attempted: commitsToCarry, carried: carriedCommits, ...(accountedCommits.length > 0 ? { accounted: accountedCommits } : {}),
-        });
-      }
+      const recreation = recreating || work.rebuiltFrom ? {
+        ...(work.rebuiltFrom ? { rebuiltFrom: work.rebuiltFrom } : {}),
+        attempted: commitsToCarry, carried: carriedCommits, ...(accountedCommits.length > 0 ? { accounted: accountedCommits } : {}),
+      } : undefined;
+      if (recreation && !upheldRepair) journal.append("worktree-recreation", t.id, recreation);
       // T2 review (material): harvest eligibility is "does this WORKTREE carry unverified work",
       // measured against taskBase — the same base the fast-kill's delta probe and the gates
       // themselves use. It was measured against this attempt's post-carry HEAD, which excluded
@@ -5386,7 +5470,26 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         repairFindings = undefined;
         retryMode = "fresh";
       }
-      // v1.85 T3: a repair dispatch replaces the bare gate-fail brief with a fix-only contract that
+      if (upheldRepair) {
+        const landed = await commitsAheadOf(taskBase, wt);
+        if (repairFindings !== undefined && landed.length > 0) {
+          const events = journal.read();
+          journal.append("repair-attempt", t.id, {
+            repair: repairReachSinceApproval(events, t.id).length + 1,
+            charge: repairsSinceApproval(events, t.id) + 1, of: MAX_REPAIRS,
+            gates: ["review"], commits: landed.length, contract: "class",
+            findings: `review: ${upheldRepair}`,
+          });
+          retryMode = "repair";
+        } else {
+          repairFindings = undefined;
+          retryMode = "fresh";
+        }
+        recordDispatch();
+        // Authorship reads this carry as the new dispatch's input, not as work it authored.
+        if (recreation) journal.append("worktree-recreation", t.id, recreation);
+      }
+      // v1.85 T3: a repair dispatch replaces the bare gate-fail brief with a repair contract that
       // carries the failing findings VERBATIM and the diff CONTENT of the work already in this
       // worktree. The measured loss it removes: 62 of 68 re-dispatches were fresh, each re-buying
       // ~20m of onboarding to rediscover a diff and a finding the journal already held.
@@ -5404,17 +5507,29 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           ? `${new TextDecoder().decode(rawBytes.subarray(0, cap))}\n… diff truncated at gates.diffCap (${cap} bytes)`
           + `\nPARTIAL DIFF: the diff above is incomplete; files cut by the cap: ${droppedFiles.join(", ") || "(unknown)"}`
           : raw.stdout;
-        const repeated = reraisedReviewChains(journaledSoFar, t.id).filter((chain) => chain.reraises > 1);
-        const brief = repairBrief(repairFindings, diff, taskBase, repeated);
+        // pendingRepairFindings established that the latest funded row is still pending, including
+        // after a bootstrap replay. Legacy rows without a contract retain the instance order.
+        const pending = journal.read().filter((e) => e.taskId === t.id && e.event === "repair-attempt").at(-1);
+        const contract = pending?.data.contract === "class" ? "class" : "instance";
+        const repeated = reraisedReviewChains(journaledSoFar, t.id).filter((chain) => chain.reraises >= 1);
+        const rulings = standingRulings(journaledSoFar, t.id);
+        // journaledFailureBrief still supplies these rows for ordinary dispatches. Move them into
+        // the repair's leading block, including a ruling with embedded newlines, exactly once.
+        const withoutRulings = (text: string) => editFindingsProse(text, reproducerQuotes, (prose) => rulings.reduce(
+          (brief, ruling) => brief.replace(new RegExp(`^approval: ${ruling.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "gm"), ""), prose,
+        ).replace(/\n{3,}/g, "\n\n").trim());
+        const brief = repairBrief(withoutRulings(repairFindings), diff, taskBase, contract, rulings, repeated);
         // anything the live brief holds beyond the journaled findings (a consult's guidance) is kept:
-        // a repair adds the diff and the fix-only contract, it never subtracts what was already known.
+        // a repair adds the diff and its contract, it never subtracts what was already known.
         // OBS-1195: a resumed upheld repair re-derives the same review bytes on both carries; when the
         // repair already quotes them verbatim they are said once, and the operator's uphold line stays.
         // Both carries had their deferrals cut above, so the quote is compared after the same cut.
         const upheldQuote = upheldFeedback ? withoutDeferrals(`review: ${upheldFeedback}`) : undefined;
-        const rest = upheldQuote && brief.includes(upheldQuote)
-          ? feedback.replace(upheldQuote, "").replace(/\n{3,}/g, "\n\n").trim()
-          : feedback;
+        // Keep extra feedback without repeating the replay block after the diff.
+        const unquotedFeedback = reproducerQuotes.length ? feedback.replace(withoutRulings(repairFindings), "") : feedback;
+        const rest = withoutRulings(upheldQuote && brief.includes(upheldQuote)
+          ? editFindingsProse(unquotedFeedback, reproducerQuotes, (prose) => prose.replace(upheldQuote, "").replace(/\n{3,}/g, "\n\n").trim())
+          : unquotedFeedback);
         feedback = rest && !brief.includes(rest) ? `${brief}\n\n${rest}` : brief;
         journal.append("repair-dispatch", t.id, { workerDispatchOrdinal, diffBytes: Buffer.byteLength(diff, "utf8"), capped, ...(capped ? { droppedFiles } : {}) });
       }
@@ -7125,7 +7240,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
             carriedFindings: outstandingFindings,
             operatorContext,
             worktree: wt, baseRef: taskBase, result, author: assignment,
-            commands, baseline, channels: pools.review, judgeChannels: pools.judge, health, adapters, cfg, artifactDir: journal.dir,
+            commands, baseline, channels: pools.review, modelAuthExclusions: modelAuthExclusions(cfg, adapters, health), judgeChannels: pools.judge, health, adapters, cfg, artifactDir: journal.dir,
             collateral: collateral.get(t.id) ?? [],
             selectTests: !testGateFailed,
             cachedRedBypass: explicitlyFundedAttempt ? "operator-rerun" : freshTimeout ? "timeout-fresh" : outsideScopeForced ? "out-of-scope-fresh" : undefined,
@@ -7228,12 +7343,9 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       // Decided before the cap, because the cap's question is whether the NEXT move would re-buy a
       // measurement already made — and a funded repair is one of the moves that would.
       const landed = await commitsAheadOf(taskBase, wt);
-      // T4 (OBS-265): judge and review are now ONE round, so a round can report both failing where the
-      // serial walk returned at the judge and review never ran. Eligibility is scored on the battery
-      // the serial contract would have surfaced — review only speaks for a round nothing else failed —
-      // so removing the waiting does not re-price the ladder. The journal below still names every
-      // failing gate, and `feedback` still carries every one of them to the next attempt.
-      const repairBattery = failing.some((g) => g.gate !== "review") ? failing.filter((g) => g.gate !== "review") : failing;
+      // Acceptance and review can jointly fund one repair; decisiveReviewRounds still owns the
+      // separate operator-facing review-round charge.
+      const repairBattery = repairBatteryFor(failing);
       const repairable = narrowRepairBattery(repairBattery) && lostCommits.length === 0 && landed.length > 0;
       const repairHistory = repairReachSinceApproval(journal.read(), t.id);
       const repairsDrawn = repairsSinceApproval(journal.read(), t.id);
@@ -7316,6 +7428,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           repair: repairHistory.length + 1, charge: repairsDrawn + 1, of: MAX_REPAIRS,
           gates: failing.map((g) => g.gate),
           commits: landed.length,
+          contract: repairContractFor(repairBattery),
           findings: feedback, // the failure bytes this repair must carry, replayable across a resume
         });
       } else if (repairExhausted && !capStep) {

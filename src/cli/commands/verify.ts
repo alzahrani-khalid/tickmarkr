@@ -3,7 +3,7 @@ import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdir
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { parseArgs } from "node:util";
-import { allAdapters, probeAll, readDoctor, rolePools, writeDoctor } from "../../adapters/registry.js";
+import { allAdapters, modelAuthExclusions, probeAll, readDoctor, rolePools, writeDoctor } from "../../adapters/registry.js";
 import { channelKey, type Assignment, type AuthHealth, type BillingChannel, type WorkerAdapter } from "../../adapters/types.js";
 import { loadConfig, type TickmarkrConfig } from "../../config/config.js";
 import { captureBaseline, detectGateCommands, staleFileCountCommands, type Baseline, type GateEvidenceOptions } from "../../gates/baseline.js";
@@ -343,6 +343,7 @@ export async function verify(argv: string[], cwd = process.cwd(), options: { evi
   // LLM seats only when a semantic gate will run.
   let channels: BillingChannel[] = [];
   let judgeChannels: BillingChannel[] | undefined;
+  let reviewModelAuthExclusions: ReturnType<typeof modelAuthExclusions> = [];
   let author: Assignment = HUMAN_AUTHOR;
   let carriedAuthors: string[] = [];
   const adapters = allAdapters();
@@ -351,6 +352,7 @@ export async function verify(argv: string[], cwd = process.cwd(), options: { evi
     const pools = rolePools(cfg, adapters, health);
     judgeChannels = pools.judge;
     channels = pools.review;
+    reviewModelAuthExclusions = modelAuthExclusions(cfg, adapters, health);
     // Resolved before either branch so an undiscoverable claim refuses here, ahead of any capture —
     // even where recorded authors bind and the claim is otherwise ignored.
     const claimed = values.author && values.author !== "human" ? authorIdentity(values.author, cfg, adapters, health, channels) : undefined;
@@ -465,7 +467,7 @@ export async function verify(argv: string[], cwd = process.cwd(), options: { evi
   const gateRun = async (phaseGates: GateName[], baseline: Baseline): Promise<GateResult[]> => (await runGates({ ...task, gates: phaseGates }, {
     worktree: cwd, baseRef: mergeBase,
     result: { ok: true, summary: "standalone verify — no worker claims to trust", deviations: [], raw: "" },
-    author, ...(carriedAuthors.length ? { carriedAuthors } : {}), commands, baseline, channels, ...(judgeChannels ? { judgeChannels } : {}), adapters, cfg,
+    author, ...(carriedAuthors.length ? { carriedAuthors } : {}), commands, baseline, channels, modelAuthExclusions: reviewModelAuthExclusions, ...(judgeChannels ? { judgeChannels } : {}), adapters, cfg,
     evidence: options.evidence,
     verificationScope: "standalone", artifactDir, stateDir: stagedStateDir,
     onGate: async (e) => {

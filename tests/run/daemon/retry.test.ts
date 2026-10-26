@@ -1425,7 +1425,7 @@ describe("T3 retry economics (fake adapter, zero tokens)", () => {
     ]);
   }, 180_000);
 
-  test("a single failing test gate over landed commits earns a repair, though the evidence gate never ran", async () => {
+  test("test: a single failing test gate over landed commits earns a repair, though the evidence gate never ran", async () => {
     // runGates returns at the first red gate, so a failing test gate never reaches the evidence
     // stage and its commit list comes back empty. The repair decision must measure the landed work
     // itself, or the ruling's own test/lint case is unreachable by construction.
@@ -2530,11 +2530,11 @@ describe("T2 a passing review does not drop what it deferred (fake adapter, zero
 
     // The SAME truth on the ordinary immediate review-repair retry, and this is the harder half: that
     // round's own raw review bytes quote BOTH findings, and they ride in under a repair brief that
-    // says "fix ONLY what these findings name". Deduping the heading away because the note is
+    // labels them failing findings. Deduping the heading away because the note is
     // "already quoted" leaves the deferral standing as blocking — the falsehood, restated. So the
     // blocking finding is quoted there truthfully, and the deferral appears nowhere before its own
     // heading.
-    expect(briefAfterReviewFail).toContain("## Repair attempt — fix ONLY what these findings name");
+    expect(briefAfterReviewFail).toContain("## Repair attempt — make the rule these findings name hold");
     expect(briefAfterReviewFail).toContain(FINDING);
     expect(sectionUnder(briefAfterReviewFail, DEFER_HEADING)).toContain(DEFERRED);
     expect(briefAfterReviewFail.split(DEFER_HEADING)[0]).not.toContain(DEFERRED);

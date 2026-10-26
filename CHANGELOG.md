@@ -2,6 +2,49 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v2.9.1 — review convergence: malformed verdict rows are a protocol failure, findings keep distinct identities, the first material finding carries the class-repair contract and the reviewer's reproducer, judged and post-waive reds earn repairs, one verb table, and a review park's hinted files are granted exactly
+
+**v2.9.1** makes the review loop converge instead of spending rounds (queue rows 42, 38, 39, 232, 187; riders 251, 252, 256,
+255). Its work comes from one `tickmarkr run` engagement (run-20261025-153549-…2850, resumed once after a spec fix), in which
+eleven tasks each passed build, lint, evidence, scope, their acceptance criteria, a cross-vendor review and the full suite.
+
+- **A malformed review verdict is a protocol failure, not a charged round (queue row 42).**
+  - A verdict whose rows leave nothing valid and blocking is asked for once more, on the same seat and subject.
+  - A seat whose verdict and its re-emission are both malformed is retired for the run.
+  - A launch failure still never strikes a seat. Two real no-verdicts (closure mismatch included) still retire one.
+- **A new material finding never inherits a resolved chain's identity (queue row 42).** A finding whose natural fingerprint
+  was already resolved on the task gets a distinct one. Its carried rows and the anchors bound to it follow that new
+  spelling, so it never inherits the old chain's re-raises.
+- **The first material review finding carries the class-repair contract (queue row 38).**
+  - The repair brief states the six-clause contract and the standing rulings first.
+  - Deterministic test, lint and oracle repairs keep "fix only".
+  - The contract is journaled, so a resumed run renders the same brief.
+- **The reviewer's reproducer rides its finding into the repair brief (queue row 38),** quoted verbatim and capped at 4 KB.
+- **A judged acceptance red earns a repair, not a fresh worker (queue row 39).**
+  - An acceptance red together with a review red funds one repair that carries both.
+  - An uphold after the repair budget is spent funds a repair.
+- **A worker red after a waive gets the ordinary repair, and a recheck keeps the waivers it should (queue row 232).**
+  - A recheck on the same subject carries the newest scope, evidence, acceptance and review waivers.
+  - Build, test and lint are always re-measured.
+- **One decision table names every review-seat park's release verbs (queue row 187).**
+  - A park prints only the verbs it admits, each command naming its own run and task.
+  - An unprobed pool names `tickmarkr doctor` instead of a dead `--waive`.
+- **A review park that names a files[] repair hint can be released with exactly those paths (queue row 251).**
+  - `--uphold` or `--recheck` with `--files` grants the hinted paths, journaled as a scope amendment.
+  - Only paths the files matcher treats literally are granted. A path with a pattern character or a leading `:` is refused
+    by name.
+- **A refused plain resume names `--graph-changed` (queue row 252).** The spec template tells authors to number tasks T1..Tn in
+  order (queue row 256). Public CI checks out the full history with tags, so the tag-reading tests run there too (queue row 255).
+
+Declared, still open:
+- Queue row 253: four minor edges of the 2.9.0 skill check.
+- Queue row 254: after a crashed run is resumed to a passing tip verify, the status header still shows the old crash.
+- Queue row 258: files[] entries reach git as pathspecs without literal-pathspec protection (2.9.1 refuses a leading `:` only
+  for hinted paths).
+- Queue row 257: candidates from the 2.9.0 atlas refresh, awaiting triage.
+- The rest of the review programme: 2.9.2 (seats, caps and liveness: rows 40, 41, 44, 45, 46, 47, 48) and 2.9.3 (attempt
+  telemetry and the design checkpoint: rows 43, 44, 45, 47).
+
 ## v2.9.0 — skills and guidance diet: a 1.2 KB managed block, a lean overseer core with on-demand references, the GSD section retired, the tkr wrapper knowledge in the CLI, and an init that removes only the skill content tickmarkr provably shipped
 
 **v2.9.0** cuts what every consumer repository loads in every session (queue rows 241–244). It is a minor release because it

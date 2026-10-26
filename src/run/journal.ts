@@ -1159,8 +1159,29 @@ function distinctReviewFinding(row: StructuredFinding): StructuredFinding {
 }
 
 /** Re-seat only an unambiguous, positively linked chain; retain the newest evidence path. */
-export function carryReviewFindings(priors: readonly StructuredFinding[], rows: readonly StructuredFinding[]): StructuredFinding[] {
+export function carryReviewFindings(
+  priors: readonly StructuredFinding[], rows: readonly StructuredFinding[], resolvedFingerprints: ReadonlySet<string> = new Set(),
+): StructuredFinding[] {
   const open = [...priors];
+  const currentAnchors = new Set<StructuredFinding>();
+  const parentSpellings = new Map<string, string | undefined>();
+  const carry = (row: StructuredFinding, newest: StructuredFinding, prior?: StructuredFinding): StructuredFinding => {
+    // Gate-side carries lack the task's resolved set. On every fold branch, discard retired
+    // aliases they imported unless this chain already owned them.
+    if (Array.isArray(newest.observedFingerprints)) {
+      const priorObserved = prior ? observedReviewFingerprints(prior) : [];
+      newest = { ...newest, observedFingerprints: newest.observedFingerprints
+        .filter((id) => !resolvedFingerprints.has(id) || priorObserved.includes(id)) };
+    }
+    if (row.class === "review:anchored") currentAnchors.add(newest);
+    else {
+      // Ambiguous current entries cannot supply an anchor's parent.
+      const from = row.fingerprint;
+      parentSpellings.set(from, parentSpellings.has(from) && parentSpellings.get(from) !== newest.fingerprint
+        ? undefined : newest.fingerprint);
+    }
+    return newest;
+  };
   for (const row of rows) {
     const identity = row.codeIdentity;
     const matches = open.filter((prior) => {
@@ -1174,45 +1195,57 @@ export function carryReviewFindings(priors: readonly StructuredFinding[], rows: 
     });
     if (matches.length === 1) {
       const prior = matches[0]!;
-      // Positive lineage does not grant this chain another open defect's display spelling.
+      // Positive lineage grants neither a resolved chain's nor another open defect's spelling.
       let newest = row;
-      while (open.some((other) => other !== prior && observedReviewFingerprints(other).includes(newest.fingerprint))) {
+      while (resolvedFingerprints.has(newest.fingerprint)
+        || open.some((other) => other !== prior && observedReviewFingerprints(other).includes(newest.fingerprint))) {
         newest = distinctReviewFinding(newest);
       }
-      const observed = [...new Set([...observedReviewFingerprints(prior), ...observedReviewFingerprints(newest)])];
-      open[open.indexOf(prior)] = {
+      const priorObserved = observedReviewFingerprints(prior);
+      const observed = [...new Set([...priorObserved, ...observedReviewFingerprints(newest)])];
+      open[open.indexOf(prior)] = carry(row, {
         ...newest,
         ...(prior.codeIdentity && !newest.codeIdentity ? { codeIdentity: prior.codeIdentity } : {}),
-        ...(observed.length > 1 ? { observedFingerprints: observed } : {}),
-      };
+        ...(observed.length > 1 || newest.observedFingerprints ? { observedFingerprints: observed } : {}),
+      }, prior);
     } else {
       // Two defects may name the same definition. Preserve both, with a copyable full triple.
       // Deferrals intentionally replace their rationale without changing their note.
-      const collision = open.some((prior) => observedReviewFingerprints(prior).includes(row.fingerprint));
+      const collision = resolvedFingerprints.has(row.fingerprint)
+        || open.some((prior) => observedReviewFingerprints(prior).includes(row.fingerprint));
       if (collision) {
         let distinct = distinctReviewFinding(row);
-        // A generated spelling may itself belong to a chain that has since moved away.
+        // A generated spelling may itself belong to a resolved chain or one that has moved away.
         // Reuse only a matching row; otherwise keep minting until the spelling is unowned.
         while (true) {
+          if (resolvedFingerprints.has(distinct.fingerprint)) {
+            distinct = distinctReviewFinding(distinct);
+            continue;
+          }
           const owners = open.filter((prior) => observedReviewFingerprints(prior).includes(distinct.fingerprint));
           if (owners.length === 0) {
-            open.push(distinct);
+            open.push(carry(row, distinct));
             break;
           }
           if (owners.length === 1 && reviewNoteIdentity(owners[0]!.note) === reviewNoteIdentity(row.note)) {
             const prior = owners[0]!;
-            open[open.indexOf(prior)] = {
+            open[open.indexOf(prior)] = carry(row, {
               ...prior, ...distinct,
               observedFingerprints: [...new Set([...observedReviewFingerprints(prior), ...observedReviewFingerprints(distinct)])],
-            };
+            }, prior);
             break;
           }
           distinct = distinctReviewFinding(distinct);
         }
-      } else open.push(row);
+      } else open.push(carry(row, row));
     }
   }
-  return open;
+  // A gate binds a current comment before the fold knows which spellings are retired. Re-point
+  // only this verdict's anchors, after every parent has its final id and before retirement filtering.
+  return open.map((finding) => {
+    const parent = currentAnchors.has(finding) && finding.boundTo ? parentSpellings.get(finding.boundTo) : undefined;
+    return parent && parent !== finding.boundTo ? { ...finding, boundTo: parent } : finding;
+  });
 }
 
 /**
@@ -1273,6 +1306,9 @@ export function priorJudgments(events: readonly JournalEvent[], taskId: string):
 
 export function outstandingReviewFindings(events: JournalEvent[], taskId: string): StructuredFinding[] {
   let open: StructuredFinding[] = [];
+  // Resolved chains own every spelling they observed for the rest of this task. A waive
+  // accepts the gate without resolving its chains, so it contributes no spellings here.
+  const resolvedFingerprints = new Set<string>();
   for (const e of effectiveEvents(events)) { // OBS-1178: only an effective review waive retires findings
     if (e.taskId !== taskId) continue;
     if (e.event === "task-approved") {
@@ -1295,7 +1331,10 @@ export function outstandingReviewFindings(events: JournalEvent[], taskId: string
         return matches.length === 1 ? matches : [];
       }));
       // OBS-1195: an anchor explicitly bound to a settled chain retires with it; unbound ones stay.
-      for (const id of [...settled].flatMap(observedReviewFingerprints)) retiredParents.add(id);
+      for (const id of [...settled].flatMap(observedReviewFingerprints)) {
+        retiredParents.add(id);
+        resolvedFingerprints.add(id);
+      }
       open = open.filter((finding) => !settled.has(finding));
     }
     // OBS-1195: a failed verdict that restates a bound anchor's parent ONLY as a deferral (its deferred
@@ -1332,15 +1371,18 @@ export function outstandingReviewFindings(events: JournalEvent[], taskId: string
     }
     if (e.data.pass !== false) {
       // a later review PASSED on this task: every finding it BLOCKED on is settled …
+      for (const id of open.filter((finding) => !isDeferredFinding(finding)).flatMap(observedReviewFingerprints)) {
+        resolvedFingerprints.add(id);
+      }
       open = open.filter(isDeferredFinding);
       // … and no deferral is, whether or not this pass restated it. A pass is silent about a
       // deferral it does not mention: the concern is unfixed either way, and the reviewer that
       // waved it through is not the release that accepts it. Retiring on omission would drop it on
       // the very next round — the same silent drop by a different door.
-      open = carryReviewFindings(open, findingRows(e, "review").filter(isDeferredFinding));
+      open = carryReviewFindings(open, findingRows(e, "review").filter(isDeferredFinding), resolvedFingerprints);
     } else {
       // OBS-1195: a repeated comment bound to a parent this verdict resolved or deferred is not re-seated.
-      open = carryReviewFindings(open, rows).filter((finding) => !boundToRetired(finding));
+      open = carryReviewFindings(open, rows, resolvedFingerprints).filter((finding) => !boundToRetired(finding));
     }
   }
   return open;
@@ -1371,7 +1413,11 @@ export function reraisedReviewChains(events: JournalEvent[], taskId: string): Ar
 
 /** The findings a funded repair must carry into the next dispatch, or undefined if none is pending. */
 export function pendingRepairFindings(events: JournalEvent[], taskId: string): string | undefined {
-  const e = decisionForNextDispatch(events, taskId, "repair-attempt");
+  // A waive settles the old repair's findings even if a round-cap park prevented its launch.
+  // Keep restart-before-launch intent within the engagement, never across that settlement.
+  const own = effectiveEvents(events).filter((e) => e.taskId === taskId);
+  const waivedAt = own.reduce((at, e, i) => e.event === "task-approved" && e.data.release === GATE_SATISFIED_RELEASE ? i : at, -1);
+  const e = decisionForNextDispatch(own.slice(waivedAt + 1), taskId, "repair-attempt");
   return typeof e?.data.findings === "string" ? e.data.findings : undefined;
 }
 
@@ -1713,7 +1759,7 @@ export function recordedGraphDefinitionHash(events: JournalEvent[]): string | un
   const origin = typeof start.data.graphDefinitionHash === "string" ? start.data.graphDefinitionHash : null;
   let recorded = origin;
   // OBS-1178: an approval's own rehash moves the identity only while that approval is effective.
-  const granted = new Set(effectiveEvents(events).filter((e) => e.event === "task-approved" && e.data.release === "scope-request")
+  const granted = new Set(effectiveEvents(events).filter((e) => e.event === "task-approved" && e.data.amendment !== undefined)
     .map((e) => `${e.taskId}\0${e.ts}`));
   for (const e of events) {
     if (e.event !== "graph-rehash") continue;
@@ -1757,7 +1803,7 @@ export const ScopeAmendmentSchema = z.object({
  * older than v2.5.7): the caller reads it from the run's materialized graph snapshot.
  */
 export function replayScopeAmendments(graph: RunGraph, events: JournalEvent[], release = false, approvedDefinitions: ReadonlyMap<string, string> = new Map()): RunGraph {
-  const amendments = effectiveEvents(events).filter((e) => e.event === "task-approved" && e.data.release === "scope-request")
+  const amendments = effectiveEvents(events).filter((e) => e.event === "task-approved" && e.data.amendment !== undefined)
     .map((event) => ({ event, amendment: ScopeAmendmentSchema.parse(event.data.amendment) }));
   if (!amendments.length) return graph;
   let result = graph;
@@ -1793,7 +1839,7 @@ export function replayScopeAmendments(graph: RunGraph, events: JournalEvent[], r
       }
     }
     if (!release && graphDefinitionHash(result) !== amendment.from) {
-      throw new Error(`refusing scope amendment replay: graph task definition changed beyond approval for ${event.taskId}`);
+      throw new Error(`refusing scope amendment replay: graph task definition changed beyond approval for ${event.taskId} — resume with --graph-changed to release it`);
     }
     result = { ...result, tasks: result.tasks.map((t) => t.id === event.taskId ? { ...t, files: amendment.files } : t) };
     if (!release && graphDefinitionHash(result) !== amendment.to) throw new Error("refusing invalid scope amendment hash");
@@ -1805,7 +1851,7 @@ export function replayScopeAmendments(graph: RunGraph, events: JournalEvent[], r
 export function applyScopeAmendments(graph: RunGraph, journal: Journal, auditReplay = false, release = false): RunGraph {
   const events = journal.read();
   const result = replayScopeAmendments(graph, events, release, release ? snapshotDefinitions(journal) : new Map()); // validate all before moving any identity
-  const approvals = effectiveEvents(events).filter((e) => e.event === "task-approved" && e.data.release === "scope-request");
+  const approvals = effectiveEvents(events).filter((e) => e.event === "task-approved" && e.data.amendment !== undefined);
   for (const approval of approvals) {
     const amendment = ScopeAmendmentSchema.parse(approval.data.amendment);
     if (!events.some((e) => e.event === "graph-rehash" && e.data.approval === approval.ts && e.taskId === approval.taskId
@@ -2224,7 +2270,7 @@ export class Journal {
     // T3 secret redaction: only the persisted bytes are masked — the caller's data stays untouched in
     // memory. The narrator receives the persisted (masked) row so a pane sink never shows a credential.
     const rows = [row];
-    if (event === "task-approved" && row.data.release === "scope-request") {
+    if (event === "task-approved" && row.data.amendment !== undefined) {
       const amendment = ScopeAmendmentSchema.parse(row.data.amendment);
       // Publish permission and its graph audit in one append. Otherwise a live sweep can read
       // permission between the two writes, race the CLI's rehash, and audit the revision twice.
@@ -2487,32 +2533,36 @@ export class Journal {
   }
 
   // OBS-130/OBS-571: only an explicit approval grants gate authority; recreation consumes
-  // its immediate enactment. OBS-1133: retain a review waiver's subject separately so a later
+  // its immediate enactment. Retain the newest non-tool waiver's subject separately so a later
   // recheck may carry it. Tool waivers never survive recheck. The daemon supplies the recreated
   // subject before using a carried waiver; absent that, replay can only compare journaled subjects.
   replaySatisfiedGates(currentSubjects?: ReadonlyMap<string, string>): Map<string, GateName> {
     const satisfied = new Map<string, GateName>();
-    const reviewSubjects = new Map<string, string>();
+    const failedSubjects = new Map<string, Map<string, string>>();
     const subjects = new Map<string, string>();
-    const reviewWaivers = new Map<string, string>();
+    // One standing waiver per task is the ceiling: a newer waive replaces the older gate.
+    const waivers = new Map<string, { gate: GateName; subject: string }>();
+    const carryable = new Set<GateName>(["review", "scope", "evidence", "acceptance"]);
     for (const e of effectiveEvents(this.read())) { // OBS-1178: a refused or unsound waive satisfies nothing
       if (!e.taskId) continue;
       if (e.event === "task-dispatch") {
-        reviewSubjects.delete(e.taskId);
+        failedSubjects.delete(e.taskId);
         subjects.delete(e.taskId);
-        reviewWaivers.delete(e.taskId);
+        waivers.delete(e.taskId);
         satisfied.delete(e.taskId);
       }
       if (e.event === "gate-result") {
         const commit = typeof e.data.commit === "string" && e.data.commit ? e.data.commit : undefined;
         if (commit) subjects.set(e.taskId, commit);
         else subjects.delete(e.taskId);
-        if (reviewWaivers.has(e.taskId) && reviewWaivers.get(e.taskId) !== commit) {
-          reviewWaivers.delete(e.taskId);
+        if (waivers.has(e.taskId) && waivers.get(e.taskId)!.subject !== commit) {
+          waivers.delete(e.taskId);
         }
-        if (e.data.gate === "review") {
-          if (commit && e.data.pass === false) reviewSubjects.set(e.taskId, commit);
-          else reviewSubjects.delete(e.taskId);
+        if (typeof e.data.gate === "string") {
+          const failed = failedSubjects.get(e.taskId) ?? new Map<string, string>();
+          if (commit && e.data.pass === false) failed.set(e.data.gate, commit);
+          else failed.delete(e.data.gate);
+          failedSubjects.set(e.taskId, failed);
         }
       }
       if (e.event === "worktree-recreation") {
@@ -2522,19 +2572,20 @@ export class Journal {
       if (e.event === "task-approved") {
         satisfied.delete(e.taskId);
         if (e.data.release === RECHECK_RELEASE) {
-          const waivedSubject = reviewWaivers.get(e.taskId);
+          const waiver = waivers.get(e.taskId);
           const subject = currentSubjects?.get(e.taskId) ?? subjects.get(e.taskId);
-          if (waivedSubject && waivedSubject === subject) satisfied.set(e.taskId, "review");
+          if (waiver && waiver.subject === subject) satisfied.set(e.taskId, waiver.gate);
           continue;
         }
-        reviewWaivers.delete(e.taskId);
+        waivers.delete(e.taskId);
         if (e.data.release === GATE_SATISFIED_RELEASE
             && typeof e.data.gate === "string"
             && (GATE_NAMES as readonly string[]).includes(e.data.gate)) {
           satisfied.set(e.taskId, e.data.gate as GateName);
-          const subject = reviewSubjects.get(e.taskId);
-          if (e.data.gate === "review" && subject && subject === subjects.get(e.taskId)) {
-            reviewWaivers.set(e.taskId, subject);
+          const gate = e.data.gate as GateName;
+          const subject = failedSubjects.get(e.taskId)?.get(gate);
+          if (carryable.has(gate) && subject && subject === subjects.get(e.taskId)) {
+            waivers.set(e.taskId, { gate, subject });
           }
         }
       }

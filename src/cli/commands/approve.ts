@@ -37,9 +37,8 @@ export function approvalDispositionForRelease(release: unknown): ApprovalDisposi
 }
 import { acquireApprovalSerialization, runLockOwner } from "../../run/lock.js";
 
-/** The closed verb set every decision surface may name. Nothing outside it reaches this command. */
-export const DECISION_VERBS = ["approve", "waive", "uphold", "recheck"] as const;
-export type DecisionVerb = (typeof DECISION_VERBS)[number];
+import { permittedDecisionVerbs, type DecisionVerb } from "../../run/decision-verbs.js";
+export { DECISION_VERBS, permittedDecisionVerbs, type DecisionVerb } from "../../run/decision-verbs.js";
 
 /** The newest park a decision binds to, read the one way this command reads it. */
 export interface NewestPark {
@@ -115,33 +114,16 @@ export function newestFailure(events: readonly JournalEvent[], taskId: string, s
   return undefined;
 }
 
-/**
- * FINAL §3.3's decision menu as data: human-gate/attempt-cap/other non-gate parks → approve; infra, and
- * a stall park that recorded a reapFailure (OBS-1202), → approve or recheck; review gate-fail →
- * waive/uphold/recheck; other gate-fail → waive/recheck; a
- * gate-fail park with no failed-gate evidence, or a tombstone → nothing (a diagnostic, never a
- * fabricated verb). The refusals in `approve` below enforce the same table; this is the one place a
- * surface may read it from, so what a menu offers and what the command accepts cannot drift.
- */
-export function permittedDecisionVerbs(park: Pick<NewestPark, "kind" | "failedGate" | "tombstone" | "reapFailure"> | undefined): readonly DecisionVerb[] {
-  if (!park || park.tombstone || park.kind === "scope-request") return [];
-  if (park.kind === "gate-fail") {
-    if (park.failedGate === undefined) return [];
-    return park.failedGate === "review" ? ["waive", "uphold", "recheck"] : ["waive", "recheck"];
-  }
-  if (park.kind === "infra") return ["approve", "recheck"];
-  // OBS-1202: an unreadable reap census parks finished work; recheck re-verifies that census and gates the
-  // harvested commits with no worker. An ordinary stall recorded no census failure: approve alone.
-  if (park.kind === "stall" && park.reapFailure !== undefined) return ["approve", "recheck"];
-  // OBS-1084: an authoring park whose newest gate row is a red tool gate is a runner report (a load
-  // flake in an unowned suite), so the battery re-runs on the preserved ref with no worker.
-  if (park.kind === "authoring" && isToolGate(park.failedGate)) return ["approve", "recheck"];
-  if (park.kind === "diff-cap") return ["recheck"]; // OBS-1007: a cap trip is re-gated under a raised cap, never re-bought
-  return ["approve"];
-}
-
 const TOOL_GATES: readonly string[] = ["build", "test", "lint"];
 const isToolGate = (gate: string | undefined): gate is string => gate !== undefined && TOOL_GATES.includes(gate);
+
+/** Exact literals in the shared files[] matcher, including its literal parentheses convention. */
+function grantableRepairPath(path: string): boolean {
+  return /^[A-Za-z0-9/ #$%&'()+\-.:;<=>@\]^_}~`]+$/.test(path)
+    && !path.startsWith(":") && !path.startsWith("/") && !path.endsWith("/")
+    && !path.startsWith(" ") && !path.endsWith(" ")
+    && path.split("/").every((segment) => segment !== "" && segment !== "." && segment !== "..");
+}
 
 /** The release marker this command appends for a verb on a park — the fact a read-back must match. */
 export function releaseForDecision(verb: DecisionVerb, park: Pick<NewestPark, "kind" | "failedGate">): string | undefined {
@@ -253,6 +235,10 @@ export async function approve(argv: string[], cwd = process.cwd()): Promise<stri
   if (status === undefined) {
     throw new Error(`task ${taskId} has no events in run ${runId} — unknown task or never dispatched`);
   }
+  const refuseFiles = (why: string): never => {
+    throw new Error(`refusing --files for ${taskId}: ${files?.join(",")} — ${why}`);
+  };
+  if (files !== undefined && status !== "human") refuseFiles(`task is ${status}, not a parked human gate`);
   // OBS-1022: a task-failed task whose preserved ref (or task branch) carries commits ahead of the
   // integration base owns verified-able work; --recheck re-gates that tree with no worker. Any other
   // verb on a failed task, or a recheck over nothing landed, is refused naming why.
@@ -283,7 +269,6 @@ export async function approve(argv: string[], cwd = process.cwd()): Promise<stri
   const lastHuman = park === undefined ? undefined : events[park.index];
   const capPark = park?.kind === ATTEMPT_CAP_RELEASE;
   const gateFailPark = park?.kind === "gate-fail";
-  const infraPark = park?.kind === "infra" || park?.kind === "diff-cap";
   const authoringRunnerPark = park?.kind === "authoring" && isToolGate(park.failedGate);
   const reapFailurePark = park?.kind === "stall" && park.reapFailure !== undefined;
   const failedGate = gateFailPark || authoringRunnerPark ? park?.failedGate : undefined;
@@ -296,43 +281,76 @@ export async function approve(argv: string[], cwd = process.cwd()): Promise<stri
   // the next brief as a standing ruling (journaledFailureBrief). No reason, no release: the refusal is
   // a ruling only when it says why. The cockpit menu still offers neither (it has no reason entry).
   const scopeRefusal = park?.kind === "scope-request" && !decisions && files === undefined && Boolean(reason?.trim());
+  let amendment: Record<string, unknown> | undefined;
+  let materializeAmendment: (() => void) | undefined;
   if ((park?.kind === "scope-request" && !decisions && !scopeRefusal) || files !== undefined) {
-    if (park?.kind !== "scope-request") throw new Error("--files requires a scope-request park");
+    const scopeRequest = park?.kind === "scope-request";
+    if (!scopeRequest) {
+      // Admit the verb BEFORE constructing an amendment. A hint grants no new decision authority.
+      const verb = uphold ? "uphold" : recheck ? "recheck" : undefined;
+      if (!verb || !permittedDecisionVerbs(park).includes(verb)) {
+        refuseFiles("requires an admitted --uphold or --recheck decision on the newest park");
+      }
+      const hint = lastHuman?.data.repairHint;
+      if (!Array.isArray(hint) || !hint.length || !hint.every((path) => typeof path === "string")) {
+        refuseFiles("newest park has no recorded repairHint paths");
+      }
+      for (const path of files ?? []) {
+        if (!grantableRepairPath(path)) refuseFiles(`path ${path} is not a grantable literal repair hint`);
+        if (!(hint as string[]).includes(path)) refuseFiles(`path ${path} is not a recorded repair hint`);
+      }
+    } else {
+      // Preserve scope-request's comma-separated, trimmed glob parsing. Hint grants use raw paths.
+      if (files?.join(",").startsWith("--") || files?.join(",") === "") throw new Error("--files requires <glob,…>");
+      if (files?.some((file) => !file.trim() || file.trim().startsWith("/") || file.trim().startsWith("!") || file.trim().split("/").includes(".."))) {
+        throw new Error("--files requires non-empty repository-relative globs");
+      }
+    }
     if (!files?.length) {
       throw new Error(`scope-request for ${taskId} requires --files <glob,…> to widen files[], or \`tickmarkr approve ${runId} ${taskId} --reason <text>\` to refuse the expansion and continue within the current files[]`);
     }
-    if (decisions) throw new Error("--files cannot be combined with --waive, --uphold or --recheck");
+    if (scopeRequest && decisions) throw new Error("--files cannot be combined with --waive, --uphold or --recheck");
+    const refuseGrant = (message: string): never => {
+      if (!scopeRequest) refuseFiles(message);
+      throw new Error(message);
+    };
     const graph = applyScopeAmendments(loadGraph(cwd), journal, false, engagementReleased(events));
     const from = graphDefinitionHash(graph);
     if (!engagementComparable(journal.read(), from).comparable
         || (lastHuman?.data.graphDefinitionHash !== undefined && lastHuman.data.graphDefinitionHash !== from)) {
-      throw new Error(`refusing stale scope-request approval for ${taskId}: graph revision changed`);
+      refuseGrant(`refusing stale scope-request approval for ${taskId}: graph revision changed`);
     }
     const task = graph.tasks.find((t) => t.id === taskId);
-    if (!task) throw new Error(`unknown task ${taskId}`);
-    const amendedFiles = [...new Set([...task.files, ...files])];
-    if (amendedFiles.length === task.files.length) throw new Error("--files must extend the parked files[] revision");
+    if (!task) return refuseGrant(`unknown task ${taskId}`);
+    const amendedFiles = [...new Set([...task.files, ...files.map((file) => scopeRequest ? file.trim() : file)])];
+    if (amendedFiles.length === task.files.length) refuseGrant("--files must extend the parked files[] revision");
     const amended = { ...graph, tasks: graph.tasks.map((t) => t.id === taskId ? { ...t, files: amendedFiles } : t) };
     const conflicts = scopeGrantConflicts(cwd, journal, runId, taskId, amended.tasks, events);
-    if (conflicts.length) throw new Error(`refusing scope-request approval for ${taskId}: ${conflicts.join("\n")}`);
+    if (conflicts.length) refuseGrant(`refusing scope-request approval for ${taskId}: ${conflicts.join("\n")}`);
     // C4: a live grant may not take a task past the bounds that fail every compile. The exception
     // list is EMPTY on purpose — a recorded historical compile exception confers no live authority.
     const overBound = [...taskBudgetErrors([{ ...task, files: amendedFiles }]), ...surfaceErrors([{ ...task, files: amendedFiles }], [])];
     if (overBound.length) {
-      throw new Error(`refusing scope-request approval for ${taskId}: ${overBound.join("\n")}\n`
+      refuseGrant(`refusing scope-request approval for ${taskId}: ${overBound.join("\n")}\n`
         + `remedy: close the run, split the task in its spec, recompile, then \`tickmarkr resume ${runId} --graph-changed\``);
     }
-    journal.append("task-approved", taskId, {
-      by, ...(reason ? { reason } : {}), via: "cli", release: "scope-request", park: parkBinding,
-      ...(reviewRoundCeiling === undefined ? {} : { reviewRoundCeiling }), // OBS-1083
-      amendment: { from, to: graphDefinitionHash(amended), beforeFiles: task.files, files: amendedFiles, parkLine: park.line, definition: taskDefinitionFingerprint(task) },
-    });
+    amendment = { from, to: graphDefinitionHash(amended), beforeFiles: task.files, files: amendedFiles, parkLine: park!.line, definition: taskDefinitionFingerprint(task) };
     // Do not write graph.json from this process while the daemon owns it: its sweep materializes
     // the amendment without replacing a sibling's running state with this command's snapshot.
-    const projected = applyScopeAmendments(graph, journal, false, engagementReleased(events));
-    const owner = approvalRunOwner(cwd, runId);
-    if (!owner.live && !owner.blockingRunId) saveGraph(cwd, projected);
-    return disposition(cwd, runId, "dispatch", `approved files[] for ${taskId} in ${runId} — by ${by}`, serialization.contended);
+    materializeAmendment = () => {
+      const projected = applyScopeAmendments(graph, journal, false, engagementReleased(events));
+      const owner = approvalRunOwner(cwd, runId);
+      if (!owner.live && !owner.blockingRunId) saveGraph(cwd, projected);
+    };
+    if (scopeRequest) {
+      journal.append("task-approved", taskId, {
+        by, ...(reason ? { reason } : {}), via: "cli", release: "scope-request", park: parkBinding,
+        ...(reviewRoundCeiling === undefined ? {} : { reviewRoundCeiling }), // OBS-1083
+        amendment,
+      });
+      materializeAmendment();
+      return disposition(cwd, runId, "dispatch", `approved files[] for ${taskId} in ${runId} — by ${by}`, serialization.contended);
+    }
   }
 
   if (gateFailPark && !failedGate) {
@@ -340,7 +358,7 @@ export async function approve(argv: string[], cwd = process.cwd()): Promise<stri
   }
 
   if (uphold) {
-    if (!gateFailPark || failedGate !== "review") {
+    if (!permittedDecisionVerbs(park).includes("uphold")) {
       throw new Error(`--uphold applies to a review gate-fail park; ${taskId}'s newest park is ${String(lastHuman?.data.kind ?? "none")} with failed gate ${failedGate ?? "none"} — refusing`);
     }
     journal.append("task-approved", taskId, {
@@ -351,14 +369,16 @@ export async function approve(argv: string[], cwd = process.cwd()): Promise<stri
       gate: "review",
       park: parkBinding,
       ...(reviewRoundCeiling === undefined ? {} : { reviewRoundCeiling }),
+      ...(amendment === undefined ? {} : { amendment }),
     });
+    materializeAmendment?.();
     return disposition(cwd, runId, "fund-fixed-attempt", `upheld the reviewer for ${taskId} in ${runId} — by ${by}`, serialization.contended);
   }
   if (recheck) {
     if (park?.kind === "stall" && !reapFailurePark) {
       throw new Error(`--recheck applies to a stall park only when it recorded a reapFailure (census recovery); ${taskId}'s stall park recorded none — plain approve dispatches a worker; refusing`);
     }
-    if ((!gateFailPark || !failedGate) && !infraPark && !authoringRunnerPark && !reapFailurePark) {
+    if (!permittedDecisionVerbs(park).includes("recheck")) {
       throw new Error(`--recheck applies to a gate-fail, infra, diff-cap or red-tool-gate authoring park; ${taskId}'s newest park is ${String(lastHuman?.data.kind ?? "none")} with failed gate ${failedGate ?? "none"} — refusing`);
     }
     journal.append("task-approved", taskId, {
@@ -374,11 +394,13 @@ export async function approve(argv: string[], cwd = process.cwd()): Promise<stri
       // OBS-1202: the daemon re-verifies the parked attempt's owned census before any gate runs.
       ...(reapFailurePark ? { reapFailure: park!.reapFailure } : {}),
       ...(reviewRoundCeiling === undefined ? {} : { reviewRoundCeiling }),
+      ...(amendment === undefined ? {} : { amendment }),
     });
+    materializeAmendment?.();
     return disposition(cwd, runId, "re-dispatch", `re-checking ${taskId} in ${runId} — by ${by}; ${failedGate ? `failed gate ${failedGate}` : reapFailurePark ? "reapFailure stall park; the owned census is re-verified before the gates" : `${park!.kind} park`}; no gate marked satisfied`, serialization.contended);
   }
   if (waive) {
-    if (!gateFailPark || !failedGate) {
+    if (!permittedDecisionVerbs(park).includes("waive")) {
       throw new Error(`--waive applies to a gate-fail park; ${taskId}'s newest park is ${String(lastHuman?.data.kind ?? "none")} with failed gate ${failedGate ?? "none"} — refusing`);
     }
     // C1: the waiver's owed check rides the SAME row — one append, captured synchronously so a live
@@ -663,11 +685,8 @@ function parseArgs(argv: string[]): ParsedArgs {
     const a = argv[i];
     if (a === "--files") {
       const value = argv[++i];
-      if (!value || value.startsWith("--")) throw new Error("--files requires <glob,…>");
-      files = value.split(",").map((file) => file.trim());
-      if (files.some((file) => !file || file.startsWith("/") || file.startsWith("!") || file.split("/").includes(".."))) {
-        throw new Error("--files requires non-empty repository-relative globs");
-      }
+      if (value === undefined) throw new Error("--files requires <glob,…>");
+      files = value.split(",");
     } else if (a === "--park") {
       const value = argv[++i];
       park = value === undefined ? undefined : parseBindingToken(value);

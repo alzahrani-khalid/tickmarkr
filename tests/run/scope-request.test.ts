@@ -253,6 +253,28 @@ test("test: an in-run scope amendment replays onto a graph where another task wa
   expect(replayScopeAmendments(graph, events).tasks.find((t) => t.id === "T1")!.files).toEqual(["owned.txt", "needed.txt"]);
 });
 
+test("test: a plain resume whose approved scope amendment no longer replays because another task changed in the graph refuses naming the graph-changed resume flag that releases it, and the replay under that flag keeps the amended files, so a refusal that names no release fails", () => {
+  const { repo } = setupRepo([T("T1", { files: ["owned.txt"] }), T("T2", { files: ["other.txt"] })], { tasks: {} });
+  const graph = loadGraph(repo);
+  const amended = { ...graph, tasks: graph.tasks.map((t) => t.id === "T1" ? { ...t, files: ["owned.txt", "needed.txt"] } : t) };
+  const journal = Journal.create(repo, "run-scope-release-hint");
+  journal.append("run-start", undefined, { graphDefinitionHash: graphDefinitionHash(graph) });
+  journal.append("task-human", "T1", { kind: "scope-request" });
+  journal.append("task-approved", "T1", { by: "operator", release: "scope-request", park: journal.newestBinding("T1"), amendment: {
+    from: graphDefinitionHash(graph), to: graphDefinitionHash(amended), beforeFiles: ["owned.txt"], files: ["owned.txt", "needed.txt"], parkLine: 2,
+    definition: taskDefinitionFingerprint(graph.tasks.find((t) => t.id === "T1")!),
+  } });
+  const events = journal.read();
+  const repaired = { ...graph, tasks: graph.tasks.map((t) => t.id === "T2" ? { ...t, goal: "repaired other task" } : t) };
+
+  expect(() => replayScopeAmendments(repaired, events)).toThrow(
+    "refusing scope amendment replay: graph task definition changed beyond approval for T1 — resume with --graph-changed to release it",
+  );
+  const released = replayScopeAmendments(repaired, events, true);
+  expect(released.tasks.find((t) => t.id === "T1")!.files).toEqual(["owned.txt", "needed.txt"]);
+  expect(released.tasks.find((t) => t.id === "T2")).toEqual(repaired.tasks.find((t) => t.id === "T2"));
+});
+
 // OBS-1073 residual (v2.5.7 run …152220, engagement 8 died 9 s after an in-run approve): the launch honoured
 // --graph-changed, the in-run approval sweep did not.
 test("test: a daemon resumed under the graph-changed release over a graph where another task was widened after an in-run scope grant survives an in-run plain approval of a parked human gate, journals the release on its run-resume row and dispatches the approved task, so a sweep that re-runs the whole-graph asserts the launch waived and dies fails", async () => {

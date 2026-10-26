@@ -991,6 +991,7 @@ Your starting point for a tickmarkr native spec. Edit this file, then run:
   tickmarkr compile tickmarkr.spec.md && tickmarkr plan && tickmarkr run
 
 Each task is a "## Tn: Title" heading with "- field: value" bullets.
+Number tasks T1..Tn in spec order; name the queue row in the title or goal, never in the id; a split renumbers.
 acceptance is required on every task (a nested list of observable outcomes).
 
 <!--
