@@ -374,6 +374,10 @@ export async function verify(argv: string[], cwd = process.cwd(), options: { evi
     }
   }
 
+  if (wantReview && values.author === undefined && owed.length === 0) {
+    console.error("verify: no --author given — review treats this diff as human-written and may seat a reviewer of the vendor that wrote it; pass --author <adapter:model> naming the agent that wrote it");
+  }
+
   // Baseline: --baseline file > cached capture for this merge-base > fresh capture on a detached
   // temp worktree of the merge-base (so pre-existing failures on base are forgiven, exactly as a run).
   // Queue row 31 / D-2134: gate-time state lives outside the repo; a validated discharge's durable

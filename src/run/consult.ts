@@ -13,7 +13,7 @@ import { rankPreferredChannels } from "../route/role-pick.js";
 import { disallowedBy, observedSeat, routingModelProvider } from "../route/preference.js";
 import { sh } from "./git.js";
 import { redactSecrets } from "./redact.js";
-import { filterLlmTranscript } from "./stall.js";
+import { filterLlmTranscript, reapSeatTree, seatShellCeiling } from "./stall.js";
 
 export interface ConsultVerdict {
   action: "retry" | "reroute" | "decompose" | "human";
@@ -230,7 +230,15 @@ export async function consult(
     const adapter = getAdapter(seatAdapter, adapters);
     let out: string;
     if (cfg.visibility.llm === "headless") {
-      const r = await sh(adapter.headlessCommand(promptFile, seatModel, effort), cwd, cfg.consult.stallMinutes * 60_000);
+      const timeoutMs = cfg.consult.stallMinutes * 60_000;
+      const ceiling = seatShellCeiling(timeoutMs);
+      const r = await (async () => {
+        try { return await sh(adapter.headlessCommand(promptFile, seatModel, effort), cwd, timeoutMs + 30_000, {
+          onSpawn: ceiling.onSpawn, ownsLeader: ceiling.ownsLeader,
+          seat: "consult",
+        }); }
+        finally { await ceiling.stop(); }
+      })();
       out = r.stdout + r.stderr;
     } else {
       // OBS-1009: the pane runs the HEADLESS command. A seeded interactive session answers on screen
@@ -248,6 +256,7 @@ export async function consult(
       // OBS-50: visible consult panes get the brand banner; headless path above stays banner-free (machine-parsed stdout)
       writeFileSync(scriptPath, [
         "export BASH_SILENCE_DEPRECATION_WARNING=1",
+        "export TICKMARKR_SEAT=consult",
         bannerShell(),
         command,
         gateExitTrailer(nonce),
@@ -259,7 +268,11 @@ export async function consult(
         out = await driver.read(slot, 300);
       } finally {
         // a failed seat must not leak its pane before the next seat opens under the same name
-        if (!opts.keep) await driver.close(slot);
+        if (!opts.keep) {
+          // The marker census must precede the pane close, before tools lose their ancestry.
+          await reapSeatTree({ marker: scriptPath });
+          await driver.close(slot);
+        }
       }
     }
     // D-OBS-12 (dossier runs 1-2, 3/3 valid verdicts destroyed): the pane path is a terminal

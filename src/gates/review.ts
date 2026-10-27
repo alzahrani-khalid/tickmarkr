@@ -777,7 +777,7 @@ export async function reviewGate(
   // finite explicit brace alternatives are explicit files and each one is named.
   const ownTestFiles = [...new Set(task.files.flatMap(explicitSuitePaths))];
   const suiteBudget = ownTestFiles.length
-    ? `You may run at most the task's own test files explicitly named in files[]; these are the only suites you may run: ${ownTestFiles.map((file) => `\`${file}\``).join(", ")}.`
+    ? `You may run at most the task's own test files explicitly named in files[]; these are the only suites you may run: ${ownTestFiles.map((file) => `\`${file}\``).join(", ")}. A test run you start may queue behind a running gate suite for minutes; if it is refused or has not finished, review from the diff instead.`
     : "No suite may be run: files[] names no explicit test file owned by this task.";
   const responseRequirement = reviewResponseRequirement(nonce);
   // D-966 (T3 E): a reviewer that stopped at the first example of a class drip-fed it one round at a
@@ -918,7 +918,7 @@ ${responseRequirement}
   if (artifactDir) {
     try {
       saved = join(artifactDir, `review-raw-${artifactId}.txt`);
-      writeFileSync(saved, redactSecrets(raw));
+      writeFileSync(saved, redactSecrets(llm.streamRaw ?? raw));
     } catch {
       saved = undefined; // persistence is evidence, not a gate input — never fail the gate on it
     }
@@ -926,7 +926,7 @@ ${responseRequirement}
   // A pane's own dewrap stops at the first parseable nonce-bound object; once the example's echo is gone
   // a genuinely wrapped verdict behind it is reconstructed here, exactly as llm.ts would have.
   const echoFree = withoutExampleEcho(raw, nonce);
-  const seat = via ? dewrapPaneVerdict(echoFree, nonce) : echoFree;
+  const seat = via && llm.streamRaw === undefined ? dewrapPaneVerdict(echoFree, nonce) : echoFree;
   const parsed = extractVerdictJson<ReviewVerdict>(seat, nonce);
   // v2.6.8 T7: with zero carried ids nothing was asked to close, so volunteered closure ids are ignored —
   // a material red stays red, never no-verdict. With carried ids the closure protocol binds unchanged.

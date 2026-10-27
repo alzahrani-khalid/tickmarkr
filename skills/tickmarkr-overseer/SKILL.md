@@ -481,7 +481,7 @@ For Leg-2 (both hosts), a Codex reviewer under `workspace-write` must be briefed
    blocks on reading additional input from stdin (`Reading additional input from stdin…`) until the
    pipe ends (42 minutes, measured). Run it as `codex exec … < /dev/null`.
 4. **Gate every exec lane with the shipped battery, not hand-rolled greps.**
-   `tickmarkr verify --base <ref> --criteria <file>` is the standalone form of the engine's own gates —
+   `tickmarkr verify --base <ref> --criteria <file> --author <adapter:model of the agent that wrote it>` is the standalone form of the engine's own gates —
    build/test/lint diffed against a recorded baseline, evidence, scope, plus the semantic judges — one
    fail-closed verdict, no daemon, no retries. A per-lane grep gate re-implements a weaker version of
    this and passes on source text the screen never renders, which is exactly the class the acceptance

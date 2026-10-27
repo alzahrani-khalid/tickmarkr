@@ -463,18 +463,19 @@ test("test: stop and start rollback wait through a Linux argv teardown ([comm] b
       const pid = owner(repo, "overseer").pid;
       const recorded = rig.children.get(pid)!.identity;
       let altered = 0;
+      let lastIdentityRead: ReturnType<BeatLifecycleDeps["identity"]> | undefined;
       const d: BeatLifecycleDeps = {
         ...rig.d,
         identity: (p) => {
-          if (p !== pid || rig.kills.length === 0 || altered === 2) return rig.d.identity(p);
+          if (p !== pid || rig.kills.length === 0 || altered === 2) return lastIdentityRead = rig.d.identity(p);
           altered++;
-          return flip === "teardown" ? { ...recorded, command: "[node]" } : { ...recorded, birth: `${recorded.birth}-reused` };
+          return lastIdentityRead = flip === "teardown" ? { ...recorded, command: "[node]" } : { ...recorded, birth: `${recorded.birth}-reused` };
         },
       };
       const stopped = await run(repo, ["stop", "overseer", "--seat", "s"], d);
       expect(rig.kills).toEqual([[pid, "SIGTERM"]]);
       if (flip === "teardown") {
-        expect(altered).toBe(2);
+        expect(altered, JSON.stringify({ kills: rig.kills, lastIdentityRead })).toBe(2);
         expect(stopped).toMatchObject({ code: 0, out: expect.stringContaining(`retired detached pid ${pid}`) });
         expect(existsSync(beatOwnerPath(repo, "overseer"))).toBe(false);
         expect(supervisionStatus(repo, "overseer").state).toBe("DISARMED");
@@ -488,6 +489,7 @@ test("test: stop and start rollback wait through a Linux argv teardown ([comm] b
   // Start rollback: an overrun start retires its own child; the first two reads after that SIGTERM are the teardown form.
   const overrun = mkRepo();
   let launchedAt: number | undefined, lastSeen: ProcessIdentity | undefined, altered = 0;
+  let lastIdentityRead: ReturnType<BeatLifecycleDeps["identity"]> | undefined;
   const kills: Array<[number, string]> = [];
   const late = deps({
     now: () => {
@@ -495,15 +497,15 @@ test("test: stop and start rollback wait through a Linux argv teardown ([comm] b
       return launchedAt + (existsSync(supervisionBeatPath(overrun, "overseer")) ? 60_001 : 0);
     },
     identity: (pid) => {
-      if (kills.length > 0 && lastSeen && altered < 2) { altered++; return { ...lastSeen, command: "[node]" }; }
+      if (kills.length > 0 && lastSeen && altered < 2) { altered++; return lastIdentityRead = { ...lastSeen, command: "[node]" }; }
       const id = readProcessIdentity(pid);
       if (typeof id === "object") lastSeen = id;
-      return id;
+      return lastIdentityRead = id;
     },
     kill: (pid, signal) => { kills.push([pid, signal]); process.kill(pid, signal); },
   });
   const overran = await run(overrun, ["start", "overseer", "--seat", "s"], late);
-  expect(altered).toBe(2);
+  expect(altered, JSON.stringify({ kills, lastIdentityRead })).toBe(2);
   expect(overran).toMatchObject({ code: 1, out: expect.stringContaining("startup overran 60000 ms") });
   expect(overran.out).toMatch(/rolled back/);
   expect(overran.out).not.toContain("not proven");

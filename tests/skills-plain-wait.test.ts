@@ -102,10 +102,11 @@ test("Cite the replaced watcher line in each of the three plain-host sections, v
   // BASE watcher lines: loop:52, auto:63, overseer:157. Hash the whole original file with only
   // that line masked; removing the new plugin bullet must restore every other byte, including
   // both host scopes, preflight, the green rule and the general blocking-consumer guidance.
+  // Queue row 286: refresh the pins for the three verify author lines, retaining them in the hash.
   const baseline = {
-    loop: "b4c1209a87cf38df8aa8f6a8a2a073ebffc9f982a3ca6459dff54e5ad456b7fa",
-    auto: "ffbbe2567b02018a00f38b31ad27c53c2d85ade4301c0ed04c62a5d22143a925",
-    overseer: "48923fc6926df8582dba0e170d6e6da6db9f840d673dfdc70c5496846973b58b",
+    loop: "dfabc46376f92a73d6c4acb850d9b6c999d6f3b17d8d275751d5ecaedc84d7be",
+    auto: "b841b9d2add68395c767f0b8c439712af2bd7175ab6861e79ef01c3abbb51e21",
+    overseer: "010286eadf2bdf19f8134ebff98647493a88d3d90f98256880bda58c66945ef6",
   };
   for (const name of SKILLS) {
     const markdown = readSkill(name);

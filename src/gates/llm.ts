@@ -2,18 +2,21 @@ import { stripVTControlCharacters } from "node:util";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { constants } from "node:buffer";
 import { randomBytes } from "node:crypto";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { matchesTrustDialog, shq, type WorkerAdapter } from "../adapters/types.js";
 import type { Effort } from "../graph/schema.js";
 import { formatOwnedName, parseOwnedName, type ExecutorDriver, type Slot } from "../drivers/types.js";
+import { SEAT_MARKER_ENV } from "../drivers/host-env.js";
 import { CHECKOUT_MARK, checkoutProofLine, type SeatLaunchCause } from "../drivers/orca.js";
 import { bannerShell, paneDispatchCommand, PLAIN_BANNER } from "../brand.js";
 import { sh } from "../run/git.js";
 import {
   harvestCpuFlatWindowMs,
   normalizeStallSnapshot,
+  reapSeatTree,
+  seatShellCeiling,
   WorkerTreeCpuAccountant,
 } from "../run/stall.js";
 
@@ -162,11 +165,12 @@ export interface GateCpuAccountant {
   start(): Promise<void>;
   read(): { cpu: { ms: number; resolutionMs: number } | undefined; gaps: number };
   stop(): Promise<void>;
+  readonly recorded?: ReadonlyMap<number, string>;
 }
 
 export type GateCpuAccountantFactory = (marker: string, cwd: string) => GateCpuAccountant;
 const productionGateCpuAccountant: GateCpuAccountantFactory =
-  (marker, cwd) => new WorkerTreeCpuAccountant(marker, cwd);
+  (marker, cwd) => new WorkerTreeCpuAccountant(marker, cwd, undefined, undefined, new Map());
 let gateCpuAccountantFactory = productionGateCpuAccountant;
 
 /** Test seam for deterministic measurable/activity/gap samples without platform-specific ps output. */
@@ -190,6 +194,8 @@ export async function captureLlmOutput<T>(run: () => Promise<T>): Promise<{ valu
 
 export interface LlmRunResult {
   output: string;
+  /** Adapter-decoded raw evidence, from its init boundary onward; distinct from verdict text. */
+  streamRaw?: string;
   exitCode?: number;
   timedOut: boolean;
   launchNeverStarted?: boolean;
@@ -411,8 +417,20 @@ export class SeatLaunchError extends Error {
 export const REVIEW_FIRST_LIVENESS_MS = 30_000;
 // OBS-1039: a seat that wrote ten bytes and went quiet escaped the zero-byte beat and sat to the
 // ceiling. Below this many seat-authored bytes at the first beat the seat is `silent` — demoted and
-// re-routed then, not at the ceiling. Pane path only; a headless runner buffers and keeps its ceiling.
+// re-routed then, not at the ceiling. Pane path only; stream seats instead prove launch with init.
 export const REVIEW_SILENT_BYTE_FLOOR = 64;
+
+function gateStreamDecoder(adapter: WorkerAdapter, prompt: string): WorkerAdapter["streamTurn"] {
+  return (prompt.startsWith("TICKMARKR-JUDGE") || prompt.startsWith("TICKMARKR-REVIEW"))
+    ? adapter.streamTurn?.bind(adapter) : undefined;
+}
+
+// SHIP (queue row 267): mark only verdict seats; scope drafts share this runner but are not seats.
+function seatRoleFromPrompt(prompt: string): "judge" | "review" | undefined {
+  if (prompt.startsWith("TICKMARKR-JUDGE")) return "judge";
+  if (prompt.startsWith("TICKMARKR-REVIEW")) return "review";
+  return undefined;
+}
 
 async function runHeadlessDetailed(
   adapter: WorkerAdapter,
@@ -426,10 +444,27 @@ async function runHeadlessDetailed(
   try {
     const pf = join(dir, "prompt.md");
     writeFileSync(pf, prompt);
-    const r = await sh(adapter.headlessCommand(pf, model, effort), cwd, timeoutMs);
+    const decode = gateStreamDecoder(adapter, prompt);
+    const command = decode
+      ? adapter.headlessCommand(pf, model, effort, "stream")
+      : adapter.headlessCommand(pf, model, effort);
+    const ceiling = seatShellCeiling(timeoutMs);
+    const role = seatRoleFromPrompt(prompt);
+    const r = await (async () => {
+      try { return await sh(command, cwd, timeoutMs + 30_000, {
+        onSpawn: ceiling.onSpawn, ownsLeader: ceiling.ownsLeader,
+        ...(role ? { seat: role } : {}),
+      }); }
+      finally { await ceiling.stop(); }
+    })();
+    if (decode) {
+      const turn = decode(r.stdout);
+      return { output: turn.output, streamRaw: turn.raw, seatAuthoredBytes: turn.seatAuthoredBytes,
+        exitCode: r.code, timedOut: ceiling.timedOut || r.timedOut === true };
+    }
     const output = r.stdout + "\n" + r.stderr;
     const nonce = extractPromptNonce(prompt) ?? "";
-    return { output, exitCode: r.code, timedOut: r.timedOut === true,
+    return { output, exitCode: r.code, timedOut: ceiling.timedOut || r.timedOut === true,
       seatAuthoredBytes: Buffer.byteLength(reviewSeatOutput(output, nonce, adapter.harnessBannerRows).trim()) };
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -462,16 +497,35 @@ async function runViaDriverDetailed(
   let slot: Slot | undefined;
   let accountant: GateCpuAccountant | undefined;
   let forceClose = false;
+  const scriptPath = join(dir, "dispatch.sh");
+  const closeSeat = async () => {
+    if (!slot) return;
+    await accountant?.stop();
+    // Census before every close, including early launch/liveness failures and an exited script.
+    await reapSeatTree({ marker: scriptPath, recorded: accountant?.recorded });
+    await via.driver.close(slot);
+    slot = undefined;
+  };
   try {
     const pf = join(dir, "prompt.md");
     writeFileSync(pf, prompt);
-    const scriptPath = join(dir, "dispatch.sh");
+    const decode = gateStreamDecoder(adapter, prompt);
+    const streamPath = join(dir, "turn.jsonl");
+    if (decode) writeFileSync(streamPath, "");
+    const readTurn = () => decode?.(readFileSync(streamPath, "utf8"));
     // OBS-50: bootstrap in a script beside the prompt — pane sees one short bash line + banner, not the raw inline command
     const nonce = extractPromptNonce(prompt) ?? generateVerdictNonce();
+    const role = seatRoleFromPrompt(prompt);
     writeFileSync(scriptPath, [
       "export BASH_SILENCE_DEPRECATION_WARNING=1",
+      // D-2174: the pane shell's host may carry an inherited marker; only a judge or review seat names a role.
+      `unset ${SEAT_MARKER_ENV}`,
+      ...(role ? [`export ${SEAT_MARKER_ENV}=${role}`] : []),
       bannerShell(),
-      adapter.headlessCommand(pf, model, effort),
+      ...(decode ? ["set -o pipefail"] : []),
+      decode
+        ? `( ${adapter.headlessCommand(pf, model, effort, "stream")} ) | tee ${shq(streamPath)}`
+        : adapter.headlessCommand(pf, model, effort),
       gateExitTrailer(nonce),
     ].join("\n"));
     try {
@@ -512,7 +566,8 @@ async function runViaDriverDetailed(
       const startedAt = Date.now();
       out = await via.driver.read(slot, 400);
       const reviewing = prompt.startsWith("TICKMARKR-REVIEW");
-      seatAuthoredBytes = Buffer.byteLength(reviewSeatOutput(out, nonce, adapter.harnessBannerRows));
+      let turn = readTurn();
+      seatAuthoredBytes = turn?.seatAuthoredBytes ?? Buffer.byteLength(reviewSeatOutput(out, nonce, adapter.harnessBannerRows));
       let firstLivenessObserved = false;
       let priorSnapshot = normalizeStallSnapshot(out);
       const anchoredAt = Date.now();
@@ -528,7 +583,8 @@ async function runViaDriverDetailed(
         const matched = await via.driver.waitOutput(slot, exitPattern, sliceMs, { regex: true });
         const raw = await via.driver.read(slot, 400);
         out = raw;
-        seatAuthoredBytes = Math.max(seatAuthoredBytes, Buffer.byteLength(reviewSeatOutput(raw, nonce, adapter.harnessBannerRows)));
+        turn = readTurn();
+        seatAuthoredBytes = Math.max(seatAuthoredBytes, turn?.seatAuthoredBytes ?? Buffer.byteLength(reviewSeatOutput(raw, nonce, adapter.harnessBannerRows)));
         // waitOutput is the driver's authoritative marker match. The raw check covers drivers whose
         // wait timed out at the same boundary the marker landed; either way a trailer completes
         // normally and is never mistaken for inactivity.
@@ -538,36 +594,23 @@ async function runViaDriverDetailed(
         // The ceiling wins if it coincides with the first beat (or the read crosses it).
         // That seat was killed by its configured timeout, not an early launch reroute.
         if (now - startedAt >= timeoutMs) break;
-        // OBS-1177: the beat is armed for an INTERACTIVE (pane) driver only. On the subprocess driver
-        // a headless `claude -p` buffers every byte until it exits, so 0 seat bytes at 30 s is not a
-        // dead launch; that seat keeps its full ceiling, which still bounds it (fail-closed by timeout).
-        // Queue row 184: an adapter whose pane review command buffers its whole output until exit
-        // (claude-code's `claude -p`) has written nothing of its own until its verdict, working or
-        // dead, so the beat cannot tell the two apart and does not arm for it; its ceiling bounds it.
-        if (reviewing && via.driver.interactive && adapter.paneReviewBuffersOutput !== true && !firstLivenessObserved && now - startedAt >= REVIEW_FIRST_LIVENESS_MS) {
+        // Stream judge/review seats prove launch with init, not a byte floor: a thinking seat can
+        // legitimately emit nothing after init until its verdict. Other adapters retain their beat.
+        if ((reviewing || decode) && via.driver.interactive && adapter.paneReviewBuffersOutput !== true && !firstLivenessObserved && now - startedAt >= REVIEW_FIRST_LIVENESS_MS) {
           firstLivenessObserved = true;
-          // RS-2: the beat reads seat-authored bytes ALONE. CPU evidence never holds a preamble-only
-          // capture open to the ceiling; a seat that has not written one byte of its own is re-routed.
-          // OBS-944: the claude-code seat's 901 s capture was byte-identical across two legs and ended
-          // at the pane-identity line — that seat never started. Until 2.8.3 the orca checkout frame
-          // counted as seat bytes and kept every claude pane seat past this beat; once it stopped
-          // counting (row 135(a)) the beat killed working claude reviewers too, hence the declared
-          // exemption above (row 184), which restores that pre-2.8.3 bound for buffering adapters only.
-          // RULING-229-06 puts the beat on the PANE path only; a headless `-p` runner
-          // (runHeadlessDetailed, no pane, no beat) buffers every byte until completion and keeps its full ceiling.
-          if (seatAuthoredBytes === 0) {
+          if (turn ? !turn.started : seatAuthoredBytes === 0) {
             launchNeverStarted = true;
             forceClose = true;
             break;
           }
-          if (seatAuthoredBytes < REVIEW_SILENT_BYTE_FLOOR) {
+          if (!decode && seatAuthoredBytes < REVIEW_SILENT_BYTE_FLOOR) {
             silentAtBeat = true;
             forceClose = true;
             break;
           }
         }
         // Producing reviews own their full ceiling; inactivity is not a review verdict.
-        if (reviewing) continue;
+        if (reviewing || decode) continue;
         const snapshot = normalizeStallSnapshot(raw);
         if (snapshot !== priorSnapshot) {
           priorSnapshot = snapshot;
@@ -602,21 +645,27 @@ async function runViaDriverDetailed(
         }
       }
       timedOut = Date.now() - startedAt >= timeoutMs && !new RegExp(exitPattern).test(out);
-      if (timedOut && reviewing) forceClose = true;
+      if (timedOut && (reviewing || decode)) forceClose = true;
     }
     const exitCode = Number(new RegExp(`TICKMARKR_EXIT_${nonce}:(\\d+)`).exec(out)?.[1]);
+    // Quiesce a killed stream before the final snapshot, including bytes tee wrote during close.
+    if (forceClose && slot) {
+      await closeSeat();
+    }
+    const turn = readTurn();
     return {
-      output: dewrapPaneVerdict(out, nonce),
+      output: turn ? turn.output : dewrapPaneVerdict(out, nonce),
+      ...(turn ? { streamRaw: turn.raw } : {}),
       ...(Number.isFinite(exitCode) ? { exitCode } : {}),
       timedOut,
       launchNeverStarted,
       silentAtBeat,
-      seatAuthoredBytes,
+      seatAuthoredBytes: turn?.seatAuthoredBytes ?? seatAuthoredBytes,
     };
   } finally {
     try {
       await accountant?.stop();
-      if (slot && (forceClose || !via.keep)) await via.driver.close(slot);
+      if (slot && (forceClose || !via.keep)) await closeSeat();
     } finally {
       // Unconditional and synchronous: a stop/close failure must not leak this call's prompt and script.
       rmSync(dir, { recursive: true, force: true });

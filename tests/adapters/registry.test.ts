@@ -1012,6 +1012,7 @@ describe("hardcoded flag drift (v1.65 T3)", () => {
       a.interactiveCommand("/tmp/p.md", "m") ?? "",
       a.resumeCommand?.("sid", "/tmp/p.md", "m") ?? "",
       a.headlessCommand("/tmp/p.md", "m", "high"), // OBS-1182: --effort is emitted only with an effort
+      a.headlessCommand("/tmp/p.md", "m", undefined, "stream"),
     ].join("\n");
     // every token these builders emit that a CLI would parse as a flag
     const usedFlags = (cmd: string) =>
@@ -1042,7 +1043,7 @@ describe("hardcoded flag drift (v1.65 T3)", () => {
     expect(asked).toEqual(["help"]);
     // this direction is the one that catches it: a used-but-undeclared flag
     const undeclared = [...used].filter((f) => !UNCHANGED.includes(f));
-    expect(undeclared).toEqual(["--settings", "--prompt-suggestions", "--effort"]);
+    expect(undeclared).toEqual(["--settings", "--prompt-suggestions", "--effort", "--verbose"]);
   });
 
   test("every adapter whose command strings hardcode flags declares those flags for the probe", () => {
@@ -1057,6 +1058,7 @@ describe("hardcoded flag drift (v1.65 T3)", () => {
         a.interactiveCommand("/tmp/p.md", "m") ?? "",
         a.resumeCommand?.("sid", "/tmp/p.md", "m") ?? "",
         a.headlessCommand("/tmp/p.md", "m", "high"),
+        a.headlessCommand("/tmp/p.md", "m", undefined, "stream"),
       ].join("\n"));
       for (const f of a.hardcodedFlags!.flags) expect(t.has(f), `${a.id} declares ${f}`).toBe(true);
     }

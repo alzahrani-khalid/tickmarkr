@@ -374,12 +374,21 @@ test("test: the brief the production review gate delivers to a fake reviewer ada
   const result = await reviewGate(task, repo, base, author, CH, [fake], DEFAULT_CONFIG, undefined, undefined, artifacts);
   expect(result.pass).toBe(true);
   expect(promptSection(delivered, "Reviewer suite budget")).toBe(
-    "You may run at most the task's own test files explicitly named in files[]; these are the only suites you may run: `tests/own.test.ts`, `tests/view.spec.tsx`, `tests/node.test.mjs`. Never run the whole suite (including an unfiltered npm test or vitest run). The gate suite owns the runner lease; a parallel full suite starves the gate.",
+    "You may run at most the task's own test files explicitly named in files[]; these are the only suites you may run: `tests/own.test.ts`, `tests/view.spec.tsx`, `tests/node.test.mjs`. A test run you start may queue behind a running gate suite for minutes; if it is refused or has not finished, review from the diff instead. Never run the whole suite (including an unfiltered npm test or vitest run). The gate suite owns the runner lease; a parallel full suite starves the gate.",
   );
   expect(result.meta?.briefPath).toBeDefined();
   expect(readFileSync(String(result.meta?.briefPath), "utf8")).toBe(delivered);
   expect(dirname(String(result.meta?.briefPath))).toBe(dirname(String(result.meta?.rawPath)));
   expect(existsSync(String(result.meta?.rawPath))).toBe(true);
+});
+
+test("test: the review brief whose suite budget names the task's own test files says a test run may queue behind a running gate suite and that a refused or unfinished run means reviewing from the diff, while the budget that allows no suite keeps its bytes, so a brief silent on the queue fails", async () => {
+  const sentence = "A test run you start may queue behind a running gate suite for minutes; if it is refused or has not finished, review from the diff instead.";
+  const allowed = promptSection(await captureReviewPrompt(mkTask({ files: ["tests/own.test.ts"] })), "Reviewer suite budget");
+  expect(allowed).toContain("`tests/own.test.ts`");
+  expect(allowed).toContain(sentence);
+  const denied = promptSection(await captureReviewPrompt(mkTask({ files: ["src/tool.ts", "tests/*.test.ts"] })), "Reviewer suite budget");
+  expect(denied).toBe("No suite may be run: files[] names no explicit test file owned by this task. Never run the whole suite (including an unfiltered npm test or vitest run). The gate suite owns the runner lease; a parallel full suite starves the gate.");
 });
 
 describe("pickReviewer", () => {

@@ -1,7 +1,8 @@
 import { type ChildProcess, spawn, spawnSync, type SpawnSyncOptions, type SpawnSyncReturns } from "node:child_process";
 import { shq } from "../adapters/types.js";
 import { createWorktree, FORK_CAP_ENV, resolvedForkCap } from "../run/git.js";
-import { HOST_SESSION_VARS, withoutHostSession } from "./host-env.js";
+import { HOST_SESSION_VARS, SEAT_MARKER_ENV, withoutHostSession } from "./host-env.js";
+import { workerReapHost } from "../run/stall.js";
 import type { ExecutorDriver, NotificationPost, NotifyOpts, Slot, TransportState } from "./types.js";
 
 export type NotificationPoster = (command: string, args: string[], options: SpawnSyncOptions) =>
@@ -31,25 +32,28 @@ export const HERDR_CONTROL_VARS = [
 /**
  * Copy of worker env with the fork cap applied and host control-plane and host-session vars stripped.
  * Workers retain the run's concurrency-derived cap (resolvedForkCap), independently of
- * verification's suite-window budget. The operator's own export still wins.
+ * verification's suite-window budget. The operator's own export still wins. An inherited seat marker is stripped
+ * (D-2174): a pane seat's own script exports its role after this seal.
  */
 export function sealHerdrEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   const out = withoutHostSession(env); // queue row 193
   if (!(FORK_CAP_ENV in out)) out[FORK_CAP_ENV] = resolvedForkCap();
   for (const k of HERDR_CONTROL_VARS) delete out[k];
+  delete out[SEAT_MARKER_ENV];
   return out;
 }
 
-/** Pane/login-shell form of the same host-neutral worker env seal (herdr seed + daemon setup). */
+/** Pane/login-shell form of the same host-neutral worker env seal (herdr seed + daemon setup). A pane shell takes its
+ * environment from its host, not the daemon's seal, so the inherited seat marker is unset here too (D-2174). */
 export function herdrSealShellPrefix(env: NodeJS.ProcessEnv = process.env): string {
   const forkCap = sealHerdrEnv(env)[FORK_CAP_ENV] ?? resolvedForkCap();
   return `export ${FORK_CAP_ENV}=${shq(forkCap)}; ` +
-    HERDR_CONTROL_VARS.map((k) => `unset ${k}`).join("; ") + `; unset ${HOST_SESSION_VARS.join(" ")}; `;
+    HERDR_CONTROL_VARS.map((k) => `unset ${k}`).join("; ") + `; unset ${HOST_SESSION_VARS.join(" ")}; unset ${SEAT_MARKER_ENV}; `;
 }
 
 /** Queue row 108 (D-1622): ONE invocation's own stream state, written only by that invocation's process listeners. */
 interface Invocation { closed: boolean; exitCode: number | null; signal: string | null }
-interface SlotState { buf: string; receivedBytes: number; proc?: ChildProcess; exited: boolean; invocation?: Invocation }
+interface SlotState { buf: string; receivedBytes: number; proc?: ChildProcess; identity?: Promise<string | null | undefined>; exited: boolean; invocation?: Invocation }
 
 export class SubprocessDriver implements ExecutorDriver {
   id = "subprocess";
@@ -114,6 +118,7 @@ export class SubprocessDriver implements ExecutorDriver {
       detached: true,
     });
     s.proc = p;
+    s.identity = p.pid === undefined ? Promise.resolve(undefined) : workerReapHost.identity(p.pid);
     // Queue row 233 (D-2130): count both received streams before retention truncates the tail.
     const receive = (d: Buffer) => {
       s.receivedBytes += d.length;
@@ -183,7 +188,18 @@ export class SubprocessDriver implements ExecutorDriver {
   async close(slot: Slot): Promise<void> {
     const s = this.slots.get(slot.id);
     if (s?.proc && !s.exited) {
-      try { process.kill(-s.proc.pid!, "SIGKILL"); } catch { s.proc.kill("SIGKILL"); }
+      const pid = s.proc.pid;
+      const identity = await s.identity;
+      if (pid !== undefined && identity && await workerReapHost.identity(pid) === identity) {
+        try { workerReapHost.kill(-pid); }
+        catch {
+          // The group probe can fail slowly enough for the leader pid to be reused.
+          if (await workerReapHost.identity(pid) === identity) {
+            try { workerReapHost.kill(pid); }
+            catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
+          }
+        }
+      }
     }
     this.slots.delete(slot.id);
   }

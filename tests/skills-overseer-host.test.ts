@@ -109,7 +109,8 @@ test("the overseer skill's setup opens with the project memory rule on herdr, on
 test("Cite the changed engine-default paragraph, worker tab line and brief list naming no GSD leg, and the rescued subsection whose items two to four are byte-identical to the deleted ones, versus a diff that rewraps a rescued line or leaves a reference to a deleted section", () => {
   const skill = readShippedSkill();
   // Queue row 242; D-2141, D-2152: these digests pin the original items, including numbers and three-space wraps.
-  const seats = rescuedSeats(skill);
+  // Queue row 286: exclude only the required author addition, pinned in skills-verify-author.test.ts.
+  const seats = rescuedSeats(skill).replace(" --author <adapter:model of the agent that wrote it>", "");
   const digests = [
     "2bd2610bc3b024ef984e1a5ae915fec5de05c8dc9afcb0a3729c6dd30b85ce86",
     "0e6ce44042ad45cadc27fc9d1c0ccc9762af22e29078f18528ce77961f4f3fd4",

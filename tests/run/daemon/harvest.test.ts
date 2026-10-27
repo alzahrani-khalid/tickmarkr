@@ -6,7 +6,7 @@ import { chmodSync, existsSync, readFileSync, realpathSync, writeFileSync } from
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomBytes } from "node:crypto";
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { describe, expect, test, vi } from "vitest";
 import * as stall from "../../../src/run/stall.js";
 import { FakeAdapter } from "../../../src/adapters/fake.js";
@@ -22,6 +22,31 @@ import { setAttemptHardTimeoutMsForTests, resetAttemptHardTimeoutMsForTests, HAR
 import { gitHead } from "../../../src/run/git.js";
 import { Journal, type JournalEvent } from "../../../src/run/journal.js";
 import { COMMIT, makeTestTempDir, setupRepo, T } from "../../helpers/tmprepo.js";
+
+// Startup includes imports, repo setup and daemon settlement. Only an event-loop leak AFTER
+// settlement owes a prompt exit; a loaded host gets a separate launch ceiling.
+const SETTLED_MARKER = "accountant-cleanup-settled";
+const waitForSettledExit = (child: ChildProcess) => new Promise<{
+  stdout: string; stderr: string; exitCode: number | null; settled: boolean;
+  launchTimedOut: boolean; killedForLeak: boolean;
+}>((resolve, reject) => {
+  let stdout = "", stderr = "", settled = false, launchTimedOut = false, killedForLeak = false;
+  let timer = setTimeout(() => { launchTimedOut = true; child.kill("SIGKILL"); }, 60_000);
+  child.stdout!.on("data", chunk => {
+    stdout += chunk;
+    if (!settled && stdout.includes(SETTLED_MARKER)) {
+      settled = true;
+      clearTimeout(timer);
+      timer = setTimeout(() => { killedForLeak = true; child.kill("SIGKILL"); }, 4_000);
+    }
+  });
+  child.stderr!.on("data", chunk => { stderr += chunk; });
+  child.once("error", error => { clearTimeout(timer); reject(error); });
+  child.once("close", exitCode => {
+    clearTimeout(timer);
+    resolve({ stdout, stderr, exitCode, settled, launchTimedOut, killedForLeak });
+  });
+});
 
 // ── T2 (OBS-264): finished work is harvested, never redone ─────────────────────────────────────
 // Every case here rides a worker that COMMITS and then goes quiet without a trailer — the exact
@@ -161,7 +186,7 @@ describe("harvest: finished work is gated, never redispatched (OBS-264)", () => 
   // loopback sockets run wherever permitted; only EPERM/EACCES uses the managed sandbox fallback.
   // CPU is pinned independently so connection cases cannot pass by accidentally burning CPU.
   const connectionCase = async (mode: "held" | "none" | "close" | "child-gone" | "error" | "hang", options: {
-    interactive?: boolean; burning?: boolean; commits?: boolean;
+    interactive?: boolean; burning?: boolean; commits?: boolean; releaseMs?: number;
   } = {}) => {
     const dir = makeTestTempDir("tickmarkr-connections-");
     const state = join(dir, "state.json"), control = join(dir, "control"), calls = join(dir, "calls.jsonl");
@@ -292,7 +317,7 @@ describe("harvest: finished work is gated, never redispatched (OBS-264)", () => 
       heartbeat++;
       if (existsSync(control) && readFileSync(control, "utf8") === "exit-at-deadline") {
         const first = JSON.parse(readFileSync(calls, "utf8").trim().split("\n")[0]!);
-        if (Date.now() - first.at >= 14_500) writeFileSync(control, "exit");
+        if (Date.now() - first.at >= (options.releaseMs ?? 14_500)) writeFileSync(control, "exit");
       }
       if (options.burning && existsSync(state) && heartbeat >= 35) writeFileSync(control, "exit");
     }, 100);
@@ -344,19 +369,35 @@ describe("harvest: finished work is gated, never redispatched (OBS-264)", () => 
 
   test("test: with an lsof stand-in that never returns, each reading is one asynchronous query reading no environment, selecting the owned process group or its complete pid set intersected by -a with established TCP, timed out as unreadable by a deadline counted from invocation, and the wait still ends at the worker's exit, so a broad, synchronous or unbounded reading fails", async () => {
     const { events, calls, heartbeat } = await connectionCase("hang");
-    expect(calls).toHaveLength(1);
-    expect(calls[0]!.args).toEqual(["-nP", "-a", "-g", calls[0]!.group, "-iTCP", "-sTCP:ESTABLISHED", "-Fp"]);
-    expect(heartbeat).toBeGreaterThan(140);
     const unreadable = events.find(event => event.event === "worker-harvest-unmeasurable");
     expect(unreadable?.data.reason).toMatch(/connection reading/);
+    // The daemon writes this verdict before it can take another reading. A late worker exit
+    // may legitimately start a second query AFTER that row; only the verdict's window counts.
+    const beforeUnreadable = calls.filter(call => call.at < Date.parse(unreadable!.ts));
+    expect(beforeUnreadable).toHaveLength(1);
+    expect(calls[0]!.args).toEqual(["-nP", "-a", "-g", calls[0]!.group, "-iTCP", "-sTCP:ESTABLISHED", "-Fp"]);
+    expect(heartbeat).toBeGreaterThan(140);
     const elapsed = Date.parse(unreadable!.ts) - calls[0]!.at;
     expect(elapsed).toBeGreaterThanOrEqual(14_000);
     expect(elapsed).toBeLessThan(18_000);
-    expect(() => process.kill(calls[0]!.pid, 0)).toThrow();
+    for (const call of calls) expect(() => process.kill(call.pid, 0), JSON.stringify(call)).toThrow();
     expect(events.filter(event => event.event === "worker-harvest")).toHaveLength(0);
     expect(events.find(event => event.event === "worker-result")?.data.finished).toBe(true);
     const source = readFileSync(new URL("../../../src/run/daemon.ts", import.meta.url), "utf8");
     expect(source).not.toMatch(/(?:ps\s+eww|\/proc\/[^\n]*\/environ)/);
+  }, 60_000);
+
+  test("test: with the worker released half a second after the first reading's deadline a second reading starts after the unreadable row, yet exactly one reading started before it and every recorded reading's process is dead, so a count of every recorded reading fails", async () => {
+    const { events, calls } = await connectionCase("hang", { releaseMs: 15_500 });
+    const unreadable = events.find(event => event.event === "worker-harvest-unmeasurable");
+    expect(unreadable?.data.reason).toMatch(/connection reading/);
+    const verdictAt = Date.parse(unreadable!.ts);
+    expect(calls.length).toBeGreaterThan(1);
+    expect(calls.filter(call => call.at < verdictAt)).toHaveLength(1);
+    expect(calls[1]!.at).toBeGreaterThan(verdictAt);
+    for (const call of calls) expect(() => process.kill(call.pid, 0), JSON.stringify(call)).toThrow();
+    expect(events.filter(event => event.event === "worker-harvest")).toHaveLength(0);
+    expect(events.find(event => event.event === "worker-result")?.data.finished).toBe(true);
   }, 60_000);
 
   test("test: an interactive committed silent worker with flat CPU holding an open connection is still harvested, and an interactive worker burning CPU is still not concluded, so a connection leg applied to pane workers or a weakened CPU leg fails", async () => {
@@ -724,7 +765,7 @@ describe("harvest: finished work is gated, never redispatched (OBS-264)", () => 
     });
   }, 120_000);
 
-  test("a wait-loop exception always stops the worker CPU accountant", async () => {
+  const assertWaitLoopStopsAccountant = async () => {
     const probeDir = makeTestTempDir("tickmarkr-accountant-cleanup-");
     const probe = join(probeDir, "probe.ts");
     const daemonUrl = new URL("../../../src/run/daemon.ts", import.meta.url).href;
@@ -754,7 +795,7 @@ describe("harvest: finished work is gated, never redispatched (OBS-264)", () => 
       '  if (!Journal.open(repo, "run-accountant-cleanup").read().some((row) => row.event === "contact-unreadable" && row.data.source === "driver")) throw new Error("the wait loop never observed the injected failure");',
       '  if (!summary.human.includes("T1")) throw new Error(`unexpected summary: ${JSON.stringify(summary)}`);',
       "} finally { resetHarvestSilentMsForTests(); resetHarvestCpuFlatMsForTests(); }",
-      'process.stdout.write("accountant-cleanup-settled\\n");',
+      `process.stdout.write(${JSON.stringify(SETTLED_MARKER + "\n")});`,
       "}",
       "main().catch((error) => { console.error(error); process.exitCode = 1; });",
     ].join("\n"));
@@ -763,26 +804,36 @@ describe("harvest: finished work is gated, never redispatched (OBS-264)", () => 
       cwd: dirname(fileURLToPath(import.meta.url)),
       stdio: ["ignore", "pipe", "pipe"],
     });
-    let stdout = "";
-    let stderr = "";
-    child.stdout.on("data", (chunk) => { stdout += chunk; });
-    child.stderr.on("data", (chunk) => { stderr += chunk; });
-    let killedForLeak = false;
-    const exitCode = await new Promise<number | null>((resolve) => {
-      const timer = setTimeout(() => {
-        killedForLeak = true;
-        child.kill("SIGKILL");
-      }, 4_000);
-      child.once("close", (code) => {
-        clearTimeout(timer);
-        resolve(code);
-      });
-    });
+    const { stdout, stderr, exitCode, settled, launchTimedOut, killedForLeak } = await waitForSettledExit(child);
 
+    expect(launchTimedOut, stderr).toBe(false);
+    expect(settled, stderr).toBe(true);
     expect(killedForLeak, stderr).toBe(false);
     expect(exitCode, stderr).toBe(0);
-    expect(stdout).toContain("accountant-cleanup-settled");
-  }, 15_000);
+    expect(stdout).toContain(SETTLED_MARKER);
+  };
+  test("a wait-loop exception always stops the worker CPU accountant", assertWaitLoopStopsAccountant, 90_000);
+
+  test("test: the settled-exit bound passes a child that starts slowly and exits within the bound after printing its settled marker, and kills one that prints the marker and keeps running, so a bound measured from spawn fails", async () => {
+    const slow = spawn(process.execPath, ["-e", `
+      setTimeout(() => {
+        process.stdout.write(${JSON.stringify(SETTLED_MARKER + "\n")});
+        setTimeout(() => process.exit(0), 100);
+      }, 4_500);
+    `], { stdio: ["ignore", "pipe", "pipe"] });
+    const exited = await waitForSettledExit(slow);
+    expect(exited, exited.stderr).toMatchObject({ settled: true, launchTimedOut: false, killedForLeak: false, exitCode: 0 });
+    expect(() => process.kill(slow.pid!, 0)).toThrow();
+
+    const leaking = spawn(process.execPath, ["-e", `
+      process.stdout.write(${JSON.stringify(SETTLED_MARKER + "\n")});
+      setInterval(() => {}, 1000);
+    `], { stdio: ["ignore", "pipe", "pipe"] });
+    const killed = await waitForSettledExit(leaking);
+    expect(killed, killed.stderr).toMatchObject({ settled: true, launchTimedOut: false, killedForLeak: true, exitCode: null });
+    expect(leaking.signalCode).toBe("SIGKILL");
+    expect(() => process.kill(leaking.pid!, 0)).toThrow();
+  }, 90_000);
 
   test("test: a worker still burning CPU is not concluded however silent its tracker is", async () => {
     // Pin three seconds, not one sparse observation: the window crosses three complete burner/gap

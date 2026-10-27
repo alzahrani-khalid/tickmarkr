@@ -18,7 +18,7 @@ vi.mock("../../src/run/git.js", async (importOriginal) => {
   const actual = await importOriginal<{ sh: typeof sh }>();
   return {
     ...actual,
-    sh: vi.fn((cmd: string, cwd: string, timeoutMs?: number) => actual.sh(cmd, cwd, timeoutMs)),
+    sh: vi.fn((cmd: string, cwd: string, timeoutMs?: number, options?: Parameters<typeof sh>[3]) => actual.sh(cmd, cwd, timeoutMs, options)),
   };
 });
 
@@ -372,7 +372,9 @@ describe("consult", () => {
     expect(v).toMatchObject({ action: "retry", notes: "headless bytes" });
     expect(built).toBeDefined();
     expect(shMock).toHaveBeenCalledTimes(1);
-    expect(shMock).toHaveBeenCalledWith(built!.command, "/tmp", cfg.consult.stallMinutes * 60_000);
+    expect(shMock).toHaveBeenCalledWith(built!.command, "/tmp", cfg.consult.stallMinutes * 60_000 + 30_000, {
+      onSpawn: expect.any(Function), ownsLeader: expect.any(Function), seat: "consult",
+    });
     expect(readdirSync(join(runDir, "consults")).some((f) => f.endsWith(".sh"))).toBe(false);
     const promptFile = join(runDir, "consults", readdirSync(join(runDir, "consults")).find((f) => f.endsWith(".md"))!);
     expect(built).toMatchObject({ promptFile, model: cfg.consult.model });

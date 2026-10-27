@@ -342,8 +342,8 @@ test("test: a pane review whose capture holds only the orca launch preamble and 
 });
 
 test("test: a pane review by an adapter whose print mode buffers its whole output until exit is not re-routed at the first liveness beat while it has written nothing and passes on the verdict it prints at exit, the same buffering seat that never exits ends at its ceiling as silent with zero seat bytes, and an adapter that does not buffer is still re-routed at that beat, so a beat that kills a working buffering reviewer fails", async () => {
-  // Queue row 184: claude-code is the buffering adapter (its pane review command is `claude -p … --output-format text`).
-  expect(claudeCode.paneReviewBuffersOutput).toBe(true);
+  // Claude gate seats stream now; synthetic buffering adapters still retain the generic exemption.
+  expect(claudeCode.paneReviewBuffersOutput).toBeUndefined();
   expect(qwen.paneReviewBuffersOutput).toBeUndefined();
   const buffering = () => Object.assign(reviewer(), { paneReviewBuffersOutput: true });
   expect(reviewSeatOutput(ORCA_PREAMBLE, "test-nonce", [])).toBe("");

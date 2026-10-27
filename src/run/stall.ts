@@ -185,9 +185,136 @@ export const workerReapHost = {
     } catch { return undefined; }
   },
   // Lazy: a partial module mock of git.js must not fail at import time.
-  identity: (pid: number): Promise<string | null | undefined> => processIdentity(pid),
+  async identity(pid: number): Promise<string | null | undefined> {
+    try { return await processIdentity(pid); } catch { return null; }
+  },
   kill(pid: number): void { process.kill(pid, "SIGKILL"); },
 };
+
+export interface SeatReapOwnership {
+  root?: { pid: number; identity: string };
+  marker?: string;
+  recorded?: ReadonlyMap<number, string>;
+}
+
+/** SHIP, D-2165 add.5: census a seat BEFORE closing it, while detached tools still have ancestry.
+ * Unlike worker reaping, an active daemon shell may be the seat itself. cwd grants no ownership.
+ * The initial census is the entire authority; later snapshots only name survivors. */
+export async function reapSeatTree({ root, marker, recorded }: SeatReapOwnership): Promise<number[] | null> {
+  const rows = await workerReapHost.snapshot();
+  if (!rows) return null;
+  const byPid = new Map(rows.map((row) => [row.pid, row]));
+  const protectedPids = new Set<number>([1, process.pid]);
+  for (let row = byPid.get(process.pid); row && !protectedPids.has(row.ppid); row = byPid.get(row.ppid)) {
+    protectedPids.add(row.ppid);
+  }
+  const ownGroup = byPid.get(process.pid)?.group;
+  // Without the daemon's row we cannot prove its group or its ancestors safe.
+  if (ownGroup === undefined) return null;
+  const tree = new Map<number, ReapProcess>();
+  const parent = new Map<number, number>();
+  const seeds = rows.filter((row) => row.pid > 1 && !protectedPids.has(row.pid) && (
+    (root?.pid === row.pid && root.identity === row.identity)
+    || (marker !== undefined && (row.command === `bash ${marker}` || row.command === `/bin/bash ${marker}`))
+    || recorded?.get(row.pid) === row.identity));
+  // A stale seed must not confer ownership on its replacement's children.
+  for (const row of seeds) if (await workerReapHost.identity(row.pid) === row.identity) tree.set(row.pid, row);
+  for (let grew = true; grew;) {
+    grew = false;
+    for (const row of rows) if (row.pid > 1 && !tree.has(row.pid) && !protectedPids.has(row.pid) && tree.has(row.ppid)) {
+      tree.set(row.pid, row);
+      parent.set(row.pid, row.ppid);
+      grew = true;
+    }
+  }
+  const invalid = new Set<number>();
+  const signalled = new Set<number>();
+  const currentPath = async (pid: number): Promise<boolean> => {
+    const ancestor = parent.get(pid);
+    if (ancestor !== undefined && !await currentPath(ancestor)) return false;
+    if (invalid.has(pid)) return false;
+    const identity = await workerReapHost.identity(pid);
+    if (identity === tree.get(pid)!.identity) return true;
+    // Our own earlier group signal may already have retired an ancestor.
+    if (identity === undefined && signalled.has(pid)) return true;
+    invalid.add(pid);
+    return false;
+  };
+  const depth = (pid: number): number => parent.has(pid) ? 1 + depth(parent.get(pid)!) : 0;
+  const targets = [...tree.values()].sort((a, b) => depth(b.pid) - depth(a.pid));
+  let unknown = false;
+  const kill = (pid: number) => {
+    try { workerReapHost.kill(pid); return true; }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") unknown = true; return false; }
+  };
+  const groups = [...new Set([...tree.values()].map((row) => row.group))];
+  for (const group of groups) {
+    const members = rows.filter((row) => row.group === group);
+    if (group <= 1 || group === ownGroup || !members.every((row) => tree.has(row.pid))) continue;
+    let safe = true;
+    for (const row of members) if (!await currentPath(row.pid)) safe = false;
+    if (safe) {
+      const identities = await Promise.all(members.map((row) => workerReapHost.identity(row.pid)));
+      identities.forEach((identity, index) => {
+        if (identity !== members[index]!.identity) { safe = false; invalid.add(members[index]!.pid); }
+      });
+    }
+    if (safe && kill(-group)) for (const row of members) signalled.add(row.pid);
+  }
+  const killPids = async (candidates: ReapProcess[]) => {
+    for (const row of candidates) {
+      if (!await currentPath(row.pid)) continue;
+      // Recheck the target itself immediately before its own signal, even after ancestor probes.
+      if (await workerReapHost.identity(row.pid) !== row.identity) { invalid.add(row.pid); continue; }
+      if (kill(row.pid)) signalled.add(row.pid);
+    }
+  };
+  await killPids(targets);
+  if (!tree.size) return [];
+  let survivors: ReapProcess[] = [];
+  for (let probe = 0; probe < 5; probe++) {
+    const fresh = await workerReapHost.snapshot();
+    if (!fresh) return null;
+    survivors = fresh.filter((row) => tree.get(row.pid)?.identity === row.identity && !invalid.has(row.pid));
+    if (!survivors.length) return unknown ? null : [];
+    if (probe < 4) {
+      await killPids(survivors);
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  }
+  return unknown ? null : survivors.map((row) => row.pid);
+}
+
+/** Seat callers own the first ceiling; the shell's pipe-drain backstop runs 30 seconds later. */
+export function seatShellCeiling(timeoutMs: number): {
+  onSpawn: (pid: number | undefined) => void;
+  ownsLeader: (pid: number) => Promise<boolean>;
+  stop: () => Promise<void>;
+  timedOut: boolean;
+} {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let reaping: Promise<unknown> | undefined;
+  let birth: Promise<string | null | undefined> = Promise.resolve(undefined);
+  const ceiling = {
+    timedOut: false,
+    onSpawn(pid: number | undefined) {
+      if (timer) clearTimeout(timer);
+      const born = pid === undefined ? Promise.resolve(undefined) : workerReapHost.identity(pid);
+      birth = born;
+      timer = setTimeout(() => {
+        ceiling.timedOut = true;
+        reaping = born.then((identity) => reapSeatTree({ root: pid !== undefined && identity ? { pid, identity } : undefined }));
+      }, timeoutMs);
+    },
+    /** D-2174: the shell's own signals reach the seat's leader or group only while it bears its spawn identity. */
+    async ownsLeader(pid: number): Promise<boolean> {
+      const recorded = await birth;
+      return !!recorded && await workerReapHost.identity(pid) === recorded;
+    },
+    async stop() { clearTimeout(timer); await reaping; },
+  };
+  return ceiling;
+}
 
 async function reapWorkerProcesses(group: number | undefined, cwd: string, ownership: WorkerReapOwnership): Promise<number[] | null> {
   let root: string;
@@ -452,9 +579,28 @@ export class WorkerTreeCpuAccountant {
   private latest: { ms: number; resolutionMs: number } | undefined;
 
   constructor(private marker: string, private cwd: string, private group?: () => number | undefined,
-    private identities?: Map<number, string>) {}
+    private identities?: Map<number, string>, readonly recorded?: Map<number, string>) {}
 
   private async sample(): Promise<void> {
+    if (this.recorded) {
+      // Gate seats keep birth receipts while the script lives, so an exited pane can still retire
+      // a detached tool. Worker accounting and worker reaping retain their existing path.
+      const rows = await workerReapHost.snapshot();
+      if (rows) {
+        const tree = new Set<number>();
+        for (let grew = true; grew;) {
+          grew = false;
+          for (const row of rows) if (!tree.has(row.pid) && (row.command === `bash ${this.marker}`
+            || row.command === `/bin/bash ${this.marker}` || tree.has(row.ppid))) {
+            if (this.recorded.has(row.pid) && this.recorded.get(row.pid) !== row.identity) continue;
+            if (await workerReapHost.identity(row.pid) !== row.identity) continue;
+            tree.add(row.pid);
+            this.recorded.set(row.pid, row.identity);
+            grew = true;
+          }
+        }
+      }
+    }
     const snapshot = await workerTreeCpuSnapshot(this.marker, this.cwd, this.group?.(), this.identities);
     if (snapshot === undefined) {
       this.gaps++;

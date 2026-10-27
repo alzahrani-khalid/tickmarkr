@@ -6,6 +6,7 @@ import type { TickmarkrConfig } from "../config/config.js";
 import type { Effort, Task } from "../graph/schema.js";
 import { withoutHostSession } from "../drivers/host-env.js";
 import { parseWorkerResult } from "./prompt.js";
+import { decodeClaudeStream } from "./claude-stream.js";
 import { type Assignment, type AuthHealth, type BillingChannel, channelsFromConfig, type ContextUsage, declareInputBox, type Invocation, MODEL_ID_RE, promptFitsArgv, type SessionRef, shq, type TokenUsage, TokenUsageSchema, type TrustDialog, type WorkerAdapter } from "./types.js";
 
 // SPEND-01/SPEND-11: claude writes a per-session JSONL to ~/.claude/projects/<slug>/ where slug is the
@@ -236,7 +237,7 @@ export const claudeCode: WorkerAdapter = {
   channels: (cfg: TickmarkrConfig): BillingChannel[] => channelsFromConfig("claude-code", cfg),
   // v1.65 T3: every flag the command builders below hardcode — doctor checks `claude --help` still
   // lists each (all present on claude 2.x, verified 2026-07-22). Advisory only, never routing.
-  hardcodedFlags: { binary: "claude", flags: ["-p", "--model", "--permission-mode", "--strict-mcp-config", "--mcp-config", "--output-format", "-r", "--prompt-suggestions", "--settings", "--effort"] },
+  hardcodedFlags: { binary: "claude", flags: ["-p", "--model", "--permission-mode", "--strict-mcp-config", "--mcp-config", "--output-format", "-r", "--prompt-suggestions", "--settings", "--effort", "--verbose"] },
   // --strict-mcp-config --mcp-config '{"mcpServers":{}}': pin the MCP surface to empty so fresh-worktree
   // workers/gates don't load project .mcp.json servers (herdr scrapes dialogs as idle — v1.4 incident,
   // memory tickmarkr-worker-mcp-dialog-stall). Live-verified 2026-07-10 on claude 2.1.205 (operator check):
@@ -248,11 +249,9 @@ export const claudeCode: WorkerAdapter = {
   // flag must always follow the value, never the prompt.
   // The empty -p argument selects print mode while stdin carries the prompt, keeping its nonce out
   // of process argv. The redirect path is shell-quoted independently from the model.
-  headlessCommand: (promptFile: string, model: string, effort?: Effort) =>
-    `claude -p '' --model ${shq(model)}${claudeEffortFlag(effort)} --permission-mode bypassPermissions --strict-mcp-config --mcp-config '{"mcpServers":{}}' --output-format text < ${shq(promptFile)}`,
-  // Queue row 184: `--output-format text` prints nothing until the turn ends, so a working pane reviewer reads zero seat bytes at
-  // the first-liveness beat; the beat must not re-route it (2.8.3 killed every claude pane reviewer at 30 s).
-  paneReviewBuffersOutput: true,
+  headlessCommand: (promptFile: string, model: string, effort?: Effort, output?: "stream") =>
+    `claude -p '' --model ${shq(model)}${claudeEffortFlag(effort)} --permission-mode bypassPermissions --strict-mcp-config --mcp-config '{"mcpServers":{}}' --output-format ${output === "stream" ? "stream-json --verbose" : "text"} < ${shq(promptFile)}`,
+  streamTurn: decodeClaudeStream,
   // HYG-03 / OBS-137: the residual first-entry dialog is workspace trust, not MCP config loading.
   // Claude's only store is global last-writer-wins ~/.claude.json, so tickmarkr still does not seed it;
   // the daemon safely answers only the exact adapter-declared dialog once per slot.

@@ -20,11 +20,12 @@ import {
   ExecutionPolicySchema, DEFAULT_DIFF_CAP, globalConfigDir, loadConfigWithMode, readOverlayFile, repoOverlayPath,
   type ModeResolution, type RoutingMode, type TickmarkrConfig,
 } from "../config/config.js";
+import { SEAT_MARKER_ENV } from "../drivers/host-env.js";
 import { DeliveryReadinessError } from "../drivers/herdr.js";
 import { driverEvidence, type DriverChoice } from "../drivers/index.js";
 import { herdrSealShellPrefix, MAX_BUF, SubprocessDriver } from "../drivers/subprocess.js";
 import { formatOwnedName, type ExecutorDriver, type Slot } from "../drivers/types.js";
-import { type Baseline, type BaselineProvenance, captureBaseline, detectGateCommands, detectVacuousOracles, type GateEvidenceOptions } from "../gates/baseline.js";
+import { type Baseline, type BaselineProvenance, captureBaseline, detectGateCommands, detectVacuousOracles, type GateEvidenceOptions, hostStarvedRerunNote } from "../gates/baseline.js";
 import { reobserveTestFiles, runGates, type GateContext, type GateEvent } from "../gates/run-gates.js";
 import { environmentFingerprint, getVerdictStore, isInfraResult, resolveStateDir } from "../gates/cache.js";
 import { RUNNER_INFRA_DIAGNOSTIC_RE, timeoutShaped } from "../gates/timeout-shaped.js";
@@ -706,7 +707,9 @@ function repairFindingsBrief(results: GateResult[]): string {
     const reproducers = g.gate === "review" && Array.isArray(g.meta?.reproducers)
       ? g.meta.reproducers.filter((row): row is { fingerprint: string; text: string } => row !== null
         && typeof row === "object" && typeof row.fingerprint === "string" && typeof row.text === "string") : [];
-    return `${g.gate}: ${readableExcerpt(g.details)}` + (Array.isArray(evidence) && evidence.length
+    // Queue row 291 (D-2174): the next worker learns the red survived a calm-window rerun and how long it waited.
+    const rerun = hostStarvedRerunNote(g.meta?.hostStarvedRerun);
+    return `${g.gate}: ${rerun && !g.details.includes(rerun) ? `${rerun}: ` : ""}${readableExcerpt(g.details)}` + (Array.isArray(evidence) && evidence.length
       ? `\nAssertion evidence:\n${JSON.stringify(evidence, null, 2)}` : "")
       + (reproducers.length ? "\n\n### Reviewer reproducers — replay these first; land each as an owned test\n"
         + reproducers.map(({ fingerprint, text }) => `Reproducer for \`${fingerprint}\`:\n${text}`).join("\n\n") : "");
@@ -2437,6 +2440,9 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
   if (process.env[COMMAND_LEASE_TOKEN_ENV]) {
     delete process.env[COMMAND_LEASE_TOKEN_ENV];
   }
+  // D-2174 (queue row 267): a daemon started from a seat (a review seat's owned test, say) is no seat; clear the inherited
+  // marker at run-start so nothing it launches is told apart as one.
+  delete process.env[SEAT_MARKER_ENV];
   // v1.51 T2 / OBS-89 (v1.60): retired --quality env seam. Mode resolution owns premium routing;
   // route() no longer reads the retired env at all, so the old entrypoint scrub is gone with it.
   const adapters = opts.adapters ?? allAdapters();
@@ -5730,6 +5736,8 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         // Shell startup can swallow the driver's leading cd; the payload owns its checkout too.
         `cd ${shq(wt)} || exit 1`,
         `export ${VITEST_CACHE_ENV}=${shq(worktreeVitestCache(wt))}`,
+        // D-2174: a pane shell's host may carry an inherited seat marker; a worker is never a seat.
+        `unset ${SEAT_MARKER_ENV}`,
         // A driver may launch inside the daemon's group. That group is never worker-owned.
         `worker_pgid=$(ps -o pgid= -p $$ 2>/dev/null); daemon_pgid=$(ps -o pgid= -p ${process.pid} 2>/dev/null)`,
         `if [ -n "$worker_pgid" ] && [ -n "$daemon_pgid" ] && [ "$worker_pgid" != "$daemon_pgid" ]; then printf '%s\\n' "$worker_pgid" > ${shq(groupFile)}; fi`,

@@ -2730,7 +2730,8 @@ const owedGit = (cwd: string, args: string[], input?: string): string => {
   assertGitTrust(cwd);
   const argv = NO_DRIVERS.has(args[0]!) ? [args[0]!, "--no-ext-diff", "--no-textconv", ...args.slice(1)] : args;
   return execFileSync("git", [...OWED_CONFIG, ...argv], {
-    cwd, env: protectedGitEnv(process.env), encoding: "utf8", maxBuffer: 64 * 1024 * 1024,
+    // Queue row 287: missing promisor objects fail closed without running a lazy-fetch transport.
+    cwd, env: { ...protectedGitEnv(process.env), GIT_NO_LAZY_FETCH: "1" }, encoding: "utf8", maxBuffer: 64 * 1024 * 1024,
     ...(input === undefined ? { stdio: ["ignore", "pipe", "pipe"] } : { input }),
   });
 };

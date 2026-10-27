@@ -5,7 +5,7 @@ import { ttyVisual } from "../../adapters/model-lints.js";
 import { addUsage, type TokenUsage } from "../../adapters/types.js";
 import { dim, rule, title } from "../../brand.js";
 import { loadConfig } from "../../config/config.js";
-import type { BaselineCommand } from "../../gates/baseline.js";
+import { hostStarvedRerunNote, type BaselineCommand } from "../../gates/baseline.js";
 import { modelProvider } from "../../gates/review.js";
 import { buildProofBundle, gateDeclined } from "../../report/bundle.js";
 import { compareRuns } from "../../report/compare.js";
@@ -577,7 +577,10 @@ export function renderMarkdownRecord(runId: string, events: JournalEvent[], pric
         }
         const resolved = gate === "review" && g.data.pass === true && Array.isArray(g.data.resolved)
           ? g.data.resolved.filter((id): id is string => typeof id === "string") : [];
-        lines.push(`  - ${gate}: ${pass} — ${firstLine(g.data.details)}${resolved.length ? `; resolved: ${resolved.join(", ")}` : ""}${fingerprintClauses(g.data)}`);
+        // Queue row 291 (D-2174): a red that survived a calm-window rerun says so, and how long it waited.
+        const rerun = hostStarvedRerunNote(g.data.hostStarvedRerun);
+        const details = firstLine(g.data.details);
+        lines.push(`  - ${gate}: ${pass} — ${rerun && !details.includes(rerun) ? `${rerun}: ` : ""}${details}${resolved.length ? `; resolved: ${resolved.join(", ")}` : ""}${fingerprintClauses(g.data)}`);
       }
       for (const row of leg2) {
         const pass = row.data.pass === true ? "pass" : row.data.pass === false ? "fail" : EM;

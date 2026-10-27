@@ -87,7 +87,7 @@ describe("extractVerdictJson", () => {
     };
     setGateCpuAccountantFactoryForTests(() => ({ start: async () => {}, read: () => ({ cpu: { ms: 0, resolutionMs: 1 }, gaps: 0 }), stop: async () => {} }));
     try {
-      const out = await runViaDriver(claudeCode, "sonnet", `TICKMARKR-JUDGE\n## Task T1: x\n${verdictNonceLine(nonce)}`, "/tmp", { driver, name: "judge · T1" }, 50);
+      const out = await runViaDriver({ ...claudeCode, streamTurn: undefined }, "sonnet", `TICKMARKR-JUDGE\n## Task T1: x\n${verdictNonceLine(nonce)}`, "/tmp", { driver, name: "judge · T1" }, 50);
       expect(sent).toEqual(["Enter"]);
       expect(extractVerdictJson<{ pass: boolean }>(out, nonce)?.pass).toBe(true);
     } finally {

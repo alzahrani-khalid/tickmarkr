@@ -520,6 +520,7 @@ export function runManifestedTest(
     nonce: string;
     reportPath: string;
     env?: NodeJS.ProcessEnv;
+    listing?: boolean;
     baselineDurations?: readonly BaselineFileDuration[] | null;
     longestFile?: BaselineFileDuration | null;
     pollMs?: number;
@@ -579,6 +580,7 @@ export function runManifestedTest(
     }
   };
   return shell(cmd, cwd, overallCeilingMs, false, {
+    unleased: opts.listing,
     onReceipt: receipt => evidence.observe(killedFile && receipt.outcome === "cancelled" ? { ...receipt, outcome: "timed-out" } : receipt),
     env, signal: controller.signal, onTimeout: () => checkHang(true),
     onSpawn: (childPid) => {
@@ -653,6 +655,7 @@ export interface DiscoveredManifest { files: string[]; listing: string; separato
 export async function discoverTestManifest(cmd: string, cwd: string, opts: { dir: string; nonce: string; env: NodeJS.ProcessEnv; overallCeilingMs?: number; evidence?: GateEvidenceOptions }): Promise<DiscoveredManifest> {
   const invocation = runnerInvocation(cmd, cwd);
   const listed = await runManifestedTest(invocation.listing, cwd, {
+    listing: true,
     evidence: opts.evidence, manifest: [], nonce: `${opts.nonce}-listing`, reportPath: join(opts.dir, `listing-${opts.nonce}.json`), env: opts.env,
     overallCeilingMs: opts.overallCeilingMs ?? DEFAULT_FILE_HANG_BUDGET_MS,
   });

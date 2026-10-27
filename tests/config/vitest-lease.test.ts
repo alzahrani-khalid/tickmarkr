@@ -2,14 +2,14 @@
 // (scripts/vitest-lease.ts), exercised through real Vitest processes over fixture repositories.
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import * as childProcesses from "node:child_process";
-import { copyFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import { copyFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import { afterEach, expect, test, vi } from "vitest";
 import type { TestProject } from "vitest/node";
 import * as lease from "../../src/run/lease.js";
 import { discoverTestManifest } from "../../src/gates/test-manifest.js";
 import { COMMAND_LEASE_TOKEN_ENV, REPOSITORY_LEASE_TOKEN_ENV, readHolder, repositoryLeasePath, withRepositoryLease } from "../../src/run/lease.js";
-import vitestLease, { CLOSE_DEADLINE_ENV, isListingInvocation, stopOwnedRunners } from "../../scripts/vitest-lease.js";
+import vitestLease, { CLOSE_DEADLINE_ENV, SEAT_LEASE_WAIT_ENV, isListingInvocation, seatLeaseWaitMs, stopOwnedRunners } from "../../scripts/vitest-lease.js";
 import { makeRepo, makeTestTempDir } from "../helpers/tmprepo.js";
 
 vi.mock("node:child_process", async importOriginal => ({
@@ -119,7 +119,7 @@ afterEach(async () => {
 });
 function vitest(cwd: string, name: string, log: string, extra: NodeJS.ProcessEnv = {}, args = ["run", "--configLoader", "runner", PROBE]): Runner {
   const env: NodeJS.ProcessEnv = { ...process.env, PROBE_LOG: log, PROBE_NAME: name, PROBE_VITEST: VITEST, VITEST_MAX_FORKS: "1", NO_COLOR: "1", FORCE_COLOR: "0" };
-  for (const key of ["VITEST", "TEST", "VITEST_WORKER_ID", "VITEST_POOL_ID", REPOSITORY_LEASE_TOKEN_ENV, COMMAND_LEASE_TOKEN_ENV]) delete env[key];
+  for (const key of ["VITEST", "TEST", "VITEST_WORKER_ID", "VITEST_POOL_ID", REPOSITORY_LEASE_TOKEN_ENV, COMMAND_LEASE_TOKEN_ENV, "TICKMARKR_SEAT", SEAT_LEASE_WAIT_ENV]) delete env[key];
   const child = spawn(process.execPath, [VITEST, ...args], { cwd, env: { ...env, ...extra }, detached: true, stdio: ["ignore", "pipe", "pipe"] });
   let out = "";
   child.stdout!.on("data", d => { out += d; });
@@ -132,6 +132,149 @@ function vitest(cwd: string, name: string, log: string, extra: NodeJS.ProcessEnv
   return runner;
 }
 const passed = async (r: Runner) => { const code = await r.exit; expect(code, r.out()).toBe(0); };
+
+test("test: the seat lease bound is sixty seconds unless the override is a plain positive safe integer, and an unset, empty, zero, signed, padded, fractional or non-numeric override keeps sixty seconds, so a bound read from an unchecked value fails", () => {
+  const invalid = [undefined, "", "0", "-1", "+1000", "01000", " 1000", "1000 ", "1000\n", "1.5", "1e3", "0x10", "NaN", "Infinity", "ten", "9007199254740992"];
+  for (const value of invalid) expect(seatLeaseWaitMs({ [SEAT_LEASE_WAIT_ENV]: value }), JSON.stringify(value)).toBe(60_000);
+  for (const value of ["1", "1000", "30000", "60000", "2147483648", "9007199254740991"]) {
+    expect(seatLeaseWaitMs({ [SEAT_LEASE_WAIT_ENV]: value }), value).toBe(Number(value));
+  }
+});
+
+test("only a judge or review wait receives a signal, aborted exactly at its bound and cleared after admission", async () => {
+  const onClose: Array<() => Promise<void>> = [];
+  const project = { vitest: { onClose: (callback: () => Promise<void>) => onClose.push(callback) } } as unknown as TestProject;
+  vi.spyOn(childProcesses, "spawnSync").mockReturnValue({ status: 0, stdout: "", stderr: "", pid: 999998, output: [], signal: null });
+  vi.spyOn(lease, "repositoryLeasePath").mockResolvedValue(join(root, "unused.lease"));
+  const error = vi.spyOn(console, "error").mockImplementation(() => {});
+  let observed: AbortSignal | undefined;
+  let admit: () => void = () => {};
+  let contended = true;
+  const reserve = vi.spyOn(lease, "withRepositoryLease").mockImplementation(async (_cwd, run, opts) => {
+    observed = opts?.signal;
+    if (contended) opts?.onWait?.({ pid: 999999, cwd: root, at: Date.now(), token: "holder" });
+    await new Promise<void>((resolve, reject) => {
+      admit = resolve;
+      observed?.addEventListener("abort", () => reject(observed!.reason), { once: true });
+    });
+    return run();
+  });
+  vi.useFakeTimers();
+  try {
+    for (const role of ["judge", "review", undefined, "consult", "worker", "daemon"]) {
+      if (role === undefined) vi.stubEnv("TICKMARKR_SEAT", undefined); else vi.stubEnv("TICKMARKR_SEAT", role);
+      vi.stubEnv(SEAT_LEASE_WAIT_ENV, undefined);
+      observed = undefined;
+      const pending = vitestLease(project);
+      const outcome = pending.then(() => "admitted", e => String(e));
+      await vi.advanceTimersByTimeAsync(0);
+      expect(reserve).toHaveBeenCalled();
+      if (role === "judge" || role === "review") {
+        expect(observed).toBeInstanceOf(AbortSignal);
+        await vi.advanceTimersByTimeAsync(59_999);
+        expect(observed!.aborted).toBe(false);
+        await vi.advanceTimersByTimeAsync(1);
+        expect(observed!.aborted).toBe(true);
+        const refusal = `tickmarkr: a ${role} seat's vitest run does not wait past 60000 ms for this repository's runner lease — review from the diff`;
+        expect(await outcome).toContain(refusal);
+        expect(error).toHaveBeenLastCalledWith(refusal);
+      } else {
+        expect(observed).toBeUndefined();
+        await vi.advanceTimersByTimeAsync(61_000);
+        admit();
+        const teardown = await pending;
+        await teardown!();
+        await onClose.pop()!();
+      }
+    }
+    // The largest safe override must not be clamped by Node to an immediate timeout.
+    vi.stubEnv("TICKMARKR_SEAT", "judge");
+    vi.stubEnv(SEAT_LEASE_WAIT_ENV, "9007199254740991");
+    const pending = vitestLease(project);
+    await vi.advanceTimersByTimeAsync(0);
+    await vi.advanceTimersByTimeAsync(2_147_483_648);
+    expect(observed!.aborted).toBe(false);
+    admit();
+    const teardown = await pending;
+    await teardown!();
+    await onClose.pop()!();
+    expect(vi.getTimerCount()).toBe(0);
+    // A free lease does not start a wait timer, even under the smallest valid override.
+    contended = false;
+    vi.stubEnv(SEAT_LEASE_WAIT_ENV, "1");
+    const free = vitestLease(project);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(vi.getTimerCount()).toBe(0);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(observed!.aborted).toBe(false);
+    admit();
+    await (await free)!();
+    await onClose.pop()!();
+  } finally {
+    vi.useRealTimers();
+    vi.unstubAllEnvs();
+    vi.restoreAllMocks();
+  }
+});
+
+test("test: the runner lease hook refuses a judge or review seat's run no sooner than the bound and seconds after it, non-zero with the prescribed refusal after naming the actual holder at once, while a seat run on a free lease, a worker, a consult seat and the daemon proceed or keep waiting, so an immediate or unbounded refusal fails", async () => {
+  const repo = fixtureRepo();
+  const log = join(makeTestTempDir("seat-lease-log-"), "rows.jsonl");
+  const path = await repositoryLeasePath(repo);
+  const bound = 1_500;
+  const marker = (role?: string): NodeJS.ProcessEnv => ({ TICKMARKR_SEAT: role, [SEAT_LEASE_WAIT_ENV]: String(bound) });
+  // Admission on a free lease succeeds; the wait deadline must not bound the admitted workload.
+  for (const role of ["judge", "review"]) {
+    await passed(vitest(repo, `free-${role}`, log, { ...marker(role), PROBE_HOLD_MS: String(bound + 100) }));
+  }
+  for (const holderRole of [undefined, "review"]) {
+    const release = join(makeTestTempDir("seat-lease-hold-"), "release");
+    const name = holderRole ?? "gate";
+    const holder = vitest(repo, `${name}-holder`, log, { ...marker(holderRole), PROBE_HOLD: release });
+    await until(() => rows(log).some(r => r.name === `${name}-holder` && r.event === "start"), 30_000, `${name} holder to start`);
+    const token = readHolder(path)!.token;
+    for (const role of ["judge", "review"]) {
+      const seat = `${name}-${role}`;
+      const started = Date.now();
+      const r = vitest(repo, seat, log, marker(role));
+      await until(() => r.out().includes(WAITING), 30_000, `${seat} to name its holder`);
+      // The child reports its physical cwd (e.g. /private/var for macOS's /var alias).
+      expect(r.out()).toContain(`held by pid ${holder.child.pid} in ${realpathSync(repo)}`);
+      expect(r.out()).not.toContain("review from the diff");
+      expect(rows(log).some(row => row.name === seat)).toBe(false);
+      let ended = false;
+      void r.exit.then(() => { ended = true; });
+      await until(() => ended, bound + 4_000, `${seat} to refuse within seconds of its bound`);
+      expect(Date.now() - started).toBeGreaterThanOrEqual(bound);
+      expect(await r.exit, r.out()).toBe(1);
+      const refusal = `tickmarkr: a ${role} seat's vitest run does not wait past ${bound} ms for this repository's runner lease — review from the diff`;
+      expect(r.out()).toContain(refusal);
+      expect(r.out().indexOf(WAITING)).toBeLessThan(r.out().indexOf(refusal));
+      expect(rows(log).some(row => row.name === seat)).toBe(false);
+      expect(readHolder(path)?.token).toBe(token);
+    }
+    if (holderRole === undefined) {
+      // A listing bypasses even a held lease and a judge marker.
+      const listing = vitest(repo, "seat-listing", log, marker("judge"), ["list", "--configLoader", "runner", PROBE, "--json"]);
+      await passed(listing);
+      expect(listing.out()).not.toContain(WAITING);
+      // These three callers retain the existing wait, even beyond a deliberately short seat bound.
+      const waiters = ["worker", "consult", "daemon"].map(role =>
+        vitest(repo, role, log, marker(role === "consult" ? role : undefined)));
+      for (const r of waiters) await until(() => r.out().includes(WAITING), 30_000, "unbounded caller to queue");
+      await new Promise(resolve => setTimeout(resolve, bound + 1_100));
+      for (const r of waiters) expect(r.out()).not.toContain("review from the diff");
+      expect(rows(log).filter(r => ["worker", "consult", "daemon"].includes(r.name))).toEqual([]);
+      writeFileSync(release, "");
+      await passed(holder);
+      for (const r of waiters) await passed(r);
+    } else {
+      writeFileSync(release, "");
+      await passed(holder);
+    }
+  }
+  expect(existsSync(path)).toBe(false);
+}, 180_000);
 
 test("configured Vitest preserves its shutdown order and retains the repository reservation until the public close hook observes that workers have ceased", async () => {
   const events: string[] = [];

@@ -2,6 +2,66 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v2.10.1 — review seats that work are never counted dead: dependency re-provisioning keeps the lockfile, claude judge and review seats stream their turn, a seat's close reaps what its tools detached, seats carry a marker that bounds this repository's runner-lease wait, a runner listing never queues behind another task's suite, standalone verify names its author assumption, and status reads never fetch over the network
+
+**v2.10.1** fixes what the 2.10.0 run exposed in tickmarkr's own review seats and dependency handling (queue rows 279, 267, 274, 277, 286
+and 287). Its work comes from one `tickmarkr run` engagement, run-20261027-131920-…3742. Each of its nine tasks passed build, lint,
+evidence, scope, its acceptance criteria, a cross-vendor review and the full suite.
+
+- **Dependency re-provisioning keeps the lockfile (queue row 279).**
+  - An attempt that changes only a manifest's `files` list, scripts or version, or only reorders a dependency group, no longer runs an
+    install.
+  - A real dependency change installs each registry dependency at the version the attempt's lockfile records, and npm reads the repository
+    lockfile instead of re-resolving every range in the shared module tree.
+  - An unreadable lockfile fails the attempt before its gates, naming the file.
+- **Claude Code judge and review seats stream their turn (queue row 267).**
+  - These seats run `--output-format stream-json --verbose`. The verdict is the final `result` event's text alone, and seat bytes count only
+    from the stream's `init` event, so a working seat is never labelled silent.
+  - A seat killed at its ceiling after starting reads `truncated` (and still takes a strike). A seat that never starts is still caught by
+    the first-liveness beat.
+  - Workers and consults keep text output. The persisted raw capture starts at `init`, so the user's own hook output is never stored.
+- **A judge, review or consult seat's close also ends what its tools detached (queue row 274).**
+  - Covered: a headless seat (the subprocess driver, as in Claude Desktop) killed at its ceiling, and a pane seat closed by its caller.
+  - A census of the seat's descendants (pid and birth time) is taken before the kill.
+  - Each process's identity is checked again immediately before every signal, the group signal and its fallback included, so a recycled
+    pid is never signalled.
+  - The daemon's own gate processes and other worktrees' processes are never touched.
+- **Seats carry a `TICKMARKR_SEAT` marker, and the review brief says a test run may queue behind a gate suite (queue row 267).** In
+  tickmarkr's own repository, a judge or review seat's runner-lease wait ends after 60 seconds, naming the holder, so the seat reviews from
+  the diff instead of timing out.
+- **A runner listing no longer queues behind another task's full suite (queue row 277, its listing half).**
+- **Standalone `tickmarkr verify` says when it treats the diff as human-written (queue row 286).**
+  - With review enabled and neither `--author` nor recorded authors, it prints one stderr line naming the assumption and the flag.
+  - The loop, auto and overseer skills' verify lines now pass `--author`.
+- **`tickmarkr status`'s owed-check re-proof never fetches over the network (queue row 287).**
+  - In a partial clone, a missing object no longer lazily fetches from the remote (and so never runs its ssh or credential helper).
+  - The read fails closed instead: the check stays outstanding or unknown, never green.
+- **A host-starved test rerun no longer splits one failure into two fingerprints (queue row 291, found during this run).**
+  - Under load, a slow test timeout earns an in-round rerun whose failure details carried a "host-starved rerun" prefix, so the same red
+    counted twice.
+  - The published details of such a red now drop that prefix. The rerun's facts stay in the gate row's structured data, and the operator
+    report and the repair brief still name the rerun and its wait.
+- **This repository's load-sensitive daemon tests were hardened, and the run board gained a render test (queue rows 275, 276 and 285).**
+
+A pre-release review found more defects after the run. Their fixes passed `tickmarkr verify` against the run's tip: build, lint, evidence,
+scope, their acceptance criteria, a cross-vendor review and the full suite.
+- **A Claude seat stream that ends with a malformed or truncated row after its result no longer keeps that result's verdict.** Only a later
+  complete success restores one, so an incomplete stream is a no-verdict, never a pass.
+- **A hook row arriving after `init` counts as seat output and is kept in the capture.**
+- **A seat shell's own timeout, fallback and post-exit signals recheck the leader's spawn identity first**, like the seat reaper.
+- **An inherited `TICKMARKR_SEAT` no longer reaches a worker, a scope draft or the daemon's own children** through spawned environments,
+  the herdr shell seal or the pane scripts. Only judge, review and consult launches set it.
+
+Declared, still open:
+- Queue row 288, row 277's oracle half: a green task's post-suite answer still waits behind another task's whole suite.
+- Queue row 289: a seat that exits normally after detaching a child leaves that child.
+- Queue row 292: a pane seat killed at its ceiling, whose tool's detached group was reparented before the census, leaves that group.
+- Queue row 293: an interactive-seed worker launch can still inherit a seat marker (read only by this repository's runner lease).
+- Queue row 290: a lock entry whose version no longer satisfies a bumped manifest range is still pinned.
+- Queue row 291's structural fix: the rerun note moves out of the failure details at its source.
+- Queue rows 276(g): the admission test asserts a journal order that concurrent dispatches do not guarantee.
+- After 2.10.1: `tickmarkr acp` (2.11.0), then the rest of the review programme.
+
 ## v2.10.0 — Claude Desktop first-class: exact approval commands everywhere, a versioned status snapshot, a blocking wait, Claude Code skills from init, macOS notifications, a recoverable folder-permission loss, a keep-awake daemon, a configurable approval window, and the Claude Code plugin with its run board
 
 **v2.10.0** makes tickmarkr work end-to-end in Claude Desktop's Code tab (queue rows 260–265). Its work comes from one `tickmarkr run`

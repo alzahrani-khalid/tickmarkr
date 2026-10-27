@@ -8,10 +8,11 @@ import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSyn
 import { availableParallelism, homedir, tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { StringDecoder } from "node:string_decoder";
+import { isDeepStrictEqual } from "node:util";
 import { shq } from "../adapters/types.js";
 import { tickmarkrDir } from "../graph/graph.js";
 import { ROUTING_ENV_SEAMS } from "../route/router.js";
-import { HOST_SESSION_VARS } from "../drivers/host-env.js";
+import { HOST_SESSION_VARS, SEAT_MARKER_ENV } from "../drivers/host-env.js";
 import { titleEnvironment } from "./title-environment.js";
 import { assertGitTrust, GitTrustRefusal, ownGitPin, protectedGitEnv, trustedCommonDir, type DetachedAddCapability, type OwnGitCapability, type TrustedStoreCapability, type WorktreeRollback } from "./git-trust.js";
 
@@ -328,6 +329,8 @@ const SHELL_REAP_GRACE_MS = 2000;
 // (pi -p / codex exec wait for stdin EOF). timedOut distinguishes SIGKILL-timeout from a real nonzero exit.
 export interface ShellOptions {
   env?: NodeJS.ProcessEnv;
+  /** Manifest discovery lists files without executing tests, so it needs no command lease. */
+  unleased?: boolean;
   signal?: AbortSignal;
   onSpawn?: (pid: number | undefined) => void;
   onTimeout?: () => void;
@@ -337,6 +340,12 @@ export interface ShellOptions {
   receiptAttribution?: (invocation: number) => CommandReceiptAttribution;
   /** Queue row 142: also keep stdout as raw bytes (ShResult.stdoutBytes); only shGit's byte readers opt in. */
   bytes?: boolean;
+  /** D-2174 (queue row 274): a seat shell's identity check. When set, the shell's own backstop, abort, fallback and
+   * post-exit signals are each sent only after it confirms the leader still bears the identity recorded at spawn, and a
+   * refused post-exit reap drains the pipes instead. Ordinary shells leave it unset and signal as before. */
+  ownsLeader?: (pid: number) => Promise<boolean>;
+  /** D-2174 (queue row 267): the seat role this shell's child carries as its marker; unset, an inherited marker is stripped. */
+  seat?: "judge" | "review" | "consult";
 }
 
 /** Shared command seam, including invocation-bound manifested runners. A PAYLOAD entry: its children keep the
@@ -392,7 +401,8 @@ function shellEntry(cmd: string, cwd: string, timeoutMs: number, login: boolean,
   };
   begin(1);
   checkAbort();
-  return withCommandLease(cmd, () => executeShell(cmd, cwd, timeoutMs, login, { ...options, signal }, { begin, emit, checkAbort }, ownGit))
+  const run = () => executeShell(cmd, cwd, timeoutMs, login, { ...options, signal }, { begin, emit, checkAbort }, ownGit);
+  return (options.unleased ? run() : withCommandLease(cmd, run))
     .catch((error: unknown) => {
       if (signal?.aborted) emit({ outcome: "cancelled", exitCode: null, signal: null });
       throw error;
@@ -419,6 +429,9 @@ function executeShell(cmd: string, cwd: string, timeoutMs: number, login: boolea
   for (const k of ROUTING_ENV_SEAMS) delete env[k];
   // Queue row 193 (D-2102 add.1): no gate or agent child inherits the launching agent session's host variables.
   for (const k of HOST_SESSION_VARS) delete env[k];
+  // D-2174: an inherited seat marker never reaches a child; only a seat launch names its own role.
+  delete env[SEAT_MARKER_ENV];
+  if (options.seat) env[SEAT_MARKER_ENV] = options.seat;
   // A run freezes the operator override and cores at startup; admission can lower the round cap.
   env[FORK_CAP_ENV] = verificationBudget.getStore()
     ? String(resolvedCapacity().forkCap)
@@ -513,29 +526,36 @@ function executeShell(cmd: string, cwd: string, timeoutMs: number, login: boolea
         finish(exitedCode ?? 1);
       }, 100);
     };
+    // D-2174 (queue row 274): a seat shell sends each signal only after rechecking its leader's spawn identity; an
+    // ordinary shell sends it synchronously, exactly as before. `then` runs either way, signalled or refused.
+    const guarded = (send: () => void, then?: () => void) => {
+      if (!options.ownsLeader) { send(); then?.(); return; }
+      void options.ownsLeader(p.pid!).then((own) => { if (own) send(); }, () => {}).then(then);
+    };
     const timer = setTimeout(() => {
       timedOut = true;
       options.onTimeout?.();
-      try {
-        process.kill(-p.pid!, "SIGKILL");
-      } catch (error) {
-        const code = (error as NodeJS.ErrnoException | undefined)?.code;
-        if (code !== "ESRCH") {
-          reapError ??= `${code ?? "kill"}: ${error instanceof Error ? error.message : String(error)}`;
+      guarded(() => {
+        try {
+          process.kill(-p.pid!, "SIGKILL");
+        } catch (error) {
+          const code = (error as NodeJS.ErrnoException | undefined)?.code;
+          if (code !== "ESRCH") {
+            reapError ??= `${code ?? "kill"}: ${error instanceof Error ? error.message : String(error)}`;
+          }
+          guarded(() => p.kill("SIGKILL"));
+          // A failed group kill can leave inherited pipes open forever; the command ceiling still wins.
+          if (code !== "ESRCH") finish(exitedCode ?? 1);
         }
-        p.kill("SIGKILL");
-        // A failed group kill can leave inherited pipes open forever; the command ceiling still wins.
-        if (code !== "ESRCH") finish(exitedCode ?? 1);
-      }
-      boundDrain();
+      }, boundDrain);
     }, timeoutMs);
     const abort = () => {
-      try { process.kill(-p.pid!, "SIGKILL"); } catch { p.kill("SIGKILL"); }
-      boundDrain();
+      guarded(() => { try { process.kill(-p.pid!, "SIGKILL"); } catch { guarded(() => p.kill("SIGKILL")); } }, boundDrain);
     };
     options.signal?.addEventListener("abort", abort, { once: true });
     try { registerRepositoryChild(p.pid); }
     catch (error) {
+      // Unguarded even for a seat: this runs in the spawn's own tick, before the child can be reaped and its pid reused.
       try { process.kill(-p.pid!, "SIGKILL"); } catch { p.kill("SIGKILL"); }
       spawnError = String(error);
     }
@@ -582,15 +602,20 @@ function executeShell(cmd: string, cwd: string, timeoutMs: number, login: boolea
       if (timedOut) return;
       reapTimer = setTimeout(() => {
         if (done) return;
-        try {
-          process.kill(-p.pid!, "SIGKILL");
-          reapedGroup = true;
-        } catch (error) {
-          // ESRCH means the group closed in the grace race; every other error must survive to the
-          // result while the command timeout remains the explicit backstop.
-          const code = (error as NodeJS.ErrnoException | undefined)?.code;
-          if (code !== "ESRCH") reapError = `${code ?? "kill"}: ${error instanceof Error ? error.message : String(error)}`;
-        }
+        // A seat's leader has exited by now, so its group cannot be proven the seat's: the reap is refused and the
+        // seat's pipes are drained rather than held to the backstop by a survivor (D-2174).
+        guarded(() => {
+          if (done) return;
+          try {
+            process.kill(-p.pid!, "SIGKILL");
+            reapedGroup = true;
+          } catch (error) {
+            // ESRCH means the group closed in the grace race; every other error must survive to the
+            // result while the command timeout remains the explicit backstop.
+            const code = (error as NodeJS.ErrnoException | undefined)?.code;
+            if (code !== "ESRCH") reapError = `${code ?? "kill"}: ${error instanceof Error ? error.message : String(error)}`;
+          }
+        }, options.ownsLeader ? boundDrain : undefined);
       }, SHELL_REAP_GRACE_MS);
     });
   });
@@ -780,41 +805,69 @@ async function dropWorktreeHeld(store: string, { dir, branch }: WorktreeRollback
 }
 
 const NPM_DEPENDENCY_MANIFESTS = ["package.json", "package-lock.json", "npm-shrinkwrap.json"];
+const NPM_DEPENDENCY_GROUPS = ["peerDependencies", "devDependencies", "dependencies", "optionalDependencies"] as const;
 
-// OBS-126: compare the whole attempt (committed, staged, unstaged, or newly added manifest) with
-// the task's integration-tip baseline. A committed package.json change is invisible to `git status`,
-// while an untracked manifest is invisible to `git diff`, so both views are required.
+// Only the groups consumed by the install below matter in package.json; publishing metadata must
+// not re-provision dependencies. Lockfiles still compare byte-for-byte, including untracked files.
 export async function npmDependencyManifestChanged(cwd: string, baselineRef: string): Promise<boolean> {
-  const paths = NPM_DEPENDENCY_MANIFESTS.map(shq).join(" ");
-  const diff = await shGit(`git diff --quiet ${shq(baselineRef)} -- ${paths}`, cwd);
+  const lockfiles = NPM_DEPENDENCY_MANIFESTS.slice(1).map(shq).join(" ");
+  const diff = await shGit(`git diff --quiet ${shq(baselineRef)} -- ${lockfiles}`, cwd);
   if (diff.code === 1) return true;
   if (diff.code !== 0) {
     throw new Error(`dependency manifest comparison failed (${diff.code}): ${diff.stderr || diff.stdout}`);
   }
-  const untracked = await shGit(`git ls-files --others --exclude-standard -- ${paths}`, cwd);
+  const untracked = await shGit(`git ls-files --others --exclude-standard -- ${NPM_DEPENDENCY_MANIFESTS.map(shq).join(" ")}`, cwd);
   if (untracked.code !== 0) {
     throw new Error(`dependency manifest comparison failed (${untracked.code}): ${untracked.stderr || untracked.stdout}`);
   }
-  return untracked.stdout.trim().length > 0;
+  if (untracked.stdout.trim().length > 0) return true;
+  const baseline = await shGit(`git show ${shq(`${baselineRef}:package.json`)}`, cwd);
+  const manifestPath = join(cwd, "package.json");
+  if (baseline.code !== 0) return existsSync(manifestPath);
+  try {
+    const before = JSON.parse(baseline.stdout) as Record<string, unknown>;
+    const after = JSON.parse(readFileSync(manifestPath, "utf8")) as Record<string, unknown>;
+    return NPM_DEPENDENCY_GROUPS.some((group) => !isDeepStrictEqual(before[group], after[group]));
+  } catch { return true; }
+}
+
+interface NpmDependencyLock {
+  lockfileVersion?: number;
+  packages?: Record<string, { name?: string; version?: string }>;
+  dependencies?: Record<string, { name?: string; version?: string }>;
+}
+
+function npmDependencyLock(cwd: string): NpmDependencyLock | undefined {
+  // npm gives shrinkwrap precedence even when package-lock.json contains a matching entry.
+  for (const file of ["npm-shrinkwrap.json", "package-lock.json"]) {
+    try {
+      try { lstatSync(join(cwd, file)); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") continue; throw error; }
+      const lock: unknown = JSON.parse(readFileSync(join(cwd, file), "utf8"));
+      if (!lock || typeof lock !== "object" || Array.isArray(lock)) throw new Error("expected a JSON object");
+      return lock as NpmDependencyLock;
+    } catch (error) {
+      throw new Error(`dependency install failed: ${file} unreadable — ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+  return undefined;
 }
 
 // npm reifies a worktree's node_modules symlink as a private directory, which makes a successful
 // install disappear at worktree cleanup. Build positional specs from the attempt manifest so the
 // daemon can install them at the main repo root (the provisioned link's target) without saving them
-// into that baseline manifest. `--install-links` packs file: dependencies before the attempt is removed.
+// into that baseline manifest. Pin registry specs from the attempt lock, while letting npm read the
+// repository lock to retain its transitive versions. `--no-save` leaves both root files untouched.
+// `--install-links` packs file: dependencies before the attempt is removed.
 export function npmDependencyInstallCommand(cwd: string): string {
   const manifestPath = join(cwd, "package.json");
   const manifest = existsSync(manifestPath)
     ? JSON.parse(readFileSync(manifestPath, "utf8")) as Record<string, unknown>
     : {};
-  const dependencyGroups = [
-    manifest.peerDependencies,
-    manifest.devDependencies,
-    manifest.dependencies,
-    manifest.optionalDependencies,
-  ];
+  const lock = npmDependencyLock(cwd);
   const dependencies: Record<string, string> = {};
-  for (const group of dependencyGroups) {
+  for (const key of NPM_DEPENDENCY_GROUPS) {
+    const group = manifest[key];
     if (!group || typeof group !== "object" || Array.isArray(group)) continue;
     for (const [name, spec] of Object.entries(group)) {
       if (typeof spec === "string") dependencies[name] = spec;
@@ -824,10 +877,22 @@ export function npmDependencyInstallCommand(cwd: string): string {
     let spec = rawSpec;
     if (spec.startsWith("file:")) spec = `file:${resolve(cwd, spec.slice("file:".length))}`;
     else if (spec.startsWith("./") || spec.startsWith("../")) spec = resolve(cwd, spec);
+    else {
+      const entry = lock?.lockfileVersion === 1 ? lock.dependencies?.[name]
+        : lock?.lockfileVersion === 2 || lock?.lockfileVersion === 3 ? lock.packages?.[`node_modules/${name}`] : undefined;
+      if (typeof entry?.version === "string") {
+        if (spec.startsWith("npm:")) {
+          const alias = spec.slice(4);
+          const packageName = alias.lastIndexOf("@") > 0 ? alias.slice(0, alias.lastIndexOf("@")) : alias;
+          // v1 records aliases in version itself; v2/v3 record the real package's name separately.
+          spec = entry.version.startsWith("npm:") ? entry.version : `npm:${entry.name ?? packageName}@${entry.version}`;
+        } else if (!/[:/\\]/.test(spec)) spec = entry.version;
+      }
+    }
     return shq(`${name}@${spec}`);
   });
   return [
-    "npm install --no-save --no-audit --no-fund --package-lock=false --install-links",
+    "npm install --no-save --no-audit --no-fund --install-links",
     ...specs,
   ].join(" ");
 }

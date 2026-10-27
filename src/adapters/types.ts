@@ -424,6 +424,14 @@ export class SettledTrailerTracker {
 /** Queue row 2 item a (D-2112, D-2114): context owned by the task dispatcher. */
 export interface WorkerLaunchContext { cwd: string; branch: string; repoRoot: string }
 
+/** One captured stream snapshot, decoded only by the adapter's streamTurn implementation. */
+export interface StreamTurn {
+  output: string;
+  raw: string;
+  started: boolean;
+  seatAuthoredBytes: number;
+}
+
 export interface WorkerAdapter {
   id: string;
   vendor: string;
@@ -436,7 +444,9 @@ export interface WorkerAdapter {
   probe(): Promise<AuthHealth>;
   channels(cfg: TickmarkrConfig): BillingChannel[];
   // OBS-1182: `effort` absent = the CLI's own default; only claude-code and codex render it.
-  headlessCommand(promptFile: string, model: string, effort?: Effort): string;
+  headlessCommand(promptFile: string, model: string, effort?: Effort, output?: "stream"): string;
+  // llm.ts opts judge/review calls into streaming; workers and consults retain the text command.
+  streamTurn?(raw: string): StreamTurn;
   // Adapter-owned launch notices are emitted by the CLI, not by the review seat. Each entry is one
   // complete recorded terminal row, in render order. The seat-byte grammar treats only this closed
   // list as harness at the banner boundary: each row at most once, in list order, skipping allowed

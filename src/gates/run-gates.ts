@@ -8,7 +8,7 @@ import { type TickmarkrConfig, TIER_RANK } from "../config/config.js";
 import { getAdapter } from "../adapters/registry.js";
 import { type Effort, GATE_NAMES, type GateName, type Task } from "../graph/schema.js";
 import { acceptanceGate, type JudgedCriterion } from "./acceptance.js";
-import { type Baseline, type RetryOptions, type GateEvidenceOptions, classifiedFileDurations, compareToBaseline, effectiveCeilingMs, waitForCalmWindow, calmWindowReady, SIGNAL_EXIT_RE } from "./baseline.js";
+import { type Baseline, type RetryOptions, type GateEvidenceOptions, classifiedFileDurations, compareToBaseline, effectiveCeilingMs, waitForCalmWindow, calmWindowReady, SIGNAL_EXIT_RE, hostStarvedRerunNote } from "./baseline.js";
 import { evidenceGate } from "./evidence.js";
 import { captureLlmOutput, type GateVia, SeatLaunchError } from "./llm.js";
 import { withLaunchGuard } from "../drivers/orca.js";
@@ -83,8 +83,10 @@ function instrumentLlmAdapter(adapter: WorkerAdapter, clocks: LlmDispatchClock[]
   return new Proxy(adapter, {
     get(target, property) {
       if (property === "headlessCommand") {
-        return (promptFile: string, model: string, effort?: Effort): string => {
-          const command = target.headlessCommand(promptFile, model, effort);
+        return (promptFile: string, model: string, effort?: Effort, output?: "stream"): string => {
+          const command = output === "stream"
+            ? target.headlessCommand(promptFile, model, effort, output)
+            : target.headlessCommand(promptFile, model, effort);
           const dir = mkdtempSync(join(tmpdir(), "tickmarkr-gate-invocation-"));
           const startedAtPath = join(dir, "started-at");
           const completedAtPath = join(dir, "completed-at");
@@ -791,6 +793,14 @@ export async function runGates(
   // path that forgets to measure is visibly missing its telemetry rather than carrying a fabricated
   // zero. The daemon lifts these off `meta` onto the gate-result row (src/run/daemon.ts).
   const withTelemetry = (result: GateResult): GateResult => {
+    // OBS-1106: retry provenance must not change a behavioral red's fingerprint. A slow
+    // timeout can buy an in-round rerun while its next fresh observation runs at normal speed.
+    // Keep the retry's timing and both receipts, but publish the same failure details for each.
+    const rerun = hostStarvedRerunNote(result.meta?.hostStarvedRerun);
+    if (result.gate === "test" && !result.pass && !isInfraResult(result) && rerun) {
+      const prefix = `${rerun}: `;
+      if (result.details.startsWith(prefix)) result = { ...result, details: result.details.slice(prefix.length) };
+    }
     if (result.gate === "test" && selectionDecision) {
       result = { ...result, meta: { ...result.meta, selectionDecision } };
     }
@@ -1487,10 +1497,12 @@ export async function runGates(
     const guarded = (adapter: WorkerAdapter): WorkerAdapter => new Proxy(adapter, {
       get(target, property) {
         if (property === "headlessCommand") {
-          return (promptFile: string, model: string, effort?: Effort): string => {
+          return (promptFile: string, model: string, effort?: Effort, output?: "stream"): string => {
             launching.seat = channelKey({ adapter: target.id, model });
             refuseRetired();
-            return target.headlessCommand(promptFile, model, effort);
+            return output === "stream"
+              ? target.headlessCommand(promptFile, model, effort, output)
+              : target.headlessCommand(promptFile, model, effort);
           };
         }
         const value: unknown = Reflect.get(target, property, target);

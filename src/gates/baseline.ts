@@ -1299,7 +1299,7 @@ export async function compareToBaseline(
       const withReapError = r.reapError ? { ...withReap, meta: { ...withReap.meta, reapError: r.reapError } } : withReap;
       const withRerun = rerunOf ? {
         ...withReapError,
-        details: `${g.meta?.classification === "infra" ? "infra; " : ""}host-starved rerun after waiting ${rerunOf.waitedMs}ms for a calm load window: ${withReapError.details.replace(/^infra; /, "")}`,
+        details: `${g.meta?.classification === "infra" ? "infra; " : ""}${hostStarvedRerunNote(rerunOf)}: ${withReapError.details.replace(/^infra; /, "")}`,
         meta: { ...withReapError.meta, hostStarvedRerun: rerunOf },
       } : withReapError;
       const final = opts.infraRerun ? {
@@ -1493,6 +1493,12 @@ export async function compareToBaseline(
 }
 
 export interface HostStarvedRerun { durationMs: number; referenceMs: number; waitedMs: number }
+/** Queue row 291 (D-2174): the rerun's provenance, one wording. A published behavioral red's details drop it so its
+ * fingerprint matches the fresh red's; the operator report and the repair brief render it from the metadata instead. */
+export function hostStarvedRerunNote(rerun: unknown): string | undefined {
+  return rerun && typeof rerun === "object" && "waitedMs" in rerun && typeof rerun.waitedMs === "number"
+    ? `host-starved rerun after waiting ${rerun.waitedMs}ms for a calm load window` : undefined;
+}
 const SUMMARY_LINE_RE = /^[^\S\n]*Test Files[^\S\n]+(.+)$/m;
 const TEARDOWN_RE = /\[birpc\] rpc is closed, cannot call\b/;
 const UNHANDLED_HEADER_RE = /^\s*[^\w]*(?:Unhandled Errors|Uncaught Exception)\b/;

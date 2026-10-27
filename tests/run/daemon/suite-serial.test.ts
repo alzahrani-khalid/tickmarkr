@@ -1,5 +1,5 @@
 import * as os from "node:os";
-import { execFileSync, spawn } from "node:child_process";
+import { ChildProcess, execFileSync, spawn } from "node:child_process";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
@@ -9,14 +9,24 @@ import { codex } from "../../../src/adapters/codex.js";
 import { batchedProcessProbes } from "../../../src/run/suite-census.js";
 import { countLiveSuites, liveSuiteCount, resetLiveSuiteCountForTests, resetSuiteWaitCeilingForTests, runDaemon, setLiveSuiteCountForTests, setSuiteWaitCeilingForTests, SUITE_POLL_MS } from "../../../src/run/daemon.js";
 import { FORK_CAP_ENV, resetSpawnForTests, setSpawnForTests, shell, SUITE_PARENT_ENV } from "../../../src/run/git.js";
+import { observeHost, resetHostLatencySampleForTests, resetHostProbeSpawnForTests, setHostLatencySampleForTests, setHostProbeSpawnForTests } from "../../../src/run/host-health.js";
 import { COMMAND_LEASE_TOKEN_ENV, CommandLeases, runWithCommandLease } from "../../../src/run/lease.js";
 import { shq } from "../../../src/adapters/types.js";
 import { Journal } from "../../../src/run/journal.js";
 import { COMMIT, makeTestTempDir, setupRepo, T } from "../../helpers/tmprepo.js";
 
 // Each daemon fixture models a separate root suite. The nested runner fixture inherits its own token.
-beforeEach(() => { vi.stubEnv(COMMAND_LEASE_TOKEN_ENV, undefined); });
-afterEach(() => { vi.unstubAllEnvs(); });
+// These fixtures test suite admission, so machine latency must not decide their verdicts.
+const calmHostSample = vi.fn(async () => 20);
+beforeEach(() => {
+  vi.stubEnv(COMMAND_LEASE_TOKEN_ENV, undefined);
+  calmHostSample.mockClear();
+  setHostLatencySampleForTests(calmHostSample);
+});
+afterEach(() => {
+  resetHostLatencySampleForTests();
+  vi.unstubAllEnvs();
+});
 
 // Exercise the auto-detected npm command with a tiny script, without a nested suite.
 const runner = (body = 'console.log("Tests  1 passed (1)")') => {
@@ -29,6 +39,37 @@ const runner = (body = 'console.log("Tests  1 passed (1)")') => {
 vi.mock("node:os", async (importOriginal) => ({
   ...await importOriginal<typeof import("node:os")>(),
 }));
+
+test("test: every daemon fixture in the suite-serial file reads the injected calm host sampler and never the real host probe, and the real sampler is restored after each test, so a fixture whose verdict depends on the machine's latency fails", async ({ onTestFinished }) => {
+  // The real sampling path is observable without launching a machine-latency probe.
+  const realProbe = vi.fn<typeof spawn>(() => {
+    const child = new ChildProcess();
+    queueMicrotask(() => child.emit("close", 0));
+    return child;
+  });
+  setHostProbeSpawnForTests(realProbe);
+  onTestFinished(async () => {
+    // onTestFinished runs after afterEach: removing the restoration leaves this on the calm seam.
+    try {
+      realProbe.mockClear();
+      await observeHost(new AbortController().signal);
+      expect(realProbe).toHaveBeenCalledTimes(3);
+    } finally { resetHostProbeSpawnForTests(); }
+  });
+  const { repo, fake } = setupRepo([T("T1")], {
+    tasks: { T1: [{ shell: `echo suite > suite.txt && ${COMMIT} suite`, result: { ok: true, summary: "suite" } }] },
+  }, `gates: { test: '${runner()}' }\n`);
+  setLiveSuiteCountForTests(async () => 0);
+  try {
+    const summary = await runDaemon(repo, { adapters: [fake], runId: "run-suite-calm-host" });
+    expect(summary.done).toEqual(["T1"]);
+    expect(calmHostSample).toHaveBeenCalled();
+    expect(realProbe).not.toHaveBeenCalled();
+    const observations = Journal.open(repo, "run-suite-calm-host").read().filter(row => row.event === "host-observation");
+    expect(observations.length).toBeGreaterThan(0);
+    for (const row of observations) expect(row.data).toMatchObject({ samplesMs: [20, 20, 20], medianMs: 20 });
+  } finally { resetLiveSuiteCountForTests(); }
+}, 30_000);
 
 test("test: a full-suite verdict round waits while another suite is live under the run's worktrees or the repo root counting a vitest child by parentage through TICKMARKR_SUITE_PARENT as well as by cwd and journals suite-wait with the count whereas a daemon that starts the round beside a live suite or counts only suite mains fails", async () => {
   const { repo, fake } = setupRepo(

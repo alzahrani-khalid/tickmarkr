@@ -79,6 +79,13 @@ export function closeDeadlineMs(env: NodeJS.ProcessEnv = process.env): number {
   return value !== undefined && /^[1-9][0-9]*$/.test(value) && Number.isSafeInteger(Number(value)) ? Number(value) : 10_000;
 }
 
+export const SEAT_LEASE_WAIT_ENV = "TICKMARKR_SEAT_LEASE_WAIT_MS";
+/** REPO only (queue row 267): use the close deadline's plain positive safe integer rule. */
+export function seatLeaseWaitMs(env: NodeJS.ProcessEnv = process.env): number {
+  const value = env[SEAT_LEASE_WAIT_ENV];
+  return value !== undefined && /^[1-9][0-9]*$/.test(value) && value.trim() === value && Number.isSafeInteger(Number(value)) ? Number(value) : 60_000;
+}
+
 async function awaitRunnerShutdown(tooling: ReadonlySet<string>, deadlineMs = closeDeadlineMs()): Promise<void> {
   const end = Date.now() + deadlineMs;
   const workload = () => descendants().some(({ identity }) => !tooling.has(identity));
@@ -100,13 +107,39 @@ export default async function vitestLease(project: TestProject): Promise<(() => 
     let release!: () => void;
     let acquired!: () => void;
     const holding = new Promise<void>((resolve) => { acquired = resolve; });
+    const role = process.env.TICKMARKR_SEAT;
+    const seatWait = role === "judge" || role === "review" ? new AbortController() : undefined;
+    let waitTimer: ReturnType<typeof setTimeout> | undefined;
+    let startWait: (() => void) | undefined;
+    if (seatWait) {
+      const waitMs = seatLeaseWaitMs();
+      const refusal = `tickmarkr: a ${role} seat's vitest run does not wait past ${waitMs} ms for this repository's runner lease — review from the diff`;
+      // Start only on actual contention, so even a 1 ms override leaves a free lease unchanged.
+      startWait = () => {
+        const started = Date.now();
+        const expire = () => {
+          const remaining = waitMs - (Date.now() - started);
+          // Node clamps larger delays to 1 ms; every positive safe integer must keep its bound.
+          if (remaining > 0) { waitTimer = setTimeout(expire, Math.min(remaining, 2_147_483_647)); return; }
+          console.error(refusal);
+          seatWait.abort(new Error(refusal));
+        };
+        expire();
+      };
+    }
     const done = withRepositoryLease(cwd, () => {
       acquired();
       return new Promise<void>((resolve) => { release = resolve; });
     }, {
-      onWait: (holder, blockers) => console.error(`tickmarkr: vitest waits for this repository's runner lease ${describeLeaseWait(holder, blockers)}`),
+      ...(seatWait ? { signal: seatWait.signal } : {}),
+      onWait: (holder, blockers) => {
+        console.error(`tickmarkr: vitest waits for this repository's runner lease ${describeLeaseWait(holder, blockers)}`);
+        startWait?.();
+        startWait = undefined; // a changed holder never resets the bound
+      },
     });
-    await Promise.race([holding, done]);
+    try { await Promise.race([holding, done]); }
+    finally { clearTimeout(waitTimer); }
     // Cancellation: Vitest answers SIGINT/SIGTERM with process.exit() and never runs global teardown or
     // closes its pool, so forks and their nested runners would outlive it. Prepended so it runs before
     // Vitest's own exit listener re-enters process.exit(); the record goes only once the tree is gone

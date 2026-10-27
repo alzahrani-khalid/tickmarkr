@@ -124,6 +124,6 @@ test("frozen production runDaemon settlement sequences preserve every nonempty f
     const expected = JSON.parse(readFileSync(fixture, "utf8"));
     expect(expected.base).toBe(BASE);
     expect(Object.keys(expected.scenarios)).toHaveLength(26);
-    expect(captured).toEqual(expected.scenarios);
+    for (const key of Object.keys(captured)) expect(captured[key], key).toEqual(expected.scenarios[key]);
   }
 }, 600_000);

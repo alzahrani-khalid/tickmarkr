@@ -74,6 +74,10 @@ export const HOST_SESSION_VARS = [
   "CLAUDE_CODE_BRIDGE_SESSION_ID",
 ] as const;
 
+/** D-2174 (queue row 267): the seat marker. No launch inherits it: the daemon clears it at start, and every shell and
+ * the worker seal strip it; only a judge, review or consult seat launch sets it, to its own role. */
+export const SEAT_MARKER_ENV = "TICKMARKR_SEAT";
+
 /** A copy of `env` without the host-session names; the input (the daemon's own process.env) is never mutated. */
 export function withoutHostSession(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   const out: NodeJS.ProcessEnv = { ...env };
