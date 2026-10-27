@@ -47,7 +47,7 @@ describe("tickmarkr init --agent skills location (T3)", () => {
     vi.spyOn(registry, "allAdapters").mockReturnValue([]);
     const repo = makeRepo({ "keep.txt": "x" });
 
-    await runInit(repo, "--agent", "--docs");
+    await init(["--global-dir", mkdtempSync(join(tmpdir(), "tickmarkr-init-global-")), "--agent", "--docs"], repo, { env: {} });
 
     expect(readFileSync(join(repo, ".agents/skills/tickmarkr-loop/SKILL.md"))).toEqual(skill("tickmarkr-loop"));
     expect(readFileSync(join(repo, ".agents/skills/tickmarkr-auto/SKILL.md"))).toEqual(skill("tickmarkr-auto"));

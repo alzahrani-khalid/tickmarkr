@@ -128,7 +128,7 @@ describe("the daemon-written re-park at the review round cap (queue row 225)", (
     const token = parkToken(park)!;
     expect(park.index).toBe(parkIndexes(events).at(-1));
     const out = await status([s.runId], s.repo);
-    expect(out).toContain(`next action Choose a decision: waive, uphold, recheck (--park ${token}) · human-decision yes`);
+    expect(out).toContain(`next action Choose a decision: ${["waive", "uphold", "recheck"].map(verb => `${verb}: tickmarkr approve ${s.runId} T1 --${verb} --gate review --park ${token}`).join("; ")} · human-decision yes`);
     const [decision, ...others] = deriveRunDecisions(journal, loadGraph(s.repo));
     expect(others).toEqual([]);
     expect(decision!.taskId).toBe("T1");

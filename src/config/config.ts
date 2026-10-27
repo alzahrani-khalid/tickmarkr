@@ -400,6 +400,9 @@ export const TickmarkrConfigSchema = z.object({
     .regex(/^[A-Za-z0-9][A-Za-z0-9._/-]*$/, "must be branch-safe (letters/digits/._/-, no spaces or shell metacharacters)")
     .refine((v) => !v.includes(".."), "may not contain '..'"),
   taskTimeoutMinutes: z.number().positive(),
+  approvalWindowSeconds: z.number().int()
+    .min(30, "approvalWindowSeconds must be between 30 and 86400 seconds")
+    .max(86400, "approvalWindowSeconds must be between 30 and 86400 seconds").optional(),
   // v1.23 T2: warn the operator once per attempt when a live worker's context fill crosses this
   // token count (sampled at existing poll seams). Telemetry only — never blocks or kills a worker.
   // Default 170_000 matches the overseer's proven ctx-watch.sh threshold.

@@ -1,0 +1,18 @@
+{
+  "modules": ["./board/register.tsx"],
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "tickmarkr wait --timeout 23h 2>&1; c=$?; case $c in 0|3|4|5) exit 2;; esac; exit 0",
+            "asyncRewake": true,
+            "timeout": 86400
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "name": "tickmarkr",
+  "owner": {
+    "name": "Khalid Alzahrani",
+    "url": "https://github.com/alzahrani-khalid/tickmarkr"
+  },
+  "description": "Spec in, verified work out.",
+  "plugins": [
+    {
+      "name": "tickmarkr",
+      "source": {
+        "source": "npm",
+        "package": "tickmarkr"
+      }
+    }
+  ]
+}

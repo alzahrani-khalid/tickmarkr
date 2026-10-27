@@ -523,15 +523,25 @@ At runtime, the **scope gate** derives `git diff --name-only` from the task base
 the spec-declared files. Out-of-scope edits fail unless the operator config explicitly allowlists
 them; worker-declared deviations are recorded as notes, not authority.
 
-## Claude Code integration
+## Claude Code and Claude Desktop
 
-If you clone this repo and use Claude Code, project skills are installed in `.claude/skills/`:
+The optional tickmarkr plugin adds the `/tickmarkr-board` pane and a session-start waiter:
+
+- **Claude Code:** `claude plugin install tickmarkr --marketplace alzahrani-khalid/tickmarkr`.
+- **Claude Desktop:** Plugins → Add marketplace (`alzahrani-khalid/tickmarkr`) → Add plugin (`tickmarkr`).
+
+Enabling the plugin runs `tickmarkr wait --timeout 23h` as a background task at every session start
+and resume and loads the board module (`hooks/board/register.tsx`); both execute with the user's
+permissions. The waiter wakes the session when the run ends, parks, a task fails or the daemon dies.
+The board shows the current run's status and decisions.
+
+The plugin and `tickmarkr init --agent` use the same skills:
 
 - **[/tickmarkr-loop](skills/tickmarkr-loop/SKILL.md)** — compile a spec, review the routing plan, run the engagement, and commit the Markdown record
 - **[/tickmarkr-auto](skills/tickmarkr-auto/SKILL.md)** — autonomous multi-phase runs (GSD milestones, etc.)
 
 These are optional — the CLI works standalone. Skills are repo-scoped and ship in the npm tarball for agents working in projects that have run `tickmarkr init --agent`.
-The canonical sources live in `skills/`; this repository's installed `.claude/skills/` links
+`skills/` stays the single source for the plugin and installed skills; this repository's `.claude/skills/` links
 resolve there. The [overseer skill](skills/tickmarkr-overseer/SKILL.md) links to the same
 loop walkthrough for cockpit and decision guidance; skill names remain unchanged.
 

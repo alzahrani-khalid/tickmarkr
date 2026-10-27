@@ -4,6 +4,7 @@ import ts from "typescript";
 import { describe, expect, it } from "vitest";
 import { newestPark, parkToken, permittedDecisionVerbs, readJournalEvents } from "../../src/cli/commands/approve.js";
 import { status } from "../../src/cli/commands/status.js";
+import { decisionCommands } from "../../src/run/decision-verbs.js";
 import { graphDefinitionHash, loadGraph } from "../../src/graph/graph.js";
 import { Journal, PARK_KINDS, type JournalEvent } from "../../src/run/journal.js";
 import { deriveRunDecisions } from "../../src/tui/cockpit/decision-actions.js";
@@ -28,7 +29,7 @@ function decision(kind: string, options: { reason?: string; gate?: string; diagn
   events.push({ event: "task-human", taskId: "T6", ts: "2026-09-20T09:01:00Z",
     data: { kind, reason: options.reason ?? `Recorded ${kind} reason` } });
   const park = newestPark(events, "T6")!;
-  return { taskId: "T6", park, verbs: permittedDecisionVerbs(park), diagnostic: options.diagnostic };
+  return { taskId: "T6", park, verbs: permittedDecisionVerbs(park), ...decisionCommands("run-summary", "T6", park), diagnostic: options.diagnostic };
 }
 
 function freeze<T>(value: T): T {
@@ -40,6 +41,20 @@ function freeze<T>(value: T): T {
 }
 
 describe("operator summary", () => {
+  it("a decision snapshot without command evidence preserves the walkthrough's human decision flags with no fabricated next action", () => {
+    // Regression: the docs-truth operator progress walkthrough supplies only park facts and verbs.
+    const snapshot: OperatorDecisionSnapshot = {
+      taskId: "T6", park: { kind: "gate-fail", tombstone: false }, verbs: ["approve"],
+    };
+    for (const evidence of [{}, { commands: [] }, { noDecision: "No recorded command is available" }]) {
+      expect(projectOperatorSummary([task()], [{ ...snapshot, ...evidence }])[0]!.blocker).toEqual({
+        kind: "human-decision", permittedActions: ["approve"],
+        humanInterventionRequired: true, decisionRequired: true,
+        nextAction: evidence.noDecision ?? null,
+      });
+    }
+  });
+
   it("every park kind the journal schema admits, paired with the verbs the production decision table returns for it, projects a blocker whose permitted actions equal exactly those verbs, whose human-intervention flag is true for every park kind except a tombstone, and whose decision flag is true only when at least one verb exists, so a scope-request shown as an automatic wait, a tombstone shown as needing a human, or a verb the table refuses fails", () => {
     const cases = [
       ...PARK_KINDS.map(kind => decision(kind)),
@@ -74,11 +89,11 @@ describe("operator summary", () => {
       expect(projectOperatorSummary([task({
         missingCapability: { capability: "sandbox-exec", diagnostic: "Unrelated host diagnostic" },
       })], [snapshot])[0]!.blocker).toMatchObject({
-        diagnostic: snapshot.diagnostic, nextAction: null, permittedActions: [], decisionRequired: false,
+        diagnostic: snapshot.diagnostic, nextAction: snapshot.noDecision, permittedActions: [], decisionRequired: false,
       });
       const { diagnostic: _diagnostic, ...withoutDiagnostic } = snapshot;
       expect(projectOperatorSummary([task()], [withoutDiagnostic])[0]!.blocker).toMatchObject({
-        diagnostic: snapshot.park.reason, nextAction: null, permittedActions: [], decisionRequired: false,
+        diagnostic: snapshot.park.reason, nextAction: snapshot.noDecision, permittedActions: [], decisionRequired: false,
       });
     }
     // A failed gate from before a production decision boundary cannot supply
@@ -91,10 +106,10 @@ describe("operator summary", () => {
         { event: "task-human", taskId: "T6", ts: "2026-09-20T09:03:00Z", data: { kind: "gate-fail", reason: "No current failed gate.\nInspect the evidence." } },
       ];
       const park = newestPark(events, "T6")!;
-      const snapshot = { taskId: "T6", park, verbs: permittedDecisionVerbs(park) };
+      const snapshot = { taskId: "T6", park, verbs: permittedDecisionVerbs(park), ...decisionCommands("run-summary", "T6", park) };
       expect(snapshot.verbs).toEqual([]);
       expect(projectOperatorSummary([task()], [snapshot])[0]!.blocker).toMatchObject({
-        diagnostic: park.reason, nextAction: null, permittedActions: [],
+        diagnostic: park.reason, nextAction: snapshot.noDecision, permittedActions: [],
         humanInterventionRequired: true, decisionRequired: false,
       });
     }
@@ -102,7 +117,7 @@ describe("operator summary", () => {
     expect(projectOperatorSummary([task()], [reasonOnly])[0]!.blocker!.diagnostic).toBe(reasonOnly.park.reason);
     const emptyDiagnostic = decision("scope-request", { diagnostic: "" });
     expect(projectOperatorSummary([task()], [emptyDiagnostic])[0]!.blocker).toMatchObject({
-      diagnostic: "", nextAction: null,
+      diagnostic: "", nextAction: emptyDiagnostic.noDecision,
     });
   });
 
@@ -257,16 +272,17 @@ describe("reapFailure stall parks across decision consumers (OBS-1202)", () => {
     expect(applySetupDecisionsKey(onT2, { input: "r", key: {} }, setup).session.confirming).toBeNull();
 
     // the operator summary projected from those production decisions
-    const summaries = projectOperatorSummary(["T1", "T2"].map((id) => task({ id })), run);
+    const summaries = projectOperatorSummary(["T1", "T2"].map((id) => task({ id })),
+      run.map(d => ({ ...d, ...decisionCommands(runId, d.taskId, d.park) })));
     for (const s of summaries) {
       expect(s.blocker!.permittedActions).toEqual(expected.get(s.taskId));
-      expect(s.blocker!.nextAction).toBe(`Choose a decision: ${expected.get(s.taskId)!.join(", ")} (--park ${tokens.get(s.taskId)})`);
+      expect(s.blocker!.nextAction).toBe(`Choose a decision: ${expected.get(s.taskId)!.map(verb => `${verb}: tickmarkr approve ${runId} ${s.taskId}${verb === "approve" ? "" : ` --${verb}`} --park ${tokens.get(s.taskId)}`).join("; ")}`);
     }
 
     // ...and the status command's rendering of the same summaries
     const out = (await status([runId], repo)).replace(/\s+/g, " ");
-    expect(out).toContain(`next action Choose a decision: approve, recheck (--park ${tokens.get("T1")})`);
-    expect(out).toContain(`next action Choose a decision: approve (--park ${tokens.get("T2")})`);
-    expect(out).not.toContain(`recheck (--park ${tokens.get("T2")})`);
+    expect(out).toContain(`next action Choose a decision: approve: tickmarkr approve ${runId} T1 --park ${tokens.get("T1")}; recheck: tickmarkr approve ${runId} T1 --recheck --park ${tokens.get("T1")}`);
+    expect(out).toContain(`next action Choose a decision: approve: tickmarkr approve ${runId} T2 --park ${tokens.get("T2")}`);
+    expect(out).not.toContain(`T2 --recheck --park ${tokens.get("T2")}`);
   });
 });

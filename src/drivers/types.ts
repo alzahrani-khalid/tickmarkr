@@ -1,4 +1,5 @@
 import type { JournalEvent } from "../run/journal.js";
+import type { DecisionCommands } from "../run/decision-verbs.js";
 // group: role-tab consolidation (VIS-04) — same-group slots share one ref-counted tab (herdr only)
 // readScreen (OBS-1205): the optional rendered-screen read of the driver that created this slot —
 // the terminal's painted frame, where a cursor-drawn modal has text that its byte stream does not.
@@ -13,6 +14,7 @@ export interface Slot {
 }
 export type NotifyTier = "routine" | "attention" | "decision";
 export interface NotifyOpts { tier?: NotifyTier; sound?: "none" | "done" | "request" }
+export interface NotificationPost { kind: "park" | "run-end"; text: string }
 
 export type DecisionEventType =
   | "phase-change"
@@ -40,6 +42,8 @@ export interface DecisionEvent {
   kind?: string;
   reason?: string;
   approvalCommand?: string;
+  decisionCommands?: DecisionCommands["commands"];
+  noDecision?: string | null;
   summary?: Record<string, unknown>;
 }
 
@@ -248,12 +252,16 @@ export interface ExecutorDriver {
   // contract: a nudge must never fail a run.
   nudge?(slot: Slot, message: string): Promise<boolean>;
   notify(msg: string, opts?: NotifyOpts): Promise<void>;
+  /** Synchronous, best-effort OS post at an explicitly chosen journal boundary. */
+  postSync?(post: NotificationPost): void;
+  /** Bind driver observations to this invocation's journal. */
+  journalWith?(append: (event: string, taskId?: string, data?: Record<string, unknown>) => void): void;
   close(slot: Slot): Promise<void>;
   // v1.99 T2: bind this driver's OWN journal writes to the live narration sink. A driver journals
   // events the daemon never sees — `dispatch-retry` is written by the driver from inside a recovery,
   // through a Journal it opens itself — so without this binding those events reach the file and the
   // pipe but never the operator's rail. The command that owns the run (run.ts / resume.ts) calls it
-  // with the same sink it hands the daemon. Optional — subprocess journals nothing of its own.
+  // with the same sink it hands the daemon. Optional — drivers may use journalWith's append sink instead.
   narrateWith?(narrate: (event: JournalEvent) => void): void;
   worktree(repo: string, branch: string, baseRef: string): Promise<string>;
   // Run-bound board, placed right with no focus where supported. Drivers must

@@ -1,0 +1,614 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "version": {
+      "type": "number",
+      "const": 1
+    },
+    "runId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "sequence": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 9007199254740991
+    },
+    "observedAt": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+    },
+    "daemon": {
+      "type": "string",
+      "enum": [
+        "alive",
+        "dead",
+        "unknown"
+      ]
+    },
+    "lifecycle": {
+      "type": "string",
+      "enum": [
+        "PENDING",
+        "RUNNING",
+        "PARTIAL",
+        "APPROVED",
+        "COMPLETE",
+        "UNKNOWN"
+      ]
+    },
+    "verdict": {
+      "type": "object",
+      "properties": {
+        "green": {
+          "type": "boolean"
+        },
+        "fatal": {
+          "type": "boolean"
+        },
+        "currentTip": {
+          "type": "string",
+          "enum": [
+            "passed",
+            "not required",
+            "pending",
+            "failed",
+            "unknown"
+          ]
+        },
+        "buckets": {
+          "type": "object",
+          "properties": {
+            "failed": {
+              "anyOf": [
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "human": {
+              "anyOf": [
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "blocked": {
+              "anyOf": [
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "pending": {
+              "anyOf": [
+                {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "failed",
+            "human",
+            "blocked",
+            "pending"
+          ],
+          "additionalProperties": false
+        },
+        "outstanding": {
+          "oneOf": [
+            {
+              "type": "object",
+              "properties": {
+                "known": {
+                  "type": "boolean",
+                  "const": true
+                },
+                "debt": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "checks": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                }
+              },
+              "required": [
+                "known",
+                "debt",
+                "checks"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "type": "object",
+              "properties": {
+                "known": {
+                  "type": "boolean",
+                  "const": false
+                },
+                "reason": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              },
+              "required": [
+                "known",
+                "reason"
+              ],
+              "additionalProperties": false
+            }
+          ]
+        }
+      },
+      "required": [
+        "green",
+        "fatal",
+        "currentTip",
+        "buckets",
+        "outstanding"
+      ],
+      "additionalProperties": false
+    },
+    "approvalWindow": {
+      "anyOf": [
+        {
+          "type": "object",
+          "properties": {
+            "opensAt": {
+              "type": "string",
+              "format": "date-time",
+              "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+            },
+            "closesAt": {
+              "type": "string",
+              "format": "date-time",
+              "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+            },
+            "parked": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "required": [
+            "opensAt",
+            "closesAt",
+            "parked"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "tasks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "deps": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "state": {
+            "type": "string",
+            "enum": [
+              "unknown",
+              "pending",
+              "running",
+              "completed",
+              "merged",
+              "failed",
+              "human",
+              "blocked"
+            ]
+          },
+          "gates": {
+            "type": "object",
+            "properties": {
+              "build": {
+                "type": "string",
+                "enum": [
+                  "unknown",
+                  "not-run",
+                  "disabled",
+                  "queued",
+                  "running",
+                  "passed",
+                  "failed"
+                ]
+              },
+              "test": {
+                "type": "string",
+                "enum": [
+                  "unknown",
+                  "not-run",
+                  "disabled",
+                  "queued",
+                  "running",
+                  "passed",
+                  "failed"
+                ]
+              },
+              "lint": {
+                "type": "string",
+                "enum": [
+                  "unknown",
+                  "not-run",
+                  "disabled",
+                  "queued",
+                  "running",
+                  "passed",
+                  "failed"
+                ]
+              },
+              "evidence": {
+                "type": "string",
+                "enum": [
+                  "unknown",
+                  "not-run",
+                  "disabled",
+                  "queued",
+                  "running",
+                  "passed",
+                  "failed"
+                ]
+              },
+              "scope": {
+                "type": "string",
+                "enum": [
+                  "unknown",
+                  "not-run",
+                  "disabled",
+                  "queued",
+                  "running",
+                  "passed",
+                  "failed"
+                ]
+              },
+              "acceptance": {
+                "type": "string",
+                "enum": [
+                  "unknown",
+                  "not-run",
+                  "disabled",
+                  "queued",
+                  "running",
+                  "passed",
+                  "failed"
+                ]
+              },
+              "review": {
+                "type": "string",
+                "enum": [
+                  "unknown",
+                  "not-run",
+                  "disabled",
+                  "queued",
+                  "running",
+                  "passed",
+                  "failed"
+                ]
+              }
+            },
+            "required": [
+              "build",
+              "test",
+              "lint",
+              "evidence",
+              "scope",
+              "acceptance",
+              "review"
+            ],
+            "additionalProperties": false
+          },
+          "tries": {
+            "type": "object",
+            "properties": {
+              "round": {
+                "anyOf": [
+                  {
+                    "type": "integer",
+                    "exclusiveMinimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "budget": {
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "maximum": 9007199254740991
+              },
+              "launches": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              }
+            },
+            "required": [
+              "round",
+              "budget",
+              "launches"
+            ],
+            "additionalProperties": false
+          },
+          "seats": {
+            "type": "object",
+            "properties": {
+              "worker": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "judge": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "reviewer": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "worker",
+              "judge",
+              "reviewer"
+            ],
+            "additionalProperties": false
+          },
+          "startedAt": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time",
+                "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "endedAt": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time",
+                "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "now": {
+            "type": "object",
+            "properties": {
+              "phase": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "since": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "format": "date-time",
+                    "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d(?::[0-5]\\d(?:\\.\\d+)?)?(?:Z|([+-](?:[01]\\d|2[0-3]):[0-5]\\d)))$"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "blocker": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "nextAction": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "phase",
+              "since",
+              "blocker",
+              "nextAction"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "id",
+          "title",
+          "deps",
+          "state",
+          "gates",
+          "tries",
+          "seats",
+          "startedAt",
+          "endedAt",
+          "now"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "parks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "taskId": {
+            "type": "string"
+          },
+          "kind": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "token": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "commands": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "verb": {
+                  "type": "string",
+                  "enum": [
+                    "approve",
+                    "waive",
+                    "uphold",
+                    "recheck"
+                  ]
+                },
+                "command": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "verb",
+                "command"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "noDecision": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "taskId",
+          "kind",
+          "reason",
+          "token",
+          "commands",
+          "noDecision"
+        ],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": [
+    "version",
+    "runId",
+    "sequence",
+    "observedAt",
+    "daemon",
+    "lifecycle",
+    "verdict",
+    "approvalWindow",
+    "tasks",
+    "parks"
+  ],
+  "additionalProperties": false,
+  "$comment": "Version 1 status snapshot; verdict and lifecycle use the shared operator fold with current owed checks."
+}

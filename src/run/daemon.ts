@@ -1,7 +1,7 @@
 import { HOST_PROBE_SAMPLE_MS, HOST_PROBE_SAMPLES, HostDegradedError, hostDegraded, observeHost, type HostObservation } from "./host-health.js";
 import { runWithInterruptionSink, VITEST_CACHE_ENV, worktreeVitestCache, type HostInterruption } from "../gates/test-manifest.js";
 import { COMMAND_LEASE_TOKEN_ENV, commandLeaseEnvironment, CommandLeases, currentCommandLeaseToken, isRunnerCommand, runWithCommandLease, withCommandLease } from "./lease.js";
-import { execFile, execFileSync, spawn } from "node:child_process";
+import { execFile, execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { createHash, type Hash, randomBytes } from "node:crypto";
 import { shq } from "../adapters/types.js";
 import { appendFileSync, closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, readlinkSync, readSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
@@ -42,8 +42,11 @@ import { addDetachedWorktree, changeRepresented, cleanupRunWorktrees, declaredBa
 import { MASK } from "./redact.js";
 import { runInteractiveSeed, type InteractiveSeedResult } from "./interactive-seed.js";
 import { classifyRepairDisposition, namedPaths, resolveScopeHints } from "./repair-disposition.js";
-import { applyScopeAmendments, activeRetryBan, interruptedAttempt, RESUME_HARVEST_SOURCE, resumeHarvestAuthor, approvalAction, APPROVAL_REFUSED, bindingToken, effectiveEvents, foldDecisions, physicalLine, staleApprovals, classifyTaskFailure, classifyWorkerResultCause, deferredReviewFindings, engagementComparable, formatPriorFindingEvidence, GATE_FINGERPRINT_CAP, GATE_SATISFIED_RELEASE, identicalGateFailures, isDeferredFinding, journaledFailureBrief, Journal, loadRoutingProfile, newRunId, normalizeGateFailure, outstandingConsultGuidance, readableExcerpt, receiptOrigin, outstandingReviewFindings, pendingApprovalActions, pendingRechecks, pendingRepairFindings, phaseForGate, priorJudgments, readPriorRunEvidence, recordedTaskFailureKind, reraisedReviewChains, RECHECK_RELEASE, renderStructuredReviewFinding, repairReachSinceApproval, repairsSinceApproval, reviewRoundsSinceApproval, runHasEnded, standingRulings, structuredFindings, upheldFeedbackByTask, type CurrentAttemptGateReplay, type JournalEvent, type ParkKind, type ResumeState, type RetryMode, type StructuredFinding } from "./journal.js";
-import { permittedDecisionVerbs, type DecisionPark } from "./decision-verbs.js";
+import { applyScopeAmendments, activeRetryBan, interruptedAttempt, RESUME_HARVEST_SOURCE, resumeHarvestAuthor, approvalAction, APPROVAL_REFUSED, effectiveEvents, foldDecisions, physicalLine, staleApprovals, classifyTaskFailure, classifyWorkerResultCause, deferredReviewFindings, engagementComparable, formatPriorFindingEvidence, GATE_FINGERPRINT_CAP, GATE_SATISFIED_RELEASE, identicalGateFailures, isDeferredFinding, journaledFailureBrief, Journal, loadRoutingProfile, newRunId, normalizeGateFailure, outstandingConsultGuidance, readableExcerpt, receiptOrigin, outstandingReviewFindings, pendingApprovalActions, pendingRechecks, pendingRepairFindings, phaseForGate, priorJudgments, readPriorRunEvidence, recordedTaskFailureKind, reraisedReviewChains, RECHECK_RELEASE, renderStructuredReviewFinding, repairReachSinceApproval, repairsSinceApproval, reviewRoundsSinceApproval, runHasEnded, standingRulings, structuredFindings, upheldFeedbackByTask, type CurrentAttemptGateReplay, type JournalEvent, type ParkKind, type ResumeState, type RetryMode, type StructuredFinding } from "./journal.js";
+import { decisionCommands, type DecisionPark } from "./decision-verbs.js";
+import { foldOwedChecks, parseJournalText } from "./journal.js";
+import { readOperatorState } from "./operator-state.js";
+import { newestPark } from "../cli/commands/approve.js";
 import { carriedAuthorVendors, gateReviewerFloor, isDiffCapPark, isGarbageReview, pickReviewer } from "../gates/review.js";
 import { acquireApprovalSerialization, acquireRunLock, isPidLive, releaseRunLock } from "./lock.js";
 import { checkIntegrationIdentity, ensureIntegration, integrationBranch, type IntegrationLeg, type IntegrationRefState, integrationRepairText, mergeTask, readIntegrationRef, reusedTipEvidence, type TipVerifyResult, verifyIntegrationTip } from "./merge.js";
@@ -188,6 +191,11 @@ export interface RunOptions {
   concurrency?: number;
   /** Bounded wait at a drain caused solely by parked tasks. */
   approvalWindowMs?: number;
+  /** Keep-awake dependencies; an injected spawner also runs under vitest. */
+  keepAwake?: {
+    spawn?: (command: string, args: string[], options: { stdio: "ignore" }) => ChildProcess;
+    platform?: NodeJS.Platform;
+  };
   driver?: ExecutorDriver;
   driverOverride?: DriverChoice;
   adapters?: WorkerAdapter[];
@@ -1186,6 +1194,7 @@ export function runEndTipProof(events: readonly JournalEvent[]): TipProof {
   const tip = typeof rawTip === "string" ? rawTip : undefined;
   const proof = (kind: TipProof["kind"]): TipProof => ({ kind, ...(tip ? { tip } : {}) });
   const after = events.slice(start + 1);
+  if (after.some((e) => e.event === "tip-verify-cancelled" && e.data.reason === "cleanup-permission")) return proof("incomplete");
   if (after.some((e) => e.event === "tip-verify-failed")) return proof("failed");
   if (after.some((e) => e.event === "tip-verify-cancelled")) return proof("incomplete");
   const rows = after.filter((e) => e.event === "tip-verify" && e.data.pass === true && e.data.tip === tip);
@@ -1336,7 +1345,7 @@ export interface TipIdentity { repo: string; branch: string; expected?: string }
 export type IdentityLeg = IntegrationLeg | "setup" | "witness" | "checkout";
 type DeferredVerdict = NonNullable<TipVerifyResult["deferredVerdict"]>;
 /** One close under an identity: `expected` is what the closing check must find; `identityFailed` skips it. */
-export interface TipClose { failed: boolean; expected?: string; identityFailed: boolean; deferred: DeferredVerdict[]; tipEnvironment?: TipEnvironment }
+export interface TipClose { failed: boolean; expected?: string; identityFailed: boolean; deferred: DeferredVerdict[]; tipEnvironment?: TipEnvironment; cancelled?: "cleanup-permission" }
 interface TipVerifyOptions { lastMergedTask?: string; baseline?: Baseline; signal?: AbortSignal; evidence?: GateEvidenceOptions }
 
 const short = (commit: string | undefined) => commit ? commit.slice(0, 12) : "none";
@@ -1455,7 +1464,14 @@ Promise<{ ok: true; dir: string; h0: string[] } | { ok: false; leg: "setup" | "w
   // A killed daemon never reaches the caller's finally; sweep checkouts whose owner is dead.
   for (const entry of readdirSync(parent)) {
     const owner = /^tip-verify-(\d+)-\w{6}$/.exec(entry)?.[1];
-    if (owner && !isPidLive(Number(owner))) await removeWorktree(repo, join(parent, entry));
+    if (!owner || isPidLive(Number(owner))) continue;
+    const stale = join(parent, entry);
+    try { await removeWorktree(repo, stale); }
+    catch (error) {
+      // queue row 283: a permission loss on a dead owner's checkout (macOS folder access) skips that entry; it never
+      // blocks this checkout, which takes a fresh name, and the next sweep retries it. Any other failure stays fatal.
+      if (!tipCleanupPermissionDenied(error, stale)) throw error;
+    }
   }
   const dir = mkdtempSync(join(parent, `tip-verify-${process.pid}-`));
   created(dir);
@@ -1603,16 +1619,46 @@ export async function verifyIntegrationTipCached(
   };
   if (!identity) return (await battery(intWt)).tipFailed;
   let checkout: string | undefined;
+  let close: TipClose;
+  let cleanupCancelled = false;
   try {
     const opened = await openVerificationCheckout(identity.repo, tip, (dir) => { checkout = dir; });
-    if (!opened.ok) return identityFailure({ started: true, expected: tip, ...opened });
-    const { tipFailed, deferred } = await battery(opened.dir);
-    const changed = await checkoutChange(opened.dir, tip, opened.h0);
-    if (changed) return identityFailure({ started: true, expected: tip, leg: "checkout", details: `verification checkout changed during the battery: ${changed}` });
-    return { failed: tipFailed, expected: tip, identityFailed: false, deferred, tipEnvironment };
+    if (!opened.ok) close = identityFailure({ started: true, expected: tip, ...opened });
+    else {
+      const { tipFailed, deferred } = await battery(opened.dir);
+      const changed = await checkoutChange(opened.dir, tip, opened.h0);
+      close = changed
+        ? identityFailure({ started: true, expected: tip, leg: "checkout", details: `verification checkout changed during the battery: ${changed}` })
+        : { failed: tipFailed, expected: tip, identityFailed: false, deferred, tipEnvironment };
+    }
   } finally {
-    if (checkout) await removeWorktree(identity.repo, checkout);
+    if (checkout) cleanupCancelled = await closeVerificationCheckout(identity.repo, checkout, journal);
   }
+  return cleanupCancelled ? { ...close, cancelled: "cleanup-permission", deferred: [] } : close;
+}
+
+async function closeVerificationCheckout(repo: string, checkout: string, journal: Journal): Promise<boolean> {
+  try { await removeWorktree(repo, checkout); return false; }
+  catch (error) {
+    if (!tipCleanupPermissionDenied(error, checkout)) throw error;
+    journal.append("tip-verify-cancelled", undefined, { reason: "cleanup-permission", checkout, details: error.message });
+    return true;
+  }
+}
+
+/** Only this checkout's cleanup: dropWorktree reports each failed rm/prune step, separated by "; ". */
+function tipCleanupPermissionDenied(error: unknown, checkout: string): error is Error {
+  if (!(error instanceof Error) || !error.message.startsWith(`cleanup of ${checkout} through `)) return false;
+  const marker = " failed: ";
+  const start = error.message.indexOf(marker);
+  if (start < 0) return false;
+  const steps = error.message.slice(start + marker.length).split(/; (?=git worktree prune(?: \(|:))/u);
+  return steps.every(step => {
+    const command = step.startsWith(`rm -rf ${shq(checkout)}`) ? `rm -rf ${shq(checkout)}` : "git worktree prune";
+    if (!step.startsWith(command)) return false;
+    const diagnostic = /^(?: \(-?\d+\))?: ([\s\S]*)$/u.exec(step.slice(command.length))?.[1];
+    return diagnostic !== undefined && /Operation not permitted|Permission denied|EPERM|EACCES/u.test(diagnostic);
+  });
 }
 
 /** OBS-953: a detected wall-over-monotonic discontinuity journals `host-suspend` (its offset was
@@ -2430,6 +2476,30 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
   let releaseApprovalSerialization: (() => void) | undefined;
   let baselineCapture: Promise<void> = Promise.resolve();
   let baselineFailed = false;
+  let stopKeepAwake: (() => void) | undefined;
+  // Called only after THIS invocation successfully appends its run-end, with no await before
+  // the post. Historical rows and post-end cleanup can never fund a second notification.
+  const postRunEnd = (phase?: string): void => {
+    if (!driver.postSync) return;
+    const started = performance.now();
+    let text = `tickmarkr ${runId}: run ended — verdict unknown — run tickmarkr status`;
+    try {
+      const raw = readFileSync(join(journal.dir, "journal.jsonl"), "utf8");
+      const events = parseJournalText(raw);
+      // queue row 282: status's readability rule — a nonblank line the parse dropped leaves the verdict unknown.
+      if (events.length !== raw.split("\n").filter((line) => line.trim()).length) throw new Error("the journal holds an unreadable line");
+      const basis = String(events.length);
+      const snapshot = readOperatorState({ events, graph, basis,
+        owed: { basis, fold: foldOwedChecks(events, repoRoot) } });
+      // Status's synchronous git re-proofs cannot be interrupted here. If they overrun,
+      // withhold the verdict once they return; an overrun must never claim GREEN.
+      if (performance.now() - started <= 10_000) {
+        text = snapshot.green ? `tickmarkr ${runId}: run ended GREEN`
+          : `tickmarkr ${runId}: run ended NOT GREEN — done ${snapshot.merged}, failed ${snapshot.buckets.failed?.length ?? 0}, parked ${snapshot.buckets.human?.length ?? 0}, blocked ${snapshot.buckets.blocked?.length ?? 0}, pending ${snapshot.buckets.pending?.length ?? 0}, tip ${snapshot.currentTip === "passed" ? "passed" : snapshot.currentTip === "failed" ? "failed" : "absent"}, owed ${snapshot.debt}${phase ? `, crashed in ${phase}` : ""}`;
+      }
+    } catch { /* A broken status fold has no verdict, especially not a green one. */ }
+    driver.postSync({ kind: "run-end", text });
+  };
   try {
   graph = loadGraph(repoRoot);
   // Queue row 220 (D-2111): a declared base is proven HERE — before any journal row (lock-reclaimed and
@@ -2693,6 +2763,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
   process.on("SIGTERM", onTermination);
 
   journal = opts.resume ? Journal.open(repoRoot, runId, opts.narrate) : Journal.create(repoRoot, runId, opts.narrate);
+  driver.journalWith?.(journal.append.bind(journal));
   // OBS-1010 / v2.6.8 T1: a demotion the JOURNAL carries into this session is replayed as what it was
   // live — a SOFT preference (reviewer role only; the worker channel is untouched — channel-demotion is
   // the worker fold, replayExcludedChannels). The seat ranks last, even over prefer, and may still be
@@ -2988,11 +3059,12 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       const count = await liveSuiteCount(repoRoot);
       signal.throwIfAborted();
       const remaining = suiteWaitCeilingMs - (Date.now() - startedAt);
-      // Reserve a full bounded batch. A partial last batch would manufacture an unreadable
-      // host at an otherwise healthy occupancy deadline. Retain the latest complete observation.
+      // Reserve a full bounded batch, including the first observation under a shorter ceiling.
+      // A clipped batch would manufacture an unreadable host at a healthy occupancy deadline.
+      // Later polls retain the latest complete observation when a full batch no longer fits.
       const probeBudget = HOST_PROBE_SAMPLE_MS * HOST_PROBE_SAMPLES;
       if (!observation || (!first && remaining >= probeBudget)) {
-        observation = await observeHost(signal, remaining > 0 ? Math.min(probeBudget, remaining) : undefined);
+        observation = await observeHost(signal, probeBudget);
         journalObservation(taskId, observation, resuming);
       }
       first = false;
@@ -3303,6 +3375,38 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     prior?.append("superseded", undefined, { by: runId });
   }
 
+  // Keep this session's rows after its lifecycle boundary: pre-resume rows would erase
+  // the prior engagement's interruption span, and refused resumes must not start a child.
+  // caffeinate follows this daemon's pid even if termination bypasses our finally.
+  // Only the default spawner is suppressed in vitest; injected dependencies exercise this path.
+  if ((opts.keepAwake?.platform ?? process.platform) === "darwin"
+      && (opts.keepAwake?.spawn !== undefined || !process.env.VITEST)) {
+    try {
+      const child = (opts.keepAwake?.spawn ?? spawn)("caffeinate", ["-i", "-w", String(process.pid)], { stdio: "ignore" });
+      stopKeepAwake = () => { try { child.kill(); } catch { /* best effort */ } };
+      const error = await new Promise<string | undefined>((resolve) => {
+        let settled = false;
+        const finish = (error?: string) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          child.removeListener("exit", onExit);
+          resolve(error);
+        };
+        const onExit = (code: number | null, signal: NodeJS.Signals | null) =>
+          finish(`caffeinate exited within one second (code ${code}, signal ${signal})`);
+        const timer = setTimeout(() => finish(), 1_000);
+        // Retain the error listener through cleanup so even a late child error stays best effort.
+        child.on("error", (error) => finish(String(error)));
+        child.once("exit", onExit);
+      });
+      journal.append(error === undefined ? "keep-awake" : "keep-awake-failed", undefined,
+        error === undefined ? { pid: child.pid } : { error });
+    } catch (error) {
+      journal.append("keep-awake-failed", undefined, { error: String(error) });
+    }
+  }
+
   // OBS-547: ONE full per-task collateral prediction for the whole run, computed here — uncapped, and
   // handed whole to every scope gate below (never recomputed at a red, never the plan's 20-item view).
   // Persisted beside baseline.json and RELOADED on resume (same reason baseline is): the prediction is
@@ -3441,9 +3545,8 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
   // gateFails/consults are execTask-scoped counters passed in so a park row is a rich verified-failure
   // observation (e.g. ladder-exhausted + gateFails:4); every task-human row has a closed kind, never prose alone.
   const parkApprovalReason = (taskId: string, identity: string, park: DecisionPark): string => {
-    const commands = permittedDecisionVerbs(park).map((verb) =>
-      `tickmarkr approve ${runId} ${taskId}${verb === "approve" ? "" : ` --${verb}`}`);
-    return `${identity} — release with ${commands.map((command) => `\`${command}\``).join(" or ")}`;
+    const { commands } = decisionCommands(runId, taskId, park, { bound: false });
+    return `${identity} — release with ${commands.map(({ command }) => `\`${command}\``).join(" or ")}`;
   };
   const gateFailApprovalReason = (taskId: string, identity: string, includeUphold = false): string =>
     parkApprovalReason(taskId, identity, { kind: "gate-fail", failedGate: includeUphold ? "review" : "other", tombstone: false });
@@ -3481,9 +3584,14 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     graph = setStatus(graph, t.id, "human");
     saveGraph(repoRoot, graph);
     journal.append("task-human", t.id, { ...details, reason, kind });
-    // OBS-1178: the notice carries the park token an approval binds to (`approve --park <token>`).
-    const parked = journal.newestBinding(t.id);
-    const token = parked && bindingToken(parked);
+    // Read the just-journaled park, including its failed gate and immutable physical token.
+    const { events: parkEvents, lines: parkLines } = journal.readSourced();
+    const parked = newestPark(parkEvents, t.id, parkLines.map(line => line - 1));
+    const { commands } = decisionCommands(runId, t.id, parked);
+    // The journal retains its unbound release wording; the notice prints each full command once.
+    const noticeReason = commands.length
+      ? reason.replace(/ — release with `tickmarkr approve [^`]*`(?: or `tickmarkr approve [^`]*`)*/u, "")
+      : reason;
     if (assignment) {
       // OBS-547: `metered` counts CHARGEABLE metered attempts, so an unchargeable dispatch passes 0 and
       // the count is omitted rather than written as 0 or as `1` beside `attempts: 0` — a row claiming
@@ -3492,7 +3600,11 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       journal.telemetry({ taskId: t.id, shape: t.shape, adapter: assignment.adapter, model: assignment.model, channel: assignment.channel, attempts, outcome: "human", durationMs: Date.now() - startMs, parkKind: kind, gateFails, consults, tokens, meteredAttempts: tokens && metered ? metered : undefined, retryMode });
     }
     await reconcile({ spareLiveLlm: true }); // task-human is a terminal event — sweep, sparing sibling tasks' live LLM panes
-    await driver.notify(`tickmarkr ${runId}: ${t.id} needs a human — ${reason}${token ? `\npark ${token} — bind the decision with \`--park ${token}\`` : ""}`, { tier: "attention" });
+    const notice = [`tickmarkr ${runId}: ${t.id} needs a human — ${noticeReason}`,
+      ...commands.map(({ verb, command }) => `${verb}: ${command}`),
+    ].join("\n");
+    driver.postSync?.({ kind: "park", text: notice });
+    await driver.notify(notice, { tier: "attention" });
   };
 
   // OBS-1106 residual: a retry that landed nothing on a timeout-class red re-observes it ONCE fresh:
@@ -7616,7 +7728,8 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           .filter((t) => t.status === "pending").every(behindPark);
         if (onlyParks) {
           if (approvalDeadline === undefined) {
-            const windowMs = opts.approvalWindowMs ?? approvalWindowMs;
+            const windowMs = opts.approvalWindowMs ?? (cfg.approvalWindowSeconds === undefined
+              ? approvalWindowMs : cfg.approvalWindowSeconds * 1_000);
             approvalDeadline = Date.now() + windowMs;
             journal.append("approval-window-start", undefined, { windowMs, parked: [...parked] });
             // The narrator may itself append a decision at this boundary.
@@ -7713,7 +7826,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         activeTipVerify = undefined;
         clearTimeout(poll);
       }
-      summary.tipVerify = tipClose.failed ? "failed" : "passed";
+      if (!tipClose.cancelled) summary.tipVerify = tipClose.failed ? "failed" : "passed";
       summary.tipProof = runEndTipProof(journal.read());
       if (tipClose.failed && lastMergedTask) summary.lastMergedTask = lastMergedTask;
     } else {
@@ -7774,6 +7887,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       }
     }
     journal.append("run-end", undefined, { ...summary });
+    postRunEnd();
     await reconcile(); // run-end boundary: nothing in flight — full sweep (empty desired set)
     // Queue row 240 (D-2138): every task checkout of this run is removed once its recovery ref is recorded,
     // unless keepPanes is forever. A dead run's leftovers go at the next daemon start in the same checkout.
@@ -7812,6 +7926,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           taskLoopStarted || opts.resume ? failedGraph : undefined, phase);
         // The fatal close states its proof too; a dead notifier never replaces the original error.
         if (tipProof) {
+          postRunEnd(phase);
           await driver.notify(`tickmarkr ${runId}: run crashed — ${formatTipProof(tipProof)} — integration branch ${branch}`,
             { tier: "attention" }).catch(() => {});
         }
@@ -7820,6 +7935,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     throw err;
   } finally {
     // Startup/dispatch errors must not leave a capture running after its daemon releases the lock.
+    stopKeepAwake?.();
     await baselineCapture.catch(() => {});
     // v1.54 T2: deregister on EVERY exit (normal run end, throw, termination unwind) — the daemon
     // test suite runs runDaemon dozens of times in one process; a leaked handler would close a

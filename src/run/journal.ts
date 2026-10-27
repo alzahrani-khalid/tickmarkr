@@ -2723,10 +2723,13 @@ export interface OwedFold {
 // v2.6.7 T4: every owed-identity git call runs the uncached trust check and the forced child config, and its
 // diff-producing verbs never run an external diff or textconv driver; a refusal throws, so the fold is unknown.
 const NO_DRIVERS = new Set(["diff", "show", "log"]);
+// Queue row 284: a read runs no configured program — log.showSignature makes log/show run gpg.program on a signed
+// commit, and a renormalizing merge-tree runs every clean filter; a merge that needed renormalization stays outstanding.
+const OWED_CONFIG = ["-c", "log.showSignature=false", "-c", "merge.renormalize=false"];
 const owedGit = (cwd: string, args: string[], input?: string): string => {
   assertGitTrust(cwd);
   const argv = NO_DRIVERS.has(args[0]!) ? [args[0]!, "--no-ext-diff", "--no-textconv", ...args.slice(1)] : args;
-  return execFileSync("git", argv, {
+  return execFileSync("git", [...OWED_CONFIG, ...argv], {
     cwd, env: protectedGitEnv(process.env), encoding: "utf8", maxBuffer: 64 * 1024 * 1024,
     ...(input === undefined ? { stdio: ["ignore", "pipe", "pipe"] } : { input }),
   });
@@ -2769,6 +2772,10 @@ const COMMIT_ID = /^[0-9a-f]{40}([0-9a-f]{24})?$/;
 export function integrationMapped(cwd: string, events: readonly JournalEvent[], o: OwedCheck, mergeBase: unknown, head: unknown, memo?: OwedProofMemo): boolean {
   if (typeof mergeBase !== "string" || typeof head !== "string" || !COMMIT_ID.test(mergeBase) || !COMMIT_ID.test(head)) return false;
   if (!events.some((e) => e.event === "merge" && e.taskId === o.taskId && e.data.commit === head)) return false;
+  // queue row 280: merge-tree executes any configured merge driver (protectedGitEnv neutralizes only hooks and
+  // fsmonitor), so with one configured anywhere in the effective config the merge stays unproven: outstanding.
+  // Checked before the memo, so a proof cached before a driver was configured never answers for it.
+  if (mergeDriverConfigured(cwd)) return false;
   // Only the git component is memoised, and only a completed proof: commit ids name immutable history,
   // so the key is the obligation's id and recorded range facts plus the claimed mergeBase..head. A refusal
   // or git failure (a shallow or partial object store can refuse a range it later proves) is never cached
@@ -2783,6 +2790,16 @@ export function integrationMapped(cwd: string, events: readonly JournalEvent[], 
 /** I2: a caller-scoped set of completed integration re-proofs (see integrationMapped); absent, every fold re-proves. */
 export type OwedProofMemo = Set<string>;
 
+// `.*`: git accepts and selects a driver with an empty name (`merge..driver`, `merge=`). An unreadable config counts
+// as configured: the merge stays unproven.
+function mergeDriverConfigured(cwd: string): boolean {
+  try {
+    return owedGit(cwd, ["config", "--list", "--name-only", "-z"]).split("\0").some((key) => /^merge\..*\.driver$/s.test(key));
+  } catch {
+    return true;
+  }
+}
+
 function integrationProved(cwd: string, o: OwedCheck, mergeBase: string, head: string): boolean {
   try {
     const parents = owedGit(cwd, ["show", "-s", "--format=%P", head]).trim().split(" ");
@@ -2791,7 +2808,8 @@ function integrationProved(cwd: string, o: OwedCheck, mergeBase: string, head: s
     const tree = (rev: string) => owedGit(cwd, ["rev-parse", `${rev}^{tree}`]).trim();
     const trees = (from: string, to: string) => owedGit(cwd, ["log", "--reverse", "--format=%T", `${from}..${to}`]).trim();
     if (tree(owedGit(cwd, ["merge-base", mergeBase, carried]).trim()) !== tree(o.base) || trees(mergeBase, carried) !== trees(o.base, o.head)) return false;
-    // A conflicted merge-tree exits 1 and throws; a clean one prints its tree first.
+    // A conflicted merge-tree exits 1 and throws; a clean one prints its tree first. integrationMapped refused a
+    // configured merge driver before calling here (queue row 280).
     if (owedGit(cwd, ["merge-tree", "--write-tree", mergeBase, carried]).trim().split("\n")[0] !== tree(head)) return false;
     const series = rangePatches(cwd, mergeBase, carried);
     return series.length === o.patches.length && series.every((id, i) => id === o.patches[i])

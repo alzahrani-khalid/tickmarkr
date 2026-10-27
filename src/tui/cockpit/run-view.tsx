@@ -7,6 +7,7 @@ import { GATE_NAMES, type GateName, type RunGraph } from "../../graph/schema.js"
 import { projectActivity } from "../../run/activity.js";
 import { effectiveDecisions, withPhysicalLine, type JournalEvent } from "../../run/journal.js";
 import { projectOperatorSummary } from "../../run/operator-summary.js";
+import { decisionCommands } from "../../run/decision-verbs.js";
 import { trackJournalRows } from "../../run/protocol.js";
 import { normalizeGateOutcome, type GateOutcome } from "../../run/outcome.js";
 import type { OperatorGateState, OperatorSnapshot, OperatorTask } from "../../run/operator-state.js";
@@ -295,6 +296,7 @@ export function projectRunTasks(snapshot: OperatorSnapshot, rows: readonly RunEv
       ...(d.park.reason === undefined ? {} : { reason: d.park.reason }),
     },
     verbs: d.verbs,
+    ...decisionCommands(runId, d.taskId, d.park),
     ...(d.diagnostic === undefined ? {} : { diagnostic: d.diagnostic }),
   }))).map((s) => [s.taskId, s]));
   return snapshot.tasks.map((t): TaskProjection => {

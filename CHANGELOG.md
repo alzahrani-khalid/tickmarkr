@@ -2,6 +2,75 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v2.10.0 — Claude Desktop first-class: exact approval commands everywhere, a versioned status snapshot, a blocking wait, Claude Code skills from init, macOS notifications, a recoverable folder-permission loss, a keep-awake daemon, a configurable approval window, and the Claude Code plugin with its run board
+
+**v2.10.0** makes tickmarkr work end-to-end in Claude Desktop's Code tab (queue rows 260–265). Its work comes from one `tickmarkr run`
+engagement, run-20261026-150241-…3259, resumed twice. Each of its eleven tasks passed build, lint, evidence, scope, its acceptance criteria,
+a cross-vendor review and the full suite, and the final tip verified fresh.
+
+- **Every surface prints the exact approve command a park admits (queue row 261).**
+  - One helper returns the full command for each verb the park admits, with `--gate` where it is needed.
+  - The status event stream, the daemon's park notice and the operator summary all print it.
+  - A gate-fail park no longer advertises a plain approve that it refuses.
+- **`tickmarkr status <run> --json` prints one versioned snapshot (queue row 265).**
+  - Its green verdict is the same fold that status and report use, so outstanding-unknown is never green.
+  - It carries per-task rows and the open parks with their commands.
+  - Its JSON Schema ships as `schema/status.schema.json`.
+- **`tickmarkr wait [<run>]` blocks until a run needs someone, then exits once (queue row 262).**
+  - Each cause has its own exit code: run-end 0, park 3, failed task 4, daemon death 5, timeout 6, no live run 7.
+  - It prints the run's green-rule fields and the admitted commands.
+  - Its `--json` snapshot is status's own projection: on the same journal bytes it equals `status --json`, `observedAt` aside.
+  - A park whose row was half-written when wait started still wakes it.
+  - Journal text it prints passes through the terminal-control filter.
+- **`init --agent` installs the Claude Code skills when the host is Claude Code (`CLAUDE_CODE_ENTRYPOINT` set) or `claude` is on the search
+  path (queue row 260).** The footer names each host that received skills, and why.
+- **On macOS the subprocess driver posts a system notification for each park, and exactly one for each run-end it appends (queue row 263).**
+  - The run-end notification states the verdict: GREEN, NOT GREEN with its buckets and debt, or verdict unknown.
+  - A post is argv-only, with no shell. One that fails or hangs is killed at ten seconds and journaled; it is never fatal.
+- **A folder-permission denial during tip-verify cleanup now ends the run resumable instead of fatal (queue row 264).** `doctor` and the run
+  preflight warn when the repository sits under ~/Desktop, ~/Documents or ~/Downloads on macOS.
+- **`run` and `resume` print doctor's locale warning (queue row 265).**
+- **On macOS the daemon keeps the machine awake for its own lifetime with `caffeinate`, best effort and journaled (queue row 265).** The
+  approval window becomes the config value `approvalWindowSeconds`: an integer from 30 to 86400, default 120.
+- **The Claude Code plugin (queue row 265).**
+  - The npm package now carries a plugin manifest and an npm-sourced marketplace entry. Its skills are the package's own `skills/`, with no
+    second copy.
+  - **What it runs:** when a Claude Code session starts or resumes, the plugin's hook runs `tickmarkr wait --timeout 23h` in the
+    background in the session's directory. It ends at once when no run is live there. Otherwise it wakes the session when the run parks,
+    fails a task, ends or loses its daemon. It reads the run journal only.
+- **The run board ships in the plugin as a mod (queue row 265).**
+  - The `tickmarkr-board` command opens a pane fed only by `tickmarkr status --json`. It is green only by that snapshot's verdict, and an
+    unreadable read shows as unreadable.
+  - Cards follow graph order, with tries "in all", a needs-you lane, the approval countdown and an ETA.
+  - Copy buttons copy only the admitted commands; the board never runs them.
+- **The plain-host skills wait with `tickmarkr wait` as a background task and name the plugin (queue rows 262, 265).** The README gains a
+  Claude Desktop section.
+- **A suite-wait ceiling shorter than one host-probe batch no longer clips the first host observation into an unreadable, degraded host (queue
+  row 275).**
+
+A pre-release review found five more defects after the run. Their fixes passed `tickmarkr verify` against the run's tip: build, lint, evidence,
+scope, their acceptance criteria and a cross-vendor review. The full suite passed on the release tree.
+- **The run board polls only once it is opened (queue row 280).** Before this, it polled from the start of every Claude Code session.
+- **`tickmarkr status`'s re-proof of an integration merge runs no configured merge driver, clean filter or signature program (queue rows
+  280, 284).**
+  - When a merge driver is configured under any name, the empty name included, the re-proof stays outstanding.
+  - Its git reads turn off renormalization and signature display.
+- **The board shows every terminal control in journal text as visible text (queue row 281).**
+- **The run-end notification reads "verdict unknown", never GREEN, when the journal holds an unreadable line (queue row 282).**
+- **A resumed tip verify no longer crashes when it is denied permission to remove a stale checkout (queue row 283).**
+
+Declared, still open:
+- Next, 2.10.1 (D-2167):
+  - Queue row 279: when an attempt changes package.json, dependency re-provisioning re-resolves ranges instead of honouring the lockfile.
+  - Queue row 267: a working headless `claude -p` review seat that reaches the review ceiling is labelled silent and struck.
+  - Queue row 274: a timed-out claude seat's background shell commands outlive it.
+  - Queue row 277: a green task's post-suite answer waits behind another task's whole suite.
+  - Queue rows 275 and 276: load-sensitive tests in this repository.
+- Queue row 266: an `init --agent` install beside the plugin shows each skill twice.
+- Queue row 278: wait and status still build their snapshots in two places, though they agree byte for byte today.
+- Queue row 280's residual: a merge driver configured globally (not by this repository) also keeps those re-proofs outstanding.
+- After 2.10.1: `tickmarkr acp` (2.11.0, D-2166), then the rest of the review programme.
+
 ## v2.9.1 — review convergence: malformed verdict rows are a protocol failure, findings keep distinct identities, the first material finding carries the class-repair contract and the reviewer's reproducer, judged and post-waive reds earn repairs, one verb table, and a review park's hinted files are granted exactly
 
 **v2.9.1** makes the review loop converge instead of spending rounds (queue rows 42, 38, 39, 232, 187; riders 251, 252, 256,

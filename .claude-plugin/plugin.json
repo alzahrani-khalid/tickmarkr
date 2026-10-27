@@ -1,0 +1,20 @@
+{
+  "name": "tickmarkr",
+  "version": "2.10.0",
+  "description": "Spec in, verified work out.",
+  "types": "./hooks/board/state.d.ts",
+  "author": {
+    "name": "Khalid Alzahrani",
+    "url": "https://github.com/alzahrani-khalid/tickmarkr"
+  },
+  "homepage": "https://github.com/alzahrani-khalid/tickmarkr",
+  "repository": "https://github.com/alzahrani-khalid/tickmarkr.git",
+  "license": "MIT",
+  "keywords": [
+    "ai",
+    "agents",
+    "orchestration",
+    "automation",
+    "cli"
+  ]
+}

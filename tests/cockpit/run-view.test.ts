@@ -924,7 +924,7 @@ describe("T9 — projection per agent with source references and honest locators
     expect(parkLine).toContain(parkProjection.blocker.label);
     expect(parkLine).toContain(parkProjection.nextAction.label);
     expect(parkLine).toContain(`#L${parkProjection.blocker.line}`);
-    expect(parkLine).toContain("(--park ");
+    expect(parkLine).toContain("--park ");
     expect(parkLine).not.toMatch(/identity |phase |build |\(no journal row\)/u);
     const waiting = parked.find((p) => p.taskId === "T3")!;
     const waitLine = projectionTaskLine(parkedFrame, "T3");
@@ -940,7 +940,7 @@ describe("T9 — projection per agent with source references and honest locators
     expect(parkText.startsWith("missing evidence · blocker ")).toBe(true);
     expect(parkText).toContain("blocker human-decision");
     expect(parkText).toContain("next Choose a decision: approve");
-    expect(parkText).toContain("(--park ");
+    expect(parkText).toContain("--park ");
     expect(parkText).toMatch(/#L\d+/u);
     expect(parkText).not.toMatch(/identity |phase |build /u);
     const waitText = taskProjectionText(parkData.taskRows.find((r) => r.taskId === "T3")!, parkData.journalRows);

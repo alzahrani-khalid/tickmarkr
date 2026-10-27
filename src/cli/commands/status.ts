@@ -17,6 +17,7 @@ import { authorsNote, doneAuthors } from "../../run/operator-state.js";
 import { projectOperatorSummary, type OperatorTaskSummary } from "../../run/operator-summary.js";
 import { trackJournalRows } from "../../run/protocol.js";
 import { newestPark, permittedDecisionVerbs } from "./approve.js";
+import { decisionCommands } from "../../run/decision-verbs.js";
 import { currentOwed, endToEndFirstPass, firstPassText, leadLines, leadRows, needsYouText, wallText } from "./report.js";
 import {
   Journal,
@@ -173,7 +174,8 @@ const RESTORE_TERMINAL_TITLE = "\x1b[23;0t";
 const ENTER_ALTERNATE_SCREEN = "\x1b[?1049h";
 const LEAVE_ALTERNATE_SCREEN = "\x1b[?1049l";
 
-export const STATUS_HELP = `usage: tickmarkr status [<runId>] [--watch [--events]] [--oneline]
+export const STATUS_HELP = `usage: tickmarkr status [<runId>] [--watch [--events]] [--oneline] [--json]
+With --json, print one validated versioned run snapshot; cannot combine with --watch.
 With --watch --events, stdout is one JSON document per decision event and stderr carries keepalive lines.
 Do not merge stdout and stderr (for example with 2>&1): doing so corrupts the JSON document stream.`;
 
@@ -232,11 +234,15 @@ export const decisionEventsFromJournal = (
     }];
   }
   if (event.event === "task-human" && event.taskId) {
+    const decision = decisionCommands(runId, event.taskId, newestPark(events.slice(0, index + 1), event.taskId));
+    const approval = decision.commands.find(({ verb }) => verb === "approve");
     return [{
       ...base,
       type: "human-decision-required" as const,
       tier: "decision" as const,
-      approvalCommand: `tickmarkr approve ${runId} ${event.taskId} --park ${bindingToken({ line: physicalLine(events, index), ts: event.ts })}`,
+      decisionCommands: decision.commands,
+      noDecision: decision.noDecision,
+      ...(approval === undefined ? {} : { approvalCommand: approval.command }),
       ...(typeof event.data.kind === "string" ? { kind: event.data.kind } : {}),
       ...(typeof event.data.reason === "string" ? { reason: event.data.reason } : {}),
     }];
@@ -784,7 +790,7 @@ type DaemonLiveness =
   | { state: "dead"; pid: number }
   | { state: "unknown" };
 
-const daemonLiveness = (events: JournalEvent[]): DaemonLiveness => {
+export const daemonLiveness = (events: JournalEvent[]): DaemonLiveness => {
   const pid = daemonPid(events);
   if (pid === undefined) return { state: "unknown" };
   return { state: isPidLive(pid) ? "alive" : "dead", pid };
@@ -1055,7 +1061,7 @@ const readRunJournalRaw = (cwd: string, runId: string, allowMissingJournal: bool
  * a lock-selected run may still be in the directory-before-first-journal window, which renders as an
  * empty snapshot for that run rather than borrowing the previous run's journal.
  */
-const readRunRecord = (cwd: string, graph: RunGraph, namedRunId?: string): RunRecord | undefined => {
+export const readRunRecord = (cwd: string, graph: RunGraph, namedRunId?: string): RunRecord | undefined => {
   const explicitRunId = namedRunId === undefined ? undefined : parseRunId(namedRunId);
   const lockedRunId = explicitRunId === undefined && canReadRunLockOwner(cwd)
     ? runLockRunId(cwd)
@@ -1093,7 +1099,7 @@ const recordTaskRows = (record: RunRecord, graph: RunGraph, isDaemonAlive?: (pid
     : new Map();
 
 /** Adapt the single journal snapshot to the shared, evidence-only projections. */
-const recordProjection = (record: RunRecord | undefined, graph: RunGraph, isDaemonAlive?: (pid: number) => boolean) => {
+export const recordProjection = (record: RunRecord | undefined, graph: RunGraph, isDaemonAlive?: (pid: number) => boolean) => {
   const rows = record ? recordTaskRows(record, graph, isDaemonAlive) : new Map<string, TaskRow>();
   const events = record?.comparable ? record.events : [];
   // OBS-1178: a refused or unsound decision released nothing, so the activity fold never reads it.
@@ -1134,7 +1140,7 @@ const recordProjection = (record: RunRecord | undefined, graph: RunGraph, isDaem
   });
   const decisions = tasks.flatMap(task => {
     const park = task.status === "human" ? newestPark(events, task.id) : undefined;
-    return park ? [{ taskId: task.id, park, verbs: permittedDecisionVerbs(park) }] : [];
+    return park ? [{ taskId: task.id, park, verbs: permittedDecisionVerbs(park), ...decisionCommands(record!.runId, task.id, park) }] : [];
   });
   return { rows, activity, summaries: new Map(projectOperatorSummary(tasks, decisions).map(task => [task.taskId, task])) };
 };
@@ -1673,6 +1679,11 @@ const oneLine = (cwd: string, namedRunId?: string): string => {
 export async function status(argv: string[], cwd = process.cwd(), opts: StatusOpts = {}): Promise<string> {
   if (argv.some((arg) => arg === "--help" || arg === "-h")) return STATUS_HELP;
   const namedRunId = positionalRunId(argv);
+  if (argv.includes("--json")) {
+    if (argv.includes("--watch")) throw new Error("status --json cannot be combined with --watch");
+    const { StatusSnapshotSchema, statusSnapshot } = await import("./status-snapshot.js");
+    return JSON.stringify(StatusSnapshotSchema.parse(statusSnapshot(cwd, namedRunId)));
+  }
   if (argv.includes("--oneline")) return oneLine(cwd, namedRunId);
   // ONE manifest read per invocation, here — every frame below names this same version.
   const binaryVersion = await readBinaryVersion();

@@ -126,8 +126,8 @@ test("test: every park a review seat outcome causes in the production daemon pri
 test("test: every release command a review seat park prints names that park's own run and task and appends its matching release when invoked exactly as printed, and the approve command, the daemon's park reasons and the status surfaces read one verb table module, so a command naming another run or task fails", async () => {
   expect(approveVerbs).toBe(permittedDecisionVerbs);
   const source = (file: string) => readFileSync(new URL(`../../src/${file}`, import.meta.url), "utf8");
-  expect(source("run/daemon.ts")).toMatch(/import \{ permittedDecisionVerbs,.*from "\.\/decision-verbs\.js"/);
-  expect(source("run/daemon.ts")).toContain("permittedDecisionVerbs(park).map");
+  expect(source("run/daemon.ts")).toMatch(/import \{ decisionCommands,.*from "\.\/decision-verbs\.js"/);
+  expect(source("run/daemon.ts")).toContain("decisionCommands(runId, taskId, park, { bound: false })");
   expect(source("cli/commands/approve.ts")).toContain('from "../../run/decision-verbs.js"');
   for (const file of ["cli/commands/status.ts", "tui/cockpit/derive.ts", "tui/cockpit/decision-actions.ts"]) {
     expect(source(file), file).toMatch(/import \{[^}]*permittedDecisionVerbs[^}]*\} from "[^"]*approve\.js"/s);

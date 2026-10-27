@@ -80,6 +80,7 @@ export const COMMAND_HELP = {
   status: {
     usage: "status [<run-id>] [options]", description: "Show a named run or the latest run. With --watch --events, stdout is one JSON document per decision event and stderr carries keepalive lines. Do not merge stdout and stderr (2>&1 corrupts the JSON document stream).",
     options: {
+      "--json": "Print one validated versioned snapshot of the named or newest run; cannot combine with --watch.",
       "--oneline": "Print a compact snapshot and exit.",
       "--watch": "Follow updates; on a TTY open Run unless plain output or event streaming is selected.",
       "--plain": "Use line-mode output with --watch, including on a TTY.",
@@ -88,6 +89,15 @@ export const COMMAND_HELP = {
       "--decision-events": "Alias for --events.",
       "--webhook <url>": "With --watch, POST decision events to this URL.",
     }, examples: ["status --oneline", "status run-example --watch --plain", "status run-example --watch --events"],
+  },
+  wait: {
+    usage: "wait [<run>] [--after <line>] [--timeout <n>s|m|h] [--json]",
+    description: "Wait once for a run to need attention or end. Without a run, attach to the live graph lock owner. Poll once per second; the earliest new run-end, task-human or task-failed row wins, then proven daemon death, then timeout. Exit codes: run-end 0 (including an already ended run), park 3, task-failed 4, daemon-death 5, timeout 6, no live lock unnamed 7; unknown run, unreadable journal or bad flag 1. Prints the green-rule fields and each open park's admitted commands for you to run.",
+    options: {
+      "--after <line>": "Consider qualifying rows after this physical journal line; defaults to the line count when called.",
+      "--timeout <n>s|m|h": "Exit once with code 6 after this duration unless a row or proven daemon death wins at that tick.",
+      "--json": "Print one JSON object with cause, deciding journal line and a validated status snapshot.",
+    }, examples: ["wait", "wait run-example --after 120 --timeout 30m", "wait run-example --json --timeout 1h"],
   },
   stats: {
     usage: "stats", description: "Print all-run channel delivery, failure, rescue, author and reviewer statistics. Takes no run ID.",

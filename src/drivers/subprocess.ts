@@ -1,8 +1,11 @@
-import { type ChildProcess, spawn } from "node:child_process";
+import { type ChildProcess, spawn, spawnSync, type SpawnSyncOptions, type SpawnSyncReturns } from "node:child_process";
 import { shq } from "../adapters/types.js";
 import { createWorktree, FORK_CAP_ENV, resolvedForkCap } from "../run/git.js";
 import { HOST_SESSION_VARS, withoutHostSession } from "./host-env.js";
-import type { ExecutorDriver, NotifyOpts, Slot, TransportState } from "./types.js";
+import type { ExecutorDriver, NotificationPost, NotifyOpts, Slot, TransportState } from "./types.js";
+
+export type NotificationPoster = (command: string, args: string[], options: SpawnSyncOptions) =>
+  Pick<SpawnSyncReturns<Buffer>, "error" | "status" | "signal">;
 
 // HARD-03: cap retained worker output so a chatty worker can't grow tickmarkr's heap unbounded.
 // 2MB is safe against BOTH consumers: the largest read() call site asks for 1000 lines
@@ -55,6 +58,35 @@ export class SubprocessDriver implements ExecutorDriver {
   // call is a no-op here by construction, so the oracle suite runs byte-identical.
   private slots = new Map<string, SlotState>();
   private n = 0;
+  private append?: Parameters<NonNullable<ExecutorDriver["journalWith"]>>[0];
+  private readonly poster: NotificationPoster;
+  private readonly platform: NodeJS.Platform;
+
+  constructor(options: { poster?: NotificationPoster; platform?: NodeJS.Platform } = {}) {
+    // Like the daemon's production wait switch, suppress only the default side effect in Vitest.
+    // An injected synchronous poster always runs, including under Vitest on either host platform.
+    this.poster = options.poster ?? (process.env.VITEST
+      ? () => ({ status: 0, signal: null }) : spawnSync);
+    this.platform = options.platform ?? process.platform;
+  }
+
+  journalWith(append: NonNullable<SubprocessDriver["append"]>): void { this.append = append; }
+
+  postSync(post: NotificationPost): void {
+    if (this.platform !== "darwin") return;
+    try {
+      const result = this.poster("osascript", [
+        "-e", "on run argv",
+        "-e", "display notification (item 1 of argv) with title (item 2 of argv)",
+        "-e", "end run", post.text, "tickmarkr",
+      ], { timeout: 10_000, killSignal: "SIGKILL", stdio: "ignore" });
+      if (result.error) throw result.error;
+      if (result.status !== 0) throw new Error(`osascript exited ${result.status ?? result.signal ?? "unknown"}`);
+    } catch (error) {
+      try { this.append?.("os-notify-failed", undefined, { kind: post.kind, error: String(error) }); }
+      catch { /* An observation failure must never stop the run either. */ }
+    }
+  }
 
   async slot(cwd: string, name: string): Promise<Slot> {
     const id = `sp-${++this.n}`;

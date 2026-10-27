@@ -2,6 +2,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { z } from "zod";
 import { TickmarkrConfigSchema } from "../src/config/config.js";
 import { RunGraphSchema } from "../src/graph/schema.js";
+import { StatusSnapshotSchema } from "../src/cli/commands/status-snapshot.js";
 
 mkdirSync("schema", { recursive: true });
 const emit = (file: string, schema: z.ZodType, comment: string) => {
@@ -14,3 +15,5 @@ emit("rungraph.schema.json", RunGraphSchema,
   "Structural schema only; duplicate-id/unknown-dep/cycle checks live in validateGraph().");
 emit("config.schema.json", TickmarkrConfigSchema,
   "Structural schema of the merged (defaults + overlays) config; cross-field refinements live in loadConfig().");
+emit("status.schema.json", StatusSnapshotSchema,
+  "Version 1 status snapshot; verdict and lifecycle use the shared operator fold with current owed checks.");

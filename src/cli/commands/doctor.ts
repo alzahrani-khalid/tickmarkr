@@ -14,7 +14,8 @@ import { catalogModelAdvisory, catalogTierRanking, declaredModelWindow, hasWindo
 import { loadConfig, overlayPreferShapes } from "../../config/config.js";
 import { HerdrDriver } from "../../drivers/herdr.js";
 import { classifyHost } from "../../drivers/index.js";
-import { ORCA_FIXTURE_VERSION, parseEnvelope, resolveOrcaCliBinary } from "../../drivers/orca.js";
+import { canonicalWorktreePath, ORCA_FIXTURE_VERSION, parseEnvelope, resolveOrcaCliBinary } from "../../drivers/orca.js";
+import { localeFinding, protectedFolderFinding } from "../../drivers/host-env.js";
 import type { WorkerAdapter } from "../../adapters/types.js";
 import { kimi, type KimiDoctorTurnResult, probeKimiDoctorTurn } from "../../adapters/kimi.js";
 import { type CodexSandbox, recordCodexCommit } from "../../adapters/codex-commit-check.js";
@@ -1121,21 +1122,6 @@ export function hostRows(env: EnvLike, llm: "pane" | "headless"): { verdict: "pa
 }
 
 /**
- * Queue row 196 (D-2102 add.1): gates inherit the launching locale. The effective value is LC_ALL, else
- * LC_CTYPE, else LANG (an empty value counts as unset). Unset, C or POSIX is the C-locale fallback;
- * C.UTF-8 is a UTF-8 locale and passes. Advisory only — doctor never sets or writes a locale.
- */
-export function localeFinding(env: EnvLike): { verdict: "pass" | "warn"; detail: string } {
-  const name = (["LC_ALL", "LC_CTYPE", "LANG"] as const).find((key) => env[key]);
-  const value = name ? env[name] : undefined;
-  if (name && value !== "C" && value !== "POSIX") return { verdict: "pass", detail: `${name}=${value}` };
-  return {
-    verdict: "warn",
-    detail: `${name ? `${name}=${value}` : "no locale set (LC_ALL, LC_CTYPE and LANG unset)"} — gates inherit the C-locale fallback (Node formats as en-US); fix: set LANG in your shell profile, e.g. export LANG=en_US.UTF-8`,
-  };
-}
-
-/**
  * Q140s(b) / operator directive (D-OBS-10): the repo's package manager must resolve in
  * THIS process's environment — the same class of environment the daemon spawns gates
  * into. Dossier run 1: pnpm lived only in the operator's interactive PATH; every gate
@@ -1576,6 +1562,10 @@ export async function doctor(
   for (const row of hostRows(process.env, cfg.visibility.llm)) rows.push(alignedStatusRow(row.verdict, row.key, row.detail));
   const locale = localeFinding(process.env);
   rows.push(alignedStatusRow(locale.verdict, "locale", locale.detail));
+  const root = canonicalWorktreePath(cwd);
+  const folders = protectedFolderFinding(root, canonicalWorktreePath(join(root, stateDirName(cwd))),
+    process.platform, process.env.HOME ? canonicalWorktreePath(process.env.HOME) : undefined);
+  if (folders) rows.push(alignedStatusRow(folders.verdict, "folders", folders.detail));
   // Q122s: the target repo's runner must not scan tickmarkr's own worktrees (advisory row).
   // Q134s: `doctor --fix` writes the ignore when a safe edit exists (verified, else reverted).
   const runnerIgnore = runnerIgnoreFinding(cwd);

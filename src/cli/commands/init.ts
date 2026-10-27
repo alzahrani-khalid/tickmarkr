@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
-import { appendFileSync, copyFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
-import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { appendFileSync, copyFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { basename, delimiter, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createInterface, type Interface } from "node:readline/promises";
 import { parseArgs } from "node:util";
@@ -102,6 +102,25 @@ const hostTargets = (cwd: string) => {
     targets.push({ skillsDir: join(cwd, ".claude", "skills"), docPath: join(cwd, "CLAUDE.md") });
   return targets;
 };
+
+// Installation can discover a new host from init's environment. Readers deliberately
+// keep hostTargets' repository-only rule, so a codex-only install remains current.
+function installHostTargets(cwd: string, env: NodeJS.ProcessEnv) {
+  const claudeOnPath = () => (env.PATH?.split(delimiter) ?? []).some((dir) => {
+    try {
+      const stat = statSync(resolve(cwd, dir, "claude"));
+      return stat.isFile() && (stat.mode & 0o111) !== 0;
+    } catch { return false; }
+  });
+  const reason = env.CLAUDE_CODE_ENTRYPOINT ? "CLAUDE_CODE_ENTRYPOINT set"
+    : claudeOnPath() ? "claude on PATH"
+      : entryStat(join(cwd, ".claude")) ? "existing .claude"
+        : entryStat(join(cwd, "CLAUDE.md")) ? "existing CLAUDE.md" : undefined;
+  return [
+    { host: "codex", skillsDir: join(cwd, ".agents", "skills"), docPath: join(cwd, "AGENTS.md"), reason: undefined },
+    ...(reason ? [{ host: "claude", skillsDir: join(cwd, ".claude", "skills"), docPath: join(cwd, "CLAUDE.md"), reason }] : []),
+  ];
+}
 const packagedSkillDir = (skill: string) => fileURLToPath(new URL(`../../../skills/${skill}`, import.meta.url));
 
 // Queue row 244 (D-2141; D-2152): lstat, including dangling links, at every step from
@@ -344,7 +363,7 @@ function gitTracked(cwd: string, path: string): boolean {
   return gitSync(cwd, ["ls-files", "--error-unmatch", "--", rel]).status === 0;
 }
 
-async function installAgentFiles(cwd: string, force: boolean, docs: boolean, notes: string[]): Promise<void> {
+async function installAgentFiles(cwd: string, force: boolean, docs: boolean, notes: string[], env: NodeJS.ProcessEnv): Promise<void> {
   const interactive = process.stdin.isTTY === true && process.stdout.isTTY === true;
   let prompt: Interface | undefined;
   const confirm = async (question: string) => {
@@ -361,7 +380,8 @@ async function installAgentFiles(cwd: string, force: boolean, docs: boolean, not
   try {
     const deferred = sweepAgentLeftovers(cwd, false, notes);
     const drift = skillDrift(cwd);
-    for (const { skillsDir, docPath } of hostTargets(cwd)) {
+    for (const { host, skillsDir, docPath, reason } of installHostTargets(cwd, env)) {
+      let receivedSkills = false;
       for (const skill of AGENT_SKILLS) {
         const dest = join(skillsDir, skill, "SKILL.md");
         const dir = join(skillsDir, skill);
@@ -377,7 +397,10 @@ async function installAgentFiles(cwd: string, force: boolean, docs: boolean, not
         // An install that already matches the package byte for byte needs no prompt and no write. Before
         // this, every re-init asked to overwrite a current skill and the answer meant nothing either way.
         if (exists && !stale && !leftovers.length) {
-          if (!destStat?.isSymbolicLink()) notes.push(`kept current ${dest}`);
+          if (!destStat?.isSymbolicLink()) {
+            notes.push(`kept current ${dest}`);
+            receivedSkills ||= destStat?.isFile() === true;
+          }
           continue;
         }
         const tracked = exists && gitTracked(cwd, dest);
@@ -400,6 +423,7 @@ async function installAgentFiles(cwd: string, force: boolean, docs: boolean, not
           if (blocked || (entryStat(path) && !entryStat(path)?.isFile())) continue;
           mkdirSync(dirname(path), { recursive: true });
           copyFileSync(join(packagedSkillDir(skill), rel), path);
+          receivedSkills = true;
           const kept = notes.indexOf(`kept ${path} (unproven)`);
           if (kept >= 0) notes[kept] = `overwrote ${path}`;
         }
@@ -410,6 +434,9 @@ async function installAgentFiles(cwd: string, force: boolean, docs: boolean, not
         if (!destStat?.isSymbolicLink()) notes.push(`${exists ? "overwrote" : "wrote"} ${tracked ? "tracked " : ""}${dest}`);
       }
 
+      if (receivedSkills && !notes.some(note => note.startsWith(`agent skills for ${host}:`))) {
+        notes.push(`agent skills for ${host}: ${relative(cwd, skillsDir)} (${basename(docPath)})${reason ? ` — ${reason}` : ""}`);
+      }
       const linkedDoc = guidanceLink(cwd, docPath);
       if (linkedDoc) { notes.push(keptLink(linkedDoc)); continue; }
       if (entryStat(docPath) && !entryStat(docPath)?.isFile()) continue;
@@ -671,10 +698,11 @@ function handleRemove(cwd: string): string {
 }
 
 
-/** Test seam mirroring FleetIO: production callers omit it and get the process streams. */
-export type InitIO = { input?: NodeJS.ReadStream; output?: NodeJS.WriteStream };
+/** Test seam mirroring FleetIO: production callers get the process streams and environment. */
+export type InitIO = { input?: NodeJS.ReadStream; output?: NodeJS.WriteStream; env?: NodeJS.ProcessEnv };
 
 export async function init(argv: string[], cwd = process.cwd(), io: InitIO = {}): Promise<string> {
+  const env = io.env ?? process.env;
   let bannerEmitted = false;
   const emitBanner = () => {
     if (visual() && !bannerEmitted) {
@@ -811,7 +839,7 @@ export async function init(argv: string[], cwd = process.cwd(), io: InitIO = {})
       writeFileSync(repoConfigPath, renderedConfig);
       notes.push(`wrote ${repoConfigPath}`);
       if (wizard.installSkills) {
-        await installAgentFiles(cwd, values.force ?? false, wizard.installDocs || (values.docs ?? false), notes);
+        await installAgentFiles(cwd, values.force ?? false, wizard.installDocs || (values.docs ?? false), notes, env);
       }
     } else {
       writeFileSync(repoConfigPath, configTemplate());
@@ -852,7 +880,7 @@ export async function init(argv: string[], cwd = process.cwd(), io: InitIO = {})
     }
   }
 
-  if (values.agent) await installAgentFiles(cwd, values.force ?? false, values.docs ?? false, notes);
+  if (values.agent) await installAgentFiles(cwd, values.force ?? false, values.docs ?? false, notes, env);
   const next = nextSteps(cwd, SCAFFOLD_SPEC);
   // Queue row 243 (D-2141; D-2152): explain skipped guidance after next steps on either surface.
   const guidedSetupHint = !interactive && !values.yes

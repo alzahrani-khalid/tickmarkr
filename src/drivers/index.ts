@@ -1,4 +1,7 @@
 import type { TickmarkrConfig } from "../config/config.js";
+import { join } from "node:path";
+import { stateDirName } from "../graph/graph.js";
+import { localeFinding, protectedFolderFinding } from "./host-env.js";
 import { HerdrDriver } from "./herdr.js";
 import { shq } from "../adapters/types.js";
 import { sh } from "../run/git.js";
@@ -81,6 +84,12 @@ export async function preflightHostDriver(
   runRoot: string,
   env: NodeJS.ProcessEnv = process.env,
 ): Promise<void> {
+  const locale = localeFinding(env);
+  if (locale.verdict === "warn") console.warn(`tickmarkr: warning: locale — ${locale.detail}`);
+  const root = canonicalWorktreePath(runRoot);
+  const folders = protectedFolderFinding(root, canonicalWorktreePath(join(root, stateDirName(runRoot))),
+    process.platform, env.HOME ? canonicalWorktreePath(env.HOME) : undefined);
+  if (folders) process.stderr.write(`warning: ${folders.detail}\n`);
   if (driverOverride === undefined && (cfg.driver === "herdr" || cfg.driver === "orca") && cfg.driver !== host) {
     const remedy = host === "none" ? "subprocess" : host;
     throw new Error(

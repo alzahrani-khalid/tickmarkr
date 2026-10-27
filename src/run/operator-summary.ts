@@ -1,3 +1,5 @@
+import type { DecisionCommands } from "./decision-verbs.js";
+
 /** Labels describe blockers, not journal park kinds or commands. */
 export const BLOCKER_KINDS = [
   "human-decision", "retry", "cooldown", "dependency-wait", "stale-receipt",
@@ -6,12 +8,13 @@ export const BLOCKER_KINDS = [
 export type BlockerKind = (typeof BLOCKER_KINDS)[number];
 
 /**
- * Structural boundary: callers compute park with newestPark and verbs with
- * permittedDecisionVerbs in cli/commands/approve. RunDecision also fits this
- * shape. This module neither imports a surface nor repeats its decision table.
+ * Structural boundary: callers compute the park with newestPark, verbs with
+ * permittedDecisionVerbs, and commands with decisionCommands. This module
+ * neither imports a surface nor repeats its decision table.
+ * Snapshots without command evidence retain their blocker flags but infer no next action.
  * Supply only current parks, from the same snapshot as the task statuses.
  */
-export interface OperatorDecisionSnapshot {
+export interface OperatorDecisionSnapshot extends Partial<DecisionCommands> {
   readonly taskId: string;
   readonly park: {
     readonly kind: string | undefined;
@@ -91,7 +94,7 @@ export function projectOperatorSummary(
     const decision = task.status === "human" ? parks.get(task.id) : undefined;
     const terminal = SETTLED.has(task.status) || task.status === "failed";
     if (decision) {
-      const { park, verbs, diagnostic } = decision;
+      const { park, verbs, diagnostic, commands = [], noDecision = null } = decision;
       blocker = {
         ...emptyBlocker(park.tombstone ? "unknown" : "human-decision"),
         permittedActions: [...verbs],
@@ -99,9 +102,9 @@ export function projectOperatorSummary(
         decisionRequired: verbs.length > 0,
         ...(diagnostic !== undefined || park.reason !== undefined
           ? { diagnostic: diagnostic ?? park.reason } : {}),
-        nextAction: verbs.length > 0
-          ? `Choose a decision: ${verbs.join(", ")}${park.line !== undefined && park.ts !== undefined ? ` (--park ${park.line}@${park.ts})` : ""}`
-          : null,
+        nextAction: commands.length > 0
+          ? `Choose a decision: ${commands.map(({ verb, command }) => `${verb}: ${command}`).join("; ")}`
+          : noDecision,
       };
       if (!park.tombstone && park.kind === "infra" && task.missingCapability) {
         const { capability, diagnostic: capabilityDiagnostic } = task.missingCapability;

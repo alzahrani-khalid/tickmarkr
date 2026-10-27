@@ -1,6 +1,6 @@
 {
   "name": "tickmarkr",
-  "version": "2.9.1",
+  "version": "2.10.0",
   "description": "Spec in, verified work out.",
   "type": "module",
   "license": "MIT",
@@ -27,7 +27,9 @@
     "dist",
     "schema",
     "skills",
-    "fixtures"
+    "fixtures",
+    ".claude-plugin",
+    "hooks"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
@@ -84,11 +86,13 @@
         "specs/export-selftest.spec.md"
       ],
       "prefixes": [
+        ".claude-plugin/",
         ".github/ISSUE_TEMPLATE/",
         ".github/workflows/",
         "assets/",
         "docs/codebase/",
         "fixtures/",
+        "hooks/",
         "schema/",
         "skills/tickmarkr-auto/",
         "skills/tickmarkr-loop/",

@@ -210,10 +210,10 @@ const OVERSEER_FILES = ["SKILL.md", join("scripts", "watch-panes.sh"),
 // Queue row 242; D-2141, D-2152: byte measurements beside fixed caps; 128 bytes reserve
 // the ownership marker. Round size + headroom up to a 4096-byte boundary, never scripts.
 const SKILL_SIZE_CAPS: Record<string, number> = {
-  "tickmarkr-auto/SKILL.md": 32768, // 30858 bytes
-  "tickmarkr-loop/SKILL.md": 32768, // 30536 bytes
+  "tickmarkr-auto/SKILL.md": 32768, // 31240 bytes
+  "tickmarkr-loop/SKILL.md": 32768, // 30918 bytes
   "tickmarkr-loop/references/cockpit.md": 12288, // 8879 bytes
-  "tickmarkr-overseer/SKILL.md": 98304, // 94402 bytes
+  "tickmarkr-overseer/SKILL.md": 98304, // 94784 bytes
   "tickmarkr-overseer/references/context-supervision.md": 20480, // 16553 bytes
   "tickmarkr-overseer/references/evidence-discipline.md": 45056, // 41385 bytes
   "tickmarkr-overseer/references/pane-mechanics.md": 16384, // 13303 bytes

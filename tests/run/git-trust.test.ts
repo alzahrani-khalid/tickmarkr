@@ -479,3 +479,114 @@ describe("v2.6.7 T4 closed raw-consumer table", () => {
     }
   }, 300_000);
 });
+
+describe("queue rows 280 and 284: owed-check re-proof runs no configured program", () => {
+  // a task merged into an integration branch that also changed a.txt, with its recorded integration discharge
+  const mergedFixture = (prefix: string) => {
+    const repo = makeRepo({ "a.txt": "1\n2\n3\n4\n5\n6\n7\n8\n9\n" });
+    const scratch = makeTestTempDir(prefix);
+    const commit = (message: string) => git(repo, "-c", "user.name=t", "-c", "user.email=t@t.invalid", "commit", "-q", "--no-gpg-sign", "-am", message);
+    const base = git(repo, "rev-parse", "HEAD");
+    git(repo, "checkout", "-q", "-b", "task");
+    writeFileSync(join(repo, "a.txt"), "one\n2\n3\n4\n5\n6\n7\n8\n9\n");
+    commit("task");
+    const head = git(repo, "rev-parse", "HEAD");
+    // a sibling's integration change to the same file, so the re-proof's merge-tree really merges a.txt
+    git(repo, "checkout", "-q", "main");
+    writeFileSync(join(repo, "a.txt"), "1\n2\n3\n4\n5\n6\n7\n8\nnine\n");
+    commit("sibling");
+    const mergeBase = git(repo, "rev-parse", "HEAD");
+    git(repo, "-c", "user.name=t", "-c", "user.email=t@t.invalid", "merge", "-q", "--no-ff", "--no-gpg-sign", "-m", "merge task", head);
+    const merged = git(repo, "rev-parse", "HEAD");
+
+    const events: JournalEvent[] = [
+      { ts: "2026-10-27T00:00:00.000Z", event: "task-dispatch", taskId: "T1", data: { assignment: { adapter: "codex", model: "m" } } },
+      { ts: "2026-10-27T00:00:01.000Z", event: "gate-result", taskId: "T1", data: { gate: "acceptance", pass: false, commit: owedSubject(repo, base, head) } },
+    ];
+    const obligation = captureOwedCheck({
+      cwd: repo, runId: "run-280", taskId: "T1", gate: "acceptance", cause: "queue row 280", acceptance: ["a"], files: ["a.txt"],
+      declared: [{ key: "codex:m", vendor: "openai" }], taskRef: head, integrationRef: base, events,
+    });
+    expect(obligation.known).toBe(true);
+    const artifactPath = join(scratch, "verify.json");
+    writeFileSync(artifactPath, JSON.stringify({ head: merged, mergeBase, green: true, criteria: obligation.criteria, files: obligation.files, gateRows: [{ gate: "acceptance", pass: true }] }));
+    const folded: JournalEvent[] = [...events,
+      { ts: "2026-10-27T00:00:02.000Z", event: "task-approved", taskId: "T1", data: { release: GATE_SATISFIED_RELEASE, gate: "acceptance", obligation } },
+      { ts: "2026-10-27T00:00:03.000Z", event: "merge", taskId: "T1", data: { commit: merged } },
+      { ts: "2026-10-27T00:00:03.500Z", event: "task-done", taskId: "T1", data: {} },
+      { ts: "2026-10-27T00:00:04.000Z", event: OWED_DISCHARGE_EVENT, taskId: "T1", data: {
+        ids: [obligation.id], mapping: "integration", mergeBase, head: merged, criteria: obligation.criteria,
+        artifactPath, artifactSha256: createHash("sha256").update(readFileSync(artifactPath)).digest("hex"),
+      } },
+    ];
+    return { repo, scratch, mergeBase, head, merged, folded, obligation };
+  };
+
+  test("status's owed-check re-proof never executes a configured merge driver: with one configured the integration discharge stays outstanding and the driver's witness stays absent, versus the same fixture without a driver proving known zero debt", () => {
+    const { repo, scratch, mergeBase, head, merged, folded, obligation } = mergedFixture("git-trust-merge-driver-");
+    // control: no driver configured, the integration merge proves — and warms a proof memo, which must not answer
+    // for the merge once a driver is configured
+    const memo: OwedProofMemo = new Set();
+    expect(foldOwedChecks(folded, repo, memo)).toMatchObject({ known: true, debt: 0, outstanding: [], discharged: [obligation.id] });
+    expect(memo.size).toBe(1);
+
+    // a faithful driver (it merges exactly as git would) that leaves a witness; raw merge-tree runs it, under a
+    // named driver and under git's valid empty driver name alike
+    const witness = join(scratch, "merge-driver.witness");
+    const driver = join(scratch, "merge-driver");
+    writeFileSync(driver, `#!/bin/sh\nprintf 'ran\\n' >> '${witness}'\nexec git merge-file "$2" "$1" "$3"\n`, { mode: 0o755 });
+    for (const name of ["tkr280", ""]) {
+      git(repo, "config", `merge.${name}.driver`, `${driver} %O %A %B`);
+      writeFileSync(join(repo, ".git", "info", "attributes"), `a.txt merge=${name}\n`);
+      expect(git(repo, "merge-tree", "--write-tree", mergeBase, head).split("\n")[0]).toBe(git(repo, "rev-parse", `${merged}^{tree}`));
+      expect(read(witness)).toBe("ran\n");
+      rmSync(witness);
+
+      for (const proofs of [undefined, memo]) {
+        const fold = foldOwedChecks(folded, repo, proofs);
+        expect(fold).toMatchObject({ outstanding: [{ id: obligation.id }], discharged: [] });
+        expect(fold.debt).not.toBe(0);
+      }
+      expect(existsSync(witness)).toBe(false);
+      git(repo, "config", "--unset", `merge.${name}.driver`);
+    }
+  }, 60_000);
+
+  test("status's owed-check re-proof never executes a configured clean filter under merge.renormalize: with both configured a raw merge-tree runs the filter, while the re-proof leaves its witness absent and still proves known zero debt", () => {
+    const { repo, scratch, mergeBase, head, merged, folded, obligation } = mergedFixture("git-trust-renormalize-");
+    // a pass-through clean filter that leaves a witness; renormalizing merge-tree runs it
+    const witness = join(scratch, "clean-filter.witness");
+    const filter = join(scratch, "clean-filter");
+    writeFileSync(filter, `#!/bin/sh\nprintf 'ran\\n' >> '${witness}'\nexec cat\n`, { mode: 0o755 });
+    git(repo, "config", "filter.tkr284.clean", filter);
+    git(repo, "config", "merge.renormalize", "true");
+    writeFileSync(join(repo, ".git", "info", "attributes"), "a.txt filter=tkr284\n");
+    expect(git(repo, "merge-tree", "--write-tree", mergeBase, head).split("\n")[0]).toBe(git(repo, "rev-parse", `${merged}^{tree}`));
+    expect(existsSync(witness)).toBe(true);
+    rmSync(witness);
+
+    expect(foldOwedChecks(folded, repo)).toMatchObject({ known: true, debt: 0, outstanding: [], discharged: [obligation.id] });
+    expect(existsSync(witness)).toBe(false);
+  }, 60_000);
+
+  test("status's owed-check git reads never run the configured gpg program under log.showSignature: a raw log over a signed commit runs it, while the owed subject read over the same range leaves its witness absent", () => {
+    const repo = makeRepo({ "a.txt": "1\n" });
+    const scratch = makeTestTempDir("git-trust-show-signature-");
+    const base = git(repo, "rev-parse", "HEAD");
+    // a commit carrying a PGP signature block, written as a raw object (no signing key needed)
+    const object = join(scratch, "signed.commit");
+    writeFileSync(object, `tree ${git(repo, "rev-parse", "HEAD^{tree}")}\nparent ${base}\nauthor t <t@t.invalid> 1700000000 +0000\ncommitter t <t@t.invalid> 1700000000 +0000\ngpgsig -----BEGIN PGP SIGNATURE-----\n \n AAAA\n -----END PGP SIGNATURE-----\n\nsigned\n`);
+    const signed = git(repo, "hash-object", "-t", "commit", "-w", object);
+    const witness = join(scratch, "gpg.witness");
+    const gpg = join(scratch, "gpg");
+    writeFileSync(gpg, `#!/bin/sh\nprintf 'ran\\n' >> '${witness}'\nexit 1\n`, { mode: 0o755 });
+    git(repo, "config", "gpg.program", gpg);
+    git(repo, "config", "log.showSignature", "true");
+    git(repo, "log", "--format=%T", `${base}..${signed}`);
+    expect(read(witness)).toBe("ran\n");
+    rmSync(witness);
+
+    owedSubject(repo, base, signed);
+    expect(existsSync(witness)).toBe(false);
+  }, 60_000);
+});

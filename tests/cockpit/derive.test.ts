@@ -2937,7 +2937,7 @@ describe("cockpit rows read the shared projection", () => {
     expect(rendered("T4").phase).not.toBe("awaiting merge phase");
     expect(rows.find((r) => r.taskId === "T4")!.summary!.phase).not.toBe("awaiting merge phase");
     // A disagreement fails: perturb one field and the comparison above would have caught it.
-    expect(rendered("T3")["next action"]).toMatch(/^Choose a decision: approve \(--park \d+@\S+\)$/u); // OBS-1178 token
+    expect(rendered("T3")["next action"]).toMatch(/^Choose a decision: approve: tickmarkr approve \S+ T3 --park \d+@\S+$/u); // OBS-1178 token
     expect(rows.find((r) => r.taskId === "T3")!.summary!.blocker!.permittedActions).toEqual(["approve"]);
     rmSync(repo, { recursive: true, force: true });
   });

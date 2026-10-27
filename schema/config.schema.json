@@ -45,6 +45,11 @@
       "type": "number",
       "exclusiveMinimum": 0
     },
+    "approvalWindowSeconds": {
+      "type": "integer",
+      "minimum": 30,
+      "maximum": 86400
+    },
     "contextWarnTokens": {
       "type": "integer",
       "exclusiveMinimum": 0,

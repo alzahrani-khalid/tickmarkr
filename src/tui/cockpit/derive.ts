@@ -3,6 +3,7 @@ export { readOperatorState as deriveOperatorState } from "../../run/operator-sta
 import { doneAuthors } from "../../run/operator-state.js";
 import { channelKey } from "../../adapters/types.js";
 import { newestPark, permittedDecisionVerbs } from "../../cli/commands/approve.js";
+import { decisionCommands } from "../../run/decision-verbs.js";
 import { parseOwnedName } from "../../drivers/types.js";
 import { projectActivity, type TaskActivityProjection } from "../../run/activity.js";
 import { effectiveDecisions, withPhysicalLine } from "../../run/journal.js";
@@ -883,7 +884,7 @@ function projectSummaries(
   });
   const decisions = summaryTasks.flatMap((task) => {
     const park = task.status === "human" ? newestPark(journal, task.id) : undefined;
-    return park ? [{ taskId: task.id, park, verbs: permittedDecisionVerbs(park) }] : [];
+    return park ? [{ taskId: task.id, park, verbs: permittedDecisionVerbs(park), ...decisionCommands(runId, task.id, park) }] : [];
   });
   return { activity, summaries: new Map(projectOperatorSummary(summaryTasks, decisions).map((task) => [task.taskId, task])) };
 }

@@ -38,7 +38,7 @@ afterEach(() => {
   for (const dir of scratchDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
-async function consumer(claude: boolean) {
+async function consumer(claude: boolean, env?: NodeJS.ProcessEnv) {
   const root = mkdtempSync(join(tmpdir(), "tickmarkr-references-"));
   scratchDirs.push(root);
   const repo = join(root, "consumer");
@@ -47,7 +47,7 @@ async function consumer(claude: boolean) {
   if (claude) mkdirSync(join(repo, ".claude"));
   // A fresh fake-only discovery snapshot makes init reuse it without probing any adapter.
   writeDoctor(repo, { fake: { installed: true, authed: true, models: [] } });
-  await init(["--agent", "--docs", "--global-dir", join(root, "global")], repo);
+  await init(["--agent", "--docs", "--global-dir", join(root, "global")], repo, { env });
   return repo;
 }
 
@@ -234,7 +234,7 @@ function assertScripts(dir: string, text: string) {
 }
 
 test("test: every bundled script an overseer reference names resolves to a file of an agent install written only into the codex skills directory, so a reference still naming the claude skills directory fails", async () => {
-  const repo = await consumer(false);
+  const repo = await consumer(false, {});
   expect(existsSync(join(repo, ".claude"))).toBe(false);
   const dir = join(repo, ".agents/skills/tickmarkr-overseer");
   const names = new Set<string>();
@@ -276,7 +276,7 @@ function assertBundledScripts(skillsDir: string, skill: string, text: string): s
 }
 
 test("test: every bundled script any shipped skill file or reference names resolves to a file of an agent install written only into the codex skills directory, so the loop or auto run watcher still naming the claude skills directory fails", async () => {
-  const repo = await consumer(false);
+  const repo = await consumer(false, {});
   expect(existsSync(join(repo, ".claude"))).toBe(false);
   const skillsDir = join(repo, ".agents/skills");
   const found = new Set<string>();
