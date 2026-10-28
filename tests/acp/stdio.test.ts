@@ -41,7 +41,7 @@ for (const name of ["spawn", "spawnSync", "exec", "execSync", "execFile", "execF
   };
 }
 require("node:module").syncBuiltinESMExports();
-record({ kind: "installed" });
+record({ kind: "installed", pid: process.pid, thread: require("node:worker_threads").threadId });
 // Positive control proves the in-process recorder sees liveness queries; it also proves
 // the lock holder is alive without giving ACP ownership of it.
 if (process.env.ACP_LIVE_HOLDER) process.kill(Number(process.env.ACP_LIVE_HOLDER), 0);
@@ -158,9 +158,13 @@ test("at end of input with a live lock holder recorded, acp exits zero having at
     expect(stderr).toBe("");
     expect(readFileSync(lock)).toEqual(bytes);
     const attempts = readFileSync(cli.audit, "utf8").trim().split("\n").map((line) => JSON.parse(line));
-    expect(attempts[0]).toEqual({ kind: "installed" });
+    expect(attempts[0]).toMatchObject({ kind: "installed", thread: 0 });
+    // Node 22 also runs a --require preload in tsx's off-thread loader hooks: more installs of the SAME process are
+    // tolerated, while a child process acp spawned would install under another pid and fail here.
+    const installs = attempts.filter((attempt) => attempt.kind === "installed");
+    expect(installs.map((attempt) => attempt.pid), JSON.stringify(installs)).toEqual(installs.map(() => attempts[0].pid));
     expect(attempts).toContainEqual({ kind: "process.kill", pid: process.pid, signal: 0 });
-    for (const attempt of attempts.slice(1)) {
+    for (const attempt of attempts.filter((attempt) => attempt.kind !== "installed")) {
       expect(["process.kill", "child.kill"]).toContain(attempt.kind);
       expect(attempt.signal).toBe(0);
     }
