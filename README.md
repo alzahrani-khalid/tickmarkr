@@ -545,6 +545,74 @@ These are optional — the CLI works standalone. Skills are repo-scoped and ship
 resolve there. The [overseer skill](skills/tickmarkr-overseer/SKILL.md) links to the same
 loop walkthrough for cockpit and decision guidance; skill names remain unchanged.
 
+## `tickmarkr acp`
+
+`tickmarkr acp` is an ACP v1 agent that an editor launches over stdio. It runs no model
+and accepts only console commands:
+
+| Command | Behavior |
+|---|---|
+| `/attach [run]` | Watch the named run, or the current/default run. |
+| `/status [run]` | Read the named run's current status, or the current/default run. |
+| `/compile <spec>` | Run `tickmarkr version --check` first; compile only if it succeeds. |
+| `/plan` | Run `tickmarkr version --check` first; plan only if it succeeds. |
+| `/run` | Launch `tickmarkr run --driver subprocess` as a detached daemon, then watch it. |
+| `/resume <run id>` | Launch `tickmarkr resume <runId> --driver subprocess` as a detached daemon, then watch it. |
+
+Journalled runs appear as sessions. Both launch commands also check the version before
+launching; they accept no driver override or other flags.
+
+A park shows its exact `tickmarkr approve` commands, who enacts each decision, and the
+approval window's close time when a window is open. The live daemon enacts a release at
+its next task boundary; without a live owner, run the printed `tickmarkr resume` command
+after approving. If another run holds the repository lock, wait for it to end before
+resuming. Window expiry is a lapse: approvals are swept again before final close, and
+the daemon owns the run until it exits. A park with no permitted decision shows its reason.
+ACP never decides: no ACP answer or client setting releases a park. Run a printed approval
+command explicitly in a terminal.
+
+Closing the editor or a session stops only the watch; nothing is signalled to the daemon
+or workers. ACP never stops a run.
+
+Dock-launched editors may lack your shell's `PATH`. Use absolute paths to both Node and
+the tickmarkr script. Replace both example paths below with your installed paths: find
+Node with `node -p 'process.execPath'`, then run `npm root -g` and append
+`/tickmarkr/dist/cli/index.js` to find the global script (or use your checkout's `dist/cli/index.js`).
+
+For [Zed](https://zed.dev/docs/ai/external-agents), merge this entry into `settings.json`
+under `agent_servers`:
+
+```json
+{
+  "agent_servers": {
+    "tickmarkr": {
+      "type": "custom",
+      "command": "/opt/homebrew/bin/node",
+      "args": ["/opt/homebrew/lib/node_modules/tickmarkr/dist/cli/index.js", "acp"],
+      "env": {}
+    }
+  }
+}
+```
+
+For [JetBrains](https://www.jetbrains.com/help/ai-assistant/acp.html), add this entry to
+`~/.jetbrains/acp.json`:
+
+```json
+{
+  "agent_servers": {
+    "tickmarkr": {
+      "command": "/opt/homebrew/bin/node",
+      "args": ["/opt/homebrew/lib/node_modules/tickmarkr/dist/cli/index.js", "acp"],
+      "env": {}
+    }
+  }
+}
+```
+
+Other ACP clients use the same command and arguments. tickmarkr is not in the ACP registry;
+configure it as a custom agent.
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, the green bar (build/test/lint), and

@@ -5,6 +5,10 @@ type Help = { usage: string; description: string; options: Record<string, string
 // Descriptions live beside dispatch, not in mutating command bodies. The parser/registry drift
 // test checks these option names against production source; adding a command requires help here.
 export const COMMAND_HELP = {
+  acp: {
+    usage: "acp", description: "Serve Agent Client Protocol v1 over stdio. Stdout contains protocol lines only; diagnostics go to stderr. End of input exits without stopping any run.",
+    options: {}, examples: ["acp"],
+  },
   init: {
     usage: "init [options]", description: "Set up repository/global config, a starter spec and adapter health.",
     options: {

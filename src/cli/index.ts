@@ -2,6 +2,7 @@
 import { realpathSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import { approve } from "./commands/approve.js";
+import { acp } from "./commands/acp.js";
 import { beat } from "./commands/beat.js";
 import { compile } from "./commands/compile.js";
 import { doctor } from "./commands/doctor.js";
@@ -30,7 +31,7 @@ const normalize = (r: CommandResult): { out: string; code: number } =>
   typeof r === "string" ? { out: r, code: 0 } : r;
 
 export const COMMANDS = {
-  init, doctor, fleet, compile, scope, plan, run, status, wait, stats, resume, report, profile, ui, unlock, approve, beat, version, verify, eval: evalCommand,
+  acp, init, doctor, fleet, compile, scope, plan, run, status, wait, stats, resume, report, profile, ui, unlock, approve, beat, version, verify, eval: evalCommand,
 } satisfies CommandMap;
 export type RegisteredCommand = keyof typeof COMMANDS;
 
@@ -42,6 +43,7 @@ import { BANNER } from "../brand.js";
 
 export const USAGE = `tickmarkr — spec-driven orchestration harness for AI coding agents
 usage: tickmarkr <command>
+  acp           serve Agent Client Protocol v1 over stdio (stdout is protocol only)
   init          guided setup + doctor; init --agent [--force] [--docs] adds agent skills/docs
   doctor        re-probe adapters, herdr, auth; print capability matrix (--fix writes the test-runner ignore when a safe edit exists)
   fleet         interactive fleet editor (fleet --print for CI drift checks)
@@ -103,7 +105,7 @@ if (argv1Real && import.meta.url === pathToFileURL(argv1Real).href) {
   const [cmd, ...argv] = process.argv.slice(2);
   dispatch(cmd, argv).then(({ out, code }) => {
     // byte-identical streams: usage + success → stdout; a handler throw → stderr (original behavior)
-    (code === 1 && !out.endsWith(USAGE) ? console.error : console.log)(out);
+    if (out) (code === 1 && !out.endsWith(USAGE) ? console.error : console.log)(out);
     if (code !== 0) process.exit(code);
   });
 }

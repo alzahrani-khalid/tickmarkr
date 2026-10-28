@@ -7,6 +7,9 @@
 ```
 tickmarkr/
 ├── src/                        # TypeScript source (tsc → dist/)
+│   ├── acp/                     # ACP v1 stdio peer and in-memory sessions (src/acp/)
+│   │   ├── peer.ts              # hand-rolled JSON-RPC decode table and newline/UTF-8 framing
+│   │   └── server.ts            # initialize, session/new, session/prompt, session/cancel
 │   ├── adapters/                # one module per agent CLI + fake + shared types/registry
 │   │   ├── types.ts               # WorkerAdapter contract, Assignment/BillingChannel, shq(), QUOTA_RE
 │   │   ├── registry.ts            # allAdapters(), probeAll(), discoverChannels(), doctor.json persistence
@@ -95,6 +98,11 @@ tickmarkr/
 ```
 
 ## Directory Purposes
+
+**`src/acp/`:**
+- Purpose: expose ACP v1 sessions over stdio without a protocol dependency or model calls
+- Contains: the newline-delimited JSON-RPC peer, initialization, in-memory sessions, text validation and cancellation
+- Key files: `src/acp/peer.ts`, `src/acp/server.ts`; `src/cli/commands/acp.ts` guards stdout and owns the input lifetime
 
 **`src/adapters/`:**
 - Purpose: everything specific to one agent CLI, isolated behind the `WorkerAdapter` contract

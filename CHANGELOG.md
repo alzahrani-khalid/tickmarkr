@@ -2,6 +2,69 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v2.11.0 — `tickmarkr acp`: an Agent Client Protocol agent, so editors such as Zed and JetBrains IDEs can watch tickmarkr runs as a plan and tool calls, list and resume them, compile, plan and launch a detached run, and see every park with its exact approve commands, while acp itself never decides and never stops a run
+
+**v2.11.0** adds `tickmarkr acp` (queue rows 268–272). It is an ACP v1 agent that an editor launches over stdio, and it runs no model.
+Its work comes from one `tickmarkr run`, run-20261028-024709-…4099. Each of its six tasks passed build, lint, evidence, scope, its
+acceptance criteria, a cross-vendor review and the full suite.
+
+- **A hand-rolled ACP v1 peer on stdio (queue row 268).**
+  - It answers `initialize` (protocol version 1, no authentication), `session/new`, `session/prompt` and `session/cancel`.
+  - Newline-delimited JSON-RPC 2.0 only. Stdout carries nothing but complete protocol lines, and stray writers go to stderr.
+  - A malformed line answers a parse error, and the connection carries on.
+  - No new dependency. The tests validate every message against a vendored, pinned copy of the v1 schema.
+- **`/attach` shows a run as a plan with one tool call per task (queue row 269).**
+  - A task completes only when it merges. A failure marks its tool call failed and never ends the turn.
+  - The run's end ends the turn with the same verdict the loop skill's green rule gives, and unknown owed checks never read green.
+  - A daemon that dies silently ends the turn not green, naming resume.
+  - Cancelling or closing stops only the watch.
+- **Parks are commands-only (queue row 270).**
+  - Each open park shows exactly the `tickmarkr approve` commands the run's own status admits, who enacts each, and when the approval
+    window closes.
+  - acp never asks the editor for permission, never runs approve, never writes the journal and never releases a park.
+- **Runs are sessions (queue row 271).**
+  - `session/list` lists the repository's journalled runs. `session/resume` binds a run, answers first, then replays its plan.
+  - `/status` reads one run. `/compile` and `/plan` run after `tickmarkr version --check`, as children of acp's own node and entry script.
+  - Closing or cancelling a session detaches it and nothing else.
+- **`/run` and `/resume` launch the daemon detached through one product helper (queue row 272, part one).**
+  - The helper refuses before spawning on a failed version check or a live lock.
+  - It scrubs any environment it is handed by exact name and starts the subprocess driver in its own process group, with stdin closed and
+    output appended to the state log.
+  - It binds the session only after its own child's new lifecycle row, with the lock rechecked.
+  - It never signals anything, so closing the editor, which kills acp's whole process group, leaves the run going.
+- **The README gains a `tickmarkr acp` section (queue row 272, part two).**
+  - It gives Zed and JetBrains launch entries with absolute node and script paths; editors started from the Dock may lack the shell's
+    PATH.
+  - It covers the commands and the version check, states that acp never decides and never stops a run, and notes that acp is not in the
+    ACP registry.
+
+A pre-release check found more defects after the run. Their fixes passed `tickmarkr verify` against the run's tip: build, lint, evidence,
+scope, its acceptance criteria, a cross-vendor review and the full suite.
+- **Resuming a session acp itself created no longer answers "Session not found".**
+  - acp advertises resume, but `session/resume` accepted run ids only, so an editor restoring a thread by the id it was given got an error.
+    The official ACP test kit's ACP-RESUME-001 caught it.
+  - Such a session now resumes idle in the given folder. Run ids still resume bound and replayed, and any other id is still not found.
+  - The official ACP test kit (acp-tck) now reports CONFORMANT.
+- **acp's messages no longer run together in the editor.** ACP clients join a turn's message chunks into one message, so one park
+  alert's last line ran into the next alert's task id, and a launch line ran into the run's verdict. Every chunk now ends with a blank line.
+- **`/compile` and `/plan` output keeps its layout.** It is shown as preformatted text with its spacing kept, so plan's routing table
+  keeps its columns. Control characters are still shown as visible escapes.
+- **A park's enactment sentence can no longer start a command line of its own.** The sentence names the run that holds the repository
+  lock, and a lock's run id is any string. It is now folded onto one line, so the only `tickmarkr approve` lines are the run's admitted
+  commands.
+- **`/attach` with a mistyped run id (`/attach 4099`) says "Not a run id"** instead of a NOT GREEN "unreadable journal" verdict.
+
+Declared, still open:
+- acp accepts the editor's MCP server list and ignores it: acp runs no model.
+- Orca's native chat needs an upstream launch spec (queue row 273), so the README promises nothing for Orca.
+- A hands-on Zed session has not been run on the release machine. A simulation of Zed's launch and of its process-group kill on thread
+  close passed.
+- `/compile` cannot take a spec path that contains a space (queue row 298).
+- compile prints earlier review notes verbatim, multi-line included (queue row 299).
+- Hardening for edge cases no user hits today: an unbounded incoming line, launch state written before validation, one unreadable old
+  journal blocking launches, a resume after a torn journal tail, and default-run selection outside its error boundary (queue row 297).
+- After 2.11.0: queue rows 285–296 (2.10.2), then the rest of the review programme.
+
 ## v2.10.1 — review seats that work are never counted dead: dependency re-provisioning keeps the lockfile, claude judge and review seats stream their turn, a seat's close reaps what its tools detached, seats carry a marker that bounds this repository's runner-lease wait, a runner listing never queues behind another task's suite, standalone verify names its author assumption, and status reads never fetch over the network
 
 **v2.10.1** fixes what the 2.10.0 run exposed in tickmarkr's own review seats and dependency handling (queue rows 279, 267, 274, 277, 286

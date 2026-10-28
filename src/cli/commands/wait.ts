@@ -16,13 +16,13 @@ import { daemonLiveness, recordProjection } from "./status.js";
 import { StatusSnapshotSchema, type StatusSnapshot } from "./status-snapshot.js";
 
 export type WaitOpts = { now?: () => number; sleep?: (ms: number) => Promise<void> };
-type Cause = "run-end" | "park" | "task-failed" | "daemon-death" | "timeout";
+export type Cause = "run-end" | "park" | "task-failed" | "daemon-death" | "timeout";
 const EXIT = { "run-end": 0, park: 3, "task-failed": 4, "daemon-death": 5, timeout: 6 } as const;
 const causes: Readonly<Record<string, Cause | undefined>> = { "run-end": "run-end", "task-human": "park", "task-failed": "task-failed" };
 const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
 
 /** An append-only cursor. A partial UTF-8 character or JSON row survives until the next read. */
-class JournalTail {
+export class JournalTail {
   readonly events: JournalEvent[] = [];
   raw = "";
   private offset = 0;
@@ -73,6 +73,47 @@ class JournalTail {
     // line can wake wait. Retain provisional evidence without consuming that wakeup.
     if (this.pending.length) this.provisional = parse(this.pending, this.completeLines + 1, false);
     return fresh;
+  }
+}
+
+/** Mutable cursor shared by wait and attached sessions. Only complete physical rows wake it. */
+export type WakeCursor = { after?: number; initial?: boolean };
+export type Wake = { cause: Exclude<Cause, "timeout">; line: number };
+
+/** Classify the next unconsumed wake, including rows observed by the death-confirmation read.
+ * Row order wins over kind; a newly recorded engagement gets its own liveness proof. */
+export function classifyWake(tail: JournalTail, cursor: WakeCursor): Wake | undefined {
+  const qualifying = () => tail.events.find(row => {
+    const line = physicalLine([row], 0);
+    return line > cursor.after! && line <= tail.completeLineCount && Object.hasOwn(causes, row.event);
+  });
+  const newestLifecycle = () => [...tail.events].reverse().find(row => physicalLine([row], 0) <= tail.completeLineCount
+    && ["run-start", "run-resume", "run-end"].includes(row.event));
+  const wake = (cause: Wake["cause"], line: number): Wake => {
+    cursor.after = line;
+    cursor.initial = false;
+    return { cause, line };
+  };
+  for (;;) {
+    tail.read();
+    cursor.after ??= tail.completeLineCount;
+    const first = qualifying();
+    if (first) return wake(causes[first.event] as Wake["cause"], physicalLine([first], 0));
+    const lifecycle = newestLifecycle();
+    if (cursor.initial !== false && lifecycle?.event === "run-end") return wake("run-end", physicalLine([lifecycle], 0));
+    if (lifecycle?.event !== "run-end" && daemonLiveness(tail.events).state === "dead") {
+      // A dying daemon can append after the tick's stat. Never decide from that stale batch.
+      tail.read();
+      const final = qualifying();
+      if (final) return wake(causes[final.event] as Wake["cause"], physicalLine([final], 0));
+      const settledLifecycle = newestLifecycle();
+      if (settledLifecycle?.event === "run-end") return wake("run-end", physicalLine([settledLifecycle], 0));
+      if (settledLifecycle !== lifecycle) continue;
+      return wake("daemon-death", tail.line);
+    }
+    cursor.after = tail.completeLineCount;
+    cursor.initial = false;
+    return undefined;
   }
 }
 
@@ -192,31 +233,11 @@ export async function wait(argv: string[], cwd = process.cwd(), opts: WaitOpts =
           ...park.commands.map(command => command.command), ...(park.noDecision ? [park.noDecision] : [])]),
       ].map(visibleControls).join("\n") };
     };
-    let baseline = after;
-    let initial = true;
-    const qualifying = (rows: JournalEvent[]) => rows.find(row => physicalLine([row], 0) > baseline! && Object.hasOwn(causes, row.event));
-    const newestLifecycle = () => [...tail.events].reverse().find(row => physicalLine([row], 0) <= tail.completeLineCount
-      && ["run-start", "run-resume", "run-end"].includes(row.event));
+    const cursor: WakeCursor = { after };
     for (;;) {
-      const fresh = tail.read();
-      baseline ??= tail.completeLineCount;
-      const first = qualifying(fresh);
-      if (first) return finish(causes[first.event]!, physicalLine([first], 0));
-      const lifecycle = newestLifecycle();
-      if (initial && lifecycle?.event === "run-end") return finish("run-end", physicalLine([lifecycle], 0));
-      if (lifecycle?.event !== "run-end" && daemonLiveness(tail.events).state === "dead") {
-        // The daemon may have appended its final rows after this tick's stat and before the
-        // death proof. Observe those bytes before deciding; their physical order still wins.
-        const final = qualifying(tail.read());
-        if (final) return finish(causes[final.event]!, physicalLine([final], 0));
-        const settledLifecycle = newestLifecycle();
-        if (settledLifecycle?.event === "run-end") return finish("run-end", physicalLine([settledLifecycle], 0));
-        // A newly recorded start/resume needs its own liveness proof.
-        if (settledLifecycle !== lifecycle) continue;
-        return finish("daemon-death", tail.line);
-      }
+      const wake = classifyWake(tail, cursor);
+      if (wake) return finish(wake.cause, wake.line);
       if (now() >= deadline) return finish("timeout", tail.line);
-      initial = false;
       await (opts.sleep ?? sleep)(1000);
     }
   } finally { closeSync(fd); }

@@ -107,6 +107,12 @@ Side modules (CLI-facing, not in the dispatch loop):
 
 ## Layers
 
+**ACP (`src/acp/`):**
+- Purpose: Agent Client Protocol v1 over newline-delimited JSON-RPC on stdio, with no protocol SDK dependency
+- Location: `src/acp/peer.ts` (closed decode table and UTF-8 framing), `src/acp/server.ts` (initialization, sessions, text prompts and cancellation)
+- Entry: `src/cli/commands/acp.ts` saves the protocol writer and redirects console and other stdout stream writes to stderr before starting the peer. The CLI entry prints nothing after the session; EOF exits without signalling or modifying a run.
+- Contains: in-memory sessions and a free-text directory/command answer; no model calls or run ownership
+
 **CLI (`src/cli/`):**
 - Purpose: thin argv-parsing shell around the engine; each command is a one-function module
 - Location: `src/cli/index.ts` (dispatch table + usage text), `src/cli/commands/*.ts` (one file per subcommand)
