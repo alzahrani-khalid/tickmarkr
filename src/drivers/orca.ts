@@ -7,7 +7,7 @@ import { createWorktree, FORK_CAP_ENV, resolvedForkCap, sh, type ShResult } from
 import { Journal, type JournalEvent, parseRunId } from "../run/journal.js";
 import { stateDirName } from "../graph/graph.js";
 import { readWatchBoard, requestWatchBoardStop, stopWatchBoard, supervisionPresencePath, WATCH_OWNER_ENV, type WatchBoardOwner } from "../run/supervision.js";
-import { HOST_SESSION_VARS } from "./host-env.js";
+import { HOST_SESSION_VARS, SEAT_MARKER_ENV } from "./host-env.js";
 import { MAX_BUF } from "./subprocess.js";
 import { formatOwnedName, panesToClose, parseOwnedName, type ExecutorDriver, type FocusTarget, type TransportState, type FocusResult, type NotifyOpts, type Slot, type SlotOpts } from "./types.js";
 
@@ -1076,8 +1076,9 @@ export class OrcaDriver implements ExecutorDriver {
     // UI's active worktree (`active`/`current`) nor the daemon's cwd — and the command itself moves
     // into the checkout, because Orca cannot be asked to place a terminal in a path it does not
     // track (OBS-1004). Shell startup can swallow that prefix; prove it from scrollback below.
-    // Queue row 193: the fork cap stays first; the agent session's host variables never reach the worker.
-    const payload = `export ${FORK_CAP_ENV}=${shq(process.env[FORK_CAP_ENV] ?? resolvedForkCap())}; unset ${HOST_SESSION_VARS.join(" ")}; ${cmd}`;
+    // Queue rows 193/293 (D-2174 add.8): the fork cap stays first, then clear the host session and inherited seat marker.
+    // Seed adapters keep their launch line verbatim; a seat's own script exports its role after this seal.
+    const payload = `export ${FORK_CAP_ENV}=${shq(process.env[FORK_CAP_ENV] ?? resolvedForkCap())}; unset ${HOST_SESSION_VARS.join(" ")} ${SEAT_MARKER_ENV}; ${cmd}`;
     launchGuards.getStore()?.(); // v2.6.8 T1: eligibility is re-read here, after every awaited lookup above
     const env = await this.call("create", [
       "terminal", "create", "--worktree", `path:${tracked}`, "--title", st.title, "--command", inCheckout(st.cwd, payload),

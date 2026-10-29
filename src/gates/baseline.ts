@@ -984,7 +984,7 @@ export function ceilingKillResult(gate: string, r: ShResult, ceilingMs: number):
 }
 
 /**
- * OBS-612: the capture gets its OWN ceiling, thirty minutes, and it is not the shell default.
+ * OBS-612: the capture gets its OWN thirty-minute floor, separate from the shell default.
  *
  * `captureBaseline` used to call `sh(cmd, cwd)` with no ceiling argument, so it inherited
  * `DEFAULT_SHELL_TIMEOUT_MS` (600s) — while every CONSUMER of the result sizes its ceiling with
@@ -999,9 +999,21 @@ export function ceilingKillResult(gate: string, r: ShResult, ceilingMs: number):
  * `ceilingMs ≈ 1800000` — the right answer — which the next run never read.
  *
  * A capture is a MEASUREMENT of how long the suite takes; giving it the same ceiling as an ordinary
- * shell asks it to finish faster than the thing it is measuring.
+ * shell asks it to finish faster than the thing it is measuring. A prior measurement can raise
+ * this floor, bounded by CAPTURE_HARD_MAX_MS below.
  */
 export const CAPTURE_CEILING_MS = 1_800_000;
+export const CAPTURE_HARD_MAX_MS = 4 * 60 * 60 * 1_000;
+
+/** Persisted measurements are untrusted. Validate the field effectiveCeilingMs will read before
+ * applying its slack, then bound capture independently of the unchanged battery ceiling rules. */
+export function captureCeilingMs(prior?: unknown): number {
+  if (prior === null || typeof prior !== "object") return CAPTURE_CEILING_MS;
+  const entry = prior as Pick<BaselineCommand, "durationMs" | "ceilingMs">;
+  const measurement = entry.ceilingMs ?? entry.durationMs;
+  if (typeof measurement !== "number" || !Number.isFinite(measurement) || measurement < 0) return CAPTURE_CEILING_MS;
+  return Math.min(CAPTURE_HARD_MAX_MS, Math.max(CAPTURE_CEILING_MS, effectiveCeilingMs(entry)));
+}
 
 const invalidCaptureEntry = (
   durationMs: number,
@@ -1049,7 +1061,7 @@ export interface BaselineReceiptOptions {
   taskBuildAttribution?: ShellOptions["receiptAttribution"];
 }
 
-export async function captureBaseline(cwd: string, commands: Record<string, string>, opts: BaselineReceiptOptions = {}): Promise<Baseline> {
+export async function captureBaseline(cwd: string, commands: Record<string, string>, opts: BaselineReceiptOptions & { priors?: Record<string, unknown> } = {}): Promise<Baseline> {
   const base: Baseline = { commands: {} };
   const refusal = dependencyLinkRefusal(cwd);
   if (refusal) {
@@ -1068,12 +1080,13 @@ export async function captureBaseline(cwd: string, commands: Record<string, stri
     // (node_modules/.bin first), so a bare repo-local runner resolves here exactly as it does in the gate — built on the
     // caller's own evidence environment when it supplies one (D-1659), never in place of it.
     const env = (name === "test" || name === "tipTest") && isVitestTestCommand(cmd, cwd) ? manifestChildEnv(cwd, opts.evidence?.env) : opts.evidence?.env;
-    const r = await sh(cmd, cwd, CAPTURE_CEILING_MS, { env, onReceipt: receipt => { evidence.observe(receipt); opts.onReceipt?.(receipt); } });
+    const ceilingMs = captureCeilingMs(opts.priors?.[name]);
+    const r = await sh(cmd, cwd, ceilingMs, { env, onReceipt: receipt => { evidence.observe(receipt); opts.onReceipt?.(receipt); } });
     (base.evidenceReceipts ??= {})[name] = evidence.finish(r.stdout, r.stderr);
     // ponytail: strip the executing cwd so repo-root capture and worktree compare fingerprint identically; /private-vs-/tmp symlink variance is out of scope
     // ponytail: a capture that was itself killed records the ceiling as its "measurement", which
     // scales the next ceiling up — the right direction for a suite that never finished once.
-    const durationMs = r.durationMs ?? 0;
+    const durationMs = r.durationMs ?? (r.timedOut === true ? ceilingMs : 0);
     const combinedOutput = r.stdout + "\n" + r.stderr;
     const raw = combinedOutput.split(cwd).join("");
     // OBS-534 (T2): a capture SIGKILLed at its ceiling never returned a verdict, so `r.code` is the
@@ -1092,7 +1105,7 @@ export async function captureBaseline(cwd: string, commands: Record<string, stri
       // line at run start, BEFORE any task gate reds, which is the whole point: the failure is
       // otherwise indistinguishable from a repo that simply has flaky tests.
       console.error(
-        `tickmarkr: baseline capture for "${name}" was killed at its ${CAPTURE_CEILING_MS}ms ceiling — `
+        `tickmarkr: baseline capture for "${name}" was killed at its ${ceilingMs}ms ceiling — `
         + `it recorded NO fingerprints, so nothing is forgiven and every gate will treat a pre-existing `
         + `failure as a fresh one. Raise the ceiling or shorten the command.`,
       );

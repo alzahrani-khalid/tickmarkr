@@ -5,10 +5,12 @@ import { PassThrough } from "node:stream";
 import { afterEach, expect, test, vi } from "vitest";
 import { attach, type AttachSession } from "../../src/acp/attach.js";
 import { createAcpAgent } from "../../src/acp/server.js";
+import { createParkPresentation } from "../../src/acp/parks.js";
 import { approvalDispositionForRelease, approvalEnactment, approvalRunOwner, releaseForDecision } from "../../src/cli/commands/approve.js";
 import * as approval from "../../src/cli/commands/approve.js";
 import { statusSnapshot } from "../../src/cli/commands/status-snapshot.js";
 import * as snapshots from "../../src/cli/commands/status-snapshot.js";
+import { JournalTail } from "../../src/cli/commands/wait.js";
 import { graphDefinitionHash, saveGraph } from "../../src/graph/graph.js";
 import { validateGraph } from "../../src/graph/schema.js";
 import { visibleControls, type JournalEvent } from "../../src/run/journal.js";
@@ -69,6 +71,137 @@ function fixture(ids = ["T1"]) {
 }
 
 afterEach(() => { vi.useRealTimers(); vi.restoreAllMocks(); vi.clearAllMocks(); });
+
+test("a window closed by the row the first snapshot read unterminated is never announced", () => {
+  for (const closer of ["task-dispatch", "run-resume", "approval-window-expired"]) {
+    const f = fixture();
+    f.append(row("task-human", "T1", { kind: "human-gate", reason: "waiting" }),
+      row("approval-window-start", undefined, { windowMs: 10000, parked: ["T1"] }));
+    fs.appendFileSync(f.path, JSON.stringify(row(closer, "T1")));
+    const alerts: string[] = [];
+    const p = createParkPresentation(f.cwd, f.runId, text => alerts.push(text));
+    const s0 = statusSnapshot(f.cwd, f.runId);
+    expect(s0.sequence).toBe(4);
+    expect(s0.approvalWindow).toBeNull();
+    p.render(s0);
+    const fd = fs.openSync(f.path, "r");
+    const tail = new JournalTail(f.path, fd);
+    try {
+      tail.read();
+      p.windows(tail.events, tail.completeLineCount);
+      fs.appendFileSync(f.path, "\n");
+      for (let n = 0; n < 3; n++) {
+        const state = statusSnapshot(f.cwd, f.runId);
+        expect(state.approvalWindow).toBeNull();
+        p.render(state);
+        tail.read();
+        p.windows(tail.events, tail.completeLineCount);
+      }
+      expect(alerts.filter(text => text.startsWith("Approval window closes at")), closer).toEqual([]);
+    } finally { fs.closeSync(fd); }
+  }
+});
+
+test("approval openings follow the initial physical boundary across closing rows, tail completion orders and later closed windows", () => {
+  const f = fixture();
+  const header = fs.readFileSync(f.path, "utf8");
+  // Blank and invalid physical rows must not shift the snapshot/tail boundary.
+  const history = header + "\n{torn history}\n" + encode([
+    row("task-human", "T1", { kind: "human-gate", reason: "waiting" }),
+    row("approval-window-start", undefined, { windowMs: 10000, parked: ["T1"] }),
+    row("approval-window-expired"),
+    row("approval-window-start", undefined, { windowMs: 10000, parked: ["T1"] }, later),
+  ]);
+  const future = "2026-10-28T00:02:00.000Z";
+  const closers = ["task-dispatch", "run-resume", "approval-window-expired", "run-start", "run-end", "task-approved"];
+  for (const closer of closers) for (const ending of ["terminated", "unterminated", "torn"]) {
+    for (const completesBeforeTailRead of [false, true]) {
+      // The approval names the park's physical line, including the blank/invalid rows.
+      const text = JSON.stringify(row(closer, "T1", closer === "task-approved" ? { park: { line: 4, ts } } : {}));
+      const cut = ending === "torn" ? text.length - 7 : text.length;
+      fs.writeFileSync(f.path, history + text.slice(0, cut) + (ending === "terminated" ? "\n" : ""));
+      const alerts: string[] = [];
+      const p = createParkPresentation(f.cwd, f.runId, text => alerts.push(text));
+      const initial = statusSnapshot(f.cwd, f.runId);
+      expect(initial.sequence).toBe(8);
+      expect(initial.approvalWindow !== null).toBe(ending === "torn");
+      p.render(initial);
+      const expected = ending === "torn" ? [expect.stringContaining("2026-10-28T00:01:10.000Z")] : [];
+      const openings = () => alerts.filter(text => text.startsWith("Approval window closes at"));
+      const complete = () => {
+        if (ending !== "terminated") fs.appendFileSync(f.path, text.slice(cut) + "\n");
+      };
+      const fd = fs.openSync(f.path, "r");
+      const tail = new JournalTail(f.path, fd);
+      const poll = () => {
+        const state = statusSnapshot(f.cwd, f.runId);
+        expect(state.approvalWindow).toBeNull();
+        p.render(state);
+        tail.read();
+        p.windows(tail.events, tail.completeLineCount);
+      };
+      try {
+        if (completesBeforeTailRead) complete();
+        for (let n = 0; n < 2; n++) { tail.read(); p.windows(tail.events, tail.completeLineCount); }
+        if (!completesBeforeTailRead) complete();
+        for (let n = 0; n < 3; n++) poll();
+        expect(openings(), `${closer}/${ending}/${completesBeforeTailRead}`).toEqual(expected);
+        // A later window can open and close between snapshots: the tail still announces it once.
+        f.append(row("approval-window-start", undefined, { windowMs: 10000, parked: ["T1"] }, future),
+          row("approval-window-expired", undefined, {}, future));
+        for (let n = 0; n < 3; n++) poll();
+        expect(openings()).toEqual([...expected, expect.stringContaining("2026-10-28T00:02:10.000Z")]);
+      } finally { fs.closeSync(fd); }
+    }
+  }
+});
+
+test("each approval window is announced exactly once by its close time whether the first snapshot read its start row unterminated or torn, so a repeated or missed opening fails", () => {
+  for (const torn of [false, true]) for (const completesBeforeTailRead of [false, true]) {
+    const f = fixture();
+    f.append(row("task-human", "T1", { kind: "human-gate", reason: "waiting" }));
+    const start = row("approval-window-start", undefined, { windowMs: 10000, parked: ["T1"] });
+    const text = JSON.stringify(start);
+    const cut = torn ? text.length - 7 : text.length;
+    fs.appendFileSync(f.path, text.slice(0, cut));
+    const alerts: string[] = [];
+    const presentation = createParkPresentation(f.cwd, f.runId, text => alerts.push(text));
+    const initial = statusSnapshot(f.cwd, f.runId);
+    expect(initial.sequence).toBe(3);
+    expect(initial.approvalWindow !== null).toBe(!torn);
+    presentation.render(initial);
+    const fd = fs.openSync(f.path, "r");
+    const tail = new JournalTail(f.path, fd);
+    const complete = () => fs.appendFileSync(f.path, text.slice(cut) + "\n");
+    const poll = () => {
+      presentation.render(statusSnapshot(f.cwd, f.runId));
+      tail.read();
+      presentation.windows(tail.events, tail.completeLineCount);
+    };
+    const openings = () => alerts.filter(text => text.startsWith("Approval window closes at"));
+    try {
+      if (completesBeforeTailRead) complete();
+      tail.read();
+      presentation.windows(tail.events, tail.completeLineCount);
+      if (!completesBeforeTailRead) complete();
+      else expect(openings()).toHaveLength(1);
+      for (let n = 0; n < 3; n++) poll();
+      expect(openings()).toEqual([expect.stringContaining("2026-10-28T00:00:10.000Z")]);
+      // Re-observing the same close time, even on a new physical row, is one opening.
+      f.append(start, row("approval-window-expired"));
+      for (let n = 0; n < 3; n++) poll();
+      expect(openings()).toHaveLength(1);
+      expect(alerts.filter(text => text.startsWith("Approval window lapsed"))).toHaveLength(1);
+      f.append(row("approval-window-start", undefined, { windowMs: 10000, parked: ["T1"] }, later));
+      for (let n = 0; n < 3; n++) poll();
+      expect(openings()).toEqual([
+        expect.stringContaining("2026-10-28T00:00:10.000Z"),
+        expect.stringContaining("2026-10-28T00:01:10.000Z"),
+      ]);
+      expect(alerts.filter(text => text.startsWith("Approval window lapsed"))).toHaveLength(1);
+    } finally { fs.closeSync(fd); }
+  }
+});
 
 test("a daemon scope-request reason cannot add an unadmitted command to its pending call or alert", async () => {
   const f = fixture();

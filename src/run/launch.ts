@@ -1,9 +1,9 @@
 import { spawn } from "node:child_process";
-import { closeSync, fstatSync, openSync, readFileSync, readdirSync, readSync } from "node:fs";
+import { closeSync, fstatSync, openSync, readFileSync, readdirSync, readSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { HOST_SESSION_VARS, SEAT_MARKER_ENV } from "../drivers/host-env.js";
 import { HERDR_CONTROL_VARS } from "../drivers/subprocess.js";
-import { tickmarkrDir, stateDirName } from "../graph/graph.js";
+import { loadGraph, tickmarkrDir, stateDirName } from "../graph/graph.js";
 import { parseRunId } from "./journal.js";
 import { isPidLive, runLockOwner } from "./lock.js";
 
@@ -41,7 +41,7 @@ export type DaemonLaunch =
 type JournalMark = { bytes: number; ino: number; boundary: boolean };
 
 // Record byte boundaries BEFORE spawning: a resume's historical rows prove nothing about this child.
-function journalMarks(cwd: string): Map<string, JournalMark> {
+function journalMarks(cwd: string, resumeTarget?: string): Map<string, JournalMark> {
   const marks = new Map<string, JournalMark>();
   const runs = join(cwd, stateDirName(cwd), "runs");
   let names: string[];
@@ -56,7 +56,11 @@ function journalMarks(cwd: string): Map<string, JournalMark> {
       const last = Buffer.alloc(1);
       if (st.size) readSync(fd, last, 0, 1, st.size - 1);
       marks.set(name, { bytes: st.size, ino: st.ino, boundary: !st.size || last[0] === 10 });
-    } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    } catch (error) {
+      // Keep every readable history marked, including for a fresh launch. Only the
+      // resume target's unreadable history can refuse this launch before spawning.
+      if (name === resumeTarget && (error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
     finally { if (fd !== undefined) closeSync(fd); }
   }
   return marks;
@@ -116,7 +120,12 @@ export async function launchDaemon(options: {
     if (check.exitCode !== 0) return refuse(`version --check exited ${check.exitCode}\n${check.output}`);
     const owner = runLockOwner(cwd);
     if (owner?.live) return refuse(`Launch refused: live lock held by pid ${owner.pid ?? "unknown"} (run ${owner.runId ?? "unknown"})`);
-    const marks = journalMarks(cwd);
+    // Preflight before journal marks or state creation; keep the daemon's graph loader authoritative.
+    if (verb === "run") loadGraph(cwd);
+    else if (!statSync(join(cwd, stateDirName(cwd), "runs", runId!, "journal.jsonl"), { throwIfNoEntry: false })?.isFile()) {
+      return refuse(`Launch refused: no journal for run ${runId}`);
+    }
+    const marks = journalMarks(cwd, runId);
     logPath = join(tickmarkrDir(cwd), "daemon.log");
     const log = openSync(logPath, "a");
     let child;

@@ -2,6 +2,54 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v2.11.1 — contained fixes: acp hardening and a launch preflight, a whole-line /compile path, a verify baseline ceiling that scales with the suite, a lock pin npm would keep, Orca's seat-marker clear, and stale text
+
+**v2.11.1** fixes what 2.11.0's pre-release checks and the queue held back (queue rows 297, 298, 300, 290, 293, 294 and 276(g)). Its
+work comes from one `tickmarkr run`, run-20261029-090318-0000000000004412. Each of its eight tasks passed build, lint, evidence, scope, its acceptance
+criteria, a cross-vendor review and the full suite.
+
+- **`tickmarkr acp` hardening (queue row 297).**
+  - The peer caps an incoming frame at 64 MiB, answers an error and carries on, and searches only new text for a line end.
+  - An unreadable old journal no longer blocks every launch: only the run being resumed must be readable.
+  - Each approval window is announced exactly once.
+  - Choosing the default run reads no run graph.
+  - A bad runs folder is answered inside /status and /attach.
+- **A launch checks first (queue row 297).** `/run` needs a compiled graph, and `/resume` needs the run's journal, before acp creates
+  any state or spawns anything. A refused launch in a folder that is not a tickmarkr repository leaves nothing behind.
+- **`/compile` takes a spec path with spaces (queue row 298).** The rest of the line is the one path, with one pair of matching quotes
+  removed. It is passed as a single argument with no shell; a leading dash or a control character is still refused.
+- **Standalone `tickmarkr verify` learns how long the suite takes (queue row 300).**
+  - Before, a test baseline capture always stopped at a fixed 30 minutes, so a suite near that length never got a baseline, and each
+    retry stopped again.
+  - The ceiling now scales from the last recorded run of the same command, never below 30 minutes or above 4 hours.
+  - A killed capture keeps its measurement, and verify and the daemon both read it back.
+  - A malformed earlier record counts as no measurement.
+- **Re-provisioning pins a locked version only when npm itself would keep it (queue row 290).** Before, a manifest range bump without a
+  lockfile update quietly installed the old major. A vendored range check, matching semver on every tested pair, decides. Dist-tags keep
+  the lock as npm does, and anything outside the supported grammar installs the manifest spec. No new dependency.
+- **An Orca worker terminal clears `TICKMARKR_SEAT` (queue row 293),** as herdr's pane seal already does, so an interactive-seed worker
+  never inherits a review marker. The adapter's launch line is unchanged.
+- **Stale text (queue row 294):** the buffering-reviewer comment no longer names claude-code, and the three run skills drop a dangling
+  journal-and-pid line.
+- **The admission test checks which tasks start before the first finishes, not their journal order (queue row 276(g)),** which
+  concurrency does not guarantee.
+
+- **The launch test's stand-in daemon writes its lock whole (queue row 305).** The product daemon already published `graph.lock`
+  atomically; only the test's stand-in wrote it in place, so under load the launcher's poll could read a torn file and refuse it as a
+  live lock of an unknown pid. A tmp write and rename closes it. Test-only; no product change.
+
+Post-run checks on the run's tip: the spec's own probe kit, all eight tasks green (two probe instruments corrected, the product
+untouched), every acceptance title present exactly once in its owned suite, and the Claude plugin installing from a marketplace.
+
+Declared, still open:
+- 2.11.2: every way a review seat ends records and reaps its descendants (queue rows 289, 295 and 301); the host-starved rerun note
+  moves out of failure details (291); torn journal tails are separated before an append (297 d); a typed full-suite lease (288); and a
+  killed test run's late pool worker no longer holds the runner lease, with every shell group signal rechecking its target's identity
+  (303, 306).
+- Queue row 302 (a double-forked seat tool), a design row.
+- Queue row 299 (compile's multi-line review notes).
+- Queue row 296 (board marks), which needs the operator's eye.
+
 ## v2.11.0 — `tickmarkr acp`: an Agent Client Protocol agent, so editors such as Zed and JetBrains IDEs can watch tickmarkr runs as a plan and tool calls, list and resume them, compile, plan and launch a detached run, and see every park with its exact approve commands, while acp itself never decides and never stops a run
 
 **v2.11.0** adds `tickmarkr acp` (queue rows 268–272). It is an ACP v1 agent that an editor launches over stdio, and it runs no model.

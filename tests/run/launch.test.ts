@@ -1,13 +1,16 @@
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, realpathSync, renameSync, writeFileSync } from "node:fs";
+import fs, { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { join } from "node:path";
 import { expect, test, vi } from "vitest";
 import { HOST_SESSION_VARS, SEAT_MARKER_ENV } from "../../src/drivers/host-env.js";
 import { HERDR_CONTROL_VARS } from "../../src/drivers/subprocess.js";
+import { loadGraph, saveGraph } from "../../src/graph/graph.js";
+import { validateGraph } from "../../src/graph/schema.js";
 import { childEnv, launchDaemon } from "../../src/run/launch.js";
 import * as locks from "../../src/run/lock.js";
-import { makeTestTempDir } from "../helpers/tmprepo.js";
+import { makeTestTempDir, T } from "../helpers/tmprepo.js";
 
 const denied = [...HOST_SESSION_VARS, ...HERDR_CONTROL_VARS, SEAT_MARKER_ENV];
 const controls = denied.flatMap(name => [`${name}_LOOKALIKE`, `PREFIX_${name}`, name.toLowerCase()]);
@@ -18,15 +21,20 @@ async function until(check: () => boolean, ms = 5000) {
   while (!check()) { if (Date.now() > end) throw new Error("fixture timed out"); await pause(); }
 }
 
-function fixture(mode = "ready") {
+function fixture(mode = "ready", prepared = true) {
   const cwd = realpathSync(makeTestTempDir("launch-"));
   const state = join(cwd, ".tickmarkr");
-  mkdirSync(state);
+  if (prepared) {
+    saveGraph(cwd, validateGraph({ version: 1, spec: { source: "native", paths: ["spec.md"], hash: "launch" }, tasks: [T("T1")] }));
+    const dir = join(state, "runs", "run-old");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "journal.jsonl"), "");
+  }
   const entry = join(cwd, "entry.mjs");
   const file = (name: string) => join(cwd, name);
   // Pin stand-in file access to this fixture; record its actual cwd independently.
   writeFileSync(entry, `
-import { appendFileSync, existsSync, fstatSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, fstatSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { join } from 'node:path';
@@ -55,7 +63,9 @@ if (process.argv[2] === 'version') {
   for (let i=0;i<25;i++) console.log('child log '+i);
   console.error('child stderr');
   if (mode !== 'silent' && mode !== 'exit') {
-    writeFileSync(lock,JSON.stringify({pid:mode === 'competing' ? Number(process.env.HOLDER) : process.pid,runId,startedAt:Date.now()}));
+    // Row 305 (D-2178 add.69): publish the lock whole, as the daemon does, so a polling launcher never reads it torn.
+    writeFileSync(lock+'.'+process.pid+'.tmp',JSON.stringify({pid:mode === 'competing' ? Number(process.env.HOLDER) : process.pid,runId,startedAt:Date.now()}));
+    renameSync(lock+'.'+process.pid+'.tmp',lock);
     appendFileSync(journal,row('baseline-start'));
     writeFileSync(file('baseline-pending'),'yes');
     if (mode === 'competing') appendFileSync(journal,JSON.stringify({event:'run-resume',data:{pid:Number(process.env.HOLDER)}})+'\\n');
@@ -87,6 +97,79 @@ if (process.argv[2] === 'version') {
       if (existsSync(file("records")) && readFileSync(file("records"), "utf8").includes('"--driver"')) await until(() => existsSync(file("done"))); },
   };
 }
+
+test("a run launch with no compiled graph in a bare folder or in a state folder holding none is refused naming the compile command before any spawn or state file, so a refusal after the spawn fails", async () => {
+  for (const stateExists of [false, true]) {
+    const f = fixture("ready", false);
+    if (stateExists) mkdirSync(f.state);
+    let waiting = false;
+    try {
+      expect(await launchDaemon({ cwd: f.cwd, self: f.entry, verb: "run", onWaiting: () => { waiting = true; } }))
+        .toEqual({ status: "refused", message: `Launch refused: no graph at ${join(f.state, "graph.json")} — run \`tickmarkr compile <src>\` first` });
+      expect(f.records().map(row => row.args)).toEqual([["version", "--check"]]);
+      expect(waiting).toBe(false);
+      expect(existsSync(f.state)).toBe(stateExists);
+      if (stateExists) expect(readdirSync(f.state)).toEqual([]);
+    } finally { await f.finish(); }
+  }
+});
+
+test("a run launch over an invalid graph is refused with the graph loader's own message while a valid graph launches as before, so a second graph validator fails", async () => {
+  const graph = validateGraph({ version: 1, spec: { source: "native", paths: ["spec.md"], hash: "launch" }, tasks: [T("T1")] });
+  for (const content of ["{", "{}", JSON.stringify({ ...graph, tasks: [T("T1"), T("T1")] }), JSON.stringify({ ...graph, tasks: [T("T1", { deps: ["missing"] })] })]) {
+    const f = fixture("ready", false);
+    mkdirSync(f.state);
+    const path = join(f.state, "graph.json");
+    writeFileSync(path, content);
+    let loaderMessage = "";
+    try { loadGraph(f.cwd); } catch (error) { loaderMessage = (error as Error).message; }
+    expect(loaderMessage).not.toBe("");
+    try {
+      expect(await launchDaemon({ cwd: f.cwd, self: f.entry, verb: "run" }))
+        .toEqual({ status: "refused", message: `Launch refused: ${loaderMessage}` });
+      expect(f.records().map(row => row.args)).toEqual([["version", "--check"]]);
+      expect(readdirSync(f.state)).toEqual(["graph.json"]);
+      expect(readFileSync(path, "utf8")).toBe(content);
+    } finally { await f.finish(); }
+  }
+  const f = fixture();
+  try {
+    const launching = launchDaemon({ cwd: f.cwd, self: f.entry, verb: "run" });
+    await until(() => existsSync(f.file("partial")));
+    writeFileSync(f.file("row"), "yes");
+    expect(await launching).toMatchObject({ status: "bound", runId: "run-new", driver: "subprocess" });
+    expect(f.records().map(row => row.args)).toEqual([["version", "--check"], ["run", "--driver", "subprocess"]]);
+  } finally { await f.finish(); }
+});
+
+test("a resume of a run without a journal is refused naming that run before any spawn or state file while a run with a journal resumes as before, so a resume that creates state first fails", async () => {
+  for (const shape of ["bare", "state", "run-folder", "journal-directory", "run-file"]) {
+    const f = fixture("ready", false);
+    const dir = join(f.state, "runs", "run-old");
+    if (shape === "state") mkdirSync(f.state);
+    if (shape === "run-folder" || shape === "journal-directory") mkdirSync(dir, { recursive: true });
+    if (shape === "journal-directory") mkdirSync(join(dir, "journal.jsonl"));
+    if (shape === "run-file") { mkdirSync(join(f.state, "runs"), { recursive: true }); writeFileSync(dir, "not a directory"); }
+    const before = existsSync(f.state) ? readdirSync(f.state, { recursive: true }).sort() : undefined;
+    let waiting = false;
+    try {
+      expect(await launchDaemon({ cwd: f.cwd, self: f.entry, verb: "resume", runId: "run-old", onWaiting: () => { waiting = true; } }))
+        .toEqual({ status: "refused", message: "Launch refused: no journal for run run-old" });
+      expect(f.records().map(row => row.args)).toEqual([["version", "--check"]]);
+      expect(waiting).toBe(false);
+      expect(existsSync(f.state) ? readdirSync(f.state, { recursive: true }).sort() : undefined).toEqual(before);
+    } finally { await f.finish(); }
+  }
+  const f = fixture();
+  rmSync(join(f.state, "graph.json")); // Resume preflights its journal, independently of the current graph.
+  try {
+    const launching = launchDaemon({ cwd: f.cwd, self: f.entry, verb: "resume", runId: "run-old" });
+    await until(() => existsSync(f.file("partial")));
+    writeFileSync(f.file("row"), "yes");
+    expect(await launching).toMatchObject({ status: "bound", runId: "run-old", driver: "subprocess" });
+    expect(f.records().map(row => row.args)).toEqual([["version", "--check"], ["resume", "run-old", "--driver", "subprocess"]]);
+  } finally { await f.finish(); }
+});
 
 test("the launch helper starts run or resume with the subprocess driver detached in its own process group, stdin closed and output appended to the state log, with every denylist name removed and look-alikes byte-equal whatever environment it is handed, so an attached or unscrubbed daemon fails", async () => {
   for (const verb of ["run", "resume"] as const) for (const inherited of [false, true]) {
@@ -123,11 +206,13 @@ test("the launch helper starts run or resume with the subprocess driver detached
 });
 
 test("a failed version check or a live lock launches nothing, and a launch binds only after a complete new run-start or run-resume row names its child, the lock then still its own for the run asked, so a lock-only, historical-row or competing-holder binding fails", async () => {
-  const fail = fixture("version-fail");
+  const fail = fixture("version-fail", false);
   expect(await launchDaemon({ cwd: fail.cwd, self: fail.entry, verb: "run" })).toMatchObject({ status: "refused", message: expect.stringContaining("version --check exited 3\nversion output sentinel\nversion stderr sentinel") });
   expect(fail.records().map(row => row.args)).toEqual([["version", "--check"]]);
   expect(existsSync(join(fail.state, "daemon.log"))).toBe(false);
-  const live = fixture();
+  expect(existsSync(fail.state)).toBe(false);
+  const live = fixture("ready", false);
+  mkdirSync(live.state);
   const payload = JSON.stringify({ pid: process.pid, runId: "run-bait-other", startedAt: Date.now() });
   writeFileSync(join(live.state, "graph.lock"), payload);
   expect(await launchDaemon({ cwd: live.cwd, self: live.entry, verb: "resume", runId: "run-old" })).toMatchObject({ status: "refused", message: expect.stringContaining(`pid ${process.pid} (run run-bait-other)`) });
@@ -223,3 +308,62 @@ test("a launched child that releases its lock before its lifecycle row, exits fi
     for (const [, signal] of kill.mock.calls) expect(signal).toBe(0);
   } finally { kill.mockRestore(); }
 }, 30000);
+
+test("a fresh run or another run's resume launches beside an unreadable journal while an unreadable resume target is refused before the spawn, so a launch refused by history fails", async () => {
+  for (const verb of ["run", "resume"] as const) {
+    const f = fixture();
+    const unreadable = join(f.state, "runs", "run-unreadable", "journal.jsonl");
+    mkdirSync(join(f.state, "runs", "run-unreadable"), { recursive: true });
+    writeFileSync(unreadable, "history\n");
+    const runId = verb === "run" ? "run-new" : "run-old";
+    const dir = join(f.state, "runs", runId);
+    mkdirSync(dir, { recursive: true });
+    const journal = join(dir, "journal.jsonl");
+    const history = (pid: number) => `{"event":"${verb === "run" ? "run-start" : "run-resume"}","data":{"pid":${String(pid).padStart(12)}}}\n`;
+    writeFileSync(journal, history(1));
+    const open = fs.openSync;
+    const denied = vi.spyOn(fs, "openSync").mockImplementation((...args) => {
+      if (String(args[0]) === unreadable) throw Object.assign(new Error("unreadable history sentinel"), { code: "EACCES" });
+      return open(...args);
+    });
+    syncBuiltinESMExports();
+    let settled = false;
+    try {
+      const launching = launchDaemon({ cwd: f.cwd, self: f.entry, verb, runId: verb === "resume" ? runId : undefined,
+        onWaiting: ({ pid }) => writeFileSync(journal, history(pid)) }).then(result => { settled = true; return result; });
+      await until(() => settled || existsSync(f.file("partial")));
+      expect(settled).toBe(false);
+      await pause(80);
+      // Rewriting a readable historical row in place must not make it post-spawn evidence.
+      expect(settled).toBe(false);
+      writeFileSync(f.file("row"), "yes");
+      expect(await launching).toMatchObject({ status: "bound", runId });
+      expect(f.records().map(row => row.args)).toEqual([["version", "--check"], [verb, ...(verb === "resume" ? [runId] : []), "--driver", "subprocess"]]);
+    } finally {
+      denied.mockRestore();
+      syncBuiltinESMExports();
+      await f.finish();
+    }
+  }
+
+  const f = fixture();
+  const journal = join(f.state, "runs", "run-old", "journal.jsonl");
+  mkdirSync(join(f.state, "runs", "run-old"), { recursive: true });
+  writeFileSync(journal, "history\n");
+  const open = fs.openSync;
+  const denied = vi.spyOn(fs, "openSync").mockImplementation((...args) => {
+    if (String(args[0]) === journal) throw Object.assign(new Error("unreadable target sentinel"), { code: "EACCES" });
+    return open(...args);
+  });
+  syncBuiltinESMExports();
+  try {
+    expect(await launchDaemon({ cwd: f.cwd, self: f.entry, verb: "resume", runId: "run-old" }))
+      .toMatchObject({ status: "refused", message: expect.stringContaining("unreadable target sentinel") });
+    expect(f.records().map(row => row.args)).toEqual([["version", "--check"]]);
+    expect(existsSync(join(f.state, "daemon.log"))).toBe(false);
+  } finally {
+    denied.mockRestore();
+    syncBuiltinESMExports();
+    await f.finish();
+  }
+});

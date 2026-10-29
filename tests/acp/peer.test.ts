@@ -5,6 +5,76 @@ import { validateAgentMessage } from "../helpers/acp-schema.js";
 
 const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
 
+test("a row over the sixty-four mebibyte bound gets one null-id invalid-request error before its newline and never runs while a row at the bound decodes, so an off-by-one or unbounded frame fails", async () => {
+  const input = new PassThrough();
+  const output: any[] = [];
+  const calls: unknown[] = [];
+  const peer = createAcpPeer({ input, isInitialized: () => true,
+    write: line => output.push(JSON.parse(line)),
+    requests: { run: params => { calls.push(params); return {}; } },
+  });
+  const bound = 64 * 1024 * 1024;
+  const chunk = " ".repeat(64 * 1024);
+  const originalIndexOf = String.prototype.indexOf;
+  let checkingSearch = false;
+  let searched = 0;
+  // Inspect this process's actual searches without retaining the searched strings.
+  String.prototype.indexOf = function (search, from) {
+    if (checkingSearch && search === "\n") {
+      expect(this.length).toBeLessThanOrEqual(chunk.length);
+      searched += this.length - (from ?? 0);
+    }
+    return originalIndexOf.call(this, search, from);
+  };
+  const feedAtBound = (id: string) => {
+    const row = JSON.stringify({ jsonrpc: "2.0", id, method: "run", params: { id } });
+    // A non-ASCII id also proves the bound counts characters rather than UTF-8 bytes.
+    input.emit("data", row);
+    let left = bound - row.length;
+    checkingSearch = true;
+    try {
+      while (left) {
+        const size = Math.min(left, chunk.length);
+        input.emit("data", chunk.slice(0, size));
+        left -= size;
+      }
+    } finally { checkingSearch = false; }
+  };
+  try {
+    feedAtBound("雪");
+    expect(output).toEqual([]);
+    expect(calls).toEqual([]);
+    input.emit("data", "\n");
+    await tick();
+    expect(output).toEqual([{ jsonrpc: "2.0", id: "雪", result: {} }]);
+    expect(calls).toEqual([{ id: "雪" }]);
+
+    feedAtBound("oversized");
+    expect(output).toHaveLength(1);
+    input.emit("data", " ");
+    const invalid = { jsonrpc: "2.0", id: null, error: { code: -32600, message: "Invalid Request" } };
+    expect(output).toEqual([{ jsonrpc: "2.0", id: "雪", result: {} }, invalid]);
+    input.emit("data", chunk);
+    input.emit("data", '{"jsonrpc":"2.0","id":"discarded","method":"run"}');
+    expect(output).toHaveLength(2);
+    expect(calls).toEqual([{ id: "雪" }]);
+    input.emit("data", '\n{"jsonrpc":"2.0","id":"after","method":"run","params":{}}\n');
+    await tick();
+    expect(output.at(-1)).toEqual({ jsonrpc: "2.0", id: "after", result: {} });
+    expect(calls).toEqual([{ id: "雪" }, {}]);
+    // The bound precedes JSON parsing for an oversized row arriving with its newline too.
+    input.emit("data", "x".repeat(bound + 1) + "\n");
+    expect(output).toHaveLength(4);
+    expect(output.at(-1)).toEqual(invalid);
+    expect(calls).toHaveLength(2);
+    expect(searched).toBeLessThanOrEqual(2 * bound);
+  } finally {
+    String.prototype.indexOf = originalIndexOf;
+    input.end();
+    await peer.done;
+  }
+});
+
 test("the ACP peer applies the closed decode table in its precedence, answering parse, envelope, method and params errors with the stated id, refusing malformed response shapes, emitting nothing for blank lines, ignored notifications and well-formed responses, and decoding a torn row only at its newline, so a partial-row decoder fails", async () => {
   const input = new PassThrough();
   const output: any[] = [];

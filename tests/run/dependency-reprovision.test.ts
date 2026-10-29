@@ -104,8 +104,37 @@ test("test: an attempt that edits its manifest's files list, scripts or version 
   }
 }, 90_000);
 
-test("test: the install command pins each registry dependency to the version the attempt lockfile records, keeps file, relative, git, tarball, link and workspace specs as the closed spec table rules, falls back to the manifest spec without a lock entry and never tells npm to ignore the lockfile, so a range install fails", () => {
+test("the install command pins a registry dependency or an alias to its locked version only when that version satisfies the manifest spec under every lockfile version and installs the manifest spec otherwise, so a stale pin fails", () => {
   const cwd = makeTestTempDir("dependency-specs-");
+  // Queue row 290 / D-2173 add.2: literal npm 11 / loose semver 7.8.5 answers.
+  const registryCases = [
+    ["^2.0.0", "1.4.0", "^2.0.0"], ["~1.2.0", "1.3.0", "~1.2.0"],
+    ["2.x", "1.9.0", "2.x"], [">=1.2.0 <2", "2.0.0", ">=1.2.0 <2"],
+    ["^3 || ^4", "2.1.0", "^3 || ^4"], ["^1.0.0", "1.5.0-beta.1", "^1.0.0"],
+    ["* || ^2.0.0-beta.0", "2.0.0-beta.1", "* || ^2.0.0-beta.0"],
+    [">=1.0.0-1alpha", "1.0.0-9007199254740992", ">=1.0.0-1alpha"],
+    ["^1.2.3.4", "1.4.0", "^1.2.3.4"],
+    ["^1.0.0", "git+https://example.invalid/repo.git#main", "^1.0.0"],
+    ["^1.0.0", "1.5.0", "1.5.0"], ["~1.2.0", "1.2.9", "1.2.9"],
+    ["*", "1.5.0-beta.1", "1.5.0-beta.1"], ["latest", "1.2.9", "1.2.9"],
+    ["1.2.3.4", "1.2.9", "1.2.9"], ["^2.0.0-beta.0", "2.0.0-beta.1", "2.0.0-beta.1"],
+    ["v1.4.0", "1.4.0", "1.4.0"], [">= 1.2.0", "1.2.9", "1.2.9"],
+    ["~>1.2", "1.2.9", "1.2.9"],
+  ];
+  const aliasCases = [
+    ["npm:real@^2", "1.4.0", "npm:real@^2"],
+    ["npm:@scope/real@~1.2", "1.3.0", "npm:@scope/real@~1.2"],
+    ["npm:real@1.0.0", "1.4.0", "npm:real@1.0.0"],
+    ["npm:real@* || ^2.0.0-beta.0", "2.0.0-beta.1", "npm:real@* || ^2.0.0-beta.0"],
+    ["npm:real@>=1.0.0-1alpha", "1.0.0-9007199254740992", "npm:real@>=1.0.0-1alpha"],
+    ["npm:@scope/real@^2", "2.3.4", "npm:@scope/real@2.3.4"],
+    ["npm:real@latest", "1.4.0", "npm:real@1.4.0"],
+    ["npm:real", "1.4.0-beta.1", "npm:real@1.4.0-beta.1"],
+    ["npm:@scope/real", "1.4.0-beta.1", "npm:@scope/real@1.4.0-beta.1"],
+    ["npm:real@", "1.4.0-beta.1", "npm:real@1.4.0-beta.1"],
+    ["npm:real@^2.0.0-beta.0", "2.0.0-beta.1", "npm:real@2.0.0-beta.1"],
+    ["npm:real@^1", "git+https://example.invalid/repo.git#main", "npm:real@^1"],
+  ];
   writeJson(cwd, "package.json", {
     peerDependencies: { peer: "^1", duplicate: "peer-range" },
     devDependencies: { dev: "latest", duplicate: "dev-range" },
@@ -115,22 +144,33 @@ test("test: the install command pins each registry dependency to the version the
       git: "git+https://example.invalid/repo.git#main", shorthand: "owner/repo#main",
       tarball: "https://example.invalid/pkg.tgz", link: "link:./linked", workspace: "workspace:*",
       missing: "~9.0.0", missingAlias: "npm:real@latest", duplicate: "regular-range",
+      ...Object.fromEntries(registryCases.map(([spec], i) => [`registry-${i}`, spec])),
+      ...Object.fromEntries(aliasCases.map(([spec], i) => [`alias-${i}`, spec])),
     },
     optionalDependencies: { optional: "*", duplicate: "optional-range" },
   });
   const locked = Object.fromEntries(["peer", "dev", "range", "exact", "@scope/pkg", "optional", "duplicate",
     "folder", "relative", "dot", "absolute", "git", "shorthand", "tarball", "link", "workspace",
   ].map((name) => [name, { version: "4.4.3" }]));
+  Object.assign(locked, Object.fromEntries(registryCases.map(([, version], i) => [`registry-${i}`, { version }])));
   const expected = [
-    "peer@4.4.3", "duplicate@4.4.3", "dev@4.4.3", "range@4.4.3", "exact@4.4.3", "@scope/pkg@4.4.3",
+    "peer@^1", "duplicate@4.4.3", "dev@4.4.3", "range@4.4.3", "exact@1.0.0", "@scope/pkg@4.4.3",
     "alias@npm:@scope/real@2.3.4", `folder@file:${resolve(cwd, "a folder")}`, `relative@${resolve(cwd, "../relative")}`,
     `dot@${resolve(cwd, "dot")}`, "absolute@/tmp/absolute", "git@git+https://example.invalid/repo.git#main",
     "shorthand@owner/repo#main", "tarball@https://example.invalid/pkg.tgz", "link@link:./linked", "workspace@workspace:*",
-    "missing@~9.0.0", "missingAlias@npm:real@latest", "optional@4.4.3",
+    "missing@~9.0.0", "missingAlias@npm:real@latest",
+    ...registryCases.map(([, , installed], i) => `registry-${i}@${installed}`),
+    ...aliasCases.map(([, , installed], i) => `alias-${i}@${installed}`), "optional@4.4.3",
   ];
   for (const lockfileVersion of [1, 2, 3]) {
     const entries = { ...locked, alias: lockfileVersion === 1
-      ? { version: "npm:@scope/real@2.3.4" } : { name: "@scope/real", version: "2.3.4" } };
+      ? { version: "npm:@scope/real@2.3.4" } : { name: "@scope/real", version: "2.3.4" },
+      ...Object.fromEntries(aliasCases.map(([spec, version], i) => {
+        const alias = spec.slice(4), separator = alias.lastIndexOf("@");
+        const target = separator > 0 ? alias.slice(0, separator) : alias;
+        return [`alias-${i}`, lockfileVersion === 1 ? { version: `npm:${target}@${version}` } : { version }];
+      })),
+    };
     writeJson(cwd, "package-lock.json", lockfileVersion === 1
       ? { lockfileVersion, dependencies: entries }
       : { lockfileVersion, packages: Object.fromEntries(Object.entries(entries).map(([name, entry]) => [`node_modules/${name}`, entry])),
@@ -142,7 +182,9 @@ test("test: the install command pins each registry dependency to the version the
   expect(npmDependencyInstallCommand(cwd)).toContain(shq("range@4.5.0"));
   expect(npmDependencyInstallCommand(cwd)).toContain(shq("dev@latest"));
   writeJson(cwd, "npm-shrinkwrap.json", { lockfileVersion: 1, dependencies: { alias: { version: "npm:other@8.0.0" } } });
-  expect(npmDependencyInstallCommand(cwd)).toContain(shq("alias@npm:other@8.0.0"));
+  expect(npmDependencyInstallCommand(cwd)).toContain(shq("alias@npm:@scope/real@^2"));
+  writeJson(cwd, "npm-shrinkwrap.json", { lockfileVersion: 1, dependencies: { alias: { version: "npm:other@2.5.0" } } });
+  expect(npmDependencyInstallCommand(cwd)).toContain(shq("alias@npm:other@2.5.0"));
 });
 
 test("test: an attempt whose lockfile is present but unreadable fails before its gates with a dependency install failure naming that lockfile, while an attempt with no lockfile installs its manifest specs, so an unreadable lockfile read as an absent one fails", async () => {

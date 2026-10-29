@@ -110,6 +110,29 @@ export function baselineCachePath(cwd: string, baseSha: string, commands: Record
 const verdictlessCommands = (baseline: Baseline, commands: Record<string, string>): string[] =>
   Object.keys(commands).filter((name) => baseline.commands[name]?.exitCode === undefined);
 
+/** Timing can cross bases and lockfiles; forgiveness cannot. Match the command subset and runner
+ * hashes, then take each command's newest capture or verdictless marker by publication time. */
+function capturePriors(cachePath: string, names: string[]): Record<string, unknown> {
+  const dir = dirname(cachePath);
+  const suffix = cachePath.slice(cachePath.lastIndexOf("-", cachePath.lastIndexOf("-") - 1));
+  const candidates = readdirSync(dir).filter(file => file.startsWith("baseline-")
+    && (file.endsWith(suffix) || file.endsWith(`${suffix}.verdictless`))).flatMap(file => {
+    try { return [{ file, modified: statSync(join(dir, file)).mtimeMs }]; } catch { return []; }
+  }).sort((a, b) => b.modified - a.modified || b.file.localeCompare(a.file));
+  const priors: Record<string, unknown> = {};
+  for (const { file } of candidates) {
+    try {
+      const record = JSON.parse(readFileSync(join(dir, file), "utf8"));
+      const measurements = file.endsWith(".verdictless") ? record?.measurements : record?.commands;
+      if (!measurements || typeof measurements !== "object") continue;
+      for (const name of names) {
+        if (!Object.hasOwn(priors, name) && Object.hasOwn(measurements, name)) priors[name] = measurements[name];
+      }
+    } catch { /* A torn or removed cache entry supplies no measurement. */ }
+  }
+  return priors;
+}
+
 export function excludeAuthorProvider(channels: BillingChannel[], author: BillingChannel): BillingChannel[] {
   const provider = modelProvider(author.model, author.vendor);
   return [author, ...channels.filter((candidate) => candidate !== author && modelProvider(candidate.model, candidate.vendor) !== provider)];
@@ -415,6 +438,7 @@ export async function verify(argv: string[], cwd = process.cwd(), options: { evi
     const cachePath = baselineCachePath(cwd, mergeBase, subset);
     const verdictlessMarker = `${cachePath}.verdictless`;
     mkdirSync(dirname(cachePath), { recursive: true });
+    const priors = capturePriors(cachePath, names);
     let cached: Baseline | undefined;
     if (existsSync(cachePath)) {
       try {
@@ -452,11 +476,14 @@ export async function verify(argv: string[], cwd = process.cwd(), options: { evi
       const added = await addDetachedWorktree(cwd, baseDir, mergeBase);
       if (added.code !== 0) throw new Error(`command failed (${added.code}): git worktree add --detach '${baseDir}' '${mergeBase}'\n${added.stderr || added.stdout}`);
       linkNodeModules(cwd, baseDir, { force: true });
-      const baseline = await captureBaseline(baseDir, subset);
+      const baseline = await captureBaseline(baseDir, subset, { priors });
       if (baseline.refusal) return baseline;
       const missing = verdictlessCommands(baseline, subset);
       if (missing.length) {
-        writeFileSync(verdictlessMarker, JSON.stringify({ base: mergeBase, commands: missing }) + "\n");
+        const measurements = Object.fromEntries(missing.map(name => [name, {
+          durationMs: baseline.commands[name]?.durationMs, ceilingMs: baseline.commands[name]?.ceilingMs,
+        }]));
+        writeFileSync(verdictlessMarker, JSON.stringify({ base: mergeBase, commands: missing, measurements }) + "\n");
         rmSync(cachePath, { force: true });
       } else {
         writeFileSync(cachePath, JSON.stringify(baseline, null, 2));

@@ -155,8 +155,7 @@ replaces the two-tier setup.
   Start the wait as a background task whose exit wakes this session, on journal lines after a baseline
   taken at arm time and on the lock holder's death:
   `tickmarkr wait <runId>` (background task; exits: 0 = run end, 3 = park, 4 = failed task, 5 = daemon death, 6 = timeout). Re-arm with `tickmarkr wait <runId> --after <line>`, where `<line>` is the journal line reported by the waiter.
-  (`<journal>` is `<state-dir>/runs/<runId>/journal.jsonl`, `<pid>` the lock pid). On every wake read
-  CURRENT `tickmarkr status <runId>` first, then re-arm.
+  On every wake read CURRENT `tickmarkr status <runId>` first, then re-arm.
 - **Optional Claude plugin:** `claude plugin install tickmarkr --marketplace alzahrani-khalid/tickmarkr`;
   in Claude Desktop: Plugins → Add marketplace (`alzahrani-khalid/tickmarkr`) → Add plugin
   (`tickmarkr`). It adds the `/tickmarkr-board` pane and the session-start waiter.

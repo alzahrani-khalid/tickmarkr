@@ -4,7 +4,7 @@ import { isAbsolute } from "node:path";
 import type { Readable } from "node:stream";
 import { AcpError, createAcpPeer, isObject } from "./peer.js";
 import { attach, finalMessage, type AttachSession } from "./attach.js";
-import { listRuns } from "../run/runs-list.js";
+import { listRunIds, listRuns } from "../run/runs-list.js";
 import { launchDaemon, runCli } from "../run/launch.js";
 import { runLockOwner } from "../run/lock.js";
 import { statusSnapshot } from "../cli/commands/status-snapshot.js";
@@ -74,7 +74,7 @@ export function createAcpAgent(options: {
   const selectedRun = (session: Session) => {
     if (session.runId) return session.runId;
     const owner = runLockOwner(session.cwd);
-    return (owner?.live ? owner.runId : undefined) ?? listRuns(session.cwd)[0]?.runId;
+    return (owner?.live ? owner.runId : undefined) ?? listRunIds(session.cwd)[0];
   };
   // Peer responses are written in a microtask. Defer lifecycle updates to the next turn so
   // the answer always precedes commands and replay, even for an already-ended run.
@@ -137,7 +137,7 @@ export function createAcpAgent(options: {
       "session/resume"(params) {
         if (!isObject(params) || typeof params.sessionId !== "string" || typeof params.cwd !== "string" || !isAbsolute(params.cwd)
           || (params.mcpServers !== undefined && !Array.isArray(params.mcpServers))) return invalid();
-        const isRun = listRuns(params.cwd).some(run => run.runId === params.sessionId);
+        const isRun = listRunIds(params.cwd).includes(params.sessionId);
         if (!isRun && !consoleId.test(params.sessionId)) throw new AcpError(-32002, "Session not found");
         const previous = sessions.get(params.sessionId);
         if (previous?.turn) throw new AcpError(-32600, "Session has an active turn");
@@ -163,7 +163,8 @@ export function createAcpAgent(options: {
           // Yield so cancellation in the same input batch can end this running turn.
           await new Promise<void>((resolve) => setImmediate(resolve));
           if (turn.signal.aborted) return { stopReason: "cancelled" };
-          const words = text.trim().split(/\s+/u);
+          const trimmed = text.trim();
+          const words = trimmed.split(/\s+/u);
           const message = (text: string) => send(sessionId, { sessionUpdate: "agent_message_chunk",
             content: { type: "text", text: text.split("\n").map(visibleControls).join("\n") } });
           if (words[0] === "/run" || words[0] === "/resume") {
@@ -193,8 +194,8 @@ export function createAcpAgent(options: {
           if (words[0] === "/status") {
             if (words.length > 2 || words[1]?.startsWith("-")) message("Usage: /status [run]");
             else {
-              const runId = words[1] ?? selectedRun(session);
               try {
+                const runId = words[1] ?? selectedRun(session);
                 if (!runId) throw new Error("No journalled run.");
                 const state = statusSnapshot(session.cwd, runId);
                 message([`Run: ${state.runId}`, `Lifecycle: ${state.lifecycle}`, `Daemon: ${state.daemon}`, finalMessage(state),
@@ -205,12 +206,15 @@ export function createAcpAgent(options: {
           }
           if (words[0] === "/compile" || words[0] === "/plan") {
             const command = words[0].slice(1);
-            if (words.length !== (command === "compile" ? 2 : 1) || words.slice(1).some(word => word.startsWith("-"))) {
+            let spec = trimmed.slice(words[0].length).trim();
+            // Remove only one surrounding pair, then validate the path that will be passed verbatim.
+            if (spec.length >= 2 && (spec[0] === '"' || spec[0] === "'") && spec.at(-1) === spec[0]) spec = spec.slice(1, -1);
+            if (command === "compile" ? !spec || spec.startsWith("-") || /[\x00-\x1f\x7f]/u.test(spec) : words.length !== 1) {
               message(`Usage: /${command}${command === "compile" ? " <spec>" : ""}`);
             } else {
               const check = await runCli(session.cwd, ["version", "--check"], env, turn.signal);
               if (turn.signal.aborted) return { stopReason: "cancelled" };
-              const result = check.exitCode === 0 ? await runCli(session.cwd, [command, ...words.slice(1)], env, turn.signal) : check;
+              const result = check.exitCode === 0 ? await runCli(session.cwd, [command, ...(command === "compile" ? [spec] : [])], env, turn.signal) : check;
               if (turn.signal.aborted) return { stopReason: "cancelled" };
               send(sessionId, { sessionUpdate: "agent_message_chunk", content: { type: "text",
                 text: `${check.exitCode === 0 ? command : "version --check"} exited ${result.exitCode}\n${preformatted(result.output)}` } });
@@ -220,9 +224,15 @@ export function createAcpAgent(options: {
           const command = /^\/attach(?:\s+(\S+))?\s*$/u.exec(text.trim());
           if (command || (session.runId && !text.trim().startsWith("/"))) {
             // An explicit attachment selects this turn's run without changing its binding.
-            const runId = command?.[1] ?? selectedRun(session);
-            return await attach({ cwd: session.cwd, runId, signal: turn.signal, session,
-              send: update => send(sessionId, update) });
+            try {
+              const runId = command?.[1] ?? selectedRun(session);
+              return await attach({ cwd: session.cwd, runId, signal: turn.signal, session,
+                send: update => send(sessionId, update) });
+            } catch (fault) {
+              if (turn.signal.aborted) return { stopReason: "cancelled" };
+              message(finalMessage(undefined, `unreadable journal: ${fault instanceof Error ? fault.message : String(fault)}`));
+              return { stopReason: "end_turn" };
+            }
           }
           const reply = await (options.reply?.(session.cwd, text, turn.signal)
             ?? `Session directory: ${session.cwd}\nCommands: /attach [run], /status [run], /compile <spec>, /plan, /run, /resume <run id>, initialize, session/new, session/list, session/resume, session/close, session/prompt, session/cancel.`);

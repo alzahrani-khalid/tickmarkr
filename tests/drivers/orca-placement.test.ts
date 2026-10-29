@@ -219,7 +219,7 @@ describe("OrcaDriver placement, laziness and owned-title reconcile", () => {
     // The terminal is created ON the tracked clone with the command cd'ed into the checkout, and the
     // receipt binds it to the clone; identity is the handle plus the owned tab title.
     expect(fake.calls.find((call) => call[1] === "create")).toEqual([
-      "terminal", "create", "--worktree", `path:${clone}`, "--title", slot.name, "--command", inCheckout(checkout, `${herdrSealShellPrefix().split(";")[0]}; unset ${HOST_SESSION_VARS.join(" ")}; pwd`), "--json",
+      "terminal", "create", "--worktree", `path:${clone}`, "--title", slot.name, "--command", inCheckout(checkout, `${herdrSealShellPrefix().split(";")[0]}; unset ${HOST_SESSION_VARS.join(" ")} TICKMARKR_SEAT; pwd`), "--json",
     ]);
     expect(fake.last()).toMatchObject({ worktree: clone, title: slot.name });
     // …and the command really ran INSIDE the checkout: the wrapper shell printed the checkout path.
@@ -529,8 +529,8 @@ describe("OrcaDriver placement, laziness and owned-title reconcile", () => {
     // Each create NAMES its own checkout outright — `path:<abs>`, never an ambient selector.
     const creates = fake.calls.filter((c) => c[1] === "create");
     expect(creates).toEqual([
-      ["terminal", "create", "--worktree", `path:${WT_A}`, "--title", TITLE_A, "--command", inCheckout(WT_A, `${herdrSealShellPrefix().split(";")[0]}; unset ${HOST_SESSION_VARS.join(" ")}; run-a`), "--json"],
-      ["terminal", "create", "--worktree", `path:${WT_B}`, "--title", TITLE_B, "--command", inCheckout(WT_B, `${herdrSealShellPrefix().split(";")[0]}; unset ${HOST_SESSION_VARS.join(" ")}; run-b`), "--json"],
+      ["terminal", "create", "--worktree", `path:${WT_A}`, "--title", TITLE_A, "--command", inCheckout(WT_A, `${herdrSealShellPrefix().split(";")[0]}; unset ${HOST_SESSION_VARS.join(" ")} TICKMARKR_SEAT; run-a`), "--json"],
+      ["terminal", "create", "--worktree", `path:${WT_B}`, "--title", TITLE_B, "--command", inCheckout(WT_B, `${herdrSealShellPrefix().split(";")[0]}; unset ${HOST_SESSION_VARS.join(" ")} TICKMARKR_SEAT; run-b`), "--json"],
     ]);
     // …and asking is not getting: the RECEIPTS bind to those same two distinct checkouts, which is
     // what the driver checked before it kept either handle.
@@ -587,7 +587,7 @@ describe("OrcaDriver placement, laziness and owned-title reconcile", () => {
     await driver.run(slot, "bash -lc 'first'");
     expect(fake.countOf("create")).toBe(1);
     expect(fake.calls.find((c) => c[1] === "create")).toEqual(
-      ["terminal", "create", "--worktree", `path:${WT_A}`, "--title", TITLE_A, "--command", inCheckout(WT_A, `${herdrSealShellPrefix().split(";")[0]}; unset ${HOST_SESSION_VARS.join(" ")}; bash -lc 'first'`), "--json"],
+      ["terminal", "create", "--worktree", `path:${WT_A}`, "--title", TITLE_A, "--command", inCheckout(WT_A, `${herdrSealShellPrefix().split(";")[0]}; unset ${HOST_SESSION_VARS.join(" ")} TICKMARKR_SEAT; bash -lc 'first'`), "--json"],
     );
     expect(fake.countOf("send")).toBe(0);
     const handle = fake.last()!.handle;

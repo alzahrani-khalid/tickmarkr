@@ -103,10 +103,12 @@ test("Cite the replaced watcher line in each of the three plain-host sections, v
   // that line masked; removing the new plugin bullet must restore every other byte, including
   // both host scopes, preflight, the green rule and the general blocking-consumer guidance.
   // Queue row 286: refresh the pins for the three verify author lines, retaining them in the hash.
+  // Queue row 294: the journal-and-lock-pid parenthetical is gone and the wake line stays,
+  // so the pins move with that deletion.
   const baseline = {
-    loop: "dfabc46376f92a73d6c4acb850d9b6c999d6f3b17d8d275751d5ecaedc84d7be",
-    auto: "b841b9d2add68395c767f0b8c439712af2bd7175ab6861e79ef01c3abbb51e21",
-    overseer: "010286eadf2bdf19f8134ebff98647493a88d3d90f98256880bda58c66945ef6",
+    loop: "efa8c2dab37d07cc799515cd5443382cd74769c346c9e72ee92bb47a7689b44c",
+    auto: "372f943c515dfa7b6cfdeb06833d8e23314a9981b9cd81491419d56747f1d2d0",
+    overseer: "6da3d0f0a1eee1e3a20e8b8d1079f84e8ea16253a9ae155fda4a17d3efebc958",
   };
   for (const name of SKILLS) {
     const markdown = readSkill(name);

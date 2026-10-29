@@ -1,7 +1,8 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { once } from "node:events";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import fs, { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { pathToFileURL } from "node:url";
@@ -71,9 +72,123 @@ function rpc(write: (line: string) => void) {
 const messages = (rows: any[]) => rows.filter(row => row.params?.update?.sessionUpdate === "agent_message_chunk").map(row => row.params.update.content.text);
 const advertised = (rows: any[]) => rows.filter(row => row.params?.update?.sessionUpdate === "available_commands_update");
 
-test("compile and plan run the version check first and stop on its non-zero exit, take exactly their arguments with no flag, and each child gets the same node, loader flags and entry with every denylist name removed and look-alikes byte-equal whatever environment the helper is handed, so a trusted environment fails", async () => {
+async function withCommandSession(cwd: string, recorder: ReturnType<typeof recordingEntry>,
+  check: (prompt: (text: string) => Promise<string>) => Promise<void>) {
+  const originalEntry = process.argv[1];
+  process.argv[1] = recorder.entry;
+  const input = new PassThrough();
+  const a = rpc(line => { input.write(line); });
+  const peer = createAcpAgent({ input, write: a.receive, env: { ...process.env, ACP_CHILD_RECORD: recorder.log } });
+  try {
+    await a.request("initialize", { protocolVersion: 1 });
+    const sessionId = (await a.request("session/new", { cwd, mcpServers: [] })).result.sessionId;
+    await tick();
+    await check(async text => {
+      const before = a.output.length;
+      expect((await a.request("session/prompt", { sessionId, prompt: [{ type: "text", text }] })).result.stopReason).toBe("end_turn");
+      const result = messages(a.output.slice(before));
+      expect(result).toHaveLength(1);
+      return result[0];
+    });
+  } finally {
+    input.end();
+    try { await peer.done; } finally { process.argv[1] = originalEntry; }
+  }
+}
+
+test("compile passes the rest of its line as one verbatim argument after removing one matching pair of surrounding quotes, so a split or shell-parsed path fails", async () => {
   const recorder = recordingEntry();
-  const cwd = makeRepo({ "work.txt": "base\n", "spec.md": "<!-- tickmarkr:spec -->\n## T1: Work\n- goal: Work\n- files: work.txt\n- acceptance:\n  - done\n" });
+  const cwd = makeRepo({ "work.txt": "base\n" });
+  const cases = [
+    ["/compile my spec.md", "my spec.md"],
+    ["  /compile   my  spec.md   ", "my  spec.md"],
+    ['/compile "my spec.md"', "my spec.md"],
+    ["/compile 'my spec.md'", "my spec.md"],
+    ["/compile spec.md extra", "spec.md extra"],
+    ["/compile spec.md --type gsd", "spec.md --type gsd"],
+    ["/compile a; touch PWNED", "a; touch PWNED"],
+    ['/compile "a" "b"', 'a" "b'],
+    ['/compile "unbalanced', '"unbalanced'],
+    ["/compile 'unbalanced", "'unbalanced"],
+    ['/compile ""my spec.md""', '"my spec.md"'],
+    ['/compile " my spec.md "', " my spec.md "],
+    ["/compile ' -x'", " -x"],
+    ["/compile '\"\"'", '""'],
+  ];
+  await withCommandSession(cwd, recorder, async prompt => {
+    for (const [text, path] of cases) {
+      const before = recorder.records().length;
+      expect(await prompt(text), text).toMatch(/^compile exited 1\n/u);
+      expect(recorder.records().slice(before).map(row => row.args), text).toEqual([["version", "--check"], ["compile", path]]);
+      expect(existsSync(join(cwd, "PWNED"))).toBe(false);
+    }
+    const before = recorder.records().length;
+    for (const text of ["/compilex my spec.md", "/Compile my spec.md", '/compile"my spec.md"']) {
+      expect(await prompt(text)).toContain("Session directory:");
+    }
+    expect(recorder.records()).toHaveLength(before);
+  });
+});
+
+test("compile answers usage and spawns nothing for an empty path, a dash first after unquoting or a control character, so a quoted flag reaching the command line fails", async () => {
+  const recorder = recordingEntry();
+  const cwd = makeRepo({ "work.txt": "base\n" });
+  const controls = Array.from({ length: 32 }, (_, code) => String.fromCharCode(code)).concat("\x7f");
+  const cases = ["/compile", "/compile   ", '/compile ""', "/compile ''", "/compile -x", "/compile --type gsd x",
+    '/compile "-x"', "/compile '-x'", '/compile "--type gsd x"', "/compile a\nsecond line", "/compile a\tb",
+    ...controls.flatMap(control => [`/compile a${control}b`, `/compile "a${control}b"`, `/compile '${control}a'`, `/compile 'a${control}'`])];
+  await withCommandSession(cwd, recorder, async prompt => {
+    for (const text of cases) {
+      expect(await prompt(text), JSON.stringify(text)).toBe("Usage: /compile <spec>\n\n");
+      expect(recorder.records(), JSON.stringify(text)).toEqual([]);
+    }
+  });
+});
+
+test("status and attach over an unreadable runs folder each answer one in-band message that ends the turn instead of an RPC error, so a selection outside their boundaries fails", async () => {
+  const cwd = makeRepo({ "work.txt": "base\n" });
+  saveGraph(cwd, validateGraph({ version: 1, spec: { source: "native", paths: ["spec.md"], hash: "unreadable" }, tasks: [T("T1")] }));
+  const runs = join(cwd, ".tickmarkr/runs");
+  mkdirSync(runs);
+  const read = fs.readdirSync;
+  const spy = vi.spyOn(fs, "readdirSync").mockImplementation((...args) => {
+    if (String(args[0]) === runs) throw Object.assign(new Error("unreadable runs sentinel"), { code: "EACCES" });
+    return read(...args);
+  });
+  syncBuiltinESMExports();
+  const input = new PassThrough();
+  const a = rpc(line => { input.write(line); });
+  const diagnostics: string[] = [];
+  const peer = createAcpAgent({ input, write: a.receive, stderr: text => diagnostics.push(text) });
+  try {
+    await a.request("initialize", { protocolVersion: 1 });
+    const sessionId = (await a.request("session/new", { cwd, mcpServers: [] })).result.sessionId;
+    await tick();
+    for (const text of ["/status", "/attach", "/status", "/attach"]) {
+      const before = a.output.length;
+      const response = await a.request("session/prompt", { sessionId, prompt: [{ type: "text", text }] });
+      expect(response).toMatchObject({ result: { stopReason: "end_turn" } });
+      expect(response.error).toBeUndefined();
+      const rows = a.output.slice(before);
+      expect(rows).toHaveLength(2);
+      expect(messages(rows)).toEqual([text === "/status"
+        ? "Status unavailable: unreadable runs sentinel\n\n"
+        : finalMessage(undefined, "unreadable journal: unreadable runs sentinel") + "\n\n"]);
+      expect(rows[0].params.update.sessionUpdate).toBe("agent_message_chunk");
+      expect(rows[1]).toBe(response);
+    }
+    expect(diagnostics).toEqual([]);
+  } finally {
+    spy.mockRestore();
+    syncBuiltinESMExports();
+    input.end();
+    await peer.done;
+  }
+});
+
+test("compile and plan run the version check and stop on its non-zero exit, compile taking the rest of its line as one path and plan none, and each child gets the same node, loader flags and entry with every denylist name removed and look-alikes byte-equal, so a trusted environment fails", async () => {
+  const recorder = recordingEntry();
+  const cwd = makeRepo({ "work.txt": "base\n", "my spec.md": "<!-- tickmarkr:spec -->\n## T1: Work\n- goal: Work\n- files: work.txt\n- acceptance:\n  - done\n" });
   mkdirSync(join(cwd, ".tickmarkr"));
   writeFileSync(join(cwd, ".tickmarkr/doctor.json"), "{}"); // an empty cached fleet: no agent is invoked
   writeFileSync(join(cwd, ".tickmarkr/config.yaml"), "driver: subprocess\n");
@@ -101,25 +216,26 @@ test("compile and plan run the version check first and stop on its non-zero exit
       expect(result).toHaveLength(1);
       return result[0];
     };
-    for (const text of ["/compile", "/compile --type gsd x", "/compile spec.md extra", "/compile --help", "/compile -x", "/plan x", "/plan --help"]) expect(await prompt(text)).toMatch(/^Usage:/u);
+    for (const text of ["/compile", "/compile --type gsd x", "/compile --help", "/compile -x", "/plan x", "/plan --help"]) expect(await prompt(text)).toMatch(/^Usage:/u);
     expect(recorder.records()).toEqual([]);
-    expect(await prompt("/compile spec.md")).toContain("compile exited 0");
+    expect(await prompt('/compile "my spec.md"')).toContain("compile exited 0");
     expect(existsSync(join(cwd, ".tickmarkr/graph.json"))).toBe(true);
     const plan = await prompt("/plan");
     expect(plan).toContain("plan exited 0");
     expect(plan).toMatch(/^plan exited 0\n(`{3,})text\n[\s\S]*\n\1\n\n$/u);
     expect(plan).toMatch(/unroutable|no .*channel/iu);
-    expect(recorder.records().map(row => row.args)).toEqual([["version", "--check"], ["compile", "spec.md"], ["version", "--check"], ["plan"]]);
+    expect(await prompt("/compile spec.md extra")).toContain("compile exited 1");
+    expect(recorder.records().map(row => row.args)).toEqual([["version", "--check"], ["compile", "my spec.md"], ["version", "--check"], ["plan"], ["version", "--check"], ["compile", "spec.md extra"]]);
     rmSync(join(cwd, ".tickmarkr/graph.json"));
     writeFileSync(join(cwd, "package.json"), JSON.stringify({ name: "tickmarkr", version: "0.0.0-stale" }));
-    for (const text of ["/compile spec.md", "/plan"]) {
+    for (const text of ["/compile spec.md extra", "/plan"]) {
       const failure = await prompt(text);
       expect(failure).toContain("version --check exited 1");
       expect(failure).toContain("versions differ");
       expect(existsSync(join(cwd, ".tickmarkr/graph.json"))).toBe(false);
     }
     const records = recorder.records();
-    expect(records.slice(4).map(row => row.args)).toEqual([["version", "--check"], ["version", "--check"]]);
+    expect(records.slice(6).map(row => row.args)).toEqual([["version", "--check"], ["version", "--check"]]);
     for (const row of records) {
       expect(row).toMatchObject({ execPath: process.execPath, execArgv: flags, entry: recorder.entry, stdin: "" });
       for (const name of denied) expect(row.env[name], name).toEqual({ present: false });

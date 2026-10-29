@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
 import { expect, test } from "vitest";
-import { HOST_SESSION_VARS } from "../../src/drivers/host-env.js";
+import { HOST_SESSION_VARS, SEAT_MARKER_ENV } from "../../src/drivers/host-env.js";
 import { HerdrDriver } from "../../src/drivers/herdr.js";
 import { OrcaDriver } from "../../src/drivers/orca.js";
 import { HERDR_CONTROL_VARS, SubprocessDriver } from "../../src/drivers/subprocess.js";
@@ -97,12 +97,12 @@ test("a command run through the production shell seam from a parent environment 
   });
 });
 
-test("a subprocess driver worker child, a herdr worker seed executed by a shell and an Orca worker terminal's create command executed by a shell, each from that same parent environment, see none of the host-session names and every user variable byte-equal, the herdr seed still unsetting the five host control names and the Orca command still exporting the fork cap first, so a seal applied to one driver only or an Orca payload that unsets nothing fails", async () => {
+test("test: a subprocess worker child, a herdr worker seed and an Orca worker terminal's create command each run by a shell under an inherited seat marker see no marker, so an Orca terminal keeping it fails", async () => {
   const rec = recorder();
   const control: Record<string, string> = {
     HERDR_ENV: "1", HERDR_SOCKET_PATH: "/tmp/herdr.sock", ORCA_TERMINAL_HANDLE: "term-x", ORCA_PANE_KEY: "pane-x", ORCA_TAB_ID: "tab-x",
   };
-  await withParent({ ...control, HERDR_WORKSPACE_ID: "wHOST", HOME: rec.dir }, async () => {
+  await withParent({ ...control, HERDR_WORKSPACE_ID: "wHOST", HOME: rec.dir, [SEAT_MARKER_ENV]: "review" }, async () => {
     // Subprocess driver: the worker child itself.
     const subprocess = new SubprocessDriver();
     const slot = await subprocess.slot(rec.dir, "T1-worker-fake-a0-r");
@@ -146,14 +146,50 @@ esac
 
     const byName = Object.fromEntries(rec.records().map((r) => [r.name, r.env]));
     expect(Object.keys(byName).sort()).toEqual(["herdr", "orca", "subprocess"]);
-    for (const name of ["subprocess", "herdr", "orca"]) expectSealed(byName[name]!);
+    for (const name of ["subprocess", "herdr", "orca"]) {
+      expectSealed(byName[name]!);
+      expect(byName[name]![SEAT_MARKER_ENV], name).toBeUndefined();
+    }
     for (const k of HERDR_CONTROL_VARS) {
       expect(byName.subprocess![k], k).toBeUndefined();
       expect(byName.herdr![k], k).toBeUndefined();
       expect(seed).toContain(`unset ${k}`);
     }
     expect(byName.orca![FORK_CAP_ENV]).toBeDefined();
+    expect(process.env[SEAT_MARKER_ENV]).toBe("review");
     for (const k of GOAL_NAMES) expect(process.env[k], k).toBe(HOST[k]);
+  });
+});
+
+test("test: the Orca create command unsets the seat marker by exact name after its fork-cap export and keeps look-alike names byte-equal, so a pattern unset fails", async () => {
+  const rec = recorder();
+  const lookAlikes = Object.fromEntries([
+    "TICKMARKR_SEATS", "TICKMARKR_SEAT_EXTRA", "TICKMARKR_SEATBELT", "MY_TICKMARKR_SEAT", "tickmarkr_seat",
+  ].map((name) => [name, odd(name)]));
+  await withParent({ TICKMARKR_SEAT: "consult", ...lookAlikes, [FORK_CAP_ENV]: "7" }, async () => {
+    const fake = new FakeOrca({ trackedWorktrees: [rec.dir] });
+    const driver = new OrcaDriver({ exec: fake.exec, time: steppedTime() });
+    const slot = await driver.slot(rec.dir, "T1-worker-fake-a0-r");
+    try {
+      await driver.run(slot, rec.cmd("orca"));
+      const create = fake.calls.find((args) => args[1] === "create")!;
+      const command = create[create.indexOf("--command") + 1]!;
+      const exactUnset = `unset ${HOST_SESSION_VARS.join(" ")} TICKMARKR_SEAT; `;
+      const capAt = command.indexOf(`export ${FORK_CAP_ENV}=`);
+      expect(capAt).toBeGreaterThanOrEqual(0);
+      expect(command).toContain(exactUnset);
+      expect(command.indexOf(exactUnset)).toBeGreaterThan(capAt);
+      execFileSync("sh", ["-c", command], { cwd: rec.dir, env: process.env });
+      const [record] = rec.records();
+      expect(record?.name).toBe("orca");
+      expect(record!.env.TICKMARKR_SEAT).toBeUndefined();
+      expect(record!.env[FORK_CAP_ENV]).toBe("7");
+      expectSealed(record!.env, lookAlikes);
+      expect(process.env.TICKMARKR_SEAT).toBe("consult");
+      for (const [name, value] of Object.entries(lookAlikes)) expect(process.env[name], name).toBe(value);
+    } finally {
+      await driver.close(slot);
+    }
   });
 });
 

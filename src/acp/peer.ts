@@ -13,6 +13,7 @@ export const isObject = (value: unknown): value is Record<string, unknown> =>
   value !== null && typeof value === "object" && !Array.isArray(value);
 const validId = (value: unknown): value is RpcId =>
   value === null || typeof value === "string" || (typeof value === "number" && Number.isSafeInteger(value));
+const MAX_FRAME_CHARS = 64 * 1024 * 1024;
 
 /** A deliberately small, hand-rolled JSON-RPC peer. Only newline-terminated rows are messages. */
 export function createAcpPeer(options: {
@@ -83,14 +84,28 @@ export function createAcpPeer(options: {
   };
   const decoder = new StringDecoder("utf8");
   let tail = "";
+  let discarding = false;
   const done = new Promise<void>((resolve, reject) => {
     options.input.on("data", (chunk: Buffer | string) => {
-      tail += typeof chunk === "string" ? chunk : decoder.write(chunk);
-      let newline: number;
-      while ((newline = tail.indexOf("\n")) !== -1) {
-        const line = tail.slice(0, newline);
-        tail = tail.slice(newline + 1);
-        decode(line);
+      const text = typeof chunk === "string" ? chunk : decoder.write(chunk);
+      let start = 0;
+      while (start < text.length) {
+        // Search only this arrival; held text was already searched in earlier chunks.
+        const newline = text.indexOf("\n", start);
+        const end = newline === -1 ? text.length : newline;
+        if (!discarding) {
+          // Bound the row before appending or entering the closed decode table.
+          if (tail.length + end - start > MAX_FRAME_CHARS) {
+            tail = "";
+            discarding = true;
+            error(null, -32600, "Invalid Request");
+          } else tail += text.slice(start, end);
+        }
+        if (newline === -1) break;
+        if (!discarding) decode(tail);
+        tail = "";
+        discarding = false;
+        start = newline + 1;
       }
     });
     options.input.once("error", reject);

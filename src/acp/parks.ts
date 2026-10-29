@@ -5,8 +5,14 @@ import { parseBindingToken, physicalLine, visibleControls, type JournalEvent } f
 /** Turn-local presentation only. The snapshot admits commands; approve owns their enactment text. */
 export function createParkPresentation(cwd: string, runId: string, message: (text: string) => void) {
   const alerted = new Set<string>();
+  const opened = new Set<string>();
+  let firstSequence: number | undefined;
   let windowAfter: number | undefined;
-  const opening = (closesAt: string) => message(`Approval window closes at ${closesAt}: nothing is in flight, a task is parked, and every pending task waits transitively behind a park; a failed task does not prevent it. Approvals are swept again after expiry and before final close; the daemon owns the run until it exits.`);
+  const opening = (closesAt: string) => {
+    if (opened.has(closesAt)) return;
+    opened.add(closesAt);
+    message(`Approval window closes at ${closesAt}: nothing is in flight, a task is parked, and every pending task waits transitively behind a park; a failed task does not prevent it. Approvals are swept again after expiry and before final close; the daemon owns the run until it exits.`);
+  };
 
   return {
     render(state: StatusSnapshot): Map<string, string> {
@@ -30,10 +36,9 @@ export function createParkPresentation(cwd: string, runId: string, message: (tex
           ? [park.taskId, park.token] : [park.taskId, park.kind, park.reason]);
         if (!alerted.has(key)) { message(`${park.taskId}\n${block}`); alerted.add(key); }
       }
-      if (windowAfter === undefined) {
-        windowAfter = state.sequence;
-        if (state.approvalWindow) opening(state.approvalWindow.closesAt);
-      }
+      firstSequence ??= state.sequence;
+      windowAfter ??= firstSequence;
+      if (state.approvalWindow) opening(state.approvalWindow.closesAt);
       return blocks;
     },
 
@@ -42,7 +47,10 @@ export function createParkPresentation(cwd: string, runId: string, message: (tex
       if (windowAfter === undefined) return;
       for (const [index, row] of events.entries()) {
         const line = physicalLine(events, index);
-        if (line <= windowAfter || line > completeLines) continue;
+        if (line > completeLines) continue;
+        // Only the first snapshot's last row may be an incomplete opening. A lowered
+        // complete-line cursor must not revisit an earlier, already-closed window.
+        if (line <= windowAfter && !(line === firstSequence && row.event === "approval-window-start")) continue;
         if (row.event === "approval-window-start") {
           const ms = row.data.windowMs;
           const opens = Date.parse(row.ts);

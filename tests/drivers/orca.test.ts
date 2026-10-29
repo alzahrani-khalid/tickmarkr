@@ -142,7 +142,7 @@ describe("OrcaDriver", () => {
     // Production argv and the shim speak the real 1.4.186 contract, not an invented lookalike.
     expect(fake.calls.every((args) => args.at(-1) === "--json")).toBe(true);
     expect(fake.calls.find((args) => args[1] === "create")).toEqual([
-      "terminal", "create", "--worktree", `path:${WT}`, "--title", TITLE, "--command", inCheckout(WT, `${herdrSealShellPrefix().split(";")[0]}; unset ${HOST_SESSION_VARS.join(" ")}; bash`), "--json",
+      "terminal", "create", "--worktree", `path:${WT}`, "--title", TITLE, "--command", inCheckout(WT, `${herdrSealShellPrefix().split(";")[0]}; unset ${HOST_SESSION_VARS.join(" ")} TICKMARKR_SEAT; bash`), "--json",
     ]);
     expect(fake.calls.filter((args) => args[1] === "read" && !args.includes("--screen"))
       .every((args) => args.includes("--limit") && !args.includes("--lines"))).toBe(true);

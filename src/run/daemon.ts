@@ -2433,6 +2433,20 @@ async function sweepDeadRunWorktrees(repo: string, current: Journal): Promise<vo
   }
 }
 
+/** Run ids are time ordered, as in Journal.latestRunId. A missing or torn capture is no timing
+ * evidence; use the newest readable baseline, never its verdicts, to size the next measurement. */
+function newestCapturePriors(repoRoot: string, currentRunId: string): Record<string, unknown> | undefined {
+  const runs = join(tickmarkrDir(repoRoot), "runs");
+  if (!existsSync(runs)) return undefined;
+  for (const run of readdirSync(runs).filter(name => name.startsWith("run-") && name !== currentRunId).sort().reverse()) {
+    try {
+      const prior = JSON.parse(readFileSync(join(runs, run, "baseline.json"), "utf8"));
+      if (prior?.commands && typeof prior.commands === "object") return prior.commands;
+    } catch { /* An interrupted capture has no measurement yet. */ }
+  }
+  return undefined;
+}
+
 export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promise<RunSummary> {
   // OBS-1045: a daemon launched from inside a leased command (a nested runner, an operator's test
   // shell) inherits its ancestor's lease token through the environment, and every gate it ran would
@@ -3316,7 +3330,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           if (added.code !== 0) throw new Error(`baseline recapture: journaled base ${baseRef} cannot be checked out: ${added.stderr.trim()}`);
           if (!linkNodeModules(repoRoot, pristine, { force: true })) throw new Error("baseline recapture: pristine node_modules link could not be provisioned");
           await initializeHost();
-          const captured: Baseline = { ...await captureBaseline(pristine, commands),
+          const captured: Baseline = { ...await captureBaseline(pristine, commands, { priors: newestCapturePriors(repoRoot, runId) }),
             provenance: { baseRef, capturedAt: new Date().toISOString() } };
           writeFileSync(staged, JSON.stringify(captured, null, 2));
           renameSync(staged, baselinePath);
@@ -3348,7 +3362,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       if (emptyCapture) writeFileSync(join(journal.dir, "baseline.json"), JSON.stringify(emptyCapture, null, 2));
       await initializeHost();
       // OBS-1123: the capture's identity and publication time ride the measurement every forgiveness reads.
-      const captured: Baseline = { ...(emptyCapture ?? await captureBaseline(repoRoot, commands)),
+      const captured: Baseline = { ...(emptyCapture ?? await captureBaseline(repoRoot, commands, { priors: newestCapturePriors(repoRoot, runId) })),
         provenance: { baseRef, capturedAt: new Date().toISOString() } };
       writeFileSync(join(journal.dir, "baseline.json"), JSON.stringify(captured, null, 2));
       baseline = captured;

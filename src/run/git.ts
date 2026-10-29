@@ -14,6 +14,7 @@ import { tickmarkrDir } from "../graph/graph.js";
 import { ROUTING_ENV_SEAMS } from "../route/router.js";
 import { HOST_SESSION_VARS, SEAT_MARKER_ENV } from "../drivers/host-env.js";
 import { titleEnvironment } from "./title-environment.js";
+import { npmLockKeeps } from "./npm-range.js";
 import { assertGitTrust, GitTrustRefusal, ownGitPin, protectedGitEnv, trustedCommonDir, type DetachedAddCapability, type OwnGitCapability, type TrustedStoreCapability, type WorktreeRollback } from "./git-trust.js";
 
 export { ROUTING_ENV_SEAMS };
@@ -856,8 +857,9 @@ function npmDependencyLock(cwd: string): NpmDependencyLock | undefined {
 // npm reifies a worktree's node_modules symlink as a private directory, which makes a successful
 // install disappear at worktree cleanup. Build positional specs from the attempt manifest so the
 // daemon can install them at the main repo root (the provisioned link's target) without saving them
-// into that baseline manifest. Pin registry specs from the attempt lock, while letting npm read the
-// repository lock to retain its transitive versions. `--no-save` leaves both root files untouched.
+// into that baseline manifest. Pin registry specs only when npm would keep the attempt's locked
+// version for that range or tag (aliases use their own range). Let npm read the repository lock
+// to retain its transitive versions. `--no-save` leaves both root files untouched.
 // `--install-links` packs file: dependencies before the attempt is removed.
 export function npmDependencyInstallCommand(cwd: string): string {
   const manifestPath = join(cwd, "package.json");
@@ -883,10 +885,15 @@ export function npmDependencyInstallCommand(cwd: string): string {
       if (typeof entry?.version === "string") {
         if (spec.startsWith("npm:")) {
           const alias = spec.slice(4);
-          const packageName = alias.lastIndexOf("@") > 0 ? alias.slice(0, alias.lastIndexOf("@")) : alias;
+          const separator = alias.lastIndexOf("@");
+          const packageName = separator > 0 ? alias.slice(0, separator) : alias;
+          const range = separator > 0 ? alias.slice(separator + 1) || "*" : "*";
           // v1 records aliases in version itself; v2/v3 record the real package's name separately.
-          spec = entry.version.startsWith("npm:") ? entry.version : `npm:${entry.name ?? packageName}@${entry.version}`;
-        } else if (!/[:/\\]/.test(spec)) spec = entry.version;
+          const locked = entry.version.startsWith("npm:") ? entry.version.slice(entry.version.lastIndexOf("@") + 1) : entry.version;
+          if (npmLockKeeps(range, locked)) {
+            spec = entry.version.startsWith("npm:") ? entry.version : `npm:${entry.name ?? packageName}@${entry.version}`;
+          }
+        } else if (!/[:/\\]/.test(spec) && npmLockKeeps(spec, entry.version)) spec = entry.version;
       }
     }
     return shq(`${name}@${spec}`);

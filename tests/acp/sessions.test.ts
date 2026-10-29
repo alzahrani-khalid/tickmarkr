@@ -1,4 +1,5 @@
-import { appendFileSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import fs, { appendFileSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { expect, test, vi } from "vitest";
@@ -6,6 +7,7 @@ import { z } from "zod";
 import { createAcpAgent } from "../../src/acp/server.js";
 import { graphDefinitionHash, saveGraph } from "../../src/graph/graph.js";
 import { validateGraph } from "../../src/graph/schema.js";
+import { listRunIds } from "../../src/run/runs-list.js";
 import { makeRepo, T } from "../helpers/tmprepo.js";
 import { validateAgentMessage } from "../helpers/acp-schema.js";
 
@@ -62,6 +64,48 @@ async function prompt(a: ReturnType<typeof client>, sessionId: string, text: str
   return updates(a.output.slice(before)).map(row => row.params.update);
 }
 const messages = (rows: any[]) => rows.filter(row => row.sessionUpdate === "agent_message_chunk").map(row => row.content.text);
+
+test("the default run and resume membership read no run's graph file while the session listing keeps titles, so a selection that parses every run graph fails", async () => {
+  const f = fixture();
+  for (const id of ["run-a", "run-b", "run-c"]) f.seed(id, true);
+  mkdirSync(join(f.cwd, ".tickmarkr/runs/run-zzz-empty"));
+  f.seed("run-invalid!", true);
+  mkdirSync(join(f.cwd, ".tickmarkr/runs/run-directory/journal.jsonl"), { recursive: true });
+  writeFileSync(join(f.cwd, ".tickmarkr/runs/run-file"), "not a directory");
+  const root = join(f.cwd, ".tickmarkr/runs") + "/";
+  const graphReads: string[] = [];
+  const read = fs.readFileSync;
+  const spy = vi.spyOn(fs, "readFileSync").mockImplementation((...args) => {
+    const path = String(args[0]);
+    if (path.startsWith(root) && path.endsWith("/graph.json")) graphReads.push(path);
+    return read(...args);
+  });
+  syncBuiltinESMExports();
+  const a = client();
+  try {
+    expect(listRunIds(f.cwd)).toEqual(["run-c", "run-b", "run-a"]);
+    await a.response(a.send("initialize", { protocolVersion: 1 }));
+    const sessionId = (await a.response(a.send("session/new", { cwd: f.cwd, mcpServers: [] }))).result.sessionId;
+    expect(messages(await prompt(a, sessionId, "/status"))).toEqual([expect.stringMatching(/^Run: run-c\n/u)]);
+    const attached = await prompt(a, sessionId, "/attach");
+    expect(attached.filter(row => row.sessionUpdate === "tool_call").map(row => row.toolCallId)).toEqual(["run-c/T1"]);
+    expect((await a.response(a.send("session/resume", { cwd: f.cwd, sessionId: "run-a" }))).result).toEqual({});
+    expect((await a.response(a.send("session/resume", { cwd: f.cwd, sessionId: "run-missing" }))).error.code).toBe(-32002);
+    expect(graphReads).toEqual([]);
+
+    const listed = (await a.response(a.send("session/list", { cwd: f.cwd }))).result.sessions;
+    expect(listed.map(({ sessionId, title }: any) => ({ sessionId, title }))).toEqual([
+      { sessionId: "run-c", title: "session.md" },
+      { sessionId: "run-b", title: "session.md" },
+      { sessionId: "run-a", title: "session.md" },
+    ]);
+    expect(graphReads).toEqual(["run-c", "run-b", "run-a"].map(id => join(root, id, "graph.json")));
+  } finally {
+    spy.mockRestore();
+    syncBuiltinESMExports();
+    await a.end();
+  }
+});
 
 test("a console session reselects the live lock after attaching to the newest run and status reads that live run", async () => {
   const f = fixture();
