@@ -85,12 +85,36 @@ export function isPidLive(pid: number): boolean {
   catch (k) { return (k as NodeJS.ErrnoException).code !== "ESRCH"; }
 }
 
-// statSync throws ENOENT when no lock exists — callers treat that as "not held".
+// openSync throws ENOENT when no lock exists — callers treat that as "not held".
+// Queue row 305 (D-2178 add.80): ONE descriptor answers both the stat and the read. A separate stat then
+// read let a holder's release land between them, so the read saw no file, the payload parsed as garbage
+// and a just-released lock refused as live with pid unknown. An unlink after open cannot change what the
+// open descriptor reads.
+// Only ENOENT means "not held": a lock that exists but cannot be opened or read (EACCES, EISDIR, …) stays
+// garbage and refuses, exactly as the stat-then-read form did — the fix must never turn it into "absent".
 function inspect(p: string, schema: typeof PayloadSchema | typeof ClaimSchema = PayloadSchema): Inspection {
-  const st = statSync(p); // single stat: both the heartbeat mtime and the reclaim-guard inode
+  let fd: number | undefined;
+  // O_NONBLOCK, as every state read here: a FIFO planted at the lock path must never hang the open.
+  // O_NOFOLLOW: tickmarkr writes every lock by link(2) of a regular file, never as a symlink, so a symlink
+  // at the lock path is not a lock tickmarkr wrote and must not lend it a target's (possibly dead) payload.
+  try { fd = openSync(p, constants.O_RDONLY | constants.O_NONBLOCK | (constants.O_NOFOLLOW ?? 0)); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") throw error; }
+  let st: Stats;
+  let raw: string | undefined;
+  try {
+    if (fd === undefined) st = lstatSync(p); // present but unopenable (or a symlink): stat the path itself, read nothing ⇒ garbage below
+    else {
+      st = fstatSync(fd); // single stat: both the heartbeat mtime and the reclaim-guard inode
+      // Only a regular file can hold a lock: a FIFO, socket or device yields bytes another process chose
+      // (a FIFO writer could hand over valid dead-pid JSON and invite a reclaim), so it stays garbage.
+      if (st.isFile()) { try { raw = readFileSync(fd, "utf8"); } catch { /* unreadable ⇒ garbage below */ } }
+    }
+  } finally { if (fd !== undefined) closeSync(fd); }
   const mtimeMs = st.mtimeMs;
   const expired = Date.now() - mtimeMs > STALE_MS;
-  const parsed = schema.safeParse(readPayload(p));
+  let payload: unknown = null;
+  if (raw !== undefined) { try { payload = JSON.parse(raw); } catch { /* not JSON ⇒ garbage below */ } }
+  const parsed = schema.safeParse(payload);
   const garbage = !parsed.success; // LOCK-01: its own state — shouldRefuse refuses it unconditionally; only `tickmarkr unlock` removes it
   const pid = parsed.success ? parsed.data.pid : undefined;
   // harmless fallback for the garbage row — garbage short-circuits shouldRefuse before this is read

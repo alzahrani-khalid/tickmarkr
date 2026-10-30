@@ -1154,7 +1154,8 @@ async function concurrentBaselineFixture(releaseEvent: "task-dispatch" | "baseli
   let release!: () => void;
   const held = new Promise<void>((resolve) => { release = resolve; });
   let timedOut = false;
-  const timeout = setTimeout(() => { timedOut = true; release(); }, 8_000);
+  // D-2178 add.80: a hang guard, not a latency bound — 8 s timed out on a loaded macOS CI runner.
+  const timeout = setTimeout(() => { timedOut = true; release(); }, 60_000);
   const order: string[] = [];
   let complete = false;
   let gateCalls = 0;

@@ -34,9 +34,12 @@ criteria, a cross-vendor review and the full suite.
 - **The admission test checks which tasks start before the first finishes, not their journal order (queue row 276(g)),** which
   concurrency does not guarantee.
 
-- **The launch test's stand-in daemon writes its lock whole (queue row 305).** The product daemon already published `graph.lock`
-  atomically; only the test's stand-in wrote it in place, so under load the launcher's poll could read a torn file and refuse it as a
-  live lock of an unknown pid. A tmp write and rename closes it. Test-only; no product change.
+- **A lock released while it is being read no longer reads as a live lock (queue row 305).** tickmarkr checked a run lock in two
+  steps, stat and then read. When the holder released the lock between them, the read found nothing and the lock was taken as
+  unreadable, which tickmarkr treats as live with an unknown owner: a launch could be refused by a lock that had just gone, and
+  a run start could ask you to `tickmarkr unlock --garbage` a lock that no longer existed. One open file now answers both steps.
+  A lock that exists but cannot be read still refuses, as before. The launch test's stand-in daemon also writes its lock
+  atomically, as the real daemon does, and two tests lost timing assumptions a slow macOS CI runner broke.
 
 Post-run checks on the run's tip: the spec's own probe kit, all eight tasks green (two probe instruments corrected, the product
 untouched), every acceptance title present exactly once in its owned suite, and the Claude plugin installing from a marketplace.

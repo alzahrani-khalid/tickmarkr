@@ -461,7 +461,8 @@ test("test: across a session holding open parks, an approval window and its expi
     expect(updates.every(update => ["available_commands_update", "plan", "tool_call", "tool_call_update", "agent_message_chunk"].includes(update.sessionUpdate))).toBe(true);
     expect(tree(stateDir)).toEqual(afterExpiry);
     noWritesOrChildren();
-    expect(vi.mocked(fs.openSync).mock.calls.every(call => call[1] === (fs.constants.O_RDONLY | fs.constants.O_NONBLOCK))).toBe(true);
+    // Read-only and non-blocking; O_NOFOLLOW (the lock reader refuses a symlinked lock, D-2178 add.88) only narrows what an open reaches.
+    expect(vi.mocked(fs.openSync).mock.calls.every(call => ((call[1] as number) & ~(fs.constants.O_NOFOLLOW ?? 0)) === (fs.constants.O_RDONLY | fs.constants.O_NONBLOCK))).toBe(true);
     send(undefined, "session/cancel", { sessionId });
     await vi.advanceTimersByTimeAsync(0);
     await tick();

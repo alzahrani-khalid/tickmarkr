@@ -2116,15 +2116,17 @@ review:
     const { repo, adapter } = setup();
     const before = readFileSync(overlayAt(repo), "utf8");
     const io = makeIO();
-    queueAnswers("n");
-    const out = await drive(
-      repo, adapter, io.io,
-      // OBS-994/FL-1: two presses reach out(all) — this test targets the all-seats allow form.
-      REACH_ALL + KEYS.t + KEYS.down + KEYS.t
-        + KEYS.down + KEYS.down + KEYS.enter + KEYS.enter
-        + "AA Index 54" + KEYS.enter + KEYS.w,
-      ["--global-dir", userDirOf(repo)],
-    );
+    // D-2178 add.80: the t-on-a-classified-row notice is transient, and one batched write let Ink coalesce
+    // its frame away on a slow host (macOS CI). Feed the keys in two phases and wait for that frame.
+    const notice = "tier reassignment on classified models is not supported in v1";
+    const run = fleet(["--global-dir", userDirOf(repo)], repo, [adapter], io.io);
+    // OBS-994/FL-1: two presses reach out(all) — this test targets the all-seats allow form.
+    io.io.input!.write(REACH_ALL + KEYS.t);
+    await settle(() => strip(io.writes.join("")).includes(notice));
+    io.io.input!.write(KEYS.down + KEYS.t
+      + KEYS.down + KEYS.down + KEYS.enter + KEYS.enter
+      + "AA Index 54" + KEYS.enter + KEYS.w + "n");
+    const out = await run;
     expect(out).toBe("fleet: discarded overlay changes");
     const all = strip(io.writes.join(""));
     // t on a classified row renders the inline notice and the session stays alive
