@@ -515,8 +515,8 @@ test("test: after a workers-scope toggle is written the four role pools discover
       version: "fake",
       models: ["fake-1", "fake-2"],
       modelAuth: {
-        "fake-1": { authed: true, probedAt: "2026-09-12T00:00:00.000Z" },
-        "fake-2": { authed: true, probedAt: "2026-09-12T00:00:00.000Z" },
+        "fake-1": { authed: true, probedAt: new Date().toISOString() },
+        "fake-2": { authed: true, probedAt: new Date().toISOString() },
       },
     },
   });

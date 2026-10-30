@@ -754,12 +754,12 @@ describe("unifiedYamlDiff shortest-edit matching", () => {
     "      fake-1: mid",
     "",
   ];
-  // hunks: the body lines of each "@@" section, in order
+  // Compare edits independently of the three lines of unchanged review context.
   const hunksOf = (diff: string): string[][] => {
     const out: string[][] = [];
     for (const line of diff.split("\n").slice(2)) {
-      if (line === "@@") out.push([]);
-      else if (line !== "") out.at(-1)!.push(line);
+      if (line.startsWith("@@ ")) out.push([]);
+      else if (line.startsWith("+") || line.startsWith("-")) out.at(-1)!.push(line);
     }
     return out;
   };

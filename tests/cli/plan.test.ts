@@ -170,9 +170,9 @@ describe("V-10 fleet preference visibility", () => {
     const repo = mkRepo();
     withOverlay(repo, "routing:\n  deny:\n    adapters: [pi]\n");
     const out = await plan([], repo);
-    expect(out).toContain("pi:zai/glm-5.2");
+    expect(out).toContain("tickmarkr doctor --models lists each excluded channel");
     expect(out).toMatch(/routing preference active: 3 channel\(s\) excluded/);
-    expect(out).toMatch(/deny: pi/);
+    expect(out).toContain("denied adapter pi: 3");
     expect(out).toMatch(/dry run \(\d+ channels available\)/);
     expect(out).not.toMatch(/dry run \(0 channels available\)/);
   });
@@ -183,12 +183,13 @@ describe("V-10 fleet preference visibility", () => {
     expect(out).not.toMatch(/routing preference active:/);
   });
 
-  test("V-10d: empty allowlist surfaces all channels as excluded with empty-allowlist reason", async () => {
+  test("V-10d: empty allowlist groups all channels under the allowlist-miss reason", async () => {
     const repo = mkRepo();
     withOverlay(repo, "routing:\n  allow:\n    adapters: []\n");
     const out = await plan([], repo);
     expect(out).toMatch(/routing preference active:/);
-    expect(out).toContain("(empty allowlist)");
+    expect(out).toContain("not in routing.allow:");
+    expect(out).not.toContain("(empty allowlist)");
     expect(out).toMatch(/dry run \(0 channels available\)/);
   });
 
@@ -260,7 +261,7 @@ consult: { prefer: [grok:grok-4.5] }
     withOverlay(workerOnly, "routing:\n  deny:\n    workers:\n      models: [claude-code:fable]\n");
     const workerOut = await plan([], workerOnly);
     expect(workerOut).not.toContain("REFUSAL OBS-576");
-    expect(workerOut).toContain("claude-code:fable (deny: claude-code:fable)");
+    expect(workerOut).toContain("denied model: 1");
     expect(workerOut).toContain("routing.deny.workers.models 'claude-code:fable' reaches seats: worker");
   });
 });

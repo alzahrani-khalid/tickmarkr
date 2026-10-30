@@ -42,6 +42,7 @@ function globalWith(yaml: string): string {
 }
 
 function stamp(repo: string): FakeAdapter {
+  const when = new Date(Date.now() - 5 * 60_000);
   registry.writeDoctor(repo, {
     fake: {
       installed: true,
@@ -50,12 +51,11 @@ function stamp(repo: string): FakeAdapter {
       models: ["fake-1", "fake-2"],
       modelsDetectedAt: "2026-07-16T12:00:00.000Z",
       modelAuth: {
-        "fake-1": { authed: true, probedAt: "2026-07-16T00:00:00.000Z" },
-        "fake-2": { authed: true, probedAt: "2026-07-16T00:00:00.000Z" },
+        "fake-1": { authed: true, probedAt: when.toISOString() },
+        "fake-2": { authed: true, probedAt: when.toISOString() },
       },
     },
   });
-  const when = new Date(Date.now() - 5 * 60_000);
   utimesSync(join(tickmarkrDir(repo), "doctor.json"), when, when);
   const script = join(repo, "fake.json");
   writeFileSync(script, JSON.stringify({ tasks: {} }));

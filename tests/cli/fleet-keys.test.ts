@@ -54,7 +54,7 @@ function fixture(): Fixture {
   ].join("\n"));
   const script = join(repo, "fake.json");
   writeFileSync(script, JSON.stringify({ tasks: {} }));
-  const at = "2026-10-06T00:00:00.000Z";
+  const at = new Date().toISOString();
   registry.writeDoctor(repo, {
     fake: {
       installed: true,
@@ -93,7 +93,7 @@ function makeIO() {
 }
 
 const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
-// the doctor-age chip counts minutes since doctor.json's mtime — the one clock on the frame
+// the doctor-age chip counts minutes since the oldest default-scope model verdict
 const stable = (frame: string) => frame.replace(/\d+[mh] old/g, "age");
 
 async function session(fx: Fixture) {
@@ -160,7 +160,9 @@ test("fleet editor cursor moves across many rows recompute no row reach after th
   for (let i = 0; i < 5; i++) await s.key(K.up);
   await s.key(K.left);
   await s.key(K.down);
+  await s.key(K.up); // the pane follows the rail; return to All models before its reach picker
   await s.key(K.right);
+  for (let i = 0; i < 25; i++) await s.key(K.down);
   await s.key(K.space);
   await s.key(K.down);
   await s.key(K.escape);
@@ -203,7 +205,9 @@ test("the frame after cursor moves is identical to a fresh render of the same st
   for (let i = 0; i < 12; i++) await a.key(K.down);
   await a.key(K.left);
   await a.key(K.down);
+  await a.key(K.up);
   await a.key(K.right);
+  for (let i = 0; i < 15; i++) await a.key(K.down);
   await a.key(K.space);
   await a.key(K.down);
   await a.key(K.escape);

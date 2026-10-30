@@ -79,6 +79,7 @@ function ttyIO(rows = 60): { io: FleetIO; input: TestInput; frames: string[] } {
 function stampFakeDoctor(repoRoot: string): FakeAdapter {
   const script = join(repoRoot, "fake.json");
   writeFileSync(script, JSON.stringify({ tasks: {} }));
+  const fresh = new Date(Date.now() - 60_000);
   registry.writeDoctor(repoRoot, {
     fake: {
       installed: true,
@@ -86,10 +87,9 @@ function stampFakeDoctor(repoRoot: string): FakeAdapter {
       version: "fake",
       models: ["fake-1"],
       modelsDetectedAt: "2026-08-05T00:00:00.000Z",
-      modelAuth: { "fake-1": { authed: true, probedAt: "2026-08-05T00:00:00.000Z" } },
+      modelAuth: { "fake-1": { authed: true, probedAt: fresh.toISOString() } },
     },
   });
-  const fresh = new Date(Date.now() - 60_000);
   utimesSync(join(tickmarkrDir(repoRoot), "doctor.json"), fresh, fresh);
   return new FakeAdapter(script);
 }
@@ -157,6 +157,7 @@ function mechanismsRepo(): { repoRoot: string; globalDir: string; adapter: Worke
     parse: () => ({ ok: false, summary: "unused", deviations: [], raw: "" }),
     listModels: async () => [],
   };
+  const fresh = new Date(Date.now() - 60_000);
   registry.writeDoctor(repoRoot, {
     fake: {
       installed: true,
@@ -164,16 +165,15 @@ function mechanismsRepo(): { repoRoot: string; globalDir: string; adapter: Worke
       version: "fake",
       models: ["fake-1", "fake-2", "fake-3", "fake-4", "fake-5", "fake-6"],
       modelAuth: {
-        "fake-1": { authed: true, probedAt: "2026-09-12T00:00:00.000Z" },
-        "fake-2": { authed: true, probedAt: "2026-09-12T00:00:00.000Z" },
-        "fake-3": { authed: true, probedAt: "2026-09-12T00:00:00.000Z" },
-        "fake-4": { authed: false, reason: "quota exceeded", probedAt: "2026-09-12T00:00:00.000Z" },
-        "fake-5": { authed: true, probedAt: "2026-09-12T00:00:00.000Z" },
-        "fake-6": { authed: true, probedAt: "2026-09-12T00:00:00.000Z" },
+        "fake-1": { authed: true, probedAt: fresh.toISOString() },
+        "fake-2": { authed: true, probedAt: fresh.toISOString() },
+        "fake-3": { authed: true, probedAt: fresh.toISOString() },
+        "fake-4": { authed: false, reason: "quota exceeded", probedAt: fresh.toISOString() },
+        "fake-5": { authed: true, probedAt: fresh.toISOString() },
+        "fake-6": { authed: true, probedAt: fresh.toISOString() },
       },
     },
   });
-  const fresh = new Date(Date.now() - 60_000);
   utimesSync(join(tickmarkrDir(repoRoot), "doctor.json"), fresh, fresh);
   return { repoRoot, globalDir, adapter };
 }
@@ -198,8 +198,7 @@ describe("fleet --why", () => {
     const adapter = stampFakeDoctor(repoRoot);
     const { io, input, frames } = ttyIO();
     const editing = fleet(["--global-dir", globalDir], repoRoot, [adapter], io);
-    // the presets overlay (auto-raised on first Shapes entry) eats jj+Enter as a MODE change —
-    // staged work, so the quit guard takes a second q
+    // Shapes → implement → pin a candidate; staged work takes a second q to quit.
     input.write("\x1b[D\x1b[B\r" + "jjp\r" + "qq");
     expect(await editing).toBe("fleet: quit without writing");
     const pinned = stripAnsi(frames.join(""))
@@ -236,7 +235,7 @@ describe("fleet --why", () => {
     // a one-chunk nav+quit could unmount before the shapes list ever painted (the recurring flake)
     const shapesPainted = () =>
       stripAnsi(frames.join("")).split("\n").some((line) => line.includes("implement") && line.includes("source:"));
-    input.write("\x1b[D\x1b[B\r" + "\x1b");
+    input.write("\x1b[D\x1b[B\r");
     for (let i = 0; i < 400 && !shapesPainted(); i++) await new Promise((resolve) => setTimeout(resolve, 5));
     input.write("q");
     expect(await editing).toBe("fleet: quit without writing");
@@ -358,9 +357,9 @@ describe("fleet --why", () => {
     const { repoRoot, globalDir, adapter } = mechanismsRepo();
     const { io, input, frames } = ttyIO(24);
     const done = fleet(["--global-dir", globalDir], repoRoot, [adapter], io);
-    // rail → Shapes → close the first-entry presets overlay → docs (5th shape) → open its picker,
+    // rail → Shapes → docs (5th shape) → open its picker,
     // then walk the cursor down past every candidate and every ledger row
-    const keys = ["\x1b[D", "\x1b[B", "\r", "\x1b", ...Array(4).fill("\x1b[B"), "p", ...Array(14).fill("\x1b[B"), "\x1b", "q", "q"];
+    const keys = ["\x1b[D", "\x1b[B", "\r", ...Array(4).fill("\x1b[B"), "p", ...Array(14).fill("\x1b[B"), "\x1b", "q", "q"];
     for (const key of keys) {
       input.write(key); // one key per macrotask: a bare Esc must not merge into the next arrow's sequence
       await new Promise((resolve) => setTimeout(resolve, 10));

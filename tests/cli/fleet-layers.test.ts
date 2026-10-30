@@ -101,7 +101,7 @@ function fixture(opts: {
       throw new Error("fleet-layers forbids a live probe");
     },
   }));
-  const at = "2026-10-02T00:00:00.000Z";
+  const at = new Date(Date.now() - 5 * 60_000).toISOString();
   const health = Object.fromEntries(ids.map((id) => {
     const tiered = Object.keys(cfg.tiers[id]?.models ?? {}).filter((m) => ["A", "B", "gpt-6-sol", "gpt-6-luna"].includes(m));
     const served = [...tiered, ...(opts.extra?.[id] ?? [])];
@@ -118,7 +118,7 @@ function fixture(opts: {
     }];
   }));
   registry.writeDoctor(repo, health);
-  const when = new Date(Date.now() - 5 * 60_000);
+  const when = new Date(at);
   utimesSync(join(tickmarkrDir(repo), "doctor.json"), when, when);
   return { repo, globalDir, userPath, repoPath, user: opts.user, repoBytes: opts.repo, adapters, health: registry.readDoctor(repo)! };
 }
@@ -334,7 +334,7 @@ describe("v2.6.6 L Fleet membership edits reach their effective overlay", () => 
       await s.clearFilter();
       await s.rail("codex");
       await s.key(REACH.in);
-      expect(s.last()).toContain("cleared codex from routing.deny.adapters");
+      expect(s.last()).toContain("removed codex from routing.deny.adapters");
       await saved(s, fx.repoPath);
       expect(parse(read(fx.repoPath)).routing.deny).toEqual({ adapters: null, models: null });
       for (const role of ["worker", "judge", "review", "consult"]) {
@@ -399,7 +399,7 @@ describe("v2.6.6 L Fleet membership edits reach their effective overlay", () => 
       const s = await session(fx);
       await s.rail("codex");
       await s.key(REACH.in);
-      expect(s.last()).toContain("cleared codex from routing.deny.workers.adapters — still out:");
+      expect(s.last()).toContain("removed codex from routing.deny.workers.adapters — still out:");
       expect(s.last()).toContain("routing.allow");
       await saved(s, fx.repoPath);
       expect(read(fx.repoPath)).toContain("    models: [codex:gpt-6-sol, fake:A, fake:B]\n"); // untouched flow list
@@ -622,7 +622,7 @@ describe("v2.6.6 L Fleet membership edits reach their effective overlay", () => 
       expect(routing.deny?.adapters, leaf).toEqual(["fake"]);
       // production discovery with U's injected probe verdict: fake:U stays out of every pool
       const probed = structuredClone(fx.health);
-      probed.fake.modelAuth = { ...probed.fake.modelAuth, U: { authed: true, probedAt: "2026-10-02T00:00:00.000Z" } };
+      probed.fake.modelAuth = { ...probed.fake.modelAuth, U: { authed: true, probedAt: new Date().toISOString() } };
       const after = Object.fromEntries(Object.entries(registry.rolePools(cfgOf(fx), fx.adapters, probed))
         .map(([role, channels]) => [role, channels.map((c) => `${c.adapter}:${c.model}`).sort()]));
       for (const role of ["worker", "judge", "review", "consult"]) {
@@ -1104,6 +1104,53 @@ async function classifyRow(s: Session, label: string) {
 }
 
 describe("v2.6.7 T5 Fleet membership acts on every grouped member's real ID", () => {
+  test("mixed grouped admission keeps healthy members routable despite a failed sibling across member orders and recorded identities", async () => {
+    // Bounded auth table: the failed member may be the representative C-max or C-low;
+    // C-high stays healthy, the remaining sibling is unprobed, and identities may overlap.
+    for (const failed of ["C-low", "C-max"]) {
+      const unprobed = failed === "C-low" ? "C-max" : "C-low";
+      for (const served of [[failed, "C-high"], ["C-high", failed]]) {
+        for (const overlap of [false, true]) {
+          const name = `${served.join(",")} unprobed=${unprobed} overlap=${overlap}`;
+          const fx = fixture({
+            user: TIERS, repo: GROUP_REPO,
+            extra: { fake: served }, unauthed: { fake: [failed] }, unprobed: { fake: [unprobed] },
+            ...(overlap ? { identities: { fake: { "C-high": failed } } } : {}),
+          });
+          const s = await session(fx);
+          try {
+            await classifyRow(s, "C");
+            expect(groupRowLine(s.last(), "C"), name).toMatch(/mid\s+out allow/);
+            expect(s.last(), name).toContain(`fake:${failed} UNAUTHED — quota exceeded — re-probe with tickmarkr doctor`);
+            await s.key(REACH.in);
+            const review = await s.w();
+            if (review?.kind !== "diff") throw new Error(`expected a diff, got ${JSON.stringify(review)}`);
+            const { outcome } = await s.y();
+            // Policy admission is independent of auth: every real id is written, while
+            // production discovery routes only C-high without repairing its failed sibling.
+            const cfg = cfgOf(fx);
+            const now = pools(fx);
+            for (const role of ROLES) {
+              expect(now[role], `${name} ${role}`).toContain("fake:C-high");
+              expect(now[role], `${name} ${role}`).not.toContain(`fake:${failed}`);
+              expect(now[role], `${name} ${role}`).not.toContain(`fake:${unprobed}`);
+            }
+            for (const model of ["C-low", "C-high", "C-max"]) {
+              expect(disallowedBy({ adapter: "fake", model }, cfg.routing, "judge"), `${name} ${model}`).toBeNull();
+            }
+            expect(review.path, name).toBe(fx.repoPath);
+            expect(read(fx.repoPath), name).toBe(review.after);
+            expect(read(fx.userPath), name).toBe(fx.user);
+            expect(outcome, name).toContain(`are unauthed (fake:${failed}) — re-probe with tickmarkr doctor`);
+            expect(outcome, name).toContain(`no probe verdict yet (fake:${unprobed})`);
+          } finally {
+            await s.quit();
+          }
+        }
+      }
+    }
+  }, CEILING);
+
   test("production Fleet classifies seeds and admits every real member in the closed grouped-member table through actual Ink reviewed bytes publication and all four role pools versus a phantom display ID or representative-only admission", async () => {
     // closed grouped-member table: label = the displayed row, members = the real ids the input served
     const cases: Array<{ name: string; served: string[]; label: string; members: string[]; record?: string; phantom?: string }> = [
@@ -1518,7 +1565,7 @@ describe("v2.6.7 T5 Fleet membership acts on every grouped member's real ID", ()
       // a later successful doctor verdict for C-low: the saved membership already admits it everywhere
       const reprobed = structuredClone(fx.health);
       reprobed.fake.models = [...new Set([...(reprobed.fake.models ?? []), "C-low"])];
-      reprobed.fake.modelAuth = { ...reprobed.fake.modelAuth, "C-low": { authed: true, probedAt: "2026-10-02T00:00:00.000Z" } };
+      reprobed.fake.modelAuth = { ...reprobed.fake.modelAuth, "C-low": { authed: true, probedAt: new Date().toISOString() } };
       const now = Object.fromEntries(Object.entries(registry.rolePools(cfg, fx.adapters, reprobed))
         .map(([role, channels]) => [role, channels.map((c) => `${c.adapter}:${c.model}`)]));
       for (const role of ROLES) {

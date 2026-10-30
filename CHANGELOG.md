@@ -2,6 +2,52 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v2.12.0 — fleet and doctor tell the truth: honest marks, an editor that reaches what you need, a readable write review, probes you ask for, gateway model lists, real explanations, and the ruled tier band
+
+**v2.12.0** fixes the 21 defects an operator hit narrowing a fleet to five adapters with `tickmarkr fleet` and `tickmarkr doctor`. Its
+work comes from one `tickmarkr run`, run-20261030-034241-0000000000004721. Each of its seven tasks passed build, lint, evidence, scope,
+its acceptance criteria, a cross-vendor review and the full suite.
+
+- **The fleet editor never shows a channel healthier than its adapter.**
+  - A model with no verdict of its own takes its adapter's signed-out state: before, every model of a signed-out adapter showed ✓.
+  - The rail mark follows the adapter's computed reach (in, partial, out, signed out), with a one-line legend.
+  - An adapter with any channel still in can be set out; only an adapter already out everywhere refuses.
+  - Reach messages name the edit as written, for example "added agy to routing.allow.adapters".
+- **The fleet editor reaches what you need.**
+  - The pane follows the rail cursor, and → focuses it.
+  - Enter on Shapes opens the Shapes list, in `fleet` and in `init`'s editor alike; the mode chooser moved to `m`.
+  - Enter on a shape edits its pool, and `[` and `]` move the selected member up and down.
+  - A model whose probe failed can now be set out, with a warning naming the failed verdict. It still cannot be admitted.
+- **The fleet write review is readable, and the write leaves the config consistent.**
+  - The review diff shows real hunks: line ranges, up to three context lines, and the YAML path of each hunk.
+  - A write removes from each pool every member the same edit disallowed, and the review lists each removal. A pool's last member
+    stays, and the review names that shape as exhausted and unroutable.
+  - An entry both allowed and denied is named in the review: deny wins, and the allow entry you wrote is kept.
+- **A probe is asked for, not sprung.**
+  - With a stale cache, `tickmarkr fleet` in a terminal asks first: probe now (with the model count), open with the cached verdicts,
+    or quit. A non-interactive run still refuses, as before, and the help says so.
+  - `tickmarkr doctor --adapter <id>` and `--model <adapter:model>` probe just that selection (repeatable, even where routing denies
+    it) and merge the verdicts into the cache, keeping every other verdict.
+  - A plain `doctor` probes only the channels routing can reach plus every review, consult and judge preference; `--all` probes every
+    configured model. Kimi's separate check runs only when its model is in scope.
+  - The cache age `fleet --pick` and `init` read is the age of the oldest verdict in that scope.
+- **Gateway CLIs report their models.**
+  - agy's model list is read (`agy models`, tab-separated rows; a 45 s listing budget, every other adapter keeps 15 s), so the
+    "no model-list surface" warning is gone for agy.
+  - A probe reply naming an unknown model is recorded as such, and doctor prints "<model> is not served by <adapter>".
+  - For every adapter whose listing succeeded, doctor prints the configured ids the CLI does not offer and the offered ids not
+    configured. A missing binary or a failed listing infers nothing and says the listing was unavailable.
+- **The reports explain instead of dumping.**
+  - The "routing preference active" line in `doctor` and `plan` groups exclusions by reason ("denied adapter omp: 12", "not in
+    routing.allow: 17"); the full list moved under `--models`.
+  - Each catalog row in `doctor --models` names its adapter.
+  - `tickmarkr fleet --print --why` now explains each shape: the pool or preference source, each member admitted or skipped with
+    its reason, the pick, and the rule that chose it.
+- **Tier suggestions follow the ruled band.** A model within 10% of the fleet's top score is frontier and within 25% is mid, on the
+  Artificial Analysis Intelligence Index first (LiveBench when a model has no AA score). Fewer than three scored models gives no
+  benchmark band, and the price-derived fallback applies as before. `doctor --models` flags every configured tier that differs from
+  its suggestion; the config is never written.
+
 ## v2.11.1 — contained fixes: acp hardening and a launch preflight, a whole-line /compile path, a verify baseline ceiling that scales with the suite, a lock pin npm would keep, Orca's seat-marker clear, and stale text
 
 **v2.11.1** fixes what 2.11.0's pre-release checks and the queue held back (queue rows 297, 298, 300, 290, 293, 294 and 276(g)). Its

@@ -93,8 +93,8 @@ export const ttyVisual = () => process.stdout.isTTY === true && process.env.NO_C
 // ponytail: chars/4 token heuristic — good enough for advisory plan lint; no tokenizer dep.
 const CHARS_PER_TOKEN = 4;
 
-/** Bases that band FLEET-RELATIVELY, most-trusted first (2026-08-13 ranking-sites assessment §4.3). */
-const RANKED_BASES = ["agentic-coding", "intelligence"] as const;
+/** D-1518: AA Intelligence Index first, then same-basis LiveBench evidence. */
+const RANKED_BASES = ["intelligence", "agentic-coding"] as const;
 type RankedBasis = typeof RANKED_BASES[number];
 export type CatalogSuggestionBasis = RankedBasis | "price";
 
@@ -115,14 +115,17 @@ export type CatalogTierRanking = ReadonlyArray<{ basis: RankedBasis; scores: num
  * D-2 (2026-08-13 ranking-sites assessment): the retired `index >= 65 → frontier` cut was calibrated
  * against an older, higher-ceilinged AA index. After the v4.x rescale the best model in existence
  * scored 63.05, so NOTHING could ever be frontier. An absolute cut against a vendor index that gets
- * rescaled is the defect CLASS — the fix is a rank among the models we actually hold same-basis
- * evidence for, not a new magic number. Three is the floor: thirds over two models is a coin toss.
+ * rescaled is the defect CLASS. D-1518 (2026-10-08) bands the score ratio to the fleet's same-basis
+ * top instead. Three scored models remain the minimum evidence sample.
  */
 const MIN_RANKED_MODELS = 3;
 
-/** Rank r of n, 0-based: top third → frontier, middle third → mid, bottom third → cheap. */
-const bandOfRank = (rank: number, total: number): Tier =>
-  rank * 3 < total ? "frontier" : rank * 3 < total * 2 ? "mid" : "cheap";
+/** D-1518: compare the unrounded ratio; a non-positive top cannot anchor a benchmark band. */
+export function tierBandOf(score: number, top: number): Tier | undefined {
+  if (!Number.isFinite(score) || score < 0 || !Number.isFinite(top) || top <= 0) return undefined;
+  const ratio = score / top;
+  return ratio >= 0.90 ? "frontier" : ratio >= 0.75 ? "mid" : "cheap";
+}
 
 const basisScore = (evidence: CatalogModelEvidence, basis: RankedBasis): number | undefined =>
   basis === "agentic-coding" ? evidence.agenticCodingScore : evidence.intelligenceIndex;
@@ -181,11 +184,11 @@ export function catalogTierRanking(
       .map((member) => basisScore(member, basis))
       .filter((score): score is number => score !== undefined)
       .sort((a, b) => b - a);
-    return scores.length >= MIN_RANKED_MODELS ? [{ basis, scores }] : [];
+    return scores.length >= MIN_RANKED_MODELS && scores[0] > 0 ? [{ basis, scores }] : [];
   });
 }
 
-/** First basis that both clears the floor AND can place this model; ties share the better band. */
+/** First basis that both clears the floor AND can place this model against its own fleet top. */
 function rankedSuggestion(
   ranking: CatalogTierRanking,
   evidence: CatalogModelEvidence,
@@ -193,13 +196,20 @@ function rankedSuggestion(
   for (const { basis, scores } of ranking) {
     const score = basisScore(evidence, basis);
     if (score === undefined) continue;
-    const rank = scores.filter((other) => other > score).length;
+    const top = scores[0];
+    if (scores.length < MIN_RANKED_MODELS) continue;
+    const tier = tierBandOf(score, top);
+    if (tier === undefined) continue;
     // Every suggestion names its evidence source AND its date: an AA band that omits the index
     // version is exactly the silent-rescale defect D-2 shipped to everyone.
     const source = basis === "agentic-coding"
-      ? `LiveBench Agentic Coding ${round1(score)} (LiveBench table ${evidence.evidenceDate ?? "date not reported"})`
-      : `Artificial Analysis Intelligence Index ${round1(score)} (intelligence index version ${evidence.intelligenceIndexVersion ?? "not reported"})`;
-    return { basis, tier: bandOfRank(rank, scores.length), basisNote: `fleet-relative rank ${rank + 1}/${scores.length} by ${source}` };
+      ? `LiveBench Agentic Coding ${score} (LiveBench table ${evidence.evidenceDate ?? "date not reported"})`
+      : `Artificial Analysis Intelligence Index ${score} (intelligence index version ${evidence.intelligenceIndexVersion ?? "not reported"})`;
+    return {
+      basis,
+      tier,
+      basisNote: `fleet-top ratio band by ${source}; score=${score}; top=${top}; ratio=${score / top}; D-1518: frontier >= 0.90, mid >= 0.75, else cheap (Terminal-Bench's 15% half awaits a catalog source)`,
+    };
   }
   return undefined;
 }
@@ -629,6 +639,30 @@ function retirementLints(id: string, configured: string[], listed: readonly stri
 // Diffs detected models (doctor.json) against configured tiers, both directions, per installed adapter.
 // No `  ! ` prefix here — the consumer (doctor rows / plan lints) owns that. Pre-v1.5 doctor.json (models:[], no
 // modelsDetectedAt) is the compat baseline: `?.`/`?? []` everywhere, no zod (would reject old files).
+export function modelListingLints(
+  cfg: TickmarkrConfig,
+  health: Record<string, AuthHealth>,
+  adapters: WorkerAdapter[],
+): string[] {
+  const summarize = (ids: string[]) => `${ids.length}${ids.length ? ` (${ids.slice(0, LINT_CAP).join(", ")}${ids.length > LINT_CAP ? `, +${ids.length - LINT_CAP} more` : ""})` : ""}`;
+  return adapters.flatMap((adapter) => {
+    if (!adapter.listModels) return [];
+    const id = adapter.id;
+    const h = health[id];
+    // Native nonempty lists establish success; native [] is ambiguous. Only declarative
+    // execution can attest success with zero rows. Unavailability overrides any stale ids.
+    const listed = h?.installed && (h.modelListing?.status === "succeeded"
+      || (h.modelListing === undefined && (h.models ?? []).length > 0));
+    if (!listed) return [`${id}: model listing unavailable${h?.modelListing?.reason ? ` — ${h.modelListing.reason}` : ""}`];
+    const offered = [...new Set(h.models ?? [])];
+    const configured = Object.keys(cfg.tiers[id]?.models ?? {});
+    return [
+      `${id}: model listing — ${offered.length} offered; configured-not-offered: ${summarize(configured.filter((m) => !offered.includes(m)))}`,
+      `${id}: offered-not-configured: ${summarize(offered.filter((m) => !configured.includes(m)))}`,
+    ];
+  });
+}
+
 export function modelLints(
   cfg: TickmarkrConfig,
   health: Record<string, AuthHealth>,
@@ -650,9 +684,8 @@ export function modelLints(
       }
     }
     if (!adapter.listModels) {
-      // v1.90 / OBS-504: the seeds-stamped wording presumes a seeded tier table. agy ships routable
-      // but UNCLASSIFIED (no listModels, no seed models) — for that shape the honest sentence names
-      // the classification debt, not a seed stamp with nothing behind it.
+      // The seed stamp presumes a configured tier table. An unclassified adapter instead
+      // names its classification debt, without dating knowledge it does not have.
       lints.push(Object.keys(cfg.tiers[id]?.models ?? {}).length > 0
         ? `${id}: no model-list surface — seeds stamped ${SEED_STAMPED}; verify manually`
         : `${id}: no model-list surface and no configured models — classify per benchmark policy to open channels`);
@@ -663,7 +696,7 @@ export function modelLints(
     const configured = Object.keys(cfg.tiers[id]?.models ?? {});
     // a configured id the CLI stopped listing but still carries a dated notice for gets the dated lint, not the bare one
     const noticed = (model: string) => !!adapter.listModelsRetirements && !!storedRetirement(h?.modelRetirements, model);
-    if (detected.length === 0) {
+    if (detected.length === 0 || h?.modelListing?.status === "unavailable" || h?.installed === false) {
       if (h?.installed) lints.push(`${id}: no detection data — run tickmarkr doctor`);
       // D-1526: a cache holding only hidden rows lists nothing, yet its dated notices are still the CLI's word
       if (adapter.listModelsRetirements) lints.push(...retirementLints(id, configured.filter(noticed), detected, h?.modelsHidden ?? [], h?.modelRetirements, nowMs));
@@ -727,13 +760,13 @@ export function suggestOverlay(
     resolvedModel?: (adapter: string, model: string) => string | undefined;
   } = {},
 ): string {
-  // Pass 1 — decide WHAT each adapter drifts by. Pass 2 renders, after every addition this call
-  // will print has joined one ranking universe: a fleet-relative band must not depend on which
-  // adapter happened to be iterated first.
+  // Pass 1 decides WHAT each adapter drifts by. Pass 2 renders against all listed models,
+  // including those the overlay omits: display filtering must not change the fleet top.
   const drifts = adapters.flatMap((adapter) => {
     const id = adapter.id;
     if (!adapter.listModels) return [];      // no list surface → nothing to diff (mirror modelLints)
     const h = health[id];
+    if (h?.modelListing?.status === "unavailable" || h?.installed === false) return [];
     const detected = h?.models ?? [];
     if (detected.length === 0) return [];    // no detection data → don't guess a delta
     const configured = Object.keys(cfg.tiers[id]?.models ?? {});
@@ -766,8 +799,8 @@ export function suggestOverlay(
     return [{ id, date: h?.modelsDetectedAt?.split("T")[0], tombstones, additions, omitted }]; // date: best-effort day stamp
   });
   const ranking = opts.catalog
-    ? catalogTierRanking(cfg, opts.catalog, drifts.flatMap(({ id, additions }) =>
-      additions.map((model) => ({ adapter: id, model, resolvedModel: opts.resolvedModel?.(id, model) }))), opts.resolvedModel)
+    ? catalogTierRanking(cfg, opts.catalog, drifts.flatMap(({ id }) =>
+      (health[id]?.models ?? []).map((model) => ({ adapter: id, model, resolvedModel: opts.resolvedModel?.(id, model) }))), opts.resolvedModel)
     : [];
 
   const blocks: string[] = [];

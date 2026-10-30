@@ -5,12 +5,12 @@ import { existsSync, readFileSync, readdirSync, realpathSync } from "node:fs";
 import { extname, join, normalize, resolve } from "node:path";
 import { detectPackageManager, turboContinueFindings } from "../../gates/baseline.js";
 import { version } from "./version.js";
-import { allAdapters, binaryShadowWarnings, detectCandidateClis, doctorAgeMs, flagDriftWarnings, formatDoctorProbeTimeoutNote, modelAliasExclusions, modelAliasLine, probeAll, probeModels, readDoctor, resolveShellBinary, servableExclusions, servabilityLine, writeDoctor } from "../../adapters/registry.js";
+import { allAdapters, binaryShadowWarnings, detectCandidateClis, doctorAgeMs, flagDriftWarnings, formatDoctorProbeTimeoutNote, modelAliasExclusions, modelAliasLine, probeAll, probeModels, probeScope, type ProbeScopeOpts, readDoctor, resolveShellBinary, servableExclusions, servabilityLine, writeDoctor } from "../../adapters/registry.js";
 import { CLAUDE_ALIAS_IDENTITY_STAMPS, claudeCode, type ClaudeAlias, resolveClaudeAliasIdentity } from "../../adapters/claude-code.js";
 import { shq } from "../../adapters/types.js";
 import { BANNER, compactTokens, dim, fail, kvRow, legend, ok, rule, statusRow, title } from "../../brand.js";
 import { graphPath, loadGraph, tickmarkrDir, stateDirName } from "../../graph/graph.js";
-import { catalogModelAdvisory, catalogTierRanking, declaredModelWindow, hasWindowsConfig, modelLints, suggestOverlay, ttyVisual } from "../../adapters/model-lints.js";
+import { catalogModelAdvisory, catalogTierRanking, declaredModelWindow, hasWindowsConfig, modelLints, modelListingLints, suggestOverlay, ttyVisual } from "../../adapters/model-lints.js";
 import { loadConfig, overlayPreferShapes } from "../../config/config.js";
 import { HerdrDriver } from "../../drivers/herdr.js";
 import { classifyHost } from "../../drivers/index.js";
@@ -74,6 +74,8 @@ export function recentReviewDemotions(cwd: string, lastRuns = 50): ReviewDemotio
 
 export type DoctorOpts = {
   banner?: boolean;
+  /** Fleet discloses and probes the same effective configuration, including --global-dir. */
+  globalDir?: string;
   kimiTurnProbe?: (cwd: string) => Promise<KimiDoctorTurnResult>;
   codexSandbox?: CodexSandbox;
   resolveClaudeAliasIdentity?: (cwd: string, alias: ClaudeAlias) => string | undefined;
@@ -1196,6 +1198,21 @@ export function liveBenchStalenessFinding(now: Date): string | undefined {
 
 type ConfiguredModel = { adapter: string; model: string };
 
+// Registry owns the shared pure scope so cache readers do not load CLI diagnostics.
+export { probeScope, type ProbeScopeOpts } from "../../adapters/registry.js";
+
+function probeScopeArgs(argv: string[]): ProbeScopeOpts {
+  const opts: ProbeScopeOpts = { all: argv.includes("--all") };
+  for (let i = 0; i < argv.length; i++) {
+    const flag = argv[i].split("=", 1)[0];
+    if (flag !== "--adapter" && flag !== "--model") continue;
+    const value = argv[i].includes("=") ? argv[i].slice(flag.length + 1) : argv[++i];
+    if (!value || value.startsWith("--")) throw new Error(`doctor: ${flag} requires a value`);
+    (opts[flag === "--adapter" ? "adapter" : "model"] ??= []).push(value);
+  }
+  return opts;
+}
+
 function configuredModels(cfg: ReturnType<typeof loadConfig>, adapters?: WorkerAdapter[]): ConfiguredModel[] {
   const allowed = adapters ? new Set(adapters.map((adapter) => adapter.id)) : undefined;
   return Object.entries(cfg.tiers).flatMap(([adapter, tier]) =>
@@ -1210,22 +1227,24 @@ function cacheAge(ageMs: number | null): string {
 
 /**
  * A no-call disclosure for the action that normal doctor performs.  This is deliberately built
- * from config alone: opening the disclosure must not turn a cache reader into a model purchase.
+ * from config and cached identities: opening it never makes adapter or model calls.
  */
 export function doctorProbePreflight(
   cwd = process.cwd(),
   cfg = loadConfig(cwd),
   adapters: WorkerAdapter[] = allAdapters(),
+  opts: ProbeScopeOpts = {},
 ): string {
-  const models = configuredModels(cfg, adapters);
+  const models = probeScope(cfg, opts, readDoctor(cwd)).filter((c) => adapters.some((a) => a.id === c.adapter));
   const scope = models.length
     ? models.map(({ adapter, model }) => `${adapter}:${model}`).join(", ")
     : "none (no configured models)";
   const state = stateDirName(cwd);
   return [
     "tickmarkr doctor — probe preflight:",
+    `probe selection: ${opts.all ? "all configured models" : opts.adapter?.length || opts.model?.length ? "explicit adapter/model selection" : "routing-reachable channels plus review, consult and judge preferences"}`,
     `configured model-call scope: ${models.length} model${models.length === 1 ? "" : "s"} — ${scope}`,
-    `cache policy: explicit probing replaces ${state}/doctor.json; each installed configured model receives one bounded call, with a serial retry only after a first failure (a prior timeout skips that retry)`,
+    `cache policy: probing merges selected verdicts into ${state}/doctor.json, preserving other verdicts and their probedAt; each installed in-scope model receives one bounded call, with a serial retry only after a first failure (a prior timeout skips that retry)`,
     `affected destinations: ${state}/doctor.json (adapter and model verdict cache); temporary probe prompts are removed`,
     "catalog-only alternative: tickmarkr doctor --refresh-catalog refreshes the catalog cache without adapter or model probes",
   ].join("\n");
@@ -1346,12 +1365,13 @@ export async function doctor(
   adapters: WorkerAdapter[] = allAdapters(),
   opts: DoctorOpts = {},
 ): Promise<string> {
+  const scopeOpts = probeScopeArgs(_argv);
   if (_argv.includes("--fix-only")) return doctorFixOnly(cwd);
   if (_argv.includes("--cached") || _argv.includes("--cached-only")) {
     return cachedDoctorDiagnostics(cwd, adapters);
   }
   if (_argv.includes("--probe-preflight") || _argv.includes("--preflight")) {
-    return doctorProbePreflight(cwd, loadConfig(cwd), adapters);
+    return doctorProbePreflight(cwd, loadConfig(cwd, { globalDir: opts.globalDir }), adapters, scopeOpts);
   }
   if (_argv.length === 1 && (_argv[0] === "--refresh-catalog" || _argv[0] === "--catalog-only")) {
     const refreshed = await refreshCatalogCommand({ repoRoot: cwd, fetcher: opts.catalogFetcher, now: opts.catalogNow });
@@ -1361,7 +1381,11 @@ export async function doctor(
   }
   // Operator directive 2026-08-12 (declutter): long per-model lists render only when asked for.
   const listAllModels = _argv.includes("--models");
-  const cfg = loadConfig(cwd);
+  const cfg = loadConfig(cwd, { globalDir: opts.globalDir });
+  const priorHealth = readDoctor(cwd);
+  const scope = probeScope(cfg, scopeOpts, priorHealth);
+  const explicitSelection = !!(scopeOpts.adapter?.length || scopeOpts.model?.length);
+  if (explicitSelection && !scopeOpts.all) adapters = adapters.filter((a) => scope.some((c) => c.adapter === a.id));
   let catalog = opts.catalog ?? readCachedCatalog(cwd, { now: opts.catalogNow });
   let catalogRefreshLine: string | undefined;
   // RULING-222-17 reverses cache-only for these two operator-facing commands only. The refresh
@@ -1384,11 +1408,28 @@ export async function doctor(
   if (opts.banner !== false && visual()) process.stdout.write(BANNER);
   // stderr, live: disclose the paid boundary before the first adapter/model call. The separate
   // --probe-preflight route exposes these same bytes without crossing that boundary.
-  console.error(`${doctorProbePreflight(cwd, cfg, adapters)}\nprobing installed agent CLIs — one short LLM call per configured model, may take a minute...`);
+  console.error(`${doctorProbePreflight(cwd, cfg, adapters, scopeOpts)}\nprobing installed agent CLIs — one short LLM call per in-scope model, may take a minute...`);
   const probeProgressTTY = process.stderr.isTTY === true;
-  const health = await probeAll(adapters, { cwd });
+  let health = await probeAll(adapters, { cwd });
+  for (const [id, h] of Object.entries(health)) {
+    // A missing or crashing CLI cannot refresh model probes. Its current absence supersedes
+    // that history, allowing reuse to fall back to this report's mtime instead of staying stale.
+    if (!h.installed) {
+      delete h.modelAuth;
+      continue;
+    }
+    // In-scope history must be replaced by this run's model verdicts. A skipped sweep
+    // (including Kimi's auth/turn short-circuit) then falls back to the report's mtime,
+    // while models outside the selection keep their verdicts and original times.
+    if (priorHealth?.[id]?.modelAuth) {
+      const untouched = Object.entries(priorHealth[id].modelAuth).filter(([model]) =>
+        !scope.some((c) => c.adapter === id && c.model === model));
+      h.modelAuth = { ...Object.fromEntries(untouched), ...h.modelAuth };
+    }
+  }
   const kimiAdapter = adapters.find((a) => a.id === kimi.id);
   const kimiTurnEnabled = kimiAdapter !== undefined
+    && scope.some((c) => c.adapter === kimi.id && c.model === "kimi-code/k3")
     && (kimiAdapter === kimi || opts.kimiTurnProbe !== undefined);
   if (kimiTurnEnabled) {
     const h = health.kimi;
@@ -1410,20 +1451,30 @@ export async function doctor(
   // MODEL-02: detect models where the adapter exposes a list surface, BEFORE writing doctor.json (write once, below).
   // Fail OPEN — the inverse of gates' fail-closed: detection is advisory, so a broken list surface NEVER fails doctor.
   for (const a of adapters) {
-    if (!a.listModels || !health[a.id].installed) continue;
+    if (!a.listModels) continue;
+    const h = health[a.id];
+    h.models = [];
+    delete h.modelsDetectedAt;
+    h.modelListing = { status: "unavailable" };
+    if (!h.installed) continue;
     try {
-      health[a.id].models = await a.listModels();
+      const listing = a.listModelsResult ? await a.listModelsResult() : undefined;
+      const models = listing?.models ?? await a.listModels();
+      h.modelListing = listing
+        ? { status: listing.status, ...(listing.reason ? { reason: listing.reason } : {}) }
+        : { status: models.length ? "succeeded" : "unavailable" };
+      h.models = h.modelListing.status === "succeeded" ? models : [];
       // MODEL-05: prefer the source's own fetch time (codex's cache fetched_at) so the staleness lint
       // measures real knowledge age, not run time. opencode reads its own offline cache too but exposes
       // no fetch timestamp, so it still stamps now — its staleness lint is best-effort until it surfaces one.
-      if (health[a.id].models.length) health[a.id].modelsDetectedAt = a.listModelsFetchedAt?.() ?? new Date().toISOString();
+      if (h.modelListing.status === "succeeded") h.modelsDetectedAt = a.listModelsFetchedAt?.() ?? new Date().toISOString();
       // v2.6.4 T2 (B1a): the CLI's retirement notices ride into doctor.json beside the list they describe;
       // an unreadable source leaves the field absent, which every reader treats as unknown.
       const retirements = a.listModelsRetirements?.();
       if (retirements) health[a.id].modelRetirements = retirements;
       const hidden = a.listModelsHidden?.(); // v2.6.9 (D-1526): the CLI's hidden flag, read by routing
       if (hidden) health[a.id].modelsHidden = hidden;
-    } catch { /* fail open: leave models as-is, doctor stays healthy */ }
+    } catch { /* unavailable: no drift may be inferred; doctor stays healthy */ }
   }
   // A free Kimi auth failure or failed earned-green turn must not spend more probes. Every other
   // adapter keeps the exact existing model-sweep path.
@@ -1440,7 +1491,7 @@ export async function doctor(
       else probeBad += 1;
       process.stderr.write(`\r\x1b[2K  probed ${probeOk + probeBad} channels · ${probeOk} ok${probeBad ? ` · ${probeBad} failed` : ""} · ${adapter}:${model} ${status} (${(durationMs / 1000).toFixed(1)}s)`);
     }
-    : undefined);
+    : undefined, scopeOpts);
   if (probeProgressTTY && probeOk + probeBad > 0) {
     process.stderr.write(`\r\x1b[2K  probed ${probeOk + probeBad} channels · ${probeOk} ok${probeBad ? ` · ${probeBad} failed` : ""}\n`);
   }
@@ -1455,7 +1506,7 @@ export async function doctor(
   if (identityResolver && health["claude-code"]?.installed) {
     const configured = cfg.tiers["claude-code"]?.models ?? {};
     for (const [alias, stampedIdentity] of Object.entries(CLAUDE_ALIAS_IDENTITY_STAMPS) as [ClaudeAlias, string][]) {
-      if (!(alias in configured)) continue;
+      if (!(alias in configured) || !scope.some((c) => c.adapter === claudeCode.id && c.model === alias)) continue;
       let resolvedIdentity: string | undefined;
       try {
         resolvedIdentity = identityResolver(cwd, alias);
@@ -1489,7 +1540,12 @@ export async function doctor(
   aliasDriftFindings.push(...discovery.findings);
   const portProbe = await probeLaunchServicesPorts();
   const launchServices = await recordLaunchServices(readDoctor(cwd), health, portProbe.observation);
-  writeDoctor(cwd, launchServices.health);
+  // Only scoped runs merge with the prior report. A full refresh must not revive
+  // adapters absent from this run (for example, a no-longer-registered CLI).
+  writeDoctor(cwd, launchServices.health, explicitSelection && !scopeOpts.all ? scope : undefined);
+  // A scoped probe's report must use the merged verdict set it just wrote. In particular,
+  // an unselected judge or consult adapter is not missing merely because it was not probed.
+  if (explicitSelection && !scopeOpts.all) health = readDoctor(cwd) ?? health;
   const rows = adapters.map((a) => {
     const h = health[a.id];
     // OBS-503: a crash-on-version verdict carries its reason in note — print it instead of the lie.
@@ -1631,8 +1687,9 @@ export async function doctor(
   const liveBenchStale = liveBenchStalenessFinding(opts.catalogNow?.() ?? new Date());
   if (liveBenchStale) lintRows.push(attentionRow(liveBenchStale));
   lintRows.push(...modelLints(cfg, health, adapters, { tty: ttyVisual(), stateDir: stateDirName(cwd), overlayPreferShapes: overlayPreferShapes(cwd), now: opts.now?.() }).map(attentionRow));
+  lintRows.push(...modelListingLints(cfg, health, adapters).map(attentionRow));
   const excluded = excludedChannels(cfg, adapters, health);
-  if (excluded.length) lintRows.push(attentionRow(exclusionLine(excluded)));
+  if (excluded.length) lintRows.push(attentionRow(exclusionLine(excluded, listAllModels)));
   lintRows.push(...denyPreferCollisions(cfg, undefined, health).map((c) => attentionRow(denyPreferCollisionLine(c))));
   const aliasExcluded = modelAliasExclusions(cfg, adapters, health);
   if (aliasExcluded.length) lintRows.push(attentionRow(modelAliasLine(aliasExcluded)));
@@ -1684,6 +1741,16 @@ export async function doctor(
   // renders — otherwise an adapter's band would depend on where it sits in the iteration.
   const catalogRanking = catalogTierRanking(cfg, catalog, [...unclassifiedByAdapter].flatMap(([adapter, models]) =>
     models.map((model) => ({ adapter, model, resolvedModel: resolvedCatalogModel(adapter, model) }))), resolvedCatalogModel);
+  // D-1518: configured tiers use the same suggestion (and tierBandOf) as unclassified rows.
+  // Check every configured model, including adapters absent from the installed status table.
+  for (const [adapter, entry] of Object.entries(cfg.tiers)) {
+    for (const [model, tier] of Object.entries(entry.models)) {
+      const { suggestion } = catalogModelAdvisory(cfg, catalog, adapter, model, resolvedCatalogModel(adapter, model), catalogRanking);
+      if (suggestion && tier !== suggestion.tier) {
+        lintRows.push(attentionRow(`tier drift: ${adapter}:${model} configured ${tier}; ${suggestion.provenanceNote} (advisory — routing unchanged)`));
+      }
+    }
+  }
   const modelStatus = adapters.flatMap((a) => {
     const h = health[a.id];
     if (!h?.installed) return [];
@@ -1705,6 +1772,8 @@ export async function doctor(
           ? `${fail(`probe error (${v.probeError})`)}${probed}`
           : v.authed
           ? `${ok("authed")}${probed}`
+          : v.cause === "unknown-model"
+          ? `${fail(`${m} is not served by ${a.id}`)} (${dateOf(v.probedAt)})`
           : `${fail("unauthed:")} ${trunc(v.reason ?? "probe failed", 40)} (${dateOf(v.probedAt)})`;
       const d = disallowedBy(observedSeat(health, a.id, m), cfg.routing);
       const denied = d?.by === "deny" ? d.entry : "—";
@@ -1733,7 +1802,7 @@ export async function doctor(
       const decisive = advisories.filter((adv) => adv.suggestion);
       const bulk = advisories.filter((adv) => !adv.suggestion);
       const shown = listAllModels ? advisories : decisive;
-      for (const advisory of shown) rows.push(`    ${dim(`catalog · ${advisory.display}`)}`);
+      for (const advisory of shown) rows.push(`    ${dim(`catalog · ${advisory.display} · adapter: ${a.id}`)}`);
       if (!listAllModels && bulk.length) {
         const uncovered = bulk.filter((adv) => adv.coverage === "uncovered").length;
         const unknown = bulk.filter((adv) => adv.coverage === "unknown").length;
@@ -1743,7 +1812,7 @@ export async function doctor(
           ...(unknown ? [`${unknown} coverage unknown after a failed refresh`] : []),
           ...(evidenceOnly ? [`${evidenceOnly} covered without a tier suggestion`] : []),
         ];
-        rows.push(`    ${dim(`catalog · ${parts.join(" · ")} — tickmarkr doctor --models lists each`)}`);
+        rows.push(`    ${dim(`catalog · ${parts.join(" · ")} — tickmarkr doctor --models lists each · adapter: ${a.id}`)}`);
       }
     }
     return rows;

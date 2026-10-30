@@ -82,10 +82,29 @@ export function excludedChannels(
   return out;
 }
 
-export function exclusionLine(excluded: { key: string; d: Disallowed }[]): string {
-  const parts = excluded.map(({ key, d }) => `${key} (${d.by}: ${d.entry})`);
-  return `routing preference active: ${excluded.length} channel(s) excluded — ${parts.join(", ")}`;
+/** Count each channel once; allow misses share a reason, never a copy of the allowlist. */
+export function formatExcludedChannels(excluded: { key: string; d: Disallowed }[], models = false): string {
+  const groups = new Map<string, string[]>();
+  const seen = new Set<string>();
+  for (const { key, d } of excluded) {
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const adapter = key.slice(0, key.indexOf(":"));
+    const reason = d.by === "allow" ? "not in routing.allow"
+      : d.entry === adapter ? `denied adapter ${adapter}` : "denied model";
+    const channels = groups.get(reason) ?? [];
+    channels.push(key);
+    groups.set(reason, channels);
+  }
+  return [
+    `routing preference active: ${seen.size} channel(s) excluded`,
+    ...[...groups].map(([reason, channels]) =>
+      `  ${reason}: ${channels.length}${models ? ` — ${channels.join(", ")}` : ""}`),
+    ...(!models && seen.size ? ["  tickmarkr doctor --models lists each excluded channel"] : []),
+  ].join("\n");
 }
+
+export const exclusionLine = formatExcludedChannels;
 
 // T4: the prefer rank a channel holds across the routing map — every shape whose prefer list ranks
 // it, with its 0-based index in that list. Empty ⇒ the channel isn't a prefer target (routes only via

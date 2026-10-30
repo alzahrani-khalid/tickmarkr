@@ -404,8 +404,8 @@ describe("suggestOverlay — paste-ready drift fragment", () => {
 
 // D-2 (.planning/assessments/2026-08-13-ranking-sites.md §4.3): the absolute `index >= 65 → frontier`
 // cut was calibrated against a pre-rescale AA index. Under v4.x the #1 model on the whole leaderboard
-// scores 63.05, so the frontier branch was unreachable. Bands are FLEET-RELATIVE thirds now, over the
-// models that actually carry same-basis evidence, so the next vendor rescale moves nothing.
+// scores 63.05, so the frontier branch was unreachable. D-1518 uses ratios to the fleet top among
+// models that actually carry same-basis evidence, with AA first.
 describe("catalogModelAdvisory — fleet-relative tier bands", () => {
   const AGENTIC_TASKS = ["javascript", "typescript", "python"] as const;
   const CATEGORIES = { "Agentic Coding": [...AGENTIC_TASKS], Coding: ["code_generation"] };
@@ -474,9 +474,9 @@ describe("catalogModelAdvisory — fleet-relative tier bands", () => {
       [model, catalogModelAdvisory(base, catalog, "fake", model, undefined, ranking).suggestion]));
   };
 
-  test("test: a fleet whose best AA intelligence index is 63 gets frontier suggested for its top third mid for its middle third and cheap for its bottom third, so the retired absolute 65 cut under which no model in existence could reach frontier fails", () => {
+  test("a fleet whose best AA intelligence index is below 65 gets suggestions by score ratio to its top", () => {
     // Verbatim from the 2026-08-13 AA leaderboard read: the #1 model scores 63.05 and NOTHING in
-    // this fleet clears the retired 65. Six models → thirds are 2/2/2.
+    // this fleet clears the retired 65. D-1518's ratio bands happen to split this sample 2/2/2.
     const fleet: Fixture[] = [
       { id: "aurora", intelligence: 63.05 },
       { id: "boreal", intelligence: 60.9 },
@@ -493,8 +493,8 @@ describe("catalogModelAdvisory — fleet-relative tier bands", () => {
     expect(fleet.every((m) => (m.intelligence ?? 0) < 65)).toBe(true);   // the retired cut's premise
     expect(ids.map((id) => suggested.get(id)?.tier)).toEqual(["frontier", "frontier", "mid", "mid", "cheap", "cheap"]);
     expect(suggested.get("aurora")).toMatchObject({ kind: "inference", basis: "intelligence" });
-    expect(suggested.get("aurora")?.provenanceNote).toContain("fleet-relative rank 1/6");
-    expect(suggested.get("flint")?.provenanceNote).toContain("fleet-relative rank 6/6");
+    expect(suggested.get("aurora")?.provenanceNote).toContain("score=63.05; top=63.05; ratio=1; D-1518");
+    expect(suggested.get("flint")?.provenanceNote).toContain(`score=40; top=63.05; ratio=${40 / 63.05}; D-1518`);
 
     // The paste-ready overlay is a production caller: it must band against the same universe.
     const adapter = { id: "fake", listModels: async () => ids } as unknown as WorkerAdapter;
@@ -505,7 +505,7 @@ describe("catalogModelAdvisory — fleet-relative tier bands", () => {
     expect(frag).not.toMatch(/^[^#]*:\s*(cheap|mid|frontier)\s*($|#)/m);
   });
 
-  test("test: a model carrying both agenticCodingScore and intelligenceIndex is banded by its LiveBench rank in a fixture where its AA rank lands a different band, and an AA-based suggestion's provenance note records the intelligence index version, so wrong basis precedence or a silently rescalable AA suggestion fails", () => {
+  test("a model carrying both benchmark scores uses AA first and cites the intelligence index version", () => {
     // aurora is the AA leader and the LiveBench laggard — the two bases disagree on purpose.
     const fleet: Fixture[] = [
       { id: "aurora", intelligence: 63, agentic: 30 },
@@ -518,16 +518,15 @@ describe("catalogModelAdvisory — fleet-relative tier bands", () => {
     const { catalog } = fetched(fleet);
     const suggested = suggestions(base, catalog, ids);
 
-    // LiveBench wins: bottom of three agentic scores → cheap, and the note names table + date.
-    expect(suggested.get("aurora")).toMatchObject({ tier: "cheap", basis: "agentic-coding" });
+    // AA wins: its fleet leader remains frontier despite a weak LiveBench score.
+    expect(suggested.get("aurora")).toMatchObject({ tier: "frontier", basis: "intelligence" });
     expect(suggested.get("aurora")?.provenanceNote)
-      .toContain("fleet-relative rank 3/3 by LiveBench Agentic Coding 30 (LiveBench table 2026_06_25)");
-    // control: the SAME fixture without the LiveBench leg bands aurora frontier off its AA rank —
-    // so "cheap" above is basis precedence, not an accident of the numbers.
+      .toContain("fleet-top ratio band by Artificial Analysis Intelligence Index 63 (intelligence index version 4.1.1)");
+    // Removing LiveBench leaves the same AA suggestion.
     const aaOnly = fetched(fleet, { liveBench: false });
     expect(suggestions(base, aaOnly.catalog, ids).get("aurora")).toMatchObject({ tier: "frontier", basis: "intelligence" });
 
-    // dunlin has no LiveBench row, so it falls to AA — and an AA band must date itself by index version.
+    // dunlin also uses AA — and an AA band must date itself by index version.
     expect(suggested.get("dunlin")).toMatchObject({ basis: "intelligence" });
     expect(suggested.get("dunlin")?.provenanceNote).toContain(`intelligence index version ${INDEX_VERSION}`);
   });
@@ -579,8 +578,8 @@ describe("catalogModelAdvisory — fleet-relative tier bands", () => {
     expect(catalogTierRanking(base, vendored, [{ adapter: "fake", model: "claude-sonnet-5" }])).toEqual([]);
   });
 
-  test("test: a basis with fewer than three evidenced models in the ranking universe yields to the next basis and an evidence-free api-channel model still receives the price-derived suggestion, so banding thirds over a two-model sample or breaking the composer-2.5 price fallback fails", () => {
-    // Two LiveBench rows is a coin toss, not a banding — the agentic basis yields to AA. composer-2.5
+  test("a basis with fewer than three scored models gives no benchmark band and an evidence-free api model keeps its price suggestion", () => {
+    // Two LiveBench rows cannot anchor a band. composer-2.5
     // has zero public benchmark evidence anywhere (assessment §4.4): price is its permanent home.
     const fleet: Fixture[] = [
       { id: "aurora", intelligence: 63, agentic: 80 },
@@ -597,7 +596,7 @@ describe("catalogModelAdvisory — fleet-relative tier bands", () => {
     expect(ranking.map((band) => band.basis)).toEqual(["intelligence"]);   // agentic (2) yielded
     // aurora HAS an agentic score and is still banded by AA — the yield is per universe, not per model
     expect(suggested.get("aurora")).toMatchObject({ tier: "frontier", basis: "intelligence" });
-    expect(suggested.get("aurora")?.provenanceNote).toContain("fleet-relative rank 1/3");
+    expect(suggested.get("aurora")?.provenanceNote).toContain("score=63; top=63; ratio=1; D-1518");
     expect(suggested.get("cinder")).toMatchObject({ tier: "cheap", basis: "intelligence" });
 
     expect(suggested.get("composer-2.5")).toMatchObject({ tier: "frontier", kind: "inference", basis: "price" });
@@ -666,7 +665,7 @@ describe("catalogModelAdvisory — fleet-relative tier bands", () => {
       .toEqual([{ basis: "intelligence", scores: [50, 50, 50] }]);   // three members, not one
     const suggested = suggestions(base, catalog, ids);
     expect(ids.map((id) => suggested.get(id)?.basis)).toEqual(["intelligence", "intelligence", "intelligence"]);
-    expect(suggested.get("alpha")?.provenanceNote).toContain("fleet-relative rank 1/3");
+    expect(suggested.get("alpha")?.provenanceNote).toContain("score=50; top=50; ratio=1; D-1518");
   });
 
   test("test: two providers sharing a bare model id rank as two distinct members by catalogId while two fleet aliases resolving to the same matched catalog record dedup to one member, so namespace-stripped or caller-spelling identity that collapses or double-counts the ranked basis fails", () => {

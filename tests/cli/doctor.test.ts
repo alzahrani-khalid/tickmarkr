@@ -188,9 +188,9 @@ describe("V-10 fleet preference visibility (doctor)", () => {
     const out = await doctor(["--"], repo, ADAPTERS5);
     expect(out).toMatch(/^tickmarkr doctor — capability matrix:/);
     expect(out).not.toContain(retiredBanner);
-    expect(out).toContain("pi:zai/glm-5.2");
+    expect(out).toContain("tickmarkr doctor --models lists each excluded channel");
     expect(out).toMatch(/! routing preference active: 3 channel\(s\) excluded/);
-    expect(out).toMatch(/deny: pi/);
+    expect(out).toContain("denied adapter pi: 3");
   });
 
   test("V-10c: no preference — exclusion line absent", async () => {
@@ -295,7 +295,7 @@ describe("model status table (T4)", () => {
   deny:
     models: [fake:fake-1]
 `);
-    const out = await doctor(["--"], repo, [mkFake(script)]);
+    const out = await doctor(["--all"], repo, [mkFake(script)]);
     // the denied flag names the matched entry; fake-denied (not denied) stays denied=—
     expect(out).toMatch(/fake-1\s+mid\s+authed [\d.]+s\s+denied=fake:fake-1\s+prefer=—/);
     expect(out).toMatch(/fake-denied[\s\S]*denied=—/);

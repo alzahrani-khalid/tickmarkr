@@ -123,13 +123,13 @@ function setup() {
       version: "fake",
       models: ["fake-1", "fake-2", "fake-3", "fake-4", "fake-5"],
       modelAuth: {
-        "fake-1": { authed: true, probedAt: "2026-09-12T00:00:00.000Z" },
-        "fake-2": { authed: true, probedAt: "2026-09-12T00:00:00.000Z" },
+        "fake-1": { authed: true, probedAt: new Date().toISOString() },
+        "fake-2": { authed: true, probedAt: new Date().toISOString() },
         // OBS-972/FL-1: a resolved alias no deny covers — flags uncovered
-        "fake-3": { authed: true, probedAt: "2026-09-12T00:00:00.000Z", identity: "resolved-3" },
+        "fake-3": { authed: true, probedAt: new Date().toISOString(), identity: "resolved-3" },
         // a resolved alias its OWN workers-deny entry above also covers — no flag
-        "fake-4": { authed: true, probedAt: "2026-09-12T00:00:00.000Z", identity: "resolved-4" },
-        "fake-5": { authed: false, reason: "quota exceeded", probedAt: "2026-09-12T00:00:00.000Z" },
+        "fake-4": { authed: true, probedAt: new Date().toISOString(), identity: "resolved-4" },
+        "fake-5": { authed: false, reason: "quota exceeded", probedAt: new Date().toISOString() },
       },
     },
   });
@@ -154,7 +154,8 @@ test("test: a config with a workers-only deny opens in the fleet browser showing
       + KEYS.down // → fake-3 (resolved alias, uncovered)
       + KEYS.down // → fake-4 (resolved alias, covered by its own workers-deny entry)
       + KEYS.down // → fake-5 (unauthed)
-      + KEYS.space // Space on the unauthed row — must not toggle its reach
+      + KEYS.space // opening the out-only picker does not itself change reach
+      + "\x1b" // cancel the picker before quitting the browser
       + KEYS.q + KEYS.q,
   );
   const out = await done;
@@ -253,7 +254,7 @@ function policyRepo(models: string[], routing: string[], identities: Record<stri
       models,
       modelAuth: Object.fromEntries(models.map((m) => [m, {
         authed: true,
-        probedAt: "2026-09-12T00:00:00.000Z",
+        probedAt: new Date().toISOString(),
         ...(identities[m] ? { identity: identities[m] } : {}),
       }])),
     },
@@ -394,7 +395,7 @@ test("round 2 finding 1 (revised by OBS-1099): a bare-model workers deny shared 
     "      models: [fake-1]",
     "",
   ].join("\n"));
-  const authed = { authed: true, probedAt: "2026-09-12T00:00:00.000Z" };
+  const authed = { authed: true, probedAt: new Date().toISOString() };
   registry.writeDoctor(repo, {
     fake: { installed: true, authed: true, version: "fake", models: ["fake-1", "fake-2"], modelAuth: { "fake-1": authed, "fake-2": authed } },
     twin: { installed: true, authed: true, version: "twin", models: ["fake-1"], modelAuth: { "fake-1": authed } },
@@ -599,7 +600,7 @@ test("test: an adapter rail row offers the same three reach choices and out for 
   const b = policyRepo(["fake-1", "fake-2"], ["  deny:", "    workers:", "      adapters: [fake]"]);
   const back = await browse(b.repo, b.globalDir, RAIL_FAKE + REACH_IN + "w" + "y");
   expect(back.out).toMatch(/^fleet: wrote /);
-  expect(back.frames.join("\n")).toContain("space: cleared fake from routing.deny.workers.adapters");
+  expect(back.frames.join("\n")).toContain("space: removed fake from routing.deny.workers.adapters");
   const cfgB = loadConfig(b.repo, { globalDir: b.globalDir });
   expect(denyEntries(cfgB)).toEqual({ adapters: [], models: [], workersAdapters: [], workersModels: [] });
   for (const role of ROLES) expect(outFor(cfgB, "fake-1", role), role).toBe(false);
@@ -671,7 +672,7 @@ test("D-199: an adapter rail row holding two reasons — routing.deny.adapters a
   expect(picker).toBeDefined();
   expect(picker).toContain("routing.deny.adapters (fake)");
   expect(picker).toContain("routing.deny.models (fake)");
-  const edited = rowLine(frames, "space: cleared fake from routing.deny.adapters");
+  const edited = rowLine(frames, "space: removed fake from routing.deny.adapters");
   expect(edited).toBeDefined();
   expect(edited).toContain("still out: routing.deny.models (fake)");
   expect(overlayOf(repo)).toContain("models: [fake] # covers every fake channel");
@@ -704,7 +705,7 @@ test("OBS-1099 review round 3: clearing an adapter rail deny while one channel k
   const picker = frames.find((f) => f.includes("reach · fake") && f.includes("now: out-all"));
   expect(picker).toContain("routing.deny.adapters (fake)");
   expect(picker).toContain("fake-1: routing.deny.models (fake:fake-1)");
-  const edited = rowLine(frames, "space: cleared fake from routing.deny.adapters");
+  const edited = rowLine(frames, "space: removed fake from routing.deny.adapters");
   expect(edited).toBeDefined();
   expect(edited).toContain("still out: fake-1: routing.deny.models (fake:fake-1)");
   const cfg = loadConfig(repo, { globalDir });
@@ -770,7 +771,7 @@ test("OBS-1099 review round 5: an adapter rail row whose channels are all out fo
   const picker = frames.find((f) => f.includes("reach · fake") && f.includes("now: "));
   expect(picker).toBeDefined();
   expect(picker).toContain("now: out-all — ");
-  expect(picker).not.toContain("partial");
+  expect(picker!.split("\n").find((line) => line.includes("now: "))).not.toContain("partial");
   const all = frames.join("\n");
   expect(all).toContain("fake is already out · all seats");
   expect(all).not.toContain("to routing.deny.adapters");
@@ -779,9 +780,9 @@ test("OBS-1099 review round 5: an adapter rail row whose channels are all out fo
 
 // ── OBS-1099 items 2 and 3, OBS-1065: covered aliases name their entry; the picker greys and lifts ──
 
-// rail → Shapes (its first entry raises the presets overlay; Esc lands on the list) → implement
+// rail → Shapes → implement
 // (floor mid, so every mid channel is eligible) → p opens the candidate picker
-const OPEN_IMPLEMENT_PICKER = "\x1b[D" + KEYS.down + "\r" + "\x1b" + KEYS.down + KEYS.down + "p";
+const OPEN_IMPLEMENT_PICKER = "\x1b[D" + KEYS.down + "\r" + KEYS.down + KEYS.down + "p";
 const QUIT_NOW = "\x03";
 const detailOf = (frames: string[], needle: string) => frames.flatMap((f) => f.split("\n")).find((line) => line.includes(needle));
 
@@ -945,7 +946,7 @@ test("review round 2 finding 1: a bare-model entry shared across two adapters na
     "      models: [fake-1]",
     "",
   ].join("\n"));
-  const authed = { authed: true, probedAt: "2026-09-12T00:00:00.000Z" };
+  const authed = { authed: true, probedAt: new Date().toISOString() };
   registry.writeDoctor(repo, {
     fake: { installed: true, authed: true, version: "fake", models: ["fake-1"], modelAuth: { "fake-1": authed } },
     twin: { installed: true, authed: true, version: "twin", models: ["fake-1"], modelAuth: { "fake-1": authed } },
@@ -993,8 +994,8 @@ test("review round 4: Enter on a greyed picker row whose model probe failed refu
       version: "fake",
       models: ["fake-1", "fake-2"],
       modelAuth: {
-        "fake-1": { authed: true, probedAt: "2026-09-12T00:00:00.000Z" },
-        "fake-2": { authed: false, reason: "quota exceeded", probedAt: "2026-09-12T00:00:00.000Z" },
+        "fake-1": { authed: true, probedAt: new Date().toISOString() },
+        "fake-2": { authed: false, reason: "quota exceeded", probedAt: new Date().toISOString() },
       },
     },
   });
@@ -1035,7 +1036,7 @@ test("review round 3: a row whose folded alias is covered by the row's own expli
       modelsDetectedAt: "2026-09-03T12:00:00.000Z",
       modelAuth: Object.fromEntries(["fake-1", ...ids].map((m) => [m, {
         authed: true,
-        probedAt: "2026-09-12T00:00:00.000Z",
+        probedAt: new Date().toISOString(),
         ...(m === "fake-1" ? {} : { identity: "same-model" }),
       }])),
     },
@@ -1100,7 +1101,7 @@ test("review round 6 finding 2: a lone displayed alias covered by a flat routing
   const all = frames.join("\n");
   expect(detailOf(frames, "covered by ")).toContain("covered by routing.deny.adapters (fake) — shared: covers fake:fake-1 (r1) — l lifts that one entry");
   expect(all).toContain("fake:fake-1 stays out — routing.deny.adapters (fake) covers 1 channels — Space edits only this channel's own entries; l lists and lifts it");
-  expect(all).not.toContain("cleared fake from routing.deny.adapters");
+  expect(all).not.toContain("removed fake from routing.deny.adapters");
   expect(overlayOf(repo)).toBe(overlay);
   expect(denyEntries(loadConfig(repo, { globalDir }))).toEqual({ adapters: ["fake"], models: [], workersAdapters: [], workersModels: [] });
 });
@@ -1294,7 +1295,7 @@ test("test: for every enumerated deny scope the reach picker on the owning row l
     const keys = (isAdapterScope(scope) ? RAIL_FAKE : "") + REACH_IN + "w" + "y";
     const { out, frames } = await browse(repo, globalDir, keys);
     expect(out, scope.dotted).toMatch(/^fleet: wrote /);
-    expect(rowLine(frames, `space: cleared ${entry} from ${scope.dotted}`), scope.dotted).toBeDefined();
+    expect(rowLine(frames, `space: ${isAdapterScope(scope) ? "removed" : "cleared"} ${entry} from ${scope.dotted}`), scope.dotted).toBeDefined();
     const cfg = loadConfig(repo, { globalDir });
     expect(denyEntriesAt(cfg.routing, scope) ?? [], `${scope.dotted} cleared`).toEqual([]);
     expect(denyEntriesAt(cfg.routing, sibling), `${sibling.dotted} kept beside ${scope.dotted}`).toEqual(["fake:fake-2"]);
@@ -1552,7 +1553,7 @@ test("production Fleet executes the closed grouped membership edit table for row
     await s.key("\x1b");
     await s.key("\t" + KEYS.down + KEYS.down + KEYS.down);
     await s.key(REACH_IN);
-    expect(s.frame()).toContain("space: cleared fake from routing.deny.workers.adapters");
+    expect(s.frame()).toContain("space: removed fake from routing.deny.workers.adapters");
     const written = await s.save();
     // the rail cleared its own adapter entry (a cleared list is tombstoned null, never left holding fake)
     expect((written.routing?.deny as { workers?: { adapters?: string[] | null } } | undefined)?.workers?.adapters ?? null).toBeNull();

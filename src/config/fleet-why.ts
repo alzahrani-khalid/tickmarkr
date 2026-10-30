@@ -1,4 +1,15 @@
 import { DEFAULT_CONFIG, fleetKeyLayer } from "./config.js";
+import { channelKey } from "../adapters/types.js";
+import type { Route } from "../route/router.js";
+
+export type ShapeWhy = {
+  declaration: string;
+  declaredAt?: string;
+  operatorPinned?: boolean;
+  members: { id: string; admitted: boolean; reason: string }[];
+  routed?: Route;
+  error?: string;
+};
 
 export type FleetWhySource =
   | "repo-overlay"
@@ -16,11 +27,13 @@ export type FleetWhyValue<Id extends string = string> = {
   operatorPinned?: boolean;
   /** Paste-ready only: projection and renderers never execute setup actions. */
   setupCommand?: string;
+  shapeWhy?: ShapeWhy;
 };
 
 export type FleetWhyRow<Id extends string = string> = FleetWhyValue<Id> & {
   source: FleetWhySource;
   label: string;
+  shapeSource?: FleetWhySource;
 };
 
 export type FleetWhyOptions = {
@@ -37,7 +50,7 @@ function valueAt(root: unknown, dotted: string): unknown {
   return value;
 }
 
-function sourceOf(value: FleetWhyValue, options: FleetWhyOptions): FleetWhySource {
+function sourceOf(value: Pick<FleetWhyValue, "operatorPinned" | "declaredAt">, options: FleetWhyOptions): FleetWhySource {
   if (value.operatorPinned) return "operator-pinned";
   if (!value.declaredAt) return "defaulted";
   const layer = fleetKeyLayer(options.repoRoot, value.declaredAt, {
@@ -61,14 +74,30 @@ export function projectFleetWhy<Id extends string>(
     return {
       ...value,
       source,
+      ...(value.shapeWhy ? { shapeSource: sourceOf(value.shapeWhy, options) } : {}),
       label: `${value.id}  →  ${value.effective}  · source: ${source}${setup}`,
     };
   });
 }
 
-/** Plain line-mode twin of the Shapes rows; labels are projected, never reconstructed here. */
+/** Reuse the Shapes labels and expand their route evidence for line-mode --why output. */
 export function renderFleetWhy(rows: readonly FleetWhyRow[]): string {
-  return ["tickmarkr fleet --why — effective shape routing", ...rows.map((row) => row.label)].join("\n");
+  return ["tickmarkr fleet --why — effective shape routing", ...rows.map((row) =>
+    row.label + (row.shapeWhy ? `\n${renderShapeWhy(row.shapeWhy, row.shapeSource)}` : ""))].join("\n");
+}
+
+/** The pick and choosing rule come verbatim from the production router's result. */
+export function renderShapeWhy(why: ShapeWhy, source: FleetWhySource = "defaulted"): string {
+  return [
+    `  ${why.declaration} · source: ${source}`,
+    ...why.members.map((member) => `    ${member.id}: ${member.admitted ? "admitted" : "skipped"} — ${member.reason}`),
+    ...(why.routed ? [
+      `  pick: ${channelKey(why.routed.assignment)}`,
+      `  rule: ${why.routed.provenance}`,
+      `  ladder: ${why.routed.ladder.join(" → ")}`,
+      ...why.routed.lints.map((lint) => `  lint: ${lint}`),
+    ] : [`  pick: unroutable — ${why.error ?? "routing unavailable"}`]),
+  ].join("\n");
 }
 
 /** LEG2-T3: one exclusion-collector scope as the reason a fleet row shows — its config path, then

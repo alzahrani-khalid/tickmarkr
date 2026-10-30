@@ -141,8 +141,9 @@ const fleetRepo = (routingYaml = `routing:\n${PINS_TO("fake-1")}`) => {
   const repo = makeRepo({ "keep.txt": "x\n" });
   mkdirSync(join(repo, ".tickmarkr"), { recursive: true });
   writeFileSync(join(repo, ".tickmarkr", "config.yaml"), FLEET_TIERS + routingYaml);
+  const probedAt = new Date().toISOString();
   writeDoctor(repo, {
-    fake: { installed: true, authed: true, version: "fake", models: ["fake-1", "fake-2"], modelAuth: authedModels(["fake-1", "fake-2"]) },
+    fake: { installed: true, authed: true, version: "fake", models: ["fake-1", "fake-2"], modelAuth: Object.fromEntries(["fake-1", "fake-2"].map((model) => [model, { authed: true, probedAt }])) },
   });
   const script = join(repo, "fake.json");
   writeFileSync(script, JSON.stringify({ tasks: {} }));

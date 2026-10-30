@@ -1,4 +1,4 @@
-import { existsSync, mkdtempSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, utimesSync, writeFileSync } from "node:fs";
 import { PassThrough } from "node:stream";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -14,13 +14,15 @@ const { mockCreateInterface } = vi.hoisted(() => {
 vi.mock("node:readline/promises", () => ({ createInterface: mockCreateInterface }));
 
 import * as registry from "../../src/adapters/registry.js";
+import { FakeAdapter } from "../../src/adapters/fake.js";
+import { channelsFromConfig } from "../../src/adapters/types.js";
 import { BANNER, legend, rule, statusRow, title } from "../../src/brand.js";
 import { init } from "../../src/cli/commands/init.js";
-import { configTemplate, loadConfig, renderFleetOverlayWrite, type FleetEditable } from "../../src/config/config.js";
+import { configTemplate, DEFAULT_CONFIG, loadConfig, renderFleetOverlayWrite, type FleetEditable } from "../../src/config/config.js";
 import { tickmarkrDir, stateDirName } from "../../src/graph/graph.js";
 import { Journal } from "../../src/run/journal.js";
 import { acquireRunLock, releaseRunLock } from "../../src/run/lock.js";
-import { makeRepo } from "../helpers/tmprepo.js";
+import { makeRepo, makeTestTempDir } from "../helpers/tmprepo.js";
 
 const ROOT = join(import.meta.dirname, "../..");
 const skill = (name: string) => readFileSync(join(ROOT, "skills", name, "SKILL.md"));
@@ -121,7 +123,7 @@ const stampDoctor = (repo: string, ageMs: number) => {
   utimesSync(join(tickmarkrDir(repo), "doctor.json"), when, when);
 };
 
-afterEach(() => vi.restoreAllMocks());
+afterEach(() => { vi.restoreAllMocks(); vi.unstubAllEnvs(); });
 
 const withTTY = async (fn: () => Promise<void>) => {
   const stdinTTY = Object.getOwnPropertyDescriptor(process.stdin, "isTTY");
@@ -159,6 +161,145 @@ const withoutTTY = async (fn: () => Promise<void>) => {
 
 
 describe("tickmarkr init doctor.json reuse (T1)", () => {
+  function globalScopeFixture(defaultRouting: object, selectedRouting: object, selectedOnlyModel = false) {
+    const repo = makeRepo({ "keep.txt": "x" });
+    const globalDir = makeTestTempDir("init-selected-global-");
+    const xdg = makeTestTempDir("init-default-global-");
+    vi.stubEnv("XDG_CONFIG_HOME", xdg);
+    mkdirSync(join(xdg, "tickmarkr"));
+    const tiers = {
+      ...Object.fromEntries(Object.keys(DEFAULT_CONFIG.tiers).map((id) => [id, null])),
+      fake: { vendor: "fake", channel: "sub", models: { "fake-1": "mid" } },
+      kimi: { vendor: "moonshot", channel: "sub", models: {
+        ...Object.fromEntries(Object.keys(DEFAULT_CONFIG.tiers.kimi.models).map((model) => [model, null])),
+        "kimi-code/k3": "mid", "kimi-code/other": "cheap",
+      } },
+    };
+    writeFileSync(join(xdg, "tickmarkr", "config.yaml"), JSON.stringify({ tiers, routing: defaultRouting }));
+    if (selectedOnlyModel) Object.assign(tiers.kimi.models, { "kimi-code/private": "mid" });
+    writeFileSync(join(globalDir, "config.yaml"), JSON.stringify({ tiers, routing: selectedRouting }));
+    writeFileSync(join(tickmarkrDir(repo), "config.yaml"), "judge: { adapter: fake, model: fake-1 }\nconsult: { adapter: fake, model: fake-1 }\n");
+    const cfg = loadConfig(repo, { globalDir });
+    const old = new Date(Date.now() - 70 * 60_000).toISOString();
+    const script = join(repo, "fake.json");
+    writeFileSync(script, JSON.stringify({ tasks: {} }));
+    const adapters = ["fake", "kimi"].map((id) => {
+      const adapter = new FakeAdapter(script);
+      adapter.id = id;
+      const models = Object.keys(cfg.tiers[id].models);
+      vi.spyOn(adapter, "probe").mockImplementation(async () => ({ installed: true, authed: true, models }));
+      vi.spyOn(adapter, "channels").mockImplementation((config) => channelsFromConfig(id, config));
+      vi.spyOn(adapter, "headlessCommand");
+      return adapter;
+    });
+    vi.spyOn(registry, "allAdapters").mockReturnValue(adapters);
+    vi.spyOn(registry, "detectCandidateClis").mockReturnValue([]);
+    vi.spyOn(registry, "resolveShellBinary").mockReturnValue({ all: [] });
+    const preflight = vi.spyOn(console, "error").mockImplementation(() => {});
+    registry.writeDoctor(repo, Object.fromEntries(adapters.map(({ id }) => [id, {
+      installed: true, authed: true, models: Object.keys(cfg.tiers[id].models),
+      modelAuth: Object.fromEntries(Object.keys(cfg.tiers[id].models).map((model) => [model, {
+        authed: true, probedAt: id === "fake" ? new Date().toISOString() : old,
+      }])),
+    }])));
+    const calls = () => adapters.flatMap((a) => vi.mocked(a.headlessCommand).mock.calls.map(([, model]) => `${a.id}:${model}`)).sort();
+    return { repo, globalDir, cfg, old, calls, preflight };
+  }
+
+  test("init --global-dir refreshes an admitted Kimi verdict, opens fleet and reuses the cache without another probe", async () => {
+    const f = globalScopeFixture({ deny: { adapters: ["kimi"] } }, {});
+    const io = makeIO();
+    const write = io.output.write;
+    let opened = false;
+    vi.spyOn(io.output, "write").mockImplementation((chunk) => {
+      const result = write(chunk);
+      if (!opened && strip(chunk).includes("All models")) {
+        opened = true;
+        io.input.write("q");
+      }
+      return result;
+    });
+    try {
+      const out = await init(["--global-dir", f.globalDir], f.repo, {
+        input: io.input as unknown as NodeJS.ReadStream, output: io.output as unknown as NodeJS.WriteStream,
+      });
+      expect.soft(f.preflight.mock.calls.flat().join("\n")).toContain("scope: 3 models — kimi:kimi-code/k3, kimi:kimi-code/other, fake:fake-1");
+      expect.soft(f.calls()).toEqual(["fake:fake-1", "kimi:kimi-code/k3", "kimi:kimi-code/other"]);
+      expect.soft(registry.readDoctor(f.repo)!.kimi.modelAuth!["kimi-code/k3"].probedAt).not.toBe(f.old);
+      expect.soft(registry.initDoctorReuse(f.repo, false, f.cfg).reuse).toBe(true);
+      expect.soft(opened).toBe(true);
+      expect.soft(out).not.toContain("probe data missing or stale");
+
+      const again = await init(["--global-dir", f.globalDir, "--yes"], f.repo);
+      expect.soft(again).toContain("using probe results");
+      expect(f.calls()).toEqual(["fake:fake-1", "kimi:kimi-code/k3", "kimi:kimi-code/other"]);
+    } finally {
+      io.input.destroy();
+    }
+  });
+
+  test("init's selected global scope agrees across disclosure, model calls and subsequent reuse for adapter denies, model denies, allowlists and added models", async () => {
+    const rows = [
+      { defaults: { deny: { adapters: ["kimi"] } }, selected: {}, models: ["kimi-code/k3", "kimi-code/other"] },
+      { defaults: { deny: { models: ["kimi:kimi-code/k3"] } }, selected: { deny: { models: ["kimi:kimi-code/other"] } }, models: ["kimi-code/k3"] },
+      { defaults: { allow: { adapters: ["fake"] } }, selected: { allow: { adapters: ["fake", "kimi"] } }, models: ["kimi-code/k3", "kimi-code/other"] },
+      { defaults: { allow: { models: ["fake:fake-1"] } }, selected: { allow: { models: ["fake:fake-1", "kimi:kimi-code/private"] } }, models: ["kimi-code/private"], added: true },
+    ];
+    for (const row of rows) {
+      const f = globalScopeFixture(row.defaults, row.selected, row.added);
+      const expected = ["fake:fake-1", ...row.models.map((m) => `kimi:${m}`)].sort();
+      const first = await init(["--global-dir", f.globalDir, "--yes"], f.repo);
+      const context = JSON.stringify(row);
+      expect.soft(first, context).not.toContain("using probe results");
+      const disclosed = f.preflight.mock.calls.flat().join("\n").split("\n").find((line) => line.startsWith("configured model-call scope:"));
+      expect.soft(disclosed, context).toContain(`scope: ${expected.length} models —`);
+      expect.soft(disclosed?.split(" — ")[1]?.split(", ").sort(), context).toEqual(expected);
+      expect.soft(f.calls(), context).toEqual(expected);
+      const after = registry.readDoctor(f.repo)!;
+      for (const model of Object.keys(f.cfg.tiers.kimi.models)) {
+        if (row.models.includes(model)) expect.soft(after.kimi.modelAuth![model].probedAt, context).not.toBe(f.old);
+        else expect.soft(after.kimi.modelAuth![model].probedAt, context).toBe(f.old);
+      }
+      expect.soft(registry.initDoctorReuse(f.repo, false, f.cfg).reuse, context).toBe(true);
+      const again = await init(["--global-dir", f.globalDir, "--yes"], f.repo);
+      expect.soft(again, context).toContain("using probe results");
+      expect.soft(f.calls(), context).toEqual(expected);
+      vi.restoreAllMocks();
+    }
+  });
+
+  test("init reads the oldest registered model verdict under its global-dir routing scope despite a fresh file mtime", async () => {
+    const repo = makeRepo({ "keep.txt": "x" });
+    const globalDir = mkdtempSync(join(tmpdir(), "tickmarkr-init-age-"));
+    const script = join(repo, "fake.json");
+    writeFileSync(script, JSON.stringify({ tasks: {} }));
+    vi.spyOn(registry, "allAdapters").mockReturnValue([new FakeAdapter(script)]);
+    const probe = vi.spyOn(registry, "probeModels").mockResolvedValue();
+    vi.spyOn(registry, "probeAll").mockResolvedValue({ fake: { installed: true, authed: true, models: [] } });
+    vi.spyOn(registry, "detectCandidateClis").mockReturnValue([]);
+    vi.spyOn(registry, "resolveShellBinary").mockReturnValue({ all: [] });
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    writeFileSync(join(tickmarkrDir(repo), "config.yaml"), "judge: { adapter: fake, model: fake-1 }\nconsult: { adapter: fake, model: fake-1 }\n");
+    for (const denied of [true, false]) {
+      writeFileSync(join(globalDir, "config.yaml"), `tiers:\n  fake:\n    vendor: fake\n    channel: sub\n    models: { fake-1: mid, fake-2: cheap }\n  retired:\n    vendor: fake\n    channel: sub\n    models: { retired-1: mid }\nrouting:\n  deny:\n    models: ${denied ? "[fake:fake-2]" : "[]"}\n`);
+      registry.writeDoctor(repo, {
+        fake: { installed: true, authed: true, models: ["fake-1", "fake-2"], modelAuth: {
+          "fake-1": { authed: true, probedAt: new Date().toISOString() },
+          "fake-2": { authed: true, probedAt: new Date(Date.now() - 70 * 60_000).toISOString() },
+        } },
+        retired: { installed: true, authed: true, models: ["retired-1"], modelAuth: {
+          "retired-1": { authed: true, probedAt: "2020-01-01T00:00:00.000Z" },
+        } },
+      });
+      probe.mockClear();
+
+      const out = await init(["--global-dir", globalDir, "--yes"], repo);
+
+      expect(probe).toHaveBeenCalledTimes(denied ? 0 : 1);
+      expect(out.includes("using probe results")).toBe(denied);
+    }
+  });
+
   test("reuses a doctor.json stamped 5 minutes ago and skips model probes", async () => {
     vi.spyOn(registry, "allAdapters").mockReturnValue([]);
     const probeModelsSpy = vi.spyOn(registry, "probeModels").mockResolvedValue();
@@ -435,7 +576,7 @@ describe("tickmarkr init wizard (T4)", () => {
     expect(io.writes.some((w) => strip(w).includes("full matrix: tickmarkr doctor"))).toBe(true);
   });
 
-  test("the act-3 presets overlay raises on the first Shapes entry, not at launch", async () => {
+  test("the act-3 presets overlay raises on m, while Enter on Shapes opens the list", async () => {
     vi.spyOn(registry, "allAdapters").mockReturnValue([]);
     const repo = makeRepo({ "keep.txt": "x" });
     stampDoctor(repo, 5 * 60 * 1000);
@@ -451,7 +592,10 @@ describe("tickmarkr init wizard (T4)", () => {
     expect(io.writes.some((w) => strip(w).includes("routing preset"))).toBe(false);
     expect(io.writes.some((w) => strip(w).includes("routing mode"))).toBe(false);
     io.input.write(KEY.left + KEY.down + KEY.enter); // rail → Shapes → FIRST Shapes entry
-    await io.whenFrame("routing mode"); // the presets overlay auto-raised
+    await io.whenFrame("Shapes  routed under");
+    expect(io.writes.some((w) => strip(w).includes("routing mode"))).toBe(false);
+    io.input.write("m");
+    await io.whenFrame("routing mode");
     io.input.write(KEY.esc); // Esc from it lands in the shapes list — never quits
     await io.whenFrame("Shapes  routed under");
     io.input.write(KEY.esc); // browser Esc → HOME preset overlay (init quit-safety)
@@ -1009,7 +1153,7 @@ describe("a judge the repository overlay holds is saved in that overlay", () => 
     const probed = (repo: string) => {
       registry.writeDoctor(repo, { fake: {
         installed: true, authed: true, version: "fake", models: ["fake-1", "fake-2"],
-        modelAuth: Object.fromEntries(["fake-1", "fake-2"].map((m) => [m, { authed: true, probedAt: "2026-09-29T00:00:00.000Z" }])),
+        modelAuth: Object.fromEntries(["fake-1", "fake-2"].map((m) => [m, { authed: true, probedAt: new Date(Date.now() - 5 * 60_000).toISOString() }])),
       } });
       const when = new Date(Date.now() - 5 * 60_000);
       utimesSync(join(tickmarkrDir(repo), "doctor.json"), when, when);

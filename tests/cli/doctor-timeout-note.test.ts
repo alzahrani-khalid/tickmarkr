@@ -97,7 +97,7 @@ test("a doctor report and the report init prints from a reused doctor record eac
     }
     Object.defineProperty(process.stdout, "isTTY", { configurable: true, value: kind === "repeat" });
     const fresh = await doctor([], repo, adapters, { banner: false });
-    const reused = registry.initDoctorReuse(repo, false);
+    const reused = registry.initDoctorReuse(repo, false, loadConfig(repo));
     expect(reused.reuse).toBe(true);
     expect(reused.health).not.toBeNull();
     const health = reused.health!;

@@ -25,6 +25,9 @@ export const COMMAND_HELP = {
     usage: "doctor [options]", description: "Probe configured adapters and models and print diagnostics. Default probing may make model calls and refresh a stale catalog.",
     options: {
       "--models": "Include full per-model diagnostics.",
+      "--adapter <id>": "Probe this adapter's configured models; repeatable, unioned with --model, including routing exclusions.",
+      "--model <adapter:model>": "Probe exactly this configured model; repeatable, without role-preference expansion. Merge verdicts into the cache.",
+      "--all": "Probe every configured model; default probes routing-reachable channels plus review, consult and judge preferences.",
       "--fix": "Run normal probes and repair the test-runner ignore when a safe edit exists.",
       "--fix-only": "Repair and verify the test-runner ignore locally; skip model probes and catalog refresh.",
       "--cached": "Read cached diagnostics without probing or refreshing the catalog.",
@@ -36,14 +39,14 @@ export const COMMAND_HELP = {
     }, examples: ["doctor --probe-preflight", "doctor --fix-only", "doctor --models", "doctor --refresh-catalog"],
   },
   fleet: {
-    usage: "fleet [options]", description: "Edit fleet configuration interactively, or print it for scripts.",
+    usage: "fleet [options]", description: "Edit fleet configuration interactively, or print it for scripts. A plain TTY run asks before probing models when the cache is stale (60 minutes): probe now, open cached verdicts, or quit.",
     options: {
       "--pick <role>": "Resolve one role preference as JSON without launching a seat (review or consult; roles without prefer refuse).",
       "--exclude-vendor <vendor>": "Exclude a vendor from --pick; repeat for multiple vendors.",
       "--print": "Print fleet configuration without opening the editor.",
       "--why": "Include routing eligibility explanations in printed output.",
       "--global-dir <path>": "Use this global configuration directory.",
-      "--fresh": "Refresh adapter health; may make model calls.",
+      "--fresh": "Force an adapter/model health probe; may make model calls. A plain run asks before a stale-cache probe.",
     }, examples: ["fleet --print --why", "fleet"],
   },
   compile: {

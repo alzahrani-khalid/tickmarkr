@@ -90,9 +90,9 @@ const stampDoctor = (repo: string) => {
       models: ["fake-1", "fake-2", "fake-new"],
       modelsDetectedAt: "2026-07-16T12:00:00.000Z",
       modelAuth: {
-        "fake-1": { authed: true, probedAt: "2026-07-16T00:00:00.000Z" },
-        "fake-2": { authed: true, probedAt: "2026-07-16T00:00:00.000Z" },
-        "fake-new": { authed: true, probedAt: "2026-07-16T00:00:00.000Z" },
+        "fake-1": { authed: true, probedAt: new Date(Date.now() - 5 * 60_000).toISOString() },
+        "fake-2": { authed: true, probedAt: new Date(Date.now() - 5 * 60_000).toISOString() },
+        "fake-new": { authed: true, probedAt: new Date(Date.now() - 5 * 60_000).toISOString() },
       },
     },
   });
@@ -256,12 +256,10 @@ afterEach(() => {
 
 describe("tickmarkr fleet", () => {
   // ── v1.92 browser navigation: the rail (left pane) lists All models(0) · Shapes(1) ·
-  // Steering(2) · one row per installed adapter (fake = 3). ← focuses the rail, Enter opens
-  // the row's view (an adapter row scopes the models list), Space on an adapter row denies it.
+  // Steering(2) · one row per installed adapter (fake = 3). ← focuses the rail, its cursor
+  // shows the row's pane, and Enter focuses that pane. Space edits an adapter's reach.
   const RAIL = KEYS.left;
-  // v1.92: the FIRST Shapes entry per session auto-raises the presets overlay (fleet scoping
-  // first — membership before routing); the trailing Esc lands in the shapes list beneath it.
-  const OPEN_SHAPES = RAIL + KEYS.down + KEYS.enter + KEYS.escape;
+  const OPEN_SHAPES = RAIL + KEYS.down + KEYS.enter;
   const OPEN_STEER = RAIL + KEYS.down.repeat(2) + KEYS.enter;
   const SCOPE_FAKE = RAIL + KEYS.down.repeat(3) + KEYS.enter;
   // shapes list order is SHAPES order: plan spec implement tests docs … — docs is row 4
@@ -400,7 +398,7 @@ describe("tickmarkr fleet", () => {
     });
     const { io } = makeIO();
 
-    const out = await drive(repo, adapter, io, KEYS.q, ["--global-dir", userDirOf(repo)],);
+    const out = await drive(repo, adapter, io, "p" + KEYS.q, ["--global-dir", userDirOf(repo)],);
 
     expect(out).toBe("fleet: quit without writing");
     expect(fetcher).not.toHaveBeenCalled();
@@ -414,17 +412,17 @@ describe("tickmarkr fleet", () => {
       catalogFetcher: fetcher,
       catalogNow: () => new Date("2026-09-20T00:00:00.000Z"),
     });
-    catalogIo.input.write(KEYS.q);
+    catalogIo.input.write("p" + KEYS.q);
     expect(await done).toContain("fleet: quit without writing");
     expect(fetcher.mock.calls.map(([url]) => String(url))).toEqual([MODELS_DEV_CATALOG_URL, LIVEBENCH_TABLE_URL]);
   });
 
-  test("a stale probe cache no longer refuses the interactive editor — fleet runs doctor first and opens on what it recorded", async () => {
+  test("a stale probe cache asks before doctor runs and opens on what it recorded after consent", async () => {
     const { repo, adapter } = setup();
     const stale = new Date(Date.now() - 2 * 60 * 60 * 1000);
     utimesSync(join(tickmarkrDir(repo), "doctor.json"), stale, stale);
     const { io, writes } = makeIO();
-    const out = await drive(repo, adapter, io, KEYS.q, ["--global-dir", userDirOf(repo)]);
+    const out = await drive(repo, adapter, io, "p" + KEYS.q, ["--global-dir", userDirOf(repo)]);
     expect(out).toBe("fleet: quit without writing");
     const all = strip(writes.join(""));
     expect(all).toContain("tickmarkr fleet"); // the editor DID open
@@ -711,7 +709,7 @@ describe("tickmarkr fleet", () => {
     );
     // 't' on the Shapes view is unhandled — nothing changed, so w stays put and q quits clean
     expect(out).toBe("fleet: quit without writing");
-    const shapesFrame = writes.map(strip).find((f) => f.includes("Shapes  routed under"));
+    const shapesFrame = writes.map(strip).findLast((f) => f.includes("Shapes  routed under"));
     expect(shapesFrame).toBeDefined();
     const keybar = shapesFrame!.split("\n").filter((l) => l.trim() !== "").at(-1)!;
     expect(keybar).toContain("a auto");
@@ -792,10 +790,9 @@ describe("tickmarkr fleet", () => {
   test("space and enter and escape bytes on a non-injected input stream toggle and navigate and abort through the production keypress path", async () => {
     const { repo, adapter } = setup();
     const { io, writes } = makeIO();
-    // the extra trailing Esc pair: the first Esc dismisses the auto-raised presets overlay on the
-    // Shapes entry (v1.92); the staged toggle arms the quit guard so TWO more Esc quit the browser
+    // The staged edit arms the quit guard, so two Esc presses quit the browser.
     // OBS-994/FL-1: two spaces cycle in → out(workers) → out(all), the state this test asserts.
-    const out = await drive(repo, adapter, io, " \x1b[B\x1b[B\r\x1b[D\x1b[B\r\x1b\x1b\x1b", ["--global-dir", userDirOf(repo)]);
+    const out = await drive(repo, adapter, io, " \x1b[B\x1b[B\r\x1b[D\x1b[B\r\x1b\x1b", ["--global-dir", userDirOf(repo)]);
     expect(out).toBe("fleet: quit without writing");
     const all = strip(writes.join(""));
     expect(all).toContain(`${GLYPHS.toggleInactive} fake/fake-1`);
@@ -869,9 +866,7 @@ describe("tickmarkr fleet", () => {
     const { io, writes } = makeIO();
     const out = await drive(
       repo, adapter, io,
-      // the Esc after the first Enter dismisses the auto-raised presets overlay on the Shapes
-      // entry (v1.92) so the walk still reaches the Steering view
-      KEYS.down + RAIL + KEYS.down + KEYS.enter + KEYS.escape + RAIL + KEYS.down + KEYS.enter + KEYS.q,
+      KEYS.down + RAIL + KEYS.down + KEYS.enter + RAIL + KEYS.down + KEYS.enter + KEYS.q,
       ["--global-dir", userDirOf(repo)],
     );
     expect(out).toBe("fleet: quit without writing");
@@ -1185,11 +1180,11 @@ describe("tickmarkr fleet", () => {
   // model for the rail-scoped adapter, and the ONLY writer remains the review-diff confirm.
   // T2/D-2: the band is fleet-relative, so the fixture carries a four-model AA universe
   // (configured opus 63 / sonnet 55 / fake-1 45 plus the unclassified fake-2 at 50) — fake-2 sits
-  // in the middle third → mid. fake-new stays uncovered. The two claude records are spelled as
+  // at 50/63 (within 25% of the top) → mid. fake-new stays uncovered. The two claude records are spelled as
   // models.dev really spells them (`claude-opus-4-8`), NOT as the aliases config carries (`opus`):
   // the aliases reach them only through fleet's resolved-model callback. Drop that callback and
   // the universe is two models, the AA basis yields under the three-model floor, and the
-  // rank-3/4 provenance below is gone.
+  // AA ratio provenance below is gone.
   test("s bulk-stages every visible catalog-suggested model through the review funnel — the written overlay carries the suggested tier with its evidence provenance while uncovered models stay unclassified", async () => {
     const { repo, adapter } = setup();
     writeFileSync(join(repo, ".tickmarkr", "catalog-cache.json"), JSON.stringify({
@@ -1235,7 +1230,8 @@ describe("tickmarkr fleet", () => {
     expect(overlay.tiers.fake.models["fake-new"]).toBeUndefined();
     const bytes = readFileSync(overlayAt(repo), "utf8");
     expect(bytes).toContain("SUGGESTED mid (intelligence inference, not a measurement)");
-    expect(bytes).toContain("fleet-relative rank 3/4 by Artificial Analysis Intelligence Index 50 (intelligence index version 4.1.1)");
+    expect(bytes).toContain("fleet-top ratio band by Artificial Analysis Intelligence Index 50 (intelligence index version 4.1.1)");
+    expect(bytes).toContain(`score=50; top=63; ratio=${50 / 63}; D-1518`);
     expect(bytes).toContain("operator confirmation required");
     expect(bytes).toMatch(/— fleet \d{4}-\d{2}-\d{2}/);
   });
@@ -1752,11 +1748,14 @@ review:
     );
   });
 
-  test("the first Shapes entry per session raises the presets overlay and Esc lands in the shapes list", async () => {
+  test("Shapes opens its list and m raises the presets overlay with Esc returning to the list", async () => {
     const { repo, adapter } = setup();
     const { io, writes, input } = makeIO();
     const done = fleet(["--global-dir", userDirOf(repo)], repo, [adapter], io);
     input.write(RAIL + KEYS.down + KEYS.enter);
+    await settle(() => strip(writes.join("")).includes("edit pool"));
+    expect(strip(writes.join(""))).not.toContain("routing mode");
+    input.write(KEYS.m);
     await settle(() => strip(writes.join("")).includes("routing mode"));
     expect(strip(writes[0])).not.toContain("routing mode"); // never at launch — the browser opens first
     const mark = writes.length;
@@ -2085,7 +2084,7 @@ review:
         version: "fake",
         models: ["fake-1", "fake-2"],
         modelsDetectedAt: "2026-07-16T12:00:00.000Z",
-        modelAuth: { "fake-1": { authed: true, probedAt: "2026-07-16T00:00:00.000Z" } },
+        modelAuth: { "fake-1": { authed: true, probedAt: new Date(Date.now() - 5 * 60_000).toISOString() } },
       },
     });
     const when = new Date(Date.now() - 5 * 60_000);
@@ -2309,8 +2308,8 @@ review:
         models: ["fake-1", "fake-2", ...many],
         modelsDetectedAt: "2026-07-16T12:00:00.000Z",
         modelAuth: {
-          "fake-1": { authed: true, probedAt: "2026-07-16T00:00:00.000Z" },
-          "fake-2": { authed: true, probedAt: "2026-07-16T00:00:00.000Z" },
+          "fake-1": { authed: true, probedAt: new Date(Date.now() - 5 * 60_000).toISOString() },
+          "fake-2": { authed: true, probedAt: new Date(Date.now() - 5 * 60_000).toISOString() },
         },
       },
     });
@@ -2355,7 +2354,7 @@ review:
         version: "fake",
         models: ["fake-1", "fake-old-20240620", "fake-live", "fake-snap-20250101", "fake-embedding", "fake-x-preview"],
         modelsDetectedAt: "2026-07-16T12:00:00.000Z",
-        modelAuth: { "fake-1": { authed: true, probedAt: "2026-07-16T00:00:00.000Z" } },
+        modelAuth: { "fake-1": { authed: true, probedAt: new Date(Date.now() - 5 * 60_000).toISOString() } },
       },
     });
     const when = new Date(Date.now() - 5 * 60_000);
@@ -2687,8 +2686,8 @@ describe("D-225: greyed ledger rows", () => {
         version: "fake",
         models: ["fake-1", "fake-2"],
         modelAuth: {
-          "fake-1": { authed: true, probedAt: "2026-09-12T00:00:00.000Z" },
-          "fake-2": { authed: false, reason: "quota exceeded", probedAt: "2026-09-12T00:00:00.000Z" },
+          "fake-1": { authed: true, probedAt: new Date(Date.now() - 5 * 60_000).toISOString() },
+          "fake-2": { authed: false, reason: "quota exceeded", probedAt: new Date(Date.now() - 5 * 60_000).toISOString() },
         },
       },
     });
@@ -2708,8 +2707,8 @@ describe("D-225: greyed ledger rows", () => {
         version: "fake",
         models: ["fake-1", "fake-2"],
         modelAuth: {
-          "fake-1": { authed: true, probedAt: "2026-09-12T00:00:00.000Z" },
-          "fake-2": { authed: true, probedAt: "2026-09-12T00:00:00.000Z" },
+          "fake-1": { authed: true, probedAt: new Date(Date.now() - 5 * 60_000).toISOString() },
+          "fake-2": { authed: true, probedAt: new Date(Date.now() - 5 * 60_000).toISOString() },
         },
       },
     });
@@ -2820,8 +2819,8 @@ describe("OBS-1144 the write review names each dead carried pool entry", () => {
     const reason = "routing.map.implement.pool entry fake:fake-1 is disallowed by routing.deny (fake:fake-1)";
 
     const partial = await writeDeny("fake:fake-1, fake:fake-2");
-    expect(partial.review).toContain(`! ${reason} — skipped — routes the admitted remainder fake:fake-2`);
-    expect(partial.implement).toContain("pool(ordered·2) → fake:fake-2");
+    expect(partial.review).toContain("! routing.map.implement.pool removed fake:fake-1 — disallowed by this edit's routing.deny.workers.models (fake:fake-1)");
+    expect(partial.implement).toContain("pool(ordered·1) → fake:fake-2");
 
     const exhausted = await writeDeny("fake:fake-1");
     expect(exhausted.review).toContain(`! ${reason} — the pool is exhausted — no admitted entry remains, so the shape is unroutable`);
@@ -2856,7 +2855,7 @@ describe("OBS-1144 the write review names each dead carried pool entry", () => {
     expect(strip(io.writes.at(-1)!)).not.toMatch(/… \d+ below/);
     for (const shape of shapes) {
       expect(seen.some((text) => text.includes(
-        `! routing.map.${shape}.pool entry fake:fake-1 is disallowed by routing.deny (fake:fake-1) — skipped — routes the admitted remainder fake:fake-2`,
+        `! routing.map.${shape}.pool removed fake:fake-1 — disallowed by this edit's routing.deny.workers.models (fake:fake-1)`,
       ))).toBe(true);
     }
     io.input.write("\x03");
@@ -2868,7 +2867,7 @@ describe("OBS-1144 the write review names each dead carried pool entry", () => {
 // ordinal with its ✗ reason, and Space drops it without lifting the deny that excludes it.
 describe("OBS-1145 Fleet removes an inadmissible carried pool entry", () => {
   const RAIL = KEYS.left;
-  const TO_DOCS = RAIL + KEYS.down + KEYS.enter + KEYS.escape + KEYS.down.repeat(4);
+  const TO_DOCS = RAIL + KEYS.down + KEYS.enter + KEYS.down.repeat(4);
   // reads cfg.tiers, so three frontier channels exist without widening the shared FakeAdapter
   const threeAdapter: WorkerAdapter = {
     id: "fake",
@@ -2895,7 +2894,7 @@ ${models.map((m) => `      ${m}: frontier\n`).join("")}routing:
   map:
     docs: { pool: { mode: ordered, channels: ${pool} } }
 `);
-    const probedAt = "2026-09-25T00:00:00.000Z";
+    const probedAt = new Date(Date.now() - 5 * 60_000).toISOString();
     registry.writeDoctor(repo, {
       fake: {
         installed: true, authed: true, version: "fake", models,
@@ -3094,7 +3093,7 @@ describe("OBS-1182 Fleet persists launch effort as channel metadata", () => {
     withOverlay(repo, "tiers:\n  codex:\n    modelOverrides:\n      gpt-5.6-sol: { channel: api }\n");
     const authed = (models: string[]) => ({
       installed: true, authed: true, version: "x", models, modelsDetectedAt: "2026-09-25T00:00:00.000Z",
-      modelAuth: Object.fromEntries(models.map((m) => [m, { authed: true, probedAt: "2026-09-25T00:00:00.000Z" }])),
+      modelAuth: Object.fromEntries(models.map((m) => [m, { authed: true, probedAt: new Date(Date.now() - 5 * 60_000).toISOString() }])),
     });
     registry.writeDoctor(repo, { "claude-code": authed(["fable", "opus"]), codex: authed(["gpt-5.6-sol"]) });
     const when = new Date(Date.now() - 5 * 60_000);
@@ -3163,7 +3162,7 @@ describe("OBS-1182 Fleet persists launch effort as channel metadata", () => {
     withOverlay(repo, "tiers:\n  claude-code:\n    modelOverrides:\n      fable: { effort: medium }\n");
     const authed = (models: string[]) => ({
       installed: true, authed: true, version: "x", models, modelsDetectedAt: "2026-09-25T00:00:00.000Z",
-      modelAuth: Object.fromEntries(models.map((m) => [m, { authed: true, probedAt: "2026-09-25T00:00:00.000Z" }])),
+      modelAuth: Object.fromEntries(models.map((m) => [m, { authed: true, probedAt: new Date(Date.now() - 5 * 60_000).toISOString() }])),
     });
     registry.writeDoctor(repo, { "claude-code": authed(["fable", "opus"]), codex: authed(["gpt-5.6-sol"]) });
     const when = new Date(Date.now() - 5 * 60_000);
@@ -3199,7 +3198,7 @@ describe("OBS-1182 Fleet persists launch effort as channel metadata", () => {
     withOverlay(repo, "tiers:\n  claude-code:\n    vendor: anthropic\n    modelOverrides:\n      fable: { effort: medium }\n");
     registry.writeDoctor(repo, { "claude-code": {
       installed: true, authed: true, version: "x", models: ["fable"], modelsDetectedAt: "2026-09-25T00:00:00.000Z",
-      modelAuth: { fable: { authed: true, probedAt: "2026-09-25T00:00:00.000Z" } },
+      modelAuth: { fable: { authed: true, probedAt: new Date(Date.now() - 5 * 60_000).toISOString() } },
     } });
     const when = new Date(Date.now() - 5 * 60_000);
     utimesSync(join(tickmarkrDir(repo), "doctor.json"), when, when);
@@ -3234,7 +3233,7 @@ describe("OBS-1182 setting effort beneath a tombstone", () => {
     withOverlay(repo, "tiers:\n  claude-code:\n    modelOverrides:\n      fable: null\n  codex:\n    modelOverrides: null\n");
     const authed = (models: string[]) => ({
       installed: true, authed: true, version: "x", models, modelsDetectedAt: "2026-09-25T00:00:00.000Z",
-      modelAuth: Object.fromEntries(models.map((m) => [m, { authed: true, probedAt: "2026-09-25T00:00:00.000Z" }])),
+      modelAuth: Object.fromEntries(models.map((m) => [m, { authed: true, probedAt: new Date(Date.now() - 5 * 60_000).toISOString() }])),
     });
     registry.writeDoctor(repo, { "claude-code": authed(["fable"]), codex: authed(["gpt-5.6-sol", "gpt-5.6-terra"]) });
     const when = new Date(Date.now() - 5 * 60_000);
@@ -3283,7 +3282,7 @@ describe("B2 Fleet saves machine model choices to the user overlay", () => {
     const repo = makeRepo({ "keep.txt": "x" });
     withOverlay(repo, user);
     if (repoOverlay !== undefined) withRepoOverlay(repo, repoOverlay);
-    const authed = { authed: true, probedAt: "2026-09-29T00:00:00.000Z" };
+    const authed = { authed: true, probedAt: new Date(Date.now() - 5 * 60_000).toISOString() };
     registry.writeDoctor(repo, Object.fromEntries(Object.entries(doctor).map(([id, models]) => [id, {
       installed: true, authed: true, version: "fake", models,
       modelsDetectedAt: "2026-09-29T00:00:00.000Z", modelAuth: Object.fromEntries(models.map((m) => [m, authed])),
@@ -3341,7 +3340,10 @@ describe("B2 Fleet saves machine model choices to the user overlay", () => {
     expect(first.path).toBe(userPath);
     expect(first.before).toBe(userBytes);
     // the repo overlay decides none of these keys: no repo-shadowed note, only the future-loads note (T10)
-    expect(first.notes).toEqual(["the save changes future config loads only — a tickmarkr run already in progress keeps the config it loaded"]);
+    expect(first.notes).toEqual([
+      "the save changes future config loads only — a tickmarkr run already in progress keeps the config it loaded",
+      "routing.allow.models entry fake:fake-1 is allowed and denied by routing.deny.workers.models (fake:fake-1) — deny wins; keeping the authored allow entry",
+    ]);
     expect(props.reloadGuard(first.after)).toBeNull();
 
     // malformed reviewed bytes: refused on y and at save, nothing lands

@@ -26,7 +26,8 @@ export type ModelIdField = (typeof MODEL_ID_FIELDS)[number];
 
 const ListModelsSchema = z.object({
   argv: z.array(z.string()).min(1),
-  parser: z.enum(["lines", "pi-table", "json"]),
+  parser: z.enum(["lines", "pi-table", "json", "id-tab"]),
+  timeoutMs: z.number().int().positive().optional(),
   path: z.string().min(1).optional(),
   field: z.enum(MODEL_ID_FIELDS).optional(),
 }).strict().superRefine((listModels, ctx) => {
@@ -190,9 +191,9 @@ export const CLI_CATALOG: readonly CliEntry[] = [
         kind: "none",
         reason: "agy 1.1.12 rendered no workspace-trust prompt across five fresh-temp-repo print-mode probes (PROBE-agy-v190.md, 2026-08-13); interactive is null, so no dialog can reach a pane",
       },
-      // `agy models` emits `id<TAB>label` rows behind a fetch banner — no parser projects that
-      // shape without admitting label words, so the list surface stays undeclared and doctor
-      // reports "no model-list surface" (claude-code posture).
+      // PROBE-agy-v190.md: id<TAB>label rows after a fetch banner; measured 15.8s, beyond
+      // the declarative runner's default 15s budget.
+      listModels: { argv: ["models"], parser: "id-tab", timeoutMs: 45000 },
     },
   } satisfies CliEntry,
   {

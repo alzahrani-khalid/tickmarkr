@@ -1,5 +1,6 @@
 import { Box, render, Text, useApp, useInput } from "ink";
 import { useRef, useState } from "react";
+import { GLYPHS } from "../../brand.js";
 import { MODEL_ID_RE, type AuthHealth, type WorkerAdapter } from "../../adapters/types.js";
 import { retiredModelReason } from "../../adapters/model-lints.js";
 import { DENY_SCOPES, EFFORT_ADAPTERS, denyBlockFrom, denyEntriesAt, initialDenyPropOf, stagedDenyKeyOf, type DenyScope, type DenyScopeKey, type InitialDenyProps, type MapEntry, type RoutingMode, type StagedDenyKey, type Tier, type TickmarkrConfig } from "../../config/config.js";
@@ -104,8 +105,10 @@ export type FleetModelEvidence = {
   outputCostPerMtok?: number;
   /** doctor's model probe wall clock (modelAuth.durationMs) — the "how fast did it answer" column */
   probeMs?: number;
-  /** OBS-519: doctor's failed model-auth verdict reason — the row must not render like a healthy one */
+  /** Doctor's failed model verdict or inherited adapter verdict — never a healthy-looking row. */
   unauthed?: string;
+  /** D-2178 F3: a verdictless model inherits this signed-out adapter's verdict. */
+  unauthedAdapter?: string;
   /** OBS-972/FL-1: a floating alias's resolved concrete model id (e.g. "opus" → "claude-opus-5") */
   identity?: string;
 };
@@ -289,6 +292,14 @@ type RailRow =
 // "out-allow" (every role, because routing.allow does not admit it).
 // "unknown" means the staged policy itself does not load (judge c2): no reach is claimed.
 export type FleetReach = "in" | "out-workers" | "out-all" | "out-allow" | "unknown";
+type ReachSummary = { reach: FleetReach; reasons: string[]; partial: boolean };
+
+/** The rail summarizes computed channel reach; signed out takes precedence over policy. */
+export function railMark(state: { reach: FleetReach; partial: boolean }, authed?: boolean): "on" | "off" | "warn" | "fail" {
+  if (authed === false || state.reach === "unknown") return "fail";
+  if (state.partial || state.reach === "out-workers") return "warn";
+  return state.reach === "in" ? "on" : "off";
+}
 
 /** The staged routing policy, or the loader's refusal of the staged overlay. */
 export type FleetStagedRouting = { ok: true; routing: TickmarkrConfig["routing"] } | { ok: false; error: string };
@@ -319,6 +330,16 @@ type ModelRow = {
   covering?: Covering;
 };
 
+/** Keep model verdict glyphs as before; an inherited signed-out verdict must always fail. */
+export function modelMark(row: Pick<ModelRow, "partial" | "reach" | "evidence" | "tier">): "on" | "off" | "warn" | "fail" | "unknown" {
+  if (row.evidence?.unauthedAdapter !== undefined) return "fail";
+  if (row.partial) return "warn";
+  if (row.reach === "out-all" || row.reach === "out-allow") return "off";
+  if (row.evidence?.unauthed !== undefined || row.reach === "unknown") return "fail";
+  if (row.reach === "out-workers") return "warn";
+  return row.tier ? "on" : "unknown";
+}
+
 type Ui = {
   focus: "rail" | "list";
   view: View;
@@ -334,8 +355,6 @@ type Ui = {
   /** first Esc/q with staged edits arms; the second within the same key sequence quits (OBS-521) */
   quitArmed: boolean;
   showAll: boolean;
-  /** v1.92: the FIRST Shapes entry per session auto-raises the presets overlay (both entries) */
-  presetsSeen: boolean;
   notice: string;
   /** judge c3: the one entry the last Space press edited, named on that channel's detail line */
   lastEdit: { id: string; text: string } | null;
@@ -454,7 +473,6 @@ export function FleetApp({
     stash: null,
     quitArmed: false,
     showAll: false,
-    presetsSeen: false,
     notice: "",
     lastEdit: null,
     allowOut: new Set(initialAllowOut),
@@ -467,8 +485,7 @@ export function FleetApp({
     steering: structuredClone(initialSteering),
     judgeSeat: null,
     channelByAdapter: {},
-    // v1.92: no entry opens an overlay at launch — the browser opens on the models view (fleet
-    // scoping first); the presets overlay raises on the first Shapes entry instead (below).
+    // Fleet and init both open on models; m opens the routing-mode chooser.
     overlay: null,
     done: false,
   };
@@ -852,6 +869,20 @@ export function FleetApp({
     ...modelGroups.map((_, index): RailRow => ({ kind: "adapter", index })),
   ];
 
+  // The rail cursor owns the shown pane; Enter and right arrow only move focus into it.
+  const showRailPane = () => {
+    const row = railRows()[ui.railAt];
+    if (!row) return;
+    ui.view = row.kind === "view" ? row.view : "models";
+    ui.adapterAt = row.kind === "adapter" ? row.index : -1;
+    ui.listAt = 0;
+    ui.filter = "";
+    ui.notice = "";
+  };
+
+  // Member auth controls routing independently; only the row's own failure limits reach edits.
+  const failedVerdict = (row: ModelRow): string | undefined => row.evidence?.unauthed;
+
   // ── state transitions ──────────────────────────────────────────────────────
 
   // T8: the previews fold the CURRENT staged metadata — never only what the last review saw
@@ -1035,7 +1066,7 @@ export function FleetApp({
   const RAIL_W = 24;
   const bodyW = width - RAIL_W - 5; // borders + padding
   // OBS-523: reserve what the chrome actually uses — header 1, outer borders 2, padding 1,
-  // scope+search 2, elision marks 2, detail lines ≤2, keybar 1 — not 16. Six list rows were
+  // rail legend 1, scope+search 2, elision marks 2, detail lines ≤2, keybar 1 — not 16. Six list rows were
   // blank at every terminal size.
   const capacity = Number.isFinite(viewRows) ? Math.max(4, viewRows as number) : Number.POSITIVE_INFINITY;
   /** review diff rows: overlay chrome is one row shorter than the browser's (no scope header) */
@@ -1049,7 +1080,8 @@ export function FleetApp({
   // disagree, so a mixed rail is never shown or guarded as an adapter-wide selected state.
   // Reasons are the UNION over the channels: one every channel shares is named once, a
   // channel-specific one carries its channel, so a partial exclusion is never intersected away.
-  const adapterReach = (id: string): { reach: FleetReach; reasons: string[]; partial: boolean } => {
+  const adapterReachMemo = useRef<{ key: string; byAdapter: Map<string, ReachSummary> }>({ key: "", byAdapter: new Map() });
+  const deriveAdapterReach = (id: string): ReachSummary => {
     const group = modelGroups.find((candidate) => candidate.adapter === id);
     // T5: every real member of every row — a collapsed or folded row's display label is no channel
     const channels = (group?.rows ?? []).flatMap((row) => membersOf(id, row))
@@ -1068,9 +1100,19 @@ export function FleetApp({
     }
     return foldReach(channels);
   };
+  // The rail now reads this on every frame; cursor moves reuse the same policy/layer generation
+  // as model rows instead of collecting every channel's reach and overlay holder again.
+  const adapterReach = (id: string): ReachSummary => {
+    const key = memoKey();
+    if (adapterReachMemo.current.key !== key) adapterReachMemo.current = { key, byAdapter: new Map() };
+    const memo = adapterReachMemo.current.byAdapter;
+    const summary = memo.get(id) ?? deriveAdapterReach(id);
+    memo.set(id, summary);
+    return summary;
+  };
   // the rail's (and a grouped row's) fold over its real channels — most-excluded reach, partial when they
   // disagree, shared reasons once and channel-specific ones carrying their channel
-  function foldReach(channels: Array<{ model: string; reach: FleetReach; reasons: string[] }>): { reach: FleetReach; reasons: string[]; partial: boolean } {
+  function foldReach(channels: Array<{ model: string; reach: FleetReach; reasons: string[] }>): ReachSummary {
     const unknown = channels.find((channel) => channel.reach === "unknown");
     if (unknown) return { reach: "unknown", reasons: unknown.reasons, partial: false };
     // OBS-1099 review round 5: out-allow and out-all are ONE picker choice (out · all seats), so a
@@ -1132,7 +1174,7 @@ export function FleetApp({
       }
       if (choice === "in") {
         take();
-        edit = `cleared ${id} from ${held}`;
+        edit = held === "routing.allow" ? `added ${id} to routing.allow.adapters` : `removed ${id} from ${held}`;
       } else if (choice === "out-workers") {
         if (held === "routing.deny.workers.adapters") {
           // OBS-1099 review round 3: the held workers entry is already the rail's whole say —
@@ -1150,7 +1192,7 @@ export function FleetApp({
         ui.denyWorkersAdapters = withEntry(ui.denyWorkersAdapters, id);
         edit = `${held === null ? "added" : "moved"} ${id} to routing.deny.workers.adapters`;
       } else {
-        if (held === "routing.deny.adapters" || held === "routing.allow") {
+        if (!partial && reached(reach, choice)) {
           ui.notice = `${id} is already ${label}`;
           return;
         }
@@ -1169,6 +1211,14 @@ export function FleetApp({
     const row = modelRows().find((candidate) => candidate.adapter === target.adapter && candidate.model === target.model);
     if (!row) return;
     const id = `${row.adapter}:${row.model}`;
+    const failed = failedVerdict(row);
+    // A failed probe must never prevent taking a broken model out, or allow admitting it.
+    // Moving an all-seats exclusion to workers-only would re-admit the steering seats.
+    const widensReach = choice === "in" || (choice === "out-workers" && (row.reach === "out-all" || row.reach === "out-allow"));
+    if (failed !== undefined && widensReach) {
+      ui.notice = `${id} is unauthed (${failed}) — cannot set ${label}; re-probe with tickmarkr doctor`;
+      return;
+    }
     // T5: a grouped row's act is the same one-reason act on EVERY real member, each decided from the reach
     // it held BEFORE this act — a sibling's fresh entry that also matches a member's recorded identity never
     // turns that member's own addition into "already" (review D-1081) — while every removal still takes only
@@ -1255,12 +1305,13 @@ export function FleetApp({
     const made = outcomes.flatMap((outcome) => ("edit" in outcome ? [outcome.edit] : []));
     const refused = outcomes.flatMap((outcome) => ("refused" in outcome ? [outcome.refused] : []));
     if (!made.length) {
-      ui.notice = refused[0] ?? `${id} is already ${label}`;
+      ui.notice = `${refused[0] ?? `${id} is already ${label}`}${failed === undefined ? "" : ` — unauthed (${failed})`}`;
       return;
     }
     const after = rowReach(members);
     const still = reached(after.reach, choice) && !after.partial ? "" : ` — still out: ${after.reasons.join("; ")}`;
     ui.lastEdit = { id, text: `space: ${made.join("; ")}${still}` };
+    if (failed !== undefined) ui.notice = `${id} is unauthed (${failed}) — set ${label}; re-probe with tickmarkr doctor before setting in`;
   };
 
   // OBS-1065: Enter on a greyed picker row lifts exactly its row-owned covering entry, then the
@@ -1635,6 +1686,18 @@ export function FleetApp({
           bump();
           return;
         }
+        if (input === "[" || input === "]") {
+          const offered = rows[overlay.at];
+          const greyed = ledger[overlay.at - rows.length];
+          const id = offered?.id ?? (greyed === undefined ? undefined : ledgerChannelId(greyed));
+          const at = id === undefined ? -1 : overlay.chain.indexOf(id);
+          const to = at + (input === "[" ? -1 : 1);
+          if (at !== -1 && to >= 0 && to < overlay.chain.length) {
+            [overlay.chain[at], overlay.chain[to]] = [overlay.chain[to], overlay.chain[at]];
+          }
+          bump();
+          return;
+        }
         if (input === " ") {
           const offered = rows[overlay.at];
           const greyed = offered ? undefined : ledger[overlay.at - rows.length];
@@ -1940,11 +2003,13 @@ export function FleetApp({
       const rows = railRows();
       if (key.downArrow || hotkey === "j") {
         ui.railAt = Math.min(ui.railAt + 1, rows.length - 1);
+        showRailPane();
         bump();
         return;
       }
       if (key.upArrow || hotkey === "k") {
         ui.railAt = Math.max(ui.railAt - 1, 0);
+        showRailPane();
         bump();
         return;
       }
@@ -1964,27 +2029,8 @@ export function FleetApp({
         return;
       }
       if (key.return) {
-        if (row.kind === "view") {
-          ui.view = row.view;
-          if (row.view === "models") ui.adapterAt = -1;
-        } else {
-          ui.view = "models";
-          ui.adapterAt = row.index;
-        }
+        showRailPane();
         ui.focus = "list";
-        ui.listAt = 0;
-        ui.filter = "";
-        ui.notice = "";
-        // v1.92: the FIRST Shapes entry per session raises the presets overlay (both entries:
-        // fleet and init) — Esc from it lands right here in the shapes list, never quits.
-        if (ui.view === "shapes" && !ui.presetsSeen) {
-          ui.presetsSeen = true;
-          ui.overlay = {
-            kind: "presets",
-            at: Math.max(modeOptions.findIndex((option) => option.id === ui.selectedMode), 0),
-            home: false,
-          };
-        }
         bump();
       }
       return;
@@ -2014,13 +2060,6 @@ export function FleetApp({
           beginClassification(row.adapter, row.model);
           return;
         }
-        // OBS-994/FL-1: membership can't fix an auth failure either — the row's reach stays
-        // whatever it is and the operator is pointed at doctor instead of a toggle that lies.
-        if (row.evidence?.unauthed !== undefined) {
-          ui.notice = `${row.adapter}:${row.model} is unauthed — re-probe with tickmarkr doctor before its fleet reach can change`;
-          bump();
-          return;
-        }
         if (row.reach === "unknown") {
           ui.notice = `${row.adapter}:${row.model} reach is unknown — Space does not toggle it until the staged overlay loads: ${row.reasons.join("; ")}`;
           bump();
@@ -2028,6 +2067,11 @@ export function FleetApp({
         }
         // OBS-1099 item 1: Space opens the reach picker; applyReach changes ONE selected reason
         setOverlay({ kind: "reach", target: { adapter: row.adapter, model: row.model }, at: 0 });
+        const failed = failedVerdict(row);
+        if (failed !== undefined) {
+          ui.notice = `${row.adapter}:${row.model} is unauthed (${failed}) — out only; re-probe with tickmarkr doctor before setting in`;
+          bump();
+        }
         return;
       }
       if (key.return && row) {
@@ -2239,7 +2283,7 @@ export function FleetApp({
   // OBS-994/FL-1: the reach line — every collector scope that excludes this row, each with its
   // config path and matching entry (an unauthed row instead points at the doctor re-probe).
   const reachDetail = (row: ModelRow): string => {
-    if (row.evidence?.unauthed !== undefined) return "unauthed — re-probe with tickmarkr doctor (Space does not toggle reach)";
+    if (row.evidence?.unauthed !== undefined) return `unauthed — ${row.evidence.unauthed} — Space sets out only; re-probe with tickmarkr doctor before setting in`;
     // T10: the reasons, then where each scope is held — the overlay a reviewed w writes
     const reasons = `${row.reasons.join("; ")}${row.held.length ? ` — held: ${row.held.join("; ")}` : ""}`;
     // T5: members disagree — never a whole-group state; each member-specific reason names its real id
@@ -2322,17 +2366,7 @@ export function FleetApp({
     return (
       <Text key={`${row.adapter}:${row.model}`} wrap="truncate">
         <Pointer on={selected} />
-        {row.partial
-          ? <Glyph kind="warn" />
-          : row.reach === "out-all" || row.reach === "out-allow"
-          ? <Glyph kind="off" />
-          : row.evidence?.unauthed !== undefined || row.reach === "unknown"
-            ? <Glyph kind="fail" />
-            : row.reach === "out-workers"
-              ? <Glyph kind="warn" />
-              : row.tier
-                ? <Glyph kind="on" />
-                : <Glyph kind="unknown" />}
+        <Glyph kind={modelMark(row)} />
         <Text> </Text>
         <Text dimColor={row.denied}>
           <Text dimColor>{name.slice(0, prefixLen)}</Text>
@@ -2390,13 +2424,14 @@ export function FleetApp({
   const railAdapter = (index: number, railIndex: number) => {
     const group = modelGroups[index];
     const agent = agents.find((candidate) => candidate.id === group.adapter);
-    const denied = ui.denyAdapters.has(group.adapter) || ui.allowOut.has(group.adapter);
+    const mark = railMark(adapterReach(group.adapter), agent?.authed);
+    const denied = mark === "off";
     const active = ui.view === "models" && ui.adapterAt === index;
     const selected = ui.focus === "rail" && ui.railAt === railIndex;
     return (
       <Text key={group.adapter}>
         {selected ? <Text color={INK.brand}>{"❯ "}</Text> : <Text>{"  "}</Text>}
-        {denied ? <Glyph kind="off" /> : agent?.authed === false ? <Glyph kind="fail" /> : <Glyph kind="on" />}
+        <Glyph kind={mark} />
         <Text> </Text>
         <Text bold={active} color={active ? INK.brand : undefined} dimColor={denied}>{padCell(group.adapter, 12)}</Text>
         <Text dimColor>{padCellStart(String(visibleCount(index)), 4)}</Text>
@@ -2829,6 +2864,7 @@ export function FleetApp({
           { key: "Enter", label: overlay.chain.length ? "apply pool" : "pin · lift greyed" },
           ...(overlay.chain.length ? [{ key: "Tab", label: "apply from any row" }] : []),
           { key: "Space", label: "pool in order" },
+          { key: "[/]", label: "move member up/down" },
           { key: "type", label: "search" },
           { key: "Esc", label: "cancel" },
         ];
@@ -2882,7 +2918,7 @@ export function FleetApp({
     }
     if (ui.view === "shapes") {
       return [
-        { key: "Enter", label: "pin from candidates" },
+        { key: "Enter", label: "edit pool" },
         { key: "f", label: "prefer chain" },
         { key: "a", label: "auto" },
         { key: "w", label: "review + write" },
@@ -2909,6 +2945,7 @@ export function FleetApp({
         <Text>{ui.selectedMode}</Text>
         {staged > 0 && <Text color={INK.warn}>{` · ${staged} staged`}</Text>}
       </Text>
+      <Text dimColor>{` rail: ${GLYPHS.toggleActive} in · ${GLYPHS.attention} partial · ${GLYPHS.toggleInactive} out · ${GLYPHS.fail} signed out`}</Text>
       <Box flexGrow={1} borderStyle="round" borderDimColor>
         <Box width={RAIL_W} flexDirection="column" paddingLeft={1} paddingTop={1}>
           {rail.slice(0, 3).map((row, index) => railView(row as Extract<RailRow, { kind: "view" }>, index))}
@@ -3053,9 +3090,9 @@ export async function runFleetInkEditor({
       judgeSeats={judgeSeats}
       // v1.90.9: cap every list to the terminal minus chrome so the cursor and header can
       // never scroll off-screen (omp's 218-model list did exactly that pre-cap).
-      // OBS-523: chrome is ≤12 rows worst case (header, borders, padding, scope+search,
+      // OBS-523: chrome is ≤13 rows worst case (header, rail legend, borders, padding, scope+search,
       // elisions, two detail lines, keybar) — the old -16 blanked six list rows at every size.
-      viewRows={Math.max(8, (output.rows ?? 40) - 12)}
+      viewRows={Math.max(8, (output.rows ?? 40) - 13)}
       frameColumns={output.columns ?? 100}
       frameRows={realTty ? output.rows : undefined}
     />

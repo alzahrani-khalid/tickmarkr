@@ -12,7 +12,7 @@ import { BANNER, kvRow, legend, rule, statusRow, title } from "../../brand.js";
 import { stateDirName, tickmarkrDir } from "../../graph/graph.js";
 import { orcaHostDetected } from "../../drivers/index.js";
 import { gitSync, WORKTREES_DIR } from "../../run/git.js";
-import { GitTrustRefusal } from "../../run/git-trust.js";
+import { assertGitTrust, GitTrustRefusal } from "../../run/git-trust.js";
 import { Journal, type JournalEvent } from "../../run/journal.js";
 import { runLockOwner, runLockRunId, runStatusLine } from "../../run/lock.js";
 import { doctor } from "./doctor.js";
@@ -731,6 +731,9 @@ export async function init(argv: string[], cwd = process.cwd(), io: InitIO = {})
   if (values.remove) {
     return handleRemove(cwd);
   }
+  // Refuse redirected linked-worktree metadata before discovery can launch a child.
+  // All later operator git goes through gitSync's guarded, forced-last entry.
+  assertGitTrust(cwd);
   const gdir = values["global-dir"] ?? globalConfigDir();
   mkdirSync(gdir, { recursive: true });
   const notes: string[] = [];
@@ -852,12 +855,19 @@ export async function init(argv: string[], cwd = process.cwd(), io: InitIO = {})
   // Interactive journeys get the COMPACT surface (status rows + pointer) — the full matrix between
   // two TUIs was the operator's clutter report; non-TTY keeps the complete machine surface.
   const fresh = values.fresh ?? false;
-  const { reuse, ageMs, health } = initDoctorReuse(cwd, fresh);
+  const adapters = allAdapters();
+  const cfg = loadConfig(cwd, { globalDir: gdir });
+  // Match the preflight's executable scope: a tier with no registered adapter cannot
+  // receive a model probe. Its historical verdict must not trigger discovery forever.
+  const probeCfg = { ...cfg, tiers: Object.fromEntries(adapters
+    .filter((a) => cfg.tiers[a.id])
+    .map((a) => [a.id, cfg.tiers[a.id]])) };
+  const { reuse, ageMs, health } = initDoctorReuse(cwd, fresh, probeCfg);
   let doc = reuse && health && ageMs !== null
     ? interactive
       ? `using probe results from ${formatDoctorAgeForInit(ageMs)} ago — full matrix: tickmarkr doctor · refresh: init --fresh`
-      : `using probe results from ${formatDoctorAgeForInit(ageMs)} ago — run tickmarkr doctor to refresh (or init --fresh)\n${formatDoctorReport(cwd, loadConfig(cwd), health, allAdapters(), { wrote: false })}`
-    : await doctor([], cwd, undefined, { banner: false, compact: interactive });
+      : `using probe results from ${formatDoctorAgeForInit(ageMs)} ago — run tickmarkr doctor to refresh (or init --fresh)\n${formatDoctorReport(cwd, cfg, health, adapters, { wrote: false })}`
+    : await doctor([], cwd, adapters, { banner: false, compact: interactive, globalDir: gdir });
 
   // Act 3 — fleet. The compact discovery surface prints BETWEEN the acts so the operator reads
   // what the fleet browser (and its presets overlay, raised on the first Shapes entry) ranks

@@ -3,11 +3,11 @@ import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { parseArgs } from "node:util";
-import { allAdapters, discoverChannels, doctorAgeMs, initDoctorReuse, modelAuthExclusions, PREFERENCE_ROLES } from "../../adapters/registry.js";
+import { allAdapters, discoverChannels, doctorAgeMs, initDoctorReuse, modelAuthExclusions, PREFERENCE_ROLES, readDoctor } from "../../adapters/registry.js";
 import { catalogModelAdvisory, catalogTierRanking, declaredModelWindow, fleetUnclassifiedModels } from "../../adapters/model-lints.js";
 import { CATALOG_REFRESH_TIMEOUT_MS, formatCatalogRefreshLegs, type CatalogFetcher, type CatalogModelEvidence, type CatalogReadResult, readCachedCatalog, refreshCatalogCommand } from "../../adapters/catalog-remote.js";
 import { CLAUDE_ALIAS_IDENTITY_STAMPS, type ClaudeAlias, readClaudeAliasIdentity } from "../../adapters/claude-code.js";
-import type { BillingChannel, WorkerAdapter } from "../../adapters/types.js";
+import { channelKey, channelsFromConfig, type BillingChannel, type WorkerAdapter } from "../../adapters/types.js";
 import {
   ConfigError,
   DEFAULT_CONFIG,
@@ -40,14 +40,14 @@ import {
   unifiedYamlDiff,
   universeEntryMatches,
 } from "../../config/config.js";
-import { exclusionReason, projectFleetWhy, renderFleetWhy, type FleetWhyValue } from "../../config/fleet-why.js";
-import { overlayHoldingLine, overlayHoldsMap } from "../../config/fleet-overlay.js";
+import { exclusionReason, projectFleetWhy, renderFleetWhy, type FleetWhyValue, type ShapeWhy } from "../../config/fleet-why.js";
+import { fleetPoolPrune, overlayHoldingLine, overlayHoldsMap } from "../../config/fleet-overlay.js";
 import { SHAPES, TIERS, type Shape, type Task } from "../../graph/schema.js";
-import { doctor } from "./doctor.js";
+import { doctor, probeScope } from "./doctor.js";
 import { candidateRow, costSignal, shapeCandidates } from "./fleet-picker.js";
-import { route } from "../../route/router.js";
+import { preferIndex, route } from "../../route/router.js";
 import { pickRole } from "../../route/role-pick.js";
-import { deadPoolEntries, deadPoolEntryLine, denyPreferCollisionLine, denyPreferCollisions, disallowedBy, entryMatchesChannel, exclusionCollector } from "../../route/preference.js";
+import { deadPoolEntries, deadPoolEntryLine, denyPreferCollisionLine, denyPreferCollisions, disallowedBy, entryMatchesChannel, exclusionCollector, observedSeat } from "../../route/preference.js";
 import { resolveRunMode, type ResolvedRunMode } from "../../run/daemon.js";
 import { loadRoutingProfile, readReviewNoVerdictHistory, reviewNoVerdictRows } from "../../run/journal.js";
 // type-only: the Ink module must never load on the print path (nor before the TTY/FORCE_COLOR fixture)
@@ -82,7 +82,37 @@ export type FleetIO = {
   reloadGuard?: (bytes: string) => string | null;
   catalogFetcher?: CatalogFetcher;
   catalogNow?: () => Date;
+  doctor?: typeof doctor;
+  runEditor?: (props: FleetEditorProps) => Promise<FleetEditorResult>;
 };
+
+async function staleProbeConsent(input: FleetInput, output: FleetOutput, count: number, cached: boolean): Promise<"probe" | "cached" | "quit"> {
+  return new Promise((resolve) => {
+    const wasRaw = (input as FleetInput & { isRaw?: boolean }).isRaw ?? false;
+    const finish = (answer: "probe" | "cached" | "quit") => {
+      input.off("data", onData);
+      input.off("end", onEnd);
+      input.off("close", onEnd);
+      input.setRawMode?.(wasRaw);
+      input.pause();
+      output.write("\n");
+      resolve(answer);
+    };
+    const onData = (chunk: string | Buffer) => {
+      const key = chunk.toString().trim().toLowerCase();
+      if (["p", "probe", "1"].includes(key)) finish("probe");
+      else if (cached && ["c", "cached", "2"].includes(key)) finish("cached");
+      else if (["q", "quit", "3", "\u0003", "\u001b"].includes(key)) finish("quit");
+    };
+    const onEnd = () => finish("quit");
+    input.on("data", onData);
+    input.once("end", onEnd);
+    input.once("close", onEnd);
+    input.setRawMode?.(true);
+    output.write(`fleet: probe cache missing or stale — probe now (${count} configured models in default scope; may make model calls)? [p] probe now${cached ? ", [c] open with cached verdicts" : ""}, [q] quit: `);
+    input.resume();
+  });
+}
 
 // v1.60 T3: every preview surface ranks with the SAME exploration setting as the candidate picker
 // (rankCandidates routes noExplore so repeated calls agree) — a due probe must never make a
@@ -327,7 +357,7 @@ export async function fleet(
     if (!role) return refuse("unsupported-role — expected worker, judge, review or consult; no role prefer resolved");
     if (values.print || values.why || values.fresh) return refuse("incompatible options — --pick cannot use --print, --why or --fresh");
     const { cfg } = resolveRunMode(cwd, { globalDir });
-    const { reuse, health } = initDoctorReuse(cwd, false);
+    const { reuse, health } = initDoctorReuse(cwd, false, cfg);
     const selection = pickRole(role, cfg, adapters, reuse && health ? health : {}, {
       excludeVendors: new Set(values["exclude-vendor"] ?? []),
     });
@@ -345,6 +375,19 @@ export async function fleet(
   const input = io.input ?? (process.stdin as FleetInput);
   const output = io.output ?? (process.stdout as FleetOutput);
   const interactive = input.isTTY === true && output.isTTY === true;
+  let allowStaleCache = false;
+  let shouldProbe = false;
+  if (!print && !why && interactive) {
+    const { cfg } = resolveRunMode(cwd, { globalDir });
+    const { reuse } = initDoctorReuse(cwd, values.fresh ?? false, cfg);
+    if (!reuse) {
+      const answer = values.fresh ? "probe" : await staleProbeConsent(input, output,
+        probeScope(cfg, {}, readDoctor(cwd)).filter((c) => adapters.some((a) => a.id === c.adapter)).length, readDoctor(cwd) !== null);
+      if (answer === "quit") return QUIT;
+      allowStaleCache = answer === "cached";
+      shouldProbe = answer === "probe";
+    }
+  }
   let catalog = readCachedCatalog(cwd, { now: io.catalogNow });
   let refreshReason = "";
   let catalogRefreshAttempted = false;
@@ -372,24 +415,23 @@ export async function fleet(
     const nl = body.indexOf("\n");
     // Steering comes from the same resolved config snapshot the editor consumes below,
     // not from another parse of either raw overlay.
-    return `${body.slice(0, nl)}\n# mode: ${rm.mode.mode} (${rm.source})${refreshReason ? `\n# ${refreshReason}` : ""}${body.slice(nl)}${formatFleetSteering(rm.cfg)}`;
+    const printed = `${body.slice(0, nl)}\n# mode: ${rm.mode.mode} (${rm.source})${refreshReason ? `\n# ${refreshReason}` : ""}${body.slice(nl)}${formatFleetSteering(rm.cfg)}`;
+    if (!why) return printed;
+    const assembled = await assembleFleetEditor(cwd, adapters, io, { globalDir, catalog });
+    if ("unavailable" in assembled) return { out: `${printed}\n${assembled.unavailable}`, code: 1 };
+    return `${printed}\n${assembled.renderWhy()}`;
   }
 
   if (!why && !interactive) return { out: `${refreshReason ? `${refreshReason}\n` : ""}${NON_TTY_MSG}`, code: 1 };
 
-  // OBS-528: `--fresh` parsed since v1.92 but nothing ever RAN the probe — it forced the reuse
-  // gate false and guaranteed the "probe data missing or stale" refusal. The law stands — the
-  // EDITOR never probes (previews stay cache-only, `r` still exits to the operator) — but the
-  // command may run the sensor up front, exactly like init's act 2: a stale cache (or --fresh)
-  // probes first, visibly, then the editor assembles from what the probe just recorded.
-  if (!why && interactive) {
-    const { reuse } = initDoctorReuse(cwd, values.fresh ?? false);
-    if (!reuse) {
-      output.write(`${await doctor([], cwd, adapters, { banner: false, compact: true, ...(catalogRefreshAttempted ? { catalog } : {}), catalogFetcher: io.catalogFetcher, catalogNow: io.catalogNow })}\n`);
-    }
+  if (shouldProbe) {
+    output.write(`${await (io.doctor ?? doctor)([], cwd, adapters, { banner: false, compact: true, globalDir, ...(catalogRefreshAttempted ? { catalog } : {}), catalogFetcher: io.catalogFetcher, catalogNow: io.catalogNow })}\n`);
+    // Consent (or --fresh) permits opening what the completed probe recorded, even if
+    // some default-scope channels could not be refreshed. The stored cache age stays honest.
+    allowStaleCache = true;
   }
 
-  const assembled = await assembleFleetEditor(cwd, adapters, io, { globalDir, catalog });
+  const assembled = await assembleFleetEditor(cwd, adapters, io, { globalDir, catalog, allowStaleCache });
   if ("unavailable" in assembled) return { out: `${refreshReason ? `${refreshReason}\n` : ""}${assembled.unavailable}`, code: 1 };
   if (why) return `${refreshReason ? `${refreshReason}\n` : ""}${assembled.renderWhy()}`;
 
@@ -409,7 +451,7 @@ export async function fleet(
   }
   let runFleetInkEditor: typeof import("../../tui/ink/fleet-app.js").runFleetInkEditor;
   try {
-    ({ runFleetInkEditor } = await import("../../tui/ink/fleet-app.js"));
+    runFleetInkEditor = io.runEditor ?? (await import("../../tui/ink/fleet-app.js")).runFleetInkEditor;
   } catch (error) {
     if (captureStartupInput) {
       input.off("data", onStartupInput);
@@ -435,7 +477,7 @@ export async function assembleFleetEditor(
   cwd: string,
   adapters: WorkerAdapter[],
   io: FleetIO,
-  opts: { globalDir: string; entry?: "presets" | "probe"; catalog?: CatalogReadResult },
+  opts: { globalDir: string; entry?: "presets" | "probe"; catalog?: CatalogReadResult; allowStaleCache?: boolean },
 ): Promise<
   | {
     props: FleetEditorProps;
@@ -463,14 +505,15 @@ export async function assembleFleetEditor(
   // the candidate bytes stand in for the destination layer in the one loader path
   const layerOf = (destination: Destination, bytes: string) =>
     (destination === "repo" ? { repoOverlayText: bytes } : { userOverlayText: bytes });
-  const { reuse, health: cached } = initDoctorReuse(cwd, false);
-  if (!reuse || !cached) {
+  const rm = resolveRunMode(cwd, { globalDir });
+  const { reuse, health: reusedHealth } = initDoctorReuse(cwd, false, rm.cfg);
+  const cached = reusedHealth ?? (opts.allowStaleCache ? readDoctor(cwd) : null);
+  if ((!reuse && !opts.allowStaleCache) || !cached) {
     return {
-      unavailable: "tickmarkr fleet: probe data missing or stale — run `tickmarkr doctor` first, or `tickmarkr fleet` interactively (it runs the probe itself when the cache is stale; --fresh forces one)",
+      unavailable: "tickmarkr fleet: probe data missing or stale — run `tickmarkr doctor` first, or `tickmarkr fleet` interactively (it asks before a stale-cache probe; --fresh forces one)",
     };
   }
 
-  const rm = resolveRunMode(cwd, { globalDir });
   const cfg = rm.cfg;
   const health = cached;
   // v1.92: the discovered fleet universe — every channel the adapters actually SERVE, discovered
@@ -561,6 +604,9 @@ export async function assembleFleetEditor(
     health[adapter]?.modelAuth?.[model]?.identity ?? health[adapter]?.modelIdentities?.[model];
   const rowEvidence = (adapter: string, model: string, evidence?: CatalogModelEvidence): FleetModelEvidence | undefined => {
     const probed = health[adapter]?.modelAuth?.[model] as { durationMs?: number; authed?: boolean; reason?: string } | undefined;
+    // D-2178 F3: without a model verdict, the adapter's signed-out verdict is the row's verdict.
+    // Keep its source so the glyph can fail even when policy also excludes this channel.
+    const inherited = probed?.authed === undefined && health[adapter]?.authed === false;
     const contextWindow = evidence?.contextWindow ?? declaredModelWindow(cfg, adapter, model);
     const identity = resolvedModelIdentity(adapter, model);
     const out: FleetModelEvidence = {
@@ -572,6 +618,7 @@ export async function assembleFleetEditor(
       // OBS-519: doctor already recorded the failed verdict — a rate-limited/unauthed model must
       // not render identically to a healthy row on the surface that edits its fleet membership.
       ...(probed?.authed === false ? { unauthed: probed.reason ?? "probe failed" } : {}),
+      ...(inherited ? { unauthed: `${adapter} adapter signed out${health[adapter]?.note ? ` — ${health[adapter].note}` : ""}`, unauthedAdapter: adapter } : {}),
       // the browser decides deny coverage itself, over the STAGED policy (LEG2-T3 finding 1)
       ...(identity !== undefined ? { identity } : {}),
     };
@@ -600,14 +647,14 @@ export async function assembleFleetEditor(
               const grouped = row.members.length > 1 || (row.members.length === 1 && row.members[0] !== row.model);
               const members = grouped ? row.members.map((model) => {
                 const identity = resolvedModelIdentity(adapter.id, model);
-                const probed = health[adapter.id]?.modelAuth?.[model] as { authed?: boolean; reason?: string } | undefined;
+                const verdict = rowEvidence(adapter.id, model);
                 return {
                   model,
                   ...(identity !== undefined ? { identity } : {}),
-                  ...(probed?.authed === false ? { unauthed: probed.reason ?? "probe failed" } : {}),
+                  ...(verdict?.unauthed !== undefined ? { unauthed: verdict.unauthed } : {}),
                 };
               }) : undefined;
-              const { unauthed: _unauthed, ...authedEvidence } = found ?? {};
+              const { unauthed: _unauthed, unauthedAdapter: _unauthedAdapter, ...authedEvidence } = found ?? {};
               const evidence = members?.some((member) => member.unauthed === undefined) && found?.unauthed !== undefined
                 ? (Object.keys(authedEvidence).length ? authedEvidence : undefined)
                 : found;
@@ -1108,6 +1155,52 @@ export async function assembleFleetEditor(
       ? { declaredAt: `routing.floors.${shape}` }
       : { declaredAt: "routing.mode" };
   };
+  const shapeWhy = (shape: Shape, cfgPreview: TickmarkrConfig, resolution: ModeResolution): ShapeWhy => {
+    const entry = cfgPreview.routing.map[shape];
+    const kind = entry?.pin ? "pin" : entry?.pool ? "pool" : entry?.prefer?.length ? "prefer" : "auto";
+    const path = `routing.map.${shape}.${kind}`;
+    const floor = cfgPreview.routing.floors[shape] ?? "cheap";
+    const live = candidateChannels(cfgPreview);
+    // Rebuild unavailable declarations as well: discovery has already removed failed auth/served
+    // members, but --why must name them rather than silently shrink the declared pool/prefer set.
+    const known = new Map<string, BillingChannel>();
+    for (const channel of [
+      ...adapters.flatMap((adapter) => [...channelsFromConfig(adapter.id, cfgPreview), ...adapter.channels(cfgPreview)]),
+      ...live,
+    ]) known.set(channelKey(channel), channel);
+    const ids = entry?.pin ? [`${entry.pin.via}:${entry.pin.model}`]
+      : entry?.pool ? entry.pool.channels
+      : [...new Set([...known.keys(), ...(entry?.prefer ?? []).filter((p) =>
+        ![...known.values()].some((c) => preferIndex(c, [p]) === 0))])];
+    const declarationSource = whyDeclaration(shape, resolution, entry, kind !== "auto");
+    return {
+      declaration: kind === "pool" ? `pool: ${path} (${entry!.pool!.mode})`
+        : kind === "prefer" ? `prefer: ${path} (${entry!.prefer!.join(" > ")}); open fleet`
+        : kind === "pin" ? `pin: ${path}` : `auto: floor ${floor}`,
+      ...declarationSource,
+      ...(kind !== "auto" && !declarationSource.operatorPinned ? { declaredAt: path } : {}),
+      members: [...new Set(ids)].map((id) => {
+        const c = known.get(id);
+        const colon = id.indexOf(":");
+        const seat = c ?? { adapter: colon < 0 ? id : id.slice(0, colon), model: colon < 0 ? "" : id.slice(colon + 1) };
+        const h = health[seat.adapter];
+        const scopes = exclusionCollector(observedSeat(health, seat.adapter, seat.model), cfgPreview.routing);
+        const reasons = scopes.map(exclusionReason);
+        if (!h?.installed) reasons.push("adapter not installed");
+        else if (!h.authed) reasons.push("adapter unauthed");
+        else if (h.modelAuth?.[seat.model]?.authed === false) reasons.push(`unauthed (${h.modelAuth[seat.model].reason ?? "probe failed"})`);
+        else if (!live.some((channel) => channelKey(channel) === id)) reasons.push("not available in doctor-discovered channels");
+        // Config floors are advisory for map pins/pools, exactly as route() treats them.
+        if (kind !== "pin" && kind !== "pool" && c && TIER_RANK[c.tier] < TIER_RANK[floor]) {
+          reasons.push(`below routing.floors.${shape} (${floor})`);
+        }
+        const rank = c ? preferIndex(c, entry?.prefer) : entry?.prefer?.length ?? 0;
+        return { id, admitted: reasons.length === 0, reason: reasons.join("; ") ||
+          (kind === "pool" ? "live pool member" : kind === "pin" ? "live pinned channel"
+            : rank < (entry?.prefer?.length ?? 0) ? `live channel; prefer rank ${rank + 1}; meets floor ${floor}` : `live channel; meets floor ${floor}`) };
+      }),
+    };
+  };
   const projectedShapeRows = (mode: RoutingMode, map: Record<string, MapEntry>, deny: StagedDeny, stage?: FleetStagedMetadata) => {
     const preview = previewCfg(mode, map, deny, stage);
     if (!preview.ok) {
@@ -1127,6 +1220,7 @@ export async function assembleFleetEditor(
       const shadowed = JSON.stringify(staged) !== JSON.stringify(mapSlot(editable.map[shape]))
         && JSON.stringify(staged) !== JSON.stringify(mapSlot(entry));
       const shadowNote = shadowed ? `  · staged ${slotLabel(staged)} shadowed — not applied in this repository` : "";
+      const explanation = shapeWhy(shape, cfgPreview, preview.mode);
       try {
         const routed = route(
           previewTask(shape),
@@ -1151,6 +1245,7 @@ export async function assembleFleetEditor(
           id: shape,
           effective,
           ...whyDeclaration(shape, preview.mode, entry, mapProducedValue),
+          shapeWhy: { ...explanation, routed },
         };
       } catch (error) {
         const mapProducedValue = entry?.pin !== undefined || entry?.pool !== undefined
@@ -1160,6 +1255,7 @@ export async function assembleFleetEditor(
           effective: `${(error as Error).message}${shadowNote}`,
           ...whyDeclaration(shape, preview.mode, entry, mapProducedValue),
           setupCommand: "tickmarkr fleet",
+          shapeWhy: { ...explanation, error: (error as Error).message },
         };
       }
     });
@@ -1520,11 +1616,29 @@ export async function assembleFleetEditor(
     // OBS-1144: the review names every dead pool entry the written config carries, with its reason and
     // what still routes — before y. Unloadable bytes carry no notes: the reload guard refuses them anyway.
     let poolNotes: string[] = [];
+    let allowDenyNotes: string[] = [];
     try {
       const written = loadConfigWithMode(cwd, { globalDir, ...layerOf(destination, after) }).cfg;
       poolNotes = deadPoolEntries(written, undefined, health).map(deadPoolEntryLine);
+      const known = Object.entries(written.tiers).flatMap(([adapter, tier]) =>
+        Object.keys(tier.models).map((model) => observedSeat(health, adapter, model)));
+      for (const leaf of ["adapters", "models"] as const) {
+        for (const entry of written.routing.allow?.[leaf] ?? []) {
+          const colon = entry.indexOf(":");
+          // Include unserved authored entries too; a probe is not required to explain their policy.
+          const seats = colon === -1
+            ? [...known, { adapter: entry, model: "" }, { adapter: "", model: entry }]
+            : [...known, observedSeat(health, entry.slice(0, colon), entry.slice(colon + 1))];
+          const conflicts = seats.filter((seat) => entryMatchesChannel(entry, seat)).flatMap((seat) =>
+            exclusionCollector(seat, written.routing).filter((reason) => reason.by === "deny"));
+          for (const reason of new Map(conflicts.map((reason) => [`${reason.path}\0${reason.entry}`, reason])).values()) {
+            allowDenyNotes.push(`routing.allow.${leaf} entry ${entry} is allowed and denied by ${reason.path} (${reason.entry}) — deny wins; keeping the authored allow entry`);
+          }
+        }
+      }
     } catch {
       poolNotes = [];
+      allowDenyNotes = [];
     }
     const controlEdits = edits.filter((edit) => CONTROL_NAMES.has(edit.name));
     const controlNote = controlEdits.length === 0
@@ -1541,7 +1655,9 @@ export async function assembleFleetEditor(
         : repoShadowNotes(before, after)),
       FUTURE_LOADS_NOTE,
       ...(lower.ok ? [] : [`${lower.error} — y will be refused`]),
+      ...fleetPoolPrune(write).notes,
       ...poolNotes,
+      ...allowDenyNotes,
     ];
     return {
       kind: "diff",
@@ -1569,7 +1685,7 @@ export async function assembleFleetEditor(
     (pendingWrite && stalePreview(pendingWrite, bytes)) || loaderGuard(pendingWrite?.destination ?? "user")(bytes);
 
   const props: FleetEditorProps = {
-    ageMs: doctorAgeMs(cwd),
+    ageMs: doctorAgeMs(cwd, cfg),
     adapters,
     health,
     ...Object.fromEntries(DENY_SCOPES.map((scope) => [initialDenyPropOf(scope), editable[scope.key] ?? []])),

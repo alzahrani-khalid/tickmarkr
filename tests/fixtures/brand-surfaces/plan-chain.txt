@@ -55,4 +55,3 @@ routing lints:
   ! opencode: no detection data — run tickmarkr doctor
   ! pi: no detection data — run tickmarkr doctor
   ! qwen: no model-list surface — seeds stamped 2026-07-09; verify manually
-  ! agy: no model-list surface and no configured models — classify per benchmark policy to open channels

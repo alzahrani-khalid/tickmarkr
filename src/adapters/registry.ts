@@ -3,10 +3,10 @@ import { existsSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type TickmarkrConfig } from "../config/config.js";
-import { modelLints, suggestOverlay } from "./model-lints.js";
+import { modelLints, modelListingLints, suggestOverlay } from "./model-lints.js";
 import { HerdrDriver } from "../drivers/herdr.js";
 import { tickmarkrDir, stateDirName } from "../graph/graph.js";
-import { disallowedBy, excludedChannels, exclusionLine, observedIdentity, observedSeat, type PreferenceRole, preferRanks } from "../route/preference.js";
+import { disallowedBy, entryMatchesChannel, excludedChannels, exclusionLine, observedIdentity, observedSeat, type PreferenceRole, preferRanks } from "../route/preference.js";
 import { sh } from "../run/git.js";
 import { FakeAdapter } from "./fake.js";
 import { parseWorkerResult } from "./prompt.js";
@@ -17,9 +17,53 @@ import {
   type CatalogEntriesOptions, type CliEntry, type DeclarativeCliDrive, type ModelIdField,
 } from "./catalog.js";
 import {
-  type AuthHealth, type BillingChannel, channelKey, channelsFromConfig, type ModelAuth,
+  type AuthHealth, type BillingChannel, channelKey, channelsFromConfig, type ModelAuth, type ModelListing,
   modelAuthed, MODEL_ID_RE, MODEL_PROBE_ERRORS, type ModelProbeError, QUOTA_PHRASE_RE, shq, STATUS_LABEL, type WorkerAdapter,
 } from "./types.js";
+
+export type ProbeScopeOpts = { adapter?: string[]; model?: string[]; all?: boolean };
+
+/** One scope for disclosure, paid calls and cache freshness. Explicit selections never expand
+ * through role preferences; default probes include channels reachable by any role plus preferences. */
+export function probeScope(
+  cfg: TickmarkrConfig,
+  opts: ProbeScopeOpts = {},
+  health?: Record<string, AuthHealth> | null,
+): { adapter: string; model: string }[] {
+  const configured = Object.entries(cfg.tiers).flatMap(([adapter, tier]) =>
+    Object.keys(tier.models ?? {}).map((model) => ({ adapter, model })));
+  for (const id of opts.adapter ?? []) {
+    if (!cfg.tiers[id]) throw new Error(`doctor: unknown configured adapter ${id}`);
+  }
+  for (const key of opts.model ?? []) {
+    if (!configured.some((c) => `${c.adapter}:${c.model}` === key)) {
+      throw new Error(`doctor: unknown configured model ${key}; expected adapter:model`);
+    }
+  }
+  const selected = !!(opts.adapter?.length || opts.model?.length);
+  const preferences = [
+    ...(cfg.review.prefer ?? []), ...(cfg.consult.prefer ?? []),
+    `${cfg.consult.adapter}:${cfg.consult.model}`, `${cfg.judge.adapter}:${cfg.judge.model}`,
+  ];
+  return configured.filter((c) => {
+    if (opts.all) return true;
+    if (selected) return opts.adapter?.includes(c.adapter) || opts.model?.includes(`${c.adapter}:${c.model}`);
+    if (preferences.some((p) => p === c.adapter || p === `${c.adapter}:${c.model}`)) return true;
+    const observed = observedSeat(health, c.adapter, c.model);
+    // Cached identities use routing's exact policy. Without an identity, retain an alias
+    // if resolving it could admit it: family denies alone are not proof it is unreachable.
+    // The model itself disables family matching; family allow entries supply the other
+    // possible identities. Direct adapter/model denies still exclude every possibility.
+    // These candidates only select probes; routing keeps its conservative unknown verdict.
+    const seats = observed.identity ? [observed] : [
+      { ...c, identity: c.model },
+      ...[...(cfg.routing.allow?.adapters ?? []), ...(cfg.routing.allow?.models ?? [])]
+        .filter((entry) => entryMatchesChannel(entry, c, true) && !entryMatchesChannel(entry, c))
+        .map((entry) => ({ ...c, identity: entry.slice(entry.indexOf(":") + 1) })),
+    ];
+    return seats.some((seat) => PREFERENCE_ROLES.some((role) => !disallowedBy(seat, cfg.routing, role)));
+  });
+}
 
 // Compatibility projection for callers/tests that only need shipped advisory names. The literal
 // list is gone: both advisory and routable catalog views derive from SHIPPED_CLI_CATALOG. Native
@@ -274,7 +318,7 @@ export interface DeclaredModels {
 
 export function parseDeclaredModels(
   raw: string,
-  parser: "lines" | "pi-table" | "json",
+  parser: "lines" | "pi-table" | "json" | "id-tab",
   path?: string,
   field?: ModelIdField,
 ): DeclaredModels {
@@ -318,6 +362,8 @@ export function parseDeclaredModels(
       const [provider, model] = line.trim().split(/\s+/);
       return provider && model ? `${provider}/${model}` : "";
     });
+  } else if (parser === "id-tab") {
+    values = raw.split("\n").filter((line) => line.includes("\t")).map((line) => line.split("\t", 1)[0].trim());
   } else {
     values = raw.split("\n").map((line) => line.trim());
   }
@@ -331,8 +377,29 @@ export function parseDeclaredModels(
   return { models };
 }
 
-function declarativeAdapter(entry: CliEntry & { drive: DeclarativeCliDrive }): WorkerAdapter {
+export function declarativeAdapter(
+  entry: CliEntry & { drive: DeclarativeCliDrive },
+  opts: {
+    resolveBinary?: typeof resolveShellBinary;
+    run?: typeof shellSpawnSync;
+  } = {},
+): WorkerAdapter {
   const drive = entry.drive;
+  const listModelsResult = async (): Promise<ModelListing> => {
+    const listing = drive.listModels!;
+    const { resolved } = (opts.resolveBinary ?? resolveShellBinary)(entry.binary);
+    if (!resolved) return { status: "unavailable", models: [], reason: "binary missing" };
+    const cmd = [shq(resolved), ...listing.argv.map(shq)].join(" ");
+    const result = (opts.run ?? shellSpawnSync)(cmd, process.cwd(), listing.timeoutMs ?? 15000);
+    if (result.code !== 0) return { status: "unavailable", models: [], reason: `listing exited ${result.code} or timed out` };
+    const { models, reason } = parseDeclaredModels(
+      // prime-agent emits its table on stderr. Fall back only when stdout is empty.
+      result.stdout.trim() ? result.stdout : result.stderr,
+      listing.parser, listing.path, listing.field,
+    );
+    if (reason) console.warn(`tickmarkr: ${entry.id} listed no models — ${reason}`);
+    return { status: reason ? "unavailable" : "succeeded", models, ...(reason ? { reason } : {}) };
+  };
   const adapter: WorkerAdapter = {
     id: entry.id,
     vendor: entry.vendor!,
@@ -365,25 +432,8 @@ function declarativeAdapter(entry: CliEntry & { drive: DeclarativeCliDrive }): W
     },
     parse: parseWorkerResult,
     ...(drive.listModels ? {
-      listModels: async () => {
-        const { resolved } = resolveShellBinary(entry.binary);
-        if (!resolved) return [];
-        const cmd = [shq(resolved), ...drive.listModels!.argv.map(shq)].join(" ");
-        const result = shellSpawnSync(cmd, process.cwd(), 15000);
-        if (result.code !== 0) return [];
-        const { models, reason } = parseDeclaredModels(
-          // OBS-506: prime-agent prints its model table to STDERR (stdout 0 bytes, live-verified
-          // 2026-08-13) — the same stream convention probeVersionShell already tolerates for
-          // version banners. Fall back only when stdout is EMPTY, never merge the streams.
-          result.stdout.trim() ? result.stdout : result.stderr,
-          drive.listModels!.parser,
-          drive.listModels!.path,
-          drive.listModels!.field,
-        );
-        // Listing stays advisory (fail-open to []), but never silently: an empty projection names why.
-        if (models.length === 0 && reason) console.warn(`tickmarkr: ${entry.id} listed no models — ${reason}`);
-        return models;
-      },
+      listModels: async () => (await listModelsResult()).models,
+      listModelsResult,
     } : {}),
   };
   declarativeBinaries.set(adapter, entry.binary);
@@ -507,6 +557,24 @@ function probeFailure(
     : undefined;
 }
 
+// Classify the reply before its diagnostic tail discards the model error behind an offered list.
+// These are model-error shapes shared by CLIs, with no adapter names or offered model ids.
+const UNKNOWN_MODEL_RE = /\b(?:unknown|unrecognized|unsupported|invalid|unserved)\s+model(?:\s+id)?\b|\bmodel(?:\s+id)?\s+(?:["'`]?[^\s"'`]+["'`]?\s+)?(?:(?:is|was)\s+)?(?:not\s+(?:found|available|offered|served|supported|recognized)|does\s+not\s+exist|unavailable|unserved|unsupported|unknown|unrecognized)\b|\bnot\s+a\s+valid\s+model\b/i;
+
+export function classifyProbeReply(
+  code: number,
+  stdout: string,
+  stderr: string,
+  timedOut?: boolean,
+  timeoutMs = MODEL_PROBE_TIMEOUT_MS,
+): Pick<ModelAuth, "authed" | "reason" | "cause"> {
+  if (!timedOut && UNKNOWN_MODEL_RE.test(`${stderr}\n${stdout}`)) {
+    return { authed: false, cause: "unknown-model", reason: "unknown model id" };
+  }
+  const reason = probeFailure(code, stdout, stderr, timedOut, timeoutMs);
+  return reason ? { authed: false, reason } : { authed: true };
+}
+
 const PROBE_ERROR_RE = new RegExp(`\\b(${MODEL_PROBE_ERRORS.join("|")})\\b`);
 function probeError(code: number, stdout: string, stderr: string, timedOut?: boolean): ModelProbeError | undefined {
   if (timedOut || code === 0) return undefined;
@@ -528,13 +596,17 @@ export async function probeModels(
   adapters: WorkerAdapter[],
   health: Record<string, AuthHealth>,
   onProgress?: ProbeModelProgress,
+  opts: ProbeScopeOpts = {},
 ): Promise<void> {
   // T2: a prior doctor.json timeout verdict for this model skips the retry — a persistently dead
   // model (e.g. opencode glm-5.2) costs one 30s attempt instead of two every run.
   const priorHealth = readDoctor(repoRoot);
+  const scope = probeScope(cfg, opts, priorHealth);
   await Promise.all(adapters.map(async (a) => {
     const h = health[a.id];
     if (!h?.installed) return;
+    const models = scope.filter((c) => c.adapter === a.id).map((c) => c.model);
+    if (!models.length) return;
     // Tests inject FakeAdapter; never let an incidental default adapter spend a real token in the suite.
     if (process.env.VITEST && SHIPPED_NATIVE_ADAPTERS.has(a)) return;
     const priorModelAuth = priorHealth?.[a.id]?.modelAuth;
@@ -550,8 +622,8 @@ export async function probeModels(
       const attempt = async (model: string, retry?: { firstTimedOut: boolean }): Promise<{ verdict: ProbedModelAuth | null; timedOut: boolean }> => {
         const t0 = Date.now();
         const probedAt = new Date().toISOString();
-        const v = (authed: boolean, reason?: string, error?: ModelProbeError): ProbedModelAuth =>
-          ({ authed, ...(reason !== undefined ? { reason } : {}), ...(error ? { probeError: error } : {}), probedAt, durationMs: Date.now() - t0 });
+        const v = (authed: boolean, reason?: string, error?: ModelProbeError, cause?: ModelAuth["cause"]): ProbedModelAuth =>
+          ({ authed, ...(reason !== undefined ? { reason } : {}), ...(error ? { probeError: error } : {}), ...(cause ? { cause } : {}), probedAt, durationMs: Date.now() - t0 });
         try {
           if (typeof a.headlessCommand !== "function") return { verdict: v(false, "headless probe unavailable"), timedOut: false };
           const promptDir = mkdtempSync(join(tmpdir(), "tickmarkr-auth-"));
@@ -565,14 +637,15 @@ export async function probeModels(
               return { verdict: v(false, `probe timed out (repeat — retry skipped) (${MODEL_PROBE_TIMEOUT_MS}ms)`), timedOut: true };
             }
             const output = `${r.stderr}\n${r.stdout}`.trim();
-            const reason = parsedStartupFailureReason(a, output) ?? probeFailure(r.code, r.stdout, r.stderr, r.timedOut, MODEL_PROBE_TIMEOUT_MS);
+            const reply = classifyProbeReply(r.code, r.stdout, r.stderr, r.timedOut, MODEL_PROBE_TIMEOUT_MS);
+            const reason = reply.cause ? reply.reason : parsedStartupFailureReason(a, output) ?? reply.reason;
             if (!reason) return { verdict: v(true), timedOut: false };
             if (!retry) return { verdict: null, timedOut: r.timedOut === true };
-            const error = probeError(r.code, r.stdout, r.stderr, r.timedOut);
+            const error = reply.cause ? undefined : probeError(r.code, r.stdout, r.stderr, r.timedOut);
             return {
               verdict: error
                 ? v(priorModelAuth?.[model]?.authed === true, undefined, error)
-                : r.timedOut && retry.firstTimedOut ? v(false, `probe timed out twice (${MODEL_PROBE_TIMEOUT_MS}ms)`) : v(false, reason),
+                : r.timedOut && retry.firstTimedOut ? v(false, `probe timed out twice (${MODEL_PROBE_TIMEOUT_MS}ms)`) : v(false, reason, undefined, reply.cause),
               timedOut: r.timedOut === true,
             };
           } finally {
@@ -587,7 +660,7 @@ export async function probeModels(
       // Capped at MODEL_PROBE_CONCURRENCY per adapter unless the adapter declares its own cap
       // (codex: 1 — OBS-72, its concurrent probes self-contend in one repo).
       const retries: { model: string; firstTimedOut: boolean }[] = [];
-      await mapLimit(Object.keys(cfg.tiers[a.id]?.models ?? {}), a.probeConcurrency ?? MODEL_PROBE_CONCURRENCY, async (model) => {
+      await mapLimit(models, a.probeConcurrency ?? MODEL_PROBE_CONCURRENCY, async (model) => {
         const first = await attempt(model);
         if (first.verdict) store(model, first.verdict);
         else retries.push({ model, firstTimedOut: first.timedOut });
@@ -600,7 +673,7 @@ export async function probeModels(
         const second = await attempt(model, { firstTimedOut });
         if (second.verdict) store(model, second.verdict);
       }
-      h.modelAuth = verdicts;
+      h.modelAuth = { ...priorModelAuth, ...verdicts };
     };
     if (a.probeCwd !== "neutral") return runProbes(repoRoot);
     const probeRoot = mkdtempSync(join(tmpdir(), "tickmarkr-probe-"));
@@ -639,7 +712,28 @@ function readDoctorFile(repoRoot: string): Record<string, unknown> | null {
   }
 }
 
-export function writeDoctor(repoRoot: string, health: Record<string, AuthHealth>): void {
+export function writeDoctor(repoRoot: string, health: Record<string, AuthHealth>, scope?: { adapter: string; model: string }[]): void {
+  if (scope) {
+    const merged = readDoctor(repoRoot) ?? {};
+    for (const id of new Set(scope.map((c) => c.adapter))) {
+      const verdict = health[id];
+      const models = scope.filter((c) => c.adapter === id).map((c) => c.model);
+      const prior = merged[id];
+      if (!verdict && !prior) continue;
+      const modelAuth = { ...prior?.modelAuth };
+      const modelIdentities = { ...prior?.modelIdentities };
+      for (const model of models) {
+        // A selected model without a current verdict was not probed (missing CLI or a
+        // skipped sweep). Release its history; unselected siblings stay byte-identical.
+        const current = verdict?.modelAuth?.[model];
+        if (verdict?.installed && current) modelAuth[model] = current;
+        else delete modelAuth[model];
+        if (verdict?.modelIdentities?.[model]) modelIdentities[model] = verdict.modelIdentities[model];
+      }
+      merged[id] = { ...(verdict ?? prior), modelAuth, ...(Object.keys(modelIdentities).length ? { modelIdentities } : {}) };
+    }
+    health = merged;
+  }
   tickmarkrDir(repoRoot);
   const path = doctorPath(repoRoot);
   const tmp = `${path}.tmp`;
@@ -755,15 +849,29 @@ export function modelAuthLine(excluded: { key: string; reason: string; probedAt:
   return `model auth: ${excluded.length} channel(s) unauthed — ${parts.join(", ")}`;
 }
 
-// HYG-07(b): file mtime is the zero-schema-change staleness signal — doctor.json carries no probe timestamp,
-// so a schema field would break the existing-files compat invariant. null when the file is absent (probeAll
-// fallback path is fresh by construction). statSync is free vs the readDoctor that already happened.
-export function doctorAgeMs(repoRoot: string): number | null {
+// Existing report readers keep file age. Reuse callers supply config to reduce the default probe
+// scope's per-model times; a partial refresh must never freshen an untouched model.
+export function doctorAgeMs(repoRoot: string, cfg?: TickmarkrConfig): number | null {
   const p = doctorPath(repoRoot);
   if (!existsSync(p)) return null;
   // Math.max: mtimeMs is sub-ms float, Date.now() is int ms — clamp so a clock-skew fraction never
   // renders a nonsensical negative age ("doctor.json is -0h old").
-  return Math.max(0, Date.now() - statSync(p).mtimeMs);
+  const fileTime = statSync(p).mtimeMs;
+  const health = cfg ? readDoctor(repoRoot) : null;
+  const times: number[] = [];
+  if (cfg) {
+    const scope = probeScope(cfg, {}, health);
+    for (const id of new Set(scope.map((c) => c.adapter))) {
+      const verdicts = scope.filter((c) => c.adapter === id)
+        .flatMap((c) => health?.[id]?.modelAuth?.[c.model] ? [health[id].modelAuth![c.model]] : []);
+      if (!verdicts.length) times.push(fileTime);
+      for (const verdict of verdicts) {
+        const time = Date.parse(verdict.probedAt);
+        times.push(Number.isFinite(time) ? time : fileTime);
+      }
+    }
+  }
+  return Math.max(0, Date.now() - (times.length ? Math.min(...times) : fileTime));
 }
 
 // ponytail: hardcoded 60m TTL for init reuse only — promote to config when an operator asks.
@@ -773,9 +881,11 @@ export function formatDoctorAgeForInit(ageMs: number): string {
   return `${Math.floor(ageMs / 60_000)}m`;
 }
 
-export function initDoctorReuse(repoRoot: string, fresh: boolean): { reuse: boolean; ageMs: number | null; health: Record<string, AuthHealth> | null } {
+// CLI callers supply their effective config; the engine never reloads an overlay. The
+// legacy two-argument form retains file-age semantics, like doctorAgeMs without config.
+export function initDoctorReuse(repoRoot: string, fresh: boolean, cfg?: TickmarkrConfig): { reuse: boolean; ageMs: number | null; health: Record<string, AuthHealth> | null } {
   const health = readDoctor(repoRoot);
-  const ageMs = doctorAgeMs(repoRoot);
+  const ageMs = doctorAgeMs(repoRoot, cfg);
   const reuse = !fresh && health !== null && ageMs !== null && ageMs < INIT_DOCTOR_REUSE_MS;
   return { reuse, ageMs, health: reuse ? health : null };
 }
@@ -818,6 +928,7 @@ export function formatDoctorReport(cwd: string, cfg: TickmarkrConfig, health: Re
     }
   }
   rows.push(...modelLints(cfg, health, adapters, { stateDir: stateDirName(cwd) }).map((l) => `  ! ${l}`));
+  rows.push(...modelListingLints(cfg, health, adapters).map((l) => `  ! ${l}`));
   const excluded = excludedChannels(cfg, adapters, health);
   if (excluded.length) rows.push(`  ! ${exclusionLine(excluded)}`);
   const servable = servableExclusions(cfg, adapters, health);
@@ -848,7 +959,9 @@ export function formatDoctorReport(cwd: string, cfg: TickmarkrConfig, health: Re
     let timeoutNotePrinted = false;
     for (const m of models) {
       const v = h.modelAuth?.[m];
-      const auth = !v ? "unknown" : v.authed ? "authed" : `unauthed: ${trunc(v.reason ?? "probe failed", 40)} (${dateOf(v.probedAt)})`;
+      const auth = !v ? "unknown" : v.authed ? "authed" : v.cause === "unknown-model"
+        ? `${m} is not served by ${a.id} (${dateOf(v.probedAt)})`
+        : `unauthed: ${trunc(v.reason ?? "probe failed", 40)} (${dateOf(v.probedAt)})`;
       const d = disallowedBy(observedSeat(health, a.id, m), cfg.routing);
       const denied = d?.by === "deny" ? d.entry : "—";
       const pref = preferRanks({ adapter: a.id, model: m }, cfg).map((p) => `${p.shape}#${p.rank}`).join(",") || "—";

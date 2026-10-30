@@ -377,13 +377,58 @@ function deleteEmptyMap(doc: OverlayDocument, path: OverlayPath): void {
   if (isMap(node) && node.items.length === 0) deleteAt(doc, path);
 }
 
+/** Remove only newly excluded pool members. Earlier exclusions remain operator-authored debt. */
+export function fleetPoolPrune(write: FleetOverlayWrite): { map: FleetEditable["map"]; notes: string[] } {
+  const map = { ...write.edited.map };
+  const notes: string[] = [];
+  const exclusion = (state: FleetEditable, channel: string): { path: string; entry: string } | undefined => {
+    const colon = channel.indexOf(":");
+    const adapter = channel.slice(0, colon);
+    const model = channel.slice(colon + 1);
+    const row = write.universe?.find((candidate) => candidate.adapter === adapter) ?? { adapter, models: [model] };
+    const matches = (entry: string, deny: boolean) => {
+      if (universeEntryMatches(row, model, entry)) return true;
+      // As in preference.entryMatchesChannel, an unobserved alias conservatively matches an
+      // explicit deny in its family; allow-complement entries use exact membership matching.
+      if (!deny || row.identities?.[model] !== undefined) return false;
+      const split = entry.indexOf(":");
+      if (split !== -1 && entry.slice(0, split) !== adapter) return false;
+      return entry.slice(split + 1).toLowerCase().split(/[^a-z0-9]+/).includes(model.toLowerCase());
+    };
+    for (const scope of DENY_SCOPES) {
+      const entry = (state[scope.key] ?? []).find((entry) => matches(entry, true));
+      if (entry !== undefined) return { path: scope.dotted, entry };
+    }
+    const entry = (state.allowOut ?? []).find((entry) => matches(entry, false));
+    return entry === undefined ? undefined : { path: "routing.allow", entry };
+  };
+  for (const [shape, entry] of Object.entries(map)) {
+    if (!entry.pool) continue;
+    const channels = [...entry.pool.channels];
+    for (const channel of entry.pool.channels) {
+      const reason = exclusion(write.edited, channel);
+      if (!reason || exclusion(write.initial, channel)) continue;
+      const path = `routing.map.${shape}.pool`;
+      if (channels.length === 1) {
+        notes.push(`${path} keeps last member ${channel}, disallowed by ${reason.path} (${reason.entry}) — the pool is exhausted and the shape is unroutable`);
+        continue;
+      }
+      channels.splice(channels.indexOf(channel), 1);
+      notes.push(`${path} removed ${channel} — disallowed by this edit's ${reason.path} (${reason.entry})`);
+    }
+    if (channels.length !== entry.pool.channels.length) map[shape] = { ...entry, pool: { ...entry.pool, channels } };
+  }
+  return { map, notes };
+}
+
 /** Apply only fields fleet authored to the parsed YAML document. Untouched nodes retain their
  * keys, ordering, scalar style, and comments; fresh provenance is written directly on its tier node. */
 export function renderFleetOverlayWrite(priorBytes: string, write: FleetOverlayWrite): string {
   const doc = parseDocument(priorBytes);
   if (doc.errors.length) throw doc.errors[0];
 
-  const { initial, edited } = write;
+  const { initial } = write;
+  const edited = { ...write.edited, map: fleetPoolPrune(write).map };
   // OBS-1046: each flat scope (and the allow complement) is compared on its own — a scope the
   // session never edited keeps its node byte for byte, whatever its sibling did.
   const changed = (before: string[] = [], after: string[] = []) =>
@@ -505,6 +550,7 @@ export function renderFleetOverlayWrite(priorBytes: string, write: FleetOverlayW
     }
     if (JSON.stringify(before?.pool) !== JSON.stringify(after?.pool)) {
       const path = ["routing", "map", shape, "pool"];
+      refuseMerge(doc, priorBytes, path);
       if (after?.pool === undefined) {
         // pool: null tombstone — masks a lower-layer pool instead of inheriting it again.
         setStringSequencePreservingComments(doc, path, null);
@@ -882,10 +928,37 @@ export function serializeFleetOverlay(
   return `${lines.join("\n")}\n`;
 }
 
+/** Paths come from YAML node ranges, so flow collections and quoted keys work as well as blocks. */
+function yamlLinePaths(bytes: string): string[] {
+  const paths: string[] = [];
+  const lineOf = (offset: number) => bytes.slice(0, offset).split("\n").length - 1;
+  const walk = (node: unknown, path: string[]) => {
+    if (isMap(node)) {
+      for (const pair of node.items) {
+        if (!isScalar(pair.key) || !pair.key.range) continue;
+        const next = [...path, String(pair.key.value)];
+        const end = isNode(pair.value) && pair.value.range ? pair.value.range[1] : pair.key.range[1];
+        for (let line = lineOf(pair.key.range[0]); line <= lineOf(end - 1); line++) paths[line] = next.join(".");
+        walk(pair.value, next);
+      }
+    } else if (isSeq(node)) {
+      for (const item of node.items) walk(item, path);
+    }
+  };
+  walk(parseDocument(bytes).contents, []);
+  return paths;
+}
+
 export function unifiedYamlDiff(before: string, after: string, label = "config overlay"): string {
   if (before === after) return "";
-  const a = before.split("\n");
-  const b = after.split("\n");
+  const linesOf = (bytes: string) => bytes === "" ? [] : bytes.replace(/\n$/, "").split("\n");
+  const a = linesOf(before);
+  const b = linesOf(after);
+  const oldPaths = yamlLinePaths(before);
+  const newPaths = yamlLinePaths(after);
+  const oldNoNewline = (i: number) => i === a.length - 1 && !before.endsWith("\n");
+  const newNoNewline = (j: number) => j === b.length - 1 && !after.endsWith("\n");
+  const equal = (i: number, j: number) => a[i] === b[j] && oldNoNewline(i) === newNoNewline(j);
   // v1.60 T3: shortest-edit (LCS) matching. The old scan resynced greedily on the first mismatched
   // line, so one inserted line could cascade into a whole-file remove/re-add hunk on the one
   // confirmation surface an operator reviews before a write.
@@ -893,26 +966,48 @@ export function unifiedYamlDiff(before: string, after: string, label = "config o
   const lcs: number[][] = Array.from({ length: a.length + 1 }, () => Array.from({ length: b.length + 1 }, () => 0));
   for (let i = a.length - 1; i >= 0; i--) {
     for (let j = b.length - 1; j >= 0; j--) {
-      lcs[i][j] = a[i] === b[j] ? lcs[i + 1][j + 1] + 1 : Math.max(lcs[i + 1][j], lcs[i][j + 1]);
+      lcs[i][j] = equal(i, j) ? lcs[i + 1][j + 1] + 1 : Math.max(lcs[i + 1][j], lcs[i][j + 1]);
     }
   }
   const header = [`--- ${label} (current)`, `+++ ${label} (proposed)`];
-  const hunks: string[] = [];
+  const edits: { kind: " " | "-" | "+"; text: string; old: number; next: number; path?: string; noNewline: boolean }[] = [];
   let i = 0;
   let j = 0;
   while (i < a.length || j < b.length) {
-    if (i < a.length && j < b.length && a[i] === b[j]) {
+    if (i < a.length && j < b.length && equal(i, j)) {
+      edits.push({ kind: " ", text: a[i], old: i, next: j, noNewline: oldNoNewline(i) });
       i++;
       j++;
-      continue;
+    } else if (j >= b.length || (i < a.length && lcs[i + 1][j] >= lcs[i][j + 1])) {
+      edits.push({ kind: "-", text: a[i], old: i, next: j, path: oldPaths[i], noNewline: oldNoNewline(i) });
+      i++;
+    } else {
+      edits.push({ kind: "+", text: b[j], old: i, next: j, path: newPaths[j], noNewline: newNoNewline(j) });
+      j++;
     }
-    const del: string[] = [];
-    const add: string[] = [];
-    while ((i < a.length || j < b.length) && !(i < a.length && j < b.length && a[i] === b[j])) {
-      if (j >= b.length || (i < a.length && lcs[i + 1][j] >= lcs[i][j + 1])) del.push(`-${a[i++]}`);
-      else add.push(`+${b[j++]}`);
+  }
+  // Expand each change by three context lines, then join overlapping windows into unified hunks.
+  const windows: { start: number; end: number }[] = [];
+  edits.forEach((edit, at) => {
+    if (edit.kind === " ") return;
+    const start = Math.max(0, at - 3);
+    const end = Math.min(edits.length, at + 4);
+    const prior = windows.at(-1);
+    if (prior && start <= prior.end) prior.end = end;
+    else windows.push({ start, end });
+  });
+  const hunks: string[] = [];
+  for (const { start, end } of windows) {
+    const body = edits.slice(start, end);
+    const oldCount = body.filter((line) => line.kind !== "+").length;
+    const newCount = body.filter((line) => line.kind !== "-").length;
+    const paths = [...new Set(body.filter((line) => line.kind !== " ").flatMap((line) => line.path ? [line.path] : []))];
+    const leaves = paths.filter((path) => !paths.some((other) => other.startsWith(`${path}.`)));
+    hunks.push(`@@ -${body[0].old + (oldCount ? 1 : 0)},${oldCount} +${body[0].next + (newCount ? 1 : 0)},${newCount} @@ ${leaves.join(", ") || "(document)"}`);
+    for (const line of body) {
+      hunks.push(`${line.kind}${line.text}`);
+      if (line.noNewline) hunks.push("\\ No newline at end of file");
     }
-    hunks.push("@@", ...del, ...add);
   }
   return `${header.join("\n")}\n${hunks.join("\n")}\n`;
 }

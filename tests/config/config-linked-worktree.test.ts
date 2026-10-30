@@ -88,18 +88,18 @@ const adapter: WorkerAdapter = {
   listModels: async () => [],
 };
 
-const HEALTH = {
+const freshHealth = () => ({
   fake: {
     installed: true,
     authed: true,
     version: "fake",
     models: ["fake-1", "fake-2"],
     modelAuth: {
-      "fake-1": { authed: true, probedAt: "2026-09-12T00:00:00.000Z" },
-      "fake-2": { authed: true, probedAt: "2026-09-12T00:00:00.000Z" },
+      "fake-1": { authed: true, probedAt: new Date().toISOString() },
+      "fake-2": { authed: true, probedAt: new Date().toISOString() },
     },
   },
-};
+});
 
 describe("queue row 195 / D-2102: the linked worktree reads its main checkout's repo layer", () => {
   test("test: in a session worktree nested at its main checkout's .claude/worktrees directory with no config of its own, the loaded configuration, the run-mode resolver under a spec mode that differs from the main file's mode, the fleet print surface and doctor's seed-preference warnings each follow the main checkout's repository layer, a shape the main file prefers raising no default-seed warning there while a worktree config of its own takes precedence and brings that warning back, so a fallback applied in the loader alone, one the mode override drops or a preference lint that still reads only the worktree fails", () => {
@@ -239,7 +239,7 @@ describe("queue row 195 / D-2102: the linked worktree reads its main checkout's 
     git(repo, ["worktree", "add", "--detach", worktree, "HEAD"]);
     // the doctor cache is per-checkout state (only the config overlay falls back), so the worktree
     // carries its own cached probe — but still no config.yaml of its own
-    registry.writeDoctor(worktree, HEALTH);
+    registry.writeDoctor(worktree, freshHealth());
     const ownPath = join(worktree, ".tickmarkr", "config.yaml");
     expect(existsSync(ownPath)).toBe(false);
     const globalDir = makeTestTempDir("tickmarkr-fleet-wt-g-");

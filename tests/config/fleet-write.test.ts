@@ -758,8 +758,8 @@ test("finding 2: the production preview loads the candidate bytes through the co
       version: "fake",
       models: ["fake-1", "fake-2"],
       modelAuth: {
-        "fake-1": { authed: true, probedAt: "2026-09-12T00:00:00.000Z" },
-        "fake-2": { authed: true, probedAt: "2026-09-12T00:00:00.000Z" },
+        "fake-1": { authed: true, probedAt: new Date().toISOString() },
+        "fake-2": { authed: true, probedAt: new Date().toISOString() },
       },
     },
   });
@@ -823,8 +823,8 @@ test("judge c2: a staged edit whose candidate bytes the loader refuses renders a
       version: "fake",
       models: ["fake-1", "fake-2"],
       modelAuth: {
-        "fake-1": { authed: true, probedAt: "2026-09-12T00:00:00.000Z" },
-        "fake-2": { authed: true, probedAt: "2026-09-12T00:00:00.000Z" },
+        "fake-1": { authed: true, probedAt: new Date().toISOString() },
+        "fake-2": { authed: true, probedAt: new Date().toISOString() },
       },
     },
   });
@@ -975,7 +975,7 @@ test("Fleet saving effort through a user modelOverrides tombstone remasks both l
       authed: true,
       version: "fake",
       models,
-      modelAuth: Object.fromEntries(models.map((m) => [m, { authed: true, probedAt: "2026-09-27T00:00:00.000Z" }])),
+      modelAuth: Object.fromEntries(models.map((m) => [m, { authed: true, probedAt: new Date().toISOString() }])),
     },
   });
   const assembled = await assembleFleetEditor(repo, [adapter], {}, { globalDir });
@@ -1132,7 +1132,7 @@ const T8_SEATS = [t8Seat("fake"), t8Seat("codex")];
 const t8Doctor = (repo: string) => registry.writeDoctor(repo, Object.fromEntries(
   [["fake", "fake-1"], ["codex", "gpt-5.6-terra"]].map(([id, model]) => [id, {
     installed: true, authed: true, version: "fake", models: [model],
-    modelAuth: { [model]: { authed: true, probedAt: "2026-09-30T00:00:00.000Z" } },
+    modelAuth: { [model]: { authed: true, probedAt: new Date().toISOString() } },
   }]),
 ));
 const t8Session = async (fake1: "cheap" | "frontier", overlayTail = "") => {

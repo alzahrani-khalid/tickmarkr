@@ -35,7 +35,9 @@ export interface Assignment { adapter: string; model: string; channel: "sub" | "
 export interface BillingChannel { adapter: string; vendor: string; model: string; channel: "sub" | "api"; tier: Tier; identity?: string; effort?: Effort }
 export const MODEL_PROBE_ERRORS = ["EMFILE", "EAGAIN", "ENFILE", "ENOMEM", "ENOSPC"] as const;
 export type ModelProbeError = typeof MODEL_PROBE_ERRORS[number];
-export interface ModelAuth { authed: boolean; reason?: string; probeError?: ModelProbeError; probedAt: string; identity?: string }
+export interface ModelAuth { authed: boolean; reason?: string; cause?: "unknown-model"; probeError?: ModelProbeError; probedAt: string; identity?: string }
+export interface ModelListingOutcome { status: "succeeded" | "unavailable"; reason?: string }
+export interface ModelListing extends ModelListingOutcome { models: string[] }
 // v2.6.4 T2 (B1a): a model's retirement notice — a listed row's, or (v2.6.9) a hidden row's dated one —
 // copied verbatim from the CLI's own cache, never inferred from a model name. `successor` is the CLI's
 // named upgrade target, not a tier claim.
@@ -44,6 +46,8 @@ export interface AuthHealth {
   installed: boolean; authed: boolean; version?: string; models: string[]; note?: string;
   // v1.5 MODEL-02: ISO timestamp — additive-optional, pre-v1.5 doctor.json lacks it, readers use ?.
   modelsDetectedAt?: string;
+  // Advisory listing evidence. Native empty arrays cannot establish a successful empty list.
+  modelListing?: ModelListingOutcome;
   // HYG-05: models this adapter can GENUINELY serve (pi-only in v1.11). Three-valued by channel:
   // model ∈ servable ⇒ authed; model ∉ servable (defined) ⇒ unauthed ⇒ not advertised, map pin ⇒ RoutingError;
   // servable === undefined ⇒ UNKNOWN ⇒ no filtering (fail closed on the CHANNEL, never on the run).
@@ -479,6 +483,8 @@ export interface WorkerAdapter {
   // Fails OPEN to [] — deliberate inversion of the gates' fail-closed posture: detection is advisory,
   // a broken list surface must never fail an otherwise-healthy doctor.
   listModels?(): Promise<string[]>;
+  // Declarative runner only: it sees the command's exit status, so it can attest an empty list.
+  listModelsResult?(): Promise<ModelListing>;
   // v1.5 MODEL-05: cache-backed adapters (codex) know when the knowledge was actually FETCHED, not
   // when doctor last ran. Returning that lets doctor stamp modelsDetectedAt with the real cache age so
   // the 30-day staleness lint can fire on an ancient cache. undefined = no honest source → doctor uses now.
