@@ -146,8 +146,9 @@ test("recorded routable opus identities keep init reuse and fleet pick stale and
   }
 });
 
-test("default probe reachability follows observed or unresolved identities across alias families, policy lists and routing map entries", async () => {
-  const rows = [
+// D-2178 add.137: one test per row — the 24 rows ran serial doctor rounds in ONE test (12–17.5 s of the 20 s budget
+// locally) and timed out in public CI under suite load.
+const reachabilityRows = [
     { policy: { deny: { models: ["old"] } }, identity: "new", included: true },
     { policy: { deny: { models: ["new"] } }, identity: "new", included: false },
     { policy: { allow: { models: ["new"] } }, identity: "new", included: true },
@@ -160,39 +161,41 @@ test("default probe reachability follows observed or unresolved identities acros
     { policy: { allow: { models: ["new"] }, deny: { models: ["new"] } }, identity: "new", included: false },
     { policy: { allow: { models: ["new"] }, deny: { models: ["old"] } }, identity: undefined, included: true },
     { policy: { allow: { models: ["old"] }, deny: { models: ["old"] } }, identity: undefined, included: false },
-  ];
-  for (const [adapter, model] of [["claude-code", "opus"], ["gateway", "orbit"]]) {
-    for (const [index, row] of rows.entries()) {
-      const f = aliasFixture(adapter, model);
-      const identities: Record<string, string> = {
-        old: `${adapter}:vendor-${model}-5`, new: `${adapter}:vendor-${model}-5-5`,
-        adapter, alias: `${adapter}:${model}`, unrelated: `${adapter}:different-5`,
-      };
-      Object.assign(f.cfg.routing, JSON.parse(JSON.stringify(row.policy), (_key, value) => identities[value] ?? value));
-      f.cfg.routing.map = {
-        plan: { pin: { via: adapter, model } },
-        implement: { prefer: [`${adapter}:${model}`] },
-        tests: { pool: { mode: "any", channels: [`${adapter}:${model}`] } },
-      };
-      f.save();
-      const identity = row.identity ? identities[row.identity].slice(adapter.length + 1) : undefined;
-      if (index % 2 && identity) f.health[adapter].modelIdentities = { [model]: identity };
-      else if (identity) f.health[adapter].modelAuth![model].identity = identity;
-      writeDoctor(f.repo, f.health);
-      const context = `${adapter}: ${JSON.stringify(row)}`;
-      const resolveIdentity = vi.fn(() => identity ?? `vendor-${model}-5-5`);
+];
+const reachabilityCases = (["claude-code:opus", "gateway:orbit"] as const).flatMap((pair) => {
+  const [adapter, model] = pair.split(":");
+  return reachabilityRows.map((row, index) => [`${adapter} row ${index}`, { adapter, model, row, index }] as const);
+});
 
-      expect.soft(initDoctorReuse(f.repo, false, f.cfg).reuse, context).toBe(!row.included);
-      expect.soft(await runDoctor(f, ["--probe-preflight"]), context).toContain(`scope: ${row.included ? 2 : 1} model`);
-      await runDoctor(f, [], { resolveClaudeAliasIdentity: resolveIdentity });
+test.each(reachabilityCases)("default probe reachability follows observed or unresolved identities across alias families, policy lists and routing map entries — %s", async (_label, { adapter, model, row, index }) => {
+  const f = aliasFixture(adapter, model);
+  const identities: Record<string, string> = {
+    old: `${adapter}:vendor-${model}-5`, new: `${adapter}:vendor-${model}-5-5`,
+    adapter, alias: `${adapter}:${model}`, unrelated: `${adapter}:different-5`,
+  };
+  Object.assign(f.cfg.routing, JSON.parse(JSON.stringify(row.policy), (_key, value) => identities[value] ?? value));
+  f.cfg.routing.map = {
+    plan: { pin: { via: adapter, model } },
+    implement: { prefer: [`${adapter}:${model}`] },
+    tests: { pool: { mode: "any", channels: [`${adapter}:${model}`] } },
+  };
+  f.save();
+  const identity = row.identity ? identities[row.identity].slice(adapter.length + 1) : undefined;
+  if (index % 2 && identity) f.health[adapter].modelIdentities = { [model]: identity };
+  else if (identity) f.health[adapter].modelAuth![model].identity = identity;
+  writeDoctor(f.repo, f.health);
+  const context = `${adapter}: ${JSON.stringify(row)}`;
+  const resolveIdentity = vi.fn(() => identity ?? `vendor-${model}-5-5`);
 
-      expect.soft(calls(f.adapters), context).toEqual(["fake:fake-1", ...(row.included ? [`${adapter}:${model}`] : [])].sort());
-      expect.soft(resolveIdentity, context).toHaveBeenCalledTimes(adapter === "claude-code" && row.included ? 1 : 0);
-      const verdict = readDoctor(f.repo)![adapter].modelAuth?.[model];
-      if (row.included) expect.soft(verdict?.probedAt, context).not.toBe(old);
-      else expect.soft(verdict, context).toEqual(f.health[adapter].modelAuth![model]);
-    }
-  }
+  expect.soft(initDoctorReuse(f.repo, false, f.cfg).reuse, context).toBe(!row.included);
+  expect.soft(await runDoctor(f, ["--probe-preflight"]), context).toContain(`scope: ${row.included ? 2 : 1} model`);
+  await runDoctor(f, [], { resolveClaudeAliasIdentity: resolveIdentity });
+
+  expect.soft(calls(f.adapters), context).toEqual(["fake:fake-1", ...(row.included ? [`${adapter}:${model}`] : [])].sort());
+  expect.soft(resolveIdentity, context).toHaveBeenCalledTimes(adapter === "claude-code" && row.included ? 1 : 0);
+  const verdict = readDoctor(f.repo)![adapter].modelAuth?.[model];
+  if (row.included) expect.soft(verdict?.probedAt, context).not.toBe(old);
+  else expect.soft(verdict, context).toEqual(f.health[adapter].modelAuth![model]);
 });
 
 test("test: closed table — a stale cache in a TTY prompts with the configured model count and each answer does what it names (probe runs the injected doctor once; cached opens the editor with no doctor call; quit exits with no write and no call), and a non-TTY plain run refuses as today, and fleet help names the stale-cache probe beside the fresh flag, so a probe that runs unasked fails", async () => {
