@@ -438,7 +438,7 @@ export function pickReviewer(
     // as well as failover, so an aggregator channel stamped "mixed" never seats the author's own provider),
     // and different base-model identity (ADDED TO the vendor rule, never replacing it). The diversity
     // filter runs BEFORE preference ranking, so prefer cannot resurrect an excluded channel.
-    .filter((c) => authorChannels.every((a) => a && c.vendor !== a.vendor
+    .filter((c) => c.vendor !== "unknown" && authorChannels.every((a) => a && c.vendor !== a.vendor
       && modelProvider(c.model, c.vendor) !== modelProvider(a.model, a.vendor)
       && modelId(c.model) !== modelId(a.model))
       && !exclude.includes(channelKey(c))

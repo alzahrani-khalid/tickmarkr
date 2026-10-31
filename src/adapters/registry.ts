@@ -6,9 +6,10 @@ import { type TickmarkrConfig } from "../config/config.js";
 import { modelLints, modelListingLints, suggestOverlay } from "./model-lints.js";
 import { HerdrDriver } from "../drivers/herdr.js";
 import { tickmarkrDir, stateDirName } from "../graph/graph.js";
-import { disallowedBy, entryMatchesChannel, excludedChannels, exclusionLine, observedIdentity, observedSeat, type PreferenceRole, preferRanks } from "../route/preference.js";
+import { disallowedBy, entryMatchesChannel, excludedChannels, exclusionLine, modelProvider, observedIdentity, observedSeat, type PreferenceRole, preferRanks } from "../route/preference.js";
 import { sh } from "../run/git.js";
 import { FakeAdapter } from "./fake.js";
+import { claudeGatewayHost } from "./claude-code.js";
 import { parseWorkerResult } from "./prompt.js";
 import { sealHerdrEnv } from "../drivers/subprocess.js";
 import { withoutHostSession } from "../drivers/host-env.js";
@@ -759,6 +760,7 @@ export function discoverChannels(
   adapters: WorkerAdapter[],
   health: Record<string, AuthHealth>,
   role: PreferenceRole = "worker",
+  gateway: string | undefined = claudeGatewayHost(),
 ): BillingChannel[] {
   const base = adapters
     .filter((a) => health[a.id]?.installed && health[a.id]?.authed)
@@ -774,7 +776,12 @@ export function discoverChannels(
         .filter((c) => !invalid.has(c.model) && modelAuthed(h, c.model, cfg.routing.allowUnverifiedModels) && (!s || s.includes(c.model)))
         .map((c) => {
           const identity = observedIdentity(health, a.id, c.model);
-          return identity ? { ...c, identity } : c;
+          const observed = identity ? { ...c, identity } : c;
+          if (c.adapter !== "claude-code" || !gateway) return observed;
+          // A gateway's requested model name is an alias, never vendor provenance.
+          const vendor = cfg.tiers["claude-code"]?.modelOverrides?.[c.model]?.vendor
+            ?? (identity && modelProvider(identity) === "anthropic" ? "anthropic" : "unknown");
+          return { ...observed, vendor };
         });
     });
   if (!cfg.routing.allow && !cfg.routing.deny) return base;

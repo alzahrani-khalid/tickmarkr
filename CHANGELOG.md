@@ -2,6 +2,31 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v2.14.0 — gateway vendor truth: behind a model-remapping gateway, a Claude Code seat reviews or judges only when its vendor is declared or observed
+
+**v2.14.0** comes from one `tickmarkr run`, run-20261031-110921-0000000000000070. Both tasks passed build, lint, evidence, scope,
+their acceptance criteria, a cross-vendor review and the full suite.
+
+- **A gateway alias no longer reviews its own vendor's work.** When Claude Code runs through a gateway or proxy that remaps
+  model names (`ANTHROPIC_BASE_URL` in the environment or in `~/.claude/settings.json`, any host but `api.anthropic.com`),
+  a model called `claude-…` may be served by another vendor's model. tickmarkr used to call every claude-code model
+  Anthropic, so such an alias could be seated as the "cross-vendor" reviewer or judge of work its own vendor wrote.
+  Behind a gateway, a claude-code model's vendor is now:
+  - the vendor you declare in `tiers.claude-code.modelOverrides.<model>.vendor`;
+  - else Anthropic, when tickmarkr has observed the model answer as an Anthropic model;
+  - else unknown.
+  A model of unknown vendor still takes worker tasks, but it never reviews and never judges. Without a gateway nothing changes.
+- **`tickmarkr plan` says which seats a gateway benched and how to seat them.** One line names the gateway host and every
+  claude-code model of unknown vendor, with the declaration that seats one:
+  ```yaml
+  tiers:
+    claude-code:
+      modelOverrides:
+        claude-opus-5-5:
+          vendor: anthropic
+  ```
+  A fleet whose only second vendor is unknown is no longer counted as able to review across vendors.
+
 ## v2.13.0 — tickmarkr cleans up after its own seats: litter its judge and review left no longer parks a green round
 
 **v2.13.0** comes from one `tickmarkr run`, run-20261030-233732-0000000000000001. Its task passed build, lint, evidence, scope,

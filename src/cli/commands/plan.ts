@@ -21,6 +21,7 @@ import { Journal, loadRoutingProfile, readProfileCursor, recordedGraphDefinition
 import { harnessLine, resolveHarness } from "../harness.js";
 import { codexCommitHeadline, codexEscapeRoleLine } from "../../adapters/codex-commit-check.js";
 import { codex } from "../../adapters/codex.js";
+import { claudeGatewayHost } from "../../adapters/claude-code.js";
 import { channelKey, shq, type Assignment, type BillingChannel, type WorkerAdapter } from "../../adapters/types.js";
 import { shGit } from "../../run/git.js";
 import { runLockRunId, runStatusLine } from "../../run/lock.js";
@@ -41,13 +42,16 @@ const stylizePlan = (out: string): string => {
 };
 
 const fleetCanCrossVendorReview = (channels: BillingChannel[]) => {
-  for (let i = 0; i < channels.length; i++)
-    for (let j = 0; j < channels.length; j++)
+  // Queue row 311: a gateway channel with no declared vendor is `unknown` — it works, but it can never
+  // review or judge, so it must not count as a vendor of its own when pairing the fleet for review.
+  const seated = channels.filter((c) => c.vendor !== "unknown");
+  for (let i = 0; i < seated.length; i++)
+    for (let j = 0; j < seated.length; j++)
       if (
         i !== j
-        && channels[i].vendor !== channels[j].vendor
-        && modelProvider(channels[i].model, channels[i].vendor) !== modelProvider(channels[j].model, channels[j].vendor)
-        && modelId(channels[i].model) !== modelId(channels[j].model)
+        && seated[i].vendor !== seated[j].vendor
+        && modelProvider(seated[i].model, seated[i].vendor) !== modelProvider(seated[j].model, seated[j].vendor)
+        && modelId(seated[i].model) !== modelId(seated[j].model)
       ) return true;
   return false;
 };
@@ -171,6 +175,7 @@ export async function plan(
   adapters: WorkerAdapter[] = allAdapters(),
   harnessFrom: string | undefined = process.argv[1],
   opts: PlanOpts = {},
+  gateway: string | undefined = claudeGatewayHost(),
 ): Promise<string> {
   // ponytail: hardcoded 24h TTL — promote to config when an operator asks. mtime is the signal because
   // doctor.json has no probe timestamp and a schema field would break the existing-files compat invariant.
@@ -387,6 +392,24 @@ export async function plan(
     lints.push("review: review.required is set but no channel can route — the fleet is empty; install or authenticate an adapter");
   } else if (cfg.review.required && !fleetCanCrossVendorReview(pools.review)) {
     lints.push("review: no cross-vendor reviewer pair in fleet — set review.required: false to waive");
+  }
+  // Queue row 311 (a): a detected gateway benches every claude-code model with no declared vendor —
+  // those seats never review or judge — so plan says so once, naming the host and the repair.
+  // Review/judge pools keep channels routing.deny.workers removes from the worker pool, so the bench
+  // list is collected (deduplicated) across every role pool: a worker-only exclusion must not hide a
+  // gateway-benched review or judge seat from the operator.
+  const benchedByGateway = gateway
+    ? [...new Set(
+        [pools.worker, pools.review, pools.judge, pools.consult]
+          .flat()
+          .filter((c) => c.adapter === "claude-code" && c.vendor === "unknown")
+          .map((c) => c.model),
+      )]
+    : [];
+  if (benchedByGateway.length) {
+    lints.push(
+      `claude-code via gateway ${gateway}: ${benchedByGateway.join(", ")} have no declared vendor, so they work but never review or judge; declare tiers.claude-code.modelOverrides.<model>.vendor to seat one`,
+    );
   }
 
   let cost = 0;

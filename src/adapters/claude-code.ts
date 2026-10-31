@@ -9,6 +9,30 @@ import { parseWorkerResult } from "./prompt.js";
 import { decodeClaudeStream } from "./claude-stream.js";
 import { type Assignment, type AuthHealth, type BillingChannel, channelsFromConfig, type ContextUsage, declareInputBox, type Invocation, MODEL_ID_RE, promptFitsArgv, type SessionRef, shq, type TokenUsage, TokenUsageSchema, type TrustDialog, type WorkerAdapter } from "./types.js";
 
+/** User-scope base URL only; explicit inputs let tests avoid the operator's settings. */
+export function claudeGatewayHost(
+  env: NodeJS.ProcessEnv = process.env,
+  settingsPath?: string,
+): string | undefined {
+  if (process.env.VITEST && env === process.env && settingsPath === undefined) return undefined;
+  let baseUrl: unknown = env.ANTHROPIC_BASE_URL;
+  if (!baseUrl) {
+    try {
+      const path = settingsPath ?? join(env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude"), "settings.json");
+      baseUrl = JSON.parse(readFileSync(path, "utf8"))?.env?.ANTHROPIC_BASE_URL;
+    } catch {
+      return undefined;
+    }
+  }
+  if (typeof baseUrl !== "string") return undefined;
+  try {
+    const host = new URL(baseUrl).hostname;
+    return host && host !== "api.anthropic.com" ? host : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 // SPEND-01/SPEND-11: claude writes a per-session JSONL to ~/.claude/projects/<slug>/ where slug is the
 // realpath'd cwd with every non-alphanumeric char replaced by "-" (verified 114/114 — 36-DIAGNOSIS.md).
 // The old `/`-only formula missed the "." in `.tickmarkr/worktrees/…` — ENOENT on every worktree dispatch.

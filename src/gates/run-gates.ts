@@ -36,6 +36,15 @@ import {
   type VerificationScope,
 } from "./cache.js";
 
+export function isIndependentJudge(
+  seat: BillingChannel,
+  authorVendors: ReadonlySet<string>,
+  authors: readonly string[],
+): boolean {
+  return !!seat.vendor && seat.vendor !== "unknown"
+    && !authorVendors.has(seat.vendor) && !authors.includes(channelKey(seat));
+}
+
 // v2.0 T2 (OBS-554): the host one-minute load average — the decision variable the parked load-aware
 // scheduler would key on. Injectable so a test can state the load a gate ran under; production always
 // reads os.loadavg. Windows reports [0,0,0] and that is what gets recorded: an honest "unmeasurable
@@ -1355,17 +1364,28 @@ export async function runGates(
     const channels = [...(ctx.judgeChannels ?? []), ...ctx.channels];
     const authors = ctx.carriedAuthors?.length ? ctx.carriedAuthors : [channelKey(ctx.author)];
     const authorVendors = carriedAuthorVendors(channels, authors);
-    const independent = (seat: BillingChannel) => !!seat.vendor
-      && !authorVendors.has(seat.vendor) && !authors.includes(channelKey(seat));
-    const judgePool = () => (ctx.judgeChannels ?? []).filter((c) => disallowedBy(c, ctx.cfg.routing, "judge") === null);
+    const independent = (seat: BillingChannel) => isIndependentJudge(seat, authorVendors, authors);
+    const judgePool = () => (ctx.judgeChannels ?? []).filter((c) => c.vendor !== "unknown"
+      && disallowedBy(c, ctx.cfg.routing, "judge") === null);
     const rankJudges = (pool: BillingChannel[]) => [...pool]
       .sort((x, y) => TIER_RANK[y.tier] - TIER_RANK[x.tier] || marginalCostRank(x) - marginalCostRank(y));
     const pickJudge = (pool: BillingChannel[], adapter: string) =>
       rankJudges(pool.filter((c) => c.adapter !== adapter))[0] ?? rankJudges(pool)[0];
     const configured = channels.find((c) => channelKey(c) === channelKey(ctx.cfg.judge));
-    const primary = authors.includes(channelKey(ctx.cfg.judge)) || (configured && authorVendors.has(configured.vendor))
-      ? pickJudge(judgePool().filter(independent), ctx.cfg.judge.adapter) ?? ctx.cfg.judge
+    const primary = authors.includes(channelKey(ctx.cfg.judge)) || (configured && !independent(configured))
+      ? pickJudge(judgePool().filter(independent), ctx.cfg.judge.adapter)
+        ?? (configured?.vendor === "unknown" ? pickJudge(judgePool(), ctx.cfg.judge.adapter) : ctx.cfg.judge)
       : ctx.cfg.judge;
+    if (!primary) {
+      return {
+        result: {
+          gate: "acceptance", pass: false,
+          details: "no judge with a known vendor is available; declare the gateway model's vendor or select another judge",
+          meta: { classification: "infra", infra: true, retryable: false, judgeIndependent: false },
+        },
+        invocations: [],
+      };
+    }
     const judgeAdapter = getAdapter(primary.adapter, ctx.adapters);
     const jvia = via
       ? { driver: via.driver, keep: via.keep, onSlot: via.onSlot, name: via.nameFor("judge", judgeAdapter.id), label: via.labelFor("judge") }
@@ -1498,7 +1518,7 @@ export async function runGates(
       // Queue row 34(a) (D-2134 R5): keep GATE-09's exclusions and fallback when independence is unavailable.
       const pool = judgePool().filter((c) => channelKey(c) !== flakedKey);
       const retry = pickJudge(pool.filter(independent), flakedAdapter)
-        ?? pickJudge(pool, flakedAdapter) ?? judgeSeat;
+        ?? pickJudge(pool, flakedAdapter) ?? (configured?.vendor === "unknown" ? primary : judgeSeat);
       const retryAdapter = getAdapter(retry.adapter, ctx.adapters);
       const retryJvia = via
         // unconditional -r1 suffix: under keepPanes:forever a same-channel retry cannot collide with the
