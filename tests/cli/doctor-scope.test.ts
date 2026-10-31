@@ -263,45 +263,44 @@ test("doctor --adapter other reports the installed cached judge and consult with
   }
 });
 
-test("scoped doctor role warnings follow merged installed, unavailable and absent verdicts across adapter and model selections", async () => {
-  const selections = [
-    ["--adapter", "other"],
-    ["--model", "other:other-1"],
-    ["--model", "other:other-1", "--model", "other:other-2"],
-  ];
-  const verdicts = [
-    { judge: true, consult: true, registered: true },
-    { judge: false, consult: true, registered: true },
-    { judge: true, consult: false, registered: true },
-    { judge: undefined, consult: undefined, registered: true },
-    { judge: true, consult: true, registered: false },
-  ];
-  for (const args of selections) {
-    for (const row of verdicts) {
-      const f = fixture();
-      f.cfg.consult = { adapter: "kimi", model: "kimi-code/other", stallMinutes: 15 };
-      f.save();
-      for (const [role, id] of [["judge", "fake"], ["consult", "kimi"]] as const) {
-        if (row[role] === undefined) delete f.health[id];
-        else f.health[id].installed = row[role];
-      }
-      if (!row.registered) f.adapters = f.adapters.filter((a) => a.id === "other");
-      writeDoctor(f.repo, f.health);
-      const prior = readDoctor(f.repo)!;
+// D-2178 add.150: the serial tables below run one test per row, as add.137 did for the reachability table — this one's
+// 15 doctor rounds took 7.4 s of the 20 s budget locally and timed out in public CI 41207552903 under suite load.
+const roleWarningVerdicts: { judge: boolean | undefined; consult: boolean | undefined; registered: boolean }[] = [
+  { judge: true, consult: true, registered: true },
+  { judge: false, consult: true, registered: true },
+  { judge: true, consult: false, registered: true },
+  { judge: undefined, consult: undefined, registered: true },
+  { judge: true, consult: true, registered: false },
+];
+const roleWarningCases = [
+  ["--adapter", "other"],
+  ["--model", "other:other-1"],
+  ["--model", "other:other-1", "--model", "other:other-2"],
+].flatMap((args) => roleWarningVerdicts.map((row, index) => [`${args.join(" ")} row ${index}`, { args, row }] as const));
 
-      const out = await runDoctor(f, args);
-
-      const after = readDoctor(f.repo)!;
-      const context = `${args.join(" ")}: ${JSON.stringify(row)}`;
-      for (const [role, id, model] of [["judge", "fake", "fake-1"], ["consult", "kimi", "kimi-code/other"]] as const) {
-        expect.soft(JSON.stringify(after[id]), context).toBe(JSON.stringify(prior[id]));
-        const warning = `${role} runs on ${id}:${model} — NOT installed; that gate will fail closed`;
-        expect.soft(out.includes(warning), context).toBe(row[role] !== true);
-      }
-      const expected = args[0] === "--adapter" || args.length > 2 ? ["other:other-1", "other:other-2"] : ["other:other-1"];
-      expect.soft(calls(f.adapters), context).toEqual(expected);
-    }
+test.each(roleWarningCases)("scoped doctor role warnings follow merged installed, unavailable and absent verdicts across adapter and model selections — %s", async (_label, { args, row }) => {
+  const f = fixture();
+  f.cfg.consult = { adapter: "kimi", model: "kimi-code/other", stallMinutes: 15 };
+  f.save();
+  for (const [role, id] of [["judge", "fake"], ["consult", "kimi"]] as const) {
+    if (row[role] === undefined) delete f.health[id];
+    else f.health[id].installed = row[role];
   }
+  if (!row.registered) f.adapters = f.adapters.filter((a) => a.id === "other");
+  writeDoctor(f.repo, f.health);
+  const prior = readDoctor(f.repo)!;
+
+  const out = await runDoctor(f, args);
+
+  const after = readDoctor(f.repo)!;
+  const context = `${args.join(" ")}: ${JSON.stringify(row)}`;
+  for (const [role, id, model] of [["judge", "fake", "fake-1"], ["consult", "kimi", "kimi-code/other"]] as const) {
+    expect.soft(JSON.stringify(after[id]), context).toBe(JSON.stringify(prior[id]));
+    const warning = `${role} runs on ${id}:${model} — NOT installed; that gate will fail closed`;
+    expect.soft(out.includes(warning), context).toBe(row[role] !== true);
+  }
+  const expected = args[0] === "--adapter" || args.length > 2 ? ["other:other-1", "other:other-2"] : ["other:other-1"];
+  expect.soft(calls(f.adapters), context).toEqual(expected);
 });
 
 test("test: doctor with a model scope probes exactly that model, even when routing denies it, keeps its sibling models' verdicts and times, and leaves the cache age of every untouched adapter as old as before, so a partial refresh that freshens the whole cache fails", async () => {
@@ -416,45 +415,44 @@ test("worker-only model denies keep role-reachable verdicts stale until a defaul
   expect(doctorAgeMs(f.repo, f.cfg)).toBeLessThan(60_000);
 });
 
-test("default doctor scope covers any routable role across worker denies, global exclusions and allowlists", async () => {
-  const all = ["fake:fake-1", "fake:fake-2", "kimi:kimi-code/k3", "kimi:kimi-code/other", "other:other-1", "other:other-2"];
-  const rows: { deny: NonNullable<typeof DEFAULT_CONFIG.routing.deny>; allow?: typeof DEFAULT_CONFIG.routing.allow; expected: string[] }[] = [
-    { deny: { workers: { adapters: ["other", "kimi"] } }, expected: all },
-    { deny: { workers: { models: ["other-1", "kimi:kimi-code/k3"] } }, expected: all },
-    { deny: { workers: { adapters: ["other", "kimi"] }, models: ["other:other-2", "kimi:kimi-code/k3"] },
-      expected: ["fake:fake-1", "fake:fake-2", "kimi:kimi-code/other", "other:other-1"] },
-    { deny: { workers: { adapters: ["other", "kimi"] } }, allow: { adapters: ["fake", "kimi"] },
-      expected: ["fake:fake-1", "fake:fake-2", "kimi:kimi-code/k3", "kimi:kimi-code/other"] },
-    { deny: { workers: { models: ["other:other-1", "kimi:kimi-code/k3"] } },
-      allow: { models: ["fake:fake-1", "other:other-1", "kimi:kimi-code/k3"] },
-      expected: ["fake:fake-1", "kimi:kimi-code/k3", "other:other-1"] },
-    { deny: { adapters: ["other", "kimi"] }, expected: ["fake:fake-1", "fake:fake-2"] },
-  ];
-  for (const row of rows) {
-    const f = fixture();
-    f.cfg.routing.deny = row.deny;
-    f.cfg.routing.allow = row.allow;
-    f.cfg.review.prefer = undefined;
-    f.save();
-    const context = JSON.stringify(row);
-    const preflight = await runDoctor(f, ["--probe-preflight"]);
-    expect.soft(preflight, context).toContain(`scope: ${row.expected.length} models`);
-    for (const key of row.expected) expect.soft(preflight, context).toContain(key);
-    const turn = vi.fn(async () => ({ ok: true, evidence: "fixed model OK" }));
+const routableAll = ["fake:fake-1", "fake:fake-2", "kimi:kimi-code/k3", "kimi:kimi-code/other", "other:other-1", "other:other-2"];
+const routableRows: { deny: NonNullable<typeof DEFAULT_CONFIG.routing.deny>; allow?: typeof DEFAULT_CONFIG.routing.allow; expected: string[] }[] = [
+  { deny: { workers: { adapters: ["other", "kimi"] } }, expected: routableAll },
+  { deny: { workers: { models: ["other-1", "kimi:kimi-code/k3"] } }, expected: routableAll },
+  { deny: { workers: { adapters: ["other", "kimi"] }, models: ["other:other-2", "kimi:kimi-code/k3"] },
+    expected: ["fake:fake-1", "fake:fake-2", "kimi:kimi-code/other", "other:other-1"] },
+  { deny: { workers: { adapters: ["other", "kimi"] } }, allow: { adapters: ["fake", "kimi"] },
+    expected: ["fake:fake-1", "fake:fake-2", "kimi:kimi-code/k3", "kimi:kimi-code/other"] },
+  { deny: { workers: { models: ["other:other-1", "kimi:kimi-code/k3"] } },
+    allow: { models: ["fake:fake-1", "other:other-1", "kimi:kimi-code/k3"] },
+    expected: ["fake:fake-1", "kimi:kimi-code/k3", "other:other-1"] },
+  { deny: { adapters: ["other", "kimi"] }, expected: ["fake:fake-1", "fake:fake-2"] },
+];
 
-    await runDoctor(f, [], { kimiTurnProbe: turn });
+test.each(routableRows.map((row, index) => [`row ${index}`, row] as const))("default doctor scope covers any routable role across worker denies, global exclusions and allowlists — %s", async (_label, row) => {
+  const f = fixture();
+  f.cfg.routing.deny = row.deny;
+  f.cfg.routing.allow = row.allow;
+  f.cfg.review.prefer = undefined;
+  f.save();
+  const context = JSON.stringify(row);
+  const preflight = await runDoctor(f, ["--probe-preflight"]);
+  expect.soft(preflight, context).toContain(`scope: ${row.expected.length} models`);
+  for (const key of row.expected) expect.soft(preflight, context).toContain(key);
+  const turn = vi.fn(async () => ({ ok: true, evidence: "fixed model OK" }));
 
-    expect.soft(calls(f.adapters), context).toEqual(row.expected);
-    expect.soft(turn, context).toHaveBeenCalledTimes(row.expected.includes("kimi:kimi-code/k3") ? 1 : 0);
-    const after = readDoctor(f.repo)!;
-    for (const key of row.expected) {
-      const [adapter, model] = key.split(":");
-      expect.soft(after[adapter].modelAuth![model], `${context}: ${key}`).toMatchObject({ authed: true });
-      expect.soft(after[adapter].modelAuth![model].probedAt, `${context}: ${key}`).not.toBe(old);
-    }
-    expect.soft(initDoctorReuse(f.repo, false, f.cfg).reuse, context).toBe(true);
-    expect.soft(doctorAgeMs(f.repo, f.cfg), context).toBeLessThan(60_000);
+  await runDoctor(f, [], { kimiTurnProbe: turn });
+
+  expect.soft(calls(f.adapters), context).toEqual(row.expected);
+  expect.soft(turn, context).toHaveBeenCalledTimes(row.expected.includes("kimi:kimi-code/k3") ? 1 : 0);
+  const after = readDoctor(f.repo)!;
+  for (const key of row.expected) {
+    const [adapter, model] = key.split(":");
+    expect.soft(after[adapter].modelAuth![model], `${context}: ${key}`).toMatchObject({ authed: true });
+    expect.soft(after[adapter].modelAuth![model].probedAt, `${context}: ${key}`).not.toBe(old);
   }
+  expect.soft(initDoctorReuse(f.repo, false, f.cfg).reuse, context).toBe(true);
+  expect.soft(doctorAgeMs(f.repo, f.cfg), context).toBeLessThan(60_000);
 });
 
 test("cache reuse uses the oldest existing default-scope verdict with file-age fallback for legacy or unprobed adapters", () => {
@@ -513,93 +511,85 @@ test("two full doctor refreshes after Kimi credential failure let init reuse the
   expect(calls(f.adapters).some((c) => c.startsWith("kimi:"))).toBe(false);
 });
 
-test("skipped Kimi model sweeps release in-scope history across default, all, adapter and model refreshes while preserving untouched cache ages", async () => {
-  const selections = [
-    { args: [], selected: ["kimi-code/k3", "kimi-code/other"] },
-    { args: ["--all"], selected: ["kimi-code/k3", "kimi-code/other"] },
-    { args: ["--adapter", "kimi"], selected: ["kimi-code/k3", "kimi-code/other"] },
-    { args: ["--model", "kimi:kimi-code/k3"], selected: ["kimi-code/k3"] },
-    { args: ["--adapter", "fake"], selected: [] },
-  ];
-  for (const failure of ["credentials", "turn", "unregistered"] as const) {
-    for (const { args, selected } of selections) {
-      const f = fixture();
-      for (const [id, h] of Object.entries(f.health)) {
-        for (const verdict of Object.values(h.modelAuth!)) {
-          verdict.authed = true;
-          if (id !== "kimi") verdict.probedAt = new Date().toISOString();
-        }
-      }
-      writeDoctor(f.repo, f.health);
-      utimesSync(f.path, new Date(old), new Date(old));
-      vi.spyOn(f.adapters[2], "probe").mockResolvedValue({ installed: true, authed: failure !== "credentials", models: [], note: failure });
-      if (failure === "unregistered") f.adapters = f.adapters.filter((a) => a.id !== "kimi");
-      const turn = vi.fn(async () => ({ ok: false, evidence: "earned-green turn failed" }));
+const kimiSweepCases = (["credentials", "turn", "unregistered"] as const).flatMap((failure) => [
+  { args: [], selected: ["kimi-code/k3", "kimi-code/other"] },
+  { args: ["--all"], selected: ["kimi-code/k3", "kimi-code/other"] },
+  { args: ["--adapter", "kimi"], selected: ["kimi-code/k3", "kimi-code/other"] },
+  { args: ["--model", "kimi:kimi-code/k3"], selected: ["kimi-code/k3"] },
+  { args: ["--adapter", "fake"], selected: [] },
+].map(({ args, selected }) => [`${failure}: ${args.join(" ") || "default"}`, { failure, args, selected }] as const));
 
-      await runDoctor(f, args, { kimiTurnProbe: turn });
-
-      const context = `${failure}: ${args.join(" ") || "default"}`;
-      const reusable = selected.length === 2;
-      expect(initDoctorReuse(f.repo, false, f.cfg).reuse, context).toBe(reusable);
-      const pick = await fleet(["--pick", "consult", "--global-dir", f.globalDir], f.repo, f.adapters);
-      if (reusable) {
-        expect(doctorAgeMs(f.repo, f.cfg), context).toBeLessThan(60_000);
-        expect(JSON.parse(pick as string), context).toMatchObject({ adapter: "fake", model: "fake-1" });
-      } else {
-        expect(doctorAgeMs(f.repo, f.cfg), context).toBeGreaterThan(60 * 60_000);
-        expect(pick, context).toMatchObject({ code: 1, out: expect.stringContaining("stale") });
-      }
-      const after = readDoctor(f.repo)!;
-      for (const model of ["kimi-code/k3", "kimi-code/other"]) {
-        if (selected.includes(model)) expect(after.kimi?.modelAuth?.[model], context).toBeUndefined();
-        else expect(JSON.stringify(after.kimi?.modelAuth?.[model]), context).toBe(JSON.stringify(f.health.kimi.modelAuth![model]));
-      }
-      if (!selected.length) expect(JSON.stringify(after.kimi), context).toBe(JSON.stringify(f.health.kimi));
-      expect(turn, context).toHaveBeenCalledTimes(failure === "turn" && selected.length ? 1 : 0);
-      expect(calls(f.adapters).some((c) => c.startsWith("kimi:")), context).toBe(false);
+test.each(kimiSweepCases)("skipped Kimi model sweeps release in-scope history across default, all, adapter and model refreshes while preserving untouched cache ages — %s", async (context, { failure, args, selected }) => {
+  const f = fixture();
+  for (const [id, h] of Object.entries(f.health)) {
+    for (const verdict of Object.values(h.modelAuth!)) {
+      verdict.authed = true;
+      if (id !== "kimi") verdict.probedAt = new Date().toISOString();
     }
   }
+  writeDoctor(f.repo, f.health);
+  utimesSync(f.path, new Date(old), new Date(old));
+  vi.spyOn(f.adapters[2], "probe").mockResolvedValue({ installed: true, authed: failure !== "credentials", models: [], note: failure });
+  if (failure === "unregistered") f.adapters = f.adapters.filter((a) => a.id !== "kimi");
+  const turn = vi.fn(async () => ({ ok: false, evidence: "earned-green turn failed" }));
+
+  await runDoctor(f, args, { kimiTurnProbe: turn });
+
+  const reusable = selected.length === 2;
+  expect(initDoctorReuse(f.repo, false, f.cfg).reuse, context).toBe(reusable);
+  const pick = await fleet(["--pick", "consult", "--global-dir", f.globalDir], f.repo, f.adapters);
+  if (reusable) {
+    expect(doctorAgeMs(f.repo, f.cfg), context).toBeLessThan(60_000);
+    expect(JSON.parse(pick as string), context).toMatchObject({ adapter: "fake", model: "fake-1" });
+  } else {
+    expect(doctorAgeMs(f.repo, f.cfg), context).toBeGreaterThan(60 * 60_000);
+    expect(pick, context).toMatchObject({ code: 1, out: expect.stringContaining("stale") });
+  }
+  const after = readDoctor(f.repo)!;
+  for (const model of ["kimi-code/k3", "kimi-code/other"]) {
+    if (selected.includes(model)) expect(after.kimi?.modelAuth?.[model], context).toBeUndefined();
+    else expect(JSON.stringify(after.kimi?.modelAuth?.[model]), context).toBe(JSON.stringify(f.health.kimi.modelAuth![model]));
+  }
+  if (!selected.length) expect(JSON.stringify(after.kimi), context).toBe(JSON.stringify(f.health.kimi));
+  expect(turn, context).toHaveBeenCalledTimes(failure === "turn" && selected.length ? 1 : 0);
+  expect(calls(f.adapters).some((c) => c.startsWith("kimi:")), context).toBe(false);
 });
 
-test("unavailable adapters release only the selected history across full, adapter and model refreshes while untouched verdicts still control reuse", async () => {
-  const selections = [
-    { args: [], selected: ["other-1", "other-2"] },
-    { args: ["--all"], selected: ["other-1", "other-2"] },
-    { args: ["--adapter", "other"], selected: ["other-1", "other-2"] },
-    { args: ["--model", "other:other-1"], selected: ["other-1"] },
-    { args: ["--adapter", "fake"], selected: [] },
-  ];
-  for (const note of ["not installed", "--version crashed (exit 139)"]) {
-    for (const { args, selected } of selections) {
-      const f = fixture();
-      // All other channels are fresh; any retained old verdict belongs to this adapter.
-      for (const [id, h] of Object.entries(f.health)) {
-        for (const verdict of Object.values(h.modelAuth!)) {
-          verdict.authed = true;
-          if (id !== "other") verdict.probedAt = new Date().toISOString();
-        }
-      }
-      writeDoctor(f.repo, f.health);
-      utimesSync(f.path, new Date(old), new Date(old));
-      vi.spyOn(f.adapters[1], "probe").mockResolvedValue({ installed: false, authed: false, models: [], note });
+const unavailableCases = ["not installed", "--version crashed (exit 139)"].flatMap((note) => [
+  { args: [], selected: ["other-1", "other-2"] },
+  { args: ["--all"], selected: ["other-1", "other-2"] },
+  { args: ["--adapter", "other"], selected: ["other-1", "other-2"] },
+  { args: ["--model", "other:other-1"], selected: ["other-1"] },
+  { args: ["--adapter", "fake"], selected: [] },
+].map(({ args, selected }) => [`${note}: ${args.join(" ") || "default"}`, { note, args, selected }] as const));
 
-      await runDoctor(f, args);
-
-      const context = `${note}: ${args.join(" ") || "default"}`;
-      const reusable = selected.length === 2;
-      expect(initDoctorReuse(f.repo, false, f.cfg).reuse, context).toBe(reusable);
-      const pick = await fleet(["--pick", "consult", "--global-dir", f.globalDir], f.repo, f.adapters);
-      if (reusable) expect(JSON.parse(pick as string), context).toMatchObject({ adapter: "fake", model: "fake-1" });
-      else expect(pick, context).toMatchObject({ code: 1, out: expect.stringContaining("stale") });
-      const after = readDoctor(f.repo)!;
-      for (const model of ["other-1", "other-2"]) {
-        if (selected.includes(model)) expect(after.other.modelAuth?.[model], context).toBeUndefined();
-        else expect(after.other.modelAuth?.[model], context).toEqual(f.health.other.modelAuth![model]);
-      }
-      if (!selected.length) expect(JSON.stringify(after.other), context).toBe(JSON.stringify(f.health.other));
-      expect(calls(f.adapters).some((c) => c.startsWith("other:")), context).toBe(false);
+test.each(unavailableCases)("unavailable adapters release only the selected history across full, adapter and model refreshes while untouched verdicts still control reuse — %s", async (context, { note, args, selected }) => {
+  const f = fixture();
+  // All other channels are fresh; any retained old verdict belongs to this adapter.
+  for (const [id, h] of Object.entries(f.health)) {
+    for (const verdict of Object.values(h.modelAuth!)) {
+      verdict.authed = true;
+      if (id !== "other") verdict.probedAt = new Date().toISOString();
     }
   }
+  writeDoctor(f.repo, f.health);
+  utimesSync(f.path, new Date(old), new Date(old));
+  vi.spyOn(f.adapters[1], "probe").mockResolvedValue({ installed: false, authed: false, models: [], note });
+
+  await runDoctor(f, args);
+
+  const reusable = selected.length === 2;
+  expect(initDoctorReuse(f.repo, false, f.cfg).reuse, context).toBe(reusable);
+  const pick = await fleet(["--pick", "consult", "--global-dir", f.globalDir], f.repo, f.adapters);
+  if (reusable) expect(JSON.parse(pick as string), context).toMatchObject({ adapter: "fake", model: "fake-1" });
+  else expect(pick, context).toMatchObject({ code: 1, out: expect.stringContaining("stale") });
+  const after = readDoctor(f.repo)!;
+  for (const model of ["other-1", "other-2"]) {
+    if (selected.includes(model)) expect(after.other.modelAuth?.[model], context).toBeUndefined();
+    else expect(after.other.modelAuth?.[model], context).toEqual(f.health.other.modelAuth![model]);
+  }
+  if (!selected.length) expect(JSON.stringify(after.other), context).toBe(JSON.stringify(f.health.other));
+  expect(calls(f.adapters).some((c) => c.startsWith("other:")), context).toBe(false);
 });
 
 test("fleet opens the recorded verdicts after a consented or fresh probe even when untouched channels remain stale", async () => {
