@@ -4126,7 +4126,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       const gateRound = async (subject: Task) => {
         const parked = new Map<GateResult, GateResult>();
         try {
-          const done = await runGates(subject, { ...ctx, excludeReviewers: [...badReviewers, ...roundTimeouts], launchRetried: launchRetried(),
+          const done = await runGates(subject, { ...ctx, ownsWorktree: true, excludeReviewers: [...badReviewers, ...roundTimeouts], launchRetried: launchRetried(),
             onGate: async (e) => {
               const park = e.phase === "end" && e.gate === "review" ? retiredOnly(e.result) : undefined;
               if (park === undefined || e.phase !== "end") return ctx.onGate?.(e);

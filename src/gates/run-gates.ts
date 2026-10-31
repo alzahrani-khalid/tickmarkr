@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { CommandReceiptAttribution, ShellReceipt } from "../run/protocol.js";
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { existsSync, lstatSync, mkdtempSync, readFileSync, readlinkSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { loadavg, tmpdir } from "node:os";
 import { join, posix } from "node:path";
 import { type Assignment, type AuthHealth, type BillingChannel, channelKey, configuredEffort, shq, type WorkerAdapter, type WorkerResult } from "../adapters/types.js";
@@ -174,6 +174,8 @@ export interface GateContext {
   authorizeInfraRetry?: (subject: string, cause?: VerificationRetryCause) => boolean;
   verificationScope?: VerificationScope;
   worktree: string;
+  /** Only the daemon may clear preserved seat litter from its own task checkout. */
+  ownsWorktree?: true;
   baseRef: string;
   result: WorkerResult;
   author: Assignment;
@@ -900,6 +902,53 @@ export async function runGates(
     const entries = parseStatusZ(r.stdout).filter((e) => !/^\.tickmarkr-[^/]*$/.test(e.path));
     if (!entries.length) return undefined;
     return { text: entries.map((e) => `${e.status} ${e.path}`).join("\n"), entries };
+  };
+
+  // Queue row 317 (b): semantic seats can leave files unrelated to the committed subject.
+  // Validate the entire set before preserving or removing anything; standalone verify never owns it.
+  const clearSeatLitter = async (dirt: DirtSnapshot): Promise<boolean> => {
+    if (ctx.ownsWorktree !== true || !ctx.baseRef || !dirt.entries.length
+      || dirt.entries.some((e) => e.status !== "??")) return false;
+    const removed: Array<() => void> = [];
+    let preservedRef: string | undefined;
+    const paths = dirt.entries.map((e) => e.path);
+    try {
+      const diff = await shGit(`git diff --name-only -z ${shq(ctx.baseRef)}..HEAD`, ctx.worktree);
+      if (diff.code !== 0) return false;
+      const touched = new Set(diff.stdout.split("\0").filter(Boolean));
+      if (paths.some((path) => touched.has(path))) return false;
+      const litter = paths.map((path) => {
+        const absolute = join(ctx.worktree, path);
+        const st = lstatSync(absolute);
+        if (!st.isFile() && !st.isSymbolicLink()) throw new Error("seat litter is not a file or symlink");
+        // Retain the originals in case an unlink or the final cleanliness check fails.
+        const target = st.isSymbolicLink() ? readlinkSync(absolute) : undefined;
+        const bytes = target === undefined ? readFileSync(absolute) : undefined;
+        return { absolute, restore: () => {
+          if (target !== undefined) symlinkSync(target, absolute);
+          else writeFileSync(absolute, bytes!, { flag: "wx", mode: st.mode });
+        } };
+      });
+      preservedRef = await preserveWorktree(ctx.worktree, ctx.producer);
+      if (!preservedRef) return false;
+      // Never recurse or clean the checkout: unlink exactly the validated paths, one at a time,
+      // only after the durable recovery ref exists.
+      for (const entry of litter) {
+        unlinkSync(entry.absolute);
+        removed.push(entry.restore);
+      }
+      if (await dirtyWorktree()) throw new Error("seat litter clearance did not leave a clean worktree");
+    } catch {
+      for (const restore of removed) {
+        try { restore(); } catch { /* A concurrent replacement stays in place; the ref retains the original. */ }
+      }
+      return false;
+    }
+    await ctx.onGate?.({ phase: "note", gate: "test", name: "worktree-litter-cleared", payload: {
+      paths, preservedRef,
+      reason: `Cleared ${paths.length} untracked seat litter path(s), starting with ${JSON.stringify(paths[0])}, preserved at ${preservedRef}.`,
+    } });
+    return true;
   };
 
   const DIRTY_WHY = `refusing to gate a dirty worktree: the shell gates run against the working tree while `
@@ -1859,7 +1908,7 @@ export async function runGates(
     // Subject freshness: the semantic gates ran oracles and vendor CLIs in this worktree. Their dirt is
     // not the committed subject, so no full job measures it and no cached green row answers for it.
     const dirt = testRuns ? await dirtyWorktree() : undefined;
-    if (dirt) {
+    if (dirt && !await clearSeatLitter(dirt)) {
       const at = results.findIndex((r) => r.gate === "test");
       if (at >= 0) results.splice(at, 1);
       await emitStart("test");

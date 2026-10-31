@@ -119,6 +119,7 @@ export const RAIL_ROWS: Record<string, { label: string; tone: RailTone }> = {
   // charging an attempt, which is the most consequential unchargeable decision it makes
   "scope-request": { label: "scope requested", tone: "attention" },
   "scope-authoring": { label: "authoring defect", tone: "attention" },
+  "worktree-litter-cleared": { label: "litter cleared", tone: "attention" },
   "session-reset": { label: "session reset", tone: "attention" },
   "worker-mode-fallback": { label: "dispatch mode", tone: "attention" },
   "delivery-readiness-failed": { label: "delivery failed", tone: "fail" },

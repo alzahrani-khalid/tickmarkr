@@ -236,6 +236,7 @@ const RAIL_SPEC: RailSpec[] = [
   { event: "retry-same-banned", label: "retry banned", tone: "attention", data: { gate: "review", from: "claude-code:sonnet", to: "codex:gpt-5.6-sol" } },
   { event: "gate-fingerprint-cap", label: "repeat capped", tone: "attention", salient: "channel claude-code:sonnet", data: { gate: "test", occurrences: 2, fingerprint: "expected 7 to be 6", retrySameBanned: true, channel: "claude-code:sonnet", attempt: 3 } },
   { event: "scope-request", label: "scope requested", tone: "attention", data: { paths: ["src/run/daemon.ts"], chargeable: false } },
+  { event: "worktree-litter-cleared", label: "litter cleared", tone: "attention", data: { paths: ["seat/note.txt"], preservedRef: "refs/tickmarkr/preserved/abc123", reason: "Cleared 1 untracked seat litter path, seat/note.txt, preserved at refs/tickmarkr/preserved/abc123." } },
   { event: "scope-authoring", label: "authoring defect", tone: "attention", salient: "channel claude-code:sonnet", data: { gate: "scope", predicted: ["src/run/daemon.ts"], repair: "declare src/run/daemon.ts in files[]", attempt: 1, chargeable: false, channel: "claude-code:sonnet" } },
   { event: "session-reset", label: "session reset", tone: "attention", salient: "tokens 174000", data: { tokens: 174000, threshold: 160000, attempt: 2 } },
   { event: "worker-mode-fallback", label: "dispatch mode", tone: "attention", data: { reason: "adapter" } },
@@ -307,6 +308,9 @@ const specEvent = (spec: RailSpec): JournalEvent => ({
 const specIdentity = (spec: RailSpec) =>
   spec.run ? (typeof spec.data.runId === "string" ? spec.data.runId : RUN_ID) : "T1";
 const RETAINED_EVENTS = RAIL_SPEC.map(specEvent);
+// Keep the existing golden's event corpus stable. The new row is covered by the complete rail
+// specification below and by the real journal event in gates/seat-litter.test.ts.
+const GOLDEN_RETAINED_EVENTS = RETAINED_EVENTS.filter((event) => event.event !== "worktree-litter-cleared");
 
 /**
  * The ONE rejection oracle every rail row is judged by — the shipped rows and every control alike.
@@ -470,7 +474,7 @@ describe("T4 v1.50 brand pass — plan, run narration, report", () => {
     expect(RAIL_ROWS["gate-replayed"]!.label.trim()).not.toBe("");
     expect(row.split("\n")).toHaveLength(1);
     expect(stripAnsi(row)).toContain(RAIL_ROWS["gate-replayed"]!.label);
-    const regenerated = RETAINED_EVENTS.map((event) => stripAnsi(narrationRow(event, 120)!)).join("\n") + "\n";
+    const regenerated = GOLDEN_RETAINED_EVENTS.map((event) => stripAnsi(narrationRow(event, 120)!)).join("\n") + "\n";
     if (process.env.UPDATE_BRAND_GOLDEN === "1") {
       writeFileSync(join(import.meta.dirname, "../fixtures/brand-surfaces/run-narration.txt"), regenerated);
     }
@@ -486,7 +490,7 @@ describe("T4 v1.50 brand pass — plan, run narration, report", () => {
       expect(row.split("\n")).toHaveLength(1);
       expect(stripAnsi(row)).toContain(RAIL_ROWS[event]!.label);
     }
-    const regenerated = RETAINED_EVENTS.map((event) => stripAnsi(narrationRow(event, 120)!)).join("\n") + "\n";
+    const regenerated = GOLDEN_RETAINED_EVENTS.map((event) => stripAnsi(narrationRow(event, 120)!)).join("\n") + "\n";
     expect(regenerated).toBe(golden("run-narration.txt"));
   });
 
@@ -503,7 +507,7 @@ describe("T4 v1.50 brand pass — plan, run narration, report", () => {
     }
     expect(output).toHaveBeenCalledTimes(3);
     output.mockRestore();
-    const regenerated = RETAINED_EVENTS.map((event) => stripAnsi(narrationRow(event, 120)!)).join("\n") + "\n";
+    const regenerated = GOLDEN_RETAINED_EVENTS.map((event) => stripAnsi(narrationRow(event, 120)!)).join("\n") + "\n";
     expect(regenerated).toBe(golden("run-narration.txt"));
   });
 
@@ -516,7 +520,7 @@ describe("T4 v1.50 brand pass — plan, run narration, report", () => {
       expect(row.split("\n")).toHaveLength(1);
       expect(stripAnsi(row)).toContain(RAIL_ROWS[event]!.label);
     }
-    const regenerated = RETAINED_EVENTS.map((event) => stripAnsi(narrationRow(event, 120)!)).join("\n") + "\n";
+    const regenerated = GOLDEN_RETAINED_EVENTS.map((event) => stripAnsi(narrationRow(event, 120)!)).join("\n") + "\n";
     expect(regenerated).toBe(golden("run-narration.txt"));
   });
 
@@ -530,7 +534,7 @@ describe("T4 v1.50 brand pass — plan, run narration, report", () => {
       expect(stripAnsi(row)).toContain(RAIL_ROWS[event]!.label);
       expect(stripAnsi(row)).toContain(spec.salient!);
     }
-    const regenerated = RETAINED_EVENTS.map((event) => stripAnsi(narrationRow(event, 120)!)).join("\n") + "\n";
+    const regenerated = GOLDEN_RETAINED_EVENTS.map((event) => stripAnsi(narrationRow(event, 120)!)).join("\n") + "\n";
     expect(regenerated).toBe(golden("run-narration.txt"));
   });
 
@@ -541,7 +545,7 @@ describe("T4 v1.50 brand pass — plan, run narration, report", () => {
 
     for (const event of Object.keys(RAIL_ROWS)) {
       // Gate notes flow through the daemon's note callback into this same journal.
-      const gateNote = ["review-no-verdict", "review-pool-demotion"].includes(event)
+      const gateNote = ["review-no-verdict", "review-pool-demotion", "worktree-litter-cleared"].includes(event)
         && src("src/gates/run-gates.ts").includes(`name: "${event}"`)
         && src("src/run/daemon.ts").includes("journal.append(e.name, t.id, e.payload)");
       expect(appends(RUN_OWNED, event) || gateNote, `${event} has no run-owned producer`).toBe(true);

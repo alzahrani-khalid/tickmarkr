@@ -160,7 +160,7 @@ async function gates(
   repo: string,
   baseRef: string,
   commands: Record<string, string>,
-  opts: { selectTests?: boolean; adapters?: FakeAdapter[]; onGate?: (e: GateEvent) => void | Promise<void>; armAfterBaseline?: () => void;
+  opts: { ownsWorktree?: true; selectTests?: boolean; adapters?: FakeAdapter[]; onGate?: (e: GateEvent) => void | Promise<void>; armAfterBaseline?: () => void;
     requiredRepairTests?: string[] } = {},
 ): Promise<{ results: GateResult[] }> {
   const cfg = structuredClone(DEFAULT_CONFIG);
@@ -173,7 +173,7 @@ async function gates(
     result: { ok: true, summary: "", deviations: [], raw: "" },
     commands, baseline, channels,
     adapters: opts.adapters ?? [fakeWith({}).adapter],
-    cfg, selectTests: opts.selectTests,
+    cfg, ownsWorktree: opts.ownsWorktree, selectTests: opts.selectTests,
     ...(opts.requiredRepairTests ? { requiredRepairTests: opts.requiredRepairTests, selectionReason: "known-failing-files" } : {}),
     onGate: opts.onGate,
   });
@@ -1594,8 +1594,8 @@ describe("OBS-635 — an in-battery full green is revalidated after the semantic
   test("runGates revalidates tree command baseline environment resolution capacity protocol lifecycle and full manifest after semantic oracles, so changed identity or oracle dirt cannot reuse an earlier full green whereas an unchanged complete identity can", async () => {
     // v2.6.7 T1 (closed order table): each oracle now runs BEFORE the one full job, so the full job
     // measures the subject the oracle left — once — and no earlier full green exists to reuse. Oracle
-    // dirt is refused before any test starts.
-    const corpus: Array<{ shape: string; oracle: string; before?: () => void; onAcceptance?: () => void; runs: string[]; pass: boolean }> = [
+    // dirt is refused before any test starts unless the daemon owns and preserves unrelated litter.
+    const corpus: Array<{ shape: string; oracle: string; ownsWorktree?: true; before?: () => void; onAcceptance?: () => void; runs: string[]; pass: boolean }> = [
       { shape: "unchanged complete identity", oracle: "true", runs: [""], pass: true },
       { shape: "tree moved by a committing oracle", oracle: "echo moved > moved.txt && git add -A && git commit -q --no-gpg-sign -m oracle", runs: [""], pass: true },
       { shape: "environment moved by an ignored lockfile", oracle: "echo '{}' > package-lock.json", runs: [""], pass: true },
@@ -1609,6 +1609,7 @@ describe("OBS-635 — an in-battery full green is revalidated after the semantic
         process.env.PATH = "/usr/bin:/bin"; process.env.NPM_CONFIG_USERCONFIG = join(mkdtempSync(join(tmpdir(), "tkr-npmrc-")), ".npmrc");
       }, runs: ["", ""], pass: true },
       { shape: "oracle dirt", oracle: "echo dirt > oracle-dirt.txt", runs: [], pass: false },
+      { shape: "daemon-owned oracle dirt", oracle: "echo dirt > oracle-dirt.txt", ownsWorktree: true, runs: [""], pass: true },
     ];
     const priorForks = process.env.VITEST_MAX_FORKS;
     const priorOptions = process.env.NODE_OPTIONS;
@@ -1635,7 +1636,7 @@ describe("OBS-635 — an in-battery full green is revalidated after the semantic
         const { results } = await gates(
           { gates: [...DETERMINISTIC, "acceptance"], files: ["**"], acceptance: [{ oracle: "command", command: member.oracle }] },
           repo, base, { test: "sh run.sh" },
-          { selectTests: false, onGate: (e) => {
+          { ownsWorktree: member.ownsWorktree, selectTests: false, onGate: (e) => {
             if (e.phase === "start" && e.gate === "acceptance") member.onAcceptance?.();
             if (e.phase === "end") ends.push(e);
           } },
@@ -1846,6 +1847,14 @@ describe("v2.6.5 T6 — a semantic repair is reviewed before its test battery is
     expect(dirty.row("test")?.meta?.culprit).toBeUndefined(); // no test command left it behind
     expect(await gitHead(fixture.repo)).toBe(head);
     rmSync(join(fixture.repo, "litter.txt"));
+
+    // The same review-seat litter in a daemon-owned checkout is preserved and cleared before testing.
+    const ownedFixture = await reviewRepair(APPROVE);
+    const owned = await ownedFixture.round({ ownsWorktree: true,
+      adapters: [new LitteringReviewFake(ownedFixture.scriptPath, ownedFixture.repo)] });
+    expect(owned.results.every((r) => r.pass)).toBe(true);
+    expect(owned.log).toEqual(["build", "lint", "test"]);
+    expect(existsSync(join(ownedFixture.repo, "litter.txt"))).toBe(false);
 
     // No seat can launch: the seatless sibling cancels the other and the round ends before any test.
     // D-1196: acceptance is refused FIRST — the review's pane is asked for only after acceptance PUBLISHED its

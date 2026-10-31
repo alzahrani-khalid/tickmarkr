@@ -2,6 +2,28 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v2.13.0 — tickmarkr cleans up after its own seats: litter its judge and review left no longer parks a green round
+
+**v2.13.0** comes from one `tickmarkr run`, run-20261030-233732-0000000000000001. Its task passed build, lint, evidence, scope,
+its acceptance criteria, a cross-vendor review and the full suite.
+
+- **Seat litter is cleared, not charged.** The acceptance and review stage runs oracles and vendor CLIs inside the task worktree.
+  Those can leave untracked files behind, for example a user-scope hook's cache. Before this release, the check before the test gate
+  recorded that litter as an ordinary test failure. The worker then spent its repair attempts on files it never wrote and the task
+  parked. Now, in a worktree tickmarkr created, untracked files outside the committed diff are handled this way:
+  - saved on a recovery ref (`refs/tickmarkr/preserved/…`), so nothing is lost;
+  - removed one by one;
+  - re-checked clean;
+  - named in a `worktree-litter-cleared` journal row.
+  The test gate then runs the exact committed subject. On a terminal, the run rail shows the row as **litter cleared**.
+- **The guard stays fail-closed.** The worktree is still refused as before when any of these holds:
+  - a tracked file was modified;
+  - an untracked path is in the committed diff;
+  - an entry is a directory;
+  - the recovery ref cannot be written;
+  - the tree is not clean afterwards.
+  `tickmarkr verify`, which gates your own checkout, never clears anything.
+
 ## v2.12.0 — fleet and doctor tell the truth: honest marks, an editor that reaches what you need, a readable write review, probes you ask for, gateway model lists, real explanations, and the ruled tier band
 
 **v2.12.0** fixes the 21 defects an operator hit narrowing a fleet to five adapters with `tickmarkr fleet` and `tickmarkr doctor`. Its
