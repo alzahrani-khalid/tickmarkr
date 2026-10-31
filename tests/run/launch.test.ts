@@ -249,11 +249,17 @@ test("a failed version check or a live lock launches nothing, and a launch binds
     const f = fixture();
     let cancelled = false;
     let checksAfterRow = 0;
+    // D-2178 add.142: the binding recheck is the SECOND lock read in one synchronous turn (launch.ts reads the
+    // lock, the journal row, then the lock again with no await between). Keying on "journal complete" raced
+    // the child's row write under CI load: a row completed between the two reads left the recheck as the
+    // first counted read, so nothing was injected and the launch correctly bound.
+    let inTurn = false;
     const original = locks.runLockOwner;
     const spy = vi.spyOn(locks, "runLockOwner").mockImplementation(cwd => {
       const owner = original(cwd);
-      const journal = join(f.state, "runs/run-new/journal.jsonl");
-      if (existsSync(f.file("row")) && existsSync(journal) && readFileSync(journal, "utf8").endsWith("\n") && ++checksAfterRow === 2) {
+      const recheck = inTurn;
+      if (!inTurn) { inTurn = true; queueMicrotask(() => { inTurn = false; }); }
+      if (recheck && existsSync(f.file("row")) && ++checksAfterRow === 1) {
         if (action === "cancel") cancelled = true;
         else return { live: true, pid: process.pid, runId: "run-competitor" };
       }
@@ -264,7 +270,7 @@ test("a failed version check or a live lock launches nothing, and a launch binds
       await until(() => existsSync(f.file("partial")));
       writeFileSync(f.file("row"), "yes");
       expect((await launching).status).toBe(action === "cancel" ? "cancelled" : "refused");
-      expect(checksAfterRow).toBe(2);
+      expect(checksAfterRow).toBe(1);
     } finally { spy.mockRestore(); await f.finish(); }
   }
   const error = fixture();
