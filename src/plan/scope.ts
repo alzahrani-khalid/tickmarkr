@@ -10,7 +10,7 @@ import type { ExecutorDriver } from "../drivers/types.js";
 import { extractJson, runLlm } from "../gates/llm.js";
 import { type Task, TaskSchema } from "../graph/schema.js";
 import { route } from "../route/router.js";
-import { scopePrompt } from "./prompt.js";
+import { SCOPE_END, scopePrompt } from "./prompt.js";
 
 // R11/R45 (C10): the drafting loop's hard ceiling — shared by the loop itself and the preview
 // disclosure so the two can never state different budgets.
@@ -73,8 +73,21 @@ function section(source: string, name: string): string {
   return lines.slice(start + 1, end === -1 ? undefined : end).join("\n");
 }
 
-function extractDraft(raw: string): string {
-  const clean = raw.replace(/\nTICKMARKR_EXIT:\d[\s\S]*$/, "").trim();
+// 2.16.0 (D-2178 add.171–174): a seat run through a driver returns its terminal transcript — for codex the banner,
+// the ECHOED prompt (its spec markers, example and the user's intent, which may hold fences, JSON or even a sample
+// exit trailer), the answer, a footer, the answer again, then the harness's exit trailer. Closed rule: line endings
+// normalise to LF; when the prompt's per-call nonce line (its last line, SCOPE_END <nonce>) appears anywhere, only the
+// text after its LAST occurrence is the answer region — an echo with no answer leaves it empty and validation fails
+// closed; with no echo (a headless answer) the whole text is the region. The region is cut at its LAST exit trailer
+// (bare or TICKMARKR_EXIT_<nonce>). Within it: a JSON string, a JSON spec/draft object, the last fenced block, else
+// from the LAST spec marker.
+export function extractDraft(raw: string, prompt?: string): string {
+  const text = raw.replace(/\r\n?/g, "\n");
+  const boundary = prompt?.trimEnd().split("\n").at(-1)?.trim();
+  const echoEnd = boundary?.startsWith(SCOPE_END) ? text.lastIndexOf(boundary) : -1;
+  const region = echoEnd === -1 ? text : text.slice(echoEnd + boundary!.length);
+  const trailer = [...region.matchAll(/(?:^|\n)TICKMARKR_EXIT(?:_[0-9A-Za-z]+)?:\d/g)].at(-1)?.index;
+  const clean = (trailer === undefined ? region : region.slice(0, trailer)).trim();
   try {
     const value = JSON.parse(clean);
     if (typeof value === "string") return value;
@@ -86,11 +99,11 @@ function extractDraft(raw: string): string {
   if (typeof value === "string") return value;
   const fenced = [...clean.matchAll(/```(?:markdown|md)?\s*\n([\s\S]*?)```/gi)].at(-1)?.[1];
   if (fenced) return fenced;
-  const marker = clean.search(new RegExp(`<!--\\s*(?:tickmarkr|${LEGACY_PREFIX}):spec`));
+  const marker = [...clean.matchAll(new RegExp(`<!--\\s*(?:tickmarkr|${LEGACY_PREFIX}):spec`, "g"))].at(-1)?.index ?? -1;
   return (marker === -1 ? clean : clean.slice(marker)).trimEnd() + "\n";
 }
 
-function validateDraft(draft: string): number {
+export function validateDraft(draft: string): number {
   if (!/^<!--\s*tickmarkr:spec/.test(draft)) throw new Error("draft is missing the tickmarkr native marker");
   if (!section(draft, "Assumptions").trim()) throw new Error("draft is missing explicit assumptions");
   const requirements = [...new Set(section(draft, "Requirements").match(/\bREQ-\d{2}\b/g) ?? [])];
@@ -237,7 +250,7 @@ export async function scopeIntent(intentFile: string, repoRoot: string, options:
       driver, name: `scope-${name}-${attempts}-${adapter.id}`, label: "SCOPE",
       keep: options.cfg.visibility.keepPanes === "forever",
     } : undefined;
-    const draft = extractDraft(await runLlm(adapter, assignment.model, prompt, repoRoot, via, undefined, assignment.effort));
+    const draft = extractDraft(await runLlm(adapter, assignment.model, prompt, repoRoot, via, undefined, assignment.effort), prompt);
     let tasks: number;
     try {
       tasks = validateDraft(draft);

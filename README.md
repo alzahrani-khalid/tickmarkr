@@ -75,12 +75,17 @@ harness is visible the day it lands, and never routed until an adapter ships for
 
 ```bash
 tickmarkr init                 # guided setup + doctor; scaffolds config and spec template
-# edit tickmarkr.spec.md        # write your tasks and acceptance criteria
-tickmarkr compile tickmarkr.spec.md # spec → task graph (fails without acceptance criteria)
-tickmarkr plan                 # dry-run routing decisions + cost estimate
+tickmarkr start "add a health endpoint" # one sentence → drafted spec, compiled graph, routed plan
 tickmarkr run                  # execute, route to best CLI, gate every result (--concurrency N)
 tickmarkr report <runId> --md  # Markdown on stdout; redirect to save beside the spec
 ```
+
+`start` writes the intent and the spec under `specs/`, asks you to confirm the scope at a terminal
+before any probe or model call unless you pass `--yes`, and refuses without `--yes` when input or
+output is not a terminal.
+
+To write the spec by hand instead, edit `tickmarkr.spec.md`, then run
+`tickmarkr compile tickmarkr.spec.md`, `tickmarkr plan` and `tickmarkr run`.
 
 That's the flow: `init` scaffolds config, you write tasks with `acceptance[]` criteria, `compile`
 validates and builds the graph, `plan` shows routing decisions and cost, `run` dispatches work to

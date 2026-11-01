@@ -393,7 +393,7 @@ describe("tickmarkr init", () => {
     expect(existsSync(join(repo, "tickmarkr.spec.md"))).toBe(true); // template written at repo root
     expect(out).toContain("init-stub");
     expect(probe).toHaveBeenCalledOnce(); // injected adapter only — no installed CLI is probed
-    expect(out).toContain("next: edit tickmarkr.spec.md, then tickmarkr compile tickmarkr.spec.md && tickmarkr plan && tickmarkr run");
+    expect(out).toContain("next: tickmarkr start \"<what you want built>\" — or edit tickmarkr.spec.md, then tickmarkr compile tickmarkr.spec.md && tickmarkr plan && tickmarkr run");
     expect(out).toContain("environments:");
     expect(out).toContain(
       "the full cockpit — every worker, judge, and consult is a visible pane you can watch and unblock · https://herdr.dev",
@@ -412,6 +412,23 @@ describe("tickmarkr init", () => {
     const out2 = await init(["--global-dir", globalDir], repo);
     expect(out2).toMatch(/kept existing.*tickmarkr\.spec\.md/);
     expect(readFileSync(join(repo, "tickmarkr.spec.md"), "utf8")).toContain("## T1: kept");
+  });
+
+  test("the init CLI test's next-step assertion expects the start-first line, so the old edit-first line fails", async () => {
+    const repo = makeRepo({ "a.txt": "x" });
+    const globalDir = mkdtempSync(join(tmpdir(), "tickmarkr-init-g-"));
+    const allAdaptersSpy = vi.spyOn(registry, "allAdapters").mockReturnValue([]);
+    let out: string;
+    try {
+      out = await init(["--global-dir", globalDir], repo);
+    } finally {
+      allAdaptersSpy.mockRestore();
+    }
+    const startFirst =
+      'next: tickmarkr start "<what you want built>" — or edit tickmarkr.spec.md, then tickmarkr compile tickmarkr.spec.md && tickmarkr plan && tickmarkr run';
+    const editFirst = "next: edit tickmarkr.spec.md, then tickmarkr compile tickmarkr.spec.md && tickmarkr plan && tickmarkr run";
+    expect(out).toContain(startFirst);
+    expect(out).not.toContain(editFirst); // the old edit-first line fails here
   });
 });
 

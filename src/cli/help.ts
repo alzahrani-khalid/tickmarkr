@@ -49,6 +49,13 @@ export const COMMAND_HELP = {
       "--fresh": "Force an adapter/model health probe; may make model calls. A plain run asks before a stale-cache probe.",
     }, examples: ["fleet --print --why", "fleet"],
   },
+  start: {
+    usage: 'start "<what you want built>" [options]', description: "Turn one sentence into specs/<slug>.intent.md, a drafted native spec, a compiled graph and a routed plan shown as a card. Drafting requires TTY confirmation or --yes and may make model calls; start never runs the graph.",
+    options: {
+      "--yes": "Confirm the disclosed drafting action without a TTY prompt.",
+      "--force": "Allow overwriting an existing specs/<slug>.intent.md or specs/<slug>.spec.md.",
+    }, examples: ['start "add a health endpoint" --yes'],
+  },
   compile: {
     usage: "compile <spec-dir-or-md> [options]", description: "Compile source into .tickmarkr/graph.json; acceptance criteria are required.",
     options: {

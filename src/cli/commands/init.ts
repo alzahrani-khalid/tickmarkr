@@ -67,7 +67,7 @@ function nextSteps(cwd: string, scaffoldedSpec: string): string {
     return `next: existing specs under specs/ (${listed}) — tickmarkr compile <spec> && tickmarkr plan && tickmarkr run`;
   }
 
-  return `next: edit ${scaffoldedSpec}, then tickmarkr compile ${scaffoldedSpec} && tickmarkr plan && tickmarkr run`;
+  return `next: tickmarkr start "<what you want built>" — or edit ${scaffoldedSpec}, then tickmarkr compile ${scaffoldedSpec} && tickmarkr plan && tickmarkr run`;
 }
 
 const visual = () => process.stdout.isTTY === true && process.env.NO_COLOR === undefined;

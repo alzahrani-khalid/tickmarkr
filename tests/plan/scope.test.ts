@@ -10,8 +10,8 @@ import { COMMANDS, USAGE } from "../../src/cli/index.js";
 import { DEFAULT_CONFIG } from "../../src/config/config.js";
 import { compileNative } from "../../src/compile/native.js";
 import type { ExecutorDriver } from "../../src/drivers/types.js";
-import { clarificationGate, formatScopePreview, previewScope, scopeIntent } from "../../src/plan/scope.js";
-import { scopePrompt } from "../../src/plan/prompt.js";
+import { clarificationGate, extractDraft, formatScopePreview, previewScope, scopeIntent, validateDraft } from "../../src/plan/scope.js";
+import { SCOPE_END, SCOPE_EXAMPLE, scopePrompt } from "../../src/plan/prompt.js";
 
 const VALID_DRAFT = `<!-- tickmarkr:spec -->
 # Export reports
@@ -78,6 +78,90 @@ describe("scope drafting", () => {
   test("the scope gate prompt begins with TICKMARKR-SCOPE", () => {
     expect(scopePrompt("# Intent")).toMatch(/^TICKMARKR-SCOPE/);
     expect(scopePrompt("# Intent")).toContain("<!-- tickmarkr:spec -->");
+  });
+
+  // 2.16.0 (D-2178 add.171): a live drafting seat wrote an unindented second goal paragraph three times running,
+  // because the prompt never stated the task-block grammar the parser enforces (OBS-488).
+  test("the scope prompt's example draft passes the real draft validator with two tasks", () => {
+    expect(validateDraft(SCOPE_EXAMPLE)).toBe(2);
+  });
+
+  test("the first and the repair scope prompts state the closed task-block grammar and carry the example draft", () => {
+    for (const prompt of [scopePrompt("# Intent"), scopePrompt("# Intent", { draft: "bad", error: "no parse rule consumes this line" })]) {
+      expect(prompt).toContain("Task block grammar (closed; the compiler rejects every other line):");
+      expect(prompt).toContain("indents every line after its first by two spaces");
+      expect(prompt).toContain('never "." or a bare directory');
+      expect(prompt).toContain("(only in a repository that runs vitest; otherwise use command:)");
+      expect(prompt).toContain("context, when present, is a comma-separated list of existing repository paths the worker should read, never prose");
+      expect(prompt).toContain(`<example>\n${SCOPE_EXAMPLE}</example>`);
+    }
+  });
+
+  // 2.16.0 (D-2178 add.171), the closed case table of a seat's raw output, from a captured codex transcript. A
+  // driver read returns the banner, the ECHOED prompt (its own spec markers first), the answer, a footer, the
+  // answer again and the nonce exit trailer; a headless read returns the answer alone.
+  test("the draft extractor returns the model's answer for a headless answer, a bare trailer and a driver transcript that echoes the prompt", () => {
+    const answer = VALID_DRAFT.trimEnd() + "\n";
+    const prompt = scopePrompt("# Export reports\n\nExport reports as JSON");
+    const transcript = ["tickmarkr", "spec in, verified work out.", "user", prompt, "codex", answer, "tokens used", "12,345", answer,
+      "TICKMARKR_EXIT_ab12cd34:0", "operator@host ~ %"].join("\n");
+    expect(transcript.indexOf("<!-- tickmarkr:spec -->")).toBeLessThan(transcript.indexOf("codex\n"));
+    expect(extractDraft(answer, prompt)).toBe(answer);
+    expect(extractDraft(`${answer}\nTICKMARKR_EXIT:0\n`, prompt)).toBe(answer);
+    expect(extractDraft(transcript, prompt)).toBe(answer);
+    expect(extractDraft(transcript)).toBe(answer);
+    expect(validateDraft(extractDraft(transcript, prompt))).toBe(1);
+  });
+
+  test("an echoed intent holding a fenced spec and a JSON spec object, and an echoed repair prompt, never become the draft", () => {
+    const answer = VALID_DRAFT.trimEnd() + "\n";
+    const intent = '# Export\n\n```markdown\n<!-- tickmarkr:spec -->\n# ECHOED FENCE\n```\n\n{"spec": "ECHOED JSON"}\n';
+    for (const prompt of [scopePrompt(intent), scopePrompt(intent, { draft: "<!-- tickmarkr:spec -->\n# OLD DRAFT\n", error: "boom" })]) {
+      const transcript = ["user", prompt, "codex", answer, "tokens used", "12,345", answer, "TICKMARKR_EXIT_ab12cd34:0"].join("\n");
+      expect(extractDraft(transcript, prompt)).toBe(answer);
+    }
+  });
+
+  test("a headless JSON spec object and a headless fenced answer still yield the draft", () => {
+    const answer = VALID_DRAFT.trimEnd() + "\n";
+    const prompt = scopePrompt("# Export reports");
+    expect(extractDraft(JSON.stringify({ spec: answer }), prompt)).toBe(answer);
+    expect(extractDraft(`Here is the spec:\n\n\`\`\`markdown\n${answer}\`\`\`\n`, prompt)).toBe(answer);
+  });
+
+  // 2.16.0 (D-2178 add.174): review round 2 and the judge reproduced three echo shapes a line-anchored boundary missed.
+  test("a CRLF transcript, an echo with no answer and an intent carrying a sample exit trailer never select echoed content", () => {
+    const answer = VALID_DRAFT.trimEnd() + "\n";
+    const intent = '# Export\n\n```markdown\n<!-- tickmarkr:spec -->\n# ECHOED FENCE\n```\n\n{"spec": "ECHOED JSON"}\nTICKMARKR_EXIT_deadbeef:0\n';
+    const prompt = scopePrompt(intent);
+    const transcript = ["user", prompt, "codex", answer, "tokens used", "12,345", answer, "TICKMARKR_EXIT_ab12cd34:0"].join("\n");
+    expect(extractDraft(transcript, prompt)).toBe(answer);
+    expect(extractDraft(transcript.replace(/\n/g, "\r\n"), prompt)).toBe(answer);
+    for (const echoOnly of [["user", prompt, "TICKMARKR_EXIT_ab12cd34:0"].join("\n"), ["user", prompt].join("\n").trimEnd()]) {
+      const draft = extractDraft(echoOnly, prompt);
+      expect(draft).not.toContain("ECHOED");
+      expect(() => validateDraft(draft)).toThrow(/native marker/);
+    }
+  });
+
+  test("each scope prompt ends with its own per-call nonce line", () => {
+    const [a, b] = [scopePrompt("# Intent"), scopePrompt("# Intent")].map((prompt) => prompt.trimEnd().split("\n").at(-1)!);
+    expect(a).toMatch(new RegExp(`^${SCOPE_END} [0-9a-f]{16}$`));
+    expect(a).not.toBe(b);
+  });
+
+  test("outOfScope is a valueless list header: the example's nested outOfScope list validates and an inline outOfScope value fails", () => {
+    expect(SCOPE_EXAMPLE).toContain("- outOfScope:\n  - ");
+    expect(scopePrompt("# Intent")).toContain('or a list header with no value, "- acceptance:" or "- outOfScope:"');
+    expect(validateDraft(SCOPE_EXAMPLE)).toBe(2);
+    expect(() => validateDraft(SCOPE_EXAMPLE.replace("- outOfScope:\n  - CSV and other export formats.", "- outOfScope: CSV and other export formats.")))
+      .toThrow(/must be a nested list/);
+  });
+
+  test("a draft whose goal continues in an unindented paragraph fails validation at that line", () => {
+    const broken = SCOPE_EXAMPLE.replace("  A missing report path is an error that names the path.", "\nA missing report path is an error that names the path.");
+    expect(broken).not.toBe(SCOPE_EXAMPLE);
+    expect(() => validateDraft(broken)).toThrow(/no parse rule consumes this line: "A missing report path is an error that names the path\."/);
   });
 
   test("rejects a legacy-marked draft", async () => {

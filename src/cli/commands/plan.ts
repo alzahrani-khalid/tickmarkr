@@ -56,8 +56,22 @@ const fleetCanCrossVendorReview = (channels: BillingChannel[]) => {
   return false;
 };
 
+// One task's routing as plan decided it, handed to PlanOpts.onTask once per task in graph order.
+// judge/review are the printed seat lines without the cost suffix; blocked is the printed refusal reason.
+export type PlanTaskRow = {
+  id: string;
+  title: string;
+  shape: string;
+  acceptance: number;
+  worker?: { adapter: string; model: string; channel: string; tier: string };
+  judge?: string;
+  review?: string;
+  blocked?: string;
+};
+
 export type PlanOpts = {
   listTests?: (cwd: string) => Promise<VitestListResult>;
+  onTask?: (row: PlanTaskRow) => void;
 };
 
 // Planning can defer authorship only to this criterion's explicitly owned landing.
@@ -493,10 +507,14 @@ export async function plan(
   const routed: RoutedAssignment[] = [];
   for (const t of g.tasks) {
     const refusals = [...(oracleRefusals.get(t.id) ?? []), ...(inputRefusals.get(t.id) ?? [])];
+    const base: PlanTaskRow = { id: t.id, title: t.title, shape: t.shape, acceptance: t.acceptance.length };
     if (refusals.length) {
-      lines.push(`  ${t.id.padEnd(6)} ${t.shape.padEnd(10)} !! pre-dispatch refusal — ${refusals.join("; ")}`, chainLine(t));
+      const blocked = refusals.join("; ");
+      lines.push(`  ${t.id.padEnd(6)} ${t.shape.padEnd(10)} !! pre-dispatch refusal — ${blocked}`, chainLine(t));
+      opts.onTask?.({ ...base, blocked });
       continue;
     }
+    let row: PlanTaskRow = base;
     try {
       // daemon.ts:3322: the resumed run routes around its replayed worker exclusions.
       const r = route(t, cfg, channels, dispatchProfile, undefined, demotedWorkers);
@@ -508,6 +526,8 @@ export async function plan(
       const est = r.assignment.channel === "sub" ? 0 : cfg.pricing[r.assignment.tier];
       const judge = judgeSeat(t);
       const review = reviewSeat(t, r.assignment);
+      const { adapter, model, channel, tier } = r.assignment;
+      row = { ...base, worker: { adapter, model, channel, tier }, judge: judge.line, review: review.line };
       cost += est + judge.cost + review.cost;
       lines.push(
         `  ${t.id.padEnd(6)} ${t.shape.padEnd(10)} c${String(t.complexity).padEnd(3)}→ ${r.assignment.adapter}:${r.assignment.model} [${r.assignment.channel}/${r.assignment.tier}]${t.timeoutMinutes !== undefined ? ` (timeout ${t.timeoutMinutes}m)` : ""}${t.humanGate ? " (human gate)" : ""}${est ? ` ~$${est.toFixed(2)}` : ""} — ${r.provenance}`,
@@ -539,7 +559,10 @@ export async function plan(
       const d = derivation(t);
       if (d) lines.push(d);
       lints.push(`${t.id}: unroutable — ${msg}`);
+      row = { ...base, blocked: msg };
     }
+    // Outside the catch: a callback's throw (a RoutingError included) propagates, never an unroutable row.
+    opts.onTask?.(row);
     for (const advisory of oracleAdvisories.get(t.id) ?? []) lines.push(`    ! ${advisory}`);
   }
   const inputWarnings = inputFindings.filter((finding) => finding.severity === "warn");

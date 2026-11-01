@@ -2,6 +2,34 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v2.16.0 — `tickmarkr start`: describe what you want in one sentence and get a drafted, compiled and routed plan
+
+**v2.16.0** was delivered by one tickmarkr run of three tasks and one verified fix. Every task passed build, lint, evidence and
+scope, its acceptance criteria, a cross-vendor review and the full test suite before it merged. The fix passed the same
+battery through `tickmarkr verify`.
+
+- **New command: `tickmarkr start "<what you want built>"`.** It turns one sentence into a plan you can run.
+  - It writes the sentence as an intent under `specs/`.
+  - It drafts a native spec from that intent through the existing `scope` command, which keeps its disclosed confirmation:
+    you are asked at a terminal, or you pass `--yes`.
+  - It compiles the spec and routes every task.
+  - It ends with a short card instead of the full routing table. The card lists each task by title, the agent that will
+    build it, its reviewer, and how many acceptance checks it must pass, then the next step: `tickmarkr run`.
+  - A task that cannot route is named with the reason, and the card says the plan is not ready.
+  - `tickmarkr plan` still shows the full routing detail.
+- **A new repository starts from a sentence.** In a repository with no specs, `tickmarkr init` now ends by pointing at
+  `tickmarkr start`. The README Quickstart leads with it too. Editing the scaffolded `tickmarkr.spec.md` and running
+  `compile`, `plan` and `run` still works exactly as before.
+- **`plan` hands its routing to callers as data.** `plan` accepts an optional per-task callback that gets each task's
+  routed worker, judge and reviewer, or the reason the task cannot route. Its printed output is unchanged byte for byte.
+  `start` builds its card from this data, never by parsing `plan`'s text.
+- **Fix: `scope` drafting through a visible pane works.** When the drafting seat ran through a driver, `scope` read the
+  seat's whole terminal transcript, starting at the prompt echoed back in it, and never removed the run's exit trailer.
+  As a result, a codex draft could never parse. `scope` now reads the model's final answer. The drafting prompt also
+  states the exact task-block format the compiler accepts, with a complete example that is tested against the real
+  validator. Three live `start` runs that failed before this fix now each produce a compiled, routed plan in under
+  45 seconds.
+
 ## v2.15.0 — public CI runs as four duration-balanced shards per OS: about an hour instead of about three
 
 **v2.15.0** is a hand delivery in six commits (queue rows 6, 320 and 321). Every commit is covered by a green

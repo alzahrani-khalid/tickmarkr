@@ -15,6 +15,7 @@ import { report } from "./commands/report.js";
 import { resume } from "./commands/resume.js";
 import { run } from "./commands/run.js";
 import { scope } from "./commands/scope.js";
+import { start } from "./commands/start.js";
 import { stats } from "./commands/stats.js";
 import { status } from "./commands/status.js";
 import { ui } from "./commands/ui.js";
@@ -31,7 +32,7 @@ const normalize = (r: CommandResult): { out: string; code: number } =>
   typeof r === "string" ? { out: r, code: 0 } : r;
 
 export const COMMANDS = {
-  acp, init, doctor, fleet, compile, scope, plan, run, status, wait, stats, resume, report, profile, ui, unlock, approve, beat, version, verify, eval: evalCommand,
+  acp, init, doctor, fleet, start, compile, scope, plan, run, status, wait, stats, resume, report, profile, ui, unlock, approve, beat, version, verify, eval: evalCommand,
 } satisfies CommandMap;
 export type RegisteredCommand = keyof typeof COMMANDS;
 
@@ -47,6 +48,7 @@ usage: tickmarkr <command>
   init          guided setup + doctor; init --agent [--force] [--docs] adds agent skills/docs
   doctor        re-probe adapters, herdr, auth; print capability matrix (--fix writes the test-runner ignore when a safe edit exists)
   fleet         interactive fleet editor (fleet --print for CI drift checks)
+  start "<idea>" one sentence → drafted spec, compiled graph and routed plan card (--yes --force; never runs)
   compile <src> spec → .tickmarkr/graph.json (fails without acceptance criteria)
   scope <intent> preview locally with --preview; draft after confirmation or --yes (--force to overwrite)
   plan          dry-run routing table + cost estimate + floor lints

@@ -804,7 +804,7 @@ describe("T4 init closing block", () => {
     const wroteRepo = makeRepo({ "keep.txt": "x" });
     stampDoctor(wroteRepo, 5 * 60 * 1000);
     const wroteOut = await runInit(wroteRepo);
-    expect(wroteOut).toMatch(/next: edit tickmarkr\.spec\.md, then tickmarkr compile tickmarkr\.spec\.md/);
+    expect(wroteOut).toMatch(/next: tickmarkr start "<what you want built>" — or edit tickmarkr\.spec\.md, then tickmarkr compile tickmarkr\.spec\.md/);
     expect(wroteOut).toContain(`wrote ${join(wroteRepo, "tickmarkr.spec.md")}`);
 
     const keptRepo = makeRepo({
@@ -812,7 +812,7 @@ describe("T4 init closing block", () => {
     });
     stampDoctor(keptRepo, 5 * 60 * 1000);
     const keptOut = await runInit(keptRepo);
-    expect(keptOut).toMatch(/next: edit tickmarkr\.spec\.md, then tickmarkr compile tickmarkr\.spec\.md/);
+    expect(keptOut).toMatch(/next: tickmarkr start "<what you want built>" — or edit tickmarkr\.spec\.md, then tickmarkr compile tickmarkr\.spec\.md/);
     expect(keptOut).toContain(`kept existing ${join(keptRepo, "tickmarkr.spec.md")}`);
   });
 
@@ -830,7 +830,7 @@ describe("T4 init closing block", () => {
     expect(out).toContain("specs/v1.0-feature.spec.md");
     expect(out).toContain("specs/v1.1-other.spec.md");
     expect(out).toMatch(/tickmarkr compile <spec>/);
-    expect(out).not.toMatch(/next: edit tickmarkr\.spec\.md/);
+    expect(out).not.toMatch(/next: tickmarkr start/);
   });
 
   test("init with an active run prints the run id with a status suggestion and no compile suggestion", async () => {
@@ -993,6 +993,58 @@ describe("init guidance (queue row 243; D-2141; D-2152)", () => {
         const { out, io } = await driveInit(repo, KEY.down.repeat(9) + KEY.enter);
         expect(io.writes.some((frame) => strip(frame).includes("Install agent skills"))).toBe(true);
         expect(strip(out)).not.toContain("guided setup skipped");
+      });
+    }
+  });
+
+  test("init in a fresh repo with no spec under specs and no active run prints the start-first next line, with the edit-then-compile alternative on that same line; the environments line follows it directly when no guided-setup hint applies, and otherwise the existing guided-setup hint stays between them on both the plain and visual surfaces, so an edit-first line, a split next line or a displaced hint fails", async () => {
+    vi.spyOn(registry, "allAdapters").mockReturnValue([]);
+    vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    const hint = "guided setup skipped (no interactive terminal): run `! tkr init` yourself, or in a visible pane";
+    const start = 'tickmarkr start "<what you want built>"';
+    const alternative = "— or edit tickmarkr.spec.md, then tickmarkr compile tickmarkr.spec.md && tickmarkr plan && tickmarkr run";
+    const nextValue = `${start} ${alternative}`;
+
+    const findings = (out: string, surface: "plain" | "visual", hinted: boolean) => {
+      const lines = out.split("\n");
+      const at = lines.findIndex((line) => line.includes(start));
+      if (at < 0) return ["no start-first next line"];
+      const found: string[] = [];
+      const expectedNext = surface === "plain" ? `next: ${nextValue}` : `  ${"next".padEnd(14)} ${nextValue}`;
+      if (lines[at] !== expectedNext) found.push("next line");
+      const after = hinted ? [surface === "plain" ? hint : `  ${hint}`, "environments:"] : ["environments:"];
+      if (lines.slice(at + 1, at + 1 + after.length).join("\n") !== after.join("\n")) found.push("hint placement");
+      if (out.split(hint).length !== (hinted ? 2 : 1)) found.push("hint count");
+      return found;
+    };
+
+    for (const [surface, render] of [["plain", withoutTTY], ["visual", withTTY]] as const) {
+      await render(async () => {
+        for (const hinted of [true, false]) {
+          const repo = makeRepo({ "keep.txt": "x" });
+          stampDoctor(repo, 5 * 60 * 1000);
+          const io = makeIO();
+          io.input.isTTY = false;
+          io.output.isTTY = false;
+          const out = strip(await init(
+            ["--global-dir", mkdtempSync(join(tmpdir(), "tickmarkr-init-global-")), ...(hinted ? [] : ["--yes"])], repo,
+            { input: io.input as unknown as NodeJS.ReadStream, output: io.output as unknown as NodeJS.WriteStream },
+          ));
+          expect(findings(out, surface, hinted)).toEqual([]);
+
+          // Wrong discriminators: the old edit-first line, the alternative split onto its own line, a displaced hint.
+          const editFirst = out.replace(nextValue, `edit tickmarkr.spec.md, then tickmarkr compile tickmarkr.spec.md && tickmarkr plan && tickmarkr run — or ${start}`);
+          expect(findings(editFirst, surface, hinted)).not.toEqual([]);
+          expect(findings(out.replace(` ${alternative}`, `\n${alternative}`), surface, hinted)).not.toEqual([]);
+          if (hinted) {
+            const lines = out.split("\n");
+            const hintLine = lines.findIndex((line) => line.includes(hint));
+            const displaced = [lines[hintLine]!, ...lines.slice(0, hintLine), ...lines.slice(hintLine + 1)].join("\n");
+            expect(findings(displaced, surface, hinted)).toContain("hint placement");
+          } else {
+            expect(findings(out.replace("environments:", `${hint}\nenvironments:`), surface, hinted)).not.toEqual([]);
+          }
+        }
       });
     }
   });
