@@ -313,24 +313,24 @@ test("prototype-named JSON keys are ordinary data, literal prototype-named globs
   }
 });
 
-// v2.8.2 T2 (ANL-022 §7.2a) — the public workflow's own steps, read from the parsed file: both jobs must declare
-// each named step identically, and a step runs verbatim through `bash -e -c` with RUNNER_TEMP a scratch directory.
+// v2.8.2 T2 (ANL-022 §7.2a) — the public workflow's own steps, read from the parsed file, run verbatim through
+// `bash -e -c` with RUNNER_TEMP a scratch directory. v2.8.2 T7 (§7.4): the sharded form — every job is a matrix over
+// both operating systems, so one declaration is both OSes' step; its matrix and runner expressions render per run.
 type WorkflowStep = { name?: string; if?: string; run?: string; env?: Record<string, string> };
-const PUBLIC_JOBS = ["test", "test-macos"] as const;
-const publicSteps = (jobName: string): WorkflowStep[] =>
+const publicJob = (jobName: string) =>
   ((parseYaml(readFileSync(join(repoRoot, ".github/workflows/ci.public.yml"), "utf8")) as {
-    jobs?: Record<string, { steps?: WorkflowStep[] }>;
-  }).jobs ?? {})[jobName]?.steps ?? [];
-/** The step both public jobs declare under `name`, asserted identical in each. */
-const declaredStep = (name: string): { run: string; env: Record<string, string> } => {
-  const declared = PUBLIC_JOBS.map((jobName) => {
-    const step = publicSteps(jobName).find((candidate) => candidate.name === name);
-    expect(step?.run?.trim(), `${jobName}: ${name} command`).toBeTruthy();
-    return { run: step!.run!.trim(), env: step!.env ?? {} };
-  });
-  expect(declared[1], `both jobs declare the same ${name} step`).toEqual(declared[0]);
-  return declared[0]!;
+    jobs?: Record<string, { strategy?: { matrix?: { os?: string[] } }; steps?: WorkflowStep[] }>;
+  }).jobs ?? {})[jobName];
+const publicSteps = (jobName: string): WorkflowStep[] => publicJob(jobName)?.steps ?? [];
+/** The step the public job `jobName` declares under `name`, run on both operating systems. */
+const declaredStep = (jobName: string, name: string): { run: string; env: Record<string, string> } => {
+  expect(publicJob(jobName)?.strategy?.matrix?.os, `${jobName}: one job per OS`).toEqual(["ubuntu-latest", "macos-latest"]);
+  const step = publicSteps(jobName).find((candidate) => candidate.name === name);
+  expect(step?.run?.trim(), `${jobName}: ${name} command`).toBeTruthy();
+  return { run: step!.run!.trim(), env: step!.env ?? {} };
 };
+const renderStep = (text: string, vars: Record<string, string>): string =>
+  text.replace(/\$\{\{\s*(?:matrix\.(\w+)|runner\.(temp))\s*\}\}/g, (_, key?: string, temp?: string) => (temp ? vars.RUNNER_TEMP! : vars[key!]!) ?? "");
 
 /** The child environment of a nested run: no inherited Vitest, record, lean-reporter, git-location or lease variables. */
 const childEnv = (extra: NodeJS.ProcessEnv): NodeJS.ProcessEnv => ({
@@ -339,17 +339,20 @@ const childEnv = (extra: NodeJS.ProcessEnv): NodeJS.ProcessEnv => ({
   NO_COLOR: "1", FORCE_COLOR: "0", ...extra,
 });
 
-test("test: the floors command both jobs declare writes its own sidecar into the runner temp proof directory, exiting zero with a GREEN sidecar over a healthy summary and one with a RED sidecar over a misrooted glob (W-P2 W-F1)", { timeout: 180_000 }, async () => {
-  for (const jobName of PUBLIC_JOBS) {
-    const steps = publicSteps(jobName);
-    const floorsIndex = steps.findIndex((step) => step.name === "Recheck coverage floors");
-    expect(floorsIndex, `${jobName}: Recheck coverage floors step`).toBeGreaterThan(-1);
-    expect(steps[floorsIndex]?.if, `${jobName}: floors step must run under always()`).toBe("always()");
-    const coverageIndex = steps.findIndex((step) => step.name === "Run coverage proof (parallel suite project)");
-    expect(coverageIndex, `${jobName}: coverage step`).toBeGreaterThan(-1);
-    expect(floorsIndex, `${jobName}: floors step must directly follow the coverage step`).toBe(coverageIndex + 1);
+test("test: the floors command each OS's aggregate declares directly after its merge of every shard's blob writes its own sidecar into the runner temp proof directory, exiting zero with a GREEN sidecar over a healthy summary and one with a RED sidecar over a misrooted glob (W-P2 W-F1)", { timeout: 180_000 }, async () => {
+  // the sharded form checks the floors once per OS, in that OS's aggregate, over the summary its merge writes
+  const steps = publicSteps("aggregate");
+  const floorsIndex = steps.findIndex((step) => step.name === "Recheck coverage floors");
+  expect(floorsIndex, "aggregate: Recheck coverage floors step").toBeGreaterThan(-1);
+  expect(steps[floorsIndex]?.if, "aggregate: floors step must run under always()").toBe("always()");
+  const coverageIndex = steps.findIndex((step) => step.name === "Merge coverage (one coverage map per OS)");
+  expect(coverageIndex, "aggregate: coverage merge step").toBeGreaterThan(-1);
+  expect(steps[coverageIndex]?.run, "aggregate: the coverage step merges every shard's blob").toMatch(/ --merge-reports=\S+ --coverage /);
+  expect(floorsIndex, "aggregate: floors step must directly follow the coverage step").toBe(coverageIndex + 1);
+  for (const jobName of ["suite", "single-fork"]) {
+    expect(publicSteps(jobName).some((step) => /\bcli\.ts floors\b/.test(step.run ?? "")), `${jobName}: no partial floors check`).toBe(false);
   }
-  const command = declaredStep("Recheck coverage floors").run;
+  const command = declaredStep("aggregate", "Recheck coverage floors").run;
   expect(command).toContain("coverage/coverage-summary.json");
   expect(command, "the producer writes its own sidecar: no pipe or tee masks its status").not.toMatch(/\||\btee\b/);
 
@@ -395,14 +398,17 @@ test("test: the floors command both jobs declare writes its own sidecar into the
   }
 });
 
-test("test: under the production configuration a suite with one failing test still writes the coverage summary and a test that prints the timeout text keeps that line in the runner output, while a passing suite writes the summary as before (W-P3)", { timeout: 300_000 }, async () => {
-  const step = declaredStep("Run coverage proof (parallel suite project)");
-  const logArg = /^bash scripts\/run-ci-vitest\.sh "([^"]+)" /.exec(step.run)?.[1];
-  expect(logArg, "the coverage step's log argument").toMatch(/^\$RUNNER_TEMP\/proof\//);
+test("test: under the production configuration the declared shard steps over a suite with one failing test and the aggregate's declared merge of their blobs still write the coverage summary the floors step reads, and a test that prints the timeout text keeps that line in its shard's log, while a merge of no blob writes no summary (W-P3)", { timeout: 600_000 }, async () => {
+  // v2.8.2 T7 (ANL-022 §7.4): the floors step reads the summary the aggregate's merge writes, so a test that failed in a
+  // shard must not cost the OS its summary. Vitest's merge reports coverage whatever the replayed tests did.
+  const shardStep = declaredStep("suite", "Run coverage shard (parallel suite project)");
+  const mergeStep = declaredStep("aggregate", "Merge coverage (one coverage map per OS)");
+  expect(shardStep.run, "the shard step's log argument").toMatch(/^bash scripts\/run-ci-vitest\.sh "\$RUNNER_TEMP\/proof\//);
   const TIMEOUT_LINES = ["Error: Test timed out in 5000ms.", "Error: Hook timed out in 10000ms."];
 
-  // a scratch production copy with the real setup file, committed so its record carries a head and its run takes
-  // its own lease: one passing test printing Vitest's own timeout wording, one failing test
+  // a scratch production copy with the real setup file, committed so its records carry a head and its runs take
+  // their own lease: four probes, one per shard by name (no durations are known) — one failing, one printing Vitest's
+  // own timeout wording
   const scratch = makeScratch();
   try {
     for (const file of ["tests/setup.ts", "tests/helpers/tmprepo.ts"]) {
@@ -410,61 +416,64 @@ test("test: under the production configuration a suite with one failing test sti
       cpSync(join(repoRoot, file), join(scratch, file));
     }
     mkdirSync(join(scratch, "tests/probe"), { recursive: true });
-    writeFileSync(join(scratch, "tests/probe/prints.test.ts"), `import { test } from "vitest";
+    writeFileSync(join(scratch, "tests/probe/a-fails.test.ts"), 'import { expect, test } from "vitest";\ntest("fails", () => {\n  expect(1).toBe(2);\n});\n');
+    writeFileSync(join(scratch, "tests/probe/b-prints.test.ts"), `import { test } from "vitest";
 test("prints the timeout text", () => {
   console.log(${JSON.stringify(TIMEOUT_LINES[0])});
   console.error(${JSON.stringify(TIMEOUT_LINES[1])});
 });
 `);
-    writeFileSync(join(scratch, "tests/probe/fails.test.ts"), 'import { expect, test } from "vitest";\ntest("fails", () => {\n  expect(1).toBe(2);\n});\n');
+    for (const name of ["c", "d"]) writeFileSync(join(scratch, `tests/probe/${name}-passes.test.ts`), 'import { test } from "vitest";\ntest("passes", () => {});\n');
     const ceiling = { GIT_CEILING_DIRECTORIES: dirname(scratch) };
     for (const args of [["init", "-q"], ["-c", "user.name=t", "-c", "user.email=t@t.invalid", "-c", "commit.gpgsign=false", "commit", "-q", "--allow-empty", "-m", "scratch"]]) {
       execFileSync("git", ["-c", "core.hooksPath=/dev/null", ...args], { cwd: scratch, env: childEnv(ceiling), stdio: "ignore" });
     }
 
-    // the declared step, verbatim with its declared env; the fixture suite covers no production file, so Vitest's
-    // own thresholds fail every run here — the subject is the summary the floors step reads, not this exit
-    const runnerTemp = join(scratch, "runner-temp");
-    const log = logArg!.replace("$RUNNER_TEMP", runnerTemp);
-    const summary = join(scratch, "coverage", "coverage-summary.json");
-    const runCoverage = async () => {
-      rmSync(join(scratch, "coverage"), { recursive: true, force: true });
-      const run = await runOwned("bash", ["-e", "-c", step.run], {
-        cwd: scratch, ms: 240_000, env: childEnv({ ...step.env, ...ceiling, RUNNER_TEMP: runnerTemp }),
+    // a declared step, verbatim with its declared env, on its own runner; the fixture suite covers no production file,
+    // so Vitest's own thresholds fail the merge here — the subject is the summary the floors step reads
+    const runStep = async (step: { run: string; env: Record<string, string> }, vars: Record<string, string>) => {
+      const env = Object.fromEntries(Object.entries(step.env).map(([key, value]) => [key, renderStep(value, vars)]));
+      const run = await runOwned("bash", ["-e", "-c", renderStep(step.run, vars)], {
+        cwd: scratch, ms: 240_000, env: childEnv({ ...env, ...ceiling, RUNNER_TEMP: vars.RUNNER_TEMP! }),
       });
-      const failures = ownedFailures(run, "declared coverage step");
+      const failures = ownedFailures(run, "declared step");
       if (failures.length > 0) throw new Error(`${failures.join("; ")}\n${run.out}\n${run.err}`);
-      const record = parseRecord(readJson(readFileSync(`${log}.record.json`, "utf8")), log);
-      return {
-        output: `${run.out}${run.err}`,
-        log: readFileSync(log, "utf8"),
-        tests: record.tests.map(({ file, name, state }) => [file, name, state]),
-        summary: existsSync(summary) ? (readJson(readFileSync(summary, "utf8")) as Record<string, unknown>) : undefined,
-      };
+      return { status: run.exitCode, output: `${run.out}${run.err}` };
     };
-
-    const failing = await runCoverage();
-    expect(failing.tests).toEqual([["tests/probe/fails.test.ts", "fails", "failed"], ["tests/probe/prints.test.ts", "prints the timeout text", "passed"]]);
-    expect(failing.summary, `a failing suite still writes the summary\n${failing.output}`).toHaveProperty("total");
-    for (const line of TIMEOUT_LINES) {
-      expect(failing.output, line).toContain(line);
-      expect(failing.log, `${line} in the step's log`).toContain(line);
+    const runners = join(scratch, ".runners");
+    const tests: string[][] = [];
+    const logs: string[] = [];
+    for (const k of [1, 2, 3, 4]) {
+      const vars = { os: "ubuntu-latest", shard: String(k), RUNNER_TEMP: join(runners, `suite-${k}`) };
+      await runStep(shardStep, vars);
+      const log = join(vars.RUNNER_TEMP, "proof", `suite-${k}.log`);
+      const record = parseRecord(readJson(readFileSync(`${log}.record.json`, "utf8")), log);
+      tests.push(...record.tests.map(({ file, name, state }) => [file, name, state]));
+      logs.push(readFileSync(log, "utf8"));
     }
+    expect(tests).toEqual([
+      ["tests/probe/a-fails.test.ts", "fails", "failed"], ["tests/probe/b-prints.test.ts", "prints the timeout text", "passed"],
+      ["tests/probe/c-passes.test.ts", "passes", "passed"], ["tests/probe/d-passes.test.ts", "passes", "passed"],
+    ]);
+    for (const line of TIMEOUT_LINES) expect(logs[1], `${line} in its shard's log`).toContain(line);
 
-    // control: the same failing suite under the configuration without reportOnFailure writes no summary — the option
-    // writes it, not a Vitest default
-    const config = readFileSync(join(scratch, "vitest.config.ts"), "utf8");
-    const withoutOption = config.replace(/\n\s*reportOnFailure: true,/, "");
-    expect(withoutOption).not.toBe(config);
-    writeFileSync(join(scratch, "vitest.config.ts"), withoutOption);
-    expect((await runCoverage()).summary, "no summary without reportOnFailure").toBeUndefined();
-    writeFileSync(join(scratch, "vitest.config.ts"), config);
-
-    rmSync(join(scratch, "tests/probe/fails.test.ts"));
-    const passing = await runCoverage();
-    expect(passing.tests).toEqual([["tests/probe/prints.test.ts", "prints the timeout text", "passed"]]);
-    expect(passing.summary, `a passing suite writes the summary\n${passing.output}`).toHaveProperty("total");
-    for (const line of TIMEOUT_LINES) expect(passing.log, `${line} in the step's log`).toContain(line);
+    // the aggregate on its own runner: every shard's proof directory flattened into its group, as the download does
+    const summary = join(scratch, "coverage", "coverage-summary.json");
+    const merge = async (name: string, shards: readonly number[]) => {
+      const vars = { os: "ubuntu-latest", RUNNER_TEMP: join(runners, name) };
+      mkdirSync(join(vars.RUNNER_TEMP, "group", "blobs"), { recursive: true });
+      for (const k of shards) cpSync(join(runners, `suite-${k}`, "proof"), join(vars.RUNNER_TEMP, "group"), { recursive: true });
+      rmSync(join(scratch, "coverage"), { recursive: true, force: true });
+      const run = await runStep(mergeStep, vars);
+      return { ...run, summary: existsSync(summary) ? (readJson(readFileSync(summary, "utf8")) as Record<string, unknown>) : undefined };
+    };
+    const merged = await merge("aggregate", [1, 2, 3, 4]);
+    expect(merged.status, "the replayed failure still fails the merge").not.toBe(0);
+    expect(merged.summary, `a merge replaying a failed test still writes the summary\n${merged.output}`).toHaveProperty("total");
+    // control: the summary is the merge's own — a merge of no blob writes none
+    const empty = await merge("aggregate-empty", []);
+    expect(empty.status).not.toBe(0);
+    expect(empty.summary, "no summary without a blob").toBeUndefined();
   } finally {
     rmSync(scratch, { recursive: true, force: true });
   }

@@ -105,10 +105,11 @@ test("Cite the replaced watcher line in each of the three plain-host sections, v
   // Queue row 286: refresh the pins for the three verify author lines, retaining them in the hash.
   // Queue row 294: the journal-and-lock-pid parenthetical is gone and the wake line stays,
   // so the pins move with that deletion.
+  // Queue row 6 (2.15.0 sharded CI re-land): the overseer's grading paragraph names the sharded twelve, so its pin moves.
   const baseline = {
     loop: "efa8c2dab37d07cc799515cd5443382cd74769c346c9e72ee92bb47a7689b44c",
     auto: "372f943c515dfa7b6cfdeb06833d8e23314a9981b9cd81491419d56747f1d2d0",
-    overseer: "6da3d0f0a1eee1e3a20e8b8d1079f84e8ea16253a9ae155fda4a17d3efebc958",
+    overseer: "6100d56273a9b226f8210f77229ffa29e07419e6a1fd549174d0fd59bd73bcfd",
   };
   for (const name of SKILLS) {
     const markdown = readSkill(name);

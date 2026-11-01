@@ -293,7 +293,9 @@ const runAssert = async (args: readonly string[]): Promise<number> => {
   return verdict === "GREEN" ? 0 : verdict === "RED" ? 1 : 2;
 };
 
-// v2.7.8 T6 — compare two complete manifest forms and their coverage over one runner root.
+// v2.7.8 T6 — compare two complete manifest forms and their coverage over one runner root. v2.8.4 T1 (D-2008): the
+// coverage half is exact — any difference in one file's covered or total count of any metric is a defect, with no note
+// and no floor-glob tolerance, since equal per-file counts over equal source sets make every glob's percentages equal.
 type ParityForm = "serial" | "sharded";
 type ParityArgs = { root: string; serial: string[]; sharded: string[]; serialCoverage: string; shardedCoverage: string };
 
@@ -341,7 +343,6 @@ function parityCoverage(root: string, source: string): Map<string, SummaryEntry>
 
 const runParity = async (args: readonly string[]): Promise<number> => {
   const defects: Defect[] = [];
-  const notes: string[] = [];
   let files: number | string = UNREADABLE;
   let sources: number | string = UNREADABLE;
   let globs: number | string = UNREADABLE;
@@ -390,46 +391,34 @@ const runParity = async (args: readonly string[]): Promise<number> => {
         const a = serial.metrics[metric];
         const b = sharded.metrics[metric];
         if (a.total !== b.total) defects.push({ form: "sharded", kind: "totals-differ", file, metric, serial: a.total, sharded: b.total });
-        if (a.covered !== b.covered) notes.push(`PARITY_COVERAGE_NOTE ${jsonLine({ file, metric, serial: a.covered, sharded: b.covered })}`);
+        if (a.covered !== b.covered) defects.push({ form: "sharded", kind: "covered-differs", file, metric, serial: a.covered, sharded: b.covered });
       }
     }
     for (const file of shardedCoverage.keys()) {
       if (!serialCoverage.has(file)) defects.push({ form: "sharded", kind: "source-only-sharded", file });
     }
 
-    // `floors` and parity load the same live thresholds and use the same glob ownership and pct math.
+    // `floors` and parity load the same live thresholds and use the same glob ownership: a glob either form leaves
+    // without a file or a statement reds.
     const floors = await loadFloors(checkout);
     const serialFloors = checkFloors(floors, [...serialCoverage.values()], input.root);
     const shardedFloors = checkFloors(floors, [...shardedCoverage.values()], input.root);
     globs = serialFloors.length;
-    for (let i = 0; i < serialFloors.length; i++) {
-      const serial = serialFloors[i]!;
-      const sharded = shardedFloors[i]!;
-      for (const [form, check] of [["serial", serial], ["sharded", sharded]] as const) {
+    for (const [form, checks] of [["serial", serialFloors], ["sharded", shardedFloors]] as const) {
+      for (const check of checks) {
         for (const kind of check.defects) {
           if (kind === "no-file" || kind === "zero-statements") defects.push({ form, kind, glob: check.glob });
-        }
-      }
-      for (const metric of FLOOR_METRICS) {
-        const a = serial.metrics[metric];
-        const b = sharded.metrics[metric];
-        if (a === undefined || b === undefined) continue;
-        const serialHundredths = Math.round(a.pct * 100);
-        const shardedHundredths = Math.round(b.pct * 100);
-        if (Math.abs(serialHundredths - shardedHundredths) > 10) {
-          defects.push({ form: "sharded", kind: "pct-differs", glob: serial.glob, metric, serial: a.pct, sharded: b.pct });
         }
       }
     }
     verdict = defects.length === 0 ? "GREEN" : "RED";
   } catch (error) {
     defects.length = 0;
-    notes.length = 0;
     files = sources = globs = UNREADABLE;
     defects.push({ form: reading, kind: "unreadable", error: message(error) });
   }
   const lines = defects.map((defect) => `PARITY_DEFECT ${jsonLine(defect)}`).sort();
-  await emit([...lines, ...notes.sort(), `PARITY verdict=${verdict} files=${files} sources=${sources} globs=${globs} defects=${lines.length}`]);
+  await emit([...lines, `PARITY verdict=${verdict} files=${files} sources=${sources} globs=${globs} defects=${lines.length}`]);
   return verdict === "GREEN" ? 0 : verdict === "RED" ? 1 : 2;
 };
 
@@ -608,11 +597,43 @@ function readFloorsOut(text: string): "GREEN" | "RED" | "UNREADABLE" {
 // and the checkManifest rules run over the DOWNLOADED records; (3) floors.out reads GREEN under the floors
 // grammar. No line the job printed is read. PROOF_DEFECT lines, one PROOF line per dir, then one PROOF_RUN
 // line; UNREADABLE outranks RED, as in the record matrix. Exit 0 GREEN, 1 RED, 2 UNREADABLE.
-// (`--merge-record` and `--blobs`, the sharded aggregate's own check, belong to ANL-022 §7.4.)
+// v2.8.2 T7 (ANL-022 §7.4) — `--merge-record <file> --blobs <dir>`, both or neither: the sharded aggregate's merge
+// record, which Vitest writes by replaying every blob and which therefore re-lists every suite file, is checked
+// SEPARATELY and never counted into a group's set (counted in, every suite file reads `duplicate`). Per dir, its
+// {file, project} set must equal the union of the dir's SHARD records (shard non-null), each once and finished, its
+// head must be <sha>, and <dir> of --blobs must hold exactly blob-1.json..blob-<n>.json for the shards' count n. A
+// record can be present while its blob is not, and a blob that is a byte copy of another is present by name while
+// its shard's files reach the merge twice and its own never, so both checks are needed; the blob format itself is
+// never decoded. The PROOF line then ends ` merge=<GREEN|RED|UNREADABLE>`.
 const MANIFEST_PATH = /^tests\/(.+\/)?[^/]+\.test\.ts$/;
 type ProofVerdict = "GREEN" | "RED" | "UNREADABLE";
 const worst = (verdicts: readonly ProofVerdict[]): ProofVerdict =>
   verdicts.includes("UNREADABLE") ? "UNREADABLE" : verdicts.includes("RED") ? "RED" : "GREEN";
+
+function checkMerge(records: readonly LoadedRecord[], merge: LoadedRecord, blobDir: string): Defect[] {
+  const defects: Defect[] = [];
+  const key = (file: string, project: string) => `${file}\0${project}`;
+  const shards = records.filter(({ record }) => record.shard !== null);
+  const union = new Map(shards.flatMap(({ record }) => record.files.map(({ file, project }) => [key(file, project), { file, project }] as const)));
+  const seen = new Map<string, number>();
+  for (const { file, project, state } of merge.record.files) {
+    const k = key(file, project);
+    const n = (seen.get(k) ?? 0) + 1;
+    seen.set(k, n);
+    if (n === 2) defects.push({ kind: "merge-duplicate", file, project });
+    if (n === 1 && !union.has(k)) defects.push({ kind: "merge-unexpected", file, project });
+    if (!FINISHED.has(state)) defects.push({ kind: "unfinished", source: merge.source, file, project, state });
+  }
+  for (const [k, { file, project }] of union) if (!seen.has(k)) defects.push({ kind: "merge-missing", file, project });
+  const expectedBlobs = new Set(shards.flatMap(({ record }) => Array.from({ length: record.shard!.count }, (_, i) => `blob-${i + 1}.json`)));
+  const present = new Set<string>();
+  for (const entry of readdirSync(blobDir, { withFileTypes: true })) {
+    if (entry.isFile() && expectedBlobs.has(entry.name)) present.add(entry.name);
+    else defects.push({ kind: "blob-unexpected", blob: entry.name });
+  }
+  for (const blob of expectedBlobs) if (!present.has(blob)) defects.push({ kind: "blob-missing", blob });
+  return defects;
+}
 
 function commitManifest(repo: string, sha: string): Set<string> {
   const listed = spawnSync("git", ["-C", repo, "ls-tree", "-r", "-z", "--name-only", sha, "--", "tests"], { encoding: "utf8", maxBuffer: 1 << 28 });
@@ -625,17 +646,24 @@ const runProof = async (args: readonly string[]): Promise<number> => {
   const verdicts: ProofVerdict[] = [];
   let head: string | null = null;
   let repo: string | null = null;
+  let mergeRecord: string | null = null;
+  let blobs: string | null = null;
+  let usage = false;
   const dirs: string[] = [];
   for (let i = 0; i < args.length; i++) {
     const arg = args[i]!;
-    if (arg === "--head" || arg === "--repo") {
+    if (arg === "--head" || arg === "--repo" || arg === "--merge-record" || arg === "--blobs") {
       const value = args[++i];
-      if (value === undefined || value === "") { dirs.length = 0; head = null; break; }
-      if (arg === "--head") head = value; else repo = value;
+      const seen = arg === "--head" ? head : arg === "--repo" ? repo : arg === "--merge-record" ? mergeRecord : blobs;
+      if (value === undefined || value === "" || seen !== null) { usage = true; break; }
+      if (arg === "--head") head = value;
+      else if (arg === "--repo") repo = value;
+      else if (arg === "--merge-record") mergeRecord = value;
+      else blobs = value;
     } else dirs.push(arg);
   }
-  if (head === null || !/^[0-9a-f]{40}$/.test(head) || repo === null || dirs.length === 0) {
-    console.error("usage: proof --head <40-hex sha> --repo <git dir> <dir>...");
+  if (usage || head === null || !/^[0-9a-f]{40}$/.test(head) || repo === null || dirs.length === 0 || (mergeRecord === null) !== (blobs === null)) {
+    console.error("usage: proof --head <40-hex sha> --repo <git dir> [--merge-record <file> --blobs <dir>] <dir>...");
     await emit(["PROOF_RUN verdict=UNREADABLE"]);
     return 2;
   }
@@ -677,11 +705,26 @@ const runProof = async (args: readonly string[]): Promise<number> => {
       defects.push({ dir, kind: "floors-unreadable", error: message(error) });
     }
     if (floors === "RED") defects.push({ dir, kind: "floors-red" });
+    let merge: ProofVerdict | null = null;
+    if (mergeRecord !== null && blobs !== null) {
+      merge = "UNREADABLE";
+      try {
+        const merged = { source: mergeRecord, record: loadRecord(mergeRecord) };
+        if (merged.record.head !== head) defects.push({ dir, kind: "wrong-head", source: mergeRecord, head: merged.record.head, expected: head });
+        else if (record.readable) {
+          const mergeDefects = checkMerge(record.records, merged, blobs);
+          for (const defect of mergeDefects) defects.push({ dir, ...defect });
+          merge = mergeDefects.length > 0 ? "RED" : "GREEN";
+        }
+      } catch (error) {
+        defects.push({ dir, kind: "merge-unreadable", error: message(error) });
+      }
+    }
     const recordProof: ProofVerdict = record.verdict === "UNREADABLE" ? "UNREADABLE" : record.verdict === "RED" ? "RED" : "GREEN";
-    const verdict = worst([recordProof, set, floors]);
+    const verdict = worst([recordProof, set, floors, ...(merge === null ? [] : [merge])]);
     verdicts.push(verdict);
     lines.push(...defects.map((defect) => `PROOF_DEFECT ${jsonLine(defect)}`).sort());
-    lines.push(`PROOF dir=${dir} verdict=${verdict} head=${head} expected=${expected} actual=${actual} records=${names.length} record=${record.verdict} floors=${floors}`);
+    lines.push(`PROOF dir=${dir} verdict=${verdict} head=${head} expected=${expected} actual=${actual} records=${names.length} record=${record.verdict} floors=${floors}${merge === null ? "" : ` merge=${merge}`}`);
   }
   const run = worst(verdicts);
   await emit([...lines, `PROOF_RUN verdict=${run}`]);

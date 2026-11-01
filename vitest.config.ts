@@ -125,7 +125,17 @@ const ciRecordValue = process.env[CI_RECORD_ENV];
 delete process.env[CI_RECORD_ENV];
 const ciRecordPath = ciRecordValue ? resolve(ciRecordValue) : undefined;
 
-export const createVitestConfig = (forkCapValue: string | undefined, lean = leanCiGuard(), record = ciRecordPath) => defineConfig({
+// v2.8.2 T7 (ANL-022 §7.4, from 2.7.8 T5): TICKMARKR_CI_COVERAGE_BLOB=<path> marks ONE shard of a coverage run, read
+// once and deleted like the record variable. It adds Vitest's blob reporter (the shard's results and coverage map go to
+// <path>) and clears the thresholds: a partial map checks no floor. The per-OS `vitest run --merge-reports=<dir>
+// --coverage` over every shard's blob writes the merged summary the floors step (`cli.ts floors`) decides. Vitest
+// refuses to merge with a blob reporter configured, so the variable leaked into the merge fails it.
+export const CI_COVERAGE_BLOB_ENV = "TICKMARKR_CI_COVERAGE_BLOB";
+const ciBlobValue = process.env[CI_COVERAGE_BLOB_ENV];
+delete process.env[CI_COVERAGE_BLOB_ENV];
+const ciBlobPath = ciBlobValue ? resolve(ciBlobValue) : undefined;
+
+export const createVitestConfig = (forkCapValue: string | undefined, lean = leanCiGuard(), record = ciRecordPath, blob = ciBlobPath) => defineConfig({
   cacheDir: worktreeVitestCache(process.cwd(), process.env[VITEST_CACHE_ENV]),
   test: {
     setupFiles: ["tests/setup.ts"], // v1.51 T2: scrub leaked TICKMARKR_QUALITY/NO_EXPLORE (gate hermeticity)
@@ -147,8 +157,14 @@ export const createVitestConfig = (forkCapValue: string | undefined, lean = lean
     // local runs keep full reporters. Env-only delta: run commands and the ci-platform pin
     // stay byte-stable.
     ...(lean ? { reporters: ["dot" as const] } : {}),
-    // v2.7.8 T2: the record reporter joins the reporters the run would otherwise use, never replaces them
-    ...(record ? { reporters: [lean ? "dot" as const : "default" as const, [CI_RECORD_REPORTER, { outputFile: record }] as const] } : {}),
+    // v2.7.8 T2 / v2.8.2 T7: the record and blob reporters join the reporters the run would otherwise use, never replace them
+    ...(record || blob ? {
+      reporters: [
+        lean ? "dot" as const : "default" as const,
+        ...(record ? [[CI_RECORD_REPORTER, { outputFile: record }] as const] : []),
+        ...(blob ? [["blob", { outputFile: blob }] as const] : []),
+      ],
+    } : {}),
     // Each project owns a Vite server; set its cacheDir explicitly as well as the root.
     // Leave test.cache untouched so --no-cache keeps disabling result persistence.
     projects: [
@@ -215,6 +231,10 @@ export const createVitestConfig = (forkCapValue: string | undefined, lean = lean
     ],
     coverage: {
       provider: "v8",
+      // v2.8.4 T1 (D-2008): each run converts V8 coverage through the AST, so a sharded merge counts every branch as the
+      // serial run does — default remapping credited phantom branch hits once shards merged. The option is experimental
+      // in Vitest 3, so package.json pins vitest and @vitest/coverage-v8 to exactly 3.2.7.
+      experimentalAstAwareRemapping: true,
       // GO-10: json-summary alone under the CI guard — thresholds enforce off the coverage map
       // regardless of reporter; text/html rendering is pure host-side crunch the hosted runner (4 cores Linux,
       // 3 macOS) pays while the worker's last onTaskUpdate waits.
@@ -240,6 +260,8 @@ export const createVitestConfig = (forkCapValue: string | undefined, lean = lean
         "src/drivers/**": { lines: 82, branches: 80 },  // measured 93.33 / 88.88 on 2026-07-10 (types.ts excluded)
         "src/cli/**": { lines: 85, branches: 75 },      // measured 94.82 / 81.52 on 2026-07-10 (post-backfill)
       },
+      // v2.8.2 T7: a shard's partial map checks no floor; the floors step over the merge of every blob decides them
+      ...(blob ? { thresholds: undefined } : {}),
     },
   },
 });

@@ -68,46 +68,65 @@ async function run(root: string, serial: readonly string[], sharded: readonly st
     code: result.status,
     verdict: verdict[0]!,
     defects: lines.filter((line) => line.startsWith("PARITY_DEFECT ")).map((line) => readJson(line.slice(14)) as { kind: string; form: string }),
-    notes: lines.filter((line) => line.startsWith("PARITY_COVERAGE_NOTE ")).map((line) => readJson(line.slice(21)) as { file: string; metric: string; serial: number; sharded: number }),
+    // every line but the verdict is a defect: parity prints no note a difference could hide in
+    others: lines.filter((line) => line !== verdict[0] && !line.startsWith("PARITY_DEFECT ")),
   };
 }
 
-test("test: parity reads GREEN for two complete forms on HEAD given in any order with equal source sets and totals and every floor glob within 0.1 point, printing a covered difference only as a note, versus a passed-against-failed file reading RED", async () => {
+/** The floors command's own lines over one summary, from the fixture's copy of the production configuration. */
+function floorsOf(root: string, summary: string): string {
+  const result = spawnSync(process.execPath, ["--import", "tsx", cli, "floors", summary], {
+    cwd: root, timeout: 60_000, encoding: "utf8", env: { ...process.env, NO_COLOR: "1", FORCE_COLOR: "0" },
+  });
+  expect(result.error, result.stderr).toBeUndefined();
+  expect(result.status, result.stdout).toBe(0);
+  return result.stdout;
+}
+
+test("test: parity reads GREEN for two complete forms on HEAD given in any order with equal source sets and every file's covered and total counts equal, printing nothing but its verdict, versus a passed-against-failed file or one file's covered lines ten apart reading RED", { timeout: 120_000 }, async () => {
   const f = fixture();
   const serial = [f.record([f.rows()[1]!], "serial-b.json"), f.record([f.rows()[0]!], "serial-a.json")];
   const sharded = [f.record([f.rows()[0]!], "sharded-a.json"), f.record([f.rows()[1]!], "sharded-b.json")];
-  const a = f.base();
-  const b = f.base();
-  b[join(f.root, "src/config/a.ts")]!.lines.covered += 10;
-  const serialSummary = f.summary(a, "serial-summary.json");
-  const shardSummary = f.summary(b, "sharded-summary.json");
+  const serialSummary = f.summary(f.base(), "serial-summary.json");
+  const shardSummary = f.summary(f.base(), "sharded-summary.json");
   const green = await run(f.root, serial, sharded, serialSummary, shardSummary);
   expect(green.code).toBe(0);
   expect(green.verdict).toBe("PARITY verdict=GREEN files=2 sources=9 globs=6 defects=0");
   expect(green.defects).toEqual([]);
-  expect(green.notes).toEqual([{ file: "src/config/a.ts", metric: "lines", serial: 9000, sharded: 9010 }]);
+  expect(green.others).toEqual([]);
+  // the covered difference 2.8.2's parity printed as a note is a defect now
+  const b = f.base();
+  b[join(f.root, "src/config/a.ts")]!.lines.covered += 10;
+  const covered = await run(f.root, serial, sharded, serialSummary, f.summary(b, "covered.json"));
+  expect(covered.code).toBe(1);
+  expect(covered.verdict).toBe("PARITY verdict=RED files=2 sources=9 globs=6 defects=1");
+  expect(covered.defects).toEqual([{ form: "sharded", kind: "covered-differs", file: "src/config/a.ts", metric: "lines", serial: 9000, sharded: 9010 }]);
+  expect(covered.others).toEqual([]);
   const failed = f.record([{ ...f.rows()[0]!, state: "failed" }], "failed.json");
   const red = await run(f.root, serial, [failed, sharded[1]!], serialSummary, shardSummary);
   expect(red.code).toBe(1);
   expect(red.defects).toContainEqual(expect.objectContaining({ kind: "state-differs", form: "sharded", file: files[0] }));
 });
 
-test("test: a floored metric exactly 0.1 point apart passes while 0.11 apart reds and a glob matching no file or summing to zero statements in either summary reds versus a tolerance applied to the overall total alone", async () => {
+test("test: a covered difference offset by the opposite difference in another floor's file so both forms' overall totals are equal reds on both files, one covered line no 0.1-point rounding shows reds, and a glob matching no file or summing to zero statements in either summary reds, versus a tolerance applied to the glob percentages or the overall total alone", { timeout: 180_000 }, async () => {
   const f = fixture();
   const r = f.record(f.rows(), "record.json");
-  const a = f.base();
-  const b = f.base();
-  const serialSummary = f.summary(a, "a.json");
+  const serialSummary = f.summary(f.base(), "a.json");
   const config = join(f.root, "src/config/a.ts");
-  b[config]!.lines.covered += 10;
-  expect((await run(f.root, [r], [r], serialSummary, f.summary(b, "b.json"))).code).toBe(0);
-  b[config]!.lines.covered += 1;
-  const eleven = await run(f.root, [r], [r], serialSummary, f.summary(b, "b.json"));
-  expect(eleven.code).toBe(1);
-  expect(eleven.defects).toContainEqual(expect.objectContaining({ kind: "pct-differs", glob: "src/config/**", metric: "lines" }));
-  // Offset the overall change in a different floor: the total is equal, but each glob still differs.
-  b[join(f.root, "src/compile/a.ts")]!.lines.covered -= 11;
-  expect((await run(f.root, [r], [r], serialSummary, f.summary(b, "b.json"))).defects.filter((d) => d.kind === "pct-differs")).toHaveLength(2);
+  const offset = f.base();
+  offset[config]!.lines.covered += 10;
+  offset[join(f.root, "src/compile/a.ts")]!.lines.covered -= 10;
+  const both = await run(f.root, [r], [r], serialSummary, f.summary(offset, "b.json"));
+  expect(both.code).toBe(1);
+  expect(both.defects).toEqual([
+    { form: "sharded", kind: "covered-differs", file: "src/compile/a.ts", metric: "lines", serial: 9000, sharded: 8990 },
+    { form: "sharded", kind: "covered-differs", file: "src/config/a.ts", metric: "lines", serial: 9000, sharded: 9010 },
+  ]);
+  const one = f.base();
+  one[config]!.lines.covered += 1;
+  const oneLine = await run(f.root, [r], [r], serialSummary, f.summary(one, "b.json"));
+  expect(oneLine.code).toBe(1);
+  expect(oneLine.defects).toEqual([{ form: "sharded", kind: "covered-differs", file: "src/config/a.ts", metric: "lines", serial: 9000, sharded: 9001 }]);
   const absent = f.base();
   delete absent[config];
   const noFile = await run(f.root, [r], [r], serialSummary, f.summary(absent, "b.json"));
@@ -116,6 +135,35 @@ test("test: a floored metric exactly 0.1 point apart passes while 0.11 apart red
   zero[config]!.statements = { total: 0, covered: 0 };
   const zeroStatements = await run(f.root, [r], [r], serialSummary, f.summary(zero, "b.json"));
   expect(zeroStatements.defects).toContainEqual(expect.objectContaining({ kind: "zero-statements", form: "sharded", glob: "src/config/**" }));
+  const zeroSerial = await run(f.root, [r], [r], f.summary(zero, "c.json"), serialSummary);
+  expect(zeroSerial.defects).toContainEqual(expect.objectContaining({ kind: "zero-statements", form: "serial", glob: "src/config/**" }));
+});
+
+test("test: parity reads RED naming the file and the metric when one file's covered count or total count of lines, statements, functions or branches differs by one, each of the eight changed alone, a statements covered difference no floor percentage shows included, while identical forms read GREEN, so a parity that forgives a covered difference, compares a subset of the four metrics or keeps a tolerance fails", { timeout: 300_000 }, async () => {
+  const f = fixture();
+  const r = f.record(f.rows(), "record.json");
+  const serialSummary = f.summary(f.base(), "serial.json");
+  const identical = await run(f.root, [r], [r], serialSummary, f.summary(f.base(), "identical.json"));
+  expect(identical.code).toBe(0);
+  expect(identical.verdict).toBe("PARITY verdict=GREEN files=2 sources=9 globs=6 defects=0");
+  const file = "src/graph/a.ts";
+  for (const metric of ["lines", "statements", "functions", "branches"] as const) {
+    for (const count of ["covered", "total"] as const) {
+      const changed = f.base();
+      const counters = changed[join(f.root, file)]![metric];
+      changed[join(f.root, file)]![metric] = { ...counters, [count]: counters[count] + 1 };
+      const shardedSummary = f.summary(changed, `${metric}-${count}.json`);
+      const result = await run(f.root, [r], [r], serialSummary, shardedSummary);
+      expect(result.code, `${metric} ${count}`).toBe(1);
+      expect(result.verdict, `${metric} ${count}`).toBe("PARITY verdict=RED files=2 sources=9 globs=6 defects=1");
+      expect(result.defects, `${metric} ${count}`).toEqual([{
+        form: "sharded", kind: count === "covered" ? "covered-differs" : "totals-differ", file, metric,
+        serial: counters[count], sharded: counters[count] + 1,
+      }]);
+      // no floor names statements, so the floors command reads that form exactly as the serial one
+      if (metric === "statements" && count === "covered") expect(floorsOf(f.root, shardedSummary)).toBe(floorsOf(f.root, serialSummary));
+    }
+  }
 });
 
 test("test: the same glob percentages over a different source file set or over equal sets with one source's totals changed read RED versus equal sets and equal totals reading GREEN", async () => {

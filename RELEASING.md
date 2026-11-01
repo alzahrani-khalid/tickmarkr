@@ -94,9 +94,17 @@ Per release:
    ```
 
    Wait for the [`CI (public)`](.github/workflows/ci.public.yml) workflow run triggered by that exact mirror `main`
-   push to reach **run-end**. Its `test` and `test-macos` jobs run the parallel `suite` project under
-   coverage and the single-fork projects `ci.public.yml` runs by name independently, write the floors
-   sidecar, assert the collected test-file set in-job, and upload each job's proof group as `proof-<job>`.
+   push to reach **run-end**. The run is the **twelve-job sharded inventory**, per OS (`ubuntu-latest` and
+   `macos-latest`) six jobs, every one a release job (no quarantine lane; a red in any job is a release red):
+   four `suite <os> k/4` jobs, each one duration-balanced shard (`--shard=k/4`) of the parallel `suite`
+   project under coverage, held to its plan over the committed `scripts/ci/durations.json` as a set, uploading
+   its record and coverage blob as `proof-<os>-suite-<k>`; one `single-fork <os>` job running
+   the single-fork projects `ci.public.yml` runs by name, uploading `proof-<os>-single-fork`; and one `aggregate <os>` job that
+   merges that OS's four blobs into one coverage map, writes the floors sidecar, checks the OS's proof group
+   in-job and uploads its merge record (under `merge/`) and the sidecar as `proof-<os>-aggregate`. The shard
+   plan reads only the committed durations table, so a refresh is a data-only commit **between** releases,
+   never part of one: `npx tsx scripts/ci/cli.ts durations <record>...` over a graded sharded run's
+   `proof-<os>-suite-*` records prints the new table (an unreadable record prints nothing and exits 2).
 4. At run-end grade that run against `MIRROR_COMMIT`, the mirror's `HEAD` — never the badge and never an
    in-progress run — with the shipped tri-state grader, giving it the mirror clone that holds the commit:
 
@@ -106,11 +114,13 @@ Per release:
 
    The grader is bound to that head: a run of any other commit, or one not yet at run-end, reads
    `UNREADABLE` (exit 2) before anything is downloaded — a hard stop, not green. It reads each job's step
-   outcomes and conclusions from `gh run view --json`, downloads the job's `proof-<job>` artifact (an
-   authenticated `gh` is required; an expired or missing artifact reads `UNREADABLE`) and recomputes it with
-   `scripts/ci/cli.ts proof`: the Vitest records CLEAN or RPC-only at that head, every test file the commit
-   tracks recorded exactly once and finished, and the floors sidecar GREEN. No job log text is read and no
-   count is derived by hand. `RED` exits 1 and `INFRA_KILLED` (a cancelled job) exits 3; neither is green.
+   outcomes and conclusions from `gh run view --json`, downloads each OS's six `proof-<os>-<part>` artifacts (an
+   authenticated `gh` is required; an expired or missing artifact reads `UNREADABLE`) and recomputes that OS's
+   proof group — the four shard records and the single-fork record, never the aggregate's merge record — with
+   `scripts/ci/cli.ts proof --merge-record <file> --blobs <dir>`: the Vitest records CLEAN or RPC-only at that
+   head, every test file the commit tracks recorded exactly once and finished, the floors sidecar GREEN, the
+   merge record equal to the shards' union and exactly `blob-1.json` to `blob-4.json`. A missing, duplicated or
+   unknown job is `UNREADABLE` by the inventory. No job log text is read and no count is derived by hand. `RED` exits 1 and `INFRA_KILLED` (a cancelled job) exits 3; neither is green.
    This is the set-checked full-suite proof for the exported tree; the Release workflow (step 5) grades the
    same run again before it publishes.
 
@@ -123,7 +133,7 @@ Per release:
    npx --no-install tsx scripts/ci/cli.ts release tag-absent /path/to/tickmarkr-public-mirror v2.14.0
    ```
 
-   Only after the grader prints `VERDICT rc=0` (GREEN for both jobs), tag `MIRROR_COMMIT` in the **public**
+   Only after the grader prints `VERDICT rc=0` (GREEN for every job of the inventory), tag `MIRROR_COMMIT` in the **public**
    mirror and push the tag. The two release checks above must also have printed `GREEN` immediately
    before this act:
 
