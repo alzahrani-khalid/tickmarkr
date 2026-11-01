@@ -392,67 +392,103 @@ const workflowPaths = (c: Candidate): string[] => c.paths.filter((p) => p.starts
 const extractScriptRefs = (text: string): string[] => text.match(/(?<![\w./-])(?:[\w.-]+\/)*scripts\/[\w./-]*\w/g) ?? [];
 const NOREPLY_IDENTITY = "53393181+alzahrani-khalid@users.noreply.github.com";
 
-// OBS-1184: every public-CI Vitest step runs through the wrapper (since v2.8.2 T1 it decides from the run's own
-// record, `<log>.record.json`, not the log). v2.8.2 T2 (ANL-022 §7.2a): the set step reads exactly the records those
-// steps write, no count step remains, and the last step uploads the records' directory as proof-<job>. What the set
-// step reads is what bash expands its arguments to in a scratch runner temp holding every file the job's steps
-// write there (the logs, their records, the floors sidecar). Returns the violations plus each wrapped command as
-// "<job>: <command>".
+// OBS-1184: every public-CI Vitest test step runs through the wrapper (since v2.8.2 T1 it decides from the run's own
+// record, `<log>.record.json`, not the log). v2.8.2 T7 (ANL-022 §7.4) — the sharded form: every job uploads its
+// $RUNNER_TEMP/proof/ as proof-<os>-<part> last, under always(), with no count step and no serial set step; the
+// aggregate downloads its OS's groups (`proof-<os>-*`, merged) into $RUNNER_TEMP/group, replays the shards' blobs with
+// its record under $RUNNER_TEMP/proof/merge/ — the one Vitest step outside the wrapper, a replay whose record must never
+// sit among the group's — and its proof check reads exactly that group, that merge record and group/blobs. What the
+// check reads is what bash expands its arguments to in a scratch runner temp after every job of one OS wrote, uploaded
+// and the aggregate downloaded. Returns the violations plus each wrapped command as "<job>: <command>".
 const CI_WRAPPER = "scripts/run-ci-vitest.sh";
-const SET_STEP = /^npx tsx scripts\/ci\/cli\.ts assert (.+)$/;
-type PublicStep = { run?: string; uses?: string; if?: string; with?: Record<string, string> };
+type PublicStep = { name?: string; run?: string; uses?: string; if?: string; env?: Record<string, string>; with?: Record<string, string | boolean> };
+type PublicJob = { steps?: PublicStep[]; strategy?: { matrix?: Record<string, unknown[]> } };
 function publicCiShape(workflow: string): { violations: string[]; wrapped: string[] } {
-  const jobs = (parseYaml(workflow) as { jobs?: Record<string, { steps?: PublicStep[] }> }).jobs ?? {};
+  const jobs = (parseYaml(workflow) as { jobs?: Record<string, PublicJob> }).jobs ?? {};
   const violations: string[] = [];
   const wrapped: string[] = [];
   const runnerTemp = realpathSync(mkdtempSync(join(tmpdir(), "tickmarkr-ci-shape-")));
-  // bash's own expansion of shell words under RUNNER_TEMP=<scratch>, one path per line
-  const expand = (words: string): string[] => {
-    const run = spawnSync("bash", ["-c", `printf '%s\\n' ${words}`], { cwd: runnerTemp, encoding: "utf8", env: { ...process.env, RUNNER_TEMP: runnerTemp } });
+  // bash's own expansion of shell words under RUNNER_TEMP=<runner>, one path per line
+  const expand = (words: string, runner: string): string[] => {
+    const run = spawnSync("bash", ["-c", `printf '%s\\n' ${words}`], { cwd: runner, encoding: "utf8", env: { ...process.env, RUNNER_TEMP: runner } });
     if (run.status !== 0) throw new Error(`bash could not expand ${words}: ${run.stderr}`);
     return run.stdout.split("\n").filter((line) => line !== "");
   };
+  // one OS: every matrix row of every job with os ubuntu-latest, its expressions rendered
+  const render = (text: string, vars: Record<string, string>, runner: string) => text
+    .replace(/\$\{\{\s*matrix\.(\w+)\s*\}\}/g, (_, key: string) => vars[key] ?? `<matrix.${key}>`).replaceAll("${{ runner.temp }}", runner);
+  const uploads: { artifact: string; dir: string }[] = [];
+  let aggregate: { steps: PublicStep[]; vars: Record<string, string>; runner: string } | undefined;
   try {
-    for (const [job, { steps = [] }] of Object.entries(jobs)) {
-      const logs: string[] = [];
-      const sets: string[] = [];
-      const written: string[] = [];
-      for (const run of steps.map((step) => (step.run ?? "").trim())) {
-        if (/\bvitest\b|\bnpm (?:run )?test\b/.test(run)) {
-          const m = /^bash scripts\/run-ci-vitest\.sh ("[^"]+") ([^\n]+)$/.exec(run);
-          if (m) {
-            logs.push(m[1]);
-            wrapped.push(`${job}: ${m[2]}`);
-          } else violations.push(`${job}: Vitest step bypasses the record wrapper: ${run}`);
+    for (const [job, { steps = [], strategy }] of Object.entries(jobs)) {
+      let rows: Record<string, string>[] = [{}];
+      for (const [axis, values] of Object.entries(strategy?.matrix ?? {})) rows = rows.flatMap((row) => values.map((value) => ({ ...row, [axis]: String(value) })));
+      for (const vars of rows.filter((row) => (row.os ?? "ubuntu-latest") === "ubuntu-latest")) {
+        const runner = join(runnerTemp, `${job}-${Object.values(vars).join("-")}`);
+        mkdirSync(runner, { recursive: true });
+        for (const step of steps) {
+          const run = (step.run ?? "").trim();
+          if (/\bvitest\b|\bnpm (?:run )?test\b/.test(run)) {
+            const m = /^bash scripts\/run-ci-vitest\.sh ("[^"]+") ([^\n]+)$/.exec(run);
+            const replay = /^mkdir -p "\$RUNNER_TEMP\/proof\/merge" && TICKMARKR_CI_RECORD="(\$RUNNER_TEMP\/proof\/merge\/[^"/]+)" npx vitest run --merge-reports=\S+ --coverage [^\n]*$/.exec(run);
+            if (m) {
+              if (!wrapped.includes(`${job}: ${m[2]}`)) wrapped.push(`${job}: ${m[2]}`);
+              for (const log of expand(render(m[1]!, vars, runner), runner)) {
+                mkdirSync(join(log, ".."), { recursive: true });
+                writeFileSync(log, "");
+                writeFileSync(`${log}.record.json`, "");
+              }
+            } else if (!replay) violations.push(`${job}: Vitest step bypasses the record wrapper: ${run}`);
+          }
+          if (/assert-test-file-count|Assert collected test-file count/.test(run)) violations.push(`${job}: keeps the old count step: ${run}`);
+          if (/\bcli\.ts assert\b/.test(run)) violations.push(`${job}: keeps the serial set step: ${run}`);
+          for (const value of Object.values(step.env ?? {})) {
+            if (/\bblob-/.test(value)) {
+              const blob = render(value, vars, runner);
+              mkdirSync(join(blob, ".."), { recursive: true });
+              writeFileSync(blob, "");
+            }
+          }
         }
-        if (/assert-test-file-count|Assert collected test-file count/.test(run)) violations.push(`${job}: keeps the old count step: ${run}`);
-        const out = /--out ("[^"]+"|\S+)/.exec(run);
-        if (out) written.push(out[1]);
-        const set = SET_STEP.exec(run);
-        if (set) sets.push(set[1]);
+        const upload = steps.at(-1);
+        const artifact = render(String(upload?.with?.name ?? ""), vars, runner);
+        if (upload?.uses !== "actions/upload-artifact@v4" || upload.if !== "always()" || upload.with?.path !== "${{ runner.temp }}/proof/"
+          || !/^proof-ubuntu-latest-[\w-]+$/.test(artifact) || uploads.some((other) => other.artifact === artifact)) {
+          violations.push(`${job}: the last step must upload $RUNNER_TEMP/proof/ as proof-<os>-<part> under always(): ${JSON.stringify(upload)}`);
+        }
+        if (job === "aggregate") aggregate = { steps, vars, runner };
+        else uploads.push({ artifact, dir: join(runner, "proof") });
       }
-      if (logs.length === 0) continue;
-      if (sets.length !== 1) {
-        violations.push(`${job}: ${sets.length} set steps, expected exactly one`);
-        continue;
+    }
+    if (aggregate === undefined) violations.push("no aggregate job");
+    else {
+      const { steps, vars, runner } = aggregate;
+      // the download: every group of this OS's other jobs, merged into one directory
+      const download = steps.find((step) => step.uses === "actions/download-artifact@v4");
+      const pattern = new RegExp(`^${render(String(download?.with?.pattern ?? ""), vars, runner).replace(/[.+?^${}()|[\]\\]/g, "\\$&").replaceAll("*", ".*")}$`);
+      const into = render(String(download?.with?.path ?? ""), vars, runner);
+      if (download?.with?.["merge-multiple"] !== true || uploads.length === 0 || !uploads.every(({ artifact }) => pattern.test(artifact))) {
+        violations.push(`aggregate: the download must merge every group of its OS: ${JSON.stringify(download)}`);
       }
-      // every file the job's steps write under the runner temp exists before the set step's words expand
-      const logPaths = expand(logs.join(" "));
-      const records = logPaths.map((log) => `${log}.record.json`);
-      for (const path of [...logPaths, ...records, ...expand(written.join(" "))]) {
+      for (const { artifact, dir } of uploads) if (pattern.test(artifact)) cpSync(dir, into, { recursive: true });
+      const replayed = steps.map((step) => /TICKMARKR_CI_RECORD="([^"]+)"/.exec(step.run ?? "")?.[1]).filter((path) => path !== undefined).flatMap((path) => expand(`"${path}"`, runner));
+      for (const path of replayed) {
         mkdirSync(join(path, ".."), { recursive: true });
         writeFileSync(path, "");
       }
-      const read = expand(sets[0]);
-      if ([...read].sort().join("\n") !== [...records].sort().join("\n")) {
-        violations.push(`${job}: set step reads [${read.join(", ")}] but the Vitest steps write [${records.join(", ")}]`);
-      }
-      const upload = steps.at(-1);
-      const proofDirs = new Set(records.map((record) => join(record, "..")));
-      const uploaded = (upload?.with?.path ?? "").replace("${{ runner.temp }}", runnerTemp).replace(/\/$/, "");
-      if (upload?.uses !== "actions/upload-artifact@v4" || upload.if !== "always()" || upload.with?.name !== "proof-${{ github.job }}"
-        || proofDirs.size !== 1 || !proofDirs.has(uploaded)) {
-        violations.push(`${job}: the last step must upload the records' directory as proof-<job> under always(): ${JSON.stringify(upload)}`);
+      const checks = steps.map((step) => /\bcli\.ts proof (.+)$/.exec((step.run ?? "").trim())?.[1]).filter((args) => args !== undefined);
+      if (checks.length !== 1) violations.push(`aggregate: ${checks.length} proof checks, expected exactly one`);
+      else {
+        const words = expand(checks[0]!.replace(/"\$GITHUB_SHA"/, "sha"), runner);
+        const flag = (name: string) => words[words.indexOf(name) + 1];
+        const dirs = words.filter((word, i) => i > 0 && !words[i - 1]!.startsWith("--") && !word.startsWith("--"));
+        const read = dirs.flatMap((dir) => (existsSync(dir) ? readdirSync(dir) : []).filter((name) => name.endsWith(".record.json")).map((name) => join(dir, name)));
+        const written = uploads.flatMap(({ dir }) => readdirSync(dir).filter((name) => name.endsWith(".record.json")).map((name) => join(into, name)));
+        if ([...read].sort().join("\n") !== [...written].sort().join("\n")) {
+          violations.push(`aggregate: proof check reads [${read.join(", ")}] but the shard and single-fork jobs upload [${written.join(", ")}]`);
+        }
+        if (replayed.length !== 1 || flag("--merge-record") !== replayed[0]) violations.push(`aggregate: proof check's merge record ${flag("--merge-record")} is not the replay's [${replayed.join(", ")}]`);
+        if (flag("--blobs") !== join(into, "blobs") || readdirSync(join(into, "blobs")).length === 0) violations.push(`aggregate: proof check's blobs ${flag("--blobs")} are not the downloaded blobs`);
       }
     }
   } finally {
@@ -505,42 +541,43 @@ describe("export workflow correctness — the exported CI stands alone", () => {
       .toEqual(["scripts/grade-ci.sh"]);
   });
 
-  test("test: the exported public workflow's set assertion reads exactly the records its two wrapped Vitest steps write, so a set step reading one record fewer or a workflow that keeps the old count step fails (W-F2)", { timeout: 180_000 }, () => {
+  test("test: the exported public workflow's proof check reads exactly the records its shard and single-fork jobs upload, beside the replay record its aggregate writes outside that group, so a check reading another directory, a replay record counted into the group, a test step outside the wrapper or a workflow that keeps the old count step fails (W-F2)", { timeout: 180_000 }, () => {
     const c = getCandidate();
     const wf = ".github/workflows/ci.public.yml";
     for (const path of [wf, CI_WRAPPER, "scripts/ci/cli.ts"]) expect(c.paths, path).toContain(path);
     const workflow = readFileSync(join(c.root, wf), "utf8");
     const { violations, wrapped } = publicCiShape(workflow);
     expect(violations).toEqual([]);
-    for (const job of ["test", "test-macos"]) {
-      expect(wrapped, job).toContain(`${job}: npm run test:coverage -- --project suite`);
-      expect(wrapped.filter((w) => w.startsWith(`${job}: npx vitest run `)), job).toHaveLength(1);
-    }
+    expect(wrapped.sort()).toEqual([
+      "single-fork: npx vitest run --project sync-heavy --project keys-ledger --project built-cli --project signal-reaper",
+      "suite: npm run test:coverage -- --project suite --shard=${{ matrix.shard }}/4",
+    ]);
     expect(workflow).not.toMatch(/assert-test-file-count/);
 
-    // the guard reds each regression it exists for, each in one job of the exported text
+    // the guard reds each regression it exists for, each in the exported text
     const regress = (from: string, to: string): string => {
       const changed = workflow.replace(from, to);
       expect(changed, from).not.toBe(workflow);
       return publicCiShape(changed).violations.join("\n");
     };
-    expect(regress(`bash ${CI_WRAPPER} "$RUNNER_TEMP/proof/tickmarkr-test-output.log" `, "")).toMatch(/^test: Vitest step bypasses the record wrapper/m);
-    // one record fewer: the set step names only the coverage step's record
-    expect(regress("assert $RUNNER_TEMP/proof/*.record.json", "assert $RUNNER_TEMP/proof/tickmarkr-test-output.log.record.json"))
-      .toMatch(/^test: set step reads \[[^,\]]+\] but the Vitest steps write \[[^,\]]+, [^,\]]+\]$/m);
-    // a wider glob reads the logs and the floors sidecar as well
-    expect(regress("assert $RUNNER_TEMP/proof/*.record.json", "assert $RUNNER_TEMP/proof/*")).toMatch(/^test: set step reads /m);
-    // the old count step kept beside the set step, or in its place
+    expect(regress(`bash ${CI_WRAPPER} "$RUNNER_TEMP/proof/suite-\${{ matrix.shard }}.log" `, "")).toMatch(/^suite: Vitest step bypasses the record wrapper/m);
+    // the check reads another directory: the aggregate's own proof directory instead of the downloaded group
+    expect(regress('--blobs "$RUNNER_TEMP/group/blobs" "$RUNNER_TEMP/group"', '--blobs "$RUNNER_TEMP/group/blobs" "$RUNNER_TEMP/proof"'))
+      .toMatch(/^aggregate: proof check reads \[[^\]]*\] but the shard and single-fork jobs upload \[[^,\]]+(, [^,\]]+){4}\]$/m);
+    // the replay record counted into the group: written at its top level, the check reads it beside the originals
+    const counted = regress('mkdir -p "$RUNNER_TEMP/proof/merge" && TICKMARKR_CI_RECORD="$RUNNER_TEMP/proof/merge/merge.record.json"',
+      'mkdir -p "$RUNNER_TEMP/proof/merge" && TICKMARKR_CI_RECORD="$RUNNER_TEMP/group/merge.record.json"');
+    expect(counted).toMatch(/^aggregate: Vitest step bypasses the record wrapper/m);
+    expect(counted).toMatch(/^aggregate: proof check reads \[[^\]]*merge\.record\.json[^\]]*\]/m);
+    // the old count step kept beside the proof check, or the serial set step in its place
     const countStep = '      - name: Assert collected test-file count\n        if: always()\n'
-      + '        run: sh scripts/assert-test-file-count.sh "$RUNNER_TEMP/proof/tickmarkr-test-output.log" "$RUNNER_TEMP/proof/tickmarkr-test-output-singlefork.log"\n';
-    const setStep = "      - name: Assert collected test-file set\n";
-    expect(regress(setStep, countStep + setStep)).toMatch(/^test: keeps the old count step/m);
-    const replaced = regress("        run: npx tsx scripts/ci/cli.ts assert $RUNNER_TEMP/proof/*.record.json\n",
-      '        run: sh scripts/assert-test-file-count.sh "$RUNNER_TEMP/proof/tickmarkr-test-output.log" "$RUNNER_TEMP/proof/tickmarkr-test-output-singlefork.log"\n');
-    expect(replaced).toMatch(/^test: keeps the old count step/m);
-    expect(replaced).toMatch(/^test: 0 set steps, expected exactly one$/m);
-    // the proof group never uploaded
-    expect(regress("          name: proof-${{ github.job }}\n", "          name: proof\n")).toMatch(/^test: the last step must upload/m);
+      + '        run: sh scripts/assert-test-file-count.sh "$RUNNER_TEMP/proof/suite-1.log"\n';
+    const checkStep = "      - name: Check the proof group of this OS\n";
+    expect(regress(checkStep, countStep + checkStep)).toMatch(/^aggregate: keeps the old count step/m);
+    expect(regress(checkStep, '      - name: Assert collected test-file set\n        run: npx tsx scripts/ci/cli.ts assert $RUNNER_TEMP/group/*.record.json\n' + checkStep))
+      .toMatch(/^aggregate: keeps the serial set step/m);
+    // a proof group never uploaded under its OS's name
+    expect(regress("          name: proof-${{ matrix.os }}-single-fork\n", "          name: proof-${{ github.job }}\n")).toMatch(/^single-fork: the last step must upload/m);
 
     // v2.8.2 T1: the exported wrapper decides from the run's own record through the exported record tooling
     // (scripts/ci) — a complete RPC-only exit 1 becomes 0 — while the same wrapper without that tooling beside it

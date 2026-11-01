@@ -918,9 +918,9 @@ seat; never close the replacement by title, never rewrite ownership from a title
    - **GRADE PUBLIC CI FROM ITS RUN RECORD AND PROOF GROUPS AT RUN-END ONLY (law 48).** A badge is not
      the grade, and an in-progress run is never graded. At run-end execute
      `scripts/grade-ci.sh <run-id> <mirror HEAD sha> <mirror clone> <tag>` and require GREEN from every job
-     of the declared inventory it prints first — serial `test` and `test-macos`; a missing, duplicated or
-     unknown job reads UNREADABLE, never a skip, and a sharded run reads UNREADABLE until its proof-group
-     selection ships (ANL-022 §7.4). The grader is bound to the head: a run of any other commit reads
+     of the declared inventory it prints first — the sharded twelve, or serial `test` and `test-macos`; a missing, duplicated or
+     unknown job reads UNREADABLE, never a skip, and the sharded twelve grade job by job from each OS's six
+     proof groups (ANL-022 §7.4). The grader is bound to the head: a run of any other commit reads
      UNREADABLE before anything is downloaded. It reads GitHub's structured step outcomes and conclusions and
      recomputes each job's uploaded proof group (`proof-<job>`: the Vitest records and the floors sidecar)
      against the test files that commit tracks in the mirror clone — there is no count to derive, and no job

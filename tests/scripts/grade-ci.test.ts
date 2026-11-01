@@ -132,14 +132,10 @@ function recorded(files?: Parameters<typeof candidateCheckout>[1]) {
 const downloads = (calls: readonly string[]) => calls.filter((call) => call.startsWith("run download "));
 const logReads = (calls: readonly string[]) => calls.filter((call) => / --log( |$)| --job /.test(` ${call} `));
 
-/** The fixture run's declared steps, read from the parsed public workflow as GitHub names them. */
-function workflowSteps(job: string): string[] {
-  const workflow = parseYaml(readFileSync(join(ROOT, ".github/workflows/ci.public.yml"), "utf8")) as {
-    jobs: Record<string, { steps: { name?: string; run?: string; uses?: string }[] }>;
-  };
-  return workflow.jobs[job]!.steps.map((step) => step.name ?? `Run ${(step.run ?? step.uses ?? "").trim().split("\n")[0]}`);
-}
-const PLATFORM_STEP = /^(Set up job|Complete job|Post .+)$/;
+/** The public workflow's job ids, parsed. */
+const workflowJobIds = (): string[] => Object.keys((parseYaml(readFileSync(join(ROOT, ".github/workflows/ci.public.yml"), "utf8")) as {
+  jobs: Record<string, unknown>;
+}).jobs);
 
 /** The public CI wrapper over the coverage form's stand-in in a candidate tree whose suite project owns the ten
  * files the summaries count: the run writes `record` (none when null), prints the raw log and exits `status`. */
@@ -251,12 +247,11 @@ describe("grade-ci.sh recorded-run controls", () => {
     const green = recordedRun(c.head);
     const proofLine = (stdout: string, job: string) => new RegExp(`^${job}: steps=\\[[^\\]]*\\] proof=\\[(.*)\\]$`, "m").exec(stdout)?.[1] ?? "";
 
-    // G-P1: the recorded run is the public workflow's serial run — its declared steps are the workflow's own, as
-    // GitHub names them — and with every step success and both groups green it grades GREEN, job by job
-    for (const job of SERIAL) {
-      const listed = green.jobs.find((entry) => entry.name === job)!.steps.map((step) => step.name).filter((name) => !PLATFORM_STEP.test(name));
-      expect(listed, job).toEqual(workflowSteps(job));
-    }
+    // G-P1: the recorded run is the serial form's (v2.8.2 T2) — the parity gate's serial run and the grader's other
+    // closed inventory since the public workflow went sharded (v2.8.2 T7: tests/scripts/ci-sharded.test.ts pins the
+    // sharded kinds' declared steps to the workflow's own) — and with every step success and both groups green it
+    // grades GREEN, job by job, its declared steps listed below as GitHub names them
+    expect(workflowJobIds().sort(), "the public workflow is the sharded form").toEqual(["aggregate", "single-fork", "suite"]);
     const p1 = await grade(c, green, greenArtifacts(c));
     expect(p1.status, p1.stdout).toBe(0);
     expect(p1.stdout.split("\n")[0]).toBe("INVENTORY form=serial declared=2 observed=2");
@@ -561,24 +556,26 @@ describe("grade-ci.sh recorded-run controls", () => {
   });
 
   test("unchanged public CI invocation forms derive candidate-tree file and project contracts through the production wrapper so seven of ten files or a never-started built-cli project stays RED while complete RPC-only exit one keeps its narrow exception", async () => {
-    // the forms are read from the public workflow itself: the same two wrapped commands in both jobs,
-    // passing nothing but a log and the command
+    // the forms are read from the public workflow itself (v2.8.2 T7: the sharded form): every wrapped command, passing
+    // nothing but a log and the command. A `--shard` form is held to its plan as a set instead (tests/scripts/
+    // ci-oracle.test.ts, and through this wrapper in tests/scripts/ci-sharded.test.ts), so the single-fork job's form
+    // is the one unsharded project contract the workflow runs; the serial coverage form stays the parity gate's.
     const workflow = parseYaml(readFileSync(join(ROOT, ".github/workflows/ci.public.yml"), "utf8")) as {
       jobs: Record<string, { steps: { run?: string }[] }>;
     };
     const forms = new Set<string>();
-    for (const job of ["test", "test-macos"]) {
-      const wrapped = workflow.jobs[job].steps
-        .map((step) => /^bash scripts\/run-ci-vitest\.sh "[^"]+" (.+)$/.exec((step.run ?? "").trim())?.[1])
-        .filter((command): command is string => command !== undefined);
-      expect(wrapped, job).toHaveLength(2);
-      for (const command of wrapped) forms.add(command);
+    for (const [job, { steps }] of Object.entries(workflow.jobs)) {
+      for (const step of steps) {
+        const command = /^bash scripts\/run-ci-vitest\.sh "[^"]+" (.+)$/.exec((step.run ?? "").trim())?.[1];
+        if (command !== undefined) forms.add(`${job}: ${command}`);
+      }
     }
-    const [coverageForm, singleForkForm] = [...forms].sort();
-    expect([coverageForm, singleForkForm]).toEqual([
-      "npm run test:coverage -- --project suite",
-      "npx vitest run --project sync-heavy --project keys-ledger --project built-cli --project signal-reaper",
+    expect([...forms].sort()).toEqual([
+      "single-fork: npx vitest run --project sync-heavy --project keys-ledger --project built-cli --project signal-reaper",
+      "suite: npm run test:coverage -- --project suite --shard=${{ matrix.shard }}/4",
     ]);
+    const singleForkForm = [...forms].find((form) => form.startsWith("single-fork: "))!.slice("single-fork: ".length);
+    const coverageForm = "npm run test:coverage -- --project suite";
 
     // the candidate tree: each project owns tests/<project>/*.test.ts, 10 per form; the stand-ins answer
     // `npx vitest list --filesOnly --project …` (text and --json=<file>) from it and fail on an unknown project, and

@@ -2,6 +2,26 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v2.15.0 — public CI runs as four duration-balanced shards per OS: about an hour instead of about three
+
+**v2.15.0** is a hand delivery in six commits (queue rows 6, 320 and 321). Every commit is covered by a green
+`tickmarkr verify`: build, lint, evidence, scope, its acceptance criteria, a cross-vendor review and the full suite.
+
+- **Public CI is sharded.** Each OS runs the suite as four shards balanced by recorded file durations, plus one single-fork
+  job. An aggregate job per OS merges the shard reports and decides the coverage floors. On one commit, the sharded run
+  finished in 57 minutes, while the serial run took 2 h 25 min on Linux and more than 3 h on macOS.
+- **Merged coverage stays honest.** Vitest and `@vitest/coverage-v8` are pinned at exactly 3.2.7, and V8 coverage is
+  remapped through the AST. Default remapping credited phantom branch hits once shard reports merged, so a branch floor
+  could pass sharded and fail serial. A serial run and a sharded run of one commit now agree on every file's test verdict,
+  every coverable count and every floor percentage. Covered counts in a few timer-driven files still vary by one to four
+  between runs, and they vary the same way between two serial runs of the same tree.
+- **The overseer's CI grader reads the sharded form.** `skills/tickmarkr-overseer/scripts/grade-ci.sh` grades the twelve
+  jobs one by one from each OS's proof groups.
+  - It reads RED when a file is in no shard, is in two shards, or is missing from a merge.
+  - It reads UNREADABLE when a job is absent.
+- **Test-only:** the hang-budget tests land their injected clock jump between two of the gate's clock reads, so a busy runner
+  can no longer hide the jump from the gate (queue row 320).
+
 ## v2.14.0 — gateway vendor truth: behind a model-remapping gateway, a Claude Code seat reviews or judges only when its vendor is declared or observed
 
 **v2.14.0** comes from one `tickmarkr run`, run-20261031-110921-0000000000000070. Both tasks passed build, lint, evidence, scope,

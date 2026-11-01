@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn, type SpawnOptions } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -11,7 +11,7 @@ import { runGates, testCommandForFiles } from "../../src/gates/run-gates.js";
 import type { GateResult } from "../../src/gates/types.js";
 import { discoverTestManifest, evaluateManifestedTest, fileHangBudgetMs, isVitestTestCommand, MIN_FILE_HANG_BUDGET_MS, readTestReport, resetHangBudgetFloorForTests, resetHangClocksForTests, resetSleepEvidenceForTests, setHangBudgetFloorForTests, setHangClocksForTests, setSleepEvidenceForTests, singleForkRetryCommand, verifyManifestReport } from "../../src/gates/test-manifest.js";
 import { TEST_REPORTER_SOURCE } from "../../src/gates/test-reporter.js";
-import { preserveWorktree, shGitOk, VERIFICATION_PROTOCOL } from "../../src/run/git.js";
+import { preserveWorktree, resetSpawnForTests, setSpawnForTests, shGitOk, VERIFICATION_PROTOCOL } from "../../src/run/git.js";
 import { SubprocessDriver } from "../../src/drivers/subprocess.js";
 import { validateGraph } from "../../src/graph/schema.js";
 import { verifyIntegrationTip } from "../../src/run/merge.js";
@@ -69,6 +69,17 @@ async function round(f: Fixture, cmd = "vitest run --globals", over: Partial<Bas
   return out.results.find(r => r.gate === "test")!;
 }
 function receipt(f: Fixture, name: string) { return join(f.repo, name + ".receipt"); }
+/** Queue row 320 (D-2178 add.161): jumps the gate's hang clocks once `path` exists, BETWEEN two of its read pairs. The pair
+ * whose wall read first sees the file stays unshifted and every later pair is shifted, so neither a parent stalled past the
+ * file before onSpawn's re-baseline nor a file landing between a pair's two reads can hide the jump. Every gate read site
+ * reads wall, then mono. */
+function jumpAfter(path: string, wallMs: number, monoMs: number) {
+  let phase = 0; // 0 before the file, 1 the read pair that first saw it, 2 every later pair
+  setHangClocksForTests({
+    wall: () => { if (phase === 1) phase = 2; else if (phase === 0 && existsSync(path)) phase = 1; return Date.now() + (phase === 2 ? wallMs : 0); },
+    mono: () => performance.now() + (phase === 2 ? monoMs : 0),
+  });
+}
 /** Only fault injection uses a stand-in. Each independent case records list and run separately. */
 function fault(f: Fixture, name: string, mode: string) {
   mkdirSync(join(f.repo, "node_modules/.bin"), { recursive: true });
@@ -326,19 +337,33 @@ test("through runGates a fixture baseline with known per-file durations yields f
   // `equal` keeps the real 5000 ms wait: it alone pins the ceiling timer's kill (atCeiling). The other ceiling rows
   // jump both hang clocks past the budget once the run's receipt exists (the OBS-953 pattern below): one overdue
   // poll, recorded unknown with nothing subtracted, so the poll kills at the same derived budget without the wait.
-  onTestFinished(() => { resetHangClocksForTests(); resetSleepEvidenceForTests(); });
+  // Queue row 320 (D-2178 add.161): keyed on the receipt alone, a parent stalled past the stand-in's receipt before onSpawn
+  // re-baselined took its baseline on jumped clocks, so no poll saw a gap and the file died in about a second with no
+  // interruption (CI 41276883043). jumpAfter lands the jump between read pairs; `none` replays that stall: its spawn
+  // returns only once the receipt exists.
+  onTestFinished(() => { resetHangClocksForTests(); resetSleepEvidenceForTests(); resetSpawnForTests(); });
   for (const [name, timing, budget] of cases) {
     const f = fixture(false); fault(f,name,"hang");
     expect(existsSync(receipt(f,name))).toBe(false);
     const jumped = budget === timing.ceilingMs && name !== "equal";
+    let stalled = false;
     if (jumped) {
-      const shift = () => existsSync(receipt(f,name)) ? budget + 1_000 : 0;
-      setHangClocksForTests({ wall: () => Date.now() + shift(), mono: () => performance.now() + shift() });
+      jumpAfter(receipt(f,name), budget + 1_000, budget + 1_000);
       setSleepEvidenceForTests({ platform: () => "linux" }); // a jump is no host sleep: the kernel's record is not read
+      if (name === "none") setSpawnForTests(((cmd: string, args: string[], opts: SpawnOptions) => {
+        const child = spawn(cmd, args, opts);
+        if (String(args.at(-1)).includes("test-manifest-report-")) { // the run, never the listing
+          const cell = new Int32Array(new SharedArrayBuffer(4));
+          for (const until = Date.now() + LISTING_ALLOWANCE_MS; !existsSync(receipt(f,name)) && Date.now() < until;) Atomics.wait(cell, 0, 0, 10);
+          stalled = existsSync(receipt(f,name));
+        }
+        return child;
+      }) as unknown as typeof spawn);
     }
     const row = await round(f,"vitest run --globals",timing);
-    resetHangClocksForTests(); resetSleepEvidenceForTests();
+    resetHangClocksForTests(); resetSleepEvidenceForTests(); resetSpawnForTests();
     executed(f,name,row,"vitest run --globals");
+    expect(stalled).toBe(name === "none");
     expect(row.meta, row.details).toMatchObject({classification:"infra",kind:"hang",file:"tests/a.test.ts",hangBudgetMs:budget});
     if (jumped) expect(row.meta?.interruptions).toContainEqual(expect.objectContaining({ kind: "unknown", subtractedMs: 0 }));
     expect(row.details).toContain(String(budget));
@@ -1207,14 +1232,9 @@ else setTimeout(() => {
 test("test: production task/tip gates classify a 156-second wall-only jump as interruption versus thirty-one active seconds as hang against a thirty-second budget, recording equal-clock overdue gaps as unknown without subtracting them", async () => {
   const { Journal } = await import("../../src/run/journal.js");
   const { verifyIntegrationTipCached } = await import("../../src/run/daemon.js");
-  const { performance } = await import("node:perf_hooks");
   // tests/a.test.ts measured 10 s at baseline: its budget is 3 × 10 s = 30 s under a 120 s battery ceiling.
   const timing: Partial<BaselineCommand> = { fileDurations: [{ file: "tests/a.test.ts", durationMs: 10_000 }], ceilingMs: 120_000 };
   expect(fileHangBudgetMs("tests/a.test.ts", timing.fileDurations, timing.ceilingMs)).toBe(30_000);
-  const jumpOnce = (started: string, wallMs: number, monoMs: number) => setHangClocksForTests({
-    wall: () => Date.now() + (existsSync(started) ? wallMs : 0),
-    mono: () => performance.now() + (existsSync(started) ? monoMs : 0),
-  });
   const cmd = "vitest run --globals";
   // The wall-only control never consults the host's kernel sleep record (tests/gates/untimed-sleep-budget.test.ts owns that table).
   setSleepEvidenceForTests({ platform: () => "linux" });
@@ -1235,7 +1255,7 @@ test("test: production task/tip gates classify a 156-second wall-only jump as in
 
       // Wall advances 156 s while the monotonic clock does not: a detected suspend, subtracted.
       const suspended = fixture(false);
-      jumpOnce(clockFault(suspended, "finish"), 156_000, 0);
+      jumpAfter(clockFault(suspended, "finish"), 156_000, 0);
       const interrupted = await outcome(suspended);
       expect(interrupted.pass, interrupted.details).toBe(true);
       expect(interrupted.details).toMatch(/host interruptions: host-suspend 15\d{4}ms wall \/ \d+ms monotonic, 15\d{4}ms subtracted/);
@@ -1253,7 +1273,7 @@ test("test: production task/tip gates classify a 156-second wall-only jump as in
       // Both clocks advance 31 s together in one overdue poll: recorded unknown, subtracted nothing,
       // so 31 active seconds against the 30 s budget is a hang.
       const active = fixture(false);
-      jumpOnce(clockFault(active, "stall"), 31_000, 31_000);
+      jumpAfter(clockFault(active, "stall"), 31_000, 31_000);
       const hung = await outcome(active);
       expect(hung.pass).toBe(false);
       expect(hung.details).toMatch(/infra hang: "tests\/a\.test\.ts" started and did not complete within its 30000ms budget \(3\d{4}ms active of 3\d{4}ms wall\)/);
