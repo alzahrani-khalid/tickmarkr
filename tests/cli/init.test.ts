@@ -312,7 +312,8 @@ describe("tickmarkr init doctor.json reuse (T1)", () => {
     expect(probeModelsSpy).not.toHaveBeenCalled();
     expect(probeAllSpy).not.toHaveBeenCalled();
     expect(out).toMatch(/using probe results from 5m ago — run tickmarkr doctor to refresh \(or init --fresh\)/);
-    expect(out).toContain("tickmarkr doctor — capability matrix:");
+    expect(out).toContain("not ready: no supported agent CLI is registered");
+    expect(out).not.toContain("capability matrix:");
     // fresh repo ⇒ active state dir is .tickmarkr; doctor output must never name the legacy state dir
     expect(out).toContain(".tickmarkr");
     expect(out).not.toContain(`.${["dro", "vr"].join("")}`);
@@ -1160,7 +1161,8 @@ describe("T3 brand banner (TTY gate)", () => {
 
     expect(out!.startsWith(BANNER)).toBe(false);
     expect(out!).toMatch(/^wrote /);
-    expect(out!).toContain("tickmarkr doctor — capability matrix:");
+    expect(out!).toContain("not ready: no supported agent CLI is registered");
+    expect(out!).not.toContain("capability matrix:");
     expect(out!).not.toMatch(/\x1b\[/);
   });
 });

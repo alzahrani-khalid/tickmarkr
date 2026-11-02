@@ -16,7 +16,7 @@ import { HerdrDriver } from "../../drivers/herdr.js";
 import { classifyHost } from "../../drivers/index.js";
 import { canonicalWorktreePath, ORCA_FIXTURE_VERSION, parseEnvelope, resolveOrcaCliBinary } from "../../drivers/orca.js";
 import { localeFinding, protectedFolderFinding } from "../../drivers/host-env.js";
-import type { WorkerAdapter } from "../../adapters/types.js";
+import type { AuthHealth, WorkerAdapter } from "../../adapters/types.js";
 import { kimi, type KimiDoctorTurnResult, probeKimiDoctorTurn } from "../../adapters/kimi.js";
 import { type CodexSandbox, recordCodexCommit } from "../../adapters/codex-commit-check.js";
 import { codex } from "../../adapters/codex.js";
@@ -38,6 +38,12 @@ const visual = () => process.stdout.isTTY === true && process.env.NO_COLOR === u
 const alignedStatusRow = (verdict: "pass" | "fail" | "warn", key: string, value: string) =>
   `  ${statusRow(verdict, kvRow(key, value).slice(2))}`;
 const attentionRow = (text: string) => `  ${statusRow("warn", text)}`;
+
+/** A capability row's verdict: installed; kimi also needs auth; missing health is not healthy.
+ *  v2.6.6 T9 (K): a Codex sandbox escape is a BLOCKING security warning — never a passing row. */
+export function adapterHealthy(adapterId: string, health: AuthHealth | undefined): boolean {
+  return !!health && health.installed && (adapterId !== kimi.id || health.authed) && !(adapterId === codex.id && health.codexCommit === "escape");
+}
 
 type ReviewDemotionSummary = { reviewer: string; count: number; causes: Record<string, number> };
 
@@ -1550,9 +1556,7 @@ export async function doctor(
     const h = health[a.id];
     // OBS-503: a crash-on-version verdict carries its reason in note — print it instead of the lie.
     const state = !h.installed ? (h.note ?? "not installed") : `${h.version ?? "installed"}${h.note ? ` (${h.note})` : ""}`;
-    // v2.6.6 T9 (K): a Codex sandbox escape is a BLOCKING security warning — never a passing row
-    const healthy = h.installed && (a.id !== kimi.id || h.authed) && !(a.id === codex.id && h.codexCommit === "escape");
-    return alignedStatusRow(healthy ? "pass" : "fail", a.id, state);
+    return alignedStatusRow(adapterHealthy(a.id, h) ? "pass" : "fail", a.id, state);
   });
   const ports = portProbe.ports;
   const portLine = ports.status === "non-darwin" ? "launchservicesd ports: not applicable"

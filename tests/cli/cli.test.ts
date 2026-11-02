@@ -379,7 +379,8 @@ describe("tickmarkr init", () => {
     const repo = makeRepo({ "a.txt": "x" });
     const globalDir = mkdtempSync(join(tmpdir(), "tickmarkr-init-g-"));
     const probe = vi.fn(async () => ({ installed: true, authed: true, models: [] }));
-    const adapters = [{ id: "init-stub", vendor: "test", probe }] as unknown as WorkerAdapter[];
+    // channels is a required WorkerAdapter member: init's readiness card asks it for routable workers.
+    const adapters = [{ id: "init-stub", vendor: "test", probe, channels: () => [] }] as unknown as WorkerAdapter[];
     const allAdaptersSpy = vi.spyOn(registry, "allAdapters").mockReturnValue(adapters);
     let out: string;
     try {

@@ -5,17 +5,21 @@ import { fileURLToPath } from "node:url";
 import { createInterface, type Interface } from "node:readline/promises";
 import { parseArgs } from "node:util";
 import { parse as parseYaml } from "yaml";
-import { allAdapters, formatDoctorAgeForInit, formatDoctorReport, initDoctorReuse } from "../../adapters/registry.js";
+import { allAdapters, discoverChannels, formatDoctorAgeForInit, initDoctorReuse, readDoctor } from "../../adapters/registry.js";
+import { modelAuthed, type AuthHealth, type WorkerAdapter } from "../../adapters/types.js";
 import { configTemplate, DEFAULT_CONFIG, globalConfigDir, loadConfig, type TickmarkrConfig, type InitConfigOverlay } from "../../config/config.js";
 import { LEGACY_PREFIX, specTemplate } from "../../compile/native.js";
 import { BANNER, kvRow, legend, rule, statusRow, title } from "../../brand.js";
 import { stateDirName, tickmarkrDir } from "../../graph/graph.js";
 import { orcaHostDetected } from "../../drivers/index.js";
+import { protectedFolderFinding } from "../../drivers/host-env.js";
+import { canonicalWorktreePath } from "../../drivers/orca.js";
 import { gitSync, WORKTREES_DIR } from "../../run/git.js";
 import { assertGitTrust, GitTrustRefusal } from "../../run/git-trust.js";
 import { Journal, type JournalEvent } from "../../run/journal.js";
 import { runLockOwner, runLockRunId, runStatusLine } from "../../run/lock.js";
-import { doctor } from "./doctor.js";
+import { doctor, hostRows, packageManagerFinding } from "./doctor.js";
+import { readinessCard } from "./init-card.js";
 import { assembleFleetEditor } from "./fleet.js";
 import { SHIPPED_DIGESTS, SHIPPED_SNAPSHOTS } from "../shipped-skill-files.js";
 
@@ -698,6 +702,42 @@ function handleRemove(cwd: string): string {
 }
 
 
+/** The non-interactive readiness card, fed from recorded health and the existing host and model helpers. */
+function initCardRows(cwd: string, cfg: TickmarkrConfig, adapters: WorkerAdapter[], health: Record<string, AuthHealth>): string[] {
+  const installed = adapters.filter((a) => health[a.id]?.installed === true);
+  const trust: Parameters<typeof readinessCard>[0]["trust"] = {};
+  for (const a of installed) {
+    if (!a.trust) continue;
+    try {
+      trust[a.id] = a.trust(cwd);
+    } catch (e) {
+      trust[a.id] = { status: "check-failed", error: e instanceof Error ? e.message : String(e) };
+    }
+  }
+  const roles = (["judge", "consult"] as const).map((role) => ({ role, adapter: cfg[role].adapter, model: cfg[role].model }));
+  const checks: Parameters<typeof readinessCard>[0]["checks"][number][] = [];
+  if (installed.length && !discoverChannels(cfg, adapters, health).length) {
+    checks.push({ key: "workers", detail: "no authenticated routable worker model is available; run tickmarkr doctor, then tickmarkr fleet" });
+  }
+  for (const { role, adapter, model } of roles) {
+    if (installed.some((a) => a.id === adapter) && !modelAuthed(health[adapter], model, cfg.routing.allowUnverifiedModels)) {
+      checks.push({ key: `${role}-model`, detail: `${adapter}:${model} has no passing recorded model probe — run tickmarkr doctor or remap ${role}` });
+    }
+  }
+  for (const row of hostRows(process.env, cfg.visibility.llm)) if (row.verdict === "warn") checks.push({ key: "visibility", detail: row.detail });
+  // Same inputs as doctor's folders row.
+  const root = canonicalWorktreePath(cwd);
+  const folders = protectedFolderFinding(root, canonicalWorktreePath(join(root, stateDirName(cwd))),
+    process.platform, process.env.HOME ? canonicalWorktreePath(process.env.HOME) : undefined);
+  if (folders) checks.push({ key: "folders", detail: folders.detail });
+  const pm = packageManagerFinding(cwd);
+  if (pm?.verdict === "fail") checks.push({ key: "package-manager", detail: pm.detail });
+  return readinessCard({ adapters, health, trust, roles, checks });
+}
+
+const cardVerdict = (row: string) =>
+  row.startsWith("ready:") ? "pass" : row.startsWith("not ready:") ? "fail" : row.startsWith("action:") ? "warn" : "neutral";
+
 /** Test seam mirroring FleetIO: production callers get the process streams and environment. */
 export type InitIO = { input?: NodeJS.ReadStream; output?: NodeJS.WriteStream; env?: NodeJS.ProcessEnv };
 
@@ -863,11 +903,16 @@ export async function init(argv: string[], cwd = process.cwd(), io: InitIO = {})
     .filter((a) => cfg.tiers[a.id])
     .map((a) => [a.id, cfg.tiers[a.id]])) };
   const { reuse, ageMs, health } = initDoctorReuse(cwd, fresh, probeCfg);
-  let doc = reuse && health && ageMs !== null
+  const reused = reuse && health && ageMs !== null;
+  let doc = reused
     ? interactive
       ? `using probe results from ${formatDoctorAgeForInit(ageMs)} ago — full matrix: tickmarkr doctor · refresh: init --fresh`
-      : `using probe results from ${formatDoctorAgeForInit(ageMs)} ago — run tickmarkr doctor to refresh (or init --fresh)\n${formatDoctorReport(cwd, cfg, health, adapters, { wrote: false })}`
+      : `using probe results from ${formatDoctorAgeForInit(ageMs)} ago — run tickmarkr doctor to refresh (or init --fresh)`
     : await doctor([], cwd, adapters, { banner: false, compact: interactive, globalDir: gdir });
+  // Non-interactive surfaces end with the readiness card: doctor's returned report is discarded
+  // (its stderr disclosure already ran) and the card reads the health doctor recorded.
+  const card = interactive ? [] : initCardRows(cwd, cfg, adapters, (reused ? health : readDoctor(cwd)) ?? {});
+  if (!interactive && !reused) doc = "";
 
   // Act 3 — fleet. The compact discovery surface prints BETWEEN the acts so the operator reads
   // what the fleet browser (and its presets overlay, raised on the first Shapes entry) ranks
@@ -896,7 +941,7 @@ export async function init(argv: string[], cwd = process.cwd(), io: InitIO = {})
   const guidedSetupHint = !interactive && !values.yes
     ? "guided setup skipped (no interactive terminal): run `! tkr init` yourself, or in a visible pane"
     : null;
-  if (!visual()) return `${notes.join("\n")}\n${doc}\n${next}${guidedSetupHint ? `\n${guidedSetupHint}` : ""}\n${ENVIRONMENTS_FOOTER}`;
+  if (!visual()) return [...notes, ...(doc ? [doc] : []), ...card, next, ...(guidedSetupHint ? [guidedSetupHint] : []), ENVIRONMENTS_FOOTER].join("\n");
 
   const noteRows = notes.map((note) => `  ${statusRow(
     /^(?:wrote|overwrote|appended|rewrote)/.test(note) ? "pass" : note.startsWith("skipped") ? "warn" : "neutral",
@@ -911,7 +956,8 @@ export async function init(argv: string[], cwd = process.cwd(), io: InitIO = {})
     legend("· setup notes"),
     rule(),
     ...noteRows,
-    doc,
+    ...(doc ? [doc] : []),
+    ...card.map((row) => `  ${statusRow(cardVerdict(row), row)}`),
     title("next steps"),
     legend("· continue from the repository's current state"),
     rule(),

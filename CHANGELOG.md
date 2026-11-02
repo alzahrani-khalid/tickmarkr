@@ -2,6 +2,30 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v2.18.0 — `tickmarkr init` tells you whether you are ready
+
+**v2.18.0** was delivered by one tickmarkr run of four tasks (run-20261102-040923-0000000000000427). Every task passed build, lint, evidence and
+scope, its acceptance criteria, a cross-vendor review and the full test suite before it merged.
+
+- **init ends with a short readiness card instead of the full doctor report.** Without an interactive terminal, or with
+  `--yes`, `init` used to print the whole capability matrix, every attention note and the model-classification overlay.
+  In a fresh repository that was close to 300 lines, with the next step at the very end. Now it prints a few lines:
+  - `ready:` the agent CLIs that pass doctor's capability check (with how many of the installed ones that is), or
+    `not ready:` and why;
+  - one `not ready:` row per installed CLI that fails the check, with its recorded reason;
+  - an `action:` row for each thing you must do: a CLI that is present but unusable, a trust prompt to accept once, a
+    judge or consult model that is not installed or has no passing probe, no authenticated worker model at all, a
+    protected folder, pane visibility the host cannot honor, or a package manager that does not resolve;
+  - a pointer to `tickmarkr doctor`, which still prints everything;
+  - then the next step.
+  The card is built from the health doctor records in `doctor.json`, never re-derived. Both the fresh-probe and the
+  reuse paths show the same verdicts as `tickmarkr doctor`. The interactive wizard is unchanged.
+- **One verdict for adapter health.** `doctor` exports the predicate its capability rows use, and init's card uses the
+  same one. Previously, init's cached report could mark an installed but unauthenticated CLI as passing while
+  `doctor` failed it.
+- **Help text no longer cites internal record ids.** A test now sweeps every command's help, every profile help and
+  the root help, so they stay out.
+
 ## v2.17.0 — the status board tells you what to do next
 
 **v2.17.0** was delivered by one tickmarkr run of three tasks (run-20261101-231717-0000000000000310). Every task passed build, lint, evidence and
