@@ -113,6 +113,15 @@ export const COMMAND_HELP = {
       "--json": "Print one JSON object with cause, deciding journal line and a validated status snapshot.",
     }, examples: ["wait", "wait run-example --after 120 --timeout 30m", "wait run-example --json --timeout 1h"],
   },
+  board: {
+    usage: "board --json [--root <dir|glob>]... [--release <dir|glob>]...",
+    description: "Print the newest run across this repository's worktrees and any named state roots as exactly one JSON line (wire version 1) for the Claude Code board pane, reading files only. With no run it prints the empty shape and still exits 0; invalid run data, a missing --json, an unknown option or a positional exits 1.",
+    options: {
+      "--json": "Required: print the board snapshot as exactly one JSON line on stdout.",
+      "--root <dir|glob>": "Also search this state root (a .tickmarkr folder, or a glob of them); repeat for more roots.",
+      "--release <dir|glob>": "Show a release card for the newest of these release folders (a folder or glob); repeat for more.",
+    }, examples: ["board --json", "board --json --root '../*/.tickmarkr' --release 'releases/*'"],
+  },
   stats: {
     usage: "stats", description: "Print all-run channel delivery, failure, rescue, author and reviewer statistics. Takes no run ID.",
     options: {}, examples: ["stats"],

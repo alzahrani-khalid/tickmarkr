@@ -113,6 +113,12 @@ Side modules (CLI-facing, not in the dispatch loop):
 - Entry: `src/cli/commands/acp.ts` saves the protocol writer and redirects console and other stdout stream writes to stderr before starting the peer. The CLI entry prints nothing after the session; EOF exits without signalling or modifying a run.
 - Contains: in-memory sessions and a free-text directory/command answer; no model calls or run ownership
 
+**Board (`src/board/`):**
+- Purpose: the board's file-only run reader: what the run board shows, computed from a run's own files, never from git or a live process (queue rows 331 and 332)
+- Location: `src/board/summarize.ts` (`summarize()`, a pure port of the frozen reference summarizer in `tests/fixtures/board/reference/`, held to rules S1–S6 of `tests/fixtures/board/PORT-RULES.md` by the reference's own goldens)
+- Contains: no file, process or clock access; the caller passes the journal events, graph, lock, `now`, typical phase times and suite progress, and times format in the process's local time zone
+- Depends on: nothing else in `src/`
+
 **CLI (`src/cli/`):**
 - Purpose: thin argv-parsing shell around the engine; each command is a one-function module
 - Location: `src/cli/index.ts` (dispatch table + usage text), `src/cli/commands/*.ts` (one file per subcommand)

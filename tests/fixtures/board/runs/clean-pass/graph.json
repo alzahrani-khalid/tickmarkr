@@ -1,0 +1,28 @@
+{
+ "tasks": [
+  {
+   "id": "T1",
+   "title": "DOCTOR'S ADAPTER-HEALTH VERDICT BECOMES ONE EXPORTED PREDICATE, WITH DOCTOR'S OUTPUT UNCHANGED",
+   "deps": []
+  },
+  {
+   "id": "T2",
+   "title": "A PURE MODULE RENDERS INIT'S READINESS CARD FROM RECORDED HEALTH, TRUST, ROLES AND HOST CHECKS",
+   "deps": [
+    "T1"
+   ]
+  },
+  {
+   "id": "T3",
+   "title": "INIT'S NON-INTERACTIVE SURFACES END WITH THE READINESS CARD INSTEAD OF THE FULL DOCTOR REPORT",
+   "deps": [
+    "T2"
+   ]
+  },
+  {
+   "id": "T4",
+   "title": "USER-FACING HELP CARRIES NO PRIVATE RECORD IDS, AND A SWEEP OVER ALL RENDERED HELP KEEPS IT THAT WAY",
+   "deps": []
+  }
+ ]
+}

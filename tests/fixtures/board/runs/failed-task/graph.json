@@ -1,0 +1,55 @@
+{
+ "tasks": [
+  {
+   "id": "T1",
+   "title": "P7 — ready tasks are admitted by critical path, and plan shows the order (OBS-1018)",
+   "deps": []
+  },
+  {
+   "id": "T2",
+   "title": "P1 — harvest truth on Orca: an exited-shaped stream on a live terminal falls back to the screen, a nudge is proven by its receipt, a consult is harvested like a judge (OBS-1011 add.1, OBS-1016, OBS-1009; riders casBoard lock staleness and crash recovery, claim wait on injected time, unclaimed or malformed receipt tombstone, classifyHost)",
+   "deps": []
+  },
+  {
+   "id": "T3",
+   "title": "P2 — a live worker is never reaped: quota needs banner text, saturation and cpu hold the legs past the window, a reap kills only its own group, a same-seat reap loop parks (OBS-1023 add.2–4, OBS-1021, OBS-1016 add.1, OBS-1011 add.1; hygiene OBS-1031)",
+   "deps": [
+    "T1"
+   ]
+  },
+  {
+   "id": "T4",
+   "title": "P3 — a review round that produced nothing spends no worker (OBS-1013 add.3, OBS-1039, OBS-1025 add.2, OBS-1033, OBS-1020)",
+   "deps": []
+  },
+  {
+   "id": "T5",
+   "title": "P4 — zero-spend verbs, honest counters: recheck re-gates committed or littered work, counters survive a recheck, the pin hosts its own repair, demotions survive resume by role, pages stop repeating, cap and prose parks are typed, an exhausted review round parks (OBS-1022, OBS-1028, OBS-1034, OBS-1010, OBS-1006, OBS-1007 add.4/5, OBS-1045, OBS-1030, OBS-1013)",
+   "deps": [
+    "T3",
+    "T4",
+    "T6"
+   ]
+  },
+  {
+   "id": "T6",
+   "title": "P5 — dirt and cap trips tell the truth at the gate (OBS-1030, OBS-932, OBS-1007)",
+   "deps": [
+    "T4"
+   ]
+  },
+  {
+   "id": "T7",
+   "title": "P6 — the standalone battery reads the manifest, standalone verifies share one repository lease, the classifier is exact, the grader reads unhandled errors (OBS-1044, OBS-1042, OBS-1045, CI grader)",
+   "deps": [
+    "T3",
+    "T6"
+   ]
+  },
+  {
+   "id": "T8",
+   "title": "P9 — one Space press edits one reason, and an untouched scope keeps its bytes (OBS-1046)",
+   "deps": []
+  }
+ ]
+}

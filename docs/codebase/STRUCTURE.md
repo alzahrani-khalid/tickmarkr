@@ -16,6 +16,8 @@ tickmarkr/
 │   │   ├── prompt.ts              # task prompt template, TRAILER_PATTERN, parseWorkerResult()
 │   │   ├── claude-code.ts         # + codex.ts, cursor-agent.ts, opencode.ts — one real adapter each
 │   │   └── fake.ts                # deterministic scripted adapter — zero-token test double
+│   ├── board/                   # the board's file-only run reader (src/board/; queue rows 331 and 332)
+│   │   └── summarize.ts         # pure port of the reference run summarizer: journal events + graph → the board's snapshot
 │   ├── cli/
 │   │   ├── index.ts               # argv → command dispatch table + usage text
 │   │   └── commands/              # one file per subcommand (init/doctor/fleet/compile/scope/plan/eval/run/status/resume/report/profile/unlock/approve/version)

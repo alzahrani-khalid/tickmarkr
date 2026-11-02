@@ -80,6 +80,27 @@ describe("Claude Code plugin package", () => {
       repository: pkg.repository.url,
       license: pkg.license,
       keywords: pkg.keywords,
+      userConfig: {
+        stateRoots: {
+          type: "string",
+          title: "Run state roots",
+          description: "Comma-separated .tickmarkr folders to read runs from; ~ and globs expand. Empty reads the session folder's own .tickmarkr.",
+          default: "",
+        },
+        releaseRoots: {
+          type: "string",
+          title: "Release folders",
+          description: "Comma-separated release folders to read the release card from; ~ and globs expand. Empty hides it.",
+          default: "",
+        },
+        marks: {
+          type: "string",
+          title: "Harness marks",
+          description: "glyph (default) draws a shape in place of each harness's name in any font. devicons draws the real logo from the Devicons icon font (devicons.io); add Devicons to your terminal's font list first, or the marks draw as empty boxes.",
+          default: "glyph",
+          options: ["glyph", "devicons"],
+        },
+      },
     });
     expect(manifest).not.toHaveProperty("skills");
     expect(readdirSync(join(ROOT, ".claude-plugin")).sort()).toEqual(["marketplace.json", "plugin.json"]);

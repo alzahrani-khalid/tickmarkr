@@ -4,6 +4,7 @@ import { pathToFileURL } from "node:url";
 import { approve } from "./commands/approve.js";
 import { acp } from "./commands/acp.js";
 import { beat } from "./commands/beat.js";
+import { board } from "./commands/board.js";
 import { compile } from "./commands/compile.js";
 import { doctor } from "./commands/doctor.js";
 import { evalCommand } from "./commands/eval.js";
@@ -32,7 +33,7 @@ const normalize = (r: CommandResult): { out: string; code: number } =>
   typeof r === "string" ? { out: r, code: 0 } : r;
 
 export const COMMANDS = {
-  acp, init, doctor, fleet, start, compile, scope, plan, run, status, wait, stats, resume, report, profile, ui, unlock, approve, beat, version, verify, eval: evalCommand,
+  acp, init, doctor, fleet, start, compile, scope, plan, run, status, wait, board, stats, resume, report, profile, ui, unlock, approve, beat, version, verify, eval: evalCommand,
 } satisfies CommandMap;
 export type RegisteredCommand = keyof typeof COMMANDS;
 
@@ -56,6 +57,7 @@ usage: tickmarkr <command>
   run           execute the graph (--concurrency N --driver auto|herdr|subprocess|orca --route-strict; orca runs only when named)
   status        live run state (--watch --events: JSON documents on stdout, keepalives on stderr; 2>&1 corrupts the stream)
   wait [<run>]  block until attention or run end (--after <line> --timeout <n>s|m|h --json)
+  board --json  print the newest run as one JSON line for the Claude Code board pane (--root <dir|glob> --release <dir|glob>, each repeatable)
   stats         all-run channel delivery, red, rescue, author and reviewer statistics
   verify        run the gate battery standalone against merge-base(--base, HEAD)..HEAD — verdict/JSON on stdout, progress on stderr; 2>&1 corrupts the verdict stream (--base main --criteria <file> | --task <id> [--files <glob>] [--author adapter:model] [--no-review] [--json])
   resume <id>   continue a run from its journal

@@ -1,0 +1,38 @@
+{
+ "tasks": [
+  {
+   "id": "constructor",
+   "title": "a prototype-named task 😀",
+   "deps": []
+  },
+  {
+   "id": "T2",
+   "title": "waits",
+   "deps": [
+    "constructor"
+   ]
+  },
+  {
+   "id": "T3",
+   "title": "waits further",
+   "deps": [
+    "T2"
+   ]
+  },
+  {
+   "id": "T4",
+   "title": "fails",
+   "deps": []
+  },
+  {
+   "id": "T5",
+   "title": "merges",
+   "deps": []
+  },
+  {
+   "id": "T6",
+   "title": "parks mid-semantics",
+   "deps": []
+  }
+ ]
+}

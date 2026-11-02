@@ -1,0 +1,50 @@
+{"ts":"2026-11-01T04:49:45.250Z","event":"run-start","data":{"runId":"run-20261101-052900-0000000000000777","effectivePolicy":{"concurrency":3}}}
+{"ts":"2026-11-01T04:50:30.250Z","event":"task-dispatch","taskId":"constructor","data":{"attempt":"0","assignment":{"model":"m1"}}}
+{"ts":"2026-11-01T04:51:15.250Z","event":"phase-start","taskId":"constructor","data":{"phase":"worker","assignment":{"model":"m1"}}}
+{"ts":"2026-11-01T04:52:00.250Z","event":"worker-launch","taskId":"constructor","data":{}}
+{"ts":"2026-11-01T04:52:45.250Z","event":"worker-result","taskId":"constructor","data":{"ok":false,"cause":"clean-exit-no-trailer"}}
+{"ts":"2026-11-01T04:53:30.250Z","event":"baseline-wait","taskId":"constructor","data":{}}
+{"ts":"2026-11-01T04:54:15.250Z","event":"phase-start","taskId":"constructor","data":{"phase":"gates"}}
+{"ts":"2026-11-01T04:55:00.250Z","event":"gate-result","taskId":"constructor","data":{"gate":"build","pass":false,"details":"refusing to gate a dirty worktree\n?? a b.txt\n M c\u001cd\n"}}
+{"ts":"2026-11-01T04:55:45.250Z","event":"task-dispatch","taskId":"T4","data":{"attempt":0,"assignment":{"adapter":"codex","model":"sol"}}}
+{"ts":"2026-11-01T04:56:30.250Z","event":"phase-start","taskId":"T4","data":{"phase":"worker","assignment":{"adapter":"codex","model":"sol"}}}
+{"ts":"2026-11-01T04:57:15.250Z","event":"worker-launch","taskId":"T4","data":{}}
+{"ts":"2026-11-01T04:58:00.250Z","event":"repair-attempt","taskId":"constructor","data":{"of":2}}
+{"ts":"2026-11-01T04:58:45.250Z","event":"task-dispatch","taskId":"constructor","data":{"attempt":1,"retryMode":"repair"}}
+{"ts":"2026-11-01T04:59:30.250Z","event":"phase-start","taskId":"constructor","data":{"phase":"worker"}}
+{"ts":"2026-11-01T05:00:15.250Z","event":"worker-result","taskId":"constructor","data":{"ok":true}}
+{"ts":"2026-11-01T05:01:00.250Z","event":"phase-start","taskId":"constructor","data":{"phase":"gates"}}
+{"ts":"2026-11-01T05:01:45.250Z","event":"gate-result","taskId":"constructor","data":{"gate":"lint","pass":true}}
+{"ts":"2026-11-01T05:02:30.250Z","event":"phase-start","taskId":"constructor","data":{"phase":"judge"}}
+{"ts":"2026-11-01T05:03:15.250Z","event":"phase-start","taskId":"constructor","data":{"phase":"review"}}
+{"ts":"2026-11-01T05:04:00.250Z","event":"gate-result","taskId":"constructor","data":{"gate":"acceptance","pass":false,"details":"criteria:\nAC1 ✖ missing ✖ twice  double  spaces","invocations":[null,"x",{"channel":""},{"channel":"claude-code:opus"}],"findings":[{},{}]}}
+{"ts":"2026-11-01T05:04:45.250Z","event":"gate-result","taskId":"constructor","data":{"gate":"review","pass":true,"reviewer":"codex:sol","invocations":[{"channel":"codex:sol"}]}}
+{"ts":"2026-11-01T05:05:30.250Z","event":"task-human","taskId":"constructor","data":{"reason":"😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀"}}
+{"ts":"2026-11-01T05:06:15.250Z","event":"approval-window-start","data":{"parked":["constructor"],"windowMs":120000}}
+{"ts":"2026-11-01T05:07:00.250Z","event":"task-dispatch","taskId":"T5","data":{"attempt":0,"assignment":{"adapter":"grok","model":"g"}}}
+{"ts":"2026-11-01T05:07:45.250Z","event":"phase-start","taskId":"T5","data":{"phase":"worker","assignment":{"adapter":"grok","model":"g"}}}
+{"ts":"2026-11-01T05:08:30.250Z","event":"worker-result","taskId":"T4","data":{"ok":true}}
+{"ts":"2026-11-01T05:09:15.250Z","event":"phase-start","taskId":"T4","data":{"phase":"gates"}}
+{"ts":"2026-11-01T05:10:00.250Z","event":"gate-result","taskId":"T4","data":{"gate":"scope","pass":true}}
+{"ts":"2026-11-01T05:10:45.250Z","event":"phase-start","taskId":"T4","data":{"phase":"gate:test","index":0}}
+{"ts":"2026-11-01T05:11:30.250Z","event":"worker-result","taskId":"T5","data":{"ok":true}}
+{"ts":"2026-11-01T05:12:15.250Z","event":"phase-start","taskId":"T5","data":{"phase":"gates"}}
+{"ts":"2026-11-01T05:13:00.250Z","event":"phase-start","taskId":"T5","data":{"phase":"gate:test","index":0}}
+{"ts":"2026-11-01T05:13:45.250Z","event":"suite-wait","taskId":"T5","data":{"gate":"test"}}
+{"ts":"2026-11-01T05:14:30.250Z","event":"task-approved","taskId":"constructor","data":{}}
+{"ts":"2026-11-01T05:15:15.250Z","event":"approval-window-expired","data":{}}
+{"ts":"2026-11-01T05:16:00.250Z","event":"task-dispatch","taskId":"constructor","data":{"attempt":"2","assignment":{"adapter":"claude-code","model":"opus"}}}
+{"ts":"2026-11-01T05:16:45.250Z","event":"phase-start","taskId":"constructor","data":{"phase":"worker","assignment":{"adapter":"claude-code","model":"opus"}}}
+{"ts":"2026-11-01T05:17:30.250Z","event":"gate-result","taskId":"T4","data":{"gate":"test","pass":false,"durationMs":70000,"details":"line one\r\nFAIL tests/x.test.ts > a b\nFAIL second"}}
+{"ts":"2026-11-01T05:18:15.250Z","event":"task-human","taskId":"T4","data":{"kind":"gate-fail","reason":"test red  twice  over"}}
+{"ts":"2026-11-01T05:19:00.250Z","event":"task-dispatch","taskId":"T6","data":{"attempt":0,"assignment":{"adapter":"omp","model":"glm"}}}
+{"ts":"2026-11-01T05:19:45.250Z","event":"phase-start","taskId":"T6","data":{"phase":"worker","assignment":{"adapter":"omp","model":"glm"}}}
+{"ts":"2026-11-01T05:20:30.250Z","event":"worker-result","taskId":"T6","data":{"ok":true}}
+{"ts":"2026-11-01T05:21:15.250Z","event":"phase-start","taskId":"T6","data":{"phase":"gates"}}
+{"ts":"2026-11-01T05:22:00.250Z","event":"phase-start","taskId":"T6","data":{"phase":"judge"}}
+{"ts":"2026-11-01T05:22:45.250Z","event":"phase-start","taskId":"T6","data":{"phase":"review"}}
+{"ts":"2026-11-01T05:23:30.250Z","event":"task-human","taskId":"T6","data":{"kind":"consult","reason":"semantic park"}}
+{"ts":"2026-11-01T05:24:15.250Z","event":"suite-admitted","taskId":"T5","data":{}}
+{"ts":"2026-11-01T05:25:00.250Z","event":"task-done","taskId":"T5","data":{}}
+{"ts":"2026-11-01T05:25:45.250Z","event":"task-failed","taskId":"T4","data":{"error":"boom ✖ x ✖ y"}}
+{"ts":"2026-11-01T05:26:30.250Z","event":"run-end","data":{"runId":"run-20261101-052900-0000000000000777","done":["T5"],"failed":["T4"],"human":["constructor","T6"],"blocked":["T2","T3"],"pending":[],"tipVerify":null,"owedChecks":{"known":false}}}

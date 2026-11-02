@@ -1,0 +1,60 @@
+{"ts":"2026-10-22T22:23:03.153Z","event":"baseline-start","data":{}}
+{"ts":"2026-10-22T22:23:03.154Z","event":"driver-capability-absent","data":{}}
+{"ts":"2026-10-22T22:23:03.155Z","event":"run-start","data":{"effectivePolicy":{"concurrency":2}}}
+{"ts":"2026-10-22T22:23:03.196Z","event":"task-dispatch","taskId":"T3","data":{"attempt":0,"retryMode":"fresh","assignment":{"adapter":"codex","model":"gpt-6.1-sol"}}}
+{"ts":"2026-10-22T22:23:03.196Z","event":"phase-start","taskId":"T3","data":{"attempt":0,"phase":"worker","assignment":{"adapter":"codex","model":"gpt-6.1-sol"}}}
+{"ts":"2026-10-22T22:23:03.405Z","event":"host-observation","data":{}}
+{"ts":"2026-10-22T22:23:03.405Z","event":"host-reference","data":{}}
+{"ts":"2026-10-22T22:23:03.791Z","event":"driver-capability-absent","data":{}}
+{"ts":"2026-10-22T22:23:03.791Z","event":"worker-mode-fallback","taskId":"T3","data":{"reason":"driver"}}
+{"ts":"2026-10-22T22:23:03.816Z","event":"worker-launch","taskId":"T3","data":{"attempt":0,"retryMode":"fresh"}}
+{"ts":"2026-10-22T22:23:07.487Z","event":"host-observation","data":{}}
+{"ts":"2026-10-22T22:33:41.319Z","event":"worker-process-reaped","taskId":"T3","data":{"attempt":0}}
+{"ts":"2026-10-22T22:33:41.363Z","event":"worker-result","taskId":"T3","data":{"ok":true}}
+{"ts":"2026-10-22T22:33:41.363Z","event":"baseline-wait","taskId":"T3","data":{}}
+{"ts":"2026-10-22T22:53:07.948Z","event":"suite-wait","data":{}}
+{"ts":"2026-10-22T22:53:09.079Z","event":"phase-start","taskId":"T3","data":{"phase":"gates"}}
+{"ts":"2026-10-22T22:53:09.391Z","event":"phase-start","taskId":"T3","data":{"index":1,"phase":"gate:build","gate":"build"}}
+{"ts":"2026-10-22T22:53:09.689Z","event":"build-receipt","taskId":"T3","data":{"gate":"build"}}
+{"ts":"2026-10-22T22:53:12.281Z","event":"build-receipt","taskId":"T3","data":{"durationMs":2593,"gate":"build"}}
+{"ts":"2026-10-22T22:53:12.311Z","event":"gate-result","taskId":"T3","data":{"details":"exit 0","attempt":0,"pass":true,"durationMs":2597,"gate":"build"}}
+{"ts":"2026-10-22T22:53:12.312Z","event":"phase-start","taskId":"T3","data":{"index":3,"phase":"gate:lint","gate":"lint"}}
+{"ts":"2026-10-22T22:53:12.831Z","event":"gate-result","taskId":"T3","data":{"details":"exit 0","attempt":0,"pass":true,"durationMs":223,"gate":"lint"}}
+{"ts":"2026-10-22T22:53:12.831Z","event":"phase-start","taskId":"T3","data":{"index":4,"phase":"gate:evidence","gate":"evidence"}}
+{"ts":"2026-10-22T22:53:12.870Z","event":"gate-result","taskId":"T3","data":{"details":"2 commit(s):\ndocs/codebase/INTEGRATIONS.md         |  10 +-","attempt":0,"pass":true,"durationMs":75,"gate":"evidence"}}
+{"ts":"2026-10-22T22:53:12.870Z","event":"phase-start","taskId":"T3","data":{"index":5,"phase":"gate:scope","gate":"scope"}}
+{"ts":"2026-10-22T22:53:12.915Z","event":"gate-result","taskId":"T3","data":{"details":"all 17 changed files in scope","attempt":0,"pass":true,"durationMs":91,"gate":"scope"}}
+{"ts":"2026-10-22T22:53:12.915Z","event":"phase-start","taskId":"T3","data":{"index":6,"phase":"judge","gate":"acceptance"}}
+{"ts":"2026-10-22T22:53:12.915Z","event":"phase-start","taskId":"T3","data":{"index":7,"phase":"review","gate":"review"}}
+{"ts":"2026-10-22T22:53:29.857Z","event":"gate-result","taskId":"T3","data":{"details":"oracle failed: test \"daemon runs dispatching a Codex worker over the headless transport, the interactive transport and the oversized-prompt fallback hand the recording codex child that task's worktree gitdir and branch leaf, and doctor's probe hands it the renderer's grant for its fixture with no grant lookup there, so a transport or the probe left without context fails\" in tests/cli/codex-grant-leaf.test.ts — the runner's per-file report shows no passing test of that title in tests/cli/codex-grant-leaf.test.ts","attempt":0,"pass":false,"durationMs":16941,"gate":"acceptance","findings":[{}]}}
+{"ts":"2026-10-22T22:59:11.511Z","event":"gate-result","taskId":"T3","data":{"details":"reviewer claude-code:opus (vendor: anthropic; provider: anthropic): approved (3 deferred)\n- [deferred/minor] src/adapters/codex.ts:101 — renderCodexGitGrant trusts the worktree gitfile via checkedAuthority, so a gitfile rewritten to name a sibling <common>/worktrees/<other> renders that sibling's gitdir as writable (executed: gitfile->sibling rendered .git/worktrees/tickmarkr-run-x--T2 + objects). Same as git-trust's seat-denied-gitfile design and the prior fragment, so not a regression; pinning authority.worktree === realpath(cwd) would close it. — rationale: Within the spec's 'trusted authority from git-trust.ts, exported unchanged' design; the gitfile is assumed seat-denied; not a widening versus the shipped fragment.","attempt":0,"pass":true,"durationMs":358594,"gate":"review","reviewer":"claude-code:opus","invocations":[{"channel":"claude-code:opus"}],"findings":[{},{},{}]}}
+{"ts":"2026-10-22T22:59:11.584Z","event":"repair-attempt","taskId":"T3","data":{"of":2}}
+{"ts":"2026-10-22T22:59:11.585Z","event":"escalation","taskId":"T3","data":{"attempt":1}}
+{"ts":"2026-10-22T22:59:11.586Z","event":"task-dispatch","taskId":"T3","data":{"attempt":1,"retryMode":"repair","assignment":{"adapter":"codex","model":"gpt-6.1-sol"}}}
+{"ts":"2026-10-22T22:59:11.586Z","event":"phase-start","taskId":"T3","data":{"attempt":1,"phase":"worker","assignment":{"adapter":"codex","model":"gpt-6.1-sol"}}}
+{"ts":"2026-10-22T22:59:13.191Z","event":"worktree-recreation","taskId":"T3","data":{}}
+{"ts":"2026-10-22T22:59:13.213Z","event":"repair-dispatch","taskId":"T3","data":{}}
+{"ts":"2026-10-22T22:59:13.267Z","event":"worker-launch","taskId":"T3","data":{"attempt":1,"retryMode":"repair"}}
+{"ts":"2026-10-22T23:01:13.837Z","event":"worker-process-reaped","taskId":"T3","data":{"attempt":1}}
+{"ts":"2026-10-22T23:01:13.852Z","event":"worker-result","taskId":"T3","data":{"ok":true}}
+{"ts":"2026-10-22T23:01:13.923Z","event":"phase-start","taskId":"T3","data":{"phase":"gates"}}
+{"ts":"2026-10-22T23:01:14.192Z","event":"phase-start","taskId":"T3","data":{"index":1,"phase":"gate:build","gate":"build"}}
+{"ts":"2026-10-22T23:01:14.473Z","event":"build-receipt","taskId":"T3","data":{"gate":"build"}}
+{"ts":"2026-10-22T23:01:17.096Z","event":"build-receipt","taskId":"T3","data":{"durationMs":2623,"gate":"build"}}
+{"ts":"2026-10-22T23:01:17.128Z","event":"gate-result","taskId":"T3","data":{"details":"exit 0","attempt":1,"pass":true,"durationMs":2630,"gate":"build"}}
+{"ts":"2026-10-22T23:01:17.128Z","event":"phase-start","taskId":"T3","data":{"index":3,"phase":"gate:lint","gate":"lint"}}
+{"ts":"2026-10-22T23:01:17.669Z","event":"gate-result","taskId":"T3","data":{"details":"exit 0","attempt":1,"pass":true,"durationMs":232,"gate":"lint"}}
+{"ts":"2026-10-22T23:01:17.669Z","event":"phase-start","taskId":"T3","data":{"index":4,"phase":"gate:evidence","gate":"evidence"}}
+{"ts":"2026-10-22T23:01:17.711Z","event":"gate-result","taskId":"T3","data":{"details":"3 commit(s):\ndocs/codebase/INTEGRATIONS.md         |  10 +-","attempt":1,"pass":true,"durationMs":80,"gate":"evidence"}}
+{"ts":"2026-10-22T23:01:17.712Z","event":"phase-start","taskId":"T3","data":{"index":5,"phase":"gate:scope","gate":"scope"}}
+{"ts":"2026-10-22T23:01:17.764Z","event":"gate-result","taskId":"T3","data":{"details":"all 16 changed files in scope","attempt":1,"pass":true,"durationMs":100,"gate":"scope"}}
+{"ts":"2026-10-22T23:01:17.764Z","event":"phase-start","taskId":"T3","data":{"index":6,"phase":"judge","gate":"acceptance"}}
+{"ts":"2026-10-22T23:01:17.764Z","event":"phase-start","taskId":"T3","data":{"index":7,"phase":"review","gate":"review"}}
+{"ts":"2026-10-22T23:01:40.248Z","event":"gate-result","taskId":"T3","data":{"details":"oracle failed: test \"in a linked worktree whose commondir names a foreign repository holding its branch, a gate command's evidence receipt records no foreign subject and the gate state directory resolves outside that repository, while an intact worktree's receipt records its own HEAD, so a lookup following the rewritten commondir fails\" in tests/gates/cache-trusted-lookups.test.ts — suite file tests/gates/cache-trusted-lookups.test.ts is absent from the worktree or is not a regular file; the test command never started","attempt":1,"pass":false,"durationMs":22483,"gate":"acceptance","findings":[{}]}}
+{"ts":"2026-10-22T23:03:13.928Z","event":"gate-result","taskId":"T3","data":{"details":"reviewer claude-code:fable (vendor: anthropic; provider: anthropic): approved (2 deferred)\n- [deferred/minor] src/gates/baseline.ts:148 — beginGateEvidence's HEAD read now goes through gitSync, which builds an own-git pin (ref view, probe) per gate command; correct, but heavier than the raw read it replaces | searched: gitSync/ownGitPin in src/run/git.ts, beginGateEvidence callers | uncertain: per-process memoisation of the ref-backend probe — rationale: Correctness and trust are right; cost is bounded per gate command and not an acceptance concern.","attempt":1,"pass":true,"durationMs":116160,"gate":"review","reviewer":"claude-code:fable","invocations":[{"channel":"claude-code:fable"}],"findings":[{},{}]}}
+{"ts":"2026-10-22T23:03:13.999Z","event":"repair-attempt","taskId":"T3","data":{"of":2}}
+{"ts":"2026-10-22T23:03:13.999Z","event":"escalation","taskId":"T3","data":{"attempt":2}}
+{"ts":"2026-10-22T23:03:13.999Z","event":"task-human","taskId":"T3","data":{"reason":"pin codex:gpt-6.1-sol held: gate-fail","kind":"gate-fail"}}
+{"ts":"2026-10-22T23:03:14.001Z","event":"approval-window-start","data":{"windowMs":120000,"parked":["T3"]}}
+{"ts":"2026-10-22T23:05:14.004Z","event":"approval-window-expired","data":{"parked":["T3"]}}
+{"ts":"2026-10-22T23:05:14.060Z","event":"run-end","data":{"pending":[],"blocked":[],"runId":"run-20261022-222302-0000000000000049","failed":[],"human":["T3"],"done":[],"owedChecks":{"known":true,"outstanding":[]}}}

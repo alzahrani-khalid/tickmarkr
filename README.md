@@ -540,6 +540,12 @@ and resume and loads the board module (`hooks/board/register.tsx`); both execute
 permissions. The waiter wakes the session when the run ends, parks, a task fails or the daemon dies.
 The board shows the current run's status and decisions.
 
+The board opens itself beside the chat when the session's own folder holds tickmarkr state (a `.tickmarkr`
+directory); a terminal narrower than 144 columns may keep it closed until `/tickmarkr-board`. The board reads
+files only: it polls `tickmarkr board --json` over the run's folders every five seconds and writes nothing.
+Its harness marks are plain glyphs by default; the `marks` setting (Devicons logos in place of the glyphs)
+needs Claude Code 2.1.271 or later.
+
 The plugin and `tickmarkr init --agent` use the same skills:
 
 - **[/tickmarkr-loop](skills/tickmarkr-loop/SKILL.md)** — compile a spec, review the routing plan, run the engagement, and commit the Markdown record

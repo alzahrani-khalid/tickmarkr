@@ -1,0 +1,30 @@
+{
+  "name": "tkr-run-progress",
+  "version": "0.3.1",
+  "description": "Live pane and status line for the newest tickmarkr run, plus the release chain's CI and publish stages",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "stateRoots": {
+      "type": "string",
+      "title": "Run state roots",
+      "description": "Comma-separated .tickmarkr folders to read runs from; ~ and globs expand. The newest run across all of them shows.",
+      "default": ""
+    },
+    "releaseRoots": {
+      "type": "string",
+      "title": "Release folders",
+      "description": "Comma-separated release folders holding a ci-watch.log; ~ and globs expand. The newest log drives the release card. Empty hides it.",
+      "default": ""
+    },
+    "marks": {
+      "type": "string",
+      "title": "Harness marks",
+      "description": "glyph (default) draws a shape after each harness's logo in any font. devicons draws the real logo from the Devicons icon font (devicons.io); add Devicons to your terminal's font list first, or the marks draw as empty boxes.",
+      "default": "glyph",
+      "options": [
+        "glyph",
+        "devicons"
+      ]
+    }
+  }
+}

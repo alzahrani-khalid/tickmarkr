@@ -2,6 +2,41 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v2.19.0 — the run board opens itself beside the chat
+
+**v2.19.0** was delivered by one tickmarkr run of five tasks (run-20261102-100040-0000000000000576) and one hand fix
+verified by `tickmarkr verify`. Every task passed build, lint, evidence and scope, its acceptance criteria and the full test suite before it merged, and
+the run's tip passed a fresh full verification. Each task was reviewed by a model from another vendor. One review finding
+on the summarizer port, a timestamp offset form, was waived during the run. It was then fixed in the hand fix, which
+passed its own full verification and cross-vendor review.
+
+- **A run board in the Claude Code plugin.** The plugin's pane is now a full board for the newest run. It shows:
+  - each task's attempt history, in the form worker → checks → acceptance and review, with the reason for any red;
+  - what each task is doing now, and for how long, against the typical times of the repository's earlier runs;
+  - tokens per task;
+  - a critical-path ETA for a clean pass and for one repair round per task;
+  - a needs-you list whose Copy button copies the exact `tickmarkr approve` command;
+  - an optional release card.
+
+  The head names the spec the run is building, for example `v2.19.0-run-board · #576`. Every string from a journal
+  or release log is shown with its control characters escaped.
+- **It opens itself.** An interactive Claude Code session whose folder holds a `.tickmarkr` directory opens the board
+  beside the chat, without taking focus and without delaying your first prompt.
+  - It refreshes every five seconds, and stops when the folder's `.tickmarkr` goes away.
+  - A terminal narrower than 144 columns may keep the pane closed; the status line then points at `/tickmarkr-board`,
+    which opens it anywhere.
+- **`tickmarkr board --json`** prints the board snapshot as exactly one JSON line (wire version 1). It reads the
+  newest run across the repository's checkouts and git worktrees, plus any `--root` folders, and takes the release
+  card from `--release` folders. It reads files only and never runs git or any other process.
+- **The ETA is honest about history.** Typical times come from the newest earlier runs across the repository's
+  checkouts and worktrees, so a run in a fresh worktree still gets one. With no earlier run anywhere, the board shows
+  no ETA rather than a guess.
+- **Settings:**
+  - `stateRoots` adds run folders to read;
+  - `releaseRoots` adds the release card, and is empty by default;
+  - `marks` draws harness logos from the Devicons font in place of plain glyphs, and needs Claude Code 2.1.271 or
+    later.
+
 ## v2.18.0 — `tickmarkr init` tells you whether you are ready
 
 **v2.18.0** was delivered by one tickmarkr run of four tasks (run-20261102-040923-0000000000000427). Every task passed build, lint, evidence and

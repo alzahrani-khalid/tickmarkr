@@ -1,0 +1,6 @@
+{"taskId":"T1","shape":"judge"}
+{"taskId":"T1","shape":"implement","tokens":{"input":38,"output":9625,"cacheRead":1114522}}
+{"taskId":"T3","shape":"judge"}
+{"taskId":"T3","shape":"implement","tokens":{"input":106,"output":21516,"cacheRead":3403812}}
+{"taskId":"T2","shape":"judge"}
+{"taskId":"T2","shape":"implement"}

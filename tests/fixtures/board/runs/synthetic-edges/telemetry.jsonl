@@ -1,0 +1,3 @@
+{"taskId":"T5","shape":"implement","tokens":{"input":10,"output":2,"cacheRead":0}}
+{"taskId":"T5","shape":"implement","tokens":{"input":5,"output":null}}
+{"taskId":"constructor","shape":"review","tokens":{"input":99}}
