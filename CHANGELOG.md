@@ -2,6 +2,27 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v2.17.0 — the status board tells you what to do next
+
+**v2.17.0** was delivered by one tickmarkr run of three tasks (run-20261101-231717-0000000000000310). Every task passed build, lint, evidence and
+scope, its acceptance criteria, a cross-vendor review and the full test suite before it merged.
+
+- **One next action, in words, at the top of the board.** On a terminal, `tickmarkr status` now prints a single line
+  right after the run summary that says what to do next, and only when the run's own records support it:
+  - a parked task that needs your decision: `next: <task> needs you — <the recorded next action>`;
+  - a run still going: `next: follow it live — tickmarkr status --watch`;
+  - a finished run whose every task is done and whose tip verification passed:
+    `next: review the work on <branch> and merge it yourself — tickmarkr never merges to main`.
+  Nothing is inferred. A failed or unrecorded tip verification, a resume after the last run end, or a run end with no
+  recorded branch gives no merge advice.
+- **Quiet supervision stays quiet.** The supervision legend appears only when a tier is armed, stale or unreadable, or
+  owes a clear. A run with no supervision no longer prints a row of `ABSENT`.
+- **Only recorded evidence under each task.** A merged task shows just its row. Under any other task, the evidence row
+  lists only what was recorded: phase, last evidence, who is responsible, the blocker, the next action, and
+  `needs your decision`. It no longer prints placeholders like `responsible unrecorded` or `human-decision no`.
+- **Nothing that parses status changes.** The plain print (non-TTY or `NO_COLOR`), `--oneline`, `--json` and
+  `--watch --events` are byte-identical to 2.16.0, so skills, watchers and scripts read what they read before.
+
 ## v2.16.0 — `tickmarkr start`: describe what you want in one sentence and get a drafted, compiled and routed plan
 
 **v2.16.0** was delivered by one tickmarkr run of three tasks and one verified fix. Every task passed build, lint, evidence and

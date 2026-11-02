@@ -867,7 +867,7 @@ test("test: at 80 columns and at 120 columns the blocker kind and next action of
     const parked = taskBlock(frame, "T3").replace(/\s+/g, " ");
     expect(parked, `${columns} columns`).toContain("blocker human-decision");
     expect(parked, `${columns} columns`).toContain("next action Choose a decision: approve");
-    expect(parked, `${columns} columns`).toContain("human-decision yes");
+    expect(parked, `${columns} columns`).toContain("needs your decision");
     for (const line of frame.split("\n")) expect(cellWidth(line)).toBeLessThanOrEqual(columns);
   }
 });

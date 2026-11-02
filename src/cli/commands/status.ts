@@ -19,6 +19,7 @@ import { trackJournalRows } from "../../run/protocol.js";
 import { newestPark, permittedDecisionVerbs } from "./approve.js";
 import { decisionCommands } from "../../run/decision-verbs.js";
 import { currentOwed, endToEndFirstPass, firstPassText, leadLines, leadRows, needsYouText, wallText } from "./report.js";
+import { boardSummaryText, storyNext, supervisionQuiet } from "./status-story.js";
 import {
   Journal,
   bindingToken,
@@ -1530,6 +1531,8 @@ const renderFrame = (
     if (taskWidth < 12) {
       return cells.flatMap((cell) => {
         const effort = effortByTask.get(cell.t.id);
+        // Only recorded facts, sanitized before the emptiness check: nothing recorded, no evidence row.
+        const evidence = sanitizeTaskText(boardSummaryText(cell.summary, cell.merged));
         const deps = cell.t.deps.length ? cell.t.deps.join(", ") : "—";
         const tone = cell.redTier
           ? fail
@@ -1550,7 +1553,7 @@ const renderFrame = (
           `    ${tone(cell.t.id)}  ${dim(taskArea(cell.t))}  ${sanitizeTaskText(cell.t.title)}`,
           ...wrapCells(`    ${dim(machinery)}`, boardColumns, { continuationPrefix: "      " }),
           ...wrapCells(`    ${dim(noteFor(cell))}`, boardColumns, { continuationPrefix: "      " }).filter((line) => line.trim()),
-          ...wrapCells(`    ${dim(summaryText(cell.summary))}`, boardColumns, { continuationPrefix: "      " }),
+          ...(evidence ? wrapCells(`    ${dim(evidence)}`, boardColumns, { continuationPrefix: "      " }) : []),
           "",
         ];
       });
@@ -1560,6 +1563,7 @@ const renderFrame = (
     const ruleRow = `    ${"─".repeat(boardColumns - 4)}`;
     const rows = cells.flatMap((cell) => {
       const effort = effortByTask.get(cell.t.id);
+      const evidence = sanitizeTaskText(boardSummaryText(cell.summary, cell.merged));
       const columns = [
         wrapCells(cell.t.id, idWidth - 1),
         wrapCells(taskArea(cell.t), areaWidth - 2),
@@ -1591,7 +1595,7 @@ const renderFrame = (
         + dim(fitColumn(columns[5]![index] ?? "", channelWidth))
         + dim(fitColumn(columns[6]![index] ?? "", attemptWidth, 1))
         + dim(fitCells(columns[7]![index] ?? "", noteWidth))
-      ), ...wrapCells(`    ${dim(summaryText(cell.summary))}`, boardColumns, { continuationPrefix: "      " })];
+      ), ...(evidence ? wrapCells(`    ${dim(evidence)}`, boardColumns, { continuationPrefix: "      " }) : [])];
     });
     return [legend(headerRow), dim(ruleRow), ...rows];
   };
@@ -1604,13 +1608,25 @@ const renderFrame = (
   ];
 
   const effort = effortPanel(g.tasks, record && !comparable ? undefined : events, boardColumns);
+  // The one next action, from facts this frame already holds: only the NEWEST run-end may name the
+  // branch, and only while the run has ended — never an older run-end or an inferred branch.
+  const endBranch = [...events].reverse().find((event) => event.event === "run-end")?.data.branch;
+  const next = storyNext({
+    tasks: cells.map((cell) => ({ id: cell.t.id, merged: cell.merged, summary: cell.summary })),
+    daemonAlive: daemon.state === "alive",
+    ...(ended && typeof endBranch === "string" && endBranch !== "" ? { runEnd: { branch: endBranch } } : {}),
+    allDone: done === total,
+    tipPassed: verify === "verify passed",
+  });
   return {
     content: boardRows(
       [
         ...leadRows(lead, boardColumns),
+        ...(next === undefined ? [] : [sanitizeTaskText(next)]),
         ...headerRows,
         ...nowLine,
-        supervisionLegend,
+        // Quiet supervision (every tier absent or stood down, no clear obligation) says nothing worth a row.
+        ...(supervisionQuiet(supervision) ? [] : [supervisionLegend]),
         "",
         taskSection,
         "",
