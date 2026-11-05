@@ -1,5 +1,6 @@
 import { chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterAll, afterEach, expect, test, vi } from "vitest";
 import { codex, CODEX_NO_DAEMON } from "../../src/adapters/codex.js";
 import { flagDriftWarnings } from "../../src/adapters/registry.js";
@@ -41,9 +42,10 @@ test("both existing Codex forms request no-daemon at their declared argv positio
     interactive: codex.interactiveCommand(promptFile, "gpt-5.2")!,
   });
 
-  // Declared positions: immediately after --dangerously-bypass-hook-trust in both forms — after `exec` in the headless
-  // and worker forms, before the prompt positional in the TUI form. Exactly once, on every host: the builders take no
-  // host input, so the same bytes are built under the Herdr app, classic herdr, Orca and a plain shell.
+  // Declared positions: --no-daemon is a ROOT option (absent from `codex exec --help`), so the headless and worker forms
+  // carry it before `exec` and the TUI form immediately after --dangerously-bypass-hook-trust (2.20.1, D-2183). Exactly
+  // once, on every host: the builders take no host input, so the same bytes are built under the Herdr app, classic
+  // herdr, Orca and a plain shell.
   const built = new Set<string>();
   for (const [host, env] of Object.entries(HOSTS)) {
     for (const [k, v] of Object.entries(env)) vi.stubEnv(k, v);
@@ -52,10 +54,10 @@ test("both existing Codex forms request no-daemon at their declared argv positio
   }
   const { headless, worker, interactive } = forms();
   for (const cmd of [headless, worker]) {
-    expect(cmd.split(" ").slice(0, 6)).toEqual(["codex", "exec", "--sandbox", "workspace-write", "--dangerously-bypass-hook-trust", CODEX_NO_DAEMON]);
+    expect(cmd.split(" ").slice(0, 6)).toEqual(["codex", CODEX_NO_DAEMON, "exec", "--sandbox", "workspace-write", "--dangerously-bypass-hook-trust"]);
     expect(cmd.split(CODEX_NO_DAEMON)).toHaveLength(2);
     expect(cmd.endsWith(`--model 'gpt-5.2' - < ${shq(promptFile)}`)).toBe(true);
-    expect(cmd.split(/\s+/, 4).join(" ")).toBe("codex exec --sandbox workspace-write"); // the first-four census
+    expect(cmd.split(/\s+/, 4).join(" ")).toBe("codex --no-daemon exec --sandbox"); // the first-four census names no runner
   }
   expect(worker).toBe(headless.replace(" --model ", " -c 'sandbox_workspace_write.writable_roots=[]' --model "));
   expect(interactive.split(" ").slice(0, 7)).toEqual(["codex", "-a", "never", "-s", "workspace-write", "--dangerously-bypass-hook-trust", CODEX_NO_DAEMON]);
@@ -78,8 +80,8 @@ test("both existing Codex forms request no-daemon at their declared argv positio
   };
   for (const cmd of [headless, worker]) {
     const argv = await argvOf(cmd);
-    expect(argv.indexOf(CODEX_NO_DAEMON)).toBe(4); // exec --sandbox workspace-write --dangerously-bypass-hook-trust --no-daemon
-    expect(argv[0]).toBe("exec");
+    expect(argv.indexOf(CODEX_NO_DAEMON)).toBe(0); // --no-daemon exec --sandbox workspace-write --dangerously-bypass-hook-trust
+    expect(argv[1]).toBe("exec");
   }
   const tui = await argvOf(interactive);
   expect(tui.indexOf(CODEX_NO_DAEMON)).toBe(5); // -a never -s workspace-write --dangerously-bypass-hook-trust --no-daemon
@@ -130,3 +132,39 @@ test("both existing Codex forms request no-daemon at their declared argv positio
     ]);
   }
 }, 120_000);
+
+// 2.20.1 (D-2183): 2.20.0 put the ROOT option --no-daemon after `exec`, and real codex-cli 0.166.0 refused every headless
+// launch ("unexpected argument '--no-daemon' found"); the stubs above accept any argv, so nothing here saw it. Each form's
+// flags must appear in the captured help of the codex command that parses them: root help before `exec`, exec help after.
+const HELP_DIR = fileURLToPath(new URL("../fixtures/codex-help/", import.meta.url));
+const helpFlags = (file: string): Set<string> => new Set(readFileSync(join(HELP_DIR, file), "utf8").split("\n")
+  .filter((line) => /^\s+-/.test(line)).flatMap((line) => line.trim().split(/[\s,]+/).filter((t) => /^--?[A-Za-z][\w-]*$/.test(t))));
+const formFlags = (cmd: string): { root: string[]; exec: string[] } => {
+  const head = cmd.split(" - < ")[0]!.split(" \"$(cat ")[0]!.split(/\s+/);
+  const at = head.indexOf("exec");
+  const flags = (tokens: string[]) => tokens.filter((t) => /^--?[A-Za-z][\w-]*$/.test(t));
+  return at < 0 ? { root: flags(head.slice(1)), exec: [] } : { root: flags(head.slice(1, at)), exec: flags(head.slice(at + 1)) };
+};
+
+test("every Codex form's flags appear in the captured help of the codex command that parses them so a root option placed after exec fails", () => {
+  const root = helpFlags("root-0.166.0.txt");
+  const exec = helpFlags("exec-0.166.0.txt");
+  expect(root.has(CODEX_NO_DAEMON)).toBe(true);
+  expect(exec.has(CODEX_NO_DAEMON)).toBe(false); // the captured fact behind the hotfix
+  const promptFile = "/p/prompt.md";
+  const forms = {
+    headless: codex.headlessCommand(promptFile, "gpt-5.2", "high"),
+    worker: codex.invoke({} as never, "/w", { model: "gpt-5.2", channel: "sub", tier: "mid" }, { promptFile }).command,
+    interactive: codex.interactiveCommand(promptFile, "gpt-5.2", "high")!,
+  };
+  for (const [name, cmd] of Object.entries(forms)) {
+    const { root: before, exec: after } = formFlags(cmd);
+    for (const flag of before) expect(root.has(flag), `${name}: ${flag} before exec must be a root option`).toBe(true);
+    for (const flag of after) expect(exec.has(flag), `${name}: ${flag} after exec must be an exec option`).toBe(true);
+    expect([...before, ...after]).toContain(CODEX_NO_DAEMON);
+  }
+  // Control: 2.20.0's headless shape is refused by this check.
+  const old = formFlags("codex exec --sandbox workspace-write --dangerously-bypass-hook-trust --no-daemon --model 'm' - < '/p'");
+  expect(old.exec.filter((flag) => !exec.has(flag))).toEqual([CODEX_NO_DAEMON]);
+});
+

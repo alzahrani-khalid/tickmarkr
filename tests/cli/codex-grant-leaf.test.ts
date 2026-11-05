@@ -347,7 +347,8 @@ test("test: daemon runs dispatching a Codex worker over the headless transport, 
     // Queue row 2 (D-2112): compare the actual task registration, not the test driver's command.
     expect(roots, mode).toEqual([gitdir, `${common}/objects`, `${common}/refs/heads/tickmarkr`, `${common}/logs/refs/heads/tickmarkr`]);
     expect(child.cwd).toContain("T1");
-    expect(child.args[0]).toBe(mode === "interactive" ? "-a" : "exec");
+    // 2.20.1 (D-2183): --no-daemon is a root option, so the headless forms begin with it and `exec` follows.
+    expect(child.args.slice(0, mode === "interactive" ? 1 : 2)).toEqual(mode === "interactive" ? ["-a"] : ["--no-daemon", "exec"]);
     const events = Journal.open(repo, runId).read();
     expect(events.some(e => e.event === "worker-mode-fallback")).toBe(mode === "oversized");
 

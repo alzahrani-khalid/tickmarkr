@@ -125,10 +125,12 @@ export function renderCodexGitGrant(ctx?: Partial<WorkerLaunchContext>): string 
 const CODEX_HOOK_TRUST = "--dangerously-bypass-hook-trust";
 // Queue row 340 (D-2180): `codex --help` (captured with hc 0.1.17) documents --no-daemon as "Run without the shared
 // background server, even if it is already running"; hc's manual requires it so a worker's tools stay in its own
-// terminal's process tree instead of a shared app-server. Shipped unconditionally on BOTH existing forms on every host,
-// at one declared position — immediately after CODEX_HOOK_TRUST (after `exec` in the headless form, before the prompt
-// in the TUI form). No help probe and no fallback: a CLI too old for it fails its launch visibly, and doctor's advisory
-// flag-drift row names it (hardcodedFlags below).
+// terminal's process tree instead of a shared app-server. Shipped unconditionally on BOTH existing forms on every host.
+// It is a ROOT option, absent from `codex exec --help`: `codex exec … --no-daemon` exits 2 with "unexpected argument
+// '--no-daemon' found" (codex-cli 0.166.0, 2.20.1 hotfix, D-2183), so the headless form carries it BEFORE `exec`, and the
+// TUI form immediately after CODEX_HOOK_TRUST. tests/fixtures/codex-help holds both captured help texts; every flag of
+// each form must appear in the help of the command that parses it. No help probe and no fallback: a CLI too old for it
+// fails its launch visibly, and doctor's advisory flag-drift row names it (hardcodedFlags below).
 export const CODEX_NO_DAEMON = "--no-daemon";
 // OBS-1182: config override, not a flag — codex has no --effort. Absent renders nothing (CLI default);
 // placed before --model so --model's value stays the last flag before the prompt, as it always was.
@@ -276,7 +278,7 @@ export function codexMcpSuppressionFlags(configPath?: string): string {
 
 // Queue row 2 (D-2112): non-worker seats omit the grant; workers carry the rendered argument.
 const codexExec = (promptFile: string, model: string, effort: Effort | undefined, grant: string): string =>
-  `codex exec --sandbox workspace-write ${CODEX_HOOK_TRUST} ${CODEX_NO_DAEMON} ${codexMcpSuppressionFlags()}${grant}${codexEffortFlag(effort)} --model ${shq(model)} - < ${shq(promptFile)}`;
+  `codex ${CODEX_NO_DAEMON} exec --sandbox workspace-write ${CODEX_HOOK_TRUST} ${codexMcpSuppressionFlags()}${grant}${codexEffortFlag(effort)} --model ${shq(model)} - < ${shq(promptFile)}`;
 
 export const codex: WorkerAdapter = {
   id: "codex",

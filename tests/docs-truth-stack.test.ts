@@ -177,7 +177,7 @@ describe.skipIf(!existsSync(codebaseDocs))("docs-truth-stack", () => {
 
     // Verify key elements match adapter's headlessCommand
     expect(adapter).toContain("headlessCommand");
-    expect(docCommand).toContain("codex exec");
+    expect(docCommand).toContain("codex --no-daemon exec"); // a root option precedes exec (2.20.1, D-2183)
     expect(docCommand).toContain("--sandbox workspace-write");
     expect(docCommand).not.toContain("--full-auto"); // Verify old stale command is gone
     // Byte-equal to the adapter's zero-config rendering (CODEX_HOME pinned empty: the per-dispatch

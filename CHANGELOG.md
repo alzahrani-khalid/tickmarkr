@@ -2,6 +2,21 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v2.20.1 — Codex launches again
+
+**v2.20.1** fixes one defect in 2.20.0. 2.20.0 added Codex's `--no-daemon` option after `exec`, where the Codex CLI does
+not accept it (`error: unexpected argument '--no-daemon' found`). Every headless Codex call failed at launch: workers,
+acceptance judges, reviews and consults. A run whose cross-vendor reviewer was Codex parked as an infrastructure failure.
+
+- **Codex headless commands put `--no-daemon` before `exec`** (`codex --no-daemon exec …`), where the CLI accepts it;
+  the interactive form keeps it as before. Codex still runs without the shared background server on every host.
+- **A new check keeps each Codex flag where Codex parses it.** Every flag of each Codex command is checked against the
+  captured help text of the Codex command that reads it (`codex --help` before `exec`, `codex exec --help` after), so an
+  option in the wrong place fails the test suite instead of a user's run.
+
+The fix passed cross-vendor review and its acceptance criteria, its review ran through the fixed Codex launch itself,
+and the full test suite passed on the release tree locally and in public CI on Linux and macOS.
+
 ## v2.20.0 — tickmarkr runs inside the Herdr app
 
 **v2.20.0** was delivered by one tickmarkr run of eight tasks (run-20261104-093422-0000000000000814) and a set of hand

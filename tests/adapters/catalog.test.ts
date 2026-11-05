@@ -377,7 +377,8 @@ test("the fable alias stamp reads claude-fable-5-1 with a dated comment and the 
     // (gitdir when distinct, common objects, the refs/heads/<D> ref and reflog pair; [] on refusal).
     // Queue row 2 (D-2112, D-2114): absent launch context renders a literal empty grant.
     // 2026-11-04 (queue row 340, D-2180): repinned when both forms gained --no-daemon.
-    codex: "b72814d74b46ad6f8d5836f42c82f6185218c5b1d1f837feaaa31764b324a32d",
+    // 2026-11-05 (2.20.1, D-2183): repinned when the headless form moved --no-daemon, a root option, before `exec`.
+    codex: "7d2f8989d666af3289d07711da3fdab8f1b7be57b79b30fb14aef4ca7cc91916",
     "cursor-agent": "b7ce2cbb18f5ccb2749739ffcc80c2d036b72193554189e4f07eff11ce16d8de",
     opencode: "15ce06482a58b5096642974bf4f9a1c3031b62b4aa4de46e6d8038f6cb94ad82",
     pi: "d8c6ab42a4052ee982ead3e119d02d4df8734429b36a129a9e926cf1c2f8c3b7",
