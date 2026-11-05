@@ -1262,14 +1262,18 @@ export class HerdrDriver implements ExecutorDriver {
     // trailer nor its absence, so it throws (the caller's decline) rather than read as an empty pane.
     // ponytail: other slots keep the historical empty-on-failure read; widen once seed/consult callers catch.
     if (r.code !== 0 && this.adoptedSlots.has(slot)) throw new Error(`herdr pane read ${pane} failed (exit ${r.code}): ${r.stderr || r.stdout}`);
-    return r.stdout;
+    // Queue row 342 (D-2180): empty-on-failure means EMPTY — a nonzero read's stdout is never pane text, so a failed
+    // read cannot hand any caller (the trust answer's selected-Yes proof above all) a frame it did not read.
+    return r.code === 0 ? r.stdout : "";
   }
 
   // v1.22 T5 / OBS-19: raw keystroke into the pane TUI (trust-dialog auto-answer). Resolves the pane
   // id fresh like every other pane-addressed call (ids compact). Fail closed on nonzero herdr exit.
+  // Queue row 342 (D-2180): the logical Down (the Claude trust selector) is herdr's lowercase `down`; every other key
+  // passes byte-identical. Whether Enter may follow is the caller's read-back decision, never this driver's.
   async sendKey(slot: Slot, key: string): Promise<void> {
     const pane = await this.paneId(slot);
-    const r = await this.herdr(`pane send-keys ${shq(pane)} ${shq(key)}`, slot.cwd);
+    const r = await this.herdr(`pane send-keys ${shq(pane)} ${shq(key === "Down" ? "down" : key)}`, slot.cwd);
     if (r.code !== 0) throw new Error(`herdr pane send-keys failed: ${r.stderr || r.stdout}`);
   }
 

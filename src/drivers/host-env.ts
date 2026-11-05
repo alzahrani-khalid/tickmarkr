@@ -74,6 +74,32 @@ export const HOST_SESSION_VARS = [
   "CLAUDE_CODE_BRIDGE_SESSION_ID",
 ] as const;
 
+// OBS-17 / v1.22 T3, OBS-843 and queue row 340 (D-2180): host control-plane vars that let a process address the
+// operator's herdr, Orca or Herdr app session. Workers and agent seats (worker/judge/review/consult and every headless
+// agent CLI) must never inherit them; only the daemon and its driver calls keep the live session. The HC pair addresses
+// the launching hc terminal and HC_SCOPE is that terminal's scope token: inherited, a role could act as ORCH, type into
+// it or become its child. Removing them is not a security boundary — any same-user process can still address the
+// default socket or app explicitly; core isolation is out of scope. TERM_PROGRAM is host description, not an
+// addressing capability, and ORCA_AGENT_HOOK_* belongs to agent status transport, so both stay. Lives in this leaf
+// module so git.ts and subprocess.ts share it without an import cycle; subprocess.ts re-exports the historical name.
+export const HERDR_CONTROL_VARS = [
+  "HERDR_ENV",
+  "HERDR_SOCKET_PATH",
+  "ORCA_TERMINAL_HANDLE",
+  "ORCA_PANE_KEY",
+  "ORCA_TAB_ID",
+  "HC_TERMINAL_ID",
+  "HC_TERMINAL_SOCKET",
+  "HC_SCOPE",
+] as const;
+
+/** Queue row 340 (D-2180): the inherited hc scope token. Its presence is recorded as a boolean only, never its value. */
+export const HC_SCOPE_ENV = "HC_SCOPE";
+/** The one prescribed warning for a daemon whose launching terminal's scope was inherited; carries no token. */
+export const HC_SCOPE_WARNING = "this daemon carries its launching terminal's scope and ends with it; detach with env -u HC_SCOPE";
+/** Whether `env` carries an hc scope token (nonblank). */
+export const hcScopePresent = (env: EnvLike): boolean => (env[HC_SCOPE_ENV] ?? "").trim() !== "";
+
 /** D-2174 (queue row 267): the seat marker. No launch inherits it: the daemon clears it at start, and every shell and
  * the worker seal strip it; only a judge, review or consult seat launch sets it, to its own role. */
 export const SEAT_MARKER_ENV = "TICKMARKR_SEAT";

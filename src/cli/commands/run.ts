@@ -1,7 +1,7 @@
 import { parseArgs } from "node:util";
 import { allAdapters, discoverChannels, probeAll, readDoctor } from "../../adapters/registry.js";
 import { ROUTING_MODES, type RoutingMode } from "../../config/config.js";
-import { classifyHost, parseDriverOverride, pickDriver, preflightHostDriver } from "../../drivers/index.js";
+import { captureHost, parseDriverOverride, pickDriver, preflightHostDriver } from "../../drivers/index.js";
 import type { ExecutorDriver } from "../../drivers/types.js";
 import { loadGraph, onDiskSpecHash, readCompileRefusal } from "../../graph/graph.js";
 import { type TaskStatus } from "../../graph/schema.js";
@@ -572,8 +572,9 @@ export async function run(argv: string[], cwd = process.cwd()): Promise<{ out: s
       if (lints.length) throw new Error(`--route-strict: routing lints present, refusing to dispatch:\n${lints.join("\n")}`);
     }
     await assertRefsWritable(cwd, "run");
-    const host = classifyHost();
-    await preflightHostDriver(cfg, driverOverride, host, cwd);
+    // Queue row 340 (D-2180): the ONE host snapshot; selection, evidence and the daemon's scope warning all read it.
+    const snapshot = captureHost();
+    await preflightHostDriver(cfg, driverOverride, snapshot.host, cwd);
     // The run id is minted HERE rather than inside the daemon, because the narration sink has to know
     // which run it is narrating before the first event arrives (the daemon's `narrate` callback is
     // handed an event and nothing else, and `run-start` carries no run id). `runDaemon` uses the id
@@ -583,7 +584,8 @@ export async function run(argv: string[], cwd = process.cwd()): Promise<{ out: s
     const s = await runDaemon(cwd, {
       runId,
       concurrency: values.concurrency ? Number(values.concurrency) : undefined,
-      driver: bindNarration(pickDriver(cfg, driverOverride, host), narrate),
+      driver: bindNarration(pickDriver(cfg, driverOverride, snapshot.host), narrate),
+      inheritedHcScope: snapshot.inheritedScope,
       mode: flagMode,
       supersedes: values.supersedes,
       narrate,

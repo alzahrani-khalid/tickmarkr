@@ -871,7 +871,7 @@ describe("T4 init closing block", () => {
     expect(out).toContain(
       "tickmarkr init --agent installs the tickmarkr-loop, tickmarkr-auto and tickmarkr-overseer skills + AGENTS.md so Claude Code (or any agent CLI) drives the loop natively",
     );
-    expect(out).toContain("no herdr or Orca terminal? same fail-closed gates, headless subprocess driver");
+    expect(out).toContain("no herdr, Herdr app or Orca terminal? same fail-closed gates, headless subprocess driver");
   });
 
   test("test: init's environments footer keeps the claude code row's existing text and appends the Claude Desktop form, naming the single-tier run on the headless subprocess driver and the status watch view, while the herdr, orca and anywhere rows are unchanged, so a footer that drops the existing claude code text or omits the Desktop form fails", async () => {
@@ -885,8 +885,9 @@ describe("T4 init closing block", () => {
     const existing = "tickmarkr init --agent installs the tickmarkr-loop, tickmarkr-auto and tickmarkr-overseer skills + AGENTS.md so Claude Code (or any agent CLI) drives the loop natively";
     const unchanged: Record<string, string> = {
       herdr: "the full cockpit — every worker, judge, and consult is a visible pane you can watch and unblock · https://herdr.dev · auto picks it first when HERDR_ENV=1",
-      orca: "visible terminals in the Orca app — auto picks it inside an Orca terminal after herdr and before subprocess; set driver: orca to force it · https://onorca.dev",
-      anywhere: "no herdr or Orca terminal? same fail-closed gates, headless subprocess driver (legacy: no herdr? same fail-closed gates, headless subprocess driver when Orca markers are absent)",
+      "herdr app": "visible hc terminals in task tabs beside ORCH — auto picks it after herdr when HC_TERMINAL_ID and HC_TERMINAL_SOCKET are set; outside one pass --driver herdr-app (a config driver: herdr-app is refused off its host)",
+      orca: "visible terminals in the Orca app — auto picks it inside an Orca terminal after herdr and the Herdr app and before subprocess; outside one pass --driver orca (a config driver: orca is refused off its host) · https://onorca.dev",
+      anywhere: "no herdr, Herdr app or Orca terminal? same fail-closed gates, headless subprocess driver",
     };
     // queue row 192: the claude code row keeps its text and appends the Desktop form after it.
     const findings = (text: string) => {

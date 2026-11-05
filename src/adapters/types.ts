@@ -456,9 +456,10 @@ export interface WorkerAdapter {
   // list as harness at the banner boundary: each row at most once, in list order, skipping allowed
   // (and, as the last row, a partial paint of a row it could still accept).
   harnessBannerRows?: readonly string[];
-  // Queue row 294: the pane review runs headlessCommand, so a CLI whose print mode buffers its whole output until it exits
-  // has written zero seat-authored bytes until its verdict, alive or dead. No shipped adapter declares this since claude seats
-  // stream; a declarer is not re-routed at the first-liveness beat, and the review ceiling bounds it instead (a dead launch costs that ceiling).
+  // Queue row 294: the pane review runs headlessCommand, so a CLI whose print mode buffers its whole output until it exits,
+  // or writes nothing while it reasons, has written zero seat-authored bytes until its verdict, alive or dead. No streaming
+  // adapter declares this; a declarer is not re-routed at the first-liveness beat, and the review ceiling bounds it instead
+  // (a dead launch costs that ceiling). Declared only on a measured silence past the beat (D-2180).
   paneReviewBuffersOutput?: boolean;
   // v1.2: launch the CLI's real interactive TUI with the prompt injected; null = adapter can't → print fallback
   interactiveCommand(promptFile: string, model: string, effort?: Effort, ctx?: WorkerLaunchContext): string | null;

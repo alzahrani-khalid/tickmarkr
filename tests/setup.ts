@@ -18,7 +18,8 @@ for (const k of [QUALITY_ENV, NO_EXPLORE_ENV]) delete process.env[k];
 // `orca` binary. vitest.config.ts seals HERDR_ENV/HERDR_SOCKET_PATH in the parent before workers
 // fork; this per-worker scrub seals the Orca pair (and HERDR_ENV again, for a worker whose parent
 // was not that config). Tests that need a host set it explicitly inside the test.
-for (const k of ["TERM_PROGRAM", "ORCA_TERMINAL_HANDLE", "HERDR_ENV"]) delete process.env[k];
+// Queue row 340 (D-2180): and the Herdr app's HC pair plus the launching terminal's HC_SCOPE, for the same reason.
+for (const k of ["TERM_PROGRAM", "ORCA_TERMINAL_HANDLE", "HERDR_ENV", "HC_TERMINAL_ID", "HC_TERMINAL_SOCKET", "HC_SCOPE"]) delete process.env[k];
 
 // D-1522 (2026-10-08): the same leak class for a CATALOG KEY. The operator's shell exports a real
 // ARTIFICIAL_ANALYSIS_API_KEY, so every catalog refresh under test grew an Artificial Analysis leg — two fleet

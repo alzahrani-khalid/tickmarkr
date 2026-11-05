@@ -1,7 +1,7 @@
 import { type ChildProcess, spawn, spawnSync, type SpawnSyncOptions, type SpawnSyncReturns } from "node:child_process";
 import { shq } from "../adapters/types.js";
 import { createWorktree, FORK_CAP_ENV, resolvedForkCap } from "../run/git.js";
-import { HOST_SESSION_VARS, SEAT_MARKER_ENV, withoutHostSession } from "./host-env.js";
+import { HERDR_CONTROL_VARS, HOST_SESSION_VARS, SEAT_MARKER_ENV, withoutHostSession } from "./host-env.js";
 import { workerReapHost } from "../run/stall.js";
 import type { ExecutorDriver, NotificationPost, NotifyOpts, Slot, TransportState } from "./types.js";
 
@@ -16,18 +16,8 @@ export type NotificationPoster = (command: string, args: string[], options: Spaw
 // consumers only ever tail-read.
 export const MAX_BUF = 2 * 1024 * 1024;
 
-// OBS-17 / v1.22 T3 and OBS-843: host control-plane vars that let a process address the operator's
-// herdr or Orca UI. Workers, judges, reviewers, and consults must never inherit them — only the
-// daemon process and its driver calls keep the live session. TERM_PROGRAM is host description, not
-// an addressing capability, and ORCA_AGENT_HOOK_* belongs to agent status transport, so both stay.
-// Keep the exported name for compatibility even though the list is now host-neutral.
-export const HERDR_CONTROL_VARS = [
-  "HERDR_ENV",
-  "HERDR_SOCKET_PATH",
-  "ORCA_TERMINAL_HANDLE",
-  "ORCA_PANE_KEY",
-  "ORCA_TAB_ID",
-] as const;
+// Host control vars moved to the leaf host-env.ts (queue row 340; D-2180) so git.ts shares them without a cycle.
+export { HERDR_CONTROL_VARS };
 
 /**
  * Copy of worker env with the fork cap applied and host control-plane and host-session vars stripped.

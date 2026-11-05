@@ -72,15 +72,20 @@ describe("extractVerdictJson", () => {
     const verdict = `noise\n{"nonce":"${nonce}","pass":true,"criteria":[]}\nTICKMARKR_EXIT_${nonce}:0`;
     const slot: Slot = { id: "s1", name: "judge · T1", cwd: "/tmp" };
     const sent: string[] = [];
+    // Queue row 342 (D-2180): Claude Code 2.1.318's captured dialog defaults to "No, exit", so its declared key is the
+    // submit that follows a verified Down — the captured before and after-Down hc screen reads, verbatim.
+    const captures = (JSON.parse(readFileSync(new URL("../fixtures/claude-trust/captures.json", import.meta.url), "utf8")) as { files: Record<string, string> }).files;
+    const screen = (file: string) => (JSON.parse(captures[file]!) as { text: string }).text;
+    let pane = screen("02-read-dialog.json");
     const driver: ExecutorDriver = {
       id: "trust-stub", interactive: true,
       slot: async () => slot,
       run: async () => {},
-      waitOutput: async () => sent.length > 0,
+      waitOutput: async () => pane === verdict,
       waitAgentStatus: async () => false,
       status: async () => "working",
-      read: async () => sent.length ? verdict : claudeCode.trustDialog.kind === "none" ? "" : claudeCode.trustDialog.fingerprint,
-      sendKey: async (_slot, key) => { sent.push(key); },
+      read: async () => pane,
+      sendKey: async (_slot, key) => { sent.push(key); pane = key === "Down" ? screen("04-read-after-down.json") : verdict; },
       notify: async () => {},
       close: async () => {},
       worktree: async () => "/tmp",
@@ -88,7 +93,7 @@ describe("extractVerdictJson", () => {
     setGateCpuAccountantFactoryForTests(() => ({ start: async () => {}, read: () => ({ cpu: { ms: 0, resolutionMs: 1 }, gaps: 0 }), stop: async () => {} }));
     try {
       const out = await runViaDriver({ ...claudeCode, streamTurn: undefined }, "sonnet", `TICKMARKR-JUDGE\n## Task T1: x\n${verdictNonceLine(nonce)}`, "/tmp", { driver, name: "judge · T1" }, 50);
-      expect(sent).toEqual(["Enter"]);
+      expect(sent).toEqual(["Down", claudeCode.trustDialog.kind === "none" ? "" : claudeCode.trustDialog.key]);
       expect(extractVerdictJson<{ pass: boolean }>(out, nonce)?.pass).toBe(true);
     } finally {
       resetGateCpuAccountantFactoryForTests();

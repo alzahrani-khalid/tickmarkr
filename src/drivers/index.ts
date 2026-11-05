@@ -1,17 +1,22 @@
 import type { TickmarkrConfig } from "../config/config.js";
-import { join } from "node:path";
+import { accessSync, constants, statSync } from "node:fs";
+import { delimiter, isAbsolute, join } from "node:path";
 import { stateDirName } from "../graph/graph.js";
-import { localeFinding, protectedFolderFinding } from "./host-env.js";
+import { hcScopePresent, localeFinding, protectedFolderFinding } from "./host-env.js";
+import { HcClient } from "./hc-client.js";
 import { HerdrDriver } from "./herdr.js";
+import { HerdrAppDriver } from "./herdr-app.js";
 import { shq } from "../adapters/types.js";
 import { sh } from "../run/git.js";
 import { canonicalWorktreePath, OrcaDriver, OrcaError, parseEnvelope, resolveOrcaCliBinary, terminalWorktree } from "./orca.js";
 import { SubprocessDriver } from "./subprocess.js";
 import type { ExecutorDriver } from "./types.js";
 
-export const DRIVER_CHOICES = ["auto", "herdr", "subprocess", "orca"] as const;
+export const DRIVER_CHOICES = ["auto", "herdr", "subprocess", "orca", "herdr-app"] as const;
 export type DriverChoice = (typeof DRIVER_CHOICES)[number];
-export type ClassifiedHost = "herdr" | "orca" | "none";
+export type ClassifiedHost = "herdr" | "herdr-app" | "orca" | "none";
+/** Run/resume's one captured launch instant: the host, and whether an hc scope token was inherited (boolean only). */
+export interface HostSnapshot { readonly host: ClassifiedHost; readonly inheritedScope: boolean }
 
 const overrideByDriver = new WeakMap<ExecutorDriver, DriverChoice>();
 // The host snapshot the driver was selected under: driverEvidence reads this, never process.env,
@@ -19,16 +24,45 @@ const overrideByDriver = new WeakMap<ExecutorDriver, DriverChoice>();
 const hostByDriver = new WeakMap<ExecutorDriver, ClassifiedHost>();
 
 /**
- * One host classifier beside the driver chooser reads the launching environment:
- * herdr only when HERDR_ENV is exactly 1, orca only when both Orca markers are present,
- * none otherwise. run and resume call it once at the refs-preflight point and thread the
- * result into pickDriver; nothing downstream reads the markers again.
+ * One host classifier beside the driver chooser reads the launching environment (CASE H, queue row 340; D-2180), in
+ * order: classic herdr only when HERDR_ENV is exactly 1; the Herdr app when BOTH HC_TERMINAL_ID and HC_TERMINAL_SOCKET
+ * are nonblank after trim; Orca only when TERM_PROGRAM is Orca and ORCA_TERMINAL_HANDLE is nonblank; none otherwise
+ * (either HC marker alone, blank markers or ghostty alone). Environment only: it executes no binary. run and resume
+ * call captureHost once at the refs-preflight point and thread the snapshot into pickDriver; nothing downstream reads
+ * the markers again.
  */
 export function classifyHost(env: NodeJS.ProcessEnv = process.env): ClassifiedHost {
-  if (env.HERDR_ENV === "1") return "herdr";
+  return hostMarkers(env)[0] ?? "none";
+}
+
+const nonblank = (v: string | undefined) => (v ?? "").trim() !== "";
+const HOST_MARKERS: readonly (readonly [Exclude<ClassifiedHost, "none">, (env: NodeJS.ProcessEnv) => boolean])[] = [
+  ["herdr", (env) => env.HERDR_ENV === "1"],
+  ["herdr-app", (env) => nonblank(env.HC_TERMINAL_ID) && nonblank(env.HC_TERMINAL_SOCKET)],
   // A whitespace-only handle is no handle: the narrator trims it and would refuse the split.
-  if (env.TERM_PROGRAM === "Orca" && (env.ORCA_TERMINAL_HANDLE ?? "").trim() !== "") return "orca";
-  return "none";
+  ["orca", (env) => env.TERM_PROGRAM === "Orca" && nonblank(env.ORCA_TERMINAL_HANDLE)],
+];
+
+/** Every host whose markers are present, in precedence order, BEFORE precedence picks one (D-2180 add.11): a row whose
+ * markers are present but which loses to an earlier host says so instead of claiming selection. */
+export function hostMarkers(env: NodeJS.ProcessEnv | Record<string, string | undefined> = process.env): Exclude<ClassifiedHost, "none">[] {
+  return HOST_MARKERS.filter(([, present]) => present(env as NodeJS.ProcessEnv)).map(([host]) => host);
+}
+
+/** D-2180 add.11: the ONE resolution — the wanted choice (an explicit --driver, else config), then auto by classifyHost
+ * precedence. pickDriver builds it, preflightHostDriver admits it, and every doctor and init host claim reads it. */
+export function resolveDriver(want: DriverChoice, host: ClassifiedHost): Exclude<DriverChoice, "auto"> {
+  return want === "auto" ? (host === "none" ? "subprocess" : host) : want;
+}
+
+/** A config driver naming a host-specific driver off its own host: run and resume refuse it (an explicit --driver bypasses). */
+export function configDriverRefused(cfgDriver: DriverChoice, host: ClassifiedHost): boolean {
+  return (cfgDriver === "herdr" || cfgDriver === "herdr-app" || cfgDriver === "orca") && cfgDriver !== host;
+}
+
+/** The immutable launch snapshot: later environment mutation (the daemon deletes HC_SCOPE) cannot change it. */
+export function captureHost(env: NodeJS.ProcessEnv = process.env): HostSnapshot {
+  return Object.freeze({ host: classifyHost(env), inheritedScope: hcScopePresent(env) });
 }
 
 const UNMANAGED_CHECKOUT = "checkout is not Orca-managed; run from an orca worktree create checkout or pass --driver subprocess";
@@ -71,11 +105,51 @@ async function admitOrcaCheckout(runRoot: string, env: NodeJS.ProcessEnv): Promi
 }
 
 /**
- * A config driver of herdr or orca whose host is not the classified one is refused naming the
- * detected host, the config line and the --driver remedy. Any explicit --driver value bypasses
- * that; auto and subprocess are never refused. Then, when the RESOLVED driver is orca (config,
- * auto on an Orca host, or an explicit flag), the run root is admitted by one probe before any run
- * directory, journal row or dispatch exists. Subprocess and herdr selections probe nothing.
+ * Queue row 340 (D-2180): the ONE hc / herdr-app executable resolution shared by doctor, preflight and the driver — the
+ * client environment's own PATH, where the hc client's execFile (argv, no shell, no login profile) runs it. A login
+ * shell lookup can see a profile-only install that no run can execute, so nothing here consults one. Filesystem only:
+ * it executes nothing. ponytail: relative PATH entries are skipped (cwd-dependent); an install reachable only through
+ * one reads absent everywhere, never admitted by one surface and refused by another.
+ */
+export function herdrAppBinary(bin: "hc" | "herdr-app", env: NodeJS.ProcessEnv | Record<string, string | undefined> = process.env): string | undefined {
+  for (const dir of (env.PATH ?? "").split(delimiter)) {
+    if (!isAbsolute(dir)) continue;
+    const path = join(dir, bin);
+    try {
+      if (statSync(path).isFile()) { accessSync(path, constants.X_OK); return path; }
+    } catch { /* absent or not executable here: the next PATH entry */ }
+  }
+  return undefined;
+}
+
+/**
+ * Queue row 340 (D-2180): admit a resolved herdr-app selection by the same validated client the driver uses — one
+ * `hc server status --json` against the launcher's core, through the hc that herdrAppBinary resolves (the one doctor
+ * reports and the driver runs). hc missing, a timeout, a signal, a nonzero exit or a malformed or incomplete body
+ * refuses visibly before any run state; it is never replaced by subprocess. Status may start a core: that is the
+ * selected intent. The app window is not consulted — without one, execution stays available.
+ */
+export async function admitHerdrApp(
+  env: NodeJS.ProcessEnv, hcBin: string | undefined = herdrAppBinary("hc", env), timeoutMs?: number,
+): Promise<{ coreId: string; version: string }> {
+  if (!hcBin) {
+    throw new Error("refusing driver 'herdr-app': hc not installed on this process's PATH; no other driver is substituted " +
+      "(install hc, start the Herdr app, or choose another --driver)");
+  }
+  try {
+    const status = await new HcClient({ hcBin, env, timeoutMs }).status();
+    return { coreId: status.coreId, version: status.version };
+  } catch (e) {
+    throw new Error(`refusing driver 'herdr-app': hc server status failed — ${(e as Error).message.split("\n")[0]}; ` +
+      "no other driver is substituted (install hc, start the Herdr app, or choose another --driver)");
+  }
+}
+
+/**
+ * A config driver of herdr, herdr-app or orca whose host is not the classified one is refused naming the detected
+ * host, the config line and the --driver remedy. Any explicit --driver value bypasses that; auto and subprocess are
+ * never refused. Then the RESOLVED driver is admitted before any run directory, journal row or dispatch exists: orca
+ * by its checkout probe, herdr-app by hc server status. Subprocess and herdr selections probe nothing.
  */
 export async function preflightHostDriver(
   cfg: TickmarkrConfig,
@@ -83,6 +157,7 @@ export async function preflightHostDriver(
   host: ClassifiedHost,
   runRoot: string,
   env: NodeJS.ProcessEnv = process.env,
+  opts: { hcBin?: string; timeoutMs?: number } = {},
 ): Promise<void> {
   const locale = localeFinding(env);
   if (locale.verdict === "warn") console.warn(`tickmarkr: warning: locale — ${locale.detail}`);
@@ -90,15 +165,16 @@ export async function preflightHostDriver(
   const folders = protectedFolderFinding(root, canonicalWorktreePath(join(root, stateDirName(runRoot))),
     process.platform, env.HOME ? canonicalWorktreePath(env.HOME) : undefined);
   if (folders) process.stderr.write(`warning: ${folders.detail}\n`);
-  if (driverOverride === undefined && (cfg.driver === "herdr" || cfg.driver === "orca") && cfg.driver !== host) {
+  if (driverOverride === undefined && configDriverRefused(cfg.driver, host)) {
     const remedy = host === "none" ? "subprocess" : host;
     throw new Error(
       `refusing driver '${cfg.driver}' (config line 'driver: ${cfg.driver}'): detected host is ${host}; use --driver ${remedy} to override`,
     );
   }
   const want = parseDriverOverride(driverOverride) ?? cfg.driver;
-  const resolved = want === "auto" ? (host === "none" ? "subprocess" : host) : want;
+  const resolved = resolveDriver(want, host);
   if (resolved === "orca") await admitOrcaCheckout(runRoot, env);
+  if (resolved === "herdr-app") await admitHerdrApp(env, opts.hcBin, opts.timeoutMs);
 }
 
 /**
@@ -124,10 +200,13 @@ export function driverEvidence(cfg: TickmarkrConfig, driver: ExecutorDriver, ove
   if (want !== "auto") return `${driver.id} (config)`;
   const host = hostByDriver.get(driver);
   if (host === "herdr" && driver.id === "herdr") return "auto → herdr (HERDR_ENV=1)";
+  if (host === "herdr-app" && driver.id === "herdr-app") return "auto → herdr-app (HC_TERMINAL_ID+HC_TERMINAL_SOCKET)";
   if (host === "orca" && driver.id === "orca") return "auto → orca (TERM_PROGRAM+ORCA_TERMINAL_HANDLE)";
   if (host === "none" && driver.id === "subprocess") return "auto → subprocess (HERDR_ENV unset)";
   return `auto → ${driver.id} (runtime)`;
 }
+
+const herdrAppDriver = () => new HerdrAppDriver({ hcBin: herdrAppBinary("hc"), appBin: herdrAppBinary("herdr-app") });
 
 export function pickDriver(cfg: TickmarkrConfig, override?: string, host: ClassifiedHost = classifyHost()): ExecutorDriver {
   const selectedOverride = parseDriverOverride(override);
@@ -135,14 +214,15 @@ export function pickDriver(cfg: TickmarkrConfig, override?: string, host: Classi
   // VIS-09 item 2: plumb the per-tab cap into the HerdrDriver — the driver takes it as a constructor
   // param and never imports config (cfg is the only seam). Guaranteed present: DEFAULT_CONFIG seeds
   // workersPerTab:3 and deepMerge overlays on top, so a missing overlay key still resolves.
-  const driver = want === "herdr" ? new HerdrDriver("herdr", cfg.visibility.workersPerTab)
-    : want === "subprocess" ? new SubprocessDriver()
+  const resolved = resolveDriver(want, host);
+  const driver = resolved === "herdr" ? new HerdrDriver("herdr", cfg.visibility.workersPerTab)
+    // Queue row 340 (D-2180): the hc client keeps the launcher's HC pair (process.env) to reach its core, and runs the
+    // hc and herdr-app that preflight admitted and doctor reported (herdrAppBinary), never a later PATH lookup.
+    : resolved === "herdr-app" ? herdrAppDriver()
       // Orca is an operator-selected execution surface. Its runtime failure stays on Orca; selection
       // must never substitute a hidden subprocess worker after an explicit or detected choice.
-      : want === "orca" ? new OrcaDriver()
-        : host === "herdr" ? new HerdrDriver("herdr", cfg.visibility.workersPerTab)
-          : host === "orca" ? new OrcaDriver()
-            : new SubprocessDriver();
+      : resolved === "orca" ? new OrcaDriver()
+        : new SubprocessDriver();
   if (selectedOverride !== undefined) overrideByDriver.set(driver, selectedOverride);
   hostByDriver.set(driver, host);
   return driver;

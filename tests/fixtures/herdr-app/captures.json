@@ -1,0 +1,190 @@
+{
+  "source": "verbatim subset of specs/v2.20.0-herdr-app-captures.json (queue row 340; D-2180): the public export omits specs/, so the suite loads its capture bytes from here",
+  "upstream": "Installed hc 0.1.17 and herdr-app 0.1.12, captured verbatim 2026-11-04 by spec-surgeon-2200; keys identify executed probes. Output is the original concatenated stdout/stderr; nonzero error cases are stderr, as the client FORMAT specifies. Operator/sibling rows in app layouts are foreign and must survive.",
+  "captures": {
+    "C6": {
+      "output": "{\"core\":{\"id\":\"f191f9b1503d40cb5c557bf9f3701747\",\"name\":\"host\"},\"finished\":0,\"holder\":null,\"holders\":[],\"installed_by\":null,\"live\":0,\"pid\":83545,\"uptime_ms\":20,\"version\":\"0.1.17\"}\n",
+      "exit": 0
+    },
+    "Q1-create": {
+      "output": "{\"address\":\"t1\",\"agent\":\"env\",\"cwd\":\"/Users/operator/Desktop/CodingSpace/tickmarkr-seats/probe-2200\",\"name\":\"tkr-probe-1\",\"state\":\"live\",\"turn\":0}\n",
+      "exit": 0
+    },
+    "Q4-split-get": {
+      "output": "{\"address\":\"t8\",\"argv\":[\"cat\"],\"cols\":120,\"created_ms\":1793777843781,\"cwd\":\"/Users/operator/Desktop/CodingSpace/tickmarkr-seats/probe-2200\",\"die_with_parent\":false,\"exit_code\":null,\"finished_ms\":null,\"identity\":\"ghostty\",\"keep\":true,\"labels\":{\"herdr.seen\":\"0\",\"herdr.space\":\"sp23e6c839058eafead7eadb19e995be56\",\"herdr.tab\":\"tb288a8a5e76ddd5f1f63ce854af851102\",\"probe.name\":\"tkr-probe-5\",\"tickmarkr.owner\":\"tickmarkr:watch:run:0:run-surgeon\",\"tickmarkr.repo\":\"/Users/operator/Desktop/CodingSpace/tickmarkr-seats/tkr-2200\",\"where\":\"tickmarkr / tkr-probe-4\"},\"name\":null,\"notify\":true,\"parent\":null,\"pid\":85193,\"reason\":null,\"reported\":false,\"rm\":false,\"rows\":40,\"screen\":\"exact\",\"signal\":null,\"state\":\"live\",\"status\":null,\"status_ms\":null,\"template\":null,\"title\":\"\",\"turn\":0}\n",
+      "exit": 0
+    },
+    "Q3-status-get": {
+      "output": "{\"address\":\"t5\",\"argv\":[\"python3\",\"-u\",\"-c\",\"import os,sys;os.write(1,b'\\\\x1b[?1049h\\\\x1b[H\\\\x1b[2JTKR_FULLSCREEN_STATUS\\\\r\\\\n\\\\x1b]7501;state=idle:app=pi\\\\x1b\\\\\\\\');\\nfor line in sys.stdin:\\n state=line.strip();os.write(1,('\\\\r\\\\nACK '+state+'\\\\r\\\\n\\\\x1b]7501;state='+state+':app=pi\\\\x1b\\\\\\\\').encode())\"],\"cols\":200,\"created_ms\":1793777843820,\"cwd\":\"/Users/operator/Desktop/CodingSpace/tickmarkr-seats/probe-2200\",\"die_with_parent\":false,\"exit_code\":null,\"finished_ms\":null,\"identity\":\"ghostty\",\"keep\":false,\"labels\":{\"tickmarkr.owner\":\"tickmarkr:worker:probe:0:run-probe\"},\"name\":\"tkr-probe-7\",\"notify\":false,\"parent\":null,\"pid\":85200,\"reason\":null,\"reported\":true,\"rm\":false,\"rows\":120,\"screen\":\"exact\",\"signal\":null,\"state\":\"live\",\"status\":{\"app\":\"pi\",\"state\":\"idle\"},\"status_ms\":1793777843834,\"template\":null,\"title\":\"\",\"turn\":0}\n",
+      "exit": 0
+    },
+    "Q3-status-working-get": {
+      "output": "{\"address\":\"t5\",\"argv\":[\"python3\",\"-u\",\"-c\",\"import os,sys;os.write(1,b'\\\\x1b[?1049h\\\\x1b[H\\\\x1b[2JTKR_FULLSCREEN_STATUS\\\\r\\\\n\\\\x1b]7501;state=idle:app=pi\\\\x1b\\\\\\\\');\\nfor line in sys.stdin:\\n state=line.strip();os.write(1,('\\\\r\\\\nACK '+state+'\\\\r\\\\n\\\\x1b]7501;state='+state+':app=pi\\\\x1b\\\\\\\\').encode())\"],\"cols\":200,\"created_ms\":1793777843820,\"cwd\":\"/Users/operator/Desktop/CodingSpace/tickmarkr-seats/probe-2200\",\"die_with_parent\":false,\"exit_code\":null,\"finished_ms\":null,\"foreground\":{\"argv\":[\"/opt/homebrew/Cellar/python@3.14/3.14.7/Frameworks/Python.framework/Versions/3.14/Resources/Python.app/Contents/MacOS/Python\",\"-u\",\"-c\",\"import os,sys;os.write(1,b'\\\\x1b[?1049h\\\\x1b[H\\\\x1b[2JTKR_FULLSCREEN_STATUS\\\\r\\\\n\\\\x1b]7501;state=idle:app=pi\\\\x1b\\\\\\\\');\\nfor line in sys.stdin:\\n state=line.strip();os.write(1,('\\\\r\\\\nACK '+state+'\\\\r\\\\n\\\\x1b]7501;state='+state+':app=pi\\\\x1b\\\\\\\\').encode())\"],\"cwd\":\"/Users/operator/Desktop/CodingSpace/tickmarkr-seats/probe-2200\",\"name\":\"Python\",\"pid\":85200},\"identity\":\"ghostty\",\"keep\":false,\"labels\":{\"tickmarkr.owner\":\"tickmarkr:worker:probe:0:run-probe\"},\"name\":\"tkr-probe-7\",\"notify\":false,\"parent\":null,\"pid\":85200,\"reason\":null,\"reported\":true,\"rm\":false,\"rows\":120,\"screen\":\"exact\",\"signal\":null,\"state\":\"live\",\"status\":{\"app\":\"pi\",\"state\":\"working\"},\"status_ms\":1793777844881,\"template\":null,\"title\":\"\",\"turn\":0}\n",
+      "exit": 0
+    },
+    "Q1-value-charset": {
+      "output": "{\"address\":\"t5\",\"argv\":[\"python3\",\"-u\",\"-c\",\"import os,sys;os.write(1,b'\\\\x1b[?1049h\\\\x1b[H\\\\x1b[2JTKR_FULLSCREEN_STATUS\\\\r\\\\n\\\\x1b]7501;state=idle:app=pi\\\\x1b\\\\\\\\');\\nfor line in sys.stdin:\\n state=line.strip();os.write(1,('\\\\r\\\\nACK '+state+'\\\\r\\\\n\\\\x1b]7501;state='+state+':app=pi\\\\x1b\\\\\\\\').encode())\"],\"cols\":200,\"created_ms\":1793777843820,\"cwd\":\"/Users/operator/Desktop/CodingSpace/tickmarkr-seats/probe-2200\",\"die_with_parent\":false,\"exit_code\":null,\"finished_ms\":null,\"foreground\":{\"argv\":[\"/opt/homebrew/Cellar/python@3.14/3.14.7/Frameworks/Python.framework/Versions/3.14/Resources/Python.app/Contents/MacOS/Python\",\"-u\",\"-c\",\"import os,sys;os.write(1,b'\\\\x1b[?1049h\\\\x1b[H\\\\x1b[2JTKR_FULLSCREEN_STATUS\\\\r\\\\n\\\\x1b]7501;state=idle:app=pi\\\\x1b\\\\\\\\');\\nfor line in sys.stdin:\\n state=line.strip();os.write(1,('\\\\r\\\\nACK '+state+'\\\\r\\\\n\\\\x1b]7501;state='+state+':app=pi\\\\x1b\\\\\\\\').encode())\"],\"cwd\":\"/Users/operator/Desktop/CodingSpace/tickmarkr-seats/probe-2200\",\"name\":\"Python\",\"pid\":85200},\"identity\":\"ghostty\",\"keep\":false,\"labels\":{\"probe.value\":\"colon:space value/λ\",\"tickmarkr.owner\":\"tickmarkr:worker:probe:0:run-probe\"},\"name\":\"tkr-probe-7\",\"notify\":false,\"parent\":null,\"pid\":85200,\"reason\":null,\"reported\":true,\"rm\":false,\"rows\":120,\"screen\":\"exact\",\"signal\":null,\"state\":\"live\",\"status\":{\"app\":\"pi\",\"state\":\"working\"},\"status_ms\":1793777844881,\"template\":null,\"title\":\"\",\"turn\":0}\n",
+      "exit": 0
+    },
+    "Q3-direct-read": {
+      "output": "{\"complete\":true,\"how\":\"history\",\"text\":\"7f7d7f621694cdc133548e9a3eb50d7f1dfdf6abd00bef37d46d18bc7967a433  -\\n\\nTKR_LONG_SENT\"}\n",
+      "exit": 0
+    },
+    "Q3-tui-read": {
+      "output": "{\"complete\":false,\"how\":\"screen\",\"text\":\"TKR_FULLSCREEN\\nTRAILER visible\"}\n",
+      "exit": 0
+    },
+    "Q3-tui-screen": {
+      "output": "{\"complete\":true,\"how\":\"screen\",\"text\":\"TKR_FULLSCREEN\\nTRAILER visible\"}\n",
+      "exit": 0
+    },
+    "Q3-status-working-read": {
+      "output": "{\"complete\":false,\"how\":\"screen\",\"text\":\"TKR_FULLSCREEN_STATUS\\nworking\\n\\nACK working\",\"why\":\"working\"}\n",
+      "exit": 0
+    },
+    "Q2-send": {
+      "output": "{\"started\":null,\"status\":null,\"turn\":0}\n",
+      "exit": 0
+    },
+    "Q3-status-working": {
+      "output": "{\"started\":true,\"status\":\"idle\",\"turn\":0}\n",
+      "exit": 0
+    },
+    "Q3-keys": {
+      "output": "{\"status\":\"working\",\"turn\":0}\n",
+      "exit": 0
+    },
+    "Q2-wait": {
+      "output": "{\"children\":[],\"ended\":true,\"exit_code\":7,\"reason\":\"exit\",\"signal\":null,\"status\":null,\"terminal\":\"t1\",\"turn\":0}\n",
+      "exit": 0
+    },
+    "Q3-status-idle": {
+      "output": "{\"children\":[],\"ended\":true,\"exit_code\":null,\"reason\":\"status\",\"signal\":null,\"status\":\"idle\",\"terminal\":\"t5\",\"turn\":0}\n",
+      "exit": 0
+    },
+    "Q3-list": {
+      "output": "{\"hidden_finished\":0,\"terminals\":[{\"address\":\"t1\",\"agent\":\"env\",\"cwd\":\"/Users/operator/Desktop/CodingSpace/tickmarkr-seats/probe-2200\",\"exit_code\":7,\"name\":\"tkr-probe-1\",\"reason\":\"exited\",\"state\":\"finished\",\"turn\":0},{\"address\":\"t2\",\"agent\":\"bash\",\"cwd\":\"/Users/operator/Desktop/CodingSpace/tickmarkr-seats/probe-2200\",\"exit_code\":7,\"name\":\"tkr-probe-2\",\"reason\":\"exited\",\"state\":\"finished\",\"turn\":0},{\"address\":\"t3\",\"agent\":\"python3\",\"cwd\":\"/Users/operator/Desktop/CodingSpace/tickmarkr-seats/probe-2200\",\"name\":\"tkr-probe-3\",\"state\":\"live\",\"turn\":0},{\"address\":\"t4\",\"agent\":\"bash\",\"cwd\":\"/Users/operator/Desktop/CodingSpace/tickmarkr-seats/probe-2200\",\"exit_code\":0,\"name\":\"tkr-probe-6\",\"reason\":\"exited\",\"state\":\"finished\",\"turn\":0},{\"address\":\"t5\",\"agent\":\"pi\",\"cwd\":\"/Users/operator/Desktop/CodingSpace/tickmarkr-seats/probe-2200\",\"name\":\"tkr-probe-7\",\"state\":\"live\",\"status\":\"working\",\"turn\":0}]}\n",
+      "exit": 0
+    },
+    "Q2-finished-send": {
+      "output": "{\"error\":{\"hint\":\"hc read t2\",\"kind\":\"finished\",\"message\":\"t2 has finished\"}}\n",
+      "exit": 11
+    },
+    "Q3-missing-read": {
+      "output": "{\"error\":{\"hint\":\"see `hc ls --all`\",\"kind\":\"not_found\",\"message\":\"no terminal \\\"t999999\\\"\"}}\n",
+      "exit": 3
+    },
+    "Q4-split": {
+      "output": "{\n  \"pane\": \"pa5469d4e41497dcec6841ab183c03c69\",\n  \"terminal\": \"t8\"\n}\n",
+      "exit": 0
+    },
+    "Q4-rename": {
+      "output": "{\n  \"ok\": true\n}\n",
+      "exit": 0
+    },
+    "Q4-split-layout": {
+      "output": "{\n  \"spaces\": [\n    {\n      \"id\": \"sp23e6c839058eafead7eadb19e995be56\",\n      \"name\": \"tickmarkr\",\n      \"folder\": \"/Users/operator\",\n      \"machine\": null,\n      \"active\": true,\n      \"tabs\": [\n        {\n          \"id\": \"tb57d958e1b418abf2bf856ec7e6a56d2e\",\n          \"name\": \"1\",\n          \"active\": true,\n          \"settled\": false,\n          \"terminals\": [\n            {\n              \"terminal\": \"t1\",\n              \"pane\": \"pfbd1bdc58078e3bcd3392b8d75ccb65b\",\n              \"status\": \"idle\",\n              \"app\": \"claude-code\",\n              \"name\": null,\n              \"sub_agents\": [\n                \"t5\",\n                \"t6\"\n              ]\n            }\n          ]\n        },\n        {\n          \"id\": \"tb288a8a5e76ddd5f1f63ce854af851102\",\n          \"name\": \"tkr-probe-4\",\n          \"active\": false,\n          \"settled\": false,\n          \"terminals\": [\n            {\n              \"terminal\": \"t7\",\n              \"pane\": \"p28f23ce78c4e7a31308a5c720c2d6468\",\n              \"status\": null,\n              \"app\": null,\n              \"name\": \"tkr-probe-4\",\n              \"sub_agents\": []\n            },\n            {\n              \"terminal\": \"t8\",\n              \"pane\": \"pa5469d4e41497dcec6841ab183c03c69\",\n              \"status\": null,\n              \"app\": null,\n              \"name\": null,\n              \"sub_agents\": []\n            }\n          ]\n        },\n        {\n          \"id\": \"tbc02cb7dd8b88a2e55df73cab3edc9308\",\n          \"name\": \"SURGEON · 2.20.0\",\n          \"active\": false,\n          \"settled\": false,\n          \"terminals\": [\n            {\n              \"terminal\": \"t6\",\n              \"pane\": \"p8be878753092780f6eee139231b0130e\",\n              \"status\": \"working\",\n              \"app\": \"codex\",\n              \"name\": \"spec-surgeon-2200\",\n              \"sub_agents\": []\n            }\n          ]\n        },\n        {\n          \"id\": \"tb55246198059adac27585d442d34c1763\",\n          \"name\": \"ATLAS · 2190\",\n          \"active\": false,\n          \"settled\": false,\n          \"terminals\": [\n            {\n              \"terminal\": \"t5\",\n              \"pane\": \"p5582fb2055896dc1bad63eec95989a10\",\n              \"status\": \"working\",\n              \"app\": \"codex\",\n              \"name\": \"atlas-2190\",\n              \"sub_agents\": []\n            }\n          ]\n        }\n      ]\n    },\n    {\n      \"id\": \"spa440972b59dbb92d2fa7cb880572d259\",\n      \"name\": \"~\",\n      \"folder\": \"/Users/operator\",\n      \"machine\": null,\n      \"active\": false,\n      \"tabs\": [\n        {\n          \"id\": \"tb0967628f7173067a269c9da1df4adce9\",\n          \"name\": \"1\",\n          \"active\": true,\n          \"settled\": false,\n          \"terminals\": [\n            {\n              \"terminal\": \"t2\",\n              \"pane\": \"pe95b7d6f6acc2c8b6652532d4fc8475d\",\n              \"status\": null,\n              \"app\": null,\n              \"name\": null,\n              \"sub_agents\": []\n            }\n          ]\n        }\n      ]\n    }\n  ],\n  \"recent\": []\n}\n",
+      "exit": 0
+    },
+    "CLEAN-real-split-kill": {
+      "output": "{\"address\":\"t8\",\"argv\":[\"cat\"],\"cols\":120,\"created_ms\":1793777843781,\"cwd\":\"/Users/operator/Desktop/CodingSpace/tickmarkr-seats/probe-2200\",\"die_with_parent\":false,\"exit_code\":null,\"finished_ms\":1793777939382,\"identity\":\"ghostty\",\"keep\":true,\"labels\":{\"herdr.seen\":\"0\",\"herdr.space\":\"sp23e6c839058eafead7eadb19e995be56\",\"herdr.tab\":\"tb288a8a5e76ddd5f1f63ce854af851102\",\"probe.name\":\"tkr-probe-5\",\"tickmarkr.owner\":\"tickmarkr:watch:run:0:run-surgeon\",\"tickmarkr.repo\":\"/Users/operator/Desktop/CodingSpace/tickmarkr-seats/tkr-2200\",\"where\":\"tickmarkr / tkr-probe-4\"},\"name\":null,\"notify\":true,\"parent\":null,\"pid\":85193,\"reason\":\"killed\",\"reported\":false,\"rm\":false,\"rows\":40,\"screen\":\"exact\",\"signal\":1,\"state\":\"finished\",\"status\":null,\"status_ms\":null,\"template\":null,\"title\":\"\",\"turn\":0}\n",
+      "exit": 0
+    },
+    "CLEAN-real-split-rm": {
+      "output": "{\"removed\":\"t8\"}\n",
+      "exit": 0
+    },
+    "CLEAN-real-layout": {
+      "output": "{\n  \"spaces\": [\n    {\n      \"id\": \"sp23e6c839058eafead7eadb19e995be56\",\n      \"name\": \"tickmarkr\",\n      \"folder\": \"/Users/operator\",\n      \"machine\": null,\n      \"active\": true,\n      \"tabs\": [\n        {\n          \"id\": \"tb57d958e1b418abf2bf856ec7e6a56d2e\",\n          \"name\": \"1\",\n          \"active\": true,\n          \"settled\": false,\n          \"terminals\": [\n            {\n              \"terminal\": \"t1\",\n              \"pane\": \"pfbd1bdc58078e3bcd3392b8d75ccb65b\",\n              \"status\": \"idle\",\n              \"app\": \"claude-code\",\n              \"name\": null,\n              \"sub_agents\": [\n                \"t5\",\n                \"t6\"\n              ]\n            }\n          ]\n        },\n        {\n          \"id\": \"tbc02cb7dd8b88a2e55df73cab3edc9308\",\n          \"name\": \"SURGEON · 2.20.0\",\n          \"active\": false,\n          \"settled\": false,\n          \"terminals\": [\n            {\n              \"terminal\": \"t6\",\n              \"pane\": \"p8be878753092780f6eee139231b0130e\",\n              \"status\": \"working\",\n              \"app\": \"codex\",\n              \"name\": \"spec-surgeon-2200\",\n              \"sub_agents\": []\n            }\n          ]\n        },\n        {\n          \"id\": \"tb55246198059adac27585d442d34c1763\",\n          \"name\": \"ATLAS · 2190\",\n          \"active\": false,\n          \"settled\": false,\n          \"terminals\": [\n            {\n              \"terminal\": \"t5\",\n              \"pane\": \"p5582fb2055896dc1bad63eec95989a10\",\n              \"status\": \"working\",\n              \"app\": \"codex\",\n              \"name\": \"atlas-2190\",\n              \"sub_agents\": []\n            }\n          ]\n        }\n      ]\n    },\n    {\n      \"id\": \"spa440972b59dbb92d2fa7cb880572d259\",\n      \"name\": \"~\",\n      \"folder\": \"/Users/operator\",\n      \"machine\": null,\n      \"active\": false,\n      \"tabs\": [\n        {\n          \"id\": \"tb0967628f7173067a269c9da1df4adce9\",\n          \"name\": \"1\",\n          \"active\": true,\n          \"settled\": false,\n          \"terminals\": [\n            {\n              \"terminal\": \"t2\",\n              \"pane\": \"pe95b7d6f6acc2c8b6652532d4fc8475d\",\n              \"status\": null,\n              \"app\": null,\n              \"name\": null,\n              \"sub_agents\": []\n            }\n          ]\n        }\n      ]\n    }\n  ],\n  \"recent\": []\n}\n",
+      "exit": 0
+    },
+    "Q6-window-absent": {
+      "output": "herdr-app: no Herdr window at /Users/operator/Desktop/CodingSpace/tickmarkr-seats/probe-2200/no-window/herdr-app.sock: No such file or directory (os error 2)\n",
+      "exit": 2
+    },
+    "R1-private-start": {
+      "stdout": "{\"core\":{\"id\":\"6cbddbb9ee1f3afcd9e3e7691515f5ca\",\"name\":\"host\"},\"finished\":0,\"holder\":null,\"holders\":[],\"installed_by\":null,\"live\":0,\"pid\":24206,\"uptime_ms\":7,\"version\":\"0.1.17\"}\n",
+      "stderr": "hc: launchd startup failed; starting directly (may end with the launching app): launchd process did not complete the detach handshake within 10 s (it may be an older binary); removing the job before direct startup\n",
+      "output": "{\"core\":{\"id\":\"6cbddbb9ee1f3afcd9e3e7691515f5ca\",\"name\":\"host\"},\"finished\":0,\"holder\":null,\"holders\":[],\"installed_by\":null,\"live\":0,\"pid\":24206,\"uptime_ms\":7,\"version\":\"0.1.17\"}\nhc: launchd startup failed; starting directly (may end with the launching app): launchd process did not complete the detach handshake within 10 s (it may be an older binary); removing the job before direct startup\n",
+      "exit": 0
+    },
+    "R1-env-run": {
+      "stdout": "{\"address\":\"t1\",\"agent\":\"sh\",\"cwd\":\"/Users/operator/Desktop/CodingSpace/tickmarkr-seats/probe-2200\",\"name\":\"tkr-probe-r1-env\",\"state\":\"live\",\"turn\":0}\n",
+      "stderr": "",
+      "output": "{\"address\":\"t1\",\"agent\":\"sh\",\"cwd\":\"/Users/operator/Desktop/CodingSpace/tickmarkr-seats/probe-2200\",\"name\":\"tkr-probe-r1-env\",\"state\":\"live\",\"turn\":0}\n",
+      "exit": 0
+    },
+    "R1-env-wait": {
+      "stdout": "{\"children\":[],\"ended\":true,\"exit_code\":0,\"reason\":\"exit\",\"signal\":null,\"status\":null,\"terminal\":\"t1\",\"turn\":0}\n",
+      "stderr": "",
+      "output": "{\"children\":[],\"ended\":true,\"exit_code\":0,\"reason\":\"exit\",\"signal\":null,\"status\":null,\"terminal\":\"t1\",\"turn\":0}\n",
+      "exit": 0
+    },
+    "R1-env-get": {
+      "stdout": "{\"address\":\"t1\",\"argv\":[\"sh\",\"-c\",\"env | grep -E \\\"^(FOO|HC_)\\\"\"],\"cols\":200,\"created_ms\":1793780012919,\"cwd\":\"/Users/operator/Desktop/CodingSpace/tickmarkr-seats/probe-2200\",\"die_with_parent\":false,\"exit_code\":0,\"finished_ms\":1793780012939,\"identity\":\"ghostty\",\"keep\":false,\"labels\":{\"tickmarkr.owner\":\"tickmarkr:other:env:1:run-surgeon-r1\"},\"name\":\"tkr-probe-r1-env\",\"notify\":false,\"parent\":null,\"pid\":24229,\"reason\":\"exited\",\"reported\":false,\"rm\":false,\"rows\":120,\"screen\":\"exact\",\"signal\":null,\"state\":\"finished\",\"status\":null,\"status_ms\":null,\"template\":null,\"title\":\"\",\"turn\":0}\n",
+      "stderr": "",
+      "output": "{\"address\":\"t1\",\"argv\":[\"sh\",\"-c\",\"env | grep -E \\\"^(FOO|HC_)\\\"\"],\"cols\":200,\"created_ms\":1793780012919,\"cwd\":\"/Users/operator/Desktop/CodingSpace/tickmarkr-seats/probe-2200\",\"die_with_parent\":false,\"exit_code\":0,\"finished_ms\":1793780012939,\"identity\":\"ghostty\",\"keep\":false,\"labels\":{\"tickmarkr.owner\":\"tickmarkr:other:env:1:run-surgeon-r1\"},\"name\":\"tkr-probe-r1-env\",\"notify\":false,\"parent\":null,\"pid\":24229,\"reason\":\"exited\",\"reported\":false,\"rm\":false,\"rows\":120,\"screen\":\"exact\",\"signal\":null,\"state\":\"finished\",\"status\":null,\"status_ms\":null,\"template\":null,\"title\":\"\",\"turn\":0}\n",
+      "exit": 0
+    },
+    "R1-env-read": {
+      "stdout": "{\"complete\":true,\"how\":\"history\",\"text\":\"HC_SESSION=tkr-surgeon-probe-r1\\nHC_TERMINAL_SOCKET=/Users/operator/Desktop/CodingSpace/tickmarkr-seats/probe-2200/r1.sock\\nHC_SCOPE=12361945397432-dbb41958d8cee79af62b6723688e9bb3\\nHC_TERMINAL_ID=t1\"}\n",
+      "stderr": "",
+      "output": "{\"complete\":true,\"how\":\"history\",\"text\":\"HC_SESSION=tkr-surgeon-probe-r1\\nHC_TERMINAL_SOCKET=/Users/operator/Desktop/CodingSpace/tickmarkr-seats/probe-2200/r1.sock\\nHC_SCOPE=12361945397432-dbb41958d8cee79af62b6723688e9bb3\\nHC_TERMINAL_ID=t1\"}\n",
+      "exit": 0
+    },
+    "R1-alt-exit-run": {
+      "stdout": "{\"address\":\"t2\",\"agent\":\"python3\",\"cwd\":\"/Users/operator/Desktop/CodingSpace/tickmarkr-seats/probe-2200\",\"name\":\"tkr-probe-r1-alt-exit\",\"state\":\"live\",\"turn\":0}\n",
+      "stderr": "",
+      "output": "{\"address\":\"t2\",\"agent\":\"python3\",\"cwd\":\"/Users/operator/Desktop/CodingSpace/tickmarkr-seats/probe-2200\",\"name\":\"tkr-probe-r1-alt-exit\",\"state\":\"live\",\"turn\":0}\n",
+      "exit": 0
+    },
+    "R1-alt-exit-get": {
+      "stdout": "{\"address\":\"t2\",\"argv\":[\"python3\",\"-c\",\"import os;os.write(1,b'\\\\x1b[?1049h\\\\x1b[H\\\\x1b[2JALT_FINISHED\\\\r\\\\nTICKMARKR_RESULT_RONE {\\\"ok\\\":true}\\\\r\\\\n')\"],\"cols\":200,\"created_ms\":1793780012971,\"cwd\":\"/Users/operator/Desktop/CodingSpace/tickmarkr-seats/probe-2200\",\"die_with_parent\":false,\"exit_code\":0,\"finished_ms\":1793780012990,\"identity\":\"ghostty\",\"keep\":false,\"labels\":{\"tickmarkr.owner\":\"tickmarkr:other:alt-exit:1:run-surgeon-r1\"},\"name\":\"tkr-probe-r1-alt-exit\",\"notify\":false,\"parent\":null,\"pid\":24236,\"reason\":\"exited\",\"reported\":false,\"rm\":false,\"rows\":120,\"screen\":\"exact\",\"signal\":null,\"state\":\"finished\",\"status\":null,\"status_ms\":null,\"template\":null,\"title\":\"\",\"turn\":0}\n",
+      "stderr": "",
+      "output": "{\"address\":\"t2\",\"argv\":[\"python3\",\"-c\",\"import os;os.write(1,b'\\\\x1b[?1049h\\\\x1b[H\\\\x1b[2JALT_FINISHED\\\\r\\\\nTICKMARKR_RESULT_RONE {\\\"ok\\\":true}\\\\r\\\\n')\"],\"cols\":200,\"created_ms\":1793780012971,\"cwd\":\"/Users/operator/Desktop/CodingSpace/tickmarkr-seats/probe-2200\",\"die_with_parent\":false,\"exit_code\":0,\"finished_ms\":1793780012990,\"identity\":\"ghostty\",\"keep\":false,\"labels\":{\"tickmarkr.owner\":\"tickmarkr:other:alt-exit:1:run-surgeon-r1\"},\"name\":\"tkr-probe-r1-alt-exit\",\"notify\":false,\"parent\":null,\"pid\":24236,\"reason\":\"exited\",\"reported\":false,\"rm\":false,\"rows\":120,\"screen\":\"exact\",\"signal\":null,\"state\":\"finished\",\"status\":null,\"status_ms\":null,\"template\":null,\"title\":\"\",\"turn\":0}\n",
+      "exit": 0
+    },
+    "R1-alt-exit-screen": {
+      "stdout": "{\"complete\":true,\"how\":\"screen\",\"text\":\"ALT_FINISHED\\nTICKMARKR_RESULT_RONE {\\\"ok\\\":true}\"}\n",
+      "stderr": "",
+      "output": "{\"complete\":true,\"how\":\"screen\",\"text\":\"ALT_FINISHED\\nTICKMARKR_RESULT_RONE {\\\"ok\\\":true}\"}\n",
+      "exit": 0
+    },
+    "R1-alt-exit-history": {
+      "stdout": "{\"complete\":false,\"how\":\"history\",\"text\":\"ALT_FINISHED\\nTICKMARKR_RESULT_RONE {\\\"ok\\\":true}\"}\n",
+      "stderr": "",
+      "output": "{\"complete\":false,\"how\":\"history\",\"text\":\"ALT_FINISHED\\nTICKMARKR_RESULT_RONE {\\\"ok\\\":true}\"}\n",
+      "exit": 0
+    },
+    "R1-alt-return-screen": {
+      "stdout": "{\"complete\":true,\"how\":\"screen\",\"text\":\"TICKMARKR_RESULT_RONE {\\\"ok\\\":true}\"}\n",
+      "stderr": "",
+      "output": "{\"complete\":true,\"how\":\"screen\",\"text\":\"TICKMARKR_RESULT_RONE {\\\"ok\\\":true}\"}\n",
+      "exit": 0
+    },
+    "R1-alt-return-history": {
+      "stdout": "{\"complete\":true,\"how\":\"history\",\"text\":\"TICKMARKR_RESULT_RONE {\\\"ok\\\":true}\"}\n",
+      "stderr": "",
+      "output": "{\"complete\":true,\"how\":\"history\",\"text\":\"TICKMARKR_RESULT_RONE {\\\"ok\\\":true}\"}\n",
+      "exit": 0
+    },
+    "R1-clean-t1-rm": {
+      "stdout": "{\"removed\":\"t1\"}\n",
+      "stderr": "",
+      "output": "{\"removed\":\"t1\"}\n",
+      "exit": 0
+    },
+    "R1-clean-list": {
+      "stdout": "{\"hidden_finished\":0,\"terminals\":[]}\n",
+      "stderr": "",
+      "output": "{\"hidden_finished\":0,\"terminals\":[]}\n",
+      "exit": 0
+    },
+    "R1-clean-core-identity": {
+      "stdout": "{\"core\":{\"id\":\"6cbddbb9ee1f3afcd9e3e7691515f5ca\",\"name\":\"host\"},\"finished\":0,\"holder\":{\"current\":true,\"instance\":\"7fbcce1ebda66e41d8956316789289da\",\"pid\":24228,\"terminals\":0},\"holders\":[{\"current\":true,\"instance\":\"7fbcce1ebda66e41d8956316789289da\",\"pid\":24228,\"terminals\":0}],\"installed_by\":null,\"live\":0,\"pid\":24206,\"uptime_ms\":80173,\"version\":\"0.1.17\"}\n",
+      "stderr": "",
+      "output": "{\"core\":{\"id\":\"6cbddbb9ee1f3afcd9e3e7691515f5ca\",\"name\":\"host\"},\"finished\":0,\"holder\":{\"current\":true,\"instance\":\"7fbcce1ebda66e41d8956316789289da\",\"pid\":24228,\"terminals\":0},\"holders\":[{\"current\":true,\"instance\":\"7fbcce1ebda66e41d8956316789289da\",\"pid\":24228,\"terminals\":0}],\"installed_by\":null,\"live\":0,\"pid\":24206,\"uptime_ms\":80173,\"version\":\"0.1.17\"}\n",
+      "exit": 0
+    }
+  }
+}

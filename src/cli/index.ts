@@ -47,14 +47,14 @@ export const USAGE = `tickmarkr — spec-driven orchestration harness for AI cod
 usage: tickmarkr <command>
   acp           serve Agent Client Protocol v1 over stdio (stdout is protocol only)
   init          guided setup + doctor; init --agent [--force] [--docs] adds agent skills/docs
-  doctor        re-probe adapters, herdr, auth; print capability matrix (--fix writes the test-runner ignore when a safe edit exists)
+  doctor        re-probe adapters, hosts, auth; print capability matrix (--fix writes the test-runner ignore when a safe edit exists)
   fleet         interactive fleet editor (fleet --print for CI drift checks)
   start "<idea>" one sentence → drafted spec, compiled graph and routed plan card (--yes --force; never runs)
   compile <src> spec → .tickmarkr/graph.json (fails without acceptance criteria)
   scope <intent> preview locally with --preview; draft after confirmation or --yes (--force to overwrite)
   plan          dry-run routing table + cost estimate + floor lints
   eval          discover and validate fixtures, seed isolated temp repos, then clean them up
-  run           execute the graph (--concurrency N --driver auto|herdr|subprocess|orca --route-strict; orca runs only when named)
+  run           execute the graph (--concurrency N --driver auto|herdr|subprocess|orca|herdr-app --route-strict; auto: herdr, herdr-app, orca, else subprocess)
   status        live run state (--watch --events: JSON documents on stdout, keepalives on stderr; 2>&1 corrupts the stream)
   wait [<run>]  block until attention or run end (--after <line> --timeout <n>s|m|h --json)
   board --json  print the newest run as one JSON line for the Claude Code board pane (--root <dir|glob> --release <dir|glob>, each repeatable)

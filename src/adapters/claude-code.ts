@@ -72,11 +72,23 @@ export type ClaudeAlias = keyof typeof CLAUDE_ALIAS_IDENTITY_STAMPS;
 export type ClaudeAliasIdentityProbe = (cwd: string, alias: ClaudeAlias) => string | undefined;
 
 // v1.75 T2 / OBS-137: current Claude Code workspace-trust prompt (2.1.218). The full question
-// distinguishes this startup gate from routine agent text; Enter accepts the selected trust option.
+// distinguishes this startup gate from routine agent text.
+// Queue row 342 (D-2180): Claude Code 2.1.318 renders the same question with its cursor on "No, exit" — a bare
+// Enter EXITS the seat. So for this fingerprint `key` is the SUBMIT key only: src/run/trust-dialog.ts sends Down,
+// re-reads the rendered frame and presses Enter only when the captured rows below prove "Yes" is selected.
 export const CLAUDE_TRUST_DIALOG: TrustDialog = {
   fingerprint: "Quick safety check: Is this a project you created or one you trust?",
   key: "Enter",
 };
+
+// Queue row 342 (D-2180): the option rows and footer, verbatim from OBSERVER's hc screen captures of Claude Code
+// 2.1.318 (02-read-dialog before Down, 04-read-after-down after it; tests/fixtures/claude-trust). Leading indents are
+// load-bearing and never trimmed; the caret's padding is the only byte a comparison may normalise (U+00A0 → U+0020).
+export const CLAUDE_TRUST_OPTION_ROWS = {
+  noSelected: [" ❯ No, exit", "   Yes, I trust this folder"],
+  yesSelected: ["   No, exit", " ❯ Yes, I trust this folder"],
+  footer: " Enter to confirm · Esc to cancel",
+} as const;
 
 // OBS-201/262 nudge deliverability: claude-code is the ONLY member of NUDGEABLE_ADAPTERS, and the
 // driver's deliverTyped pincer (readiness stable-frame → type → read-back → verified submit) needs a

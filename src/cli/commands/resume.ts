@@ -1,7 +1,7 @@
 import { parseArgs } from "node:util";
 import { readDoctor } from "../../adapters/registry.js";
 import { loadConfig } from "../../config/config.js";
-import { classifyHost, parseDriverOverride, pickDriver, preflightHostDriver } from "../../drivers/index.js";
+import { captureHost, parseDriverOverride, pickDriver, preflightHostDriver } from "../../drivers/index.js";
 import { loadGraph } from "../../graph/graph.js";
 import { formatSummary, runDaemon } from "../../run/daemon.js";
 import { denyPreferCollisionLine, denyPreferCollisions } from "../../route/preference.js";
@@ -19,7 +19,7 @@ export async function resume(argv: string[], cwd = process.cwd()): Promise<{ out
     allowPositionals: true,
   });
   const runId = positionals[0];
-  if (!runId) throw new Error("usage: tickmarkr resume <run-id> [--graph-changed] [--retry-failed] [--driver <auto|herdr|subprocess|orca>]");
+  if (!runId) throw new Error("usage: tickmarkr resume <run-id> [--graph-changed] [--retry-failed] [--driver <auto|herdr|subprocess|orca|herdr-app>]");
   const driverOverride = parseDriverOverride(values.driver);
   // T3: --graph-changed is the operator's audited release of the engagement-identity guard (Sol #2 /
   // Fable F2) — the daemon refuses a mismatched/unbound journal unless this is set, then journals a
@@ -38,8 +38,9 @@ export async function resume(argv: string[], cwd = process.cwd()): Promise<{ out
     throw new Error(collisions.map(denyPreferCollisionLine).join("; "));
   }
   await assertRefsWritable(cwd, "resume");
-  const host = classifyHost();
-  await preflightHostDriver(cfg, driverOverride, host, cwd);
+  // Queue row 340 (D-2180): the ONE host snapshot; selection, evidence and the daemon's scope warning all read it.
+  const snapshot = captureHost();
+  await preflightHostDriver(cfg, driverOverride, snapshot.host, cwd);
   const narrate = narrationSink(runId);
   const s = await runDaemon(cwd, {
     runId,
@@ -47,7 +48,8 @@ export async function resume(argv: string[], cwd = process.cwd()): Promise<{ out
     graphChanged,
     retryFailed,
     // bound to the same sink the daemon gets, so a driver-journaled recovery reaches this rail too
-    driver: bindNarration(pickDriver(cfg, driverOverride, host), narrate),
+    driver: bindNarration(pickDriver(cfg, driverOverride, snapshot.host), narrate),
+    inheritedHcScope: snapshot.inheritedScope,
     // v1.99 T2: the ONE narration sink — the quiet rail on a TTY, the raw journal formatter on a
     // pipe. A resumed run meets the same surface a fresh one does; printing the raw formatter here
     // would leave `resume` as the last place the old unfiltered dump survives. Bound to the run id

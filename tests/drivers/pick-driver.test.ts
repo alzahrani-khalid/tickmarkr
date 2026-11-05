@@ -97,10 +97,10 @@ describe("pickDriver", () => {
     expect(legacyPickDriver(DEFAULT_CONFIG, "not-a-driver").id).toBe("fallback");
 
     await expect(run(["--driver", "not-a-driver"], missingRepo)).rejects.toThrow(
-      "usage: --driver must be one of auto | herdr | subprocess | orca (got not-a-driver)",
+      "usage: --driver must be one of auto | herdr | subprocess | orca | herdr-app (got not-a-driver)",
     );
     await expect(resume(["run-test", "--driver", "not-a-driver"], missingRepo)).rejects.toThrow(
-      "usage: --driver must be one of auto | herdr | subprocess | orca (got not-a-driver)",
+      "usage: --driver must be one of auto | herdr | subprocess | orca | herdr-app (got not-a-driver)",
     );
 
     expect(runDaemonSpy).not.toHaveBeenCalled();
@@ -200,7 +200,8 @@ describe("pickDriver", () => {
   }, 60_000);
 
   test("the config template driver comment README and INTEGRATIONS state that auto resolves herdr then orca on both Orca markers then subprocess and that orca is named explicitly outside an Orca terminal as the diff shows in the changed lines of those three files", () => {
-    const expectedRule = "auto: herdr when HERDR_ENV=1, then orca when TERM_PROGRAM=Orca + ORCA_TERMINAL_HANDLE, else subprocess; name orca explicitly outside an Orca terminal";
+    // Queue row 340 (D-2180): the Herdr app sits between herdr and Orca in the one auto order.
+    const expectedRule = "auto: herdr when HERDR_ENV=1, then herdr-app when HC_TERMINAL_ID + HC_TERMINAL_SOCKET, then orca when TERM_PROGRAM=Orca + ORCA_TERMINAL_HANDLE, else subprocess; elsewhere pass --driver herdr-app or --driver orca (a config driver: herdr-app or orca is refused off its host)";
     const readme = readFileSync(join(import.meta.dirname, "../../README.md"), "utf8");
     const integrations = readFileSync(join(import.meta.dirname, "../../docs/codebase/INTEGRATIONS.md"), "utf8");
 
@@ -210,11 +211,13 @@ describe("pickDriver", () => {
       expect(document).toContain("HERDR_ENV=1");
       expect(document).toContain("TERM_PROGRAM=Orca");
       expect(document).toContain("ORCA_TERMINAL_HANDLE");
-      expect(normalized).toMatch(/then (?:Orca|`OrcaDriver`).*then (?:subprocess|`SubprocessDriver`)/);
+      expect(document).toContain("HC_TERMINAL_ID");
+      expect(document).toContain("HC_TERMINAL_SOCKET");
+      expect(normalized).toMatch(/then (?:the Herdr app|`HerdrAppDriver`).*then (?:Orca|`OrcaDriver`).*then (?:subprocess|`SubprocessDriver`)/);
       expect(normalized).toMatch(/Outside an Orca terminal, (?:name|select) it explicitly/);
     }
     // src/config/config.ts:304 — the enum the loader validates against, so the offered value loads.
-    expect(TickmarkrConfigSchema.shape.driver.options).toEqual(["auto", "herdr", "subprocess", "orca"]);
+    expect(TickmarkrConfigSchema.shape.driver.options).toEqual(["auto", "herdr", "subprocess", "orca", "herdr-app"]);
     expect(TickmarkrConfigSchema.shape.driver.safeParse("orca").success).toBe(true);
     expect(TickmarkrConfigSchema.shape.driver.safeParse("not-a-driver").success).toBe(false);
     expect(pickDriver({ ...DEFAULT_CONFIG, driver: "orca" }).id).toBe("orca");

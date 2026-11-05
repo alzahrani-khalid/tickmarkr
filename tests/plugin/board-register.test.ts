@@ -134,7 +134,8 @@ test("the controller has no effect for a missing, non-directory or rejected-chec
   await flush();
   expect([h.runs.length, h.timers[0]!.cancelled]).toEqual([5, true]);
 
-  // an autoloaded board: an unplaced open sets the ready hint and leaves no timer; a placed one polls until the folder goes
+  // an autoloaded board: an unplaced open sets the ready hint and keeps the eligible poll (queue row 343 — a narrow
+  // miss does not latch and does not stop the timer). A placed one polls until the folder goes.
   const narrow = host("dir", false);
   const hinted = narrow.controller.start(true);
   await flush();
@@ -142,7 +143,8 @@ test("the controller has no effect for a missing, non-directory or rejected-chec
   await hinted;
   expect(narrow.statuses).toEqual([boardStatusLine(shown(SNAPSHOT)), READY_HINT]);
   expect(READY_HINT).toBe("Run board ready — /tickmarkr-board opens it");
-  expect(narrow.timers).toHaveLength(0);
+  expect(narrow.timers).toHaveLength(1);
+  expect(narrow.timers[0]!.cancelled).toBe(false);
   const asked = narrow.controller.command();
   await flush();
   narrow.runs[1]!.answer.resolve(OK);

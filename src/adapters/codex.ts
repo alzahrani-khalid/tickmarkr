@@ -123,6 +123,13 @@ export function renderCodexGitGrant(ctx?: Partial<WorkerLaunchContext>): string 
 // -s/--sandbox workspace-write sandbox (deliberately NOT --dangerously-bypass-approvals-and-sandbox,
 // which would drop the sandbox). Listed by `codex --help` and `codex exec --help` (verified 2026-07-23).
 const CODEX_HOOK_TRUST = "--dangerously-bypass-hook-trust";
+// Queue row 340 (D-2180): `codex --help` (captured with hc 0.1.17) documents --no-daemon as "Run without the shared
+// background server, even if it is already running"; hc's manual requires it so a worker's tools stay in its own
+// terminal's process tree instead of a shared app-server. Shipped unconditionally on BOTH existing forms on every host,
+// at one declared position — immediately after CODEX_HOOK_TRUST (after `exec` in the headless form, before the prompt
+// in the TUI form). No help probe and no fallback: a CLI too old for it fails its launch visibly, and doctor's advisory
+// flag-drift row names it (hardcodedFlags below).
+export const CODEX_NO_DAEMON = "--no-daemon";
 // OBS-1182: config override, not a flag — codex has no --effort. Absent renders nothing (CLI default);
 // placed before --model so --model's value stays the last flag before the prompt, as it always was.
 const codexEffortFlag = (effort?: Effort): string => (effort ? ` -c ${shq(`model_reasoning_effort=${effort}`)}` : "");
@@ -269,7 +276,7 @@ export function codexMcpSuppressionFlags(configPath?: string): string {
 
 // Queue row 2 (D-2112): non-worker seats omit the grant; workers carry the rendered argument.
 const codexExec = (promptFile: string, model: string, effort: Effort | undefined, grant: string): string =>
-  `codex exec --sandbox workspace-write ${CODEX_HOOK_TRUST} ${codexMcpSuppressionFlags()}${grant}${codexEffortFlag(effort)} --model ${shq(model)} - < ${shq(promptFile)}`;
+  `codex exec --sandbox workspace-write ${CODEX_HOOK_TRUST} ${CODEX_NO_DAEMON} ${codexMcpSuppressionFlags()}${grant}${codexEffortFlag(effort)} --model ${shq(model)} - < ${shq(promptFile)}`;
 
 export const codex: WorkerAdapter = {
   id: "codex",
@@ -281,7 +288,7 @@ export const codex: WorkerAdapter = {
   channels: (cfg: TickmarkrConfig): BillingChannel[] => channelsFromConfig("codex", cfg),
   // v1.65 T3: every flag the command builder below hardcodes (incl. codexMcpSuppressionFlags' -c/
   // --disable and renderCodexGitGrant's -c) — all listed by top-level `codex --help`, verified 2026-07-22.
-  hardcodedFlags: { binary: "codex", flags: ["--sandbox", "-a", "-s", "--model", "-c", "--disable", "--dangerously-bypass-hook-trust"] },
+  hardcodedFlags: { binary: "codex", flags: ["--sandbox", "-a", "-s", "--model", "-c", "--disable", "--dangerously-bypass-hook-trust", CODEX_NO_DAEMON] },
   // --sandbox workspace-write is the autonomous sandbox mode (codex v0.144.1+)
   // MCP suppression built per dispatch (config can change between runs) — see codexMcpSuppressionFlags.
   // CODEX_HOOK_TRUST (OBS-125) clears the per-worktree "Hooks need review" gate while keeping the sandbox.
@@ -300,7 +307,7 @@ export const codex: WorkerAdapter = {
   // prompt over promptArgvCeiling() returns null → worker-mode-fallback → the headless form (types.ts).
   interactiveCommand: (promptFile: string, model: string, effort?: Effort, ctx?: WorkerLaunchContext) =>
     promptFitsArgv(promptFile)
-      ? `codex -a never -s workspace-write ${CODEX_HOOK_TRUST} ${codexMcpSuppressionFlags()} ${renderCodexGitGrant(ctx)}${codexEffortFlag(effort)} --model ${shq(model)} "$(cat ${shq(promptFile)})"`
+      ? `codex -a never -s workspace-write ${CODEX_HOOK_TRUST} ${CODEX_NO_DAEMON} ${codexMcpSuppressionFlags()} ${renderCodexGitGrant(ctx)}${codexEffortFlag(effort)} --model ${shq(model)} "$(cat ${shq(promptFile)})"`
       : null,
   invoke(task: Task, cwd: string, a: Assignment, ctx: { promptFile: string; branch?: string; repoRoot?: string }): Invocation {
     return { command: codexExec(ctx.promptFile, a.model, a.effort, ` ${renderCodexGitGrant({ ...ctx, cwd })}`) };

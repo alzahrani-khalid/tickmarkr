@@ -29,7 +29,8 @@ const stub = (id: string) =>
 const QWEN_PROBE_CAPTURE_DIR = join(import.meta.dirname, "../../.planning/assessments/2026-09-03-qwen-cli-probe");
 
 // Pinned at v1.34 T3 (re-pinned v1.92: trust n/a roster + counted attention section; re-pinned for
-// queue rows 196 and 197: the host and locale rows beside herdr, under a fixed environment): non-TTY
+// queue rows 196 and 197: the host and locale rows beside herdr, under a fixed environment; queue row 340, D-2180: the
+// herdr-app runtime row, unselected and absent here, so never probed): non-TTY
 // doctor stdout must stay byte-identical when probe progress is stderr-only.
 const NON_TTY_DOCTOR_PIN = `tickmarkr doctor — capability matrix:
   ✓ claude-code    installed
@@ -38,12 +39,13 @@ const NON_TTY_DOCTOR_PIN = `tickmarkr doctor — capability matrix:
   ✓ opencode       installed
   ✓ pi             installed
   ✗ herdr          not detected — subprocess driver will be used
-  ✓ host           no herdr or Orca host — seats run headless on the subprocess driver with no daemon board
+  ✓ host           no herdr, Herdr app or Orca host — seats run headless on the subprocess driver with no daemon board
   ✓ locale         LANG=en_US.UTF-8
 workspace trust:
   = n/a (5): claude-code, codex, cursor-agent, opencode, pi
 execution runtime:
   ✗ orca           CLI not installed
+  ✗ herdr-app      hc not installed — herdr-app not selected here
 attention (8):
   ! claude-code: no model-list surface — seeds stamped 2026-07-09; verify manually
   ! codex: no model-list surface — seeds stamped 2026-07-09; verify manually
@@ -788,7 +790,7 @@ describe("v1.34 T3 probe progress", () => {
 
   const fixedDoctorReport = async (check?: (out: string, repo: string, adapters: WorkerAdapter[]) => Promise<void>) => {
     // The host and locale rows read the launching environment: fix every variable they consult.
-    for (const key of ["HERDR_ENV", "TERM_PROGRAM", "ORCA_TERMINAL_HANDLE", "CLAUDE_CODE_ENTRYPOINT", "LC_ALL", "LC_CTYPE"]) {
+    for (const key of ["HERDR_ENV", "HC_TERMINAL_ID", "HC_TERMINAL_SOCKET", "HC_SCOPE", "TERM_PROGRAM", "ORCA_TERMINAL_HANDLE", "CLAUDE_CODE_ENTRYPOINT", "LC_ALL", "LC_CTYPE"]) {
       vi.stubEnv(key, undefined);
     }
     vi.stubEnv("LANG", "en_US.UTF-8");

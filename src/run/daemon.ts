@@ -20,7 +20,7 @@ import {
   ExecutionPolicySchema, DEFAULT_DIFF_CAP, globalConfigDir, loadConfigWithMode, readOverlayFile, repoOverlayPath,
   type ModeResolution, type RoutingMode, type TickmarkrConfig,
 } from "../config/config.js";
-import { SEAT_MARKER_ENV } from "../drivers/host-env.js";
+import { HC_SCOPE_ENV, HC_SCOPE_WARNING, hcScopePresent, SEAT_MARKER_ENV } from "../drivers/host-env.js";
 import { DeliveryReadinessError } from "../drivers/herdr.js";
 import { driverEvidence, type DriverChoice } from "../drivers/index.js";
 import { herdrSealShellPrefix, MAX_BUF, SubprocessDriver } from "../drivers/subprocess.js";
@@ -42,6 +42,7 @@ import { runEnvironment } from "./environment.js";
 import { addDetachedWorktree, changeRepresented, cleanupRunWorktrees, declaredBaseContainment, dependencyLinkRefusal, deriveForkCap, FORK_CAP_ENV, gitHead, linkNodeModules, npmDependencyInstallCommand, npmDependencyManifestChanged, PRESERVE_COMMIT_SUBJECT, PRESERVE_PRODUCER_TRAILER, preserveWorktree, type PreserveProducer, producerFields, reflogWitness, removeWorktree, resolvedCapacity, runWithForkBudget, runWithVerificationBudget, type RunCapacity, sameCapacity, sameVerification, sh, shell, shGit, SUITE_PARENT_ENV, verificationProtocol, WorktreeAdminRaceError, WORKTREE_LAYOUT_CONTRACT, WORKTREES_DIR, worktreePath } from "./git.js";
 import { MASK } from "./redact.js";
 import { runInteractiveSeed, type InteractiveSeedResult } from "./interactive-seed.js";
+import { answerTrustDialog, type TrustAnswer } from "./trust-dialog.js";
 import { classifyRepairDisposition, namedPaths, resolveScopeHints } from "./repair-disposition.js";
 import { applyScopeAmendments, activeRetryBan, interruptedAttempt, RESUME_HARVEST_SOURCE, resumeHarvestAuthor, approvalAction, APPROVAL_REFUSED, effectiveEvents, foldDecisions, physicalLine, staleApprovals, classifyTaskFailure, classifyWorkerResultCause, deferredReviewFindings, engagementComparable, formatPriorFindingEvidence, GATE_FINGERPRINT_CAP, GATE_SATISFIED_RELEASE, identicalGateFailures, isDeferredFinding, journaledFailureBrief, Journal, loadRoutingProfile, newRunId, normalizeGateFailure, outstandingConsultGuidance, readableExcerpt, receiptOrigin, outstandingReviewFindings, pendingApprovalActions, pendingRechecks, pendingRepairFindings, phaseForGate, priorJudgments, readPriorRunEvidence, recordedTaskFailureKind, reraisedReviewChains, RECHECK_RELEASE, renderStructuredReviewFinding, repairReachSinceApproval, repairsSinceApproval, reviewRoundsSinceApproval, runHasEnded, standingRulings, structuredFindings, upheldFeedbackByTask, type CurrentAttemptGateReplay, type JournalEvent, type ParkKind, type ResumeState, type RetryMode, type StructuredFinding } from "./journal.js";
 import { decisionCommands, type DecisionPark } from "./decision-verbs.js";
@@ -199,6 +200,9 @@ export interface RunOptions {
   };
   driver?: ExecutorDriver;
   driverOverride?: DriverChoice;
+  /** Queue row 340 (D-2180): run/resume's launch snapshot of an inherited HC_SCOPE (boolean only). Direct daemon entry
+   * omits it and the daemon captures it itself before stripping it. */
+  inheritedHcScope?: boolean;
   adapters?: WorkerAdapter[];
   globalDir?: string;
   // v1.51 T2: run-flag routing mode (--mode / the --quality alias) — the strongest mode source.
@@ -2457,6 +2461,12 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
   // D-2174 (queue row 267): a daemon started from a seat (a review seat's owned test, say) is no seat; clear the inherited
   // marker at run-start so nothing it launches is told apart as one.
   delete process.env[SEAT_MARKER_ENV];
+  // Queue row 340 (D-2180): an inherited hc scope token ties whatever carries it to its launching terminal. Record its
+  // presence (never the value), then delete it before any child spawns, keeping the HC pair as the core anchor. This
+  // protects CHILDREN only: the daemon's own exec-time scope is outside process.env, so the daemon itself is detached
+  // from that terminal only when launched under `env -u HC_SCOPE` — hence the warning below.
+  const inheritedHcScope = opts.inheritedHcScope ?? hcScopePresent(process.env);
+  delete process.env[HC_SCOPE_ENV];
   // v1.51 T2 / OBS-89 (v1.60): retired --quality env seam. Mode resolution owns premium routing;
   // route() no longer reads the retired env at all, so the old entrypoint scrub is gone with it.
   const adapters = opts.adapters ?? allAdapters();
@@ -3222,6 +3232,12 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     mode: rm.mode.mode,
     modeSource: rm.source,
   };
+  // Queue row 340 (D-2180): exactly one journal row and one stderr line per admitted invocation, never the token.
+  const warnInheritedScope = () => {
+    if (!inheritedHcScope) return;
+    journal.append("host-scope-inherited", undefined, { warning: HC_SCOPE_WARNING });
+    process.stderr.write(`tickmarkr: warning: ${HC_SCOPE_WARNING}\n`);
+  };
   if (opts.resume) {
     // The superseded check and the run-start read refused at the resume anchor (above), before any append.
     const start = journal.read().find((e) => e.event === "run-start")!;
@@ -3308,6 +3324,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       ...declaredBaseRow,
     });
     runStarted = true;
+    warnInheritedScope();
     await placeBoard();
     if (recapture) {
       // Moved HEAD is never baseline authority: measure the journaled base in a detached checkout this
@@ -3390,6 +3407,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       ...declaredBaseRow,
     }); // graphDefinitionHash: T3 engagement identity (status+resume share it); pid: v1.13 (VIS-11) liveness; mode/modeSource: v1.51 T2; supersedes: v1.53 T5
     runStarted = true;
+    warnInheritedScope();
     // v1.53 T5: mark the prior run AFTER this run's run-start exists, so the prior journal never
     // names a successor that has no journal. Append-only — the prior journal is never rewritten.
     prior?.append("superseded", undefined, { by: runId });
@@ -6042,12 +6060,28 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       // latch built from one would start false with the key already sent, and the next modal on
       // this slot would get the free Enter this contract exists to prevent.
       let trustAnswered = trustAnsweredSlots.has(slot.id);
-      const noteSeedTrustAnswered = () => {
+      // Queue row 342 (D-2180): one record per spent latch, wherever it was spent. Only a resolved submit key is an
+      // accepted trust. A refused sequence (Claude's selection not proven, Down undeliverable, a terminal the driver
+      // refused to key) is `trust-answer-refused`; a submit dispatched and then rejected keeps its `trust-auto-answer`
+      // key record (a key may have landed: the latch is spent) but carries `unconfirmed`. Both page the operator.
+      const recordTrustAnswer = (answer: TrustAnswer | undefined, phase?: "seed") => {
+        const where = { slot: slot.name, adapter: adapter.id, ...(phase ? { phase } : {}) };
+        if (answer?.outcome === "answered" || answer === undefined) {
+          journal.append("trust-auto-answer", t.id, where);
+          return;
+        }
+        if (answer.outcome === "refused") journal.append("trust-answer-refused", t.id, { ...where, reason: answer.reason });
+        else journal.append("trust-auto-answer", t.id, { ...where, unconfirmed: answer.reason });
+        const left = answer.outcome === "refused" ? "left unanswered" : "answer unconfirmed";
+        void driver.notify(`tickmarkr ${runId}: ${slot.name} trust dialog ${left} (${answer.reason}) — answer it in its pane`, { tier: "attention" })
+          .catch(() => { /* the journal row above already records it */ });
+      };
+      const noteSeedTrustAnswered = (answer?: TrustAnswer) => {
         if (trustAnswered) return;
         trustAnswered = true;
         trustAnsweredSlots.add(slot.id);
         // Same audit line the loop below writes, so a live run shows the answer wherever it happened.
-        journal.append("trust-auto-answer", t.id, { slot: slot.name, adapter: adapter.id, phase: "seed" });
+        recordTrustAnswer(answer, "seed");
       };
       const handleDeliveryReadiness = async (error: DeliveryReadinessError): Promise<boolean> => {
         journal.append("delivery-readiness-failed", t.id, {
@@ -6369,18 +6403,33 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
               // T5: once-per-slot auto-answer when the adapter declares a trust dialog and the pane
               // text matches. tickmarkr created the worktree from the operator's own repo — safe by construction.
               if (!trustAnswered && adapter.trustDialog && driver.sendKey) {
+                const sendKey = driver.sendKey.bind(driver);
                 try {
-                  const paneText = await (slot.readScreen ? slot.readScreen() : workerTransport.read(slot, 80));
+                  const readFrame = () => (slot.readScreen ? slot.readScreen() : workerTransport.read(slot, 80));
+                  // The worker's ORIGINAL startup deadline, capped by the attempt's, fixed BEFORE the first frame read and
+                  // never extended: a dialog first met after it (or an attempt that expires sooner) refuses and pages.
+                  const trustDeadline = Math.min((workerLaunchedAt ?? 0) + workerStartupWindowMs, hardDeadline);
+                  const paneText = await readFrame();
                   if ((st !== "unknown" || withinTrustStartup()) && matchesTrustDialog(paneText, adapter.trustDialog)) {
                     trustAnswered = true;
                     trustAnsweredSlots.add(slot.id);
+                    // Queue row 342 (D-2180): the latch is spent above, before the first key; the shared answer sends
+                    // the adapter's key (Claude: a verified Down → re-read → Enter) and never throws. An exhausted held
+                    // probe inside its re-read still ends the attempt below, exactly as on the first read.
+                    let held: unknown;
+                    const answer = await answerTrustDialog({
+                      dialog: adapter.trustDialog, frame: paneText, sendKey: (key) => sendKey(slot, key),
+                      read: () => readFrame().catch((error: unknown) => { if (error instanceof HeldProbeExhausted) held = error; throw error; }),
+                      deadline: trustDeadline,
+                    });
+                    if (held) throw held;
                     // v1.25 T1: audit trail for live runs — prove the dialog appeared and was answered.
-                    // Latch + sendKey + no-page continue stay byte-identical; this append is additive only.
-                    journal.append("trust-auto-answer", t.id, { slot: slot.name, adapter: adapter.id });
-                    await driver.sendKey(slot, adapter.trustDialog.key);
-                    const spent = Date.now() - sliceStart;
-                    if (spent < slice) await new Promise((r) => setTimeout(r, Math.min(slice - spent, 1_000)));
-                    continue; // do not page — keep waiting for the trailer
+                    recordTrustAnswer(answer);
+                    if (answer.outcome === "answered") {
+                      const spent = Date.now() - sliceStart;
+                      if (spent < slice) await new Promise((r) => setTimeout(r, Math.min(slice - spent, 1_000)));
+                      continue; // do not page — keep waiting for the trailer
+                    }
                   }
                 } catch (error) {
                   if (error instanceof HeldProbeExhausted) throw error;

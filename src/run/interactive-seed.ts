@@ -1,6 +1,7 @@
 import { matchesTrustDialog, type Assignment, type WorkerAdapter } from "../adapters/types.js";
 import { DeliveryReadinessError } from "../drivers/herdr.js";
 import type { ExecutorDriver, Slot } from "../drivers/types.js";
+import { answerTrustDialog, type TrustAnswer } from "./trust-dialog.js";
 
 export interface InteractiveSeedResult {
   output: string;
@@ -49,7 +50,7 @@ async function awaitReadiness(opts: {
   adapter: WorkerAdapter;
   readinessMatch: string;
   deadline: number;
-  onTrustAnswered?: () => void;
+  onTrustAnswered?: (answer: TrustAnswer) => void;
 }): Promise<{ ready: boolean; trustAnswered: boolean }> {
   const { driver, slot, readinessMatch, deadline } = opts;
   const dialog = opts.adapter.trustDialog;
@@ -71,11 +72,12 @@ async function awaitReadiness(opts: {
       return { ready: true, trustAnswered };
     }
     let paneText: string;
+    // OBS-1205: a cursor-drawn modal has text only on the RENDERED frame, so the slot's screen read
+    // is preferred when its driver has one. An unreadable or foreign frame is a failed read, never
+    // a cue to match the stream instead; drivers without a screen keep polling `read`.
+    const readFrame = () => (slot.readScreen ? slot.readScreen() : driver.read(slot, TRUST_PANE_ROWS));
     try {
-      // OBS-1205: a cursor-drawn modal has text only on the RENDERED frame, so the slot's screen read
-      // is preferred when its driver has one. An unreadable or foreign frame is a failed read, never
-      // a cue to match the stream instead; drivers without a screen keep polling `read`.
-      paneText = await (slot.readScreen ? slot.readScreen() : driver.read(slot, TRUST_PANE_ROWS));
+      paneText = await readFrame();
     } catch {
       continue; // a failed read is not a matched modal — keep observing, spend nothing
     }
@@ -90,12 +92,16 @@ async function awaitReadiness(opts: {
     // Review round 8 (material): the RETURN VALUE is not the only path out of this function — the
     // seed-line delivery below it throws DeliveryReadinessError, and a daemon that learns of the
     // answer only from a result it never receives initializes its latch false with the key already
-    // sent. So the answer is reported the instant it is spent, before anything that can throw.
-    opts.onTrustAnswered?.();
+    // sent. So the answer is reported the instant the sequence ends, before anything that can throw.
+    // Queue row 342 (D-2180): the shared answer decides the keys (Claude's verified Down → re-read → Enter, every
+    // other adapter's single key) and never throws; a dispatched-then-rejected send is never retried here, nor by the
+    // daemon. A refused or unconfirmed answer is carried out explicitly, so the daemon pages instead of recording trust.
+    let answer: TrustAnswer = { outcome: "refused", reason: "trust answer did not complete" };
+    const sendKey = driver.sendKey.bind(driver);
     try {
-      await driver.sendKey(slot, dialog.key);
-    } catch {
-      /* dispatched-then-rejected: never retried here, and never re-tried by the daemon either */
+      answer = await answerTrustDialog({ dialog, frame: paneText, read: readFrame, sendKey: (key) => sendKey(slot, key), deadline });
+    } finally {
+      opts.onTrustAnswered?.(answer);
     }
   }
   // An expired budget gets no closing sweep: a zero-length wait still reads the terminal once.
@@ -115,8 +121,9 @@ export async function runInteractiveSeed(opts: {
   taskTimeoutMinutes: number;
   // Fired the instant the trust key is spent, so a caller keeping a per-slot latch learns of the
   // answer even when this call ends by THROWING (the seed-line delivery below can) rather than
-  // returning. `trustAnswered` on the result carries the same fact for every returning path.
-  onTrustAnswered?: () => void;
+  // returning. `trustAnswered` on the result carries the same fact for every returning path; the
+  // answer says whether the submit key was sent or the sequence was refused (queue row 342).
+  onTrustAnswered?: (answer: TrustAnswer) => void;
 }): Promise<InteractiveSeedResult> {
   const seed = opts.adapter.interactiveSeed!;
   await opts.driver.run(opts.slot, seed.launch(opts.assignment.model));

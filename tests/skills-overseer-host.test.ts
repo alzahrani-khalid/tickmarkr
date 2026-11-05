@@ -110,7 +110,10 @@ test("Cite the changed engine-default paragraph, worker tab line and brief list 
   const skill = readShippedSkill();
   // Queue row 242; D-2141, D-2152: these digests pin the original items, including numbers and three-space wraps.
   // Queue row 286: exclude only the required author addition, pinned in skills-verify-author.test.ts.
-  const seats = rescuedSeats(skill).replace(" --author <adapter:model of the agent that wrote it>", "");
+  // Queue row 340; D-2180: one blank line ends the Orca bullet whose lazy continuation carried the codex worktree rule
+  // into the Orca scope, so it reads on every host; the rescued bytes are otherwise identical.
+  const seats = rescuedSeats(skill).replace(" --author <adapter:model of the agent that wrote it>", "")
+    .replace("time pressure.\n\n   **A codex seat", "time pressure.\n   **A codex seat");
   const digests = [
     "2bd2610bc3b024ef984e1a5ae915fec5de05c8dc9afcb0a3729c6dd30b85ce86",
     "0e6ce44042ad45cadc27fc9d1c0ccc9762af22e29078f18528ce77961f4f3fd4",
@@ -441,7 +444,7 @@ test("LEG A REPAIR: overseer fallback launches use the recorded ORCH handle or p
 const PLAIN_HEADING = "On a plain host (neither herdr nor Orca)";
 const PLAIN_LINK = `[${PLAIN_HEADING}](#on-a-plain-host-neither-herdr-nor-orca)`;
 function plainReading(markdown: string): { lines: string[]; scope: string[]; scopes: number } {
-  type Node = { parent?: Node; host?: "herdr" | "orca" | "plain"; depth: number };
+  type Node = { parent?: Node; host?: "herdr" | "orca" | "app" | "plain"; depth: number };
   const hostOfPlain = (text: string): Node["host"] => text.replace(/^[*_]+/, "").startsWith(PLAIN_HEADING) ? "plain" : hostOf(text);
   const headings: Node[] = [{ depth: -1 }];
   const bullets: Node[] = [];
@@ -530,8 +533,8 @@ test("test: a plain-host reading of each shipped skill, following every universa
       "Keep a foreground `until grep` on the run's terminal events, re-armed at most every twenty minutes.",
     ]) expect(plainHostFindings(name, universal(mandate)), `${name}: ${mandate}`).not.toEqual([]);
     const stops = name === "overseer"
-      ? skill.replace(/ for that hierarchy; if neither host is detected, do not stop: .*$/m, "; if neither host is detected, say so and stop.")
-      : skill.replace(/^With neither herdr nor Orca there is no role to decide.*$/m, "Outside a multi-agent terminal environment, run the loop directly.");
+      ? skill.replace(/ for that hierarchy\b.*; if none is detected, do not stop: .*$/m, "; if neither host is detected, say so and stop.")
+      : skill.replace(/^With neither herdr\b.* nor Orca there is no role to decide.*$/m, "Outside a multi-agent terminal environment, run the loop directly.");
     expect(stops, name).not.toBe(skill);
     expect(plainHostFindings(name, stops), `${name}: stops`).toContain("the host or role check does not route a plain host to its scope");
   }

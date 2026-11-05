@@ -94,7 +94,7 @@ function fakeScriptPath(): string {
 async function runTrustPane(
   paneText: string,
   trustDialog: TrustDialog | undefined,
-  opts: { unblockOnKey: boolean },
+  opts: { unblockOnKey: boolean; paneAfter?: Record<string, string> },
 ): Promise<{ keys: string[]; keyedSlots: string[]; notified: string[]; human: string[] }> {
   const { repo, fake } = setupRepo(
     [T("T1")],
@@ -111,6 +111,7 @@ async function runTrustPane(
   if (trustDialog) (fake as { trustDialog?: TrustDialog }).trustDialog = trustDialog;
 
   let phase: "dialog" | "working" = "dialog";
+  let pane = paneText;
   let nonce = "";
   const keys: string[] = [];
   const keyedSlots: string[] = [];
@@ -133,14 +134,16 @@ async function runTrustPane(
     },
     waitAgentStatus: async () => true,
     read: async () => {
-      if (phase === "dialog") return paneText;
+      if (phase === "dialog") return pane;
       return `working\nTICKMARKR_RESULT_${nonce} {"ok":true,"summary":"done after trust","deviations":[]}\n`;
     },
     status: async () => (phase === "dialog" ? "blocked" : "working"),
     sendKey: async (s, key) => {
       keys.push(key);
       keyedSlots.push(s.name);
-      if (opts.unblockOnKey) phase = "working";
+      const next = opts.paneAfter?.[key];
+      if (next !== undefined) pane = next;
+      else if (opts.unblockOnKey) phase = "working";
     },
     notify: async (msg) => { notified.push(msg); },
     close: async () => {},
@@ -208,8 +211,13 @@ describe("trust-dialog declarations", () => {
     if (dialog.kind === "none") return;
     expect(matchesTrustDialog(CLAUDE_TRUST_PANE, dialog)).toBe(true);
 
-    const { keys, notified } = await runTrustPane(CLAUDE_TRUST_PANE, dialog, { unblockOnKey: true });
-    expect(keys).toEqual([dialog.key]);
+    // Queue row 342 (D-2180): Claude Code 2.1.318's captured dialog opens on "No, exit", so its declared key is the
+    // submit after a verified Down — the captured hc screen reads before and after Down, verbatim.
+    const captures = (JSON.parse(readFileSync(new URL("../fixtures/claude-trust/captures.json", import.meta.url), "utf8")) as { files: Record<string, string> }).files;
+    const screen = (file: string) => (JSON.parse(captures[file]!) as { text: string }).text;
+    expect(matchesTrustDialog(screen("02-read-dialog.json"), dialog)).toBe(true);
+    const { keys, notified } = await runTrustPane(screen("02-read-dialog.json"), dialog, { unblockOnKey: true, paneAfter: { Down: screen("04-read-after-down.json") } });
+    expect(keys).toEqual(["Down", dialog.key]);
     expect(notified.filter((m) => /blocked on a prompt|looks idle/.test(m))).toHaveLength(0);
   }, 30_000);
 

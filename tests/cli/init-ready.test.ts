@@ -119,8 +119,9 @@ describe("init's non-interactive readiness card", () => {
       expect.soft(probeAll, context).toHaveBeenCalled();
       expect.soft(at, context).toBeGreaterThan(0);
       expect.soft(lines.slice(at, at + 3), context).toEqual([FAKE_READY, MORE, NEXT]);
-      expect.soft(lines.slice(at + 3, -5), context).toEqual(args.includes("--yes") ? [] : [HINT]);
-      expect.soft(lines.at(-5), context).toBe("environments:");
+      // Queue row 340 (D-2180): the footer gained the Herdr app row (six lines with its heading).
+      expect.soft(lines.slice(at + 3, -6), context).toEqual(args.includes("--yes") ? [] : [HINT]);
+      expect.soft(lines.at(-6), context).toBe("environments:");
       expect.soft(out, context).not.toContain("using probe results");
       expect.soft(out, context).not.toMatch(DOCTOR_REPORT);
       expect.soft(out, context).not.toContain("paste-ready overlay");
@@ -195,6 +196,7 @@ describe("init's non-interactive readiness card", () => {
       NEXT,
       "environments:",
       expect.stringMatching(/^ {2}herdr — /),
+      expect.stringMatching(/^ {2}herdr app — /),
       expect.stringMatching(/^ {2}orca — /),
       expect.stringMatching(/^ {2}claude code — /),
       expect.stringMatching(/^ {2}anywhere — /),

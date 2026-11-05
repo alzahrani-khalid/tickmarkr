@@ -81,7 +81,7 @@ Side modules (CLI-facing, not in the dispatch loop):
 | Existing Fleet / init UI | Separate Ink apps pending Fleet/Bootstrap follow-on | `src/tui/ink/fleet-app.tsx`, `src/tui/ink/init-app.tsx`, `src/tui/ink/frame.tsx`, `src/tui/ink/components.tsx` |
 | Adapter registry | Discovers installed/authed CLIs (`probe()`), builds the available `BillingChannel[]` | `src/adapters/registry.ts` |
 | Worker adapters | One per agent CLI: headless/interactive command strings + output parsing | `src/adapters/claude-code.ts`, `src/adapters/codex.ts`, `src/adapters/cursor-agent.ts`, `src/adapters/opencode.ts`, `src/adapters/fake.ts` |
-| Executor drivers | Slot lifecycle (pane or subprocess), wait/read/notify primitives, worktree creation | `src/drivers/herdr.ts`, `src/drivers/subprocess.ts`, `src/drivers/types.ts` |
+| Executor drivers | Slot lifecycle (pane, hc terminal or subprocess), wait/read/notify primitives, worktree creation | `src/drivers/herdr.ts`, `src/drivers/herdr-app.ts`, `src/drivers/hc-client.ts`, `src/drivers/subprocess.ts`, `src/drivers/types.ts` |
 | Daemon | Main dispatch loop: ready-task selection, concurrency cap, escalation, journaling | `src/run/daemon.ts` |
 | Journal / ledger | Append-only event log + telemetry log; resumable status replay | `src/run/journal.ts` |
 | Git worktree ops | `git worktree add/remove`, HEAD lookup, shell helper | `src/run/git.ts` |
@@ -162,7 +162,8 @@ Side modules (CLI-facing, not in the dispatch loop):
 
 **Drivers (`src/drivers/`):**
 - Purpose: abstract "where does a command actually run and how do we watch it" behind one interface
-- Location: `src/drivers/types.ts` (`ExecutorDriver`, `Slot`), `herdr.ts` (visible-pane implementation), `subprocess.ts` (child-process implementation), `index.ts` (`pickDriver()` auto-selection)
+- Location: `src/drivers/types.ts` (`ExecutorDriver`, `Slot`), `herdr.ts` (visible-pane implementation), `herdr-app.ts` (Herdr-app hc-terminal implementation over the `hc-client.ts` JSON client), `subprocess.ts` (child-process implementation), `index.ts` (`pickDriver()` auto-selection)
+- Herdr app (queue row 340; D-2180): `HerdrAppDriver` creates one hc terminal per slot on its first run (`hc run --bg --json --no-parent --no-notify --cwd` with `tickmarkr.owner`/`tickmarkr.repo` labels), whose argv is `bash -lc` of a payload that saves the terminal's own fresh `HC_SCOPE`, applies `herdrSealShellPrefix()`, restores that scope, then explicit exports and the command — the core supplies the terminal's environment, never the client's. Every later call re-verifies owner label, repo label (canonical git common dir), canonical checkout and core identity at the pinned address; later runs/nudges are readiness-gated `hc send` (never `--force`) confirmed only by evidence attributable to that send (a new echo, or a working transition from the last pre-send observation — a get after the readiness read and the status the send met); `sendKey` is the closed set Enter/Down/Up/Esc/ctrl+c; transport closure and a negative `waitOutput` need a finished terminal plus a screen-only read answering complete with how screen (a history answer or an incomplete one never proves drain); close is kill → rm → proven absence, and absence is proven only by an exhaustive listing (`hidden_finished` 0), a receipt-bound but unconfirmed creation is re-verified at its receipt address before that, and an issued creation with no receipt closes as a reported unresolved failure (never success, never a guessed kill). `hc-client.ts` is the only JSON seam: argv (no shell), deadline, output cap, closed consumed fields per response family, fail-closed with bounded diagnostics
 - Contains: slot lifecycle (`slot`/`run`/`waitOutput`/`waitAgentStatus`/`status`/`read`/`notify`/`close`), worktree creation delegated to `run/git.ts`
 - Depends on: `run/git.ts` (`createWorktree`), `adapters/types.ts` (`shq` shell-quoting)
 - Used by: `run/daemon.ts`, `run/consult.ts`, `gates/llm.ts` (judge/review pane dispatch)
@@ -341,7 +342,7 @@ instead of introducing another help skill or independent instructions.
 
 **ExecutorDriver (`src/drivers/types.ts`):**
 - Purpose: isolate "where/how a command runs and is observed" from the daemon's control flow
-- Examples: `src/drivers/herdr.ts` (visible pane via the `herdr` CLI), `src/drivers/subprocess.ts` (plain child process)
+- Examples: `src/drivers/herdr.ts` (visible pane via the `herdr` CLI), `src/drivers/herdr-app.ts` (owned hc terminal in the Herdr app), `src/drivers/subprocess.ts` (plain child process)
 - Pattern: strategy pattern selected once per run by `pickDriver()` (`src/drivers/index.ts:6-11`); `Slot` is the addressable execution unit both implementations return
 
 **BillingChannel / Assignment (`src/adapters/types.ts`):**

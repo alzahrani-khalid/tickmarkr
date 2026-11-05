@@ -11,7 +11,7 @@ import { configTemplate, DEFAULT_CONFIG, globalConfigDir, loadConfig, type Tickm
 import { LEGACY_PREFIX, specTemplate } from "../../compile/native.js";
 import { BANNER, kvRow, legend, rule, statusRow, title } from "../../brand.js";
 import { stateDirName, tickmarkrDir } from "../../graph/graph.js";
-import { orcaHostDetected } from "../../drivers/index.js";
+import { classifyHost, resolveDriver } from "../../drivers/index.js";
 import { protectedFolderFinding } from "../../drivers/host-env.js";
 import { canonicalWorktreePath } from "../../drivers/orca.js";
 import { gitSync, WORKTREES_DIR } from "../../run/git.js";
@@ -26,14 +26,15 @@ import { SHIPPED_DIGESTS, SHIPPED_SNAPSHOTS } from "../shipped-skill-files.js";
 const SCAFFOLD_SPEC = "tickmarkr.spec.md";
 
 // Operator-approved (2026-07-17) environments footer — no npm install for herdr (npm package
-// "herdr" is a reserved 0.0.0 placeholder as of that date). Auto resolves herdr → orca →
-// subprocess; the orca leg is environment-only, using the two markers Orca stamps in its terminals.
+// "herdr" is a reserved 0.0.0 placeholder as of that date). Auto resolves herdr → herdr-app → orca →
+// subprocess, environment-only: the HC pair the Herdr app stamps, then the two markers Orca stamps in its terminals.
 const ENVIRONMENTS_FOOTER = [
   "environments:",
   "  herdr — the full cockpit — every worker, judge, and consult is a visible pane you can watch and unblock · https://herdr.dev · auto picks it first when HERDR_ENV=1",
-  "  orca — visible terminals in the Orca app — auto picks it inside an Orca terminal after herdr and before subprocess; set driver: orca to force it · https://onorca.dev",
+  "  herdr app — visible hc terminals in task tabs beside ORCH — auto picks it after herdr when HC_TERMINAL_ID and HC_TERMINAL_SOCKET are set; outside one pass --driver herdr-app (a config driver: herdr-app is refused off its host)",
+  "  orca — visible terminals in the Orca app — auto picks it inside an Orca terminal after herdr and the Herdr app and before subprocess; outside one pass --driver orca (a config driver: orca is refused off its host) · https://onorca.dev",
   "  claude code — tickmarkr init --agent installs the tickmarkr-loop, tickmarkr-auto and tickmarkr-overseer skills + AGENTS.md so Claude Code (or any agent CLI) drives the loop natively; in Claude Desktop's Code tab (neither herdr nor Orca) one single-tier session runs the loop on the headless subprocess driver, watched with tickmarkr status --watch --plain",
-  "  anywhere — no herdr or Orca terminal? same fail-closed gates, headless subprocess driver (legacy: no herdr? same fail-closed gates, headless subprocess driver when Orca markers are absent)",
+  "  anywhere — no herdr, Herdr app or Orca terminal? same fail-closed gates, headless subprocess driver",
 ].join("\n");
 
 /** Current run truth, lock first; falls back to an abandoned journal. */
@@ -342,12 +343,12 @@ const describeDrift = (d: SkillDrift) => [
 const skillsInstalled = (cwd: string) =>
   hostTargets(cwd).every((t) => AGENT_SKILLS.every((s) => !guidanceLink(cwd, join(t.skillsDir, s, "SKILL.md"))
     && entryStat(join(t.skillsDir, s, "SKILL.md"))?.isFile()));
-export type DetectedHost = "herdr" | "orca" | "subprocess";
+export type DetectedHost = "herdr" | "herdr-app" | "orca" | "subprocess";
 
+/** Same classifier as doctor's hostRows and the wizard (queue row 340; D-2180): environment only, no binary call. */
 export function detectedHost(env: NodeJS.ProcessEnv = process.env): DetectedHost {
-  if (env.HERDR_ENV === "1") return "herdr";
-  if (orcaHostDetected(env)) return "orca";
-  return "subprocess";
+  // D-2180 add.11: auto's claim is the one resolution (resolveDriver over classifyHost precedence), never a marker read.
+  return resolveDriver("auto", classifyHost(env));
 }
 
 const wizardDriverDefault = (): TickmarkrConfig["driver"] => "auto";

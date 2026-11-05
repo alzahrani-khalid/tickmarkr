@@ -5,11 +5,16 @@ import { configDefaults, coverageConfigDefaults, defineConfig } from "vitest/con
 import LptSequencer from "./scripts/ci/shard.js";
 import { DEFAULT_FORK_CAP } from "./src/run/git.js";
 
+/** The Herdr app's addressing pair plus the inherited scope token, removed before collection forks (queue row 340). */
+export const COLLECTION_HC_MARKERS = ["HC_TERMINAL_ID", "HC_TERMINAL_SOCKET", "HC_SCOPE"] as const;
+
 // v1.22 T3 / OBS-17: seal herdr control-plane vars before workers fork so the suite never inherits
 // HERDR_ENV=1 (or a live socket) from the operator's shell. Tests may re-set these explicitly
 // (e.g. pickDriver HERDR_ENV oracle); the leak class is ambient inheritance, not deliberate fixtures.
 // Daemon process under a real run keeps its env — only the vitest process tree is sealed here.
-for (const k of ["HERDR_ENV", "HERDR_SOCKET_PATH"] as const) delete process.env[k];
+// Queue row 340 (D-2180): the same for the Herdr app — a suite launched from an hc terminal carries HC_TERMINAL_ID +
+// HC_TERMINAL_SOCKET (auto would pick herdr-app) and that terminal's HC_SCOPE token; neither may reach a forked worker.
+for (const k of ["HERDR_ENV", "HERDR_SOCKET_PATH", ...COLLECTION_HC_MARKERS] as const) delete process.env[k];
 
 // Ink detects CI via `is-in-ci` (memoized at import time) and suppresses interactive re-renders when it's
 // set, so the fleet interaction tests read EMPTY frames under CI (release.yml) though they render real

@@ -13,7 +13,8 @@ import { graphPath, loadGraph, tickmarkrDir, stateDirName } from "../../graph/gr
 import { catalogModelAdvisory, catalogTierRanking, declaredModelWindow, hasWindowsConfig, modelLints, modelListingLints, suggestOverlay, ttyVisual } from "../../adapters/model-lints.js";
 import { loadConfig, overlayPreferShapes } from "../../config/config.js";
 import { HerdrDriver } from "../../drivers/herdr.js";
-import { classifyHost } from "../../drivers/index.js";
+import { admitHerdrApp, classifyHost, configDriverRefused, herdrAppBinary, hostMarkers, resolveDriver, type DriverChoice } from "../../drivers/index.js";
+import { HcClient, HcError, WINDOW_UNAVAILABLE } from "../../drivers/hc-client.js";
 import { canonicalWorktreePath, ORCA_FIXTURE_VERSION, parseEnvelope, resolveOrcaCliBinary } from "../../drivers/orca.js";
 import { localeFinding, protectedFolderFinding } from "../../drivers/host-env.js";
 import type { AuthHealth, WorkerAdapter } from "../../adapters/types.js";
@@ -99,6 +100,9 @@ export type DoctorOpts = {
   orcaEnv?: NodeJS.ProcessEnv | Record<string, string | undefined>;
   /** Test seam for shell-path discovery; absence remains a normal doctor row, never an exception. */
   resolveOrcaBinary?: (cwd: string) => string | undefined;
+  /** Test seams for hc / herdr-app discovery (queue row 340; D-2180); absence is a normal row. */
+  resolveHcBinary?: (cwd: string) => string | undefined;
+  resolveHerdrAppBinary?: (cwd: string) => string | undefined;
   /** Test seam for the runner-owned JSON listing used by the acceptance-oracle report row. */
   listTests?: (cwd: string) => Promise<VitestListResult>;
   /** Clock for model-knowledge lints (retirement notices, knowledge age); absent = the wall clock. */
@@ -119,11 +123,40 @@ const ORCA_HOOK_ADAPTERS: Readonly<Record<string, string>> = {
   pi: "pi",
 };
 
-function orcaSelectionDetail(env: NodeJS.ProcessEnv | Record<string, string | undefined>): string {
-  const inside = env.TERM_PROGRAM === "Orca" && !!env.ORCA_TERMINAL_HANDLE?.trim();
-  return inside
-    ? "auto picks orca in this Orca terminal"
-    : "not an Orca terminal; auto picks orca only inside one; use --driver orca";
+type HostKey = "herdr" | "herdr-app" | "orca";
+const HOST_LABEL: Readonly<Record<HostKey, string>> = { herdr: "herdr", "herdr-app": "Herdr app", orca: "Orca" };
+const HOST_EVIDENCE: Readonly<Record<HostKey, string>> = {
+  herdr: "HERDR_ENV=1", "herdr-app": "HC_TERMINAL_ID+HC_TERMINAL_SOCKET", orca: "TERM_PROGRAM+ORCA_TERMINAL_HANDLE",
+};
+/** One host's selection claim. `unmarked`: no claim at all (detail empty). */
+export type HostClaim = { kind: "auto" | "config" | "refused" | "unselected" | "unmarked"; detail: string };
+
+/**
+ * D-2180 add.8 and add.11: ONE resolution decides every doctor and init host claim — the config driver, then auto by
+ * classifyHost precedence (doctor takes no --driver), exactly resolveDriver as pickDriver and preflightHostDriver apply
+ * it. A host is claimed (auto or config) only when that resolution yields it; a config naming it off its host is the
+ * refused claim; markers present that lose — to an earlier host or to the config driver — say so with no auto claim.
+ */
+export function hostSelection(target: HostKey, env: NodeJS.ProcessEnv | Record<string, string | undefined>, configDriver: DriverChoice): HostClaim {
+  const host = classifyHost(env as NodeJS.ProcessEnv);
+  if (configDriver === target && configDriverRefused(configDriver, host)) {
+    return { kind: "refused", detail: `config driver: ${target} but the detected host is ${host} — run and resume refuse that config line here; select it with --driver ${target}` };
+  }
+  if (resolveDriver(configDriver, host) === target) {
+    return configDriver === "auto"
+      ? { kind: "auto", detail: `auto selects ${target} (${HOST_EVIDENCE[target]})` }
+      : { kind: "config", detail: `config driver: ${target} on this ${HOST_LABEL[target]} host` };
+  }
+  if (!hostMarkers(env).includes(target)) return { kind: "unmarked", detail: "" };
+  const reason = host === target ? `config driver: ${configDriver}` : `${host} takes precedence`;
+  return { kind: "unselected", detail: `${HOST_LABEL[target]} markers present, not selected: ${reason}` };
+}
+
+function orcaSelectionDetail(env: NodeJS.ProcessEnv | Record<string, string | undefined>, configDriver: DriverChoice): string {
+  const claim = hostSelection("orca", env, configDriver);
+  return claim.kind === "auto" ? "auto picks orca in this Orca terminal"
+    : claim.kind === "unmarked" ? "not an Orca terminal; auto picks orca only inside one; use --driver orca"
+      : claim.detail;
 }
 
 async function orcaHookCoverage(
@@ -175,6 +208,7 @@ async function orcaHookCoverage(
 export async function probeOrcaCapability(
   cwd: string,
   opts: Pick<DoctorOpts, "orcaStatusProbe" | "orcaHooksStatusProbe" | "resolveOrcaBinary" | "orcaEnv"> = {},
+  configDriver: DriverChoice = "auto",
 ): Promise<OrcaCapability> {
   const binary = opts.resolveOrcaBinary
     ? opts.resolveOrcaBinary(cwd)
@@ -207,7 +241,7 @@ export async function probeOrcaCapability(
       : undefined;
     if (reachable === true) {
       const hooks = await orcaHookCoverage(cwd, binary, opts);
-      const selection = orcaSelectionDetail(opts.orcaEnv ?? process.env);
+      const selection = orcaSelectionDetail(opts.orcaEnv ?? process.env, configDriver);
       const appVersion = typeof runtime === "object" && runtime !== null && !Array.isArray(runtime)
         ? (runtime as Record<string, unknown>).appVersion
         : undefined;
@@ -228,6 +262,50 @@ export async function probeOrcaCapability(
     // its runtime down — tests/helpers/fake-orca.ts).
     return { verdict: "fail", detail: "CLI installed but runtime probe failed" };
   }
+}
+
+/**
+ * Queue row 340 (D-2180): the Herdr app capability row. The core is probed ONLY when the configured driver resolves to
+ * herdr-app (auto on a Herdr app host, or config herdr-app) — `hc server status` may start a core, so an unselected
+ * configuration never calls it and makes no run claim. A selected probe uses preflight's own admission (one client, one validation). It separates detected from
+ * explicit-only selection, absent hc, a selected-but-unreachable core, and a reachable core whose app window is absent
+ * (execution available; tabs and board are not) from an app probe that failed some other way (window unknown). An
+ * explicit-only config selection says run/resume refuse that host-specific line here (only --driver selects it
+ * elsewhere). Nothing here claims another driver will be used. Absent hc is a row on every host, probed or not.
+ */
+export async function probeHerdrAppCapability(
+  cwd: string,
+  env: NodeJS.ProcessEnv | Record<string, string | undefined>,
+  configDriver: DriverChoice,
+  opts: Pick<DoctorOpts, "resolveHcBinary" | "resolveHerdrAppBinary"> = {},
+): Promise<{ verdict: "pass" | "fail" | "warn"; detail: string }> {
+  // D-2180 add.8/add.11: probed only when the one resolution yields herdr-app or config names it (hostSelection).
+  // Config subprocess, herdr or orca, or HC markers outranked by herdr, leave this a capability-only row.
+  const claim = hostSelection("herdr-app", env, configDriver);
+  const selection = claim.kind === "auto" || claim.kind === "config" || claim.kind === "refused" ? claim.detail : undefined;
+  const note = claim.kind === "unselected" ? `; ${claim.detail}` : "";
+  // The run's own resolution (herdrAppBinary: the env PATH the hc client executes from), never a login-shell lookup —
+  // a profile-only hc would read reachable here while preflight and the driver cannot run it.
+  const resolve = (bin: "hc" | "herdr-app") => herdrAppBinary(bin, env);
+  const hc = opts.resolveHcBinary ? opts.resolveHcBinary(cwd) : resolve("hc");
+  // Unselected: never probed (status may start a core); installed or absent, the row says which.
+  if (!selection) return hc ? { verdict: "pass", detail: `hc installed — not probed (probing starts a core)${note}` } : { verdict: "fail", detail: `hc not installed — herdr-app not selected here${note}` };
+  if (!hc) return { verdict: "fail", detail: `hc not installed — ${selection}, so runs refuse; no other driver is substituted` };
+  let core: { coreId: string; version: string };
+  try { core = await admitHerdrApp(env as NodeJS.ProcessEnv, hc); }
+  catch (e) { return { verdict: "fail", detail: `hc installed but core unreachable — ${(e as Error).message.replace(/^refusing driver 'herdr-app': /, "")} — ${selection}` }; }
+  const reached = `core ${core.coreId} reachable (hc ${core.version})`;
+  const unavailable = "execution available, task tabs and board unavailable";
+  const app = opts.resolveHerdrAppBinary ? opts.resolveHerdrAppBinary(cwd) : resolve("herdr-app");
+  if (!app) return { verdict: "warn", detail: `${reached}; herdr-app not installed — ${unavailable} — ${selection}` };
+  try {
+    await new HcClient({ hcBin: hc, appBin: app, env: env as NodeJS.ProcessEnv }).app("app-ls", ["ls"]);
+  } catch (e) {
+    // Only herdr-app's recognized no-window refusal proves the window absent; any other failure leaves it unknown.
+    if (e instanceof HcError && e.kind === WINDOW_UNAVAILABLE) return { verdict: "warn", detail: `${reached}; app window absent — ${unavailable} — ${selection}` };
+    return { verdict: "warn", detail: `${reached}; app window unknown — herdr-app ls failed: ${(e as Error).message.split("\n")[0]} — ${selection}` };
+  }
+  return { verdict: "pass", detail: `${reached}; app window present — ${selection}` };
 }
 
 /**
@@ -1110,21 +1188,25 @@ export function applyRunnerIgnore(cwd: string): { action: "none" | "wrote" | "ma
 type EnvLike = NodeJS.ProcessEnv | Record<string, string | undefined>;
 
 /**
- * Queue row 196 (D-2102 add.1): the host decides where seats run. herdr or Orca markers (classifyHost)
- * name that driver; with neither, seats run headless on the subprocess driver with no daemon board.
+ * Queue row 196 (D-2102 add.1): the host decides where seats run. herdr, Herdr app or Orca markers (classifyHost,
+ * queue row 340) name that driver; with neither, seats run headless on the subprocess driver with no daemon board.
  * Only the exact claude-desktop entry point names Claude Desktop — a cli entry point is a terminal seat
  * and no Claude variable alone is a host. Panes configured where no pane host exists cannot be honored.
  */
-export function hostRows(env: EnvLike, llm: "pane" | "headless"): { verdict: "pass" | "warn"; key: string; detail: string }[] {
+export function hostRows(env: EnvLike, llm: "pane" | "headless", configDriver: DriverChoice = "auto"): { verdict: "pass" | "warn"; key: string; detail: string }[] {
   const host = classifyHost(env as NodeJS.ProcessEnv);
   if (host !== "none") {
-    return [{ verdict: "pass", key: "host", detail: `${host === "herdr" ? "herdr" : "Orca"} — auto selects the ${host} driver` }];
+    // D-2180 add.11: the same one resolution as every other host row; "auto selects" only when auto really does.
+    const claim = hostSelection(host, env, configDriver);
+    return [{ verdict: "pass", key: "host", detail: `${HOST_LABEL[host]} — ${claim.kind === "auto" ? `auto selects the ${host} driver` : claim.detail}` }];
   }
-  const name = env.CLAUDE_CODE_ENTRYPOINT === "claude-desktop" ? "Claude Desktop" : "no herdr or Orca host";
+  const name = env.CLAUDE_CODE_ENTRYPOINT === "claude-desktop" ? "Claude Desktop" : "no herdr, Herdr app or Orca host";
+  // A config naming a host-specific driver here is refused by run and resume: no headless-subprocess claim either.
+  const refused = configDriver !== "auto" && configDriver !== "subprocess" ? hostSelection(configDriver, env, configDriver).detail : undefined;
   return [
-    { verdict: "pass", key: "host", detail: `${name} — seats run headless on the subprocess driver with no daemon board` },
+    { verdict: "pass", key: "host", detail: `${name} — ${refused ?? "seats run headless on the subprocess driver with no daemon board"}` },
     ...(llm === "pane"
-      ? [{ verdict: "warn" as const, key: "visibility", detail: "visibility.llm is pane, but panes cannot be honored on this host — run under herdr or Orca, or set visibility.llm: headless" }]
+      ? [{ verdict: "warn" as const, key: "visibility", detail: "visibility.llm is pane, but panes cannot be honored on this host — run under herdr, the Herdr app or Orca, or set visibility.llm: headless" }]
       : []),
   ];
 }
@@ -1617,9 +1699,15 @@ export async function doctor(
     alignedStatusRow("warn", binary, `detected at ${path} (no drive contract — not routable)`),
   ));
   const herdr = HerdrDriver.available();
-  rows.push(alignedStatusRow(herdr ? "pass" : "fail", "herdr", herdr ? "driver available (HERDR_ENV=1)" : "not detected — subprocess driver will be used"));
+  // Queue row 340 (D-2180 add.11): classic herdr's absence alone never implies subprocess — say so only when the one
+  // resolution yields subprocess here; HERDR_ENV=1 outranked by a config driver, or a refused config herdr, says so.
+  const herdrClaim = hostSelection("herdr", process.env, cfg.driver);
+  const herdrDetail = herdr ? "driver available (HERDR_ENV=1)"
+    : resolveDriver(cfg.driver, classifyHost(process.env)) === "subprocess" ? "not detected — subprocess driver will be used" : "classic herdr not detected (HERDR_ENV unset)";
+  rows.push(alignedStatusRow(herdr ? "pass" : "fail", "herdr",
+    herdrClaim.kind === "unselected" || herdrClaim.kind === "refused" ? `${herdrDetail} — ${herdrClaim.detail}` : herdrDetail));
   // Queue rows 196 and 197 (D-2102 add.1): where seats run, and the locale every gate inherits.
-  for (const row of hostRows(process.env, cfg.visibility.llm)) rows.push(alignedStatusRow(row.verdict, row.key, row.detail));
+  for (const row of hostRows(process.env, cfg.visibility.llm, cfg.driver)) rows.push(alignedStatusRow(row.verdict, row.key, row.detail));
   const locale = localeFinding(process.env);
   rows.push(alignedStatusRow(locale.verdict, "locale", locale.detail));
   const root = canonicalWorktreePath(cwd);
@@ -1676,9 +1764,11 @@ export async function doctor(
   if (trustNa.length) rows.push(`  ${dim("=")} ${dim(`n/a (${trustNa.length}): ${trustNa.join(", ")}`)}`);
   // Capability is diagnostic only: auto-selection is decided from terminal identity markers, never
   // from this runtime probe, and a failed probe cannot silently substitute another driver.
-  const orca = await probeOrcaCapability(cwd, opts);
+  const orca = await probeOrcaCapability(cwd, opts, cfg.driver);
   rows.push(legend("execution runtime:"));
   rows.push(alignedStatusRow(orca.verdict, "orca", orca.detail));
+  const herdrApp = await probeHerdrAppCapability(cwd, process.env, cfg.driver, opts);
+  rows.push(alignedStatusRow(herdrApp.verdict, "herdr-app", herdrApp.detail));
   for (const [role, sel] of [["judge", cfg.judge], ["consult", cfg.consult]] as const) {
     if (!health[sel.adapter]?.installed) {
       rows.push(attentionRow(`${role} runs on ${sel.adapter}:${sel.model} — NOT installed; that gate will fail closed until you install it or remap cfg.${role}`));

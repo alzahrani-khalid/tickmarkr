@@ -37,6 +37,8 @@ tickmarkr/
 │   │   ├── types.ts               # ExecutorDriver, Slot, NotifyOpts
 │   │   ├── index.ts               # pickDriver(): herdr | subprocess | auto
 │   │   ├── herdr.ts               # visible-pane driver (shells out to the `herdr` CLI)
+│   │   ├── herdr-app.ts           # Herdr-app driver: owned hc terminals (labels + checkout + core), pinned input
+│   │   ├── hc-client.ts           # bounded argv JSON client for `hc`/`herdr-app`, closed response-family validation
 │   │   └── subprocess.ts          # plain child-process driver (fallback, no operator visibility)
 │   ├── gates/                    # quality gates + shared LLM dispatch
 │   │   ├── types.ts               # GateResult
@@ -133,8 +135,8 @@ tickmarkr/
 
 **`src/drivers/`:**
 - Purpose: abstract "where a command runs and how it's observed" behind one interface
-- Contains: the `ExecutorDriver`/`Slot` contract, the herdr (visible pane) implementation, the subprocess (child process) fallback, and `pickDriver()` auto-selection
-- Key files: `src/drivers/types.ts`, `src/drivers/herdr.ts`, `src/drivers/subprocess.ts`
+- Contains: the `ExecutorDriver`/`Slot` contract, the herdr (visible pane) implementation, the Herdr-app (hc terminal) implementation and its shared JSON client, the subprocess (child process) fallback, and `pickDriver()` auto-selection
+- Key files: `src/drivers/types.ts`, `src/drivers/herdr.ts`, `src/drivers/herdr-app.ts`, `src/drivers/hc-client.ts`, `src/drivers/subprocess.ts`
 
 **`src/gates/`:**
 - Purpose: independently re-verify every worker claim before a task can merge

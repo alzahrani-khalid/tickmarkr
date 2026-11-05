@@ -2,7 +2,7 @@ import { Box, render, Text, useApp, useInput } from "ink";
 import type { ReactNode } from "react";
 import { useRef, useState } from "react";
 import type { InitConfigOverlay } from "../../config/config.js";
-import { orcaHostDetected } from "../../drivers/index.js";
+import { classifyHost, resolveDriver } from "../../drivers/index.js";
 import { ToggleMark } from "./components.js";
 import { clip, INK, inkInput, inkOutput, KeyBar, padCell, Pointer } from "./frame.js";
 
@@ -11,22 +11,22 @@ import { clip, INK, inkInput, inkOutput, KeyBar, padCell, Pointer } from "./fram
 // any value the schema does not know.
 type Driver = NonNullable<InitConfigOverlay["driver"]>;
 type VisibilityLlm = NonNullable<NonNullable<InitConfigOverlay["visibility"]>["llm"]>;
-const DRIVERS: readonly Driver[] = ["auto", "herdr", "subprocess", "orca"];
+const DRIVERS: readonly Driver[] = ["auto", "herdr", "subprocess", "orca", "herdr-app"];
 
 // One line per driver, shown for the value currently selected: four environments no longer fit on
 // a single description row at 80 columns (the shipped three already clipped). Auto identifies its
-// innermost host from environment markers only; outside an Orca terminal, Orca is named explicitly.
-export type DetectedHost = "herdr" | "orca" | "subprocess";
+// innermost host from environment markers only (classifyHost: herdr, Herdr app, Orca, else subprocess).
+export type DetectedHost = "herdr" | "herdr-app" | "orca" | "subprocess";
 
 export function detectedHost(env: NodeJS.ProcessEnv = process.env): DetectedHost {
-  if (env.HERDR_ENV === "1") return "herdr";
-  if (orcaHostDetected(env)) return "orca";
-  return "subprocess";
+  // D-2180 add.11: auto's claim is the one resolution (resolveDriver over classifyHost precedence), never a marker read.
+  return resolveDriver("auto", classifyHost(env));
 }
 
 const DRIVER_DESC: Record<Driver, string> = {
   auto: "auto — resolves to subprocess here",
   herdr: "herdr: every worker runs in a visible pane you can watch and unblock",
+  "herdr-app": "herdr-app: visible hc terminals in the Herdr app — picked by auto inside one",
   subprocess: "subprocess: headless child processes — no cockpit, same fail-closed gates",
   orca: "orca: visible terminals in the Orca app — picked by auto inside one; name it elsewhere",
 };

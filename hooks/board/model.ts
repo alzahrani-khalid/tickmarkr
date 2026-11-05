@@ -2,8 +2,8 @@ import type { BoardProps } from "./board";
 import type { BoardState, RunSnapshot } from "./state";
 
 /**
- * The board's model and lifecycle (queue rows 280, 331 and 332). Pure but for its plain-function deps: nothing here
- * imports claude-code or src/board at runtime, so every rule is tested under Vitest with fixed wire fixtures.
+ * The board's model and lifecycle (queue rows 280, 331, 332 and 343). Pure but for its plain-function deps: nothing
+ * here imports claude-code or src/board at runtime, so every rule is tested under Vitest with fixed wire fixtures.
  */
 
 /**
@@ -168,13 +168,21 @@ export const READY_HINT = "Run board ready — /tickmarkr-board opens it";
 
 /**
  * queue row 280: a session opens the board by itself only where its own folder holds tickmarkr state, so a session
- * anywhere else never polls. One timer and one in-flight read serve start, the command and the poll; end() bumps the
- * session generation, which every publication, status and pane effect checks first, so a late read lands nowhere.
+ * anywhere else never polls. Queue row 343 (D-2180): it reads first and opens only a run that has not ended, once per
+ * run id this session, and keeps that one poll while the pane stays closed. One timer and one in-flight read serve
+ * start, the command and the poll; end() bumps the session generation, which every publication, status and pane
+ * effect checks first, so a late read lands nowhere.
  */
 export function boardController(deps: BoardDeps) {
   let session = 0;
   let cancel: (() => void) | undefined;
   let reading: Promise<void> | undefined;
+  let latest: BoardState | undefined;
+  /** Run ids successfully placed this session, by an automatic open or by a command that displayed a snapshot. */
+  const opened = new Set<string>();
+  /** One automatic placement at a time. A narrow miss does not enter `opened`, so the next poll may try again. */
+  let placing = false;
+  let placeGen = 0;
 
   /** The session folder when its own `.tickmarkr` is a directory; undefined otherwise, a rejected check included. */
   const eligible = async (): Promise<string | undefined> => {
@@ -199,6 +207,7 @@ export function boardController(deps: BoardDeps) {
         state = parseBoard({ rejected });
       }
       if (live !== session) return;
+      latest = state;
       await deps.publish(state);
       if (live !== session) return;
       // an empty or failed read clears the status line, as the published state cleared Copy
@@ -213,6 +222,27 @@ export function boardController(deps: BoardDeps) {
     cancel = undefined;
   };
 
+  // Automatic placement only. The decision uses the snapshot just published — never a second read. Daemon liveness
+  // is not an input: an unfinished run opens once whether the daemon is alive, down or unknown. A false placement
+  // keeps the ready hint and leaves the id unlatched. Concurrent completions share this gate, so two of them cannot
+  // open the same id, and a miss cannot become a latch.
+  const autoOpen = async (live: number): Promise<void> => {
+    if (live !== session || placing) return;
+    const snap = latest?.snapshot ?? null;
+    if (snap === null || snap.ended !== null || opened.has(snap.runId)) return;
+    const runId = snap.runId;
+    placing = true;
+    const gen = placeGen;
+    try {
+      const placed = await deps.open();
+      if (live !== session) return;
+      if (placed) opened.add(runId);
+      else if (!opened.has(runId)) deps.status(READY_HINT);
+    } finally {
+      if (placeGen === gen) placing = false;
+    }
+  };
+
   // Every automatic refresh, after start and after the command alike, rechecks the session folder and reads only in the
   // folder it checked; polling stops once that `.tickmarkr` is gone. Only the command's own refresh is unconditional.
   const tick = async (): Promise<void> => {
@@ -220,14 +250,18 @@ export function boardController(deps: BoardDeps) {
     const cwd = await eligible();
     if (live !== session) return;
     if (cwd === undefined) stopPolling();
-    else await refresh(cwd);
+    else {
+      await refresh(cwd);
+      if (live !== session) return;
+      await autoOpen(live);
+    }
   };
   const poll = (): void => {
     cancel ??= deps.every(POLL_MS, () => { void tick().catch(() => undefined); });
   };
 
   return {
-    /** session.start: autoload only in an interactive session whose own folder holds a `.tickmarkr` directory */
+    /** session.start: read an eligible interactive folder, then open only an unfinished run. The poll stays either way. */
     async start(interactive: boolean): Promise<void> {
       if (!interactive) return;
       const live = session;
@@ -235,24 +269,31 @@ export function boardController(deps: BoardDeps) {
       if (cwd === undefined || live !== session) return;
       await refresh(cwd);
       if (live !== session) return;
-      const placed = await deps.open();
-      if (live !== session) return;
-      // an unasked pane waits undrawn on a narrow terminal: point at the command instead of polling an unseen board
-      if (placed) poll();
-      else deps.status(READY_HINT);
+      // An ended, empty, failed or still-unplaced read keeps watching the folder. The open itself is one cheap
+      // placement request per poll, not another read.
+      poll();
+      await autoOpen(live);
     },
-    /** /tickmarkr-board: its own refresh has no autoload condition; the one timer it keeps rechecks the folder per tick */
+    /** /tickmarkr-board: its own refresh has no autoload condition; a placed snapshot's run id counts as opened. */
     async command(): Promise<void> {
       const live = session;
       poll();
       await refresh();
       if (live !== session) return;
-      await deps.open();
+      const snap = latest?.snapshot ?? null;
+      const placed = await deps.open();
+      if (live !== session) return;
+      // An empty or failed display has no run id. A false placement records none, so a later poll may still open.
+      if (placed && snap !== null) opened.add(snap.runId);
     },
-    /** session.end: cancel the timer and invalidate every pending effect */
+    /** session.end: cancel the timer, drop this session's autoload memory, and invalidate every pending effect. */
     end(): void {
       session += 1;
+      placeGen += 1;
+      placing = false;
       reading = undefined;
+      latest = undefined;
+      opened.clear();
       stopPolling();
     },
   };

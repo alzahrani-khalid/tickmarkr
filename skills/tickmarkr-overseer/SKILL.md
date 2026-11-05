@@ -14,7 +14,7 @@ hierarchy of VISIBLE agents (you → orchestrator → tickmarkr's own worker fle
 to the user with evidence.
 
 The mission is the skill argument. If empty, ask the user what to run end-to-end before doing anything else.
-Requires a supported host: herdr (`HERDR_ENV=1`) or Orca (`TERM_PROGRAM=Orca` and non-empty `ORCA_TERMINAL_HANDLE`) for that hierarchy; if neither host is detected, do not stop: this is a plain host — follow [On a plain host (neither herdr nor Orca)](#on-a-plain-host-neither-herdr-nor-orca) and run single-tier as the orchestrator.
+Requires a supported host: herdr (`HERDR_ENV=1`) or Orca (`TERM_PROGRAM=Orca` and non-empty `ORCA_TERMINAL_HANDLE`) for that hierarchy, or the Herdr app — both `HC_TERMINAL_ID` and `HC_TERMINAL_SOCKET` nonblank without `HERDR_ENV=1`, which outranks Orca's markers — two-tier through [On the Herdr app (HC pair, no classic marker)](#on-the-herdr-app-hc-pair-no-classic-marker); if none is detected, do not stop: this is a plain host — follow [On a plain host (neither herdr nor Orca)](#on-a-plain-host-neither-herdr-nor-orca) and run single-tier as the orchestrator.
 
 Use the canonical loop skill's [cockpit, parked decisions and printed twins](../tickmarkr-loop/SKILL.md#cockpit-parked-decisions-and-printed-twins)
 when reading or relaying operator evidence. Delivered views are **1 Home, 4 Run, 5 Evidence**;
@@ -134,7 +134,7 @@ by directory glob, directory sweep or worktree-list inventory. For each owned li
 
 ## On a plain host (neither herdr nor Orca)
 
-Neither `HERDR_ENV=1` nor the Orca markers are set: the Claude Desktop Code tab, a plain terminal, any
+Neither `HERDR_ENV=1`, the HC pair (`HC_TERMINAL_ID` and `HC_TERMINAL_SOCKET`) nor the Orca markers are set: the Claude Desktop Code tab, a plain terminal, any
 agent session that owns no panes (queue row 192; D-2102). There is no hierarchy to build, so this scope
 replaces the two-tier setup.
 
@@ -168,6 +168,58 @@ replaces the two-tier setup.
   there is no composer to read back, so a message no peer answered is not a handoff.
 - **Keep a permission mode that never stalls per command** for the whole run (for example
   `bypassPermissions`): nobody answers a per-command approval prompt in an unattended session.
+
+## On the Herdr app (HC pair, no classic marker)
+
+The host is read in this order (queue row 340; D-2180): `HERDR_ENV=1` is classic herdr even beside every
+other marker; otherwise both `HC_TERMINAL_ID` and `HC_TERMINAL_SOCKET` nonblank after trim is the Herdr
+app, even beside Orca's markers; otherwise the Orca markers are Orca; otherwise this is a plain host —
+either HC marker alone, or a blank one, is no app. This scope is the canonical app guidance for the
+overseer, loop and auto skills.
+
+- **Two visible tiers, never single-tier.** The Herdr app is a two-tier host: an OVERSEER and one ORCH,
+  each an interactive TUI in its own visible `hc` terminal. The plain-host single-tier scope never applies
+  here, and no classic herdr command or classic watcher shell script is compatible with `hc`: never run
+  one on the app. Wherever another scope reads On herdr, On Orca or On a plain host, follow this scope.
+- **Seat launch.** Before every seat (ORCH, consultant, reviewer) consume a successful
+  `tickmarkr fleet --pick <purpose>` and build the launch command from its returned `adapter` and `model`,
+  keeping the role's permission flags (claude `--permission-mode bypassPermissions`; codex
+  `--dangerously-bypass-approvals-and-sandbox`); every codex seat also adds `--no-daemon`, the all-host
+  adapter contract. Read the launcher's own `herdr.space` label with `hc get "$HC_TERMINAL_ID" --json` and
+  use it only from a valid read-back. The first task travels IN the launch argv:
+
+  ```bash
+  hc run --bg --json --no-parent --no-notify --name "ORCH · <label>" --cwd "<checkout>" --label "tickmarkr.owner=<seat>" --label "tickmarkr.repo=<repo>" --label "herdr.space=<verified space>" -- <fleet-selected agent command> "<first task>"
+  ```
+
+  Record the receipt's `address`, the core's `HC_TERMINAL_SOCKET`, owner, repo, checkout and mission in
+  the seat ledger (`pids/<seat>.handle`, `host=herdr-app`), then verify the JSON read-back:
+  `hc get <address> --json` returns that same address, both labels, the checkout as `cwd` and `parent`
+  null, and `hc read <address> --json --lines 0` shows the model banner. No headless `-p` or `exec`
+  auxiliary seat and no in-process subagent.
+- **Delivery after launch.** Send only to a recorded, verified address with
+  `hc send <address> "<message>" --json`, never `--force`. A booting seat, an occupied composer, a blocked
+  dialog, an uncertain submit (`started` not `true`) or `first_message` false is NO handoff: read the seat
+  with `hc read <address> --json --lines 0` and `hc get <address> --json`, resolve readiness, then send
+  once more. A read never proves a queued message was submitted unless composer or turn evidence says so.
+- **Waits are addressed, never a census.** A seat launched `--no-parent` has no parent: wait each recorded
+  detached seat at its own address with `hc wait <address> --timeout <seconds> --json`, never an empty
+  `--children` census. `hc wait <parent> --children any --timeout <seconds> --json` (or `all`) is only for
+  helpers actually launched as that parent's children. Every wait carries an explicit timeout and its
+  `reason` is read: `timeout` or `message` is a wake reason to read the seat, never completion proof.
+- **The run's consumer is the journal.** The blocking file consumer is `tickmarkr wait <runId>`,
+  supervised with `hc wait` at the ORCH's recorded address; on every run-end or park wake read CURRENT
+  `tickmarkr status <runId>` and re-arm with `tickmarkr wait <runId> --after <line>`. No sleep watcher, and
+  never an agent-idle state as mission completion. Beat and journal obligations are unchanged.
+- **Detached run and resume.** Run the `env -u HC_SCOPE` lines of the
+  [detached launch](#host-owned-daemon-and-detached-beats): `HC_TERMINAL_ID` is the ORCH's recorded
+  terminal and `HC_TERMINAL_SOCKET` that core's recorded socket, so the daemon places its board right of
+  the ORCH and inherits no launcher scope. When the ORCH launches, those are its own recorded values; when
+  the OVERSEER runs the sandbox-denial fallback, it uses the recorded ORCH address, never its own.
+- **Teardown.** Follow the On the Herdr app step of
+  [mission-end teardown](#mission-end-teardown-queue-row-240-d-2138-add1-r3-add4): exact owner, repo,
+  address and checkout, then `hc kill` and `hc rm` and proven absence; a mismatch or unreadable read
+  leaves the terminal protected, and neither tier ever closes the other tier's terminal.
 
 ## Setup
 
@@ -213,6 +265,7 @@ replaces the two-tier setup.
      recorded pids. It never uses `pkill -f`, `pgrep -f`, or any argv/path pattern. The pre-arm beat probe lists unowned writers and is reconciled in the beat section; retiring a watcher this seat armed stays kill-by-recorded-pid and never that probe. Verify each executing
      pid in two process-table reads before acting. A stand-down inventories this seat's recorded pids
      and the partner's watchers that must survive it.
+
    **An adopted seat ANNOUNCES itself, in the same act as re-arming:** tell the adopted orchestrator the
    fresh seat is live (verified send: probe token + read-back). Through the gap its view of your tier read
    STALE, and a tier that believes it is unsupervised escalates into a file nobody is reading. Earned
@@ -278,11 +331,14 @@ replaces the two-tier setup.
      with the task id and holding that task's worker plus its judge/review/consult panes (tickmarkr
      updates it). Never long context strings or ✓-chains.
    - **On Orca (`TERM_PROGRAM=Orca` and non-empty `ORCA_TERMINAL_HANDLE`)**: Do not load the `herdr` skill and do not map a Herdr workspace. Work from the current Orca terminal context. Keep the overseer in the launching terminal, name it in the same act — `orca terminal rename --terminal "$ORCA_TERMINAL_HANDLE" --title "OVERSEER · <label>"` (tab title; see the seat-name law under Seat-spawn recipes) — and inspect terminals with `orca terminal list --json`. Launch the daemon detached at the orchestrator terminal's recorded handle using the detached launch below — no pane of its own; its self-placed watch board stays in the ORCH tab.
+   - **On the Herdr app (HC pair, no classic marker)**: Do not load the `herdr` skill and map no Herdr workspace. Keep the overseer in its launching `hc` terminal, record its own `HC_TERMINAL_ID`, `HC_TERMINAL_SOCKET` and the verified `herdr.space` label from `hc get "$HC_TERMINAL_ID" --json`, and follow [On the Herdr app](#on-the-herdr-app-hc-pair-no-classic-marker).
 2. **Orchestrator**: First consume a successful `tickmarkr fleet --pick consult` in the seat repository, per the Fleet selection contract below; then launch the returned adapter/model with your agent host.
    - **On herdr (`HERDR_ENV=1`)**: Spawning on current herdr is two-step — the one-shot `agent start --cwd` form was removed in the herdr CLI redesign and now fails with `unknown option` (OBS-138): first create the pane with `herdr tab create --workspace <ws> --cwd <repo> --label "ORCH · <label>"` and parse `result.root_pane.pane_id` from its JSON, then start the agent in it. For Claude Code, use `herdr agent start orchestrator --kind claude --pane <root-pane-id> -- --permission-mode bypassPermissions` (append `--model <picked-model>` after the `--` from the Fleet receipt). For Codex, use `herdr agent start orchestrator --kind codex --pane <root-pane-id> -- --dangerously-bypass-approvals-and-sandbox` (add `--model <picked-model>` from the Fleet receipt). The unsandboxed flag is REQUIRED: codex's `workspace-write` sandbox keeps `.git` refs read-only, so a sandboxed orchestrator's `tickmarkr run` dies at integration-branch creation — do not downgrade it. Workers you never spawn — tickmarkr spawns its own visible worker panes. Auxiliary agents you do spawn (consultants, reviewers, scouts) follow the same forms: never launch a claude session in plan mode or default permission mode for autonomous work — both stall on per-command approval prompts nobody is watching; claude is always `--permission-mode bypassPermissions --settings '{"promptSuggestionEnabled":false}'`. **For a codex consultant, use `-a never --sandbox workspace-write` — NOT `--sandbox read-only`.** ⚠ **`--sandbox read-only` CONTRADICTS this skill's own completion protocol and will hang the seat.** Every seat you spawn is told to deliver an ARTIFACT ending in a terminal MARKER, because that is the only completion signal the artifact watcher can key on (`done` is turn end). A read-only sandbox cannot write that artifact, so codex blocks on `Would you like to make the following edits?` for its OWN report — and the report exists ONLY in the pending edit, so abandoning the prompt destroys the work rather than merely delaying it. Measured 2026-08-28: a consultant spawned `--sandbox read-only` finished a 14,604-byte verdict, sat blocked on the write, and the operator saw the prompt before the supervising tier did. `read-only` is correct ONLY for a seat that writes nothing at all — which, under the artifact+marker rule, is no seat this skill tells you to spawn. When the prompt does appear, answer **"Yes, and don't ask again for these files"** rather than plain yes: plain yes re-blocks on the next write of the same file. **That `--settings` pair is not cosmetic and it is not optional:** claude-code's AUTOSUGGEST renders context-plausible ghost text into an idle seat's prompt line that is BYTE-IDENTICAL to a typed draft in text-format reads (OBS-482), so a supervising tier cannot tell a seat's own unsent work from a rendering artifact without `agent read --format ansi`. Turning the suggester off at spawn removes the ambiguity at its source instead of paying for the discrimination at every read. Verified against the shipped binary: `claude --settings '{"promptSuggestionEnabled":false}' -p …` exits 0 with a real response, and the key appears in the binary's own settings schema. **For kimi, pass `-y`** (`herdr agent start <name> --kind kimi --pane <id> -- -y`) — the adapter already launches its own workers that way (`src/adapters/kimi.ts:204`), and a kimi seat spawned without it sits on an approval prompt having done nothing. **Herdr cannot see that state**: it reports a kimi pane as `agent_status: working` with `screen_detection_skipped: true` while the prompt is up, so the BLOCKED-STATE watcher in `references/watchers.md` is blind on this vendor and the spawn flag is the ONLY control. Every vendor you spawn needs its auto-approve form named here; a vendor absent from this list is a seat that will hang.
    - **On Orca (`TERM_PROGRAM=Orca` and non-empty `ORCA_TERMINAL_HANDLE`)**: Seats spawn with `orca terminal create` on a path worktree selector with a command:
      `orca terminal create --worktree path:<repo> --title "ORCH · <label>" --command "<agent-cmd>" --json`
      For Claude Code: `orca terminal create --worktree path:<repo> --title "ORCH · <label>" --command "claude --model <picked-model> --permission-mode bypassPermissions --settings '{\"promptSuggestionEnabled\":false}'" --json`. For Codex: `orca terminal create --worktree path:<repo> --title "ORCH · <label>" --command "codex --model <picked-model> --dangerously-bypass-approvals-and-sandbox" --json`. Parse `result.terminal.handle` from the create receipt.
+   - **On the Herdr app (HC pair, no classic marker)**: write the brief of step 3 first, then launch the ORCH with the `hc run --bg --json --no-parent --no-notify` seat recipe of [On the Herdr app](#on-the-herdr-app-hc-pair-no-classic-marker), reading that brief as the first task in its launch argv; record and verify its address.
+
    Require the orchestrator to use the host-owned daemon and detached-beat lifecycle below for both run and resume, and to report the lock pid ancestry check.
 3. **Standing instructions travel as a brief FILE, never as pane text** — PTY input truncates at ~1024B and a
    truncated brief silently drops policy. Write the full brief to `<repo>/.tickmarkr/overseer/ORCH-BRIEF.md`
@@ -292,6 +348,8 @@ replaces the two-tier setup.
    - **On Orca (`TERM_PROGRAM=Orca` and non-empty `ORCA_TERMINAL_HANDLE`)**: Briefs travel as a file announced by `terminal send` with enter and a submit wait whose receipt is read for observed submission rather than input acceptance:
      `orca terminal send --terminal <handle> --text "Read .tickmarkr/overseer/ORCH-BRIEF.md and follow it exactly." --enter --wait-submit 15 --json`
      Read `result.send.prompt.stages` and treat the brief as delivered only when a `turn_started` stage is present; `accepted: true` proves input acceptance, not a started turn; never resend on `accepted` alone.
+   - **On the Herdr app (HC pair, no classic marker)**: the brief file is the first task in the ORCH's launch argv; any later announcement is `hc send <orch address> "Read .tickmarkr/overseer/ORCH-BRIEF.md and follow it exactly." --json` under the delivery rule of [On the Herdr app](#on-the-herdr-app-hc-pair-no-classic-marker).
+
    The brief MUST contain: **Seat hygiene — in a multi-tier session the tiers clear each other at 50% context or more after writing a handoff; a new spec or run is a mission boundary, so hand off and clear before the next mission; copy this duty into every brief and handoff; on a single-tier plain host write your handoff and ask the operator to clear the session**, then the mission, the five-tab canon (on herdr) or seat layout (on Orca), the pane mechanics in `references/pane-mechanics.md`, rules 1–2, and require a verbatim one-sentence
    acknowledgment of the human-checkpoint rule before anything is dispatched.
    *method guards* in that brief (how to know a thing, not what is true of this spec), and deleting them
@@ -303,6 +361,7 @@ replaces the two-tier setup.
 4. **Supervision setup**: Report the hierarchy map to the user.
    - **On herdr (`HERDR_ENV=1`)**: Arm the watcher and supervision beat from the On herdr section of `references/watchers.md`; report pane ids and names.
    - **On Orca (`TERM_PROGRAM=Orca` and non-empty `ORCA_TERMINAL_HANDLE`)**: Follow the On Orca section of `references/watchers.md`; record terminal handles, file/journal watcher ownership and evidence paths.
+   - **On the Herdr app (HC pair, no classic marker)**: arm `tickmarkr wait <runId>` and the supervision beat, and supervise each detached seat with `hc wait <address>` per [On the Herdr app](#on-the-herdr-app-hc-pair-no-classic-marker); report terminal addresses and names. The classic watcher scripts in `references/watchers.md` are not used here.
 
 ### Restart, seat identity, and verified launch law (host-specific)
 
@@ -322,6 +381,9 @@ replaces the two-tier setup.
   otherwise — a gate that was running in that seat has to be re-launched, never assumed to continue.
   When briefing a seat on either host, take its current address from the handoff file; never hardcode a pane id
   or terminal handle in a brief or command template.
+- **On the Herdr app (HC pair, no classic marker)**: After any restart, re-read each recorded address with `hc get <address> --json` on its
+  recorded socket; a changed core or a mismatched owner, repo or checkout is a dead seat — re-launch it,
+  never re-adopt it by name.
 
 The orchestrator's run log, handoff, and plan live inside its sandbox root and are artifacts of that orchestrator.
 The overseer reads them from there, using the path the orchestrator reports; do not substitute the
@@ -340,6 +402,9 @@ re-resolved by title if stale; the launching overseer's own terminal is not the 
 - **On herdr (`HERDR_ENV=1`)**: record the ORCH's `result.root_pane.pane_id` from its tab-create
   receipt. For the fallback, run the detached `HERDR_PANE_ID="<ORCH pane id>"` line of the detached
   launch below with that recorded ORCH pane id; never target the OVERSEER's pane.
+- **On the Herdr app (HC pair, no classic marker)**: record the ORCH's `address` from its `hc run` receipt and the core's
+  `HC_TERMINAL_SOCKET`. For the fallback, run the `env -u HC_SCOPE` lines of the detached launch below
+  with that recorded ORCH terminal and socket; never the OVERSEER's own `HC_TERMINAL_ID`.
 
 The same recorded ORCH address is required for a fallback `tickmarkr resume <runId>`.
 
@@ -434,6 +499,7 @@ Kimi `-y`, artifact plus terminal marker, and verified file-brief delivery. Flee
   for the same reason). The earlier three-part launch form (`DISABLE_AUTO_TITLE` + `printf` +
   `CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1`) is withdrawn: it silenced one vendor's pane title and named
   nothing the tab did not already hold. Brief delivery travels as a file announced by `orca terminal send --terminal <handle> --text "<announcement>" --enter --wait-submit 15 --json`. Read `result.send.prompt.stages` and treat the brief as delivered only when a `turn_started` stage is present; `accepted: true` proves input acceptance, not a started turn; never resend on `accepted` alone.
+
 For Leg-2 (both hosts), a Codex reviewer under `workspace-write` must be briefed with an in-worktree verdict path such as
 `<repo>/.tickmarkr/overseer/verdicts/<task>.md`, and its verdict must be written there before it is read.
 
@@ -467,6 +533,7 @@ For Leg-2 (both hosts), a Codex reviewer under `workspace-write` must be briefed
    - **On herdr (`HERDR_ENV=1`)** the independent seat uses its Fleet-selected adapter kind and model with `herdr agent start … --kind <picked-kind> -- …`;
    - **On Orca (`TERM_PROGRAM=Orca` and non-empty `ORCA_TERMINAL_HANDLE`)** it uses the Orca terminal-create
    seat recipe. The choice is ruled at dispatch, never debated under time pressure.
+
    **A codex seat inside a git WORKTREE cannot commit and cannot write outside the worktree** (OBS-824, measured
    twice on 2026-09-01): its sandbox pins writes to the worktree's own path, and a worktree's `.git` is a FILE pointing
    at the main repository's object store, so every `git commit` from inside it is refused. Brief such a seat to leave its
@@ -526,7 +593,16 @@ cd <repo> && node -e "require('child_process').spawn(process.argv[1], process.ar
 - **On herdr (`HERDR_ENV=1`)**: run the `HERDR_PANE_ID` lines; `<ORCH pane id>` is the ORCH's own
   `$HERDR_PANE_ID`. When the OVERSEER launches the fallback, substitute the ORCH pane id recorded
   at seat creation, never the OVERSEER's pane.
-- With neither host, run the two lines that carry no address
+- **On the Herdr app (HC pair, no classic marker)**: run the `env -u HC_SCOPE` lines below; `<ORCH terminal>` is the
+  ORCH's `HC_TERMINAL_ID` and `<ORCH socket>` that core's `HC_TERMINAL_SOCKET`, both recorded at seat
+  creation, so the daemon places its board right of the ORCH and inherits no launcher `HC_SCOPE`. When
+  the OVERSEER launches the fallback, substitute that recorded ORCH address, never its own terminal.
+
+  ```bash
+  cd "<repo>" && env -u HC_SCOPE HC_TERMINAL_ID="<ORCH terminal>" HC_TERMINAL_SOCKET="<ORCH socket>" node -e "require('child_process').spawn(process.argv[1], process.argv.slice(2), { detached: true, stdio: 'inherit' }).unref()" tickmarkr run >> "<state-dir>/daemon.log" 2>&1 < /dev/null
+  cd "<repo>" && env -u HC_SCOPE HC_TERMINAL_ID="<ORCH terminal>" HC_TERMINAL_SOCKET="<ORCH socket>" node -e "require('child_process').spawn(process.argv[1], process.argv.slice(2), { detached: true, stdio: 'inherit' }).unref()" tickmarkr resume <runId> >> "<state-dir>/daemon.log" 2>&1 < /dev/null
+  ```
+- With no host at all (no `HERDR_ENV=1`, no HC pair, no Orca markers), run the two lines that carry no address
   ([On a plain host (neither herdr nor Orca)](#on-a-plain-host-neither-herdr-nor-orca)).
 
 After any launch, read this repository's lock pid from `<state-dir>/graph.lock` and confirm it:
@@ -538,6 +614,7 @@ visible split to watch it.
 
 - **On herdr (`HERDR_ENV=1`)**: the daemon-placed board is the live surface.
 - **On Orca (`TERM_PROGRAM=Orca` and non-empty `ORCA_TERMINAL_HANDLE`)**: the daemon-placed board is the live surface.
+- **On the Herdr app (HC pair, no classic marker)**: the daemon-placed board, right of the ORCH terminal, is the live surface.
 
 Detached beats are product-owned, one per (tier, seat), from the repository root, through the
 shipped lifecycle verbs — never a hand-rolled setsid plus nohup wrapper, pidfile or shell loop:
@@ -715,6 +792,9 @@ journal tail to decide what happens next, or sweeping orphans — you have taken
     pinned the same way beside the ORCH. **Look for the matching daemon-placed pane.** If it is absent,
     treat that as a daemon/run liveness fault and use the normal recovery path; never hand-place,
     hand-roll, or launch a replacement live surface.
+  - **On the Herdr app (HC pair, no classic marker)**: the same board, placed by the daemon to the right of the ORCH terminal
+    and pinned to the run id. If it is absent, treat that as a daemon/run liveness fault and use the
+    normal recovery path; never hand-place a replacement.
 - **The journal is the source of truth**, not panes. Watchers go on `run-end` / `task-human` /
   `task-failed` / `consult-verdict`; never sleep-poll inside an agent turn. **Never key a watcher on an
   agent's `done`** — that is turn end and fires the moment a seat finishes acknowledging you.
@@ -730,6 +810,7 @@ journal tail to decide what happens next, or sweeping orphans — you have taken
     `outstanding 0`. `scripts/watch-parks.sh` stays the park-specific wake for THIS seat (it counts parks and speaks
     about rulings); the two overlap on `task-human` deliberately, and arming both is coverage, not a bug.
   - **On Orca (`TERM_PROGRAM=Orca` and non-empty `ORCA_TERMINAL_HANDLE`)**: Arm a file/journal consumer for the same terminal events, or a foreground `until grep` on them, and ensure it is re-armed at most every twenty minutes; inspect the seat with `orca terminal read --terminal <handle> --screen --json`; re-arm after every wake.
+  - **On the Herdr app (HC pair, no classic marker)**: the consumer is `tickmarkr wait <runId>`, supervised with `hc wait <ORCH address> --timeout <seconds> --json` and re-armed after every wake per [On the Herdr app](#on-the-herdr-app-hc-pair-no-classic-marker); never a classic watcher script, a sleep watcher or a `--children` census of a detached seat.
 - **Daemon liveness ≠ journal activity.** A dead daemon emits no events, so journal watchers sleep through
   its death. Liveness comes from the lock's OWN pid (`kill -0`), never a command-name grep. Recovery is
   `tickmarkr resume <runId>` — **the orchestrator's command, not yours** — and note that resume REPLAYS the
@@ -832,6 +913,12 @@ seat; never close the replacement by title, never rewrite ownership from a title
   `orca terminal list --include-visual-layouts --json` after its final terminal closes, in the same
   runtime as the pre-close listing. A surviving owned tab is a spec question, never permission to
   close by title. The Orca smoke e2e asserts this tab leg; a receipt alone is no close proof.
+- **On the Herdr app (HC pair, no classic marker)**: verify `hc get <address> --json` at the recorded
+  address: its `tickmarkr.owner` and `tickmarkr.repo` labels, `address` and `cwd` equal the ledger's exact
+  owner, repo, address and checkout. Only then `hc kill <address> --json` and `hc rm <address> --json`
+  (`removed` equals that address), and prove the terminal absent from `hc ls --all --json` and the app
+  window. A mismatch or an unreadable read closes nothing and leaves the terminal protected; never target
+  the other tier's terminal, a foreign terminal or your own launching terminal.
 
 ## Non-negotiable rules
 

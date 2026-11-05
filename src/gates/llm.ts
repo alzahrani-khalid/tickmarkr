@@ -6,6 +6,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { matchesTrustDialog, shq, type WorkerAdapter } from "../adapters/types.js";
+import { answerTrustDialog } from "../run/trust-dialog.js";
 import type { Effort } from "../graph/schema.js";
 import { formatOwnedName, parseOwnedName, type ExecutorDriver, type Slot } from "../drivers/types.js";
 import { SEAT_MARKER_ENV } from "../drivers/host-env.js";
@@ -451,8 +452,10 @@ async function runHeadlessDetailed(
     const ceiling = seatShellCeiling(timeoutMs);
     const role = seatRoleFromPrompt(prompt);
     const r = await (async () => {
+      // Queue row 340 (D-2180): every agent this launches is sealed from the caller's host addressing, including a
+      // role-less caller (scope/start drafting) the prompt cannot name a seat for; only a seat role sets its marker.
       try { return await sh(command, cwd, timeoutMs + 30_000, {
-        onSpawn: ceiling.onSpawn, ownsLeader: ceiling.ownsLeader,
+        onSpawn: ceiling.onSpawn, ownsLeader: ceiling.ownsLeader, agent: true,
         ...(role ? { seat: role } : {}),
       }); }
       finally { await ceiling.stop(); }
@@ -537,9 +540,26 @@ async function runViaDriverDetailed(
       throw new SeatLaunchError(`${adapter.id}:${model}`, error);
     }
     if (via.driver.sendKey) {
+      // Queue row 342 (D-2180): the shared trust answer (src/run/trust-dialog.ts) on the slot's rendered frame when the
+      // driver has one — Claude's dialog is a verified Down → re-read → Enter, never a bare Enter that exits the seat.
+      // An answer that is not "answered" (refused, or a submit rejected after dispatch) pages the operator; it never buys
+      // a second sequence.
+      const seat = slot;
+      const sendKey = via.driver.sendKey.bind(via.driver);
+      const readFrame = () => (seat.readScreen ? seat.readScreen() : via.driver.read(seat, 400));
+      // The seat's startup budget is fixed at launch, BEFORE the first frame read, and never recomputed: a first read
+      // that ends at or after it refuses with no Down and no Enter (a slow read never buys a fresh budget).
+      const deadline = Date.now() + Math.min(timeoutMs, REVIEW_FIRST_LIVENESS_MS);
       try {
-        if (matchesTrustDialog(await via.driver.read(slot, 400), adapter.trustDialog)) {
-          await via.driver.sendKey(slot, adapter.trustDialog.key);
+        const frame = await readFrame();
+        if (matchesTrustDialog(frame, adapter.trustDialog)) {
+          const answer = await answerTrustDialog({
+            dialog: adapter.trustDialog, frame, read: readFrame, sendKey: (key) => sendKey(seat, key), deadline,
+          });
+          if (answer.outcome !== "answered") {
+            const left = answer.outcome === "refused" ? "left unanswered" : "answer unconfirmed";
+            await via.driver.notify(`tickmarkr: ${seat.name} trust dialog ${left} (${answer.reason}) — answer it in its pane`, { tier: "attention" });
+          }
         }
       } catch {
         /* a failed pre-wait read must not replace the verdict wait */

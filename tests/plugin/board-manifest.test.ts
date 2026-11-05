@@ -225,14 +225,15 @@ test("test: the production register function, executed with a fake host and the 
     expect(occupied.world.timers).toEqual([]);
   }
 
-  // An unplaced pane still reads and publishes, but parks behind the ready hint instead of polling unseen.
+  // An unplaced automatic open keeps the ready hint and the eligible poll (queue row 343). The miss is not a latch.
   const unplaced = rig({ placed: false });
   await unplaced.fire("session.start", { isInteractive: true });
   await flush();
   expect(unplaced.world.runs).toHaveLength(1);
   expect(unplaced.world.opens).toHaveLength(1);
   expect(unplaced.world.statuses).toEqual([unplaced.model.boardStatusLine(unplaced.model.shown(SNAPSHOT)), unplaced.model.READY_HINT]);
-  expect(unplaced.world.timers).toEqual([]);
+  expect(unplaced.world.timers.map(timer => timer.ms)).toEqual([5000]);
+  expect(unplaced.world.timers[0]!.cancelled).toBe(false);
 
   // The autoload start: register, cwd + kind check, board json run, focus-less open, status line, one poll.
   const w = rig({ options: { stateRoots: "/state/a, /state/b", releaseRoots: "/rel", marks: "devicons" } });

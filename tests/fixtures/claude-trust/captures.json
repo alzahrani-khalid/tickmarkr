@@ -1,0 +1,51 @@
+{
+  "provenance": "OBSERVER executed hc capture, Claude Code 2.1.318, 2026-11-04, fresh untrusted git repository root. Default No, exit. A subfolder of a trusted parent does not reproduce it. There is one MCP negative control captured twice with identical bytes. Raw file strings remain verbatim; derived frames below are explicitly synthetic concatenations of captured bytes.",
+  "files": {
+    "claude-version.txt": "2.1.318 (Claude Code)\n",
+    "00-run.json": "{\"address\":\"t13\",\"agent\":\"claude\",\"cwd\":\"/Users/operator/Desktop/CodingSpace/clones/probe-claude-trust-2200\",\"name\":\"tkr-probe-claude-trust3\",\"parent\":\"t1\",\"state\":\"live\",\"turn\":0}\n",
+    "01-get.json": "{\"address\":\"t13\",\"argv\":[\"claude\",\"--model\",\"claude-opus-5-5\",\"--settings\",\"{\\\"promptSuggestionEnabled\\\":false}\"],\"cols\":200,\"created_ms\":1793780234112,\"cwd\":\"/Users/operator/Desktop/CodingSpace/clones/probe-claude-trust-2200\",\"die_with_parent\":true,\"exit_code\":null,\"finished_ms\":null,\"foreground\":{\"argv\":[\"claude\",\"--model\",\"claude-opus-5-5\",\"--settings\",\"{\\\"promptSuggestionEnabled\\\":false}\"],\"cwd\":\"/Users/operator/Desktop/CodingSpace/clones/probe-claude-trust-2200\",\"name\":\"2.1.318\",\"pid\":27243},\"identity\":\"ghostty\",\"keep\":false,\"labels\":{\"tickmarkr.seat\":\"OBSERVER-probe\",\"where\":\"tickmarkr / OBSERVER · 2.20.0\"},\"name\":\"tkr-probe-claude-trust3\",\"notify\":false,\"parent\":\"t1\",\"pid\":27243,\"reason\":null,\"reported\":false,\"rm\":false,\"rows\":120,\"screen\":\"exact\",\"signal\":null,\"state\":\"live\",\"status\":null,\"status_ms\":null,\"template\":null,\"title\":\"\",\"turn\":0}\n",
+    "02-read-dialog.json": "{\"complete\":true,\"how\":\"screen\",\"text\":\"\\n────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\\n Accessing workspace:\\n\\n /Users/operator/Desktop/CodingSpace/clones/probe-claude-trust-2200\\n\\n Quick safety check: Is this a project you created or one you trust? (Like your own code, a well-known open source project, or work from your team). If not, take a moment to review what's in this\\n folder first.\\n\\n Claude Code'll be able to read, edit, and execute files here.\\n\\n Security guide\\n\\n ❯ No, exit\\n   Yes, I trust this folder\\n\\n Enter to confirm · Esc to cancel\"}\n",
+    "03-keys-down.json": "{\"status\":null,\"turn\":0}\n",
+    "04-read-after-down.json": "{\"complete\":true,\"how\":\"screen\",\"text\":\"\\n────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\\n Accessing workspace:\\n\\n /Users/operator/Desktop/CodingSpace/clones/probe-claude-trust-2200\\n\\n Quick safety check: Is this a project you created or one you trust? (Like your own code, a well-known open source project, or work from your team). If not, take a moment to review what's in this\\n folder first.\\n\\n Claude Code'll be able to read, edit, and execute files here.\\n\\n Security guide\\n\\n   No, exit\\n ❯ Yes, I trust this folder\\n\\n Enter to confirm · Esc to cancel\"}\n",
+    "05-kill.json": "{\"address\":\"t13\",\"argv\":[\"claude\",\"--model\",\"claude-opus-5-5\",\"--settings\",\"{\\\"promptSuggestionEnabled\\\":false}\"],\"cols\":200,\"created_ms\":1793780234112,\"cwd\":\"/Users/operator/Desktop/CodingSpace/clones/probe-claude-trust-2200\",\"die_with_parent\":true,\"exit_code\":129,\"finished_ms\":1793780254111,\"identity\":\"ghostty\",\"keep\":false,\"labels\":{\"tickmarkr.seat\":\"OBSERVER-probe\",\"where\":\"tickmarkr / OBSERVER · 2.20.0\"},\"name\":\"tkr-probe-claude-trust3\",\"notify\":false,\"parent\":\"t1\",\"pid\":27243,\"reason\":\"killed\",\"reported\":true,\"rm\":false,\"rows\":120,\"screen\":\"exact\",\"signal\":null,\"state\":\"finished\",\"status\":null,\"status_ms\":null,\"template\":null,\"title\":\"\",\"turn\":0}\n",
+    "06-rm.json": "{\"removed\":\"t13\"}\n",
+    "not-trust-mcp-dialog/02-read-dialog.json": "{\"complete\":true,\"how\":\"screen\",\"text\":\"\\n────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\\n  New MCP server found in this project: graft\\n\\n  MCP servers may execute code or access system resources. All tool calls require approval. Learn more in the MCP documentation.\\n\\n    Use this MCP server\\n    Use this and all future MCP servers in this project\\n  ❯ Continue without using this MCP server\\n\\n  Enter to confirm · Esc to cancel\"}\n",
+    "not-trust-mcp-dialog-2/02-read-dialog.json": "{\"complete\":true,\"how\":\"screen\",\"text\":\"\\n────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\\n  New MCP server found in this project: graft\\n\\n  MCP servers may execute code or access system resources. All tool calls require approval. Learn more in the MCP documentation.\\n\\n    Use this MCP server\\n    Use this and all future MCP servers in this project\\n  ❯ Continue without using this MCP server\\n\\n  Enter to confirm · Esc to cancel\"}\n"
+  },
+  "duplicateControl": {
+    "files": [
+      "not-trust-mcp-dialog/02-read-dialog.json",
+      "not-trust-mcp-dialog-2/02-read-dialog.json"
+    ],
+    "sha256": "921ef3b45abc7b255e4e087c91b3b5c65be8322054858cb335dab9ff14069e74",
+    "identical": true
+  },
+  "derivedFrames": {
+    "stacked_mcp": {
+      "operation": "concatenate captured after-Down text with captured MCP text, with no inserted bytes",
+      "parts": [
+        "04-read-after-down.json.text",
+        "not-trust-mcp-dialog/02-read-dialog.json.text"
+      ],
+      "text": "\n────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n Accessing workspace:\n\n /Users/operator/Desktop/CodingSpace/clones/probe-claude-trust-2200\n\n Quick safety check: Is this a project you created or one you trust? (Like your own code, a well-known open source project, or work from your team). If not, take a moment to review what's in this\n folder first.\n\n Claude Code'll be able to read, edit, and execute files here.\n\n Security guide\n\n   No, exit\n ❯ Yes, I trust this folder\n\n Enter to confirm · Esc to cancel\n────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n  New MCP server found in this project: graft\n\n  MCP servers may execute code or access system resources. All tool calls require approval. Learn more in the MCP documentation.\n\n    Use this MCP server\n    Use this and all future MCP servers in this project\n  ❯ Continue without using this MCP server\n\n  Enter to confirm · Esc to cancel"
+    },
+    "prose_only_question": {
+      "operation": "concatenate two identical verbatim question-paragraph slices; no option/footer rows and no inserted bytes",
+      "source": "02-read-dialog.json.text",
+      "slice": [
+        300,
+        511
+      ],
+      "parts": 2,
+      "text": "\n Quick safety check: Is this a project you created or one you trust? (Like your own code, a well-known open source project, or work from your team). If not, take a moment to review what's in this\n folder first.\n Quick safety check: Is this a project you created or one you trust? (Like your own code, a well-known open source project, or work from your team). If not, take a moment to review what's in this\n folder first."
+    },
+    "after_down_nbsp": {
+      "operation": "one U+0020 to U+00A0 substitution in selected-caret padding only; leading indentation and every other character unchanged",
+      "source": "04-read-after-down.json.text",
+      "from": " ❯ Yes, I trust this folder",
+      "to": " ❯ Yes, I trust this folder",
+      "count": 1,
+      "text": "\n────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────\n Accessing workspace:\n\n /Users/operator/Desktop/CodingSpace/clones/probe-claude-trust-2200\n\n Quick safety check: Is this a project you created or one you trust? (Like your own code, a well-known open source project, or work from your team). If not, take a moment to review what's in this\n folder first.\n\n Claude Code'll be able to read, edit, and execute files here.\n\n Security guide\n\n   No, exit\n ❯ Yes, I trust this folder\n\n Enter to confirm · Esc to cancel"
+    }
+  }
+}

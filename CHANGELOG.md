@@ -2,6 +2,59 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v2.20.0 — tickmarkr runs inside the Herdr app
+
+**v2.20.0** was delivered by one tickmarkr run of eight tasks (run-20261104-093422-0000000000000814) and a set of hand
+fixes verified by `tickmarkr verify`. Every task passed build, lint, evidence and scope, its acceptance criteria and the
+full test suite before it merged. Seven tasks were reviewed by a model from another vendor. The eighth, the private
+real-core smoke test, had both vendors among its authors after a repair escalation, so no eligible reviewer was left;
+that review was waived on executed evidence and stays recorded as an owed check.
+
+Before release, the built CLI ran real two-task runs inside the Herdr app. That live proof found five defects that the
+run's tests and fakes could not see, and all are fixed here:
+- terminal addresses past `t19` (the core counts `t19`, `t1b`, … `t1z`, `t20`) were refused, so workers failed to start
+  once a core had handed out nineteen terminals;
+- a history read of a full-screen app, which the Herdr app now answers as `stitched`, was treated as unreadable;
+- the run board's close failed at run end, because the window drops a finished terminal's pane before tickmarkr closes it;
+- terminals did not get the daemon's `PATH`, so an agent CLI installed in a shell-profile directory was "command not
+  found" inside them;
+- Grok reviews in visible panes were retired after 30 seconds of silence while Grok was still reasoning (this affected
+  every pane host, not only the Herdr app).
+
+The run's own tip verification had also gone red, on a test fake that wrote its state file without an atomic rename;
+that fake is fixed too. Every hand fix passed its own full verification and cross-vendor review, and the final live run
+went green: both tasks merged on the first pass, reviewed, with the tip verified and every terminal cleaned up.
+
+- **The Herdr app is a first-class host.** A run launched inside the Herdr app (an `hc` terminal) is detected
+  automatically and runs its workers as visible interactive terminals in task tabs, instead of invisible background
+  processes.
+  - `driver: auto` now picks herdr, then the Herdr app, then Orca, from host markers, else the subprocess driver.
+    `driver: herdr-app` selects it explicitly. Classic herdr keeps working as before.
+  - Before any run state exists, the run checks that the Herdr app core answers. An unreachable core stops the
+    launch; it never falls back to background workers.
+  - Workers get their own terminal scope. A scope inherited from the launching terminal is removed for every
+    child, and the run writes one warning line (without the token) when it was launched with one. The shipped
+    skills show the scope-cleared detached launch.
+  - Finished workers are drained from the screen even when their history is incomplete, task tabs keep each
+    terminal bound to its checkout across a resume, and teardown closes only terminals the run owns.
+- **The run board opens beside the launcher.** In the Herdr app the run board splits to the right of the terminal
+  that launched the run, is labelled and verified before use, and closes when the run ends. A resumed run never
+  stacks a second board over a surviving one.
+- **`doctor` and `init` tell the same truth about the host.** They probe the Herdr app only when it is the selected
+  host. An `hc` install you are not using never starts a core and never makes them report the subprocess driver.
+- **Codex workers stay contained on every host.** Codex headless and interactive commands now carry `--no-daemon`.
+- **Claude Code's workspace-trust prompt is answered with the selected option verified.** tickmarkr reads the
+  bottom-anchored selection back before pressing Enter, and a refused check never submits.
+- **The Claude Code board opens itself only for a live run.** The plugin's board no longer opens for a run that has
+  already ended. It opens once per run in a session, keeps polling while closed, and `/tickmarkr-board` still opens
+  it on demand.
+- **The overseer, loop and auto skills use `hc` in the Herdr app.** They spawn two visible tiers, confirm every
+  delivery, wait on addressed terminals, launch `run` and `resume` with the inherited scope cleared, and tear down only
+  what they started. The classic herdr, Orca and plain-host recipes are unchanged.
+- **A private real-core smoke test** (`TICKMARKR_E2E=1`) proves the driver against a real Herdr app core in a private
+  session, without tokens and without touching your window.
+- **`tickmarkr init`'s environment list** no longer repeats the "anywhere" row's sentence.
+
 ## v2.19.0 — the run board opens itself beside the chat
 
 **v2.19.0** was delivered by one tickmarkr run of five tasks (run-20261102-100040-0000000000000576) and one hand fix

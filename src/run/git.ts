@@ -12,7 +12,7 @@ import { isDeepStrictEqual } from "node:util";
 import { shq } from "../adapters/types.js";
 import { tickmarkrDir } from "../graph/graph.js";
 import { ROUTING_ENV_SEAMS } from "../route/router.js";
-import { HOST_SESSION_VARS, SEAT_MARKER_ENV } from "../drivers/host-env.js";
+import { HERDR_CONTROL_VARS, HOST_SESSION_VARS, SEAT_MARKER_ENV } from "../drivers/host-env.js";
 import { titleEnvironment } from "./title-environment.js";
 import { npmLockKeeps } from "./npm-range.js";
 import { assertGitTrust, GitTrustRefusal, ownGitPin, protectedGitEnv, trustedCommonDir, type DetachedAddCapability, type OwnGitCapability, type TrustedStoreCapability, type WorktreeRollback } from "./git-trust.js";
@@ -347,6 +347,9 @@ export interface ShellOptions {
   ownsLeader?: (pid: number) => Promise<boolean>;
   /** D-2174 (queue row 267): the seat role this shell's child carries as its marker; unset, an inherited marker is stripped. */
   seat?: "judge" | "review" | "consult";
+  /** Queue row 340 (D-2180): this shell launches an agent CLI. Like a seat it drops the host control vars (herdr, Orca
+   * and the hc pair plus HC_SCOPE) from its child copy, but sets no seat marker. Non-agent shells keep them. */
+  agent?: boolean;
 }
 
 /** Shared command seam, including invocation-bound manifested runners. A PAYLOAD entry: its children keep the
@@ -433,6 +436,10 @@ function executeShell(cmd: string, cwd: string, timeoutMs: number, login: boolea
   // D-2174: an inherited seat marker never reaches a child; only a seat launch names its own role.
   delete env[SEAT_MARKER_ENV];
   if (options.seat) env[SEAT_MARKER_ENV] = options.seat;
+  // Queue row 340 (D-2180): an agent or seat child never inherits the caller's host addressing, so it cannot act as ORCH,
+  // type into it or become its child. Ordinary shells (gate payloads, the hc client) keep it: removing the hc pair there
+  // would redirect a non-default session to the default core.
+  if (options.seat || options.agent) for (const k of HERDR_CONTROL_VARS) delete env[k];
   // A run freezes the operator override and cores at startup; admission can lower the round cap.
   env[FORK_CAP_ENV] = verificationBudget.getStore()
     ? String(resolvedCapacity().forkCap)

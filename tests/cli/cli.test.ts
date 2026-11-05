@@ -402,7 +402,8 @@ describe("tickmarkr init", () => {
     expect(out).toContain(
       "tickmarkr init --agent installs the tickmarkr-loop, tickmarkr-auto and tickmarkr-overseer skills + AGENTS.md so Claude Code (or any agent CLI) drives the loop natively",
     );
-    expect(out).toContain("no herdr? same fail-closed gates, headless subprocess driver");
+    expect(out).toContain("no herdr, Herdr app or Orca terminal? same fail-closed gates, headless subprocess driver");
+    expect(out).not.toContain("legacy: no herdr?");
     const retired = ["dro", "vr"].join("");
     expect(out).not.toMatch(new RegExp(`next:.*\\b${retired}\\b`));
     const spec = readFileSync(join(repo, "tickmarkr.spec.md"), "utf8");

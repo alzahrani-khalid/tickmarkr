@@ -11,7 +11,6 @@ const ROOT = join(import.meta.dirname, "../..");
 const RUN_SKILLS = ["tickmarkr-loop", "tickmarkr-auto", "tickmarkr-overseer"] as const;
 const WAKE = "On every wake read CURRENT `tickmarkr status <runId>` first, then re-arm.";
 const PAREN = "(`<journal>` is `<state-dir>/runs/<runId>/journal.jsonl`, `<pid>` the lock pid).";
-const SEATS_STREAM = "since claude seats stream";
 
 const shipped = allAdapters({ operatorYaml: null });
 const adapterNames = [...new Set([
@@ -21,10 +20,9 @@ const adapterNames = [...new Set([
 
 const escapeRegExp = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
-/** An adapter name outside the historical "seats stream" clause. The stale comment cites `claude -p`. */
+/** Any adapter name anywhere in the comment. The stale comment cited `claude -p`; no clause is exempt (D-2180). */
 function namedAdapter(comment: string): string | undefined {
-  const stripped = comment.replaceAll(SEATS_STREAM, "");
-  return adapterNames.find((name) => new RegExp(`(?<![A-Za-z0-9-])${escapeRegExp(name)}(?![A-Za-z0-9-])`, "i").test(stripped));
+  return adapterNames.find((name) => new RegExp(`(?<![A-Za-z0-9-])${escapeRegExp(name)}(?![A-Za-z0-9-])`, "i").test(comment));
 }
 
 function bufferingComment(source: string): string {
@@ -78,12 +76,14 @@ test("test: the three shipped run skills keep the wake instruction without the j
 
   const comment = bufferingComment(readFileSync(join(ROOT, "src/adapters/types.ts"), "utf8"));
   expect(comment).toContain("a CLI whose print mode buffers");
-  expect(comment).toContain(`No shipped adapter declares this ${SEATS_STREAM}`);
+  expect(comment).toContain("No streaming adapter declares this;");
   expect(comment).toContain("Queue row 294");
   expect(comment).not.toContain("`");
   expect(namedAdapter(comment)).toBeUndefined();
   expect(namedAdapter("(`claude -p`) has written zero seat-authored bytes until its verdict")).toBe("claude");
-  for (const adapter of shipped) expect(adapter.paneReviewBuffersOutput, adapter.id).not.toBe(true);
+  expect(namedAdapter("No streaming adapter declares this since claude seats stream")).toBe("claude");
+  // Only grok declares it: its plain print mode was measured silent past the first-liveness beat (D-2180).
+  for (const adapter of shipped) expect(adapter.paneReviewBuffersOutput === true, adapter.id).toBe(adapter.id === "grok");
 });
 
 test("test: the shipped-skill provenance module's current snapshot equals the digests of the shipped skill files, so a skill edited without regenerating the module fails", () => {

@@ -34,7 +34,8 @@
         "auto",
         "herdr",
         "subprocess",
-        "orca"
+        "orca",
+        "herdr-app"
       ]
     },
     "integrationBranchPrefix": {

@@ -109,6 +109,9 @@ describe("sealHerdrEnv (pure)", () => {
       "ORCA_TERMINAL_HANDLE",
       "ORCA_PANE_KEY",
       "ORCA_TAB_ID",
+      "HC_TERMINAL_ID",
+      "HC_TERMINAL_SOCKET",
+      "HC_SCOPE",
     ]);
   });
 
@@ -193,6 +196,8 @@ describe("vitest process seal (ambient inheritance dies at the boundary)", () =>
     // of THIS file, which never re-sets them.
     expect(process.env.HERDR_ENV).toBeUndefined();
     expect(process.env.HERDR_SOCKET_PATH).toBeUndefined();
+    // Queue row 340 (D-2180): nor the Herdr app's HC pair or the launching terminal's HC_SCOPE.
+    for (const k of ["HC_TERMINAL_ID", "HC_TERMINAL_SOCKET", "HC_SCOPE"]) expect(process.env[k], k).toBeUndefined();
   });
 });
 

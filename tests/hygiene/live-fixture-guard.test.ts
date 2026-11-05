@@ -30,7 +30,11 @@ const HYGIENE_FIX = join(import.meta.dirname, "../fixtures/hygiene");
 
 /** Allowlist is R2-only. Every entry needs a reason; freshness check asserts the excused pattern remains. */
 // B2: config.test.ts's hygiene checks now run over fixture overlays in a fresh sandbox — its entry retired.
-const ALLOWLIST: Record<string, string> = {};
+const ALLOWLIST: Record<string, string> = {
+  // Queue row 340; D-2180 add.30.
+  "tests/skills-herdr-app.test.ts":
+    "the file's fake executable reports its own working directory inside a scratch checkout; it never reads the live repository's state",
+};
 
 interface Violation {
   file: string;

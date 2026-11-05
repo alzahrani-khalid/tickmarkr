@@ -76,14 +76,14 @@ export const COMMAND_HELP = {
     usage: "plan [options]", description: "Print the compiled graph's routing preview, cost estimate and floor lints without dispatching workers.",
     options: {
       "--mode <risk-based|partner-led|staff-led>": "Preview routing under the selected mode.",
-      "--driver <auto|herdr|subprocess|orca>": "Preview the execution driver; orca is explicit-only.",
+      "--driver <auto|herdr|subprocess|orca|herdr-app>": "Preview the execution driver; auto picks herdr, then herdr-app, then orca from host markers, else subprocess.",
     }, examples: ["plan", "plan --mode risk-based --driver subprocess"],
   },
   run: {
     usage: "run [options]", description: "Execute the compiled graph with production preflight, gates and run locking.",
     options: {
       "--concurrency <N>": "Set a positive integer worker concurrency.",
-      "--driver <auto|herdr|subprocess|orca>": "Choose the execution driver; orca is explicit-only.",
+      "--driver <auto|herdr|subprocess|orca|herdr-app>": "Choose the execution driver; auto picks herdr, then herdr-app, then orca from host markers, else subprocess.",
       "--route-strict": "Refuse routing conflicts and lints before dispatch.",
       "--no-explore": "Disable learned routing exploration for this run.",
       "--mode <risk-based|partner-led|staff-led>": "Override the routing mode for this run.",
@@ -131,7 +131,7 @@ export const COMMAND_HELP = {
     options: {
       "--graph-changed": "Accept and journal a changed graph identity for this run.",
       "--retry-failed": "Retry failed tasks.",
-      "--driver <auto|herdr|subprocess|orca>": "Choose the execution driver; orca is explicit-only.",
+      "--driver <auto|herdr|subprocess|orca|herdr-app>": "Choose the execution driver; auto picks herdr, then herdr-app, then orca from host markers, else subprocess.",
     }, examples: ["resume run-example --driver subprocess", "resume run-example --retry-failed"],
   },
   report: {

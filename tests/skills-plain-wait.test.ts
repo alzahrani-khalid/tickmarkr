@@ -106,10 +106,13 @@ test("Cite the replaced watcher line in each of the three plain-host sections, v
   // Queue row 294: the journal-and-lock-pid parenthetical is gone and the wake line stays,
   // so the pins move with that deletion.
   // Queue row 6 (2.15.0 sharded CI re-land): the overseer's grading paragraph names the sharded twelve, so its pin moves.
+  // Queue row 340 (D-2180): the On the Herdr app scopes, their quoted recipes and the HC pair in each plain route move all three pins;
+  // tests/skills-herdr-app.test.ts owns those additions. Its fail-closed list walk then found five universal lines
+  // that rendered as lazy continuations inside a host bullet; a blank line before each moves the overseer pin.
   const baseline = {
-    loop: "efa8c2dab37d07cc799515cd5443382cd74769c346c9e72ee92bb47a7689b44c",
-    auto: "372f943c515dfa7b6cfdeb06833d8e23314a9981b9cd81491419d56747f1d2d0",
-    overseer: "6100d56273a9b226f8210f77229ffa29e07419e6a1fd549174d0fd59bd73bcfd",
+    loop: "1a49a9e0afa2c68920739d882b556244037ddb08d0023e91a28d8ecb5f0d8db2",
+    auto: "d6e257678ec555679675e9a3f9b4416f0a87af7831e5ec8441cada4a9140b499",
+    overseer: "d6eca93ed2bed35130066680f47fa1c5928e22f9914cc0b3cf7f5cc2249fd8ea",
   };
   for (const name of SKILLS) {
     const markdown = readSkill(name);

@@ -384,13 +384,51 @@ and first-attempt success rate. Cost reporting follows strict honesty rules and 
 When running under [herdr](https://herdr.dev), tickmarkr creates a labeled pane-and-tab workspace
 for real-time visibility (optional — omit `--driver herdr` or run headless if preferred).
 
+### The Herdr app: hc terminals in task tabs
+
+The Herdr app runs tickmarkr's workers as visible `hc` terminals, one task tab each, with the run
+board beside the terminal that launched the run (ORCH). `auto` resolves herdr first when
+`HERDR_ENV=1`, then the Herdr app when both `HC_TERMINAL_ID` and `HC_TERMINAL_SOCKET` are set
+(nonblank), then Orca, then subprocess; either HC variable alone selects nothing. Selection reads the
+environment only. Outside a Herdr app terminal, select it with `--driver herdr-app`. A config
+`driver: herdr-app` (like `driver: herdr` or `driver: orca`) is host-specific: it holds only where
+that host's markers are present, and on any other host `run` and `resume` refuse it before any hc
+call, naming the config line, the detected host and the `--driver` remedy. Once selected, `run` and
+`resume` admit it with one `hc server status --json` against the launcher's core before any run
+state exists: hc missing from this process's PATH (doctor, admission and the driver share that one lookup, never a
+login profile), a timeout, a signal, a nonzero exit or a malformed reply refuses the run
+and nothing else is substituted. A reachable core without an open app
+window still runs; only task tabs and the board are unavailable. `tickmarkr doctor` probes the core
+only where herdr-app is selected (that probe can start a core); elsewhere an installed hc reads
+`hc installed — not probed (probing starts a core)` and an absent one
+`hc not installed — herdr-app not selected here`. One resolution — the config driver, then `auto` by that
+host order, as `run` resolves it — decides every doctor host row: a row says `auto selects`/`auto picks` only for
+the host auto really picks, and a host whose markers are present but lose says so (`Orca markers present, not
+selected: herdr-app takes precedence`, or `… not selected: config driver: subprocess`) with no auto claim.
+
+Workers, judges, reviewers, consults and every headless agent CLI run without the launcher's
+`HC_TERMINAL_ID`, `HC_TERMINAL_SOCKET` and `HC_SCOPE`, so none can type into ORCH or join its
+terminal; each new hc terminal keeps only its own fresh scope. This is not isolation: any process
+of the same user can still reach the default core. A daemon started from an hc terminal deletes the
+inherited `HC_SCOPE` before it starts any child, which protects the children only. The daemon's own
+scope was fixed when it started, so it still ends with that terminal, and it says so once on stderr
+and once in the journal: `this daemon carries its launching terminal's scope and ends with it;
+detach with env -u HC_SCOPE`. To detach a run from that terminal, launch it with `HC_SCOPE` removed
+and the ORCH terminal's address and socket kept as the core anchor:
+
+```bash
+cd <repo> && env -u HC_SCOPE HC_TERMINAL_ID="<ORCH terminal>" HC_TERMINAL_SOCKET="$HC_TERMINAL_SOCKET" node -e "require('child_process').spawn(process.argv[1], process.argv.slice(2), { detached: true, stdio: 'inherit' }).unref()" tickmarkr run >> <state-dir>/daemon.log 2>&1 < /dev/null
+cd <repo> && env -u HC_SCOPE HC_TERMINAL_ID="<ORCH terminal>" HC_TERMINAL_SOCKET="$HC_TERMINAL_SOCKET" node -e "require('child_process').spawn(process.argv[1], process.argv.slice(2), { detached: true, stdio: 'inherit' }).unref()" tickmarkr resume <runId> >> <state-dir>/daemon.log 2>&1 < /dev/null
+```
+
 ### Orca: a detected-or-named execution surface
 
-[Orca](https://onorca.dev) is the third execution surface. `auto` resolves herdr first when
-`HERDR_ENV=1`, then Orca only when both Orca-authored markers `TERM_PROGRAM=Orca` and
+[Orca](https://onorca.dev) is another execution surface. `auto` resolves herdr first when
+`HERDR_ENV=1`, then the Herdr app when `HC_TERMINAL_ID` and `HC_TERMINAL_SOCKET` are both set,
+then Orca only when both Orca-authored markers `TERM_PROGRAM=Orca` and
 `ORCA_TERMINAL_HANDLE` are present, then subprocess. This environment-only choice executes no
-binary or runtime probe. Outside an Orca terminal, name it explicitly with `--driver orca` or
-`driver: orca` in config. Once selected either way, an unreachable Orca stays a loud Orca driver
+binary or runtime probe. Outside an Orca terminal, name it explicitly with `--driver orca`; a
+config `driver: orca` holds only inside an Orca terminal and is refused elsewhere. Once selected, an unreachable Orca stays a loud Orca driver
 failure and is never silently replaced by a hidden subprocess worker.
 
 What Orca supplies is terminals. What tickmarkr keeps is everything that decides whether work
@@ -540,11 +578,12 @@ and resume and loads the board module (`hooks/board/register.tsx`); both execute
 permissions. The waiter wakes the session when the run ends, parks, a task fails or the daemon dies.
 The board shows the current run's status and decisions.
 
-The board opens itself beside the chat when the session's own folder holds tickmarkr state (a `.tickmarkr`
-directory); a terminal narrower than 144 columns may keep it closed until `/tickmarkr-board`. The board reads
-files only: it polls `tickmarkr board --json` over the run's folders every five seconds and writes nothing.
-Its harness marks are plain glyphs by default; the `marks` setting (Devicons logos in place of the glyphs)
-needs Claude Code 2.1.271 or later.
+The board opens itself beside the chat only when the session's own folder holds tickmarkr state (a `.tickmarkr`
+directory) and the run has not ended. An ended run does not open automatically, even when it still owes checks;
+`/tickmarkr-board` still opens it. A terminal narrower than 144 columns may keep the automatic pane closed until
+`/tickmarkr-board`. The board reads files only: it polls `tickmarkr board --json` over the run's folders every
+five seconds and writes nothing. Its harness marks are plain glyphs by default; the `marks` setting (Devicons
+logos in place of the glyphs) needs Claude Code 2.1.271 or later.
 
 The plugin and `tickmarkr init --agent` use the same skills:
 

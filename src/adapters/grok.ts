@@ -110,6 +110,9 @@ export const grok: WorkerAdapter = {
   // is scope-gate chaos (src/run/git.ts owns worktrees).
   headlessCommand: (promptFile: string, model: string) =>
     `grok -p "$(cat ${shq(promptFile)})" --model ${shq(model)} --permission-mode bypassPermissions --output-format plain`,
+  // Plain print mode writes nothing while it reasons: a real 2.20.0 review brief stayed silent past 60 s in a Herdr app
+  // terminal before its first line, so the pane review's 30 s first-liveness beat retired a working seat (queue row 294; D-2180).
+  paneReviewBuffersOutput: true,
   // GROK-02 interactive. Positional prompt seeds the TUI (40-CONTEXT D-01). Same permission flag;
   // NEVER the -w/--worktree flag (see headless comment above — tickmarkr owns worktrees).
   interactiveCommand: (promptFile: string, model: string) =>
