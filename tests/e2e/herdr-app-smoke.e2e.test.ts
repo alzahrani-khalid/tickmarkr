@@ -240,6 +240,16 @@ async function stopOwnedChild(h: Pick<SmokeHost, "child" | "nonce">): Promise<vo
 // and starting directly. Startup and lost-receipt recovery need room for that fallback;
 // ordinary calls (including verification after the socket exists) retain their 8 s bound.
 const PRIVATE_CORE_START_TIMEOUT_MS = 45_000;
+/** `lsof -Fn` name rows prove a pid holds the socket, in the producing platform's grammar. macOS prints
+ * the bare path, so only exact equality counts there. Linux appends exactly the socket type and, on newer
+ * lsof, its state (`n<path> type=STREAM (LISTEN)`), so only that suffix is accepted there. A longer path
+ * never matches on either platform. The one residual ambiguity (an old Linux lsof printing no suffix for a
+ * socket literally named `<path> type=STREAM`) needs a second socket inside this probe's private mkdtemp
+ * directory, which only the private core writes (queue row 340; D-2180). */
+const LINUX_UNIX_SUFFIX = /^ type=[A-Z]+(?: \([A-Z_]+\))?$/;
+export const lsofOwnsSocket = (rows: string, socket: string, platform: NodeJS.Platform = process.platform): boolean =>
+  rows.split("\n").some((row) => row === `n${socket}`
+    || (platform === "linux" && row.startsWith(`n${socket}`) && LINUX_UNIX_SUFFIX.test(row.slice(socket.length + 1))));
 export function liveHost(hcBin: string, root: string): SmokeHost {
   check(isAbsolute(root), "TICKMARKR_HC_PROBE_ROOT must be an absolute durable seats probe directory");
   const base = realpathSync(root);
@@ -262,7 +272,7 @@ export function liveHost(hcBin: string, root: string): SmokeHost {
   const socketPid = async (pid: number) => {
     check(existsSync(socket), "private socket absent; refuse auto-start during cleanup");
     const rows = await command("lsof", ["-a", "-p", String(pid), "-U", "-Fn"]);
-    check(rows.split("\n").includes(`n${socket}`), "starting core pid does not own the private socket");
+    check(lsofOwnsSocket(rows, socket), "starting core pid does not own the private socket");
   };
   const h: SmokeHost = {
     dir, repo, socket, nonce, client, driver, newDriver,

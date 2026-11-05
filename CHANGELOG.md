@@ -22,8 +22,10 @@ run's tests and fakes could not see, and all are fixed here:
   every pane host, not only the Herdr app).
 
 The run's own tip verification had also gone red, on a test fake that wrote its state file without an atomic rename;
-that fake is fixed too. Every hand fix passed its own full verification and cross-vendor review, and the final live run
-went green: both tasks merged on the first pass, reviewed, with the tip verified and every terminal cleaned up.
+that fake is fixed too. Public CI then found that the private smoke test read Linux's `lsof` output wrongly; that test is
+fixed as well. Every hand fix passed cross-vendor review and its acceptance criteria, and the full test suite passed on the
+final release tree, locally and in public CI on Linux and macOS. The final live run went green: both tasks merged on the
+first pass, reviewed, with the tip verified and every terminal cleaned up.
 
 - **The Herdr app is a first-class host.** A run launched inside the Herdr app (an `hc` terminal) is detected
   automatically and runs its workers as visible interactive terminals in task tabs, instead of invisible background

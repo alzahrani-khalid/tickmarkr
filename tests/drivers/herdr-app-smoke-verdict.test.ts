@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { expect, test, vi } from "vitest";
 import { buildRecord, type CiRecord } from "../../scripts/ci/reporter.js";
-import { fakeHost, liveHost, HERDR_APP_LIVE_TITLE, REQUIRED_OBSERVATIONS, runSmoke, smokeVerdict, type SmokeEvidence } from "../e2e/herdr-app-smoke.e2e.test.js";
+import { fakeHost, liveHost, lsofOwnsSocket, HERDR_APP_LIVE_TITLE, REQUIRED_OBSERVATIONS, runSmoke, smokeVerdict, type SmokeEvidence } from "../e2e/herdr-app-smoke.e2e.test.js";
 import { makeTestTempDir } from "../helpers/tmprepo.js";
 
 // Queue row 340; D-2180, closed CASE R. Importing the e2e module registers no tests here:
@@ -266,4 +266,19 @@ test("test: required-live-test grading satisfies the closed record-verdict table
   expect(docs).toContain(`--require-test "${FILE}::${HERDR_APP_LIVE_TITLE}"`);
   expect(docs).toContain("TICKMARKR_E2E=1");
   expect(docs).toContain("TICKMARKR_CI_RECORD");
+});
+
+test("the private socket owner check reads the lsof name row on macOS and Linux while a longer path or another socket never matches", () => {
+  const socket = "/seats/p/r-ab12/s";
+  // macOS prints the bare path, so only exact equality proves ownership there, even for a name ending like a Linux suffix.
+  expect(lsofOwnsSocket(`p140\nn${socket}\nn->0x1f\n`, socket, "darwin")).toBe(true);
+  for (const row of [`n${socket} type=STREAM`, `n${socket} type=DGRAM`, `n${socket} type=STREAM (LISTEN)`, `n${socket}x`, `n${socket} extra`, ""])
+    expect(lsofOwnsSocket(`p140\n${row}\n`, socket, "darwin"), row).toBe(false);
+  // Linux lsof 4.95 (captured in node:22-bookworm, D-2180) appends the type; newer lsof adds the state.
+  for (const row of [`n${socket}`, `n${socket} type=STREAM`, `n${socket} type=DGRAM`, `n${socket} type=STREAM (LISTEN)`])
+    expect(lsofOwnsSocket(`p140\n${row}\nntype=STREAM\n`, socket, "linux"), row).toBe(true);
+  // A longer path, including one that continues with a space, is another socket, with or without a suffix.
+  for (const row of [`n${socket}x type=STREAM`, `n${socket}2`, `n${socket} extra type=STREAM`, `n${socket} other-socket`, `n${socket} `,
+    `n${socket} type=STREAM extra`, `n${socket} type=stream`, `n${socket} type=STREAM type=STREAM`, "n/seats/p/r-zz99/s type=STREAM"])
+    expect(lsofOwnsSocket(`p140\n${row}\nntype=STREAM\n`, socket, "linux"), row).toBe(false);
 });
