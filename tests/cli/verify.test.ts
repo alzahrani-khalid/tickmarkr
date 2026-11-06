@@ -166,6 +166,8 @@ describe("tickmarkr verify — standalone gate battery", () => {
       reflogWitness: vi.fn(async () => ({ code: 0, lines: ["cccccccccccc"] })),
       linkNodeModules: vi.fn(),
       removeWorktree: vi.fn(),
+      // verify.ts imports test-manifest.ts directly (queue row 300), whose module scope reads this seam list.
+      ROUTING_ENV_SEAMS: [],
     }));
     vi.doMock("../../src/gates/baseline.js", () => ({
       detectGateCommands: vi.fn(() => ({})),

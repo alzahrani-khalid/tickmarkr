@@ -2,6 +2,28 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v2.21.0 — faster verification, and a run board that tells the truth
+
+**v2.21.0** was delivered by two tickmarkr runs: one task for faster verification (run-20261105-152309-0000000000001499)
+and three tasks for the run board (run-20261105-213929-0000000000001601). Every task passed build, lint, evidence and scope, its acceptance
+criteria, a review by a model from another vendor and the full test suite before it merged, and each run's tip verify
+passed.
+
+- **`tickmarkr verify` no longer runs the merge-base test suite for a Vitest repository.** It used to run the base
+  commit's full suite first, to measure a time limit for the candidate's suite; on this repository that cost 30–37
+  minutes per verify, green or red. The limit now comes from an earlier measurement on the same machine and runner, or
+  a safe default with no measurement, and a candidate killed at its limit raises the limit for the next verify. A
+  cached base capture, a supplied `--baseline` and non-Vitest test commands work as before.
+- **The run board reads a resumed run as live.** After a run ended and was resumed, `tickmarkr board --json` still
+  reported the first end (its parked tasks, end time and elapsed time) while the run was working again, so the
+  Claude Code board could show a running task as parked. A resume now reopens the run until its next end.
+- **A board that has stopped refreshing says so.** The board reads a new snapshot every 5 seconds. When no new snapshot
+  has arrived for 30 seconds, it shows `STALE` with the time of its last read instead of `LIVE`, and its clocks stop,
+  instead of advancing old state as if it were current.
+- **The board keeps polling, and `/tickmarkr-board` recovers it.** A failed folder check no longer stops polling for
+  the rest of the session. A read that never finishes is replaced after a minute. The command starts a fresh read and
+  restarts polling if it had stopped. Only the newest read updates the board or its status line.
+
 ## v2.20.1 — Codex launches again
 
 **v2.20.1** fixes one defect in 2.20.0. 2.20.0 added Codex's `--no-daemon` option after `exec`, where the Codex CLI does

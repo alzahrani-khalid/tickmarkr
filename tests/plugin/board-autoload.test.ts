@@ -205,7 +205,9 @@ test("eligible closed-pane polling opens each newly observed unfinished run once
   await poll(narrow, ok(shownRun));
   await poll(narrow, ok({ ...shownRun, alive: false }));
   expect(opens(narrow)).toBe(2);
+  // The command kept the one armed poll (B7, D-2184): a live timer is not replaced.
   expect(narrow.timers).toHaveLength(1);
+  expect(narrow.timers[0]!.cancelled).toBe(false);
 });
 
 test("an unplaced automatic attempt keeps the ready hint and poll without latching while a later placed poll records the run once", async () => {
@@ -240,10 +242,11 @@ test("an unplaced automatic attempt keeps the ready hint and poll without latchi
   h.runs[during]!.answer.resolve(ok(run));
   await flush();
   expect(opens(h)).toBe(3);
+  // This placement belongs to the previous read. Its miss cannot overwrite the newer read's status (contract C).
   gate.resolve(false);
   await flush();
   expect(opens(h)).toBe(3);
-  expect(h.statuses.at(-1)).toBe(READY_HINT);
+  expect(h.statuses.at(-1)).toBe(boardStatusLine(shown(run)));
   expect(h.timers).toHaveLength(1);
 
   h.fs.placed = true;
@@ -277,9 +280,12 @@ test("the explicit command opens ended empty and failed snapshots while automati
   outside.runs[0]!.answer.resolve(FAILED);
   await forced;
   expect(opens(outside)).toBe(1);
+  // The folder check still throws. B7 (D-2184): that rejection reads nothing and does not stop the poll.
   outside.timers[0]!.tick();
   await flush();
-  expect([outside.runs.length, outside.timers[0]!.cancelled]).toEqual([1, true]);
+  outside.timers[0]!.tick();
+  await flush();
+  expect([outside.runs.length, outside.timers[0]!.cancelled]).toEqual([1, false]);
 
   const ended = host();
   const endedSnap = snap({ runId: "run-ended", alive: true, ended: endedOf(3) });
@@ -344,7 +350,8 @@ test("closed-pane observation shares one timer and read while folder loss or ses
   // Two completions of one read place the new unfinished run once.
   expect(opens(h)).toBe(1);
 
-  h.fs.kind = "missing";
+  // Not a directory: the unchanged stop. A thrown "missing" check is a rejection and keeps polling (B7, D-2184).
+  h.fs.kind = "file";
   h.timers[0]!.tick();
   await flush();
   expect([h.runs.length, h.timers[0]!.cancelled, opens(h)]).toEqual([before + 1, true, 1]);

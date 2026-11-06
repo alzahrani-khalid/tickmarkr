@@ -10,6 +10,7 @@ import { captureBaseline, detectGateCommands, staleFileCountCommands, type Basel
 import { getVerdictStore, lockfileKeyBytes, runnerInputsHash, type StoredVerdictRecord } from "../../gates/cache.js";
 import { modelProvider } from "../../gates/review.js";
 import { runGates } from "../../gates/run-gates.js";
+import { isVitestTestCommand } from "../../gates/test-manifest.js";
 import type { GateResult } from "../../gates/types.js";
 import { getTask, loadGraph } from "../../graph/graph.js";
 import { GATE_NAMES, type AcceptanceItem, type GateName, type Task } from "../../graph/schema.js";
@@ -19,6 +20,7 @@ import { foldOwedChecks, integrationMapped, owedCriteria, Journal, OWED_DISCHARG
 import { describeLeaseWait, withRepositoryLease } from "../../run/lease.js";
 import { isPidLive } from "../../run/lock.js";
 import { LAUNCHSERVICES_PORT_STOP, probeLaunchServicesPorts, recordLaunchServices } from "../../run/launchservices-check.js";
+import { ceilingLine, manifestedBaseline, manifestedRow, resolveManifestedCeiling, verdictlessCommands } from "../verify-speed.js";
 
 /**
  * tickmarkr verify — the gate battery as a standalone command (OPERATING-MODEL-2026-08-11 item 3).
@@ -26,7 +28,7 @@ import { LAUNCHSERVICES_PORT_STOP, probeLaunchServicesPorts, recordLaunchService
  * Runs the existing seven-gate pipeline against `merge-base(--base, HEAD)..HEAD` of the CURRENT
  * checkout in two phases: build/lint against a captured base baseline, evidence, scope, then
  * acceptance ‖ review, all unleased; then, under the repository lease, the test suite against its
- * own base baseline. No daemon, no worktree lifecycle, no retries, no approvals, no resumable state: one
+ * own base baseline (a detected manifested Vitest suite captures none — queue row 300, D-2182). No daemon, no worktree lifecycle, no retries, no approvals, no resumable state: one
  * invocation, one immutable candidate, one machine-readable verdict. A verifier failure costs one
  * rerun. Same fail-closed guarantees — this is a thin caller of runGates, not a second pipeline.
  */
@@ -106,9 +108,6 @@ export function baselineCachePath(cwd: string, baseSha: string, commands: Record
   return join(realpathSync(tmpdir()), "tickmarkr-verify", "cache",
     `baseline-${baseSha.slice(0, 12)}-${hashParts(lockParts)}-${hashParts(commandParts)}-${runnerInputsHash()}.json`);
 }
-
-const verdictlessCommands = (baseline: Baseline, commands: Record<string, string>): string[] =>
-  Object.keys(commands).filter((name) => baseline.commands[name]?.exitCode === undefined);
 
 /** Timing can cross bases and lockfiles; forgiveness cannot. Match the command subset and runner
  * hashes, then take each command's newest capture or verdictless marker by publication time. */
@@ -422,9 +421,12 @@ export async function verify(argv: string[], cwd = process.cwd(), options: { evi
   // outputs (dist/) must meet them at base as the candidate does, or its unchanged failures read as
   // new. So build belongs to the suite subset's capture — and to its cache identity.
   const suiteCommands = leased.length ? subsetOf(["build", "test"]) : {};
+  // Queue row 300 / D-2182 (contract V): a detected manifested Vitest suite with no supplied baseline
+  // captures no base suite; its gate reads only timing, sourced under contract C inside the lease.
+  const manifested = !values.baseline && leased.length > 0 && isVitestTestCommand(commands.test!, cwd);
   // A prior verdictless capture is announced before any gate runs, whichever phase will recapture it.
   if (!values.baseline) {
-    for (const subset of [cheapCommands, suiteCommands]) {
+    for (const subset of manifested ? [cheapCommands] : [cheapCommands, suiteCommands]) {
       if (Object.keys(subset).length && existsSync(`${baselineCachePath(cwd, mergeBase, subset)}.verdictless`)) {
         console.error(`verify: prior baseline recorded no verdict and was not cached; recapturing merge-base ${mergeBase.slice(0, 12)} for ${Object.keys(subset).join(", ")}`);
       }
@@ -568,11 +570,20 @@ export async function verify(argv: string[], cwd = process.cwd(), options: { evi
     const suite = await withRepositoryLease(cwd, async (): Promise<GateResult[]> => {
       const before = await subjectChange();
       if (before) return [{ gate: "test", pass: false, details: refused(before), meta: { subjectChanged: before } }];
-      const baseline = await baselineFor(suiteCommands);
-      // The earlier gates already answered: a refused suite baseline is the test gate's red, and it
-      // joins their rows in the one verdict and artifact rather than discarding them.
-      if (baseline.refusal) return [{ gate: "test", pass: false, details: baseline.refusal, meta: { infra: true, classification: "infra", retryable: false, kind: "workspace-dependency" } }];
-      const rows = await gateRun(leased, baseline);
+      let rows: GateResult[];
+      if (manifested) {
+        // Contract C resolves here, inside the reservation, immediately before the candidate job.
+        const cachePath = baselineCachePath(cwd, mergeBase, suiteCommands);
+        const ceiling = resolveManifestedCeiling(cachePath, suiteCommands, cwd);
+        console.error(ceilingLine(ceiling));
+        rows = (await gateRun(leased, manifestedBaseline(ceiling))).map((row) => manifestedRow(row, ceiling, cachePath, mergeBase));
+      } else {
+        const baseline = await baselineFor(suiteCommands);
+        // The earlier gates already answered: a refused suite baseline is the test gate's red, and it
+        // joins their rows in the one verdict and artifact rather than discarding them.
+        if (baseline.refusal) return [{ gate: "test", pass: false, details: baseline.refusal, meta: { infra: true, classification: "infra", retryable: false, kind: "workspace-dependency" } }];
+        rows = await gateRun(leased, baseline);
+      }
       const after = await subjectChange();
       return after ? rows.map((r) => ({ ...r, pass: false, details: `${refused(after)}\n${r.details}`, meta: { ...r.meta, subjectChanged: after } })) : rows;
     }, {

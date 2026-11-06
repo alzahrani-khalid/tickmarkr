@@ -2,7 +2,7 @@
 // read-only), plus the rules the reference cannot show: the git-file worktree walk, the lock and input validation.
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { afterEach, expect, test, vi } from "vitest";
 import { readRelease, readRunBoard, stateRoots } from "../../src/board/read.js";
 
@@ -40,6 +40,29 @@ function materialize(tmp: string, layout: Layout[]): void {
     put(join(tmp, f.path), f.text ?? (f.cut === undefined ? full : lfLines(full).slice(0, f.cut).join("\n") + "\n"), f.mtime);
   }
 }
+/** Find the selected golden journal by its reported id and newest mtime, then inspect its materialized prefix. */
+function selectedJournal(tmp: string, c: Io, runId: string): { event: string }[] {
+  const candidates = c.layout.filter((f) => f.path.endsWith("/journal.jsonl")).map((f) => {
+    const events = lfLines(readFileSync(join(tmp, f.path), "utf8")).filter((line) => line.startsWith("{")).map((line) => JSON.parse(line));
+    let id = "";
+    for (const e of events) {
+      if ((e.event === "run-start" || e.event === "run-resume") && !id) id = e.data?.runId || "";
+      if (e.event === "run-end" && e.data && Object.hasOwn(e.data, "runId")) id = e.data.runId;
+    }
+    return { events, id: id || basename(dirname(f.path)), mtime: f.mtime };
+  }).filter((f) => f.id === runId).sort((a, b) => b.mtime - a.mtime);
+  expect(candidates.length, c.name).toBeGreaterThan(0);
+  return candidates[0].events;
+}
+function isReopened(events: { event: string }[]): boolean {
+  let sawEnd = false;
+  let reopened = false;
+  for (const { event } of events) {
+    if (event === "run-end") { sawEnd = true; reopened = false; }
+    else if (event === "run-resume" && sawEnd) reopened = true;
+  }
+  return reopened;
+}
 const placeholder = (x: unknown, tmp: string): unknown => JSON.parse(JSON.stringify(x).replaceAll(tmp, "{root}"));
 function argsOf(args: string[], tmp: string): [string[], string[]] {
   const a = args.map((s) => s.replaceAll("{root}", tmp));
@@ -54,6 +77,12 @@ function runGolden(read: typeof readRunBoard, c: Io): void {
   const got = read(tmp, roots, releases, c.now) as Record<string, unknown>;
   expect(got.version, c.name).toBe(1);
   expect(got.readAt, c.name).toMatch(/^\d\d:\d\d:\d\d$/);
+  if (isReopened(selectedJournal(tmp, c, got.runId as string))) {
+    expect(got.ended, c.name).toBeNull();
+    expect(got.endEpoch, c.name).toBeNull();
+    expect(got.atEpoch, c.name).toBe(c.now);
+    return;
+  }
   const { version: _v, readAt: _r, spec, ...rest } = got;
   expect(spec, c.name).toBeNull(); // the fixture graphs record no spec path (R1, queue row 335)
   expect(placeholder(rest, tmp), c.name).toStrictEqual(c.expected);
@@ -78,6 +107,17 @@ test("every golden io case, materialized under a temp folder with its mtimes and
     process.env.TZ = c.tz;
     expect(placeholder(readRelease(tmp, argsOf(c.args, tmp)[0], c.now), tmp), c.name).toStrictEqual(c.expected);
   }
+});
+
+test("a reader snapshot of the failed-task journal after its reopening resume reports the live S7 fields", () => {
+  const tmp = temp();
+  const root = join(tmp, ".tickmarkr");
+  const run = join(root, "runs", "run-20260916-094901-0000000000000091");
+  put(join(run, "journal.jsonl"), lfLines(readFileSync(join(fixtures, "runs", "failed-task", "journal.jsonl"), "utf8")).slice(0, 428).join("\n") + "\n");
+  put(join(run, "graph.json"), readFileSync(join(fixtures, "runs", "failed-task", "graph.json"), "utf8"));
+  const now = Date.parse("2026-09-16T18:00:00.000Z") / 1000;
+  const got = readRunBoard(tmp, [], [], now) as { ended: unknown; endEpoch: unknown; atEpoch: unknown };
+  expect([got.ended, got.endEpoch, got.atEpoch]).toEqual([null, null, now]);
 });
 
 test("plain-file repositories select the newest run starting from either checkout, once with the main checkout newer and once with the linked one newer, resolve relative gitdir and commondir paths, skip a stale worktree entry and stop at a submodule", () => {

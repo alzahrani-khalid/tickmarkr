@@ -25,7 +25,7 @@ const deferred = () => {
 
 afterEach(() => { vi.restoreAllMocks(); vi.useRealTimers(); });
 
-test("test: the baseline capture of a vitest command over a fixture suite whose tests echo nested runner summaries records the count the shared manifest discovery seam lists and not the stdout sum while running the suite once, a standalone verify in a linked worktree over that suite passes its test gate with no deficit and a manifest file killed mid-run still reds as infra naming the file, a scripted non-vitest test command keeps the stdout deficit rule byte-identically, and a cached baseline whose vitest entry's count is not manifest-derived is recaptured rather than applied while a cached non-vitest entry is reused as on the base, so a capture that sums summary lines or runs twice, a verify that counts stdout, a scripted command routed through the manifest, or a stale inflated count applied fails", async () => {
+test("test: the baseline capture of a vitest command over a fixture suite whose tests echo nested runner summaries records the count the shared manifest discovery seam lists and not the stdout sum while running the suite once, a standalone verify in a linked worktree over that suite passes its test gate with no deficit and a manifest file killed mid-run still reds as infra naming the file, a scripted non-vitest test command keeps the stdout deficit rule byte-identically, and a cached baseline whose vitest entry's count is not manifest-derived is never applied (the manifested verify captures no base suite, queue row 300) while a cached non-vitest entry is reused as on the base, so a capture that sums summary lines or runs twice, a verify that counts stdout, a scripted command routed through the manifest, or a stale inflated count applied fails", async () => {
   const counter = join(makeTestTempDir("tickmarkr-capture-count-"), "runs");
   // Each test writes a nested runner's summary straight to the runner's stdout (a spawned child
   // runner's echo, bypassing vitest's attributed echo blocks) — the OBS-1044 shape.
@@ -60,19 +60,24 @@ test("test: the baseline capture of a vitest command over a fixture suite whose 
   expect(green.out).not.toContain("below baseline");
   const mergeBase = git(wt, "merge-base", "main", "HEAD");
   const cache = baselineCachePath(wt, mergeBase, { test: "npm run -s test" }); // detectGateCommands' own spelling
-  expect(JSON.parse(readFileSync(cache, "utf8")).commands.test).toMatchObject({ fileCount: 2, fileCountSource: "manifest" });
+  // Queue row 300 / D-2182: a manifested Vitest verify captures no merge-base suite, so nothing is cached.
+  expect(existsSync(cache)).toBe(false);
+  expect(errors.mock.calls.flat().join("\n")).toContain("base suite not required for manifested Vitest");
 
-  // An inflated pre-2.5.6 cached count (a stdout sum) is recaptured, never applied.
-  const stale = JSON.parse(readFileSync(cache, "utf8")) as Baseline;
+  // An inflated pre-2.5.6 cached count (a stdout sum) is never applied, and nothing recaptures or rewrites it.
+  const stale = JSON.parse(JSON.stringify(captured)) as Baseline;
   delete stale.commands.test!.fileCountSource;
   stale.commands.test!.fileCount = 999;
+  mkdirSync(dirname(cache), { recursive: true });
   writeFileSync(cache, JSON.stringify(stale));
   errors.mockClear();
   const recaptured = await verify(["--no-review"], wt);
   expect(recaptured.code, recaptured.out).toBe(0);
-  expect(errors.mock.calls.flat().join("\n")).toContain("cached baseline's file count for test is not manifest-derived; it will be recaptured");
+  expect(errors.mock.calls.flat().join("\n")).toContain("ceiling source prior-measurement");
+  expect(errors.mock.calls.flat().join("\n")).not.toContain("exact-base-cache");
   expect(errors.mock.calls.flat().join("\n")).not.toContain("reusing cached baseline");
-  expect(JSON.parse(readFileSync(cache, "utf8")).commands.test).toMatchObject({ fileCount: 2, fileCountSource: "manifest" });
+  expect(errors.mock.calls.flat().join("\n")).not.toContain("capturing baseline");
+  expect(JSON.parse(readFileSync(cache, "utf8"))).toEqual(stale);
 
   // A manifest file killed mid-run (its per-file hang budget, derived from the supplied baseline) reds as infra naming it.
   writeFileSync(join(wt, "tests/hang.test.ts"), 'test("hangs", async () => { await new Promise((r) => setTimeout(r, 20_000)); }, 30_000);\n');

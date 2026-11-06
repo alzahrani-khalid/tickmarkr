@@ -12,7 +12,7 @@ import type { AttemptLine, AttemptPart, RunSnapshot, TaskRow } from "./state"
  * narrower proportional font, so a line cut at the cell count ends well short of the edge.
  */
 export type BoardProps = { snap: RunSnapshot; error: string | null; fit?: number; marks?: 'glyph' | 'devicons' }
-type BoardState = { ticks: number; seen: number; live: boolean; sel: string | null }
+type BoardState = { ticks: number; seen: number; live: boolean; sel: string | null; readAt: string; unreadSec: number; readTicks: number }
 type Layout = 'wide' | 'medium' | 'narrow'
 type Mark = 'pass' | 'fail' | 'running' | 'queued' | 'pending'
 type Piece = { text: string; color?: string; bold?: boolean }
@@ -236,20 +236,23 @@ const Board: ClientModule<JsonValue, BoardState> = (raw, surface: ClientSurface<
   const { snap: s, error, fit = 1, marks: logos = 'glyph' } = raw as unknown as BoardProps
   const live = s.ended === null
 
-  // The frame clock: start it once; it ticks while the run is live, and a new snapshot (a new atEpoch) restarts the count.
+  // The frame clock counts time since the last read even for ended runs; live ticks keep their atEpoch-based meaning.
   let st = surface.state
   if (st === undefined) {
     surface.every(1000, () => {
       const cur = surface.state
-      if (cur?.live) surface.setState({ ...cur, ticks: cur.ticks + 1 })
+      if (cur) surface.setState({ ...cur, ticks: cur.ticks + (cur.live ? 1 : 0), unreadSec: cur.unreadSec + 1 })
     })
-    st = { ticks: 0, seen: s.atEpoch, live, sel: null }
+    st = { ticks: 0, seen: s.atEpoch, live, sel: null, readAt: s.readAt, unreadSec: 0, readTicks: 0 }
     surface.setState(st)
-  } else if (st.seen !== s.atEpoch || st.live !== live) {
-    st = { ...st, ticks: 0, seen: s.atEpoch, live }
+  } else if (st.seen !== s.atEpoch || st.live !== live || st.readAt !== s.readAt) {
+    const newRead = st.readAt !== s.readAt
+    const ticks = st.seen !== s.atEpoch || st.live !== live ? 0 : st.ticks
+    st = { ...st, ticks, seen: s.atEpoch, live, readAt: s.readAt, unreadSec: newRead ? 0 : st.unreadSec, readTicks: newRead ? ticks : st.readTicks }
     surface.setState(st)
   }
-  const now = s.atEpoch + (live ? st.ticks : 0)
+  const stale = st.unreadSec >= 30
+  const now = s.atEpoch + (live ? stale ? st.readTicks : st.ticks : 0)
   const cols = surface.columns
   const layout = layoutFor(cols)
   const W = Math.max(30, (cols || 110) - 2) // the room inside the 1-cell side padding
@@ -263,7 +266,7 @@ const Board: ClientModule<JsonValue, BoardState> = (raw, surface: ClientSurface<
 
   const done = s.tasks.filter(t => t.state === 'done').length
   // green only when every clause of the green rule holds: empty buckets, tip verify passed, owed checks known and zero
-  const life = s.ended
+  const life = stale ? { word: `STALE · read ${s.readAt}`, color: INK.warn } : s.ended
     ? {
         word: s.ended.owed === null ? 'ENDED · owed unknown' : s.ended.owed > 0 ? `ENDED · owes ${s.ended.owed}` : 'ENDED',
         color: s.ended.failed.length || s.ended.human.length || s.ended.blocked.length || s.ended.pending.length
@@ -395,6 +398,7 @@ const Board: ClientModule<JsonValue, BoardState> = (raw, surface: ClientSurface<
           <Text color={INK.chrome}>│</Text>
           <Text color={life.color} bold>● {life.word}</Text>
         </Box>
+        {stale ? <Text color={INK.warn}>not refreshed since {s.readAt} — /tickmarkr-board reloads it</Text> : null}
         <Box key="head-2" flexDirection={layout === 'narrow' ? 'column' : 'row'} columnGap={1}>
           {[
             <Text color={INK.pass} bold>{done} of {s.tasks.length} merged</Text>,

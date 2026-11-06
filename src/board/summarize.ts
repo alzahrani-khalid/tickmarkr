@@ -1,6 +1,6 @@
 // The run board's summarizer (queue rows 331 and 332): a port of the operator's run board summarizer, the frozen oracle
 // tests/fixtures/board/reference/summarize.py lines 15–422 (constants through summarize), under tests/fixtures/board/PORT-RULES.md
-// rules S1–S6. It is pure: no file, process or clock — the caller passes events, graph, lock, now, history and suites.
+// rules S1–S7. It is pure: no file, process or clock — the caller passes events, graph, lock, now, history and suites.
 // Names follow the reference so the two read side by side; every Python idiom goes through a helper below that keeps
 // Python's semantics (truthiness, `or`, `get`, `int`, `round`, `str`, `splitlines`, code-point slices and order).
 
@@ -344,6 +344,10 @@ class Track {
     const tid = get(e, "taskId");
     const d = or(get(e, "data"), {});
     if (ev === "run-start" || ev === "run-resume") {
+      if (ev === "run-resume" && this.end !== null) {
+        this.end = null; // S7: the earlier run-end closed its spans, but this leg is live again.
+        this.window = null;
+      }
       this.start = this.start || t;
       this.conc = get(or(get(d, "effectivePolicy"), {}), "concurrency", this.conc);
     } else if (ev === "approval-window-start") {
@@ -685,6 +689,8 @@ export function summarize(events: readonly unknown[], graph: unknown, lockPid: n
       const oc = or(get(d, "owedChecks"), {});
       ended.owed = truthy(get(oc, "known")) ? len(or(get(oc, "outstanding"), [])) : null;
       runId = get(d, "runId", runId);
+    } else if (ev === "run-resume" && ended !== null) {
+      ended = null; // S7: a reopening resume supersedes the earlier run-end record.
     }
     const row = truthy(tid) ? mapGet(rows, tid, undefined) : undefined;
     if (row === undefined) return;

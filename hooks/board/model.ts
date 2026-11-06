@@ -148,7 +148,7 @@ export function view(state: BoardState, marks: "glyph" | "devicons" = "glyph", f
 export type BoardDeps = {
   /** the session's folder, read at each use */
   cwd: () => Promise<string>;
-  /** whether the path is a directory; a rejection reads as false */
+  /** whether the path is a directory. A throw is a rejected check (B7, D-2184); false means it is not a directory. */
   isDirectory: (path: string) => Promise<boolean>;
   /** runs the argv in the folder (no shell) */
   run: (argv: readonly string[], cwd: string) => Promise<Exclude<BoardRun, { rejected: unknown }>>;
@@ -165,18 +165,33 @@ export type BoardDeps = {
 };
 export const POLL_MS = 5000;
 export const READY_HINT = "Run board ready — /tickmarkr-board opens it";
+/** B7 (D-2184): an automatic tick replaces a read that has stayed in flight for this many polls (60 s at POLL_MS). */
+const STALE_READ_TICKS = 12;
 
 /**
  * queue row 280: a session opens the board by itself only where its own folder holds tickmarkr state, so a session
  * anywhere else never polls. Queue row 343 (D-2180): it reads first and opens only a run that has not ended, once per
- * run id this session, and keeps that one poll while the pane stays closed. One timer and one in-flight read serve
- * start, the command and the poll; end() bumps the session generation, which every publication, status and pane
- * effect checks first, so a late read lands nowhere.
+ * run id this session, and keeps that one poll while the pane stays closed. B7 (D-2184): the command leaves exactly
+ * one armed timer — a stopped poll is armed again, an armed poll stays that subscription — and starts a fresh read.
+ * A read in flight for 12 automatic ticks is replaced. Those ticks are counted when they start and stay bound to
+ * the read then in flight, rejected checks included. Newest wins: only the most recently started read publishes,
+ * sets the status line or feeds autoOpen, so a placement that resolves after a newer empty or failed read does not
+ * restore the ready hint. end() bumps the session generation, which every publication, status and pane effect
+ * checks first, so a late read lands nowhere.
  */
 export function boardController(deps: BoardDeps) {
   let session = 0;
   let cancel: (() => void) | undefined;
-  let reading: Promise<void> | undefined;
+  let timerGen = 0;
+  let reading: Promise<number> | undefined;
+  /** Identity of the most recently started read. An older read that settles later loses to it (B7, D-2184). */
+  let current = 0;
+  let readSeq = 0;
+  /**
+   * Automatic ticks already counted against the current read. The count is taken when the tick starts and bound to
+   * the read in flight then, so a rejected check ages that read and a late probe cannot age a newer one.
+   */
+  let flight = 0;
   let latest: BoardState | undefined;
   /** Run ids successfully placed this session, by an automatic open or by a command that displayed a snapshot. */
   const opened = new Set<string>();
@@ -184,21 +199,33 @@ export function boardController(deps: BoardDeps) {
   let placing = false;
   let placeGen = 0;
 
-  /** The session folder when its own `.tickmarkr` is a directory; undefined otherwise, a rejected check included. */
-  const eligible = async (): Promise<string | undefined> => {
+  /**
+   * The session folder when its own `.tickmarkr` is a directory. `rejected` is a thrown check, distinct from an
+   * answer that the path is not a directory (B7, D-2184).
+   */
+  const probe = async (): Promise<{ ok: true; cwd: string } | { ok: false; rejected: boolean }> => {
     try {
       const cwd = await deps.cwd();
-      return (await deps.isDirectory(`${cwd.replace(/\/+$/, "")}/.tickmarkr`)) === true ? cwd : undefined;
+      const dir = await deps.isDirectory(`${cwd.replace(/\/+$/, "")}/.tickmarkr`);
+      return dir === true ? { ok: true, cwd } : { ok: false, rejected: false };
     } catch {
-      return undefined;
+      return { ok: false, rejected: true };
     }
   };
 
-  /** One read at a time. `checked` binds an automatic read to the folder whose `.tickmarkr` was just checked. */
-  const refresh = (checked?: string): Promise<void> => {
-    if (reading) return reading;
+  /**
+   * `checked` binds an automatic read to the folder whose `.tickmarkr` was just checked. `force` starts a fresh
+   * read even when one is in flight (the command, or a read held for STALE_READ_TICKS).
+   * B7 (D-2184), newest wins: only the most recently started read publishes, sets the status line or feeds
+   * autoOpen. An older read that settles later has no effect.
+   */
+  const refresh = (checked: string | undefined, force: boolean): Promise<number> => {
+    if (reading && !force) return reading;
     const live = session;
-    const read: Promise<void> = (async () => {
+    const mine = ++readSeq;
+    current = mine;
+    flight = 0;
+    const read: Promise<number> = (async () => {
       let state: BoardState;
       try {
         const cwd = checked ?? await deps.cwd();
@@ -206,28 +233,43 @@ export function boardController(deps: BoardDeps) {
       } catch (rejected) {
         state = parseBoard({ rejected });
       }
-      if (live !== session) return;
+      if (live !== session || mine !== current) return mine;
       latest = state;
       await deps.publish(state);
-      if (live !== session) return;
+      if (live !== session || mine !== current) return mine;
       // an empty or failed read clears the status line, as the published state cleared Copy
       deps.status(state.snapshot ? boardStatusLine(shown(state.snapshot)) : undefined);
+      return mine;
     })().finally(() => { if (reading === read) reading = undefined; });
     reading = read;
     return read;
   };
 
   const stopPolling = (): void => {
-    cancel?.();
+    timerGen += 1;
+    const stop = cancel;
     cancel = undefined;
+    stop?.();
+  };
+  const arm = (): void => {
+    const generation = ++timerGen;
+    cancel = deps.every(POLL_MS, () => {
+      if (generation !== timerGen) return;
+      void tick().catch(() => undefined);
+    });
+  };
+  /** Exactly one subscription (B7, D-2184). A stopped poll is armed again. An armed poll stays that subscription. */
+  const poll = (): void => {
+    if (cancel) return;
+    arm();
   };
 
   // Automatic placement only. The decision uses the snapshot just published — never a second read. Daemon liveness
   // is not an input: an unfinished run opens once whether the daemon is alive, down or unknown. A false placement
   // keeps the ready hint and leaves the id unlatched. Concurrent completions share this gate, so two of them cannot
   // open the same id, and a miss cannot become a latch.
-  const autoOpen = async (live: number): Promise<void> => {
-    if (live !== session || placing) return;
+  const autoOpen = async (live: number, mine: number): Promise<void> => {
+    if (live !== session || mine !== current || placing) return;
     const snap = latest?.snapshot ?? null;
     if (snap === null || snap.ended !== null || opened.has(snap.runId)) return;
     const runId = snap.runId;
@@ -236,28 +278,42 @@ export function boardController(deps: BoardDeps) {
     try {
       const placed = await deps.open();
       if (live !== session) return;
-      if (placed) opened.add(runId);
-      else if (!opened.has(runId)) deps.status(READY_HINT);
+      // A successful placement still latches, including when a newer read began while the pane request was open.
+      if (placed) {
+        opened.add(runId);
+        return;
+      }
+      if (opened.has(runId)) return;
+      // Contract C's newest-wins status rule applies even when the newer read is still pending or shows the same run.
+      if (mine !== current) return;
+      deps.status(READY_HINT);
     } finally {
       if (placeGen === gen) placing = false;
     }
   };
 
   // Every automatic refresh, after start and after the command alike, rechecks the session folder and reads only in the
-  // folder it checked; polling stops once that `.tickmarkr` is gone. Only the command's own refresh is unconditional.
+  // folder it checked. B7 (D-2184): a rejected folder check (a throw) keeps polling and this tick reads nothing; a
+  // check that answers not-a-directory stops polling, including when `.tickmarkr` is gone. The tick's age is measured
+  // before that check and bound to the read already in flight, so rejected ticks count toward STALE_READ_TICKS and a
+  // probe that resolves after a newer read has started does not age the newer one. Only the command's own refresh is
+  // unconditional. A read in flight for fewer than STALE_READ_TICKS ticks is shared; the 12th eligible one replaces it.
   const tick = async (): Promise<void> => {
     const live = session;
-    const cwd = await eligible();
+    const agedRead = reading === undefined ? undefined : current;
+    const agedFlight = agedRead === undefined ? flight : flight + 1;
+    if (agedRead !== undefined) flight = agedFlight;
+    const found = await probe();
     if (live !== session) return;
-    if (cwd === undefined) stopPolling();
-    else {
-      await refresh(cwd);
-      if (live !== session) return;
-      await autoOpen(live);
+    if (!found.ok) {
+      if (!found.rejected) stopPolling();
+      return;
     }
-  };
-  const poll = (): void => {
-    cancel ??= deps.every(POLL_MS, () => { void tick().catch(() => undefined); });
+    const replace = agedRead !== undefined && agedRead === current && reading !== undefined
+      && agedFlight >= STALE_READ_TICKS;
+    const mine = await refresh(found.cwd, replace);
+    if (live !== session || mine !== current) return;
+    await autoOpen(live, mine);
   };
 
   return {
@@ -265,34 +321,37 @@ export function boardController(deps: BoardDeps) {
     async start(interactive: boolean): Promise<void> {
       if (!interactive) return;
       const live = session;
-      const cwd = await eligible();
-      if (cwd === undefined || live !== session) return;
-      await refresh(cwd);
-      if (live !== session) return;
+      const found = await probe();
+      // A rejected, missing or not-a-directory check still has no board effect (B7).
+      if (!found.ok || live !== session) return;
+      const mine = await refresh(found.cwd, false);
+      if (live !== session || mine !== current) return;
       // An ended, empty, failed or still-unplaced read keeps watching the folder. The open itself is one cheap
       // placement request per poll, not another read.
       poll();
-      await autoOpen(live);
+      await autoOpen(live, mine);
     },
-    /** /tickmarkr-board: its own refresh has no autoload condition; a placed snapshot's run id counts as opened. */
+    /** /tickmarkr-board: exactly one armed timer, a fresh read, and a placed snapshot's run id counts as opened. */
     async command(): Promise<void> {
       const live = session;
       poll();
-      await refresh();
-      if (live !== session) return;
+      const mine = await refresh(undefined, true);
+      if (live !== session || mine !== current) return;
       const snap = latest?.snapshot ?? null;
       const placed = await deps.open();
-      if (live !== session) return;
+      if (live !== session || mine !== current) return;
       // An empty or failed display has no run id. A false placement records none, so a later poll may still open.
       if (placed && snap !== null) opened.add(snap.runId);
     },
     /** session.end: cancel the timer, drop this session's autoload memory, and invalidate every pending effect. */
     end(): void {
       session += 1;
+      current = ++readSeq;
       placeGen += 1;
       placing = false;
       reading = undefined;
       latest = undefined;
+      flight = 0;
       opened.clear();
       stopPolling();
     },

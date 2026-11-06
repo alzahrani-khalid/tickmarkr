@@ -26,6 +26,16 @@ const journalLines = (run: string): string[] => {
 const eventsOf = (lines: string[]) =>
   lines.flatMap((l, i) => (l.trim().startsWith("{") ? [{ ...JSON.parse(l), _line: i + 1 }] : []));
 const telemetryOf = (run: string) => runFile(run, "telemetry.jsonl").split("\n").filter((l) => l.trim().startsWith("{")).map((l) => JSON.parse(l));
+/** S7: only a run-end followed by a run-resume with no later run-end is reopened. */
+const isReopened = (events: { event: string }[]): boolean => {
+  let sawEnd = false;
+  let reopened = false;
+  for (const { event } of events) {
+    if (event === "run-end") { sawEnd = true; reopened = false; }
+    else if (event === "run-resume" && sawEnd) reopened = true;
+  }
+  return reopened;
+};
 
 const savedTz = process.env.TZ;
 afterEach(() => {
@@ -33,16 +43,26 @@ afterEach(() => {
   else process.env.TZ = savedTz;
 });
 
-test("for every golden case, with the process time zone set to the case's tz, summarize over the first cut lines of the run's journal split on LF only, its graph and every telemetry row, at the case's now, pid, alive, hist and suites, deep-equals the case's expected object", () => {
+test("golden cuts that are not reopened stay exactly equal while every reopened golden cut reads ended null endEpoch null and atEpoch at the case's now (contract R goldens)", () => {
   let compared = 0;
+  let reopened = 0;
   for (const c of cases) {
     process.env.TZ = c.tz;
-    const got = summarize(eventsOf(journalLines(c.run).slice(0, c.cut)), JSON.parse(runFile(c.run, "graph.json")), c.pid, c.alive, c.now,
+    const events = eventsOf(journalLines(c.run).slice(0, c.cut));
+    const got = summarize(events, JSON.parse(runFile(c.run, "graph.json")), c.pid, c.alive, c.now,
       c.hist, telemetryOf(c.run), c.suites);
-    expect(got, c.name).toStrictEqual(c.expected);
+    if (isReopened(events)) {
+      expect(got.ended, c.name).toBeNull();
+      expect(got.endEpoch, c.name).toBeNull();
+      expect(got.atEpoch, c.name).toBe(c.now);
+      reopened++;
+    } else {
+      expect(got, c.name).toStrictEqual(c.expected);
+    }
     compared++;
   }
   expect(compared).toBe(cases.length);
+  expect(reopened).toBeGreaterThan(0);
 });
 
 test("the golden cases run in full with none skipped and include both time zones, the synthetic run, a suite waiting on a named holder, a failed cheap check, a park and an open approval window, so a trimmed golden file fails", () => {

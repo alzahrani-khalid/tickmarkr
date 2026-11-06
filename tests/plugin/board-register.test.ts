@@ -67,7 +67,7 @@ function host(folder: "dir" | "file" | "missing" | "rejected" = "dir", placed = 
   return { deps, fs, checks, runs, timers, effects, published, statuses, hold, controller: boardController(deps) };
 }
 
-test("the controller has no effect for a missing, non-directory or rejected-check folder or a non-interactive start; an eligible start and repeated commands share one timer and one read, an unplaced open sets the ready hint, folder loss stops polling, snapshot, empty and error results each publish a complete replacement, and end suppresses pending publication, status and pane effects", async () => {
+test("the controller has no effect for a missing, non-directory or rejected-check folder or a non-interactive start; an eligible start and repeated commands leave one live timer and publish only the newest read, an unplaced open sets the ready hint, a not-a-directory stops polling, snapshot, empty and error results each publish a complete replacement, and end suppresses pending publication, status and pane effects", async () => {
   // no board effect: a folder without a .tickmarkr directory, a rejected check, or a non-interactive session
   for (const folder of ["missing", "file", "rejected"] as const) {
     const h = host(folder);
@@ -79,46 +79,56 @@ test("the controller has no effect for a missing, non-directory or rejected-chec
   await quiet.controller.start(false);
   expect([quiet.checks, quiet.runs.length, quiet.timers.length, quiet.effects]).toEqual([[], 0, 0, []]);
 
-  // an eligible start and repeated commands: one timer, one read in flight, the board json argv in the session folder
+  // an eligible start reads the board json argv in the session folder, then arms one poll
   const h = host("dir");
   const started = h.controller.start(true);
-  await flush();
-  const first = h.controller.command();
-  const second = h.controller.command();
   await flush();
   expect(h.runs).toHaveLength(1);
   expect(h.runs[0]!.argv).toEqual(["tickmarkr", "board", "--json", "--root", "/elsewhere/.tickmarkr"]);
   expect(h.runs[0]!.cwd).toBe("/work/repo/");
-  expect(h.timers.map(timer => timer.ms)).toEqual([5000]);
   h.runs[0]!.answer.resolve(OK);
-  await Promise.all([started, first, second]);
-  expect(h.runs).toHaveLength(1);
-  expect(h.timers).toHaveLength(1);
+  await started;
+  expect(h.timers.map(timer => timer.ms)).toEqual([5000]);
   expect(h.published).toEqual([{ snapshot: SNAPSHOT, empty: null, error: null }]);
   expect(h.statuses).toEqual([boardStatusLine(shown(SNAPSHOT))]);
-  expect(h.effects).toEqual(["publish", "status", "open", "open", "open"]);
-  // a tick while a read is in flight shares it
-  h.timers[0]!.tick();
-  h.timers[0]!.tick();
+  // repeated commands each start a fresh read and keep the one armed timer (B7, D-2184)
+  const first = h.controller.command();
   await flush();
-  expect(h.runs).toHaveLength(2);
+  const second = h.controller.command();
+  await flush();
+  expect(h.runs).toHaveLength(3);
+  expect(h.timers).toHaveLength(1);
+  expect(h.timers[0]!.cancelled).toBe(false);
+  h.runs[1]!.answer.resolve(EMPTY);
+  await flush();
+  h.runs[2]!.answer.resolve(OK);
+  await Promise.all([first, second]);
+  // The first command's read was superseded: newest wins, so only the second command's snapshot publishes.
+  expect(h.published.at(-1)).toEqual({ snapshot: SNAPSHOT, empty: null, error: null });
+  expect(h.effects.filter(effect => effect === "open")).toEqual(["open", "open"]);
+  const live = (): (typeof h.timers)[number] => h.timers.filter(timer => !timer.cancelled).at(-1)!;
+  // a tick while a read is in flight for fewer than 12 ticks shares it
+  live().tick();
+  live().tick();
+  await flush();
+  expect(h.runs).toHaveLength(4);
 
   // snapshot, empty and error results each publish one complete replacement; empty and error clear the status line
   h.published.length = 0;
   h.statuses.length = 0;
-  h.runs[1]!.answer.resolve(EMPTY);
+  h.runs[3]!.answer.resolve(EMPTY);
   await flush();
-  h.timers[0]!.tick();
+  live().tick();
   await flush();
-  h.runs[2]!.answer.resolve(FAILED);
+  h.runs[4]!.answer.resolve(FAILED);
   await flush();
-  h.timers[0]!.tick();
+  live().tick();
   await flush();
-  h.runs[3]!.answer.reject(new Error("spawn tickmarkr ENOENT"));
+  h.runs[5]!.answer.reject(new Error("spawn tickmarkr ENOENT"));
   await flush();
-  h.timers[0]!.tick();
+  live().tick();
   await flush();
-  h.runs[4]!.answer.resolve(OK);
+  h.runs[6]!.answer.resolve(OK);
   await flush();
   expect(h.published).toEqual([
     { snapshot: null, empty: "no tickmarkr run under /work/repo/.tickmarkr", error: null },
@@ -128,11 +138,12 @@ test("the controller has no effect for a missing, non-directory or rejected-chec
   ]);
   for (const state of h.published) expect(Object.keys(state).sort()).toEqual(["empty", "error", "snapshot"]);
   expect(h.statuses).toEqual([undefined, undefined, undefined, boardStatusLine(shown(SNAPSHOT))]);
-  // after the command too, each tick rechecks the folder: its loss stops polling and starts no read
-  h.fs.kind = "missing";
-  h.timers[0]!.tick();
+  // after the command too, each tick rechecks the folder: not-a-directory stops polling and starts no read
+  const polling = live();
+  h.fs.kind = "file";
+  polling.tick();
   await flush();
-  expect([h.runs.length, h.timers[0]!.cancelled]).toEqual([5, true]);
+  expect([h.runs.length, polling.cancelled]).toEqual([7, true]);
 
   // an autoloaded board: an unplaced open sets the ready hint and keeps the eligible poll (queue row 343 — a narrow
   // miss does not latch and does not stop the timer). A placed one polls until the folder goes.
@@ -149,7 +160,7 @@ test("the controller has no effect for a missing, non-directory or rejected-chec
   await flush();
   narrow.runs[1]!.answer.resolve(OK);
   await asked;
-  expect([narrow.timers.length, narrow.effects.filter(effect => effect === "open").length]).toEqual([1, 2]);
+  expect([narrow.timers.filter(timer => !timer.cancelled).length, narrow.effects.filter(effect => effect === "open").length]).toEqual([1, 2]);
 
   const auto = host("dir");
   const loaded = auto.controller.start(true);
@@ -233,23 +244,27 @@ test("every automatic refresh after a start, a command or both rechecks the sess
       h.runs.at(-1)!.answer.resolve(OK);
       await asked;
     }
-    expect(h.timers, entry).toHaveLength(1);
+    expect(h.timers.filter(timer => !timer.cancelled), entry).toHaveLength(1);
     return h;
   };
+  const polling = (h: Awaited<ReturnType<typeof opened>>) => h.timers.filter(timer => !timer.cancelled).at(-1)!;
 
   for (const entry of ENTRIES) {
     for (const loss of ["missing", "file", "rejected"] as const) {
       const h = await opened(entry);
       const reads = h.runs.length;
-      h.timers[0]!.tick();
+      const timer = polling(h);
+      timer.tick();
       await flush();
       expect(h.runs.length, `${entry}, eligible tick`).toBe(reads + 1);
       h.runs.at(-1)!.answer.resolve(OK);
       await flush();
       h.fs.kind = loss;
-      h.timers[0]!.tick();
+      timer.tick();
       await flush();
-      expect([h.runs.length, h.timers[0]!.cancelled], `${entry}, ${loss}`).toEqual([reads + 1, true]);
+      // A throw (missing or rejected) keeps the poll and reads nothing. Not-a-directory still stops it (B7, D-2184).
+      const stopped = loss === "file";
+      expect([h.runs.length, timer.cancelled], `${entry}, ${loss}`).toEqual([reads + 1, stopped]);
       expect(h.checks.at(-1)).toBe("/work/repo/.tickmarkr");
     }
 
@@ -257,7 +272,8 @@ test("every automatic refresh after a start, a command or both rechecks the sess
     const moving = await opened(entry);
     const check = deferred<boolean>();
     moving.hold.check = check;
-    moving.timers[0]!.tick();
+    const timer = polling(moving);
+    timer.tick();
     await flush();
     moving.fs.cwd = "/unrelated";
     check.resolve(true);
@@ -266,13 +282,13 @@ test("every automatic refresh after a start, a command or both rechecks the sess
     expect(moving.checks.at(-1)).toBe("/work/repo/.tickmarkr");
     moving.runs.at(-1)!.answer.resolve(OK);
     await flush();
-    // the next tick checks the folder the session is in now, and that one holds no .tickmarkr
-    moving.fs.kind = "missing";
+    // the next tick checks the folder the session is in now, and that one is not a directory
+    moving.fs.kind = "file";
     const reads = moving.runs.length;
-    moving.timers[0]!.tick();
+    timer.tick();
     await flush();
     expect(moving.checks.at(-1)).toBe("/unrelated/.tickmarkr");
-    expect([moving.runs.length, moving.timers[0]!.cancelled], entry).toEqual([reads, true]);
+    expect([moving.runs.length, timer.cancelled], entry).toEqual([reads, true]);
   }
 
   // the same race on an autoload start: the read and the pane follow the checked folder, never the new one

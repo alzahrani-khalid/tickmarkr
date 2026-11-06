@@ -46,6 +46,10 @@ a rule names a deliberate difference from `reference/summarize.py`, the rule win
   - Negative indexes are translated explicitly.
 - S6 Purity: the module imports no node built-in and never reads the clock. `summarize` returns the reference object
   without `readAt`; events carry `_line`, the 1-based journal line counted on LF only.
+- S7 Resumed runs (D-2184): a `run-resume` after a `run-end` reopens the run. It clears `ended`, the track's end time,
+  and any approval window opened before that resume. Until a later `run-end`, `ended` and `endEpoch` are null and
+  `atEpoch` is `now`; a later end supplies its own record and time. Spans closed by the earlier end stay closed.
+  This deliberately differs from `reference/summarize.py`, which retains the earlier end after resume.
 
 ## R. Reader (`src/board/read.ts`, a port of `reference/summarize.py` lines 425–560)
 
@@ -127,9 +131,14 @@ a rule names a deliberate difference from `reference/summarize.py`, the rule win
 
 ## B. Plugin board (`hooks/board/`)
 
-- B1 `board.tsx` is `reference/board.tsx` byte for byte except three lines: the types import reads from `"./state"`,
+- B1 `board.tsx` is `reference/board.tsx` byte for byte except the types import reads from `"./state"`,
   the footer literal `/run-progress reopens` reads `/tickmarkr-board reopens`, and the head names the spec being built
-  as `<spec> · #<n>`, keeping the reference's run-id head when `spec` is null (queue row 335).
+  as `<spec> · #<n>`, keeping the reference's run-id head when `spec` is null (queue row 335), plus contract S's
+  D-2184 additions: the frame clock counts seconds since `readAt` changed even for ended snapshots; at 30 seconds
+  the head reads `STALE · read <readAt>` in `INK.warn` (never `LIVE`) and the line below reads
+  `not refreshed since <readAt> — /tickmarkr-board reloads it`. Durations, the approval countdown and ETA freeze
+  at the last read: live `now` is `atEpoch` plus the live ticks counted up to that read. A new `readAt` restores
+  the fresh display on the next frame. The reference test pins every other line.
 - B2 `state.d.ts` declares wire contract version 1 (R1), with no repository runtime import:
   - `RunSnapshot` gains `version: 1`, `readAt: string`, `release: ReleaseSnapshot | null` and `spec: string | null`.
   - The empty answer is `{ version: 1; empty: string }`.
@@ -159,11 +168,24 @@ a rule names a deliberate difference from `reference/summarize.py`, the rule win
     refreshes and opens the pane without requesting focus. A missing, non-directory or rejected check, or a
     non-interactive start, has no board effect. An unplaced open sets the status `Run board ready — /tickmarkr-board opens it`. Otherwise
     it reads, polls, opens and sets nothing (queue row 280).
-  - `command()` enables the board without the autoload condition, keeps one timer, refreshes and opens the pane.
-  - Each automatic refresh rechecks the current cwd's `.tickmarkr`; polling stops when it is gone.
-  - One read is in flight at a time.
+  - `command()` enables the board without the autoload condition, refreshes and opens the pane. Contract C (D-2184):
+    it leaves exactly one armed timer. A poll that has stopped is armed again, exactly one new timer. A timer that
+    is already armed stays that timer. While a read is in flight the command starts a fresh read.
+  - Each automatic refresh rechecks the current cwd's `.tickmarkr`. Contract C (D-2184): a folder check that rejects
+    (throws) keeps polling and that tick reads nothing. The tick still ages a read that was already in flight when
+    the tick started; that age is taken before the check and stays bound to that read. A check that answers
+    not-a-directory, or finds `.tickmarkr` gone, stops polling.
+  - An automatic tick shares a read that has been in flight for fewer than 12 consecutive ticks. On the 12th (60 s)
+    eligible tick it starts a fresh read (contract C, D-2184). Rejected checks count toward those 12. Ticks whose
+    check resolves only after a newer read has started do not age or replace that newer read.
+  - Newest wins (contract C, D-2184): only the most recently started read publishes, sets the status line or feeds
+    autoOpen. An older read that settles later has no effect. A pane placement already in flight that resolves false
+    cannot write the ready hint after a newer read starts, even before that read publishes or when it publishes the
+    same run with updated status. A successful placement still records the run id. `end()` still invalidates every
+    pending effect.
   - Every result replaces the whole state. A failure or empty result clears Copy and the status line.
-  - `end()` cancels the timer and invalidates the session, so a late read publishes nothing.
+  - `end()` cancels the timer and invalidates the session, so a late read publishes nothing. Session-generation
+    checks and autoOpen's once-per-run latch stay as they are.
 - B8 `view(state)` shows one of:
   - `shown(snapshot)` with marks and fit;
   - the empty text: `No tickmarkr runs found.`, then the searched roots, then `Compile a spec and review its plan,
