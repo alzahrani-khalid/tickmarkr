@@ -34,7 +34,8 @@ one tree, before release.
   your API key.
 - **Herdr app fixes:** omp reviewers in pane mode are no longer dropped as silent; an unreadable or truncated pane read
   is retried and then parks as infrastructure instead of failing the task; the skills' seat recipe uses valid `hc`
-  names and labels each tab with `herdr-app do tab.rename`.
+  names and labels each tab with `herdr-app do tab.rename`; the overseer skill opens every tab in its own verified
+  space, never in the space you are looking at.
 - **The skills and the command reference explain closing a waived finding that was fixed later**, with
   `verify --supersede`, alongside the existing discharge guidance.
 

@@ -115,10 +115,11 @@ test("Cite the replaced watcher line in each of the three plain-host sections, v
   // paragraph (universal scope, plain section byte-unchanged) moves those two pins; tests/skills-run-truth.test.ts owns it.
   // Row 359; D-2185 add.19: app lookup now names terminals[].terminal; hostile host edits still red.
   // Row 359; D-2185 add.20: auto shares loop's condensed role section; keep the parity and hostile-edit pins.
+  // Row 380; D-2185 add.35: the overseer app scope gains the placement bullet; that moves the overseer pin only.
   const baseline = {
     loop: "d1bd9807906f68435920fb4f710163b2ff1fd18d732dfeee5cf231bbd8962742",
     auto: "1b07e1eb72d5b4cf3620a086e6958fc50d0aa673ad231a02d2ad58bf4d560f93",
-    overseer: "7cf48feff7a63543b88fa55086503bf8f86bec5d797745da6ffd10aa854f23b2",
+    overseer: "6ba1143c5c7d3405fe2d1f8af7629c755519f5cba1cae8ef6782cb12d78d8014",
   };
   for (const name of SKILLS) {
     const markdown = readSkill(name);

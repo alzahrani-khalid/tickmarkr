@@ -14,6 +14,7 @@ import * as baselineModule from "../../src/gates/baseline.js";
 import { VerdictStore, type VerificationIdentity } from "../../src/gates/cache.js";
 import type { GateResult } from "../../src/gates/types.js";
 import { runDaemon } from "../../src/run/daemon.js";
+import * as git from "../../src/run/git.js";
 import { Journal, type JournalEvent } from "../../src/run/journal.js";
 import * as recoveryModule from "../../src/run/recovery.js";
 import { attributable, executedFullTest, INTERRUPTED_RECHECK_EVENT, INTERRUPTED_RETRY_EVENT, interruptedLedger, interruptedRetryState, LISTING_INVOCATION_SUFFIX } from "../../src/run/recovery.js";
@@ -28,7 +29,8 @@ const SLOW = "tests/slow.test.ts";
 /** The runner-level diagnostic block the vitest manifest path appends to a red (a scripted runner cannot). */
 const WORKER_RPC = "\nclassification: regression; runner-level diagnostic: never-started 0; reporter errors 1; runner vitest\nError: [vitest-worker]: Timeout calling \"onTaskUpdate\"";
 /** `red` names a DIFFERENT failure than an interrupted execution; `infra` is a runner-infrastructure red the
- * ordinary in-gate retry would re-run; `starved` is a timeout red the host-starved remeasure would re-run;
+ * ordinary in-gate retry would re-run; `starved` is a timeout red the host-starved remeasure would re-run
+ * (its durations are injected at the sh seam by `starvedDurations`, never measured: row 377; D-2185 add.37);
  * `diag` is a timeout red with runner diagnostics on SLOW, which an isolated re-observation would rerun;
  * `discovery` is a manifest discovery refusal (listing receipts only); `litter` is a green full job that
  * then leaves dirt in the worktree; `stale` is a green full job whose command writes an IGNORED lockfile,
@@ -55,7 +57,7 @@ case "$(sed -n "\${n}p" '${dir}/plan')" in
   green) exit 0;;
   red) echo 'FAIL t1.test.ts > reads two'; echo 'AssertionError: expected two to be three'; exit 1;;
   infra) echo 'Error: [vitest-worker]: Timeout calling "onTaskUpdate"'; exit 1;;
-  starved) i=0; while [ "$i" -lt 60000 ]; do i=$((i+1)); done; echo 'FAIL t1.test.ts > reads one'; echo 'Error: Test timed out in 5000ms'; exit 1;;
+  starved) echo 'FAIL t1.test.ts > reads one'; echo 'Error: Test timed out in 5000ms'; exit 1;;
   diag) echo 'FAIL ${SLOW} > slow'; echo 'Error: Test timed out in 5000ms.'; exit 1;;
   discovery) echo 'cannot list'; exit 2;;
   litter) echo left > "$PWD/litter.txt"; exit 0;;
@@ -118,7 +120,18 @@ esac
   };
   /** From now on the build command fails: a resume's build provisioning is red. */
   const failBuild = () => writeFileSync(join(dir, "build-fails"), "");
-  return { repo, fake, executions, setPlan, interrupt, onReserve, cacheSeed, failBuild };
+  /** hostStarved reads durations, so a `starved` red gets them from the sh seam, never from a wall clock: the
+   * planned timeout red took 10 ms, every other test-command execution (the baseline capture included) 1 ms
+   * (the tests/gates/run-gates-fingerprint.test.ts form; row 377, D-2185 add.37). Install it after `interrupt`. */
+  const starvedDurations = () => {
+    const sh = git.sh;
+    vi.spyOn(git, "sh").mockImplementation(async (...args) => {
+      const result = await sh(...args);
+      if (!args[0].includes(join(dir, "run.sh"))) return result;
+      return { ...result, durationMs: result.stdout.includes("Error: Test timed out in 5000ms") ? 10 : 1 };
+    });
+  };
+  return { repo, fake, executions, setPlan, interrupt, onReserve, cacheSeed, failBuild, starvedDurations };
 }
 
 const reservations = (evs: JournalEvent[]) => of(evs, INTERRUPTED_RETRY_EVENT);
@@ -226,6 +239,7 @@ describe("row 337 (D-2181 D2): one reserved test-only retry, then an infra park"
       const runId = `run-interrupted-then-${second}`;
       const p = planned(["interrupted", second, "green", "green", "green", "green"]);
       p.interrupt();
+      if (second === "starved") p.starvedDurations();
       await runDaemon(p.repo, { adapters: [p.fake], runId });
       const evs = rows(p.repo, runId);
       const tests = testRows(evs);

@@ -220,6 +220,13 @@ overseer, loop and auto skills.
   Right after the ORCH spawn read-back, map its address via `terminals[].terminal` in `herdr-app ls`, run
   `herdr-app do tab.rename --id "<tab-id>" --name "ORCH · <label>"` and verify tab id, label and
   address. The creator labels it once; later state labels belong to its owner.
+- **Placement is the space label, never the screen.** A new tab opens in the space its command names;
+  a command that names none opens in the space the person is looking at. Every terminal or tab you open
+  names your verified space: `--label "herdr.space=<verified space>"` on `hc run`, or
+  `--space <verified space>` on `herdr-app do tab.new`. Never give a seat its pane with
+  `herdr-app do terminal.keep --place tab`, which takes no space, and never aim one with `space.select`,
+  which moves the person's view. Without a valid read-back of your own space, open nothing visible:
+  report it and stop.
 - **Delivery after launch.** Send only to a recorded, verified address with
   `hc send <address> "<message>" --json`, never `--force`. A booting seat, an occupied composer, a blocked
   dialog, an uncertain submit (`started` not `true`) or `first_message` false is NO handoff: read the seat
