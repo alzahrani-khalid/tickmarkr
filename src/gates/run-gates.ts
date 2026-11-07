@@ -32,6 +32,7 @@ import {
   isInfraResult,
   resolveStateDir,
   reusedIdentity,
+  type VerdictOrigin,
   type VerificationIdentity,
   type VerificationScope,
 } from "./cache.js";
@@ -181,6 +182,10 @@ export interface GateContext {
   evidence?: GateEvidenceOptions;
   buildReceiptIdentity?: Omit<CommandReceiptAttribution, "invocation">;
   authorizeInfraRetry?: (subject: string, cause?: VerificationRetryCause) => boolean;
+  /** Row 337 (D-2181 D2): this round IS the reserved interruption retry or an interrupted subject's
+   * operator recheck — exactly ONE full test execution. No in-gate infra or host-starved remeasurement
+   * and no stale-proof replacement job: a stale green fails closed instead. */
+  singleExecution?: true;
   verificationScope?: VerificationScope;
   worktree: string;
   /** Only the daemon may clear preserved seat litter from its own task checkout. */
@@ -222,6 +227,12 @@ export interface GateContext {
    * a retry that landed nothing on a timeout-class red — its one fresh re-observation. C: and one whose
    * unchanged red is attributed wholly outside the task's files[] — its one fresh re-execution. */
   cachedRedBypass?: "operator-rerun" | "timeout-fresh" | "out-of-scope-fresh";
+  /** Row 337 (D-2181 D3): the subject's fresh test force is still pending — no cached test verdict answers
+   * it, green or red, until a full execution is journaled; every other gate keeps its existing reuse. */
+  pendingFreshForce?: true;
+  /** Row 337 (D-2181 D3): who this round executes for. A verdict this round EXECUTES is stored with it as
+   * its origin; a reused verdict keeps the origin its record already carries. */
+  provenance?: VerdictOrigin;
   // OBS-1033: channel keys of the seats that authored the carried commits (the task's tried list) —
   // a reviewer of that vendor is excluded for the round, never handed its own work to approve.
   carriedAuthors?: readonly string[];
@@ -715,13 +726,18 @@ export async function runGates(
     ctx.onGate?.({ phase: "note", gate, name: "gate-reused-verdict", payload: { gate, pass: r.pass, details: r.meta?.reusedDetails, ...reusedIdentity(id) }, result: r });
   // OBS-1055: on a recheck a cached red is the answer the operator just said was wrongly given; it is
   // journaled as discarded and the gate runs. Returns true when the hit must NOT be reused.
+  // Row 337 (D-2181 D3): a pending fresh force refuses every cached TEST verdict, a green one included.
   const discardCachedRed = async (gate: GateName, hit: GateResult): Promise<boolean> => {
-    const reason = ctx.recheck ? "recheck" : ctx.cachedRedBypass;
-    if (!reason || hit.pass) return false;
+    const forced = gate === "test" && ctx.pendingFreshForce === true;
+    const reason = ctx.recheck ? "recheck" : ctx.cachedRedBypass ?? (forced ? "pending-fresh-force" : undefined);
+    if (!reason || (hit.pass && !forced)) return false;
     await ctx.onGate?.({ phase: "note", gate, name: reason === "recheck" ? "recheck-rerun" : "gate-rerun",
-      payload: { gate, reason: "cached-red-discarded", ...(reason === "recheck" ? {} : { bypass: reason }) }, result: hit });
+      payload: { gate, reason: hit.pass ? "cached-green-discarded" : "cached-red-discarded", ...(reason === "recheck" ? {} : { bypass: reason }) }, result: hit });
     return true;
   };
+  // Row 337 (D-2181 D3): a verdict this round EXECUTED is stored with its origin; a reused one is never re-stored.
+  const stored = (r: GateResult): GateResult =>
+    ({ ...r, meta: { ...r.meta, source: "gate", runDir: ctx.artifactDir, ...(ctx.provenance ? { origin: ctx.provenance } : {}) } });
   // OBS-1168(c): every judge/review seat this round opens, so a failed sibling can cancel the other.
   // A cancelled round dispatches, re-routes and publishes nothing more; its closed seats' own errors
   // are consequences of the cancel, never a second failure.
@@ -1177,8 +1193,9 @@ export async function runGates(
     meta: { ...r.meta, infra: true, classification: "infra", retryable: false, staleProof: true, ...(superseded ? { skipped: true } : {}) } });
 
   // shell tools vs the shared baseline
-  const retryOptions = (identity: VerificationIdentity | undefined): RetryOptions => ctx.authorizeInfraRetry
-    ? { authorizeRetry: (cause) => ctx.authorizeInfraRetry!(identity ? verificationIdentityKey(identity) : "",
+  const retryOptions = (identity: VerificationIdentity | undefined): RetryOptions => ctx.singleExecution
+    ? { authorizeRetry: () => false }
+    : ctx.authorizeInfraRetry ? { authorizeRetry: (cause) => ctx.authorizeInfraRetry!(identity ? verificationIdentityKey(identity) : "",
       cause === "infra" ? "infrastructure" : "host-starved") }
     : {};
 
@@ -1202,7 +1219,9 @@ export async function runGates(
           selectedSet: g === "test" ? selected : undefined,
           capacity: resolvedCapacity(),
         });
-        const hit = verdictStore.get(identity);
+        // Row 337 (D-2181 D2): a single-execution round's test IS its one fresh execution — no cached
+        // test verdict answers it, green or red; every other gate keeps its existing reuse.
+        const hit = ctx.singleExecution && g === "test" ? undefined : verdictStore.get(identity);
         if (hit) classifySignalOnlyTest(hit, true); // Older entries predate classification at the write seam.
         if (hit && identity && !isInfraResult(hit) && (hit.pass || (ctx.verificationScope ?? "battery") === "battery")
             && !(await discardCachedRed(g, hit))) {
@@ -1246,12 +1265,13 @@ export async function runGates(
       if (r) classifySignalOnlyTest(r);
       // Every round's in-battery full job is its first — test-only verification included: stale, it is
       // published unverdicted and buys one fresh merge-candidate job below, whose own stale green fails closed.
+      // A single-execution round (row 337, D-2181 D2) buys none: its stale green fails closed here.
       if (g === "test" && !selected && cmd !== undefined && !cached && r!.pass && !(await answersNow(identity, r!, true))) {
-        r = staleProof(r!, true);
-        rerunFull = true;
+        r = staleProof(r!, !ctx.singleExecution);
+        rerunFull = !ctx.singleExecution;
       }
       if (!cached && identity && r && !isInfraResult(r)) {
-        verdictStore.set(identity, { ...r, meta: { ...r.meta, source: "gate", runDir: ctx.artifactDir } });
+        verdictStore.set(identity, stored(r));
       }
       if (g === "test" && selected) {
         // v2.6.7 T1: the attributed diagnostic. A behavioral red IS the round's verdict and ends it
@@ -1894,7 +1914,7 @@ export async function runGates(
       const id = await fullTestIdentity();
       const hit = verdictStore.get(id);
       if (hit) classifySignalOnlyTest(hit, true);
-      if (hit?.pass === true && !isInfraResult(hit) && await answersNow(id, hit, false)) decision = { reason: "full-green-cache" };
+      if (hit?.pass === true && !ctx.pendingFreshForce && !isInfraResult(hit) && await answersNow(id, hit, false)) decision = { reason: "full-green-cache" };
       else {
         decision = diagnosticAdmission(ctx.baseline, files);
         if ((decision as DiagnosticAdmission).admitted) diagnostic = files;
@@ -1955,7 +1975,7 @@ export async function runGates(
   // earlier event and this is the second.
   // OBS-635 (answersNow): a diagnosed round's full job is its first, so, like the in-battery job, a stale
   // green buys one fresh job (published unverdicted); a stale last job fails closed. Neither is cached.
-  let spare = diagnosed ? 1 : 0;
+  let spare = diagnosed && !ctx.singleExecution ? 1 : 0;
   while (diagnosed || rerunFull) {
     await emitStart("test");
     // This is the last shell command a round can run — the judge's named-test oracle (acceptance.ts)
@@ -1968,7 +1988,7 @@ export async function runGates(
     let identity: VerificationIdentity | undefined;
     if (ctx.commands.test !== undefined) {
       identity = await fullTestIdentity();
-      const hit = verdictStore.get(identity);
+      const hit = ctx.singleExecution ? undefined : verdictStore.get(identity); // row 337: as in the battery
       if (hit) classifySignalOnlyTest(hit, true);
       if (hit && identity && !isInfraResult(hit) && (hit.pass || (ctx.verificationScope ?? "battery") === "battery")
           && !(await discardCachedRed("test", hit))) {
@@ -1991,7 +2011,7 @@ export async function runGates(
     if (full) classifySignalOnlyTest(full);
     const stale = !cached && !dirt && full!.pass && !(await answersNow(identity, full!, false, true));
     if (!cached && identity && full && !dirt && !stale && !isInfraResult(full)) {
-      verdictStore.set(identity, { ...full, meta: { ...full.meta, source: "gate", runDir: ctx.artifactDir } });
+      verdictStore.set(identity, stored(full));
     }
     const spoke = stale ? staleProof(full!, spare > 0) : full!;
     const merged = withTelemetry(dirt

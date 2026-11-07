@@ -14,8 +14,9 @@ import { type ExecutorDriver, type Slot } from "../../../src/drivers/types.js";
 import { tickmarkrDir } from "../../../src/graph/graph.js";
 import { EARLY_LAUNCH_LIVENESS_MS, NUDGEABLE_ADAPTERS, resetContactUnreadableDeadlineMsForTests, resetDeadChannelFastKillMsForTests, resetEarlyLaunchLivenessMsForTests, resetNudgeTimingForTests, resetPageRepeatMsForTests, resetQuotaBannerSilentMsForTests, runDaemon, setContactUnreadableDeadlineMsForTests, setDeadChannelFastKillMsForTests, setEarlyLaunchLivenessMsForTests, setNudgeTimingForTests, setPageRepeatMsForTests, setQuotaBannerSilentMsForTests, WORKER_NUDGE_MESSAGE } from "../../../src/run/daemon.js";
 import { Journal } from "../../../src/run/journal.js";
+import { processLivenessHost } from "../../../src/run/process-liveness.js";
 import { shGit } from "../../../src/run/git.js";
-import { PANE_READ_ROWS, resetRowRearmTokenFlatMsForTests, setRowRearmTokenFlatMsForTests, workerReapHost } from "../../../src/run/stall.js";
+import { PANE_READ_ROWS, resetRowRearmTokenFlatMsForTests, setRowRearmTokenFlatMsForTests, workerReapHost, WorkerTreeCpuAccountant } from "../../../src/run/stall.js";
 import { COMMIT, makeTestTempDir, setupRepo, T } from "../../helpers/tmprepo.js";
 
 
@@ -73,6 +74,17 @@ describe("OBS-82 spinner-blind stall, headless site (fake adapter, zero tokens)"
 
 
 describe("v1.76 progress-based stall watchdog (fake adapter, zero tokens)", () => {
+  let restoreQuietProbes: () => void;
+  beforeEach(() => {
+    // Row 364; D-2184 add.31: isolate the OUTPUT guard with measured flat CPU and no model connection.
+    const start = vi.spyOn(WorkerTreeCpuAccountant.prototype, "start").mockResolvedValue();
+    const stop = vi.spyOn(WorkerTreeCpuAccountant.prototype, "stop").mockResolvedValue();
+    const cpu = vi.spyOn(WorkerTreeCpuAccountant.prototype, "read").mockReturnValue({ cpu: { ms: 0, resolutionMs: 10 }, gaps: 0 });
+    const connection = vi.spyOn(processLivenessHost, "connection").mockResolvedValue("none");
+    setHarvestCpuFlatMsForTests(0);
+    restoreQuietProbes = () => { start.mockRestore(); stop.mockRestore(); cpu.mockRestore(); connection.mockRestore(); resetHarvestCpuFlatMsForTests(); };
+  });
+  afterEach(() => restoreQuietProbes());
   test("test: a worker pane emitting only cursor and status-bar repaints past the stall threshold triggers the stall escalation", async () => {
     setAttemptHardTimeoutMsForTests(60_000); // Queue row 233 (D-2130): isolate inactivity from the hard deadline.
     const { repo, fake } = setupRepo(
@@ -435,17 +447,21 @@ describe("T1 stall detection (OBS-262/263, fake adapter, zero tokens)", () => {
   // baseline, so the suite was never the worker's to buy; what the worker owes inside the window is
   // a commit and a trailer. Read off the prompt a dispatched worker actually received, never off the
   // template — the contract is prepended at dispatch, and only the delivered file proves delivery.
-  test("test: the harness contract a dispatched worker receives puts the full suite on the gates and still demands a commit and completion trailer inside the stall window; a contract telling the worker to budget the full suite once fails", async () => {
+  test("test: the harness contract a dispatched worker receives puts the full suite on the gates and states the inactivity window, model connection hold and hard ceiling while demanding a commit and completion trailer", async () => {
     const { repo, fake } = setupRepo([T("T1", { timeoutMinutes: 7 })], {
       tasks: { T1: [{ shell: `echo done > d.txt && ${COMMIT} d`, result: { ok: true, summary: "done" } }] },
     });
     await runDaemon(repo, { adapters: [fake], runId: "run-worker-contract" });
     const prompt = readFileSync(join(tickmarkrDir(repo), "runs", "run-worker-contract", "prompts", "T1-a0.md"), "utf8");
-    const contract = prompt.split("\n").find((line) => line.includes("stall window"))!;
+    const contract = prompt.split("\n").find((line) => line.includes("inactivity window"))!;
 
-    expect(contract).toContain("7 minute stall window"); // still the task's own window, named
+    expect(contract).toContain("7 minute inactivity window");
+    expect(contract).toContain("model connection is open");
+    expect(contract).toContain("hard ceiling of 28 minutes");
     // the suite belongs to the gates, and the worker is told so
     expect(contract).toMatch(/gates run the full suite/i);
+    // Row 364; D-2185 add.20: gates owning the suite must explicitly forbid workers buying it.
+    expect(contract).toMatch(/never run it yourself/i);
     // …and never told to spend the window on one
     expect(contract).not.toMatch(/budget the full suite/i);
     // what it still owes inside that window is unchanged: a commit and the completion trailer
@@ -1072,7 +1088,7 @@ async function printByteCase(options: PrintByteOptions) {
   }
 }
 
-test("test: an uncommitted print-mode worker streaming on stdout or stderr past the 500-line read or 2 MB buffer longer than its stall window ends on its trailer, one falling silent ends by stall-timeout, one still streaming at its default four-window or seamed deadline ends by stall-timeout no earlier than it, within a polling allowance, so a tail-keyed or unbounded wait fails", async () => {
+test("test: an uncommitted print-mode worker streaming on stdout or stderr past the 500-line read or 2 MB buffer longer than its stall window ends on its trailer, one falling silent ends by stall-timeout, one still streaming at its default four-window or seamed deadline ends by hard-timeout no earlier than it, within a polling allowance, so a tail-keyed or unbounded wait fails", async () => {
   for (const channel of ["stdout", "stderr"] as const) {
     for (const stream of ["below", "rows", "buffer"] as const) {
       const active = await printByteCase({ channel, stream, committed: false, ending: "trailer" });
@@ -1095,9 +1111,10 @@ test("test: an uncommitted print-mode worker streaming on stdout or stderr past 
         expect(deadline.stoppedAt - deadline.state.lastAt).toBeLessThan(500);
         expect(deadline.stoppedAt - deadline.attemptStart).toBeGreaterThanOrEqual(deadlineMs);
         expect(deadline.stoppedAt - deadline.attemptStart).toBeLessThanOrEqual(deadlineMs + 1500);
-        expect(deadline.events.find(e => e.event === "worker-result")?.data.cause).toBe("stall-timeout");
-        expect(deadline.events.find(e => e.event === "worker-reaped-before-harvest")?.data.cause).toBe("stall-timeout");
-        expect(deadline.events.filter(e => e.event === "worker-hard-timeout" || e.event === "worker-result-harvested")).toEqual([]);
+        expect(deadline.events.find(e => e.event === "worker-result")?.data.cause).toBe("hard-timeout");
+        expect(deadline.events.find(e => e.event === "worker-reaped-before-harvest")?.data.cause).toBe("hard-timeout");
+        expect(deadline.events.filter(e => e.event === "worker-hard-timeout")).toHaveLength(1);
+        expect(deadline.events.filter(e => e.event === "worker-result-harvested")).toEqual([]);
         expect(deadline.summary.human).toEqual(["T1"]);
       }
     }

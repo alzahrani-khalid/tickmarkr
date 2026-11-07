@@ -3,7 +3,8 @@ import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node
 import { dirname, join } from "node:path";
 
 export const MODELS_DEV_CATALOG_URL = "https://models.dev/api.json";
-export const ARTIFICIAL_ANALYSIS_CATALOG_URL = "https://artificialanalysis.ai/api/v2/data/llms/models";
+// Queue row 368, D-2185 add.8: the free V2 route is available to every API key.
+export const ARTIFICIAL_ANALYSIS_CATALOG_URL = "https://artificialanalysis.ai/api/v2/language/models/free";
 // LiveBench ships one dated CSV per question-set release plus the category->task map that defines
 // the aggregates. Fetch the deployed site, NEVER raw.githubusercontent.com: same filename, 15 fewer
 // models on raw. ponytail: hand-bumped constant; doctor lints its age against the release listing.
@@ -551,7 +552,20 @@ async function fetchCatalog<T>(
   try {
     const request = (async () => {
       const response = await fetcher(url, { ...init, signal: controller.signal });
-      if (!response.ok) throw new Error(`${catalogSourceLabel(url)} HTTP ${response.status}`);
+      if (!response.ok) {
+        const source = catalogSourceLabel(url);
+        let detail = "";
+        if (source === "Artificial Analysis" && (response.status === 410 || response.status === 403)) {
+          const body = record(await response.json().catch(() => undefined));
+          const cause = [body?.error, body?.message]
+            .filter((value): value is string => typeof value === "string")
+            .join(": ");
+          const apiKey = new Headers(init.headers).get("x-api-key");
+          detail = (apiKey ? cause.replaceAll(apiKey, "[redacted]") : cause)
+            .replace(/\s+/g, " ").trim().slice(0, 500);
+        }
+        throw new Error(`${source} HTTP ${response.status}${detail ? `: ${detail}` : ""}`);
+      }
       return read(response);
     })();
     return await Promise.race([request, timeout]);
@@ -659,7 +673,7 @@ export async function refreshCatalogCommand(opts: RefreshCatalogOptions): Promis
       legAt.artificialAnalysis = stamp;
       legs.push({ leg: "Artificial Analysis", status: "updated", detail: "fetched", retry: "next retry after this leg is stale" });
     } catch (error) {
-      const detail = error instanceof Error ? error.message : String(error);
+      const detail = (error instanceof Error ? error.message : String(error)).replaceAll(apiKey, "[redacted]");
       warnings.push(`Artificial Analysis refresh failed: ${detail}`);
       legs.push({ leg: "Artificial Analysis", status: "failed", detail, retry: "retry next refresh because this leg kept its prior age" });
     }

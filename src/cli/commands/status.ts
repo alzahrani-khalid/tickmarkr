@@ -1278,14 +1278,20 @@ const renderFrame = (
   const hotPhase = [...phases.values()].sort((a, b) => a.order - b.order).at(-1);
   // CG1: the three lead lines — finished, wall, needs you from the CURRENT owed-check fold — open
   // every frame, plain and terminal; the header below keeps every comparability, supersession and verify fact.
-  const lead = runId
-    ? leadLines(events, currentOwed(events, cwd), {
+  const owed = runId ? currentOwed(events, cwd) : undefined;
+  const lead = runId && owed
+    ? leadLines(events, owed, {
       // The header's own rule: while the tip is unverified the tally never reads as a finished run.
       tally: comparable ? tipPhase ? `${done}/${total} tasks done` : `${done}/${total} done` : NOT_COMPARABLE_CLAIM,
       tip: verify ? `tip ${verify}` : "tip verify pending",
       notes: supersededBy ? [`superseded by ${supersededBy}`] : [],
     }).map(sanitizeTaskText)
     : [];
+  // Row 339 (D-2181 D5): a check the CURRENT fold closed by supersede reads closed, from its fixing head and verify record.
+  const closedLines = (owed?.superseded ?? []).map((closed) => {
+    const check = owed!.acceptedRisk.find((o) => o.id === closed.id);
+    return sanitizeTaskText(`closed — ${check ? `${check.taskId} ${check.gate} ` : ""}${closed.id} superseded from fixing head ${closed.head} — verify record ${closed.artifactPath} sha256 ${closed.artifactSha256}`);
+  });
 
   // OBS-738: recovery facts stay on the journal's two established reducers. The prefix fold keeps an
   // older journal equally readable by asking restoresUpheldFeedback what was funded at that exact
@@ -1397,6 +1403,7 @@ const renderFrame = (
     return {
       content: [
         ...leadRows(lead, width),
+        ...(width >= MACHINE_COLUMNS ? closedLines : closedLines.flatMap(wrapRow)),
         ...(width >= MACHINE_COLUMNS ? body : body.flatMap(wrapRow)),
       ].join("\n"),
       ...(hotPhase ? { hotPhase } : {}),
@@ -1622,6 +1629,7 @@ const renderFrame = (
     content: boardRows(
       [
         ...leadRows(lead, boardColumns),
+        ...closedLines.flatMap((line) => wrapCells(line, boardColumns, { continuationPrefix: "  " })),
         ...(next === undefined ? [] : [sanitizeTaskText(next)]),
         ...headerRows,
         ...nowLine,

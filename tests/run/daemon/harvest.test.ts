@@ -2155,12 +2155,14 @@ test("test: a committed print-mode worker whose CPU reads flat and that keeps st
     for (const stream of ["below", "rows", "buffer"] as const) {
       const hardMs = 2200;
       const result = await printByteCase({ channel, stream, committed: true, ending: "deadline", windowMs: 700, hardMs });
-      expect(result.events.filter(e => e.event === "worker-harvest" || e.event === "worker-hard-timeout")).toEqual([]);
+      // Row 364 BRIEF r3 cell 5 (D-2185 add.3): every reading at the hard deadline ends as hard-timeout.
+      expect(result.events.filter(e => e.event === "worker-harvest")).toEqual([]);
+      expect(result.events.filter(e => e.event === "worker-hard-timeout")).toHaveLength(1);
       expect(result.state.finalAt).toBe(0);
       expect(result.stoppedAt - result.attemptStart).toBeGreaterThanOrEqual(hardMs);
       expect(result.stoppedAt - result.attemptStart).toBeLessThanOrEqual(hardMs + 1500);
-      expect(result.events.find(e => e.event === "worker-result")?.data.cause).toBe("stall-timeout");
-      expect(result.events.find(e => e.event === "worker-reaped-before-harvest")?.data.cause).toBe("stall-timeout");
+      expect(result.events.find(e => e.event === "worker-result")?.data.cause).toBe("hard-timeout");
+      expect(result.events.find(e => e.event === "worker-reaped-before-harvest")?.data.cause).toBe("hard-timeout");
       expect(result.events.filter(e => e.event === "worker-result-harvested")).toHaveLength(1);
     }
   }

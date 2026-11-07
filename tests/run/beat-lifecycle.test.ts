@@ -1,4 +1,4 @@
-import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess, type SpawnOptions } from "node:child_process";
 import { once } from "node:events";
 import {
   appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, watch, writeFileSync,
@@ -20,8 +20,8 @@ import {
   type SupervisionTier,
 } from "../../src/run/supervision.js";
 
-// Every row below crosses the REAL bridge — dispatch -> registered beat -> beat-lifecycle — with real
-// owned temporary processes. Failures are injected at the production boundaries (spawn, kill, identity,
+// Every row below crosses the REAL bridge — dispatch -> registered beat -> beat-lifecycle — with owned
+// temporary processes or a capture-only spawn fake. Failures are injected at the production boundaries (spawn, kill, identity,
 // log open, clock) or by occupying the real paths; nothing reaches into the lifecycle's private helpers.
 
 // D-1150 closed repair table (production dispatch -> beat -> lifecycle; all SUPERVISION_TIERS):
@@ -187,6 +187,67 @@ function onFinalIdentity(rig: ReturnType<typeof boundaryRig>, repo: string, tier
   });
   return () => fired;
 }
+
+/** Row 366: capture the production dispatch's spawn seam, then refuse so no child needs to run. */
+async function detachedBeatSpawn(env: NodeJS.ProcessEnv) {
+  const repo = mkRepo();
+  const calls: Array<{ command: string; args: readonly string[]; options: SpawnOptions }> = [];
+  try {
+    const result = await run(repo, ["start", "overseer", "--seat", "row-366"], deps({
+      env,
+      spawn: (command, args, options) => {
+        calls.push({ command, args, options });
+        throw new Error("row 366 captured spawn");
+      },
+    }));
+    expect(result).toMatchObject({ code: 1, out: expect.stringContaining("row 366 captured spawn") });
+    expect(calls).toHaveLength(1);
+    const { command, args, options } = calls[0]!;
+    const generation = args.at(-1)!;
+    expect(generation).toEqual(expect.any(String));
+    expect(generation).not.toBe("");
+    expect([command, ...args]).toEqual([...CLI, "beat", "overseer", "--seat", "row-366", "--loop", "--arm-id", generation]);
+    expect(options).toMatchObject({ cwd: repo, detached: true, stdio: ["ignore", expect.any(Number), expect.any(Number)] });
+    expect(options.env).toBeDefined();
+    return { env: options.env!, generation };
+  } finally { rmSync(repo, { recursive: true, force: true }); }
+}
+
+test("row 366 cell 1: a detached beat omits HC_SCOPE while retaining HC_TERMINAL_ID, HC_TERMINAL_SOCKET and its generation", async () => {
+  const parent = { HC_SCOPE: "synthetic-arming-scope", HC_TERMINAL_ID: "t-fixture", HC_TERMINAL_SOCKET: "/fixture/core.sock" };
+  const before = { ...parent };
+  const child = await detachedBeatSpawn(parent);
+  expect(child.env).not.toHaveProperty("HC_SCOPE");
+  expect(child.env).toEqual({ HC_TERMINAL_ID: parent.HC_TERMINAL_ID, HC_TERMINAL_SOCKET: parent.HC_TERMINAL_SOCKET, [BEAT_GENERATION_ENV]: child.generation });
+  expect(parent).toEqual(before);
+});
+
+test("row 366 cell 2: a plain host environment is unchanged except for the detached beat generation", async () => {
+  const parent = { LANG: "C.UTF-8" };
+  const child = await detachedBeatSpawn(parent);
+  expect(child.env).toEqual({ ...parent, [BEAT_GENERATION_ENV]: child.generation });
+  expect(parent).toEqual({ LANG: "C.UTF-8" });
+});
+
+test("row 366 cell 3: a blank HC_SCOPE is absent from the detached beat child environment", async () => {
+  const parent = { HC_SCOPE: "" };
+  const child = await detachedBeatSpawn(parent);
+  expect(child.env).not.toHaveProperty("HC_SCOPE");
+  expect(child.env).toEqual({ [BEAT_GENERATION_ENV]: child.generation });
+  expect(parent).toEqual({ HC_SCOPE: "" });
+});
+
+test("row 366 cell 4: PATH, HOME and a sentinel pass byte-equal while the detached beat subtracts only HC_SCOPE", async () => {
+  const parent = {
+    HC_SCOPE: "synthetic-arming-scope", PATH: "/fixture/bin with spaces:/usr/bin", HOME: "/fixture/home with spaces",
+    ROW_366_SENTINEL: "  byte-equal \"quotes\" $literal\\path\n", [BEAT_GENERATION_ENV]: "prior-generation",
+  };
+  const before = { ...parent };
+  const child = await detachedBeatSpawn(parent);
+  expect(child.env).toEqual({ PATH: parent.PATH, HOME: parent.HOME, ROW_366_SENTINEL: parent.ROW_366_SENTINEL, [BEAT_GENERATION_ENV]: child.generation });
+  expect(child.generation).not.toBe(parent[BEAT_GENERATION_ENV]);
+  expect(parent).toEqual(before);
+});
 
 test("production dispatch confirms child death after an unreadable startup identity without reporting a changed process or signalling it", async () => {
   const rig = boundaryRig();

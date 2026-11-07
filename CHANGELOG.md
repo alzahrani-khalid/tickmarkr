@@ -2,6 +2,42 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v2.22.0 — the run tells the truth about tests and owed checks
+
+**v2.22.0** was delivered by one tickmarkr run of four tasks (run-20261106-053243-0000000000001724) plus a verified fix leg.
+Every task passed build, lint, evidence and scope, its acceptance criteria, a review by a model from another vendor and
+the full test suite before it merged, and the run's tip verify passed. The fix leg and the run were verified together, as
+one tree, before release.
+
+- **An interrupted test red is inconclusive.** When a test run is cut off (a timeout, a kill or a crash mid-suite), its
+  red no longer counts as a failure the worker caused. It gets one fresh execution with no worker repair, and it does
+  not count toward the repeated-failure limit.
+- **A fresh test run, once required, stays required until it actually runs.** A cached result, a replayed journal row,
+  an approval or a semantic park can no longer satisfy it. When a task parks, the message says truthfully whether the
+  test ran or a result was reused, and from which attempt.
+- **`tickmarkr verify --supersede` closes one owed check with a later fix.** When a waived finding was fixed later, a
+  green independent verify whose range contains the owed range can close that check. It needs `--record`, `--task`,
+  `--base` and `--author`, uses the task's own criteria and scope, and requires a reviewer from a different vendor than
+  both the original authors and the fixer. Status shows how the check was closed.
+- **Security: `tickmarkr verify --base` no longer passes the ref through a shell unquoted.** A ref containing an
+  apostrophe could break out of the quoting and run a command; a valid ref with an apostrophe also failed as unresolvable.
+  The value is now quoted, and a test proves six injection payloads never run.
+- **Silent workers and consults are no longer killed while they are working.** A headless worker or consult that prints
+  nothing until it finishes was treated as stalled at the silence window even with an open connection to its model.
+  It is now held while the connection or CPU shows it is alive, and cut only at the hard deadline. A dirty tree left by a
+  worker the daemon killed is no longer charged to the worker. A worker that has printed its completion line goes to the
+  gates: it is no longer held to the deadline or re-routed because its final output mentions a quota or rate limit.
+- **Detached supervision beats survive closing the terminal that started them** on the Herdr app: they no longer inherit
+  that terminal's `HC_SCOPE`.
+- **The Artificial Analysis catalog works again.** Its old endpoint was retired (HTTP 410); `tickmarkr doctor
+  --refresh-catalog` now uses the free V2 endpoint, and a refused or retired response explains itself without printing
+  your API key.
+- **Herdr app fixes:** omp reviewers in pane mode are no longer dropped as silent; an unreadable or truncated pane read
+  is retried and then parks as infrastructure instead of failing the task; the skills' seat recipe uses valid `hc`
+  names and labels each tab with `herdr-app do tab.rename`.
+- **The skills and the command reference explain closing a waived finding that was fixed later**, with
+  `verify --supersede`, alongside the existing discharge guidance.
+
 ## v2.21.0 — faster verification, and a run board that tells the truth
 
 **v2.21.0** was delivered by two tickmarkr runs: one task for faster verification (run-20261105-152309-0000000000001499)

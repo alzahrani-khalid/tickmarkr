@@ -1,4 +1,5 @@
 import type { JournalEvent } from "./journal.js";
+import { isInterruptedResult } from "./recovery.js";
 
 export interface RepairSelectionDecision {
   selectTests: boolean;
@@ -40,6 +41,9 @@ export function repairSelectionDecision(
     if (event.taskId !== taskId || event.event !== "gate-result"
       || event.data.gate !== "test" || event.data.pass !== false) continue;
     const data = event.data;
+    // Row 337 (D-2181 D2): an interrupted red is inconclusive infrastructure — no repair test is
+    // required from it and it is never behavioral provenance, whatever its raw classification says.
+    if (isInterruptedResult({ pass: data.pass, meta: data })) continue;
     if (!enabled) {
       distrust ??= "legacy-test-failure";
       continue;

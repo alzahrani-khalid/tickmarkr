@@ -1,7 +1,7 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { getAdapter } from "../adapters/registry.js";
-import { type AuthHealth, configuredEffort, type WorkerAdapter } from "../adapters/types.js";
+import { type AuthHealth, configuredEffort, shq, type WorkerAdapter } from "../adapters/types.js";
 import type { TickmarkrConfig } from "../config/config.js";
 import type { Effort } from "../graph/schema.js";
 import type { ExecutorDriver, Slot } from "../drivers/types.js";
@@ -13,7 +13,8 @@ import { rankPreferredChannels } from "../route/role-pick.js";
 import { disallowedBy, observedSeat, routingModelProvider } from "../route/preference.js";
 import { sh } from "./git.js";
 import { redactSecrets } from "./redact.js";
-import { filterLlmTranscript, reapSeatTree, seatShellCeiling } from "./stall.js";
+import { filterLlmTranscript, readOwnedProcessGroup, reapSeatTree, seatShellCeiling, StallProgressTracker, WorkerTreeCpuAccountant } from "./stall.js";
+import { CpuLegReader, livenessTime, readOwnedProcessLiveness, type LivenessTime } from "./process-liveness.js";
 
 export interface ConsultVerdict {
   action: "retry" | "reroute" | "decompose" | "human";
@@ -212,7 +213,7 @@ export async function consult(
   // OBS-1182: onInvocation hears every launched seat — its identity, effort and outcome — failed seats
   // included, so a seat that never produced the verdict still reaches the journal.
   // OBS-1186: health — doctor's cached verdict, the observed identity of the pinned seat (absent ⇒ unknown, conservative).
-  opts: { keep?: boolean; onSlot?: (slot: Slot) => void; onInvocation?: (inv: ConsultInvocation) => void; runId?: string; channels?: Array<{ adapter: string; model?: string; vendor?: string; channel?: "sub" | "api"; tier?: string; identity?: string }>; health?: Record<string, AuthHealth> | null } = {},
+  opts: { keep?: boolean; onSlot?: (slot: Slot) => void; onInvocation?: (inv: ConsultInvocation) => void; runId?: string; channels?: Array<{ adapter: string; model?: string; vendor?: string; channel?: "sub" | "api"; tier?: string; identity?: string }>; health?: Record<string, AuthHealth> | null; time?: LivenessTime } = {},
 ): Promise<ConsultVerdict> {
   const n = ++consultSeq;
   const nonce = generateVerdictNonce();
@@ -229,15 +230,58 @@ export async function consult(
   const invokeSeat = async (seatAdapter: string, seatModel: string, seatIdx: number, effort: Effort | undefined): Promise<ConsultParseResult> => {
     const adapter = getAdapter(seatAdapter, adapters);
     let out: string;
+    let cut = false;
+    const time = opts.time ?? livenessTime;
+    const windowMs = cfg.consult.stallMinutes * 60_000;
+    const hardMs = windowMs * 4;
+    const cpuReader = new CpuLegReader();
+    // Row 364; D-2184 add.44; D-2185 add.3: silence may conclude only on two measurable quiet legs.
+    const silent = async (accountant: WorkerTreeCpuAccountant, group: number | undefined, deadline: number) =>
+      (await readOwnedProcessLiveness(group, cpuReader.read(accountant.read(), time.now()), deadline - time.now())).state === "silent";
     if (cfg.visibility.llm === "headless") {
-      const timeoutMs = cfg.consult.stallMinutes * 60_000;
-      const ceiling = seatShellCeiling(timeoutMs);
+      const ceiling = seatShellCeiling(hardMs);
+      const stop = new AbortController();
+      let group: number | undefined;
+      let startedAt = time.now();
+      let lastProgressAt = startedAt;
+      let done = false;
+      let launched!: () => void;
+      const launch = new Promise<void>((resolve) => { launched = resolve; });
+      const accountant = new WorkerTreeCpuAccountant(promptFile, cwd, () => group);
       const r = await (async () => {
-        try { return await sh(adapter.headlessCommand(promptFile, seatModel, effort), cwd, timeoutMs + 30_000, {
-          onSpawn: ceiling.onSpawn, ownsLeader: ceiling.ownsLeader,
-          seat: "consult",
-        }); }
-        finally { await ceiling.stop(); }
+        const pending = sh(adapter.headlessCommand(promptFile, seatModel, effort), cwd, hardMs + 30_000, {
+          onSpawn: (pid) => { group = pid; startedAt = lastProgressAt = time.now(); ceiling.onSpawn(pid); launched(); },
+          onOutput: () => { lastProgressAt = time.now(); },
+          ownsLeader: ceiling.ownsLeader, signal: stop.signal, seat: "consult",
+        }).finally(() => { done = true; });
+        try {
+          await Promise.race([launch, pending.then(() => {}, () => {})]);
+          if (!done) {
+            await accountant.start();
+            cpuReader.read(accountant.read(), time.now());
+          }
+          const deadline = startedAt + hardMs;
+          while (!done) {
+            if (time.now() >= deadline || (time.now() - lastProgressAt >= windowMs && await silent(accountant, group, deadline))) {
+              cut = true;
+              stop.abort();
+              break;
+            }
+            const pause = new AbortController();
+            const left = windowMs - (time.now() - lastProgressAt);
+            try {
+              await Promise.race([pending.then(() => {}, () => {}), time.sleep(Math.max(1, Math.min(left > 0 ? left : 30_000, deadline - time.now())), pause.signal)]);
+            } finally { pause.abort(); }
+          }
+          const result = await pending;
+          cut ||= ceiling.timedOut || time.now() >= deadline;
+          return result;
+        } finally {
+          stop.abort();
+          await pending.catch(() => {});
+          await accountant.stop();
+          await ceiling.stop();
+        }
       })();
       out = r.stdout + r.stderr;
     } else {
@@ -253,22 +297,47 @@ export async function consult(
       });
       opts.onSlot?.(slot);
       const scriptPath = join(dir, `${d.taskId}-${n}${seatIdx > 0 ? `-s${seatIdx}` : ""}.sh`);
+      const groupFile = `${scriptPath}.${nonce}.pgid`;
+      const accountant = new WorkerTreeCpuAccountant(scriptPath, cwd, () => readOwnedProcessGroup(groupFile));
       // OBS-50: visible consult panes get the brand banner; headless path above stays banner-free (machine-parsed stdout)
       writeFileSync(scriptPath, [
         "export BASH_SILENCE_DEPRECATION_WARNING=1",
         "export TICKMARKR_SEAT=consult",
+        `seat_pgid=$(ps -o pgid= -p $$ 2>/dev/null); daemon_pgid=$(ps -o pgid= -p ${process.pid} 2>/dev/null)`,
+        `if [ -n "$seat_pgid" ] && [ -n "$daemon_pgid" ] && [ "$seat_pgid" != "$daemon_pgid" ]; then printf '%s\\n' "$seat_pgid" > ${shq(groupFile)}; fi`,
         bannerShell(),
         command,
         gateExitTrailer(nonce),
       ].join("\n"));
       try {
         await driver.run(slot, paneDispatchCommand(scriptPath));
-        // nonce-suffixed exit only: a dossier quoting tickmarkr's own exit literal must not false-complete.
-        await driver.waitOutput(slot, `TICKMARKR_EXIT_${nonce}:\\d`, cfg.consult.stallMinutes * 60_000, { regex: true });
+        const startedAt = time.now();
+        const deadline = startedAt + hardMs;
+        let lastProgressAt = startedAt;
+        const progress = new StallProgressTracker();
         out = await driver.read(slot, 300);
+        progress.observe({ paneText: out, seedSubmitted: true }, time.now());
+        await accountant.start();
+        cpuReader.read(accountant.read(), time.now());
+        // nonce-suffixed exit only: a dossier quoting tickmarkr's own exit literal must not false-complete.
+        const pattern = `TICKMARKR_EXIT_${nonce}:\\d`;
+        for (;;) {
+          if (time.now() >= deadline) { cut = true; break; }
+          const left = windowMs - (time.now() - lastProgressAt);
+          const matched = await driver.waitOutput(slot, pattern, Math.min(left > 0 ? left : 30_000, deadline - time.now()), { regex: true });
+          out = await driver.read(slot, 300);
+          if (time.now() >= deadline) { cut = true; break; }
+          if (matched || new RegExp(pattern).test(out)) break;
+          if (progress.observe({ paneText: out }, time.now())) lastProgressAt = time.now();
+          if (time.now() - lastProgressAt >= windowMs && await silent(accountant, readOwnedProcessGroup(groupFile), deadline)) {
+            cut = true;
+            break;
+          }
+        }
       } finally {
+        await accountant.stop();
         // a failed seat must not leak its pane before the next seat opens under the same name
-        if (!opts.keep) {
+        if (cut || !opts.keep) {
           // The marker census must precede the pane close, before tools lose their ancestry.
           await reapSeatTree({ marker: scriptPath });
           await driver.close(slot);
@@ -280,7 +349,7 @@ export async function consult(
     // Judge/review got dewrapPaneVerdict for exactly this (llm.ts, OBS-209 lineage); the consult
     // seat never did. Headless output is machine-read stdout and needs no reconstruction.
     const effective = cfg.visibility.llm === "headless" ? out : dewrapPaneVerdict(out, nonce);
-    const parsed = parseConsultVerdict(effective, nonce);
+    const parsed: ConsultParseResult = cut ? { verdict: null, cause: "timeout" } : parseConsultVerdict(effective, nonce);
     if (!parsed.verdict) {
       // Q144s / OBS-196 parity: an unparseable verdict persists its raw bytes (pre-dewrap,
       // rendering verbatim) beside the prompt — three human parks carried zero diagnostic

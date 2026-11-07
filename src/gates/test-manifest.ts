@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { performance } from "node:perf_hooks";
 import { verificationPhase, withVerificationJob } from "../run/verification-job.js";
+import { type FailureWindow, interruptedReason, LISTING_INVOCATION_SUFFIX } from "../run/recovery.js";
 import { TEST_REPORTER_SOURCE } from "./test-reporter.js";
 import { shq } from "../adapters/types.js";
 import { beginGateEvidence, redactGateOutput, type GateEvidenceOptions, type BaselineFileDuration } from "./baseline.js";
@@ -656,7 +657,7 @@ export async function discoverTestManifest(cmd: string, cwd: string, opts: { dir
   const invocation = runnerInvocation(cmd, cwd);
   const listed = await runManifestedTest(invocation.listing, cwd, {
     listing: true,
-    evidence: opts.evidence, manifest: [], nonce: `${opts.nonce}-listing`, reportPath: join(opts.dir, `listing-${opts.nonce}.json`), env: opts.env,
+    evidence: opts.evidence, manifest: [], nonce: `${opts.nonce}${LISTING_INVOCATION_SUFFIX}`, reportPath: join(opts.dir, `listing-${opts.nonce}.json`), env: opts.env,
     overallCeilingMs: opts.overallCeilingMs ?? DEFAULT_FILE_HANG_BUDGET_MS,
   });
   const discoveryError = (message: string) => Object.assign(new Error(message), { evidenceReceipt: listed.evidenceReceipt, evidenceReceipts: listed.evidenceReceipts });
@@ -716,6 +717,25 @@ function strandedSingleForkFiles(files: string[], nonce: string, run: ManifestRu
   return single;
 }
 
+/** Row 337 (D-2181 D1): each failed file's measured window, read from THIS invocation's own report
+ * only — a first pass and its continuation each keep their own. An unbound report measures nothing. */
+function measuredFailureWindows(report: TestReport | undefined, nonce: string): FailureWindow[] {
+  if (!report || report.nonce !== nonce) return [];
+  return Object.entries(report.completed).filter(([, c]) => c.status === "failed")
+    .flatMap(([file, c]) => Object.hasOwn(report.started, file) ? [{ file, from: report.started[file]!, to: c.at }] : []);
+}
+
+/** Row 337 (D-2181 D1): an interrupted red is published as inconclusive infrastructure beside its raw
+ * classification, failures, receipts and detector measurements — never as a behavioral verdict. */
+function withInterruptionVerdict(outcome: ManifestGateOutcome): ManifestGateOutcome {
+  const reason = interruptedReason(outcome);
+  return reason === undefined ? outcome : {
+    ...outcome,
+    details: `${outcome.details}\ninterrupted: ${reason} — inconclusive infrastructure, not a behavioral verdict`,
+    meta: { ...outcome.meta, disposition: "interrupted", infra: true, interruptedReason: reason },
+  };
+}
+
 /** The stranded single-fork retry: positional filters are substring matches that OR with any filter
  * the command already carries, and under a `projects` config the CLI `--exclude` never subtracts such a
  * selection (OBS-1166: a selected screen's retry rediscovered the whole selection and refused). So the
@@ -757,9 +777,12 @@ export async function evaluateManifestedTest(cmd: string, cwd: string, opts: {
       let manifestPath: string | undefined;
       let retainedFirstVerdict: ManifestVerdict | undefined;
       let recovery: { firstNonce: string; firstReportPath: string; retryNonce: string; files: string[] } | undefined;
+      // Row 337 (D-2181 D1): held outside the try, so a continuation that throws keeps the first pass's.
+      const interruptions: HostInterruption[] = [];
+      const failureWindows: FailureWindow[] = [];
       const { env, verification } = manifestEnvironment(cwd);
       try {
-        const invocation = await verificationPhase("discovery", `${nonce}-listing`, join(dir, `listing-${nonce}.json`), () => discoverTestManifest(cmd, cwd, { dir, nonce, env, overallCeilingMs: opts.overallCeilingMs, evidence: { ...opts.evidence, artifactDir: opts.evidence?.artifactDir ?? dir } }));
+        const invocation = await verificationPhase("discovery", `${nonce}${LISTING_INVOCATION_SUFFIX}`, join(dir, `listing-${nonce}.json`), () => discoverTestManifest(cmd, cwd, { dir, nonce, env, overallCeilingMs: opts.overallCeilingMs, evidence: { ...opts.evidence, artifactDir: opts.evidence?.artifactDir ?? dir } }));
         evidenceReceipts.push(...invocation.evidenceReceipts);
         const files = invocation.files;
         // R41: the EXPECTED manifest is evidence in its own right — persisted beside the report with the
@@ -784,7 +807,8 @@ export async function evaluateManifestedTest(cmd: string, cwd: string, opts: {
           report: invoked.report, killedFile: invoked.killedFile, hangBudgetMs: invoked.hangBudgetMs,
           hangActiveMs: invoked.hangActiveMs, hangWallMs: invoked.hangWallMs });
         evidenceReceipts.push(...invoked.evidenceReceipts);
-        const interruptions = [...invoked.interruptions];
+        interruptions.push(...invoked.interruptions);
+        failureWindows.push(...measuredFailureWindows(invoked.report, nonce));
         const stranded = opts.allowStrandedRecovery === false ? undefined : strandedSingleForkFiles(files, nonce, invoked);
         if (stranded) {
           const first = invoked.report!;
@@ -794,7 +818,7 @@ export async function evaluateManifestedTest(cmd: string, cwd: string, opts: {
           nonce = retryNonce;
           reportPath = join(dir, `test-manifest-report-${nonce}.json`);
           const retryCommand = singleForkRetryCommand(opts.retryBaseCommand ?? cmd, cwd, stranded, files.filter(f => !stranded.includes(f)));
-          const listed = await verificationPhase("continuation-discovery", `${nonce}-listing`, join(dir, `listing-${nonce}.json`), () => discoverTestManifest(retryCommand, cwd, { dir, nonce, env,
+          const listed = await verificationPhase("continuation-discovery", `${nonce}${LISTING_INVOCATION_SUFFIX}`, join(dir, `listing-${nonce}.json`), () => discoverTestManifest(retryCommand, cwd, { dir, nonce, env,
             overallCeilingMs: opts.overallCeilingMs, evidence: { ...opts.evidence, artifactDir: opts.evidence?.artifactDir ?? dir } }), recovery.firstNonce);
           evidenceReceipts.push(...listed.evidenceReceipts);
           if (listed.files.length !== stranded.length || listed.files.some(f => !stranded.includes(f)))
@@ -809,6 +833,7 @@ export async function evaluateManifestedTest(cmd: string, cwd: string, opts: {
           }), recovery.firstNonce);
           evidenceReceipts.push(...invoked.evidenceReceipts);
           interruptions.push(...invoked.interruptions);
+          failureWindows.push(...measuredFailureWindows(invoked.report, nonce));
           verdict = verifyManifestReport({ manifest: stranded, nonce, exitCode: invoked.exitCode,
             report: invoked.report, killedFile: invoked.killedFile, hangBudgetMs: invoked.hangBudgetMs,
           hangActiveMs: invoked.hangActiveMs, hangWallMs: invoked.hangWallMs });
@@ -853,20 +878,22 @@ export async function evaluateManifestedTest(cmd: string, cwd: string, opts: {
         const interrupted = interruptions.length
           ? `\nhost interruptions: ${interruptions.map(i => `${i.kind} ${Math.round(i.wallMs)}ms wall / ${Math.round(i.monoMs)}ms monotonic, ${Math.round(i.subtractedMs)}ms subtracted`).join("; ")}`
           : "";
-        return { evidenceReceipt, evidenceReceipts, pass: verdict.pass, kind: verdict.kind,
+        return withInterruptionVerdict({ evidenceReceipt, evidenceReceipts, pass: verdict.pass, kind: verdict.kind,
           details: verdict.details + interrupted + diagnostics,
           classification: verdict.meta.classification as "infra" | "regression" | undefined,
           meta: { ...verdict.meta, nonce, manifest: files, manifestPath, listingCommand: invocation.listing, verification,
             ...(recovery ? { recovery, retryable: false } : {}), ...(interruptions.length ? { interruptions } : {}),
+            ...(!verdict.pass && failureWindows.length ? { failureWindows } : {}),
             spawnedCommand, processExit: invoked.exitCode, pid: invoked.pid, stdoutPath, stderrPath },
-          exitCode: invoked.exitCode ?? -1, reportPath };
+          exitCode: invoked.exitCode ?? -1, reportPath });
       } catch (error) {
         const evidenceReceipt = (error as { evidenceReceipt?: GateEvidenceReceipt })?.evidenceReceipt;
         if (evidenceReceipt) evidenceReceipts.push(...((error as { evidenceReceipts?: GateEvidenceReceipt[] }).evidenceReceipts ?? [evidenceReceipt]));
-        return { evidenceReceipt, evidenceReceipts, pass: false, kind: retainedFirstVerdict ? "work" : "infra", classification: retainedFirstVerdict ? "regression" : "infra", exitCode: -1, reportPath,
+        return withInterruptionVerdict({ evidenceReceipt, evidenceReceipts, pass: false, kind: retainedFirstVerdict ? "work" : "infra", classification: retainedFirstVerdict ? "regression" : "infra", exitCode: -1, reportPath,
           details: (retainedFirstVerdict ? `${retainedFirstVerdict.details}\n` : "") + (recovery ? `single fork retry ${recovery.retryNonce} after ${recovery.firstNonce}: ` : "") + (error instanceof Error ? error.message : String(error)),
           meta: { ...(retainedFirstVerdict?.meta ?? { classification: "infra", infra: true }), ...(retainedFirstVerdict ? { firstPass: retainedFirstVerdict.meta } : {}), manifestDiscoveryFailed: true, spawnedCommand, verification,
-            ...(recovery ? { recovery, retryable: false } : {}), ...(manifestPath ? { manifestPath } : {}) } };
+            ...(recovery ? { recovery, retryable: false } : {}), ...(manifestPath ? { manifestPath } : {}),
+            ...(interruptions.length ? { interruptions } : {}), ...(failureWindows.length ? { failureWindows } : {}) } });
       }
     });
   } catch (error) {

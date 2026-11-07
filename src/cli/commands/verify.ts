@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { allAdapters, modelAuthExclusions, probeAll, readDoctor, rolePools, writeDoctor } from "../../adapters/registry.js";
-import { channelKey, type Assignment, type AuthHealth, type BillingChannel, type WorkerAdapter } from "../../adapters/types.js";
+import { channelKey, shq, type Assignment, type AuthHealth, type BillingChannel, type WorkerAdapter } from "../../adapters/types.js";
 import { loadConfig, type TickmarkrConfig } from "../../config/config.js";
 import { captureBaseline, detectGateCommands, staleFileCountCommands, type Baseline, type GateEvidenceOptions } from "../../gates/baseline.js";
 import { getVerdictStore, lockfileKeyBytes, runnerInputsHash, type StoredVerdictRecord } from "../../gates/cache.js";
@@ -13,10 +13,13 @@ import { runGates } from "../../gates/run-gates.js";
 import { isVitestTestCommand } from "../../gates/test-manifest.js";
 import type { GateResult } from "../../gates/types.js";
 import { getTask, loadGraph } from "../../graph/graph.js";
-import { GATE_NAMES, type AcceptanceItem, type GateName, type Task } from "../../graph/schema.js";
+import { GATE_NAMES, validateGraph, type AcceptanceItem, type GateName, type RunGraph, type Task } from "../../graph/schema.js";
 import { executionSignal } from "../../run/execution-budget.js";
 import { addDetachedWorktree, linkNodeModules, reflogWitness, removeWorktree, shGit, shGitOk } from "../../run/git.js";
-import { foldOwedChecks, integrationMapped, owedCriteria, Journal, OWED_DISCHARGE_EVENT, parseRunId, type OwedCheck, type OwedFold } from "../../run/journal.js";
+import {
+  foldOwedChecks, integrationMapped, owedCriteria, Journal, OWED_DISCHARGE_EVENT, OWED_SUPERSEDE_EVENT, parseRunId, replayScopeAmendments,
+  supersedeContainment, type OwedCheck, type OwedFold, type OwedSupersede,
+} from "../../run/journal.js";
 import { describeLeaseWait, withRepositoryLease } from "../../run/lease.js";
 import { isPidLive } from "../../run/lock.js";
 import { LAUNCHSERVICES_PORT_STOP, probeLaunchServicesPorts, recordLaunchServices } from "../../run/launchservices-check.js";
@@ -79,9 +82,25 @@ export function verifyStateDir(cwd: string): string {
 const STATE_FILES = ["graph.json", "doctor.json", "config.yaml"] as const;
 const LOCKFILES = ["package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml", "yarn.lock", "bun.lock", "bun.lockb"] as const;
 
+/**
+ * Row 339 (D-2181 D5): verify's ONE own-git seam. Under --supersede (`noLazy`) every read verify makes — rev-parse,
+ * the HEAD reflog witness, merge-base, rev-list, status — carries GIT_NO_LAZY_FETCH=1 on the protected own-git entry, so
+ * a missing promisor object fails the read (unreadable history) and never runs a transport. Ordinary verify is unchanged.
+ */
+const ownGit = (cmd: string, cwd: string, noLazy: boolean) => shGit(`${noLazy ? "GIT_NO_LAZY_FETCH=1 " : ""}${cmd}`, cwd);
+const ownGitOk = (cmd: string, cwd: string, noLazy: boolean) => shGitOk(`${noLazy ? "GIT_NO_LAZY_FETCH=1 " : ""}${cmd}`, cwd);
+/** HEAD's reflog witness through the seam; ordinary verify keeps reflogWitness, whose command this restates. */
+async function headWitness(cwd: string, noLazy: boolean): Promise<{ code: number; lines: string[]; stderr?: string }> {
+  // ponytail: restates reflogWitness's one command because src/run/git.ts is outside row 339's files[]; an env
+  // parameter on reflogWitness removes this copy.
+  if (!noLazy) return reflogWitness(cwd, "HEAD");
+  const r = await ownGit("git reflog show --no-abbrev --format=%H HEAD", cwd, true);
+  return { code: r.code, lines: r.stdout.split("\n").map((line) => line.trim()).filter(Boolean), stderr: r.stderr };
+}
+
 /** Linked worktrees share operational state with the repository that owns the common git dir. */
-export async function verifyStateRoot(cwd: string): Promise<string> {
-  const commonDir = resolve(cwd, (await shGitOk("git rev-parse --git-common-dir", cwd)).trim());
+export async function verifyStateRoot(cwd: string, noLazy = false): Promise<string> {
+  const commonDir = resolve(cwd, (await ownGitOk("git rev-parse --git-common-dir", cwd, noLazy)).trim());
   const commonRoot = realpathSync(dirname(commonDir));
   if (commonRoot === realpathSync(cwd)) return cwd;
   const localState = join(cwd, ".tickmarkr");
@@ -185,8 +204,8 @@ function recordedMerges(repoRoot: string): Array<{ runId: string; taskId: string
   return rows;
 }
 
-async function warnWideTaskRange(cwd: string, stateRoot: string, taskId: string, mergeBase: string): Promise<void> {
-  const inRange = new Set((await shGitOk(`git rev-list --merges '${mergeBase}..HEAD'`, cwd)).trim().split("\n").filter(Boolean));
+async function warnWideTaskRange(cwd: string, stateRoot: string, taskId: string, mergeBase: string, noLazy: boolean): Promise<void> {
+  const inRange = new Set((await ownGitOk(`git rev-list --merges '${mergeBase}..HEAD'`, cwd, noLazy)).trim().split("\n").filter(Boolean));
   const merges = recordedMerges(stateRoot).filter((row) => inRange.has(row.commit));
   const own = merges.find((row) => row.taskId === taskId);
   const others = own ? merges.filter((row) => row.taskId !== taskId) : [];
@@ -195,12 +214,88 @@ async function warnWideTaskRange(cwd: string, stateRoot: string, taskId: string,
   }
 }
 
+export const SUPERSEDE_RECOVERY = "compile the run's spec as it was when the check was waived, so the current graph carries the task, then run supersede again";
+
+/**
+ * Row 339 (D-2181 D5): the owed task's definition from the FIRST source whose criteria digest AND files equal the
+ * obligation's — the run's start snapshot with its journal's approved scope amendments replayed, then the current
+ * compiled graph. A source never relaxes the match; each that fails is named. Returns the task, or every failure.
+ */
+function supersedeSource(o: OwedCheck, journal: Journal, graphRoot: string): Task | string[] {
+  const snapshot = join(journal.dir, "graph.json");
+  const sources: Array<[string, () => RunGraph]> = [
+    [`run snapshot ${snapshot} (approved scope amendments replayed)`, () => {
+      if (!existsSync(snapshot)) throw new Error("missing");
+      let graph: RunGraph;
+      try { graph = validateGraph(JSON.parse(readFileSync(snapshot, "utf8"))); } catch (error) { throw new Error(`unreadable or invalid (${String(error).split("\n")[0]})`); }
+      return replayScopeAmendments(graph, journal.read());
+    }],
+    ["current compiled graph", () => loadGraph(graphRoot)],
+  ];
+  const failures: string[] = [];
+  for (const [name, read] of sources) {
+    let task: Task | undefined;
+    try { task = read().tasks.find((t) => t.id === o.taskId); } catch (error) { failures.push(`${name}: ${(error as Error).message.split("\n")[0]}`); continue; }
+    const why = !task ? `no task ${o.taskId}` : [owedCriteria(task.acceptance) !== o.criteria ? "criteria digest differs" : "",
+      JSON.stringify(task.files) !== JSON.stringify(o.files) ? "files differ" : ""].filter(Boolean).join(" and ");
+    if (task && !why) return task;
+    failures.push(`${name}: ${why}`);
+  }
+  return failures;
+}
+
+/** The owed endpoints and the one-line owed-head-branch recipe; the owed values and the fixer are shell-quoted. */
+const supersedeRecipe = (o: OwedCheck, author: string): string[] => [
+  `owed check ${o.id} (${o.runId} ${o.taskId} ${o.gate}): owed base ${o.base}, owed head ${o.head}`,
+  `recover: git switch -c <branch> ${shq(o.head)}; commit the in-scope fix there; run tickmarkr verify --record ${shq(o.runId)} --task ${shq(o.taskId)} --base ${shq(o.base)} --supersede ${shq(o.id)} --author ${shq(author)} on that branch; then merge that branch into the integration branch`,
+];
+
 export const VERIFY_HELP = `usage: tickmarkr verify [--base <ref>] [--criteria <file> | --task <id>] [--json]
+       tickmarkr verify --record <runId> --task <taskId> --base <ref> --supersede <checkId> --author <adapter:model|human>
+--supersede closes one owed check of the run with a verified fix on a range containing it; --author names who wrote the fix.
 The final verdict and JSON result are written to stdout; progress and diagnostics are written to stderr.
 Do not merge stdout and stderr (for example with 2>&1): doing so corrupts the verdict stream.`;
 
+type SupersedeOwed = { debt?: OwedFold["debt"]; discharged?: string[]; superseded?: OwedSupersede[]; refused?: string; recover?: string[] };
+/** Row 339 (D-2181 D5): the JSON document of a --supersede --json exit no battery result carries. */
+const supersedeDoc = (owed: SupersedeOwed): string => JSON.stringify({ owed: { debt: owed.debt, discharged: [], superseded: [], ...owed } }, null, 2);
+const isJsonDocument = (text: string): boolean => {
+  try { const doc: unknown = JSON.parse(text); return typeof doc === "object" && doc !== null; } catch { return false; }
+};
+
+/**
+ * Row 339 (D-2181 D5) publication boundary: once the closure append has BEGUN, no outcome is a refusal. An error
+ * during or after it (ENOSPC partway, EIO after a complete write, a torn line) or a re-read that folds no closure
+ * exits nonzero saying the closure may already be recorded — never `refused`, never an empty superseded list.
+ */
+export function publicationUncertain(id: string, why: string, json: boolean): { out: string; code: number } {
+  const said = `the closure of check ${id} may already be recorded (${why.split("\n")[0]}); re-run the same verify --supersede: it returns the existing closure or a refusal`;
+  return { code: 1, out: json ? JSON.stringify({ owed: { discharged: [], superseded: "unknown", mayAlreadyBeRecorded: [id], publication: said } }, null, 2) : `verify --supersede: ${said}` };
+}
+
 export async function verify(argv: string[], cwd = process.cwd(), options: { evidence?: GateEvidenceOptions } = {}): Promise<{ out: string; code: number }> {
   if (argv.some((arg) => arg === "--help" || arg === "-h")) return { out: VERIFY_HELP, code: 0 };
+  if (!argv.some((arg) => arg === "--supersede" || arg.startsWith("--supersede="))) return verifyCommand(argv, cwd, options);
+  // Row 339 (D-2181 D5): with --json, EVERY --supersede exit — a parse or usage refusal, a thrown refusal, an
+  // already-closed answer, a battery verdict — is exactly one JSON document on stdout naming its superseded and
+  // discharged checks, never plain text. (parseArgs refuses `--json` as another option's value, so the token is the flag.)
+  const json = argv.includes("--json");
+  // Set once the closure append begins: from then on a throw, plain or JSON, is the publication-boundary answer.
+  let publishing = undefined as string | undefined;
+  let result: { out: string; code: number };
+  try {
+    result = await verifyCommand(argv, cwd, options, (id) => { publishing = id; });
+  } catch (error) {
+    const why = error instanceof Error ? error.message : String(error);
+    if (publishing !== undefined) return publicationUncertain(publishing, why, json);
+    if (!json) throw error;
+    return { out: supersedeDoc({ refused: why }), code: 1 };
+  }
+  return !json || isJsonDocument(result.out) ? result : { out: supersedeDoc({ refused: result.out }), code: result.code };
+}
+
+async function verifyCommand(argv: string[], cwd: string, options: { evidence?: GateEvidenceOptions },
+  onPublish: (checkId: string) => void = () => {}): Promise<{ out: string; code: number }> {
   const { values } = parseArgs({
     args: argv,
     options: {
@@ -211,12 +306,21 @@ export async function verify(argv: string[], cwd = process.cwd(), options: { evi
       author: { type: "string" },
       baseline: { type: "string" },
       record: { type: "string" },
+      supersede: { type: "string" },
       json: { type: "boolean", default: false },
       "no-review": { type: "boolean", default: false },
       "no-acceptance": { type: "boolean", default: false },
     },
     allowPositionals: false,
   });
+  // Row 339 (D-2181 D5): a supersede names one owed check of one run's task and REQUIRES who wrote the fix.
+  const noLazy = values.supersede !== undefined;
+  const supersedeExit = (code: number, lines: string[], owed: SupersedeOwed) => ({ code, out: values.json ? supersedeDoc(owed) : lines.join("\n") });
+  if (values.supersede !== undefined) {
+    const missing = ([["--record <runId>", values.record], ["--task <taskId>", values.task], ["--supersede <checkId>", values.supersede],
+      ["--author <adapter:model|human>", values.author]] as const).filter(([, value]) => !value).map(([flag]) => flag);
+    if (missing.length) return supersedeExit(1, [`verify --supersede refused: it requires ${missing.join(", ")}`], { refused: `it requires ${missing.join(", ")}` });
+  }
 
   const portProbe = await probeLaunchServicesPorts({ requireTop: true });
   const ports = portProbe.ports;
@@ -227,7 +331,7 @@ export async function verify(argv: string[], cwd = process.cwd(), options: { evi
     return { out: `verify refused: launchservicesd has ${ports.count} ports (threshold ${LAUNCHSERVICES_PORT_STOP}); log out or restart to reset launchservicesd before verifying`, code: 1 };
   }
 
-  const stateRoot = await verifyStateRoot(cwd);
+  const stateRoot = await verifyStateRoot(cwd, noLazy);
   const fileRoot = (file: typeof STATE_FILES[number]) =>
     existsSync(join(cwd, ".tickmarkr", file)) ? cwd : stateRoot;
   if (resolve(stateRoot) !== resolve(cwd)) {
@@ -244,7 +348,38 @@ export async function verify(argv: string[], cwd = process.cwd(), options: { evi
     console.error(`verify: linked worktree — state files resolve from ${join(stateRoot, ".tickmarkr")} (reads: ${reads}; writes: ${writes})`);
   }
   const cfg = loadConfig(fileRoot("config.yaml"));
-  const head = (await shGitOk("git rev-parse HEAD", cwd)).trim();
+  const debtLine = (fold: OwedFold) => `owed checks for ${values.record}: debt ${fold.debt}`
+    + (fold.outstanding.length ? ` — outstanding ${fold.outstanding.map((o) => `${o.taskId}/${o.gate} ${o.id}`).join(", ")}` : "")
+    + (fold.unknown.length ? ` — unknown: ${fold.unknown.map((u) => `${u.taskId ?? "?"}${u.gate ? `/${u.gate}` : ""} ${u.reason}`).join("; ")}` : "");
+  // Row 339 (D-2181 D5): bind the one owed check before any seat or capture is spent. A closed check answers with its
+  // own closure; anything else that cannot bind refuses with the run journal untouched.
+  let sup: { journal: Journal; fold: OwedFold; o: OwedCheck; task: Task } | undefined;
+  const supRefuse = (fold: OwedFold, why: string, recover: string[] = []) => supersedeExit(2, [`verify --supersede refused: ${why}`, ...recover, debtLine(fold)],
+    { debt: fold.debt, refused: why, ...(recover.length ? { recover } : {}) });
+  if (values.supersede !== undefined) {
+    const journal = Journal.open(stateRoot, values.record!);
+    const fold = foldOwedChecks(journal.read(), cwd);
+    const refuse = (why: string) => supRefuse(fold, why);
+    const o = fold.acceptedRisk.find((c) => c.id === values.supersede);
+    if (!o) return refuse(`run ${values.record} records no owed check ${values.supersede}`);
+    if (o.runId !== values.record || o.taskId !== values.task) return refuse(`check ${o.id} is owed by ${o.runId} task ${o.taskId}, not ${values.record} task ${values.task}`);
+    const closure = fold.superseded?.find((c) => c.id === o.id);
+    // An already-closed check answers with its ORIGINAL provenance — superseded or discharged, never conflated.
+    if (closure) {
+      return supersedeExit(0, [`verify --supersede: check ${o.id} is already closed — superseded from fixing head ${closure.head} (verify record ${closure.artifactPath} sha256 ${closure.artifactSha256}); nothing appended`, debtLine(fold)],
+        { debt: fold.debt, superseded: [closure] });
+    }
+    if (fold.discharged.includes(o.id)) {
+      return supersedeExit(0, [`verify --supersede: check ${o.id} is already closed — discharged; nothing appended`, debtLine(fold)], { debt: fold.debt, discharged: [o.id] });
+    }
+    if (!fold.known) return refuse("the run's owed-check debt is unknown (legacy, missing or malformed evidence)");
+    if (values.files?.length) return refuse(`a supersede gates the recorded scope of ${o.taskId}; --files cannot replace it`);
+    if (values.baseline) return refuse("a supersede captures its own baseline; --baseline cannot supply one");
+    const source = supersedeSource(o, journal, fileRoot("graph.json"));
+    if (Array.isArray(source)) return refuse(`no task definition binds check ${o.id}'s criteria digest and files — ${source.join("; ")}\n${SUPERSEDE_RECOVERY}`);
+    sup = { journal, fold, o, task: source };
+  }
+  const head = (await ownGitOk("git rev-parse HEAD", cwd, noLazy)).trim();
   // The latch reads HEAD's reflog through git as a validated witness, refuses before capture when it
   // is absent or invalid, and compares it line for line at every subject check.
   const witnessFault = (witness: { code: number; lines: string[] }, commit: string): string | undefined => {
@@ -254,16 +389,35 @@ export async function verify(argv: string[], cwd = process.cwd(), options: { evi
     if (newest !== commit) return `newest is ${newest.slice(0, 12)}`;
     return undefined;
   };
-  const capturedWitness = await reflogWitness(cwd, "HEAD");
+  const capturedWitness = await headWitness(cwd, noLazy);
+  // Row 339 (D-2181 D5): rev-parse HEAD reads no object, so the witness is a supersede's first read of HEAD's commit —
+  // a failed read there (a never-fetched HEAD) is unreadable history, never a transport or a later dirty-tree message.
+  if (sup && capturedWitness.code !== 0) {
+    return supRefuse(sup.fold, `unreadable history (git reflog exit ${capturedWitness.code}: ${(capturedWitness.stderr ?? "").trim().split("\n")[0]})`);
+  }
   const fault = witnessFault(capturedWitness, head);
   if (fault) {
     throw new Error(`verify refused: HEAD's reflog cannot witness the candidate (${fault}) — record HEAD moves in this checkout, then verify again`);
   }
   const headReflogAtCapture = capturedWitness.lines.join("\n");
-  const baseTip = (await shGitOk(`git rev-parse '${values.base}'`, cwd).catch(() => {
+  // Row 339 (D-2181 D5): a supersede resolves its range through the no-lazy-fetch seam — a promisor clone missing an
+  // object refuses as unreadable history instead of running a transport. --base is operator text and rev-parse echoes
+  // an unknown option verbatim, so the ref and its resolution are shell-quoted wherever they reach a shell.
+  const baseTip = (await ownGitOk(`git rev-parse ${shq(values.base)}`, cwd, noLazy).catch(() => {
     throw new Error(`--base ${values.base} is not a resolvable ref — pass --base <ref> naming the branch this diff targets`);
   })).trim();
-  const mergeBase = (await shGitOk(`git merge-base '${baseTip}' HEAD`, cwd)).trim();
+  let mergeBase: string;
+  if (sup) {
+    // Containment reads the MEASURED mergeBase and captured HEAD, never the unmeasured --base ref, and is decided
+    // before the empty-range exit so a HEAD at the owed base still names the owed endpoints and the recipe.
+    const measured = await ownGit(`git merge-base ${shq(baseTip)} HEAD`, cwd, true);
+    mergeBase = measured.code === 0 ? measured.stdout.trim() : "";
+    const contained = measured.code === 0 ? supersedeContainment(cwd, sup.o, mergeBase, head)
+      : { ok: false as const, unreadable: true, reason: `unreadable history (git merge-base exit ${measured.code}: ${measured.stderr.trim().split("\n")[0]})` };
+    if (!contained.ok) return supRefuse(sup.fold, contained.reason, contained.unreadable ? [] : supersedeRecipe(sup.o, values.author!));
+  } else {
+    mergeBase = (await ownGitOk(`git merge-base ${shq(baseTip)} HEAD`, cwd, false)).trim();
+  }
   if (mergeBase === head) {
     throw new Error(`nothing to verify — HEAD is contained in ${values.base} (merge-base == HEAD). Commit work on a branch first.`);
   }
@@ -272,7 +426,9 @@ export async function verify(argv: string[], cwd = process.cwd(), options: { evi
   let acceptance: AcceptanceItem[] = [];
   let files = values.files ?? [];
   let goal = `independent verification of the ${values.base}..HEAD diff`;
-  if (values.task) {
+  if (sup) {
+    ({ acceptance, files, goal } = sup.task);
+  } else if (values.task) {
     const t = getTask(loadGraph(fileRoot("graph.json")), values.task);
     acceptance = t.acceptance;
     if (!files.length) files = t.files;
@@ -282,7 +438,7 @@ export async function verify(argv: string[], cwd = process.cwd(), options: { evi
     if (!acceptance.length) throw new Error(`--criteria ${values.criteria}: no criteria found (bullets or command:/test:/judge: lines)`);
   }
 
-  if (values.task) await warnWideTaskRange(cwd, stateRoot, values.task, mergeBase);
+  if (values.task) await warnWideTaskRange(cwd, stateRoot, values.task, mergeBase, noLazy);
 
   const wantAcceptance = acceptance.length > 0 && !values["no-acceptance"];
   const wantReview = !values["no-review"];
@@ -319,7 +475,7 @@ export async function verify(argv: string[], cwd = process.cwd(), options: { evi
   // to a bare `?? dir/`, so the refusal names every offending path. The `.tickmarkr-*` exemption is
   // unaffected — the harness's droppings are root-level files, never directories.
   const candidateDirt = async (): Promise<string | undefined> => {
-    const status = await shGit("GIT_OPTIONAL_LOCKS=0 git status --porcelain --untracked-files=all", cwd);
+    const status = await ownGit("GIT_OPTIONAL_LOCKS=0 git status --porcelain --untracked-files=all", cwd, noLazy);
     const dirt = status.code !== 0
       ? `git status failed (exit ${status.code}) — the worktree cannot be proven clean`
       : status.stdout.split("\n").map((l) => l.trimEnd())
@@ -333,15 +489,17 @@ export async function verify(argv: string[], cwd = process.cwd(), options: { evi
   // capture is spent. It must name the exact obligation — its run, task, immutable range (or that
   // range's validated integration merge), required gate and unchanged criteria — or it refuses with
   // exit 2 and the check stays outstanding. Unknown debt refuses outright: nothing proves it paid.
-  const recordJournal = values.record ? Journal.open(stateRoot, values.record) : undefined;
-  const owedBefore = recordJournal ? foldOwedChecks(recordJournal.read(), cwd) : undefined;
-  const debtLine = (fold: OwedFold) => `owed checks for ${values.record}: debt ${fold.debt}`
-    + (fold.outstanding.length ? ` — outstanding ${fold.outstanding.map((o) => `${o.taskId}/${o.gate} ${o.id}`).join(", ")}` : "")
-    + (fold.unknown.length ? ` — unknown: ${fold.unknown.map((u) => `${u.taskId ?? "?"}${u.gate ? `/${u.gate}` : ""} ${u.reason}`).join("; ")}` : "");
-  const refuseDischarge = (why: string) => ({ out: `verify --record refused: ${why}\n${debtLine(owedBefore!)}`, code: 2 });
+  const recordJournal = sup?.journal ?? (values.record ? Journal.open(stateRoot, values.record) : undefined);
+  const owedBefore = sup?.fold ?? (recordJournal ? foldOwedChecks(recordJournal.read(), cwd) : undefined);
+  const refuseDischarge = (why: string) => sup ? supersedeExit(2, [`verify --record refused: ${why}`, debtLine(owedBefore!)], { debt: owedBefore!.debt, refused: why })
+    : { out: `verify --record refused: ${why}\n${debtLine(owedBefore!)}`, code: 2 };
   let owed: OwedCheck[] = [];
-  let mapping: "exact" | "integration" = "exact";
-  if (owedBefore && (!owedBefore.known || owedBefore.outstanding.length > 0)) {
+  let mapping: "exact" | "integration" | "supersede" = "exact";
+  if (sup) {
+    owed = [sup.o];
+    mapping = "supersede";
+    if (!gates.includes(sup.o.gate)) return refuseDischarge(`check ${sup.o.id} requires the ${sup.o.gate} gate, which this invocation skips`);
+  } else if (owedBefore && (!owedBefore.known || owedBefore.outstanding.length > 0)) {
     if (!owedBefore.known) return refuseDischarge("the run's owed-check debt is unknown (legacy, missing or malformed evidence)");
     const own = owedBefore.outstanding.filter((o) => o.runId === values.record && o.taskId === values.task);
     if (!own.length) return refuseDischarge(`run ${values.record} owes no check for task ${values.task ?? "(no --task)"}`);
@@ -368,8 +526,9 @@ export async function verify(argv: string[], cwd = process.cwd(), options: { evi
   let reviewModelAuthExclusions: ReturnType<typeof modelAuthExclusions> = [];
   let author: Assignment = HUMAN_AUTHOR;
   let carriedAuthors: string[] = [];
+  let fixer: BillingChannel | undefined;
   const adapters = allAdapters();
-  if (wantAcceptance || wantReview) {
+  if (wantAcceptance || wantReview || sup) {
     const health = readDoctor(fileRoot("doctor.json")) ?? (await probeAll(adapters));
     const pools = rolePools(cfg, adapters, health);
     judgeChannels = pools.judge;
@@ -377,12 +536,25 @@ export async function verify(argv: string[], cwd = process.cwd(), options: { evi
     reviewModelAuthExclusions = modelAuthExclusions(cfg, adapters, health);
     // Resolved before either branch so an undiscoverable claim refuses here, ahead of any capture —
     // even where recorded authors bind and the claim is otherwise ignored.
-    const claimed = values.author && values.author !== "human" ? authorIdentity(values.author, cfg, adapters, health, channels) : undefined;
+    let claimed: BillingChannel | undefined;
+    try {
+      claimed = values.author && values.author !== "human" ? authorIdentity(values.author, cfg, adapters, health, channels) : undefined;
+    } catch (error) {
+      if (!sup) throw error;
+      return refuseDischarge(`unresolved fixing author: ${(error as Error).message}`);
+    }
     if (owed.length) {
       // The run's lifetime patch authors bind the reviewer's exclusions; --author never overrides
       // them. An author the pool cannot resolve leaves review unseatable, which fails closed.
       carriedAuthors = [...new Set(owed.flatMap((o) => o.authors))];
-      if (values.author) console.error(`verify: --author ${values.author} ignored — ${values.record}'s recorded patch authors (${carriedAuthors.join(", ")}) bind this discharge`);
+      if (sup) {
+        // Row 339 (D-2181 D5): the declared fixer of owedHead..HEAD JOINS the recorded authors in every exclusion,
+        // resolved once here (human is the sentinel channel) and recorded apart from them as fixAuthors.
+        const fix = claimed ?? HUMAN_CHANNEL;
+        fixer = fix;
+        if (!channels.some((c) => channelKey(c) === channelKey(fix))) channels = [...channels, fix];
+        carriedAuthors = [...new Set([...carriedAuthors, channelKey(fix)])];
+      } else if (values.author) console.error(`verify: --author ${values.author} ignored — ${values.record}'s recorded patch authors (${carriedAuthors.join(", ")}) bind this discharge`);
       const first = channels.find((c) => channelKey(c) === carriedAuthors[0]);
       if (first) author = { adapter: first.adapter, model: first.model, channel: first.channel, tier: first.tier };
     } else if (claimed) {
@@ -407,6 +579,7 @@ export async function verify(argv: string[], cwd = process.cwd(), options: { evi
   // ponytail: tmpdir means the baseline cache dies on reboot/cleanup — worst case is one re-capture.
   const stateDir = verifyStateDir(cwd);
   mkdirSync(stateDir, { recursive: true });
+  const deferred: Array<[string, Record<string, unknown>]> = [];
 
   // T5 (D): only the full suite and its baseline need the repository's runner lease. build/lint
   // (baseline and candidate), evidence, scope and judge ‖ review run first and unleased, so a red
@@ -540,10 +713,10 @@ export async function verify(argv: string[], cwd = process.cwd(), options: { evi
   // HEAD is re-read through the same reader that captured `head`, so both sides compare like for like.
   let subjectLatch: string | undefined;
   const subjectChange = async (): Promise<string | undefined> => {
-    const now = await shGitOk("git rev-parse HEAD", cwd).then((out) => out.trim(), () => undefined);
+    const now = await ownGitOk("git rev-parse HEAD", cwd, noLazy).then((out) => out.trim(), () => undefined);
     // The latch reads HEAD's reflog through git as a validated witness, refuses before capture when it
     // is absent or invalid, and compares it line for line at every subject check.
-    const witness = now === head ? await reflogWitness(cwd, "HEAD") : undefined;
+    const witness = now === head ? await headWitness(cwd, noLazy) : undefined;
     const reflogMoved = witness !== undefined && (
       witness.code !== 0 || witness.lines.join("\n") !== headReflogAtCapture || witness.lines[0] !== head);
     const why = now === undefined ? "HEAD is unreadable"
@@ -590,7 +763,10 @@ export async function verify(argv: string[], cwd = process.cwd(), options: { evi
       signal: executionSignal(),
       onWait: (holder, blockers) => {
         console.error(`verify: waiting for the repository's runner lease ${describeLeaseWait(holder, blockers)}`);
-        recordJournal?.append("suite-wait", values.task ?? "VERIFY", { holderPid: holder.pid, holderCwd: holder.cwd, ...(blockers ? { blockers } : {}) });
+        const wait = { holderPid: holder.pid, holderCwd: holder.cwd, ...(blockers ? { blockers } : {}) };
+        // Row 339 (D-2181 D5): a supersede's audit rows wait for its closure; a refusal leaves the journal byte-identical.
+        if (sup) deferred.push(["suite-wait", wait]);
+        else recordJournal?.append("suite-wait", values.task ?? "VERIFY", wait);
       },
     });
     results = [...results, ...suite].sort((a, b) => GATE_NAMES.indexOf(a.gate as GateName) - GATE_NAMES.indexOf(b.gate as GateName));
@@ -617,7 +793,9 @@ export async function verify(argv: string[], cwd = process.cwd(), options: { evi
   }));
   const artifactPath = join(artifactDir, "verify-results.json");
   // `criteria` is the digest of the acceptance this invocation measured: a discharge's fold binds it.
-  const artifactBytes = Buffer.from(JSON.stringify({ base: baseTip, head, mergeBase, green, files, criteria: owedCriteria(acceptance), gateRows: results, reviewFindings }, null, 2) + "\n");
+  const fixAuthors = fixer ? [{ key: channelKey(fixer), vendor: fixer.vendor }] : undefined;
+  const artifactBytes = Buffer.from(JSON.stringify({ base: baseTip, head, mergeBase, green, files, criteria: owedCriteria(acceptance), gateRows: results, reviewFindings,
+    ...(fixAuthors ? { fixAuthors } : {}) }, null, 2) + "\n");
   let artifactSha256: string | null = null;
   let artifactAvailability: "available" | "capture-failed" = "capture-failed";
   try {
@@ -634,23 +812,29 @@ export async function verify(argv: string[], cwd = process.cwd(), options: { evi
   // criteria and each resolved channel — and it is appended only when the fold, the single decider,
   // already accepts it: verify never writes a proof that would turn known debt into unknown debt.
   let dischargeRefusal: string | undefined;
+  let priorClosure = false;
+  let published = false;
   if (recordJournal && owed.length) {
     const facts = (key: string) => channels.find((c) => channelKey(c) === key);
     const reviewer = typeof review?.meta?.reviewer === "string" ? facts(review.meta.reviewer) : undefined;
-    const authorChannels = carriedAuthors.map(facts).filter((c): c is BillingChannel => c !== undefined);
+    // A supersede keeps the original authors' proof intact; its fixer rides apart, as fixAuthors.
+    const authorChannels = (sup ? sup.o.authors : carriedAuthors).map(facts).filter((c): c is BillingChannel => c !== undefined);
     const data = {
       ids: owed.map((o) => o.id), gates: owed.map((o) => o.gate), mapping, mergeBase, head, criteria: owedCriteria(acceptance),
       ...(mapping === "integration" ? { patch: owed[0]!.patch } : {}),
       artifactPath, artifactSha256,
       ...(reviewer ? { reviewer: { key: channelKey(reviewer), vendor: reviewer.vendor } } : {}),
       authorChannels: authorChannels.map((c) => ({ key: channelKey(c), vendor: c.vendor })),
+      ...(fixAuthors ? { fixAuthors } : {}),
     };
+    const event = sup ? OWED_SUPERSEDE_EVENT : OWED_DISCHARGE_EVENT;
+    const closes = (fold: OwedFold) => owed.every((o) => sup ? fold.superseded?.some((c) => c.id === o.id) : fold.discharged.includes(o.id));
     const candidate = green && artifactAvailability === "available"
-      ? foldOwedChecks([...recordJournal.read(), { ts: new Date().toISOString(), event: OWED_DISCHARGE_EVENT, taskId: values.task, data }], cwd)
+      ? foldOwedChecks([...recordJournal.read(), { ts: new Date().toISOString(), event, taskId: values.task, data }], cwd)
       : undefined;
     if (!green) dischargeRefusal = "the verdict is not green";
     else if (!candidate) dischargeRefusal = "the results artifact is unavailable";
-    else if (!candidate.known || !owed.every((o) => candidate.discharged.includes(o.id))) dischargeRefusal = candidate.unknown.at(-1)?.reason ?? "the proof does not discharge the check";
+    else if (!candidate.known || !closes(candidate)) dischargeRefusal = candidate.unknown.at(-1)?.reason ?? `the proof does not ${sup ? "supersede" : "discharge"} the check`;
     else {
       // Queue row 31 / D-2134: validate before writing under the run, then retain the exact bytes.
       // Exclusive creation accepts an identical existing proof, never overwrites different bytes.
@@ -667,7 +851,28 @@ export async function verify(argv: string[], cwd = process.cwd(), options: { evi
       } catch {
         dischargeRefusal = "durable results artifact unavailable or has different bytes";
       }
-      if (!dischargeRefusal) {
+      if (!dischargeRefusal && sup) {
+        // Row 339 (D-2181 D5): re-read the current fold before publishing. A prior invocation's closure is returned,
+        // never duplicated; a stale obligation or a durable proof the fold refuses publishes nothing.
+        const current = recordJournal.read();
+        const now = foldOwedChecks(current, cwd);
+        const row = { ts: new Date().toISOString(), event, taskId: values.task, data: { ...data, artifactPath: relativePath } };
+        if (now.superseded?.some((c) => c.id === sup.o.id) || now.discharged.includes(sup.o.id)) priorClosure = true;
+        else if (!now.known || !now.outstanding.some((o) => o.id === sup.o.id)) dischargeRefusal = "stale final reread: the check is no longer known outstanding";
+        else if (!closes(foldOwedChecks([...current, row], cwd))) dischargeRefusal = "the durable proof does not supersede the check";
+        // An interrupted earlier append left an incomplete last line: this closure would join it and read as torn, so
+        // the re-run the publication boundary promises refuses here instead of publishing into it.
+        else if (readFileSync(join(recordJournal.dir, "journal.jsonl")).at(-1) !== 0x0a) {
+          dischargeRefusal = "the run journal ends in an incomplete line left by an interrupted append (readers ignore it); remove that line, then re-run";
+        }
+        else {
+          recordedArtifactPath = relativePath;
+          // The publication boundary: every refusal was decided above; from this append on, verify() answers a throw.
+          onPublish(sup.o.id);
+          published = true;
+          recordJournal.append(OWED_SUPERSEDE_EVENT, values.task, row.data);
+        }
+      } else if (!dischargeRefusal) {
         recordedArtifactPath = relativePath;
         recordJournal.append(OWED_DISCHARGE_EVENT, values.task, { ...data, artifactPath: recordedArtifactPath });
       }
@@ -675,9 +880,21 @@ export async function verify(argv: string[], cwd = process.cwd(), options: { evi
   }
   const owedAfter = recordJournal ? foldOwedChecks(recordJournal.read(), cwd) : undefined;
   const code = green && !dischargeRefusal ? 0 : 2;
+  // Row 339 (D-2181 D5): a scope-red supersede names the owed endpoints and the owed-head-branch recipe.
+  const scopeRed = results.some((r) => r.gate === "scope" && !r.pass);
+  const closure = sup && !dischargeRefusal ? owedAfter?.superseded?.find((c) => c.id === sup.o.id) : undefined;
+  // A completed append whose re-read folds no closure (a torn earlier line swallowed it) is no answer either way.
+  if (sup && published && !closure) return publicationUncertain(sup.o.id, "the re-read journal folds no closure for it", values.json);
+  const supLines = !sup ? [] : dischargeRefusal ? (scopeRed ? supersedeRecipe(sup.o, values.author!) : [])
+    : closure ? [`superseded ${closure.id}${priorClosure ? " (closed by an earlier invocation; nothing appended)" : ""} — closed from fixing head ${closure.head} (verify record ${closure.artifactPath} sha256 ${closure.artifactSha256})`]
+    : priorClosure ? [`check ${sup.o.id} was closed by an earlier invocation — discharged; nothing appended`] : [];
   const owedLines = owedAfter && (owed.length || owedAfter.acceptedRisk.length || !owedAfter.known)
-    ? [...(dischargeRefusal ? [`verify --record refused discharge: ${dischargeRefusal}`] : []), debtLine(owedAfter)] : [];
-  if (recordJournal && review) {
+    ? [...(dischargeRefusal ? [`verify --record refused ${sup ? "supersede" : "discharge"}: ${dischargeRefusal}`] : []), ...supLines, debtLine(owedAfter)] : [];
+  // Row 339 (D-2181 D5): a supersede's audit rows follow its published closure, after the closure fold above is read.
+  // They are appended AFTER the publication boundary, so an error writing one is the boundary's answer (verify()
+  // returns publicationUncertain: nonzero, the closure may already be recorded), never a refusal and never exit 0.
+  if (closure && !priorClosure) for (const [name, wait] of deferred) recordJournal!.append(name, values.task!, wait);
+  if (recordJournal && review && (!sup || (closure && !priorClosure))) {
     recordJournal.append("review-leg2", values.task ?? "VERIFY", {
       base: baseTip, head, mergeBase, author: channelKey(author), artifactPath: recordedArtifactPath, artifactSha256, artifactAvailability,
       ...review,
@@ -704,7 +921,9 @@ export async function verify(argv: string[], cwd = process.cwd(), options: { evi
   if (launchServices?.line) console.error(`verify: ${launchServices.line}`);
   if (values.json) {
     return { out: JSON.stringify({ base: baseTip, head, mergeBase, green, artifactPath, artifactSha256, artifactAvailability, results,
-      ...(owedAfter && owedLines.length ? { owed: { debt: owedAfter.debt, discharged: dischargeRefusal ? [] : owed.map((o) => o.id), ...(dischargeRefusal ? { refused: dischargeRefusal } : {}) } } : {}),
+      ...(owedAfter && owedLines.length ? { owed: sup
+        ? { debt: owedAfter.debt, discharged: priorClosure && !closure ? [sup.o.id] : [], superseded: closure ? [closure] : [], ...(dischargeRefusal ? { refused: dischargeRefusal } : {}), ...(supLines.length && dischargeRefusal ? { recover: supLines } : {}) }
+        : { debt: owedAfter.debt, discharged: dischargeRefusal ? [] : owed.map((o) => o.id), ...(dischargeRefusal ? { refused: dischargeRefusal } : {}) } } : {}),
     }, null, 2), code };
   }
   const lines = results.map((r: GateResult) =>

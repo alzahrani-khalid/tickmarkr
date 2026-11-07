@@ -9,6 +9,7 @@ import {
 import { filesGlob } from "../graph/files-glob.js";
 import { renderAcceptanceItem, type Task, TIERS } from "../graph/schema.js";
 import { getAdapter } from "../adapters/registry.js";
+import { HcReadUnavailableError } from "../drivers/hc-client.js";
 import { shGitOk } from "../run/git.js";
 import { carryReviewFindings, isDeferredFinding, observedReviewFingerprints, reviewFingerprintMatches, structuredFindings, type StructuredFinding, UNIDENTIFIED } from "../run/journal.js";
 import { redactSecrets } from "../run/redact.js";
@@ -901,6 +902,14 @@ ${responseRequirement}
     reviewer.effort, // OBS-1182: the picked seat's own effort, never the author's
   );
   } catch (error) {
+    // Row 360; D-2184 add.19: transport bytes are not a reviewer verdict; retain existing no-verdict recovery.
+    if (error instanceof HcReadUnavailableError) {
+      return { gate: "review", pass: false,
+        details: `review pane unreadable — ${error.message} — no verdict; failing closed`,
+        meta: { ...policyMeta, ...rotationMeta, ...floorMeta, reviewer: channelKey(reviewer), reviewerTier: reviewer.tier,
+          vendor: reviewer.vendor, provider, noVerdict: true, classification: "infra", infra: true,
+          cause: "no-verdict" satisfies ReviewUnparseableCause, ...(savedBrief ? { briefPath: savedBrief } : {}) } };
+    }
     if (!(error instanceof SeatLaunchError)) throw error;
     // OBS-1168(b): the seat never launched, so there is no verdict and nothing about the WORK. A typed
     // no-verdict re-routes to another seat in run-gates; an exhausted pool is an infra park.

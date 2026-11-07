@@ -242,9 +242,9 @@ export class HerdrAppDriver implements ExecutorDriver {
 
   constructor(private readonly opts: HerdrAppDriverOpts = {}) {
     this.env = opts.env ?? process.env;
-    this.client = new HcClient({ hcBin: opts.hcBin ?? "hc", appBin: opts.appBin, env: this.env, timeoutMs: opts.callTimeoutMs, outputCap: opts.outputCap });
-    this.runId = opts.runId ?? `run-local-${randomBytes(4).toString("hex")}`;
     this.time = opts.time ?? SYSTEM_TIME;
+    this.client = new HcClient({ hcBin: opts.hcBin ?? "hc", appBin: opts.appBin, env: this.env, timeoutMs: opts.callTimeoutMs, outputCap: opts.outputCap, now: () => this.time.now() });
+    this.runId = opts.runId ?? `run-local-${randomBytes(4).toString("hex")}`;
   }
 
   journalWith(append: NonNullable<HerdrAppDriver["append"]>): void { this.append = append; this.fallback.journalWith(append); }

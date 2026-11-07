@@ -43,7 +43,18 @@ exits 1 with the strand on disk — that static CLEAN would have waived a real d
 is uphold or recheck. Waive only on a supported executed read: the same reproduction at the task head
 exits 0, its log is on file, and the record names both. The waive keeps its park and gate binding and
 its debt: CURRENT `tickmarkr status <runId>` reads `outstanding 1 (T2 review)` until
-`tickmarkr verify --record <runId>` discharges it. Record example:
+`tickmarkr verify --record <runId>` discharges it. When the defect is fixed later, a verified
+supersede closes it instead; the waive itself never closes the debt and neither does an unverified
+fix (queue row 339; D-2181). Recipe: create a branch at the owed head with
+`git switch -c <branch> <owed head>`; commit the in-scope fix there; run
+`tickmarkr verify --record <runId> --task <T> --base <owed base> --supersede <check> --author <who wrote the fix>`
+on that branch; then merge that branch into the integration branch. The fixing HEAD must contain
+the owed range, under the task's same criteria and file scope with a green independent battery
+whose reviewer is outside both the original and the fixing authors. A fix made above other tasks'
+later integration merges carries their files and is scope-red by design. Record the fixing HEAD
+and CURRENT status reading `outstanding 0` as the closure; a broader or non-containing hand fix, a
+red battery or unknown debt is refused with nothing appended and the check stays outstanding or
+unknown — never widen the task's files to admit it. Record example:
 
 ```text
 D-NNN WAIVE T2 review — park <line>@<ts> --gate review
@@ -181,6 +192,15 @@ overseer, loop and auto skills.
   each an interactive TUI in its own visible `hc` terminal. The plain-host single-tier scope never applies
   here, and no classic herdr command or classic watcher shell script is compatible with `hc`: never run
   one on the app. Wherever another scope reads On herdr, On Orca or On a plain host, follow this scope.
+- **Terminal names and app tab labels (queue row 359; D-2184 add.16).** `hc run --name` names only
+  the TERMINAL, never the app TAB: 1-32 of `a-z`, `0-9`, `-`, `_`, starting with a letter or digit,
+  never id-shaped (`t7`); `<label-slug>` is lowercase within that length.
+  At Setup, map your verified seat address to its unique tab via `terminals[].terminal` in `herdr-app ls`:
+  `herdr-app do tab.rename --id "<tab-id>" --name "OVERSEER · <label>"`.
+  `herdr-app ls` read-back verifies tab id, label and address.
+  On every state change the tab's owner repeats lookup, rename and read-back: progress fraction
+  on every task-done, at most one hot-state token. Never rename a tab you did not create or
+  worker tabs (the daemon's); uncertain mapping means leave it and report it.
 - **Seat launch.** Before every seat (ORCH, consultant, reviewer) consume a successful
   `tickmarkr fleet --pick <purpose>` and build the launch command from its returned `adapter` and `model`,
   keeping the role's permission flags (claude `--permission-mode bypassPermissions`; codex
@@ -189,7 +209,7 @@ overseer, loop and auto skills.
   use it only from a valid read-back. The first task travels IN the launch argv:
 
   ```bash
-  hc run --bg --json --no-parent --no-notify --name "ORCH · <label>" --cwd "<checkout>" --label "tickmarkr.owner=<seat>" --label "tickmarkr.repo=<repo>" --label "herdr.space=<verified space>" -- <fleet-selected agent command> "<first task>"
+  hc run --bg --json --no-parent --no-notify --name "orch-<label-slug>" --cwd "<checkout>" --label "tickmarkr.owner=<seat>" --label "tickmarkr.repo=<repo>" --label "herdr.space=<verified space>" -- <fleet-selected agent command> "<first task>"
   ```
 
   Record the receipt's `address`, the core's `HC_TERMINAL_SOCKET`, owner, repo, checkout and mission in
@@ -197,6 +217,9 @@ overseer, loop and auto skills.
   `hc get <address> --json` returns that same address, both labels, the checkout as `cwd` and `parent`
   null, and `hc read <address> --json --lines 0` shows the model banner. No headless `-p` or `exec`
   auxiliary seat and no in-process subagent.
+  Right after the ORCH spawn read-back, map its address via `terminals[].terminal` in `herdr-app ls`, run
+  `herdr-app do tab.rename --id "<tab-id>" --name "ORCH · <label>"` and verify tab id, label and
+  address. The creator labels it once; later state labels belong to its owner.
 - **Delivery after launch.** Send only to a recorded, verified address with
   `hc send <address> "<message>" --json`, never `--force`. A booting seat, an occupied composer, a blocked
   dialog, an uncertain submit (`started` not `true`) or `first_message` false is NO handoff: read the seat
@@ -331,13 +354,13 @@ overseer, loop and auto skills.
      with the task id and holding that task's worker plus its judge/review/consult panes (tickmarkr
      updates it). Never long context strings or ✓-chains.
    - **On Orca (`TERM_PROGRAM=Orca` and non-empty `ORCA_TERMINAL_HANDLE`)**: Do not load the `herdr` skill and do not map a Herdr workspace. Work from the current Orca terminal context. Keep the overseer in the launching terminal, name it in the same act — `orca terminal rename --terminal "$ORCA_TERMINAL_HANDLE" --title "OVERSEER · <label>"` (tab title; see the seat-name law under Seat-spawn recipes) — and inspect terminals with `orca terminal list --json`. Launch the daemon detached at the orchestrator terminal's recorded handle using the detached launch below — no pane of its own; its self-placed watch board stays in the ORCH tab.
-   - **On the Herdr app (HC pair, no classic marker)**: Do not load the `herdr` skill and map no Herdr workspace. Keep the overseer in its launching `hc` terminal, record its own `HC_TERMINAL_ID`, `HC_TERMINAL_SOCKET` and the verified `herdr.space` label from `hc get "$HC_TERMINAL_ID" --json`, and follow [On the Herdr app](#on-the-herdr-app-hc-pair-no-classic-marker).
+   - **On the Herdr app (HC pair, no classic marker)**: Do not load the `herdr` skill and map no Herdr workspace. In your launching `hc` terminal, record `HC_TERMINAL_ID`, `HC_TERMINAL_SOCKET` and verified `herdr.space` from `hc get "$HC_TERMINAL_ID" --json`. Map, rename and read back your `OVERSEER · <label>` tab by the [Setup recipe above](#on-the-herdr-app-hc-pair-no-classic-marker).
 2. **Orchestrator**: First consume a successful `tickmarkr fleet --pick consult` in the seat repository, per the Fleet selection contract below; then launch the returned adapter/model with your agent host.
    - **On herdr (`HERDR_ENV=1`)**: Spawning on current herdr is two-step — the one-shot `agent start --cwd` form was removed in the herdr CLI redesign and now fails with `unknown option` (OBS-138): first create the pane with `herdr tab create --workspace <ws> --cwd <repo> --label "ORCH · <label>"` and parse `result.root_pane.pane_id` from its JSON, then start the agent in it. For Claude Code, use `herdr agent start orchestrator --kind claude --pane <root-pane-id> -- --permission-mode bypassPermissions` (append `--model <picked-model>` after the `--` from the Fleet receipt). For Codex, use `herdr agent start orchestrator --kind codex --pane <root-pane-id> -- --dangerously-bypass-approvals-and-sandbox` (add `--model <picked-model>` from the Fleet receipt). The unsandboxed flag is REQUIRED: codex's `workspace-write` sandbox keeps `.git` refs read-only, so a sandboxed orchestrator's `tickmarkr run` dies at integration-branch creation — do not downgrade it. Workers you never spawn — tickmarkr spawns its own visible worker panes. Auxiliary agents you do spawn (consultants, reviewers, scouts) follow the same forms: never launch a claude session in plan mode or default permission mode for autonomous work — both stall on per-command approval prompts nobody is watching; claude is always `--permission-mode bypassPermissions --settings '{"promptSuggestionEnabled":false}'`. **For a codex consultant, use `-a never --sandbox workspace-write` — NOT `--sandbox read-only`.** ⚠ **`--sandbox read-only` CONTRADICTS this skill's own completion protocol and will hang the seat.** Every seat you spawn is told to deliver an ARTIFACT ending in a terminal MARKER, because that is the only completion signal the artifact watcher can key on (`done` is turn end). A read-only sandbox cannot write that artifact, so codex blocks on `Would you like to make the following edits?` for its OWN report — and the report exists ONLY in the pending edit, so abandoning the prompt destroys the work rather than merely delaying it. Measured 2026-08-28: a consultant spawned `--sandbox read-only` finished a 14,604-byte verdict, sat blocked on the write, and the operator saw the prompt before the supervising tier did. `read-only` is correct ONLY for a seat that writes nothing at all — which, under the artifact+marker rule, is no seat this skill tells you to spawn. When the prompt does appear, answer **"Yes, and don't ask again for these files"** rather than plain yes: plain yes re-blocks on the next write of the same file. **That `--settings` pair is not cosmetic and it is not optional:** claude-code's AUTOSUGGEST renders context-plausible ghost text into an idle seat's prompt line that is BYTE-IDENTICAL to a typed draft in text-format reads (OBS-482), so a supervising tier cannot tell a seat's own unsent work from a rendering artifact without `agent read --format ansi`. Turning the suggester off at spawn removes the ambiguity at its source instead of paying for the discrimination at every read. Verified against the shipped binary: `claude --settings '{"promptSuggestionEnabled":false}' -p …` exits 0 with a real response, and the key appears in the binary's own settings schema. **For kimi, pass `-y`** (`herdr agent start <name> --kind kimi --pane <id> -- -y`) — the adapter already launches its own workers that way (`src/adapters/kimi.ts:204`), and a kimi seat spawned without it sits on an approval prompt having done nothing. **Herdr cannot see that state**: it reports a kimi pane as `agent_status: working` with `screen_detection_skipped: true` while the prompt is up, so the BLOCKED-STATE watcher in `references/watchers.md` is blind on this vendor and the spawn flag is the ONLY control. Every vendor you spawn needs its auto-approve form named here; a vendor absent from this list is a seat that will hang.
    - **On Orca (`TERM_PROGRAM=Orca` and non-empty `ORCA_TERMINAL_HANDLE`)**: Seats spawn with `orca terminal create` on a path worktree selector with a command:
      `orca terminal create --worktree path:<repo> --title "ORCH · <label>" --command "<agent-cmd>" --json`
      For Claude Code: `orca terminal create --worktree path:<repo> --title "ORCH · <label>" --command "claude --model <picked-model> --permission-mode bypassPermissions --settings '{\"promptSuggestionEnabled\":false}'" --json`. For Codex: `orca terminal create --worktree path:<repo> --title "ORCH · <label>" --command "codex --model <picked-model> --dangerously-bypass-approvals-and-sandbox" --json`. Parse `result.terminal.handle` from the create receipt.
-   - **On the Herdr app (HC pair, no classic marker)**: write the brief of step 3 first, then launch the ORCH with the `hc run --bg --json --no-parent --no-notify` seat recipe of [On the Herdr app](#on-the-herdr-app-hc-pair-no-classic-marker), reading that brief as the first task in its launch argv; record and verify its address.
+   - **On the Herdr app (HC pair, no classic marker)**: write the brief of step 3 first, then launch the ORCH with the `hc run --bg --json --no-parent --no-notify` seat recipe of [On the Herdr app](#on-the-herdr-app-hc-pair-no-classic-marker), reading that brief as the first task in its launch argv with terminal name `orch-<label-slug>`; record and verify its address, then immediately map its new tab through `herdr-app ls`, label it with `herdr-app do tab.rename --id "<tab-id>" --name "ORCH · <label>"` and read `herdr-app ls` back as that recipe requires.
 
    Require the orchestrator to use the host-owned daemon and detached-beat lifecycle below for both run and resume, and to report the lock pid ancestry check.
 3. **Standing instructions travel as a brief FILE, never as pane text** — PTY input truncates at ~1024B and a

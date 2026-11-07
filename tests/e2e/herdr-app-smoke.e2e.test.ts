@@ -339,7 +339,10 @@ export function fakeHost(failure?: string): SmokeHost & { fake: FakeHerdrApp; di
       s.spawn = kind === "interactive" ? { reported: true, status: { state: "idle" }, screen: { text: "screen says blocked", complete: true }, onSend: { status: { state: "working" } } } : {};
     }); },
     created: async (kind, address) => {
-      if (kind === "normal" && failure === "transport") f.rule({ match: ["read", address, "--lines", "0"], output: "{", once: true });
+      // Row 360; D-2184 add.19: a transient read may recover; persistent malformed observations cannot prove anything.
+      if (kind === "normal" && (failure === "transport" || failure === "read-once")) {
+        f.rule({ match: ["read", address], output: "{", once: failure === "read-once" });
+      }
       if (kind === "altExit" || kind === "altReturn") {
         const t = f.term(address);
         const text = t.history.text.replace(/\x1b\[[0-9;?]*[a-zA-Z]/g, "");
@@ -406,6 +409,19 @@ if (expect.getState().testPath === fileURLToPath(import.meta.url)) {
       expect(h.fake.hcCalls("rm")).toHaveLength(1);
     } finally { await h.dispose(); }
   });
+
+  test("row 360: one malformed smoke read recovers through a validated reread and completes every required observation", async () => {
+    const h = fakeHost("read-once");
+    try {
+      const result = await runSmoke(h);
+      expect(smokeVerdict(result)).toEqual({ status: "passed", reasons: [] });
+      expect(result.errors).toEqual([]);
+      expect(Object.keys(result.observations).sort()).toEqual([...REQUIRED_OBSERVATIONS].sort());
+      const reads = h.fake.hcCalls("read");
+      expect(reads[1]).toEqual(reads[0]);
+      expect(result.observations).toMatchObject({ terminalsAbsent: true, childAbsent: true, coreAbsent: true });
+    } finally { await h.dispose(); }
+  }, 90_000);
 
   test(HERDR_APP_LIVE_TITLE, { timeout: 180_000 }, async (ctx) => {
     const gate = process.env.TICKMARKR_E2E === "1";

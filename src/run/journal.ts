@@ -890,8 +890,16 @@ export function identicalGateFailures(events: JournalEvent[], taskId: string, ga
   const counted = new Set<string>();
   const byAttempt = new Map<number, string>();
   const bySubject = new Map<string, string>();
+  let daemonKilled = false;
   effectiveEvents(events).forEach((e, i) => { // OBS-1178: a refused or unsound approval is no new engagement
     if (e.taskId !== taskId) return;
+    // Row 364; D-2185 add.19: only the recorded live fact excludes an interrupted edit's dirty refusal.
+    // Pre-upgrade rows have no fact and stay chargeable, including across replay.
+    if (e.event === "task-dispatch") { daemonKilled = false; return; }
+    if (e.event === "worker-result") {
+      daemonKilled = e.data.daemonKilled === true;
+      return;
+    }
     if (e.event === "task-approved") { counted.clear(); return; }
     if (e.event !== "gate-result" || e.data.gate !== gate) return;
     const commit = typeof e.data.commit === "string" ? e.data.commit : undefined;
@@ -902,7 +910,8 @@ export function identicalGateFailures(events: JournalEvent[], taskId: string, ga
         : receiptOrigin(e.data) ?? `row:${i}`;
     if (typeof e.data.attempt === "number") byAttempt.set(e.data.attempt, origin);
     if (commit) bySubject.set(commit, origin);
-    if (e.data.pass === false && e.data.replayMeasurement !== true && typeof e.data.details === "string"
+    if (!(daemonKilled && e.data.dirtyWorktree === true)
+        && e.data.pass === false && e.data.replayMeasurement !== true && typeof e.data.details === "string"
         && normalizeGateFailure(e.data.details) === normalized) counted.add(origin);
   });
   return counted.size;
@@ -1468,7 +1477,7 @@ export type RetryMode = (typeof RETRY_MODES)[number];
 // concludes a worker while the rolling stall window still has most of its time left, so labelling it
 // stall-timeout points every downstream reader — the repair brief, the consult — at a mechanism that
 // cannot have fired.
-export const WORKER_RESULT_CAUSES = ["provider-death", "dead-channel", "stall-timeout", "malformed-trailer", "clean-exit-no-trailer", "startup-failure"] as const;
+export const WORKER_RESULT_CAUSES = ["provider-death", "dead-channel", "stall-timeout", "hard-timeout", "malformed-trailer", "clean-exit-no-trailer", "startup-failure"] as const;
 export type WorkerResultCause = (typeof WORKER_RESULT_CAUSES)[number];
 
 // Status consumes the routing profile's existing quality split directly: verified park kinds classify
@@ -1781,7 +1790,8 @@ export function engagementReleased(events: JournalEvent[]): boolean {
   return engagement?.data.graphChanged === true;
 }
 
-/** The run's own graph.json (copied by the daemon at every start/resume) — the definitions the last engagement ran on. */
+/** The run's own graph.json — copied by the daemon at a fresh start only (resume never re-snapshots), so it holds
+ * the definitions the run STARTED on, not those of a later --graph-changed engagement (row 339, D-2181). */
 function snapshotDefinitions(journal: Journal): Map<string, string> {
   const path = join(journal.dir, "graph.json");
   if (!existsSync(path)) return new Map();
@@ -2683,6 +2693,8 @@ export class Journal {
 
 export const OWED_CHECK_VERSION = 1 as const;
 export const OWED_DISCHARGE_EVENT = "owed-check-discharged" as const;
+/** Row 339 (D-2181 D5): one owed check closed by a verified fix on a range containing it — never a discharge. */
+export const OWED_SUPERSEDE_EVENT = "owed-check-superseded" as const;
 
 export interface OwedCheck {
   version: typeof OWED_CHECK_VERSION;
@@ -2717,8 +2729,13 @@ export interface OwedFold {
   outstanding: OwedCheck[];
   acceptedRisk: OwedCheck[];
   discharged: string[];
+  /** Row 339 (D-2181 D5): checks closed by a validated supersede, with the fixing head and verify record.
+   *  Omitted when empty, so legacy and manual producers never invent supersede history. */
+  superseded?: OwedSupersede[];
   unknown: Array<{ taskId?: string; gate?: string; reason: string }>;
 }
+
+export interface OwedSupersede { id: string; head: string; artifactPath: string; artifactSha256: string }
 
 // v2.6.7 T4: every owed-identity git call runs the uncached trust check and the forced child config, and its
 // diff-producing verbs never run an external diff or textconv driver; a refusal throws, so the fold is unknown.
@@ -2726,12 +2743,17 @@ const NO_DRIVERS = new Set(["diff", "show", "log"]);
 // Queue row 284: a read runs no configured program — log.showSignature makes log/show run gpg.program on a signed
 // commit, and a renormalizing merge-tree runs every clean filter; a merge that needed renormalization stays outstanding.
 const OWED_CONFIG = ["-c", "log.showSignature=false", "-c", "merge.renormalize=false"];
-const owedGit = (cwd: string, args: string[], input?: string): string => {
+// Row 339 (D-2181 D5): an IMMUTABLE read takes commit ancestry from the content-addressed commit objects alone.
+// Replace refs, the legacy graft file and the commit-graph cache can each rewrite a commit's parents without changing
+// its id, so none is consulted: a proof (and its memo) never rests on an overlay that can be added or removed.
+const IMMUTABLE_CONFIG = ["-c", "core.commitGraph=false"];
+const IMMUTABLE_ENV = { GIT_NO_REPLACE_OBJECTS: "1", GIT_GRAFT_FILE: "/dev/null" };
+const owedGit = (cwd: string, args: string[], input?: string, immutable = false): string => {
   assertGitTrust(cwd);
   const argv = NO_DRIVERS.has(args[0]!) ? [args[0]!, "--no-ext-diff", "--no-textconv", ...args.slice(1)] : args;
-  return execFileSync("git", [...OWED_CONFIG, ...argv], {
+  return execFileSync("git", [...OWED_CONFIG, ...(immutable ? IMMUTABLE_CONFIG : []), ...argv], {
     // Queue row 287: missing promisor objects fail closed without running a lazy-fetch transport.
-    cwd, env: { ...protectedGitEnv(process.env), GIT_NO_LAZY_FETCH: "1" }, encoding: "utf8", maxBuffer: 64 * 1024 * 1024,
+    cwd, env: { ...protectedGitEnv(process.env), GIT_NO_LAZY_FETCH: "1", ...(immutable ? IMMUTABLE_ENV : {}) }, encoding: "utf8", maxBuffer: 64 * 1024 * 1024,
     ...(input === undefined ? { stdio: ["ignore", "pipe", "pipe"] } : { input }),
   });
 };
@@ -2817,6 +2839,45 @@ function integrationProved(cwd: string, o: OwedCheck, mergeBase: string, head: s
       && rangePatch(cwd, mergeBase, head) === o.patch;
   } catch {
     return false;
+  }
+}
+
+export type SupersedeContainment = { ok: true } | { ok: false; unreadable: boolean; reason: string };
+
+/**
+ * Row 339 (D-2181 D5): a supersede's range CONTAINS the owed one — the measured mergeBase is an ancestor of (or
+ * equals) the owed base AND the owed head is an ancestor of (or equals) the fixing head — read through protected
+ * git with no lazy fetch, from the commit objects alone (no replace ref, graft or commit-graph overlay). All four ids
+ * must resolve to readable commits; `merge-base --is-ancestor` exit 1 is a
+ * refusal and any other failure is unreadable history, never yes. Containment is commit ancestry, never patch
+ * resemblance. As integrationMapped does, only a completed proof is memoised, keyed on the immutable tuple, and
+ * trust is re-derived before a memo can answer; a refusal or unreadable object is re-proved next time.
+ */
+export function supersedeContainment(cwd: string, owed: { base: string; head: string }, mergeBase: unknown, head: unknown, memo?: OwedProofMemo): SupersedeContainment {
+  const ids = [owed.base, owed.head, mergeBase, head];
+  if (!ids.every((id): id is string => typeof id === "string" && COMMIT_ID.test(id))) {
+    return { ok: false, unreadable: true, reason: "unreadable history: a range end is not a commit id" };
+  }
+  const [base, owedHead, measured, fixing] = ids as [string, string, string, string];
+  const ancestor = (a: string, b: string): boolean => {
+    try { owedGit(cwd, ["merge-base", "--is-ancestor", a, b], undefined, true); return true; } catch (error) {
+      if ((error as { status?: unknown }).status === 1) return false;
+      throw error;
+    }
+  };
+  try {
+    assertGitTrust(cwd);
+    const key = JSON.stringify(["supersede", base, owedHead, measured, fixing]);
+    if (memo?.has(key)) return { ok: true };
+    for (const id of ids as string[]) {
+      if (owedGit(cwd, ["rev-parse", "--verify", "--quiet", `${id}^{commit}`], undefined, true).trim() !== id) throw new Error(`${id} is not a readable commit`);
+    }
+    if (!ancestor(measured, base)) return { ok: false, unreadable: false, reason: `the measured base ${measured} does not precede the owed base ${base}` };
+    if (!ancestor(owedHead, fixing)) return { ok: false, unreadable: false, reason: `the owed head ${owedHead} is not an ancestor of ${fixing}` };
+    memo?.add(key);
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, unreadable: true, reason: `unreadable history (${String(error).split("\n")[0]})` };
   }
 }
 
@@ -2977,13 +3038,24 @@ const declaredVendors = (o: OwedCheck): Map<string, Set<string>> => {
 /** Why a discharge row no longer proves its obligation, re-read from its artifact; undefined when it does. */
 function dischargeProblem(row: JournalEvent, o: OwedCheck, events: readonly JournalEvent[], cwd: string, memo?: OwedProofMemo): string | undefined {
   const d = row.data;
+  const supersede = row.event === OWED_SUPERSEDE_EVENT;
   if (row.taskId !== o.taskId) return "discharge names another task";
   if (d.criteria !== o.criteria) return "discharge proved other criteria";
-  const exact = d.mapping === "exact" && d.mergeBase === o.base && d.head === o.head;
-  // The integration mapping is re-proved from git on every fold, never taken from the row's claims.
-  const integration = d.mapping === "integration" && integrationMapped(cwd, events, o, d.mergeBase, d.head, memo);
-  if (!exact && !integration) return "discharge range does not bind the obligation";
-  let artifact: { head?: unknown; mergeBase?: unknown; green?: unknown; files?: unknown; criteria?: unknown; gateRows?: unknown };
+  if (supersede) {
+    // Row 339 (D-2181 D5): exactly this one check and its own gate, its containment re-proved from git (or a
+    // memoised immutable proof) on every fold — never taken from the row's claims.
+    if (d.mapping !== "supersede" || !Array.isArray(d.ids) || d.ids.length !== 1 || JSON.stringify(d.gates) !== JSON.stringify([o.gate])) {
+      return "supersede does not bind the obligation's one check and gate";
+    }
+    const contained = supersedeContainment(cwd, o, d.mergeBase, d.head, memo);
+    if (!contained.ok) return `supersede range does not contain the obligation: ${contained.reason}`;
+  } else {
+    const exact = d.mapping === "exact" && d.mergeBase === o.base && d.head === o.head;
+    // The integration mapping is re-proved from git on every fold, never taken from the row's claims.
+    const integration = d.mapping === "integration" && integrationMapped(cwd, events, o, d.mergeBase, d.head, memo);
+    if (!exact && !integration) return "discharge range does not bind the obligation";
+  }
+  let artifact: { head?: unknown; mergeBase?: unknown; green?: unknown; files?: unknown; criteria?: unknown; gateRows?: unknown; fixAuthors?: unknown };
   try {
     let artifactPath = String(d.artifactPath);
     if (!isAbsolute(artifactPath)) {
@@ -3009,12 +3081,25 @@ function dischargeProblem(row: JournalEvent, o: OwedCheck, events: readonly Jour
   const rows = (Array.isArray(artifact.gateRows) ? artifact.gateRows : []) as GateRowFact[];
   const gateRow = rows.find((r) => r?.gate === o.gate && r.pass === true && r.meta?.skipped !== true);
   if (!gateRow) return `artifact holds no passing ${o.gate} row`;
-  if (o.gate === "review") {
+  // Row 339 (D-2181 D5): the fixer resolved once, at verify time. A fact is accepted only well formed (the human
+  // sentinel included) and byte-equal to the hash-bound artifact's — never re-resolved against config or doctor.
+  let fixers: ChannelFact[] = [];
+  if (supersede) {
+    if (!Array.isArray(d.fixAuthors) || !d.fixAuthors.length || !d.fixAuthors.every(isChannelFact)) return "malformed fixing-author facts";
+    if (JSON.stringify(d.fixAuthors) !== JSON.stringify(artifact.fixAuthors)) return "artifact verified another fixing author";
+    fixers = d.fixAuthors;
+  }
+  // Row 339 (D-2181 D5): a supersede's independent review is re-validated on EVERY fold whatever gate it owes — the
+  // reviewer resolved from the row AND the artifact's passing review row, outside the original and fixing authors.
+  // An ordinary discharge keeps its review-gate-only check.
+  if (o.gate === "review" || supersede) {
+    const reviewRow = o.gate === "review" ? gateRow : rows.find((r) => r?.gate === "review" && r.pass === true && r.meta?.skipped !== true);
+    if (!reviewRow) return "artifact holds no passing review row";
     const reviewer = d.reviewer;
     const authors = Array.isArray(d.authorChannels) ? d.authorChannels as unknown[] : [];
     // The row's reviewer must be the seat the hash-bound review row recorded — key, vendor and provider.
-    if (!isChannelFact(reviewer) || gateRow.meta?.reviewer !== reviewer.key || gateRow.meta.vendor !== reviewer.vendor
-      || gateRow.meta.provider !== providerOf(reviewer)) return "unresolved reviewer";
+    if (!isChannelFact(reviewer) || reviewRow.meta?.reviewer !== reviewer.key || reviewRow.meta.vendor !== reviewer.vendor
+      || reviewRow.meta.provider !== providerOf(reviewer)) return "unresolved reviewer";
     // ...and a channel the waive recorded as declared under exactly that vendor: agreement between the row
     // and the artifact only repeats a claim, so identity and vendor resolve against the obligation's own.
     const declared = declaredVendors(o);
@@ -3026,6 +3111,9 @@ function dischargeProblem(row: JournalEvent, o: OwedCheck, events: readonly Jour
     if (authors.some((a) => authors.some((b) => a.key === b.key && a.vendor !== b.vendor))) return "unresolved author channel (inconsistent vendor claims)";
     if (!authors.every(resolves)) return "unresolved author channel (no declared channel with that identity and vendor)";
     if (authors.some((a) => a.vendor === reviewer.vendor || providerOf(a) === providerOf(reviewer))) return "same-vendor reviewer";
+    if (fixers.some((f) => f.key === reviewer.key || f.vendor === reviewer.vendor || providerOf(f) === providerOf(reviewer))) {
+      return "same-vendor reviewer (the reviewer matches a fixing author)";
+    }
   }
   return undefined;
 }
@@ -3036,7 +3124,8 @@ type GateRowFact = { gate?: unknown; pass?: unknown; meta?: { skipped?: unknown;
  * `cwd` is any checkout of the run's repository (integration discharges are re-proved from git).
  * It never throws: a fold that cannot be computed is unknown debt, not a crash and never zero.
  * `memo` (I2, optional): a store-scoped table reusing the immutable git re-proof of an integration mapping
- * across folds; every artifact, hash, criteria and reviewer condition is still re-read on every fold.
+ * (and, row 339 / D-2181 D5, of a supersede's containment) across folds; every artifact, hash, criteria,
+ * reviewer and fixing-author condition is still re-read on every fold.
  */
 export function foldOwedChecks(events: readonly JournalEvent[], cwd: string, memo?: OwedProofMemo): OwedFold {
   let fold: OwedFold;
@@ -3056,6 +3145,7 @@ function foldOwedChecksOrThrow(events: readonly JournalEvent[], cwd: string, mem
   assertGitTrust(cwd);
   const accepted = new Map<string, OwedCheck>();
   const discharged = new Set<string>();
+  const superseded = new Map<string, OwedSupersede>();
   const unknown: OwedFold["unknown"] = [];
   for (const e of effectiveEvents(events)) {
     if (e.event === "task-approved" && e.data.release === GATE_SATISFIED_RELEASE) {
@@ -3066,7 +3156,7 @@ function foldOwedChecksOrThrow(events: readonly JournalEvent[], cwd: string, mem
         unknown.push({ taskId: e.taskId, gate: String(e.data.gate), reason: o === undefined ? "legacy waiver without an owed-check obligation"
           : typeof recorded === "string" ? recorded : "malformed owed-check obligation" });
       }
-    } else if (e.event === OWED_DISCHARGE_EVENT) {
+    } else if (e.event === OWED_DISCHARGE_EVENT || e.event === OWED_SUPERSEDE_EVENT) {
       const ids = Array.isArray(e.data.ids) ? e.data.ids as unknown[] : [];
       const problems = ids.map((id) => {
         const o = accepted.get(String(id));
@@ -3074,11 +3164,16 @@ function foldOwedChecksOrThrow(events: readonly JournalEvent[], cwd: string, mem
       });
       const problem = ids.length ? problems.find((p) => p !== undefined) : "discharge names no obligation";
       if (problem) unknown.push({ taskId: e.taskId, reason: problem });
-      else for (const id of ids) discharged.add(String(id));
+      // Row 339 (D-2181 D5): the first valid closure keeps its provenance; a duplicate never subtracts twice.
+      else if (e.event === OWED_DISCHARGE_EVENT) { for (const id of ids) if (!superseded.has(String(id))) discharged.add(String(id)); }
+      else if (!discharged.has(String(ids[0])) && !superseded.has(String(ids[0]))) {
+        superseded.set(String(ids[0]), { id: String(ids[0]), head: String(e.data.head), artifactPath: String(e.data.artifactPath), artifactSha256: String(e.data.artifactSha256) });
+      }
     }
   }
   const acceptedRisk = [...accepted.values()];
-  const outstanding = acceptedRisk.filter((o) => !discharged.has(o.id));
+  const outstanding = acceptedRisk.filter((o) => !discharged.has(o.id) && !superseded.has(o.id));
   const known = unknown.length === 0;
-  return { known, debt: known ? outstanding.length : "unknown", outstanding, acceptedRisk, discharged: [...discharged], unknown };
+  return { known, debt: known ? outstanding.length : "unknown", outstanding, acceptedRisk, discharged: [...discharged],
+    ...(superseded.size ? { superseded: [...superseded.values()] } : {}), unknown };
 }

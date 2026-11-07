@@ -628,6 +628,8 @@ export class WorkerTreeCpuAccountant {
         if (this.active) await this.sample();
       }
     })();
+    // Row 364; D-2185 add.28: observe cancellation immediately; stop still awaits the original error.
+    void this.loop.catch(() => {});
   }
 
   read(): { cpu: { ms: number; resolutionMs: number } | undefined; gaps: number } {

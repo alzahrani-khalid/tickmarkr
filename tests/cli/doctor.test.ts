@@ -1059,7 +1059,7 @@ test("test: doctor and fleet against a catalog cache older than seven days invok
   const keyedFetch = routes();
   vi.stubEnv("ARTIFICIAL_ANALYSIS_API_KEY", "key");
   await doctor(["--"], keyedRepo, [stub("probe")], { banner: false, catalogNow: now, catalogFetcher: keyedFetch });
-  expect(keyedFetch.mock.calls.some(([url]) => String(url).startsWith(ARTIFICIAL_ANALYSIS_CATALOG_URL))).toBe(true);
+  expect(keyedFetch.mock.calls.map(([url]) => String(url))).toContain("https://artificialanalysis.ai/api/v2/language/models/free?page=1&page_size=100");
   vi.stubEnv("ARTIFICIAL_ANALYSIS_API_KEY", "");
 
   const freshRepo = makeRepo({

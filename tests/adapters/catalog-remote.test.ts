@@ -312,8 +312,8 @@ describe("cache-only model capability catalog", () => {
     expect(refreshOutput).toContain("model catalog refreshed");
     expect(network).toHaveBeenCalledTimes(5);
     expect(network.mock.calls[1][1]).toMatchObject({ headers: { "x-api-key": "configured-key" } });
-    expect(String(network.mock.calls[1][0])).toContain("/api/v2/data/llms/models?page=1");
-    expect(String(network.mock.calls[2][0])).toContain("/api/v2/data/llms/models?page=2");
+    expect(String(network.mock.calls[1][0])).toBe("https://artificialanalysis.ai/api/v2/language/models/free?page=1&page_size=100");
+    expect(String(network.mock.calls[2][0])).toBe("https://artificialanalysis.ai/api/v2/language/models/free?page=2&page_size=100");
     expect(String(network.mock.calls[3][0])).toBe(LIVEBENCH_TABLE_URL);
     expect(String(network.mock.calls[4][0])).toBe(LIVEBENCH_CATEGORIES_URL);
     expect(probe).toHaveBeenCalledOnce();
@@ -826,12 +826,99 @@ test("a LiveBench fetch that fails and one that parses to zero rows each preserv
   }
 });
 
-test("the AA leg requests the documented data llms models route and resolved evidence carries codingIndex from artificial_analysis_coding_index beside the intelligence index, so the legacy language models free route or a dropped coding index fails", async () => {
+test("row 368 cell 1: two free-tier pages update the Artificial Analysis leg and retain both rows and intelligence_index_version", async () => {
   const repo = makeRepo({ "keep.txt": "x" });
+  const modelsDev = catalogFixture([
+    { id: "fake-2", input: 1, output: 2, context: 200_000 },
+    { id: "claude-opus-5-5", input: 4, output: 20, context: 1_000_000 },
+  ]).modelsDev;
+  const rows = [
+    { id: "free-page-one", slug: "fake-2", model_creator: { slug: "anthropic" }, evaluations: { artificial_analysis_intelligence_index: 37 } },
+    { id: "free-page-two", slug: "claude-opus-5-5", model_creator: { slug: "anthropic" }, evaluations: { artificial_analysis_intelligence_index: 59.1 } },
+  ];
+  let page = 0;
   const fetcher = routedFetcher({
+    modelsDev: () => response(modelsDev),
+    aa: () => response({
+      tier: "free",
+      intelligence_index_version: 5,
+      pagination: { page: ++page, page_size: 200, total_pages: 2, has_more: page < 2 },
+      data: [rows[page - 1]],
+    }),
+  });
+  const result = await refreshCatalogCommand({ repoRoot: repo, fetcher, artificialAnalysisKey: "row-368-sentinel-key" });
+
+  expect(result.legs).toContainEqual(expect.objectContaining({ leg: "Artificial Analysis", status: "updated" }));
+  expect(result.catalog.catalog.artificialAnalysis).toMatchObject({
+    tier: "free",
+    intelligence_index_version: 5,
+    data: rows,
+    pagination: { page: 2, page_size: 200, total_pages: 2, has_more: false },
+  });
+  const stored = readCachedCatalog(repo).catalog;
+  expect(stored.artificialAnalysis).toEqual(result.catalog.catalog.artificialAnalysis);
+  expect(resolveCatalogModel(stored, { provider: "anthropic", model: "fake-2" })).toMatchObject({ intelligenceIndex: 37, intelligenceIndexVersion: "5" });
+  expect(resolveCatalogModel(stored, { provider: "anthropic", model: "claude-opus-5-5" })).toMatchObject({ intelligenceIndex: 59.1, intelligenceIndexVersion: "5" });
+  expect(requestedUrls(fetcher).filter((url) => url.includes("artificialanalysis.ai"))).toEqual([
+    "https://artificialanalysis.ai/api/v2/language/models/free?page=1&page_size=100",
+    "https://artificialanalysis.ai/api/v2/language/models/free?page=2&page_size=100",
+  ]);
+  expect(JSON.stringify({ legs: result.legs, warning: result.warning })).not.toContain("row-368-sentinel-key");
+});
+
+test("row 368 cell 2: a 410 retirement response reports the server message and preserves the prior Artificial Analysis catalog and age", async () => {
+  const repo = makeRepo({ "keep.txt": "x" });
+  const oldAt = "2026-11-01T00:00:00.000Z";
+  const now = () => new Date("2026-11-06T21:00:00.000Z");
+  const prior = catalogFixture([{ id: "fake-2", input: 1, output: 2, context: 200_000, intelligence: 42 }], oldAt);
+  writeCache(repo, { ...prior, legFetchedAt: { modelsDev: oldAt, artificialAnalysis: oldAt } });
+  const message = "The legacy /api/v2/data/* endpoints were retired on Wed, 04 Nov 2026 23:59:59 GMT. Migrate to the documented V2 API: https://artificialanalysis.ai/data-api/migrate-v2-data";
+  const result = await refreshCatalogCommand({
+    repoRoot: repo,
+    now,
+    artificialAnalysisKey: "row-368-sentinel-key",
+    fetcher: routedFetcher({ aa: () => response({ error: "Gone", message }, 410) }),
+  });
+
+  expect(result.legs).toContainEqual(expect.objectContaining({
+    leg: "Artificial Analysis", status: "failed", detail: `Artificial Analysis HTTP 410: Gone: ${message}`,
+  }));
+  expect(result.warning).toContain(message);
+  const stored = readCachedCatalog(repo, { now }).catalog;
+  expect(stored.artificialAnalysis).toEqual(prior.artificialAnalysis);
+  expect(stored.legFetchedAt?.artificialAnalysis).toBe(oldAt);
+  expect(stored.legFetchedAt?.modelsDev).toBe(now().toISOString());
+  expect(JSON.stringify({ legs: result.legs, warning: result.warning })).not.toContain("row-368-sentinel-key");
+});
+
+test("row 368 cell 3: a 403 tier refusal reports its error text with bounded server detail and a redacted API key", async () => {
+  const repo = makeRepo({ "keep.txt": "x" });
+  const apiKey = "row-368-sentinel-key";
+  const error = "Language models list requires a Pro subscription";
+  for (const body of [{ error }, { error, message: `${apiKey}\n${"x".repeat(1_000)} omitted-tail` }]) {
+    const result = await refreshCatalogCommand({
+      repoRoot: repo,
+      artificialAnalysisKey: apiKey,
+      fetcher: routedFetcher({ aa: () => response(body, 403) }),
+    });
+    const leg = result.legs.find(({ leg }) => leg === "Artificial Analysis");
+    expect(leg).toMatchObject({ status: "failed", detail: expect.stringContaining(`Artificial Analysis HTTP 403: ${error}`) });
+    expect(result.warning).toContain(error);
+    expect(leg!.detail.length).toBeLessThanOrEqual("Artificial Analysis HTTP 403: ".length + 500);
+    expect(leg!.detail).not.toContain("omitted-tail");
+    expect(leg!.detail).not.toContain("\n");
+    if ("message" in body) expect(leg!.detail).toContain("[redacted]");
+    expect(JSON.stringify({ legs: result.legs, warning: result.warning })).not.toContain(apiKey);
+  }
+});
+
+test("row 368 cell 4: the AA leg requests exactly the V2 free endpoint with page parameters and x-api-key without exposing the key and retains codingIndex", async () => {
+  const repo = makeRepo({ "keep.txt": "x" });
+  const routes = routedFetcher({
     aa: () => response({
       pagination: { page: 1, page_size: 100, has_more: false },
-      intelligence_index_version: "4.1.1",
+      tier: "free",
+      intelligence_index_version: 5,
       data: [{
         id: "00000000-0000-4000-8000-fake20000000",
         slug: "fake-2",
@@ -840,18 +927,22 @@ test("the AA leg requests the documented data llms models route and resolved evi
       }],
     }),
   });
-  const result = await refreshCatalogCommand({ repoRoot: repo, fetcher, artificialAnalysisKey: "configured-key" });
+  const fetcher = vi.fn(async (input: string | URL | Request, _init?: RequestInit) => routes(input));
+  const apiKey = "row-368-sentinel-key";
+  const result = await refreshCatalogCommand({ repoRoot: repo, fetcher, artificialAnalysisKey: apiKey });
 
   expect(result.updated).toBe(true);
-  expect(ARTIFICIAL_ANALYSIS_CATALOG_URL).toBe("https://artificialanalysis.ai/api/v2/data/llms/models");
+  expect(ARTIFICIAL_ANALYSIS_CATALOG_URL).toBe("https://artificialanalysis.ai/api/v2/language/models/free");
   const aaUrls = requestedUrls(fetcher).filter((url) => url.includes("artificialanalysis.ai"));
-  expect(aaUrls[0]).toContain("/api/v2/data/llms/models?page=1");
-  expect(aaUrls.some((url) => url.includes("/language/models/free"))).toBe(false);
+  expect(aaUrls).toEqual(["https://artificialanalysis.ai/api/v2/language/models/free?page=1&page_size=100"]);
+  const aaRequest = fetcher.mock.calls.find(([url]) => String(url).startsWith(ARTIFICIAL_ANALYSIS_CATALOG_URL));
+  expect(aaRequest?.[1]).toMatchObject({ headers: { "x-api-key": apiKey } });
+  expect(JSON.stringify({ legs: result.legs, warning: result.warning })).not.toContain(apiKey);
 
   const evidence = resolveCatalogModel(readCachedCatalog(repo).catalog, { provider: "anthropic", model: "fake-2" });
   expect(evidence).toMatchObject({
     intelligenceIndex: 63.05,
-    intelligenceIndexVersion: "4.1.1",
+    intelligenceIndexVersion: "5",
     codingIndex: 48.5,
   });
 });

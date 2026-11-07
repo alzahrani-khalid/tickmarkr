@@ -226,6 +226,20 @@ run-end record keeps its old count; `outstanding unknown` never completes. An un
 graph says “not comparable” and supplies no borrowed denominator. Historical GATES RAN
 does not establish current completion.
 
+A waived check whose defect is fixed later closes by supersede, never by the waive itself or an
+unverified fix (queue row 339; D-2181). Create a branch at the owed head with
+`git switch -c <branch> <owed head>`; commit the in-scope fix there; run
+`tickmarkr verify --record <runId> --task <T> --base <owed base> --supersede <check> --author <who wrote the fix>`
+on that branch; then merge that branch into the integration branch. `--author` is required on
+this path and names who wrote the fix. The fixing HEAD must contain the owed range, and the task's
+recorded criteria and file scope plus a green independent battery (its reviewer outside both the
+original and the fixing authors) still gate it. A fix made above other tasks' later integration
+merges carries their files and is scope-red by design; the owed-head branch keeps the verified
+diff to the owed task. Closure is that fixing HEAD plus CURRENT status reading `outstanding 0`,
+with the check shown as superseded rather than discharged. A broader or non-containing hand fix,
+a red battery or unknown debt closes nothing: verify refuses and appends nothing, and the check
+stays outstanding or unknown — never widen the task's files to admit it.
+
 The CLI twin for the same decision is
 `tickmarkr approve <runId> T2 --park <line>@<ts> --by operator --reason 'ready to proceed'`,
 followed by the receipt check and explicit resume above. Every decision is bound to one park:

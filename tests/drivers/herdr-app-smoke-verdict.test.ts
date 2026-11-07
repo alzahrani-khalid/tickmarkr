@@ -26,6 +26,16 @@ test("test: smoke availability satisfies the closed skip table while every post-
     }
   } finally { await h.dispose(); }
 
+  const recovered = fakeHost("read-once");
+  try {
+    const result = await runSmoke(recovered);
+    expect(smokeVerdict(result)).toEqual({ status: "passed", reasons: [] });
+    expect(result.errors).toEqual([]);
+    expect(Object.keys(result.observations).sort()).toEqual([...REQUIRED_OBSERVATIONS].sort());
+    const reads = recovered.fake.hcCalls("read");
+    expect(reads[1]).toEqual(reads[0]);
+  } finally { await recovered.dispose(); }
+
   for (const [gate, installed, reason] of [[false, true, "TICKMARKR_E2E is not 1"], [false, false, "TICKMARKR_E2E is not 1"], [true, false, "hc is missing before private-core creation"]] as const) {
     const unavailable = fakeHost();
     try {

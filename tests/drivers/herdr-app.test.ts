@@ -2,7 +2,7 @@ import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, describe, expect, it, vi } from "vitest";
 import { declareInputBox } from "../../src/adapters/types.js";
-import { HcClient, HcError } from "../../src/drivers/hc-client.js";
+import { HcClient, HcError, HcReadUnavailableError } from "../../src/drivers/hc-client.js";
 import { HC_KEYS, HcUnavailableError, HerdrAppDriver, OWNER_LABEL, REPO_LABEL, terminalPayload, type HerdrAppDriverOpts, type HerdrAppTime } from "../../src/drivers/herdr-app.js";
 import { HERDR_CONTROL_VARS } from "../../src/drivers/subprocess.js";
 import { formatOwnedName, type Slot, type SlotOpts } from "../../src/drivers/types.js";
@@ -88,7 +88,7 @@ describe("HerdrAppDriver — hc JSON client (contract J)", () => {
       const f = fake();
       const client = new HcClient({ hcBin: f.hc, appBin: f.app, env: { PATH: process.env.PATH }, timeoutMs: 10_000, outputCap: 64 * 1024 });
       const quick = new HcClient({ hcBin: f.hc, appBin: f.app, env: { PATH: process.env.PATH }, timeoutMs: 700, placementTimeoutMs: 700 });
-      const once = (r: Omit<FakeRule, "match" | "once" | "tool">): void => { f.clearRules(); f.rule({ tool: fam.tool, match: [], once: true, ...r }); };
+      const once = (r: Omit<FakeRule, "match" | "once" | "tool">, repeat = false): void => { f.clearRules(); f.rule({ tool: fam.tool, match: [], once: !repeat, ...r }); };
       // Base case first: every captured valid body for the family succeeds.
       for (const key of fam.valid) {
         once({ output: cap(key), ...(CAPTURES[key].stderr ? { stderr: CAPTURES[key].stderr } : {}) }); // stderr beside exit 0 is diagnostic only
@@ -112,7 +112,8 @@ describe("HerdrAppDriver — hc JSON client (contract J)", () => {
         ["output cap", { output: base + " ".repeat(70 * 1024) }, client],
       ];
       for (const [row, rule, c] of rows) {
-        once(rule);
+        // Row 360; D-2184 add.19: read's FORMAT failures must persist across its bounded re-reads.
+        once(rule, fam.family === "read");
         const err = await fam.call(c, at).then(() => undefined, (e: unknown) => e);
         expect(err, `${fam.family}: ${row}`).toBeInstanceOf(HcError);
         expect((err as HcError).message, `${fam.family}: ${row}`).toContain(`${fam.family} response family failed`);
@@ -146,6 +147,54 @@ describe("HerdrAppDriver — hc JSON client (contract J)", () => {
     // A missing binary is an explicit failure, not an empty success.
     await expect(new HcClient({ hcBin: join(f.dir, "absent-hc") }).status()).rejects.toThrow(/could not be invoked/);
   }, 120_000);
+
+  it("row 360: malformed, empty and shape-failed read responses are reread at the same address while refusals and other families are never replayed", async () => {
+    const f = fake();
+    const client = new HcClient({ hcBin: f.hc, appBin: f.app, timeoutMs: 10_000, now: () => 0 });
+    for (const output of ['{"complete":true,"how":"history","text":"cut', "", "null", "[]", "{}",
+      '{"complete":"true","how":"history","text":"wrong type"}']) {
+      for (const lines of [0, 1000]) {
+        f.clearRules(); f.clearCalls();
+        f.rule({ match: ["read", "t1"], output, once: true }, { match: ["read", "t1"], output: cap("Q3-direct-read") });
+        await expect(client.read("t1", lines)).resolves.toMatchObject(capJson("Q3-direct-read"));
+        expect(f.hcCalls("read")).toEqual(Array(2).fill(["read", "t1", "--lines", String(lines), "--json"]));
+      }
+    }
+    f.clearRules(); f.clearCalls();
+    f.rule({ match: ["read"], output: cap("Q3-direct-read"), exit: 1 });
+    await expect(client.read("t1", 1000)).rejects.toBeInstanceOf(HcError);
+    expect(f.hcCalls("read")).toHaveLength(1);
+    for (const fam of FAMILIES.filter((fam) => fam.family !== "read")) {
+      f.clearRules(); f.clearCalls();
+      f.rule({ tool: fam.tool, match: [], output: "{" });
+      await expect(fam.call(client, "t1")).rejects.toBeInstanceOf(HcError);
+      expect(f.calls()).toHaveLength(1);
+    }
+  }, 60_000);
+
+  it("row 360: persistent unreadable reads stop after three attempts or the original injected deadline without accepting or fabricating pane text", async () => {
+    for (const [bound, consumedMs] of [[undefined, 0], [undefined, 6_000], [5_000, 3_000]] as const) {
+      const f = fake();
+      const client = new HcClient({ hcBin: f.hc, appBin: f.app, timeoutMs: 10_000,
+        now: () => f.hcCalls("read").length * consumedMs });
+      f.rule({ match: ["read"], output: '{"text":"cut' });
+      const error = await client.read("t1", 1000, bound).catch((error: unknown) => error);
+      expect(error).toBeInstanceOf(HcReadUnavailableError);
+      expect((error as HcError).diagnostics).toMatchObject({ exit: 0, timedOut: false, stdout: '{"text":"cut' });
+      expect(f.hcCalls("read")).toHaveLength(consumedMs === 0 ? 3 : 2);
+    }
+    const expired = fake();
+    const noBudget = new HcClient({ hcBin: expired.hc, now: () => 0 });
+    await expect(noBudget.read("t1", 1000, 0)).rejects.toBeInstanceOf(HcReadUnavailableError);
+    expect(expired.calls()).toEqual([]);
+    // A read that used the remaining recovery budget without answering is still a transport loss.
+    const f = fake();
+    const client = new HcClient({ hcBin: f.hc, appBin: f.app, timeoutMs: 10_000,
+      now: () => f.hcCalls("read").length === 0 ? 0 : 9_900 });
+    f.rule({ match: ["read"], output: "{", once: true }, { match: ["read"], sleepMs: 5_000 });
+    await expect(client.read("t1", 1000)).rejects.toMatchObject({ name: "HcReadUnavailableError", diagnostics: { timedOut: true } });
+    expect(f.hcCalls("read").length).toBeLessThanOrEqual(2);
+  }, 60_000);
 });
 
 describe("HerdrAppDriver — terminal addresses (queue row 340; D-2180)", () => {
@@ -193,9 +242,12 @@ describe("HerdrAppDriver — stitched reads (queue row 340; D-2180)", () => {
     const client = new HcClient({ hcBin: f.hc, appBin: f.app, env: { PATH: process.env.PATH }, timeoutMs: 10_000 });
     f.rule({ tool: "hc", match: ["read"], once: true, output: body });
     await expect(client.read("t1", 30)).resolves.toEqual({ complete: true, how: "stitched", text: "line one\nline two\n" });
-    // Any other form stays a FORMAT failure.
-    f.rule({ tool: "hc", match: ["read"], once: true, output: JSON.stringify({ complete: true, how: "scrolled", text: "x" }) + "\n" });
+    // Row 360; D-2184 add.19: persist the invalid form through the bounded read recovery.
+    const readsBeforeFault = f.hcCalls("read").length;
+    f.rule({ tool: "hc", match: ["read"], output: JSON.stringify({ complete: true, how: "scrolled", text: "x" }) + "\n" });
     await expect(client.read("t1", 30)).rejects.toThrow(/how is not screen\/history\/stitched/);
+    expect(f.hcCalls("read").length - readsBeforeFault).toBe(3);
+    f.clearRules();
 
     // A finished worker whose final screen-only read answers stitched: drain is unproven, never closed. The same
     // terminal's complete screen answer still closes it.

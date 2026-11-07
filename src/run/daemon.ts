@@ -1,7 +1,8 @@
+import { z } from "zod";
 import { HOST_PROBE_SAMPLE_MS, HOST_PROBE_SAMPLES, HostDegradedError, hostDegraded, observeHost, type HostObservation } from "./host-health.js";
 import { runWithInterruptionSink, VITEST_CACHE_ENV, worktreeVitestCache, type HostInterruption } from "../gates/test-manifest.js";
 import { COMMAND_LEASE_TOKEN_ENV, commandLeaseEnvironment, CommandLeases, currentCommandLeaseToken, isRunnerCommand, runWithCommandLease, withCommandLease } from "./lease.js";
-import { execFile, execFileSync, spawn, type ChildProcess } from "node:child_process";
+import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { createHash, type Hash, randomBytes } from "node:crypto";
 import { shq } from "../adapters/types.js";
 import { appendFileSync, closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, readlinkSync, readSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
@@ -22,12 +23,13 @@ import {
 } from "../config/config.js";
 import { HC_SCOPE_ENV, HC_SCOPE_WARNING, hcScopePresent, SEAT_MARKER_ENV } from "../drivers/host-env.js";
 import { DeliveryReadinessError } from "../drivers/herdr.js";
+import { HcReadUnavailableError } from "../drivers/hc-client.js";
 import { driverEvidence, type DriverChoice } from "../drivers/index.js";
 import { herdrSealShellPrefix, MAX_BUF, SubprocessDriver } from "../drivers/subprocess.js";
 import { formatOwnedName, type ExecutorDriver, type Slot } from "../drivers/types.js";
 import { type Baseline, type BaselineProvenance, captureBaseline, detectGateCommands, detectVacuousOracles, type GateEvidenceOptions, hostStarvedRerunNote } from "../gates/baseline.js";
 import { reobserveTestFiles, runGates, type GateContext, type GateEvent } from "../gates/run-gates.js";
-import { environmentFingerprint, getVerdictStore, isInfraResult, resolveStateDir } from "../gates/cache.js";
+import { environmentFingerprint, getVerdictStore, isInfraResult, resolveStateDir, verdictOrigin } from "../gates/cache.js";
 import { RUNNER_INFRA_DIAGNOSTIC_RE, timeoutShaped } from "../gates/timeout-shaped.js";
 import type { GateResult } from "../gates/types.js";
 import { filesGlob } from "../graph/files-glob.js";
@@ -37,14 +39,14 @@ import { distFingerprint } from "../cli/commands/version.js";
 import { augmentRetryBrief, consult, renderRetryGuidance, type ConsultInvocation, type ConsultVerdict } from "./consult.js";
 import { executionSignal, remainingExecutionMs, withExecutionBudget, withoutExecutionBudget, ExecutionBudgetExceeded } from "./execution-budget.js";
 import { repairSelectionDecision, repairSelectionEnabled } from "./repair-selection.js";
-import { failureDisposition, reserveInfrastructureRetry } from "./recovery.js";
+import { executedFullTest, failureDisposition, INTERRUPTED_RECHECK_EVENT, INTERRUPTED_RETRY_EVENT, interruptedLedger, isInterruptedResult, LISTING_INVOCATION_SUFFIX, readAccountingJournal, refusedLedger, reserveInfrastructureRetry, type InterruptedLedger } from "./recovery.js";
 import { runEnvironment } from "./environment.js";
 import { addDetachedWorktree, changeRepresented, cleanupRunWorktrees, declaredBaseContainment, dependencyLinkRefusal, deriveForkCap, FORK_CAP_ENV, gitHead, linkNodeModules, npmDependencyInstallCommand, npmDependencyManifestChanged, PRESERVE_COMMIT_SUBJECT, PRESERVE_PRODUCER_TRAILER, preserveWorktree, type PreserveProducer, producerFields, reflogWitness, removeWorktree, resolvedCapacity, runWithForkBudget, runWithVerificationBudget, type RunCapacity, sameCapacity, sameVerification, sh, shell, shGit, SUITE_PARENT_ENV, verificationProtocol, WorktreeAdminRaceError, WORKTREE_LAYOUT_CONTRACT, WORKTREES_DIR, worktreePath } from "./git.js";
 import { MASK } from "./redact.js";
 import { runInteractiveSeed, type InteractiveSeedResult } from "./interactive-seed.js";
 import { answerTrustDialog, type TrustAnswer } from "./trust-dialog.js";
 import { classifyRepairDisposition, namedPaths, resolveScopeHints } from "./repair-disposition.js";
-import { applyScopeAmendments, activeRetryBan, interruptedAttempt, RESUME_HARVEST_SOURCE, resumeHarvestAuthor, approvalAction, APPROVAL_REFUSED, effectiveEvents, foldDecisions, physicalLine, staleApprovals, classifyTaskFailure, classifyWorkerResultCause, deferredReviewFindings, engagementComparable, formatPriorFindingEvidence, GATE_FINGERPRINT_CAP, GATE_SATISFIED_RELEASE, identicalGateFailures, isDeferredFinding, journaledFailureBrief, Journal, loadRoutingProfile, newRunId, normalizeGateFailure, outstandingConsultGuidance, readableExcerpt, receiptOrigin, outstandingReviewFindings, pendingApprovalActions, pendingRechecks, pendingRepairFindings, phaseForGate, priorJudgments, readPriorRunEvidence, recordedTaskFailureKind, reraisedReviewChains, RECHECK_RELEASE, renderStructuredReviewFinding, repairReachSinceApproval, repairsSinceApproval, reviewRoundsSinceApproval, runHasEnded, standingRulings, structuredFindings, upheldFeedbackByTask, type CurrentAttemptGateReplay, type JournalEvent, type ParkKind, type ResumeState, type RetryMode, type StructuredFinding } from "./journal.js";
+import { applyScopeAmendments, activeRetryBan, interruptedAttempt, RESUME_HARVEST_SOURCE, resumeHarvestAuthor, approvalAction, APPROVAL_REFUSED, ATTEMPT_CAP_RELEASE, REVIEW_UPHELD_RELEASE, effectiveEvents, foldDecisions, physicalLine, staleApprovals, classifyTaskFailure, classifyWorkerResultCause, deferredReviewFindings, engagementComparable, formatPriorFindingEvidence, GATE_FINGERPRINT_CAP, GATE_SATISFIED_RELEASE, identicalGateFailures, isDeferredFinding, journaledFailureBrief, Journal, loadRoutingProfile, newRunId, normalizeGateFailure, outstandingConsultGuidance, readableExcerpt, receiptOrigin, outstandingReviewFindings, pendingApprovalActions, pendingRechecks, pendingRepairFindings, phaseForGate, priorJudgments, readPriorRunEvidence, recordedTaskFailureKind, reraisedReviewChains, RECHECK_RELEASE, renderStructuredReviewFinding, repairReachSinceApproval, repairsSinceApproval, reviewRoundsSinceApproval, runHasEnded, standingRulings, structuredFindings, upheldFeedbackByTask, type CurrentAttemptGateReplay, type JournalEvent, type ParkKind, type ResumeState, type RetryMode, type StructuredFinding } from "./journal.js";
 import { decisionCommands, type DecisionPark } from "./decision-verbs.js";
 import { foldOwedChecks, parseJournalText } from "./journal.js";
 import { readOperatorState } from "./operator-state.js";
@@ -55,8 +57,8 @@ import { checkIntegrationIdentity, ensureIntegration, integrationBranch, type In
 import { channelExclusion, climbChannel, inTaskPool, marginalCostRank, nextChannel, poolExhaustion, route, taskPool } from "../route/router.js";
 import { desiredPanes } from "./reconcile.js";
 import { readTierLiveness, readWatchBoard, supervisionPresencePath } from "./supervision.js";
+import { CpuLegReader, readOwnedProcessLiveness, type CpuLeg } from "./process-liveness.js";
 import {
-  harvestCpuFlatWindowMs,
   NUDGEABLE_ADAPTERS,
   PANE_READ_ROWS,
   StallProgressTracker,
@@ -118,7 +120,8 @@ export function heldWorkerTransport(driver: ExecutorDriver, slot: Slot, dispatch
     for (let retry = 0; ; retry++) {
       try { return await call(); }
       catch (error) {
-        if (!isTransportTimeout(error)) throw error;
+        // Row 360; D-2184 add.19: exhausted hc read responses hold the worker like transport timeouts.
+        if (!isTransportTimeout(error) && !(error instanceof HcReadUnavailableError)) throw error;
         held({ operation, retry, state: "held", error: String(error), backoffMs: delays[retry] });
         if (retry === delays.length) throw new HeldProbeExhausted(`${operation} transport retry budget exhausted`);
         await sleep(delays[retry]!);
@@ -361,6 +364,9 @@ function approvalReviewContext(events: JournalEvent[], taskId: string): string |
 // task exists to kill).
 const DISPATCH_ENACTMENT = new Set(["task-dispatch", "repair-dispatch", "resume-restore"]);
 const RECHECK_ENACTMENT = "recheck-battery";
+// Row 337 (D-2181 D2): the rows that settle an operator recheck's round, or fund work beyond it. Not
+// resume-restore: every restart writes it, before any settlement.
+const RECHECK_SETTLED = new Set(["task-human", "task-done", "task-dispatch", "repair-dispatch", "worker-launch", "repair-attempt"]);
 
 // The ONE approval that enacts without buying a worker: GATE_SATISFIED_RELEASE resumes from the
 // persisted task branch after the approved gate (execTask's satisfiedGate branch), whose first act
@@ -501,7 +507,8 @@ function classifySignalOnlyTest(g: GateResult): void {
 function classifyInfraResult(g: GateResult): void {
   classifySignalOnlyTest(g);
   if (g.pass || g.meta?.infra === true || !isInfraResult(g)) return;
-  g.meta = { ...g.meta, classification: "infra", infra: true };
+  // Row 337 (D-2181 D1): an interrupted red keeps its raw regression evidence beside its disposition.
+  g.meta = isInterruptedResult(g) ? { ...g.meta, disposition: "interrupted", infra: true } : { ...g.meta, classification: "infra", infra: true };
 }
 
 // OBS-1106 residual: a red whose assertion is a timeout or a wall-clock budget, and the runner-level
@@ -541,7 +548,9 @@ export function outsideScopeRed(t: Task, taskId: string, data: Record<string, un
   if (!t.files.length || data.gate !== "test" || data.pass !== false || data.skipped === true || data.commit !== commit
     // a failed producer — an infra row, a dirty-tree refusal, a recovery the runner could not finish —
     // never attributes anything, whatever files it lists
-    || data.infra === true || data.dirtyWorktree === true || data.recoveryBlocked !== undefined) return false;
+    // row 337 (D-2181 D4): by the shared infra predicate — an interrupted red, an infra classification, a ceiling
+    // kill or hang is inconclusive infrastructure, whose settlement precedes this park
+    || isInfraResult({ pass: false, meta: data }) || data.dirtyWorktree === true || data.recoveryBlocked !== undefined) return false;
   const attribution = repairSelectionDecision([{ event: "gate-result", taskId, data }], taskId, true);
   if (attribution.reason !== "known-failing-files" || attribution.requiredFiles.length === 0) return false;
   const text = readableExcerpt(String(data.details ?? ""));
@@ -556,6 +565,275 @@ export function outsideScopeRed(t: Task, taskId: string, data: Record<string, un
   if (named.some((file) => !attribution.requiredFiles.includes(file))) return false; // contradictory
   const inScope = filesGlob(t.files);
   return attribution.requiredFiles.every((file) => !inScope(file));
+}
+const isRecord = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
+const named = (v: unknown): v is string => typeof v === "string" && v !== "";
+/** Row 337 (D-2181 D3): the ONE strict positive schema — a whitelist, never a list of rejected shapes — for the
+ * accounting rows the force fold, the reuse-source resolver and the park wording read. FORCE and TEST RESULT rows
+ * count only when they match; one that does not, or a row naming no readable event, makes the history unprovable. */
+const Text = z.string().min(1);
+const AttemptNo = z.number().int().nonnegative();
+const unlisted = (v: string) => !v.endsWith(LISTING_INVOCATION_SUFFIX);
+const ForceRowSchema = z.looseObject({ event: z.literal("gate-fresh-forced"), taskId: Text,
+  data: z.looseObject({ gate: z.literal("test"), commit: Text, attempt: AttemptNo }) });
+const TestRowSchema = z.looseObject({ event: z.literal("gate-result"), taskId: Text, data: z.looseObject({
+  gate: z.literal("test"), commit: Text, attempt: AttemptNo, pass: z.boolean().optional(), skipped: z.literal(true).optional(),
+  fullSuite: z.boolean().optional(), reused: z.literal(true).optional(), replayedFromAttempt: AttemptNo.optional(),
+  originAttempt: AttemptNo.optional(), nonce: Text.optional(), subjectHead: Text.optional(),
+  testExecution: z.enum(["executed", "reused", "unexecuted"]).optional(),
+  evidenceReceipt: z.record(z.string(), z.unknown()).optional(), evidenceReceipts: z.array(z.record(z.string(), z.unknown())).optional(),
+}) });
+/** A started test invocation's receipt: every identity field present and exactly typed (its `subjectCommit` is the
+ * git commit it measured — never the gate subject digest). */
+const ReceiptSchema = z.looseObject({ invocationId: Text.refine(unlisted), nonce: Text.refine(unlisted).optional(),
+  subject: z.looseObject({ runId: Text, taskId: Text, attempt: AttemptNo, gate: z.literal("test"), subjectCommit: Text }),
+  termination: z.looseObject({ kind: z.enum(["exit", "signal", "timeout"]) }) });
+type Receipt = z.infer<typeof ReceiptSchema>;
+type TestRow = z.infer<typeof TestRowSchema>;
+const receiptsOf = (data: Record<string, unknown>): unknown[] =>
+  [data.evidenceReceipt, ...(Array.isArray(data.evidenceReceipts) ? data.evidenceReceipts : [])].filter((r) => r !== undefined);
+/** A receipt that CLAIMS a started test invocation (not a discovery listing, not a spawn that never started), read
+ * tolerantly: a claim that does not then bind as proof is contradictory evidence, never silently nothing. */
+const claimsStart = (r: unknown): boolean => isRecord(r) && isRecord(r.termination)
+  && ["exit", "signal", "timeout"].includes(r.termination.kind as string)
+  && !(typeof r.invocationId === "string" && !unlisted(r.invocationId)) && !(typeof r.nonce === "string" && !unlisted(r.nonce));
+/** The receipts a row carries that claim a started test invocation, parsed: a discovery listing or a spawn that never
+ * started proves nothing and invalidates nothing; a started claim that does not parse is `malformed`. */
+const startedReceipts = (data: Record<string, unknown>): { receipts: Receipt[]; malformed: boolean } => {
+  const claims = receiptsOf(data).filter(claimsStart);
+  const receipts = claims.flatMap((r) => { const p = ReceiptSchema.safeParse(r); return p.success ? [p.data] : []; });
+  return { receipts, malformed: receipts.length !== claims.length };
+};
+/** PROOF IS CONJUNCTIVE: the receipt names THIS run, the row's task, its integer attempt and the git commit the row's
+ * canonical subject was measured on (`subjectHead`). Any field missing, mistyped or disagreeing is not proof. */
+const bindsIdentity = (r: Receipt, row: TestRow, runId: string): boolean => r.subject.runId === runId && r.subject.taskId === row.taskId
+  && r.subject.attempt === row.data.attempt && r.subject.subjectCommit === row.data.subjectHead;
+/** Row 337 (D-2181 D3): the ONE execution-proof rule force consumption, `testExecution` and the wording share. `proof`:
+ * the primary receipt (the round's final invocation) binds and carries exactly the row's nonce (both absent on a plain
+ * shell gate), AND every other started receipt the row carries — a first pass before its continuation or infra rerun —
+ * binds the same identity, so a matching secondary never hides a contradictory primary. `none`: nothing claims a start. */
+const executionProof = (row: TestRow, runId: string): "proof" | "none" | "contradictory" => {
+  if (!receiptsOf(row.data).some(claimsStart)) return "none";
+  const { receipts, malformed } = startedReceipts(row.data);
+  const primary = ReceiptSchema.safeParse(row.data.evidenceReceipt);
+  return !malformed && primary.success && primary.data.nonce === row.data.nonce
+    && receipts.every((r) => bindsIdentity(r, row, runId)) ? "proof" : "contradictory";
+};
+const reuseFlagged = (d: Record<string, unknown>): boolean =>
+  d.reused === true || d.replayedFromAttempt !== undefined || d.testExecution === "reused";
+/** `testExecution` for a new test row, by the same proof rule the resolver reads. */
+const testExecutionOf = (data: Record<string, unknown>, taskId: string, runId: string): "executed" | "reused" | "unexecuted" => {
+  if (reuseFlagged(data)) return "reused";
+  const row = TestRowSchema.safeParse({ event: "gate-result", taskId, data });
+  return row.success && executionProof(row.data, runId) === "proof" ? "executed" : "unexecuted";
+};
+/** Invocation ownership: a row's tokens are its nonce and its receipts' invocation ids and EFFECTIVE nonces (a
+ * receipt's nonce, else its invocation id), one namespace; a row owns its invocation only when it is the FIRST row
+ * in the whole history to journal any of them — a later carrier is a copy. */
+const invocationTokens = (data: Record<string, unknown>): string[] => [data.nonce, ...receiptsOf(data).filter(isRecord)
+  .flatMap((r) => [r.invocationId, r.nonce ?? r.invocationId])].filter(named);
+/** One resolved test row. `exec`: a FULL owned execution; a PARTIAL one (a selected screen, `fullSuite` false or
+ * not boolean, a skipped or verdict-less row); a COPY (bound, but an earlier row journaled its invocation); a REUSE
+ * (cache hit or journal replay copy); UNEXECUTED (no receipt claims a started test invocation). */
+type ResolvedTest = { kind: "test"; at: number; taskId: string; commit: string; attempt: number; engagement: number; data: TestRow["data"];
+  exec: "full" | "partial" | "copy" | "reused" | "unexecuted" };
+type ResolvedRow = { kind: "force"; at: number; taskId: string; commit: string; attempt: number; engagement: number } | ResolvedTest;
+/** Row 337 (D-2181 D3): execution order is (engagement, attempt), never the bare attempt — an uphold or attempt-cap
+ * release resets the attempt counter, so an execution in a LATER engagement follows the force whatever its attempt,
+ * while within one engagement an older attempt journaled late still never does. */
+type Ordered = { engagement: number; attempt: number };
+const reaches = (row: Ordered, force: Ordered): boolean =>
+  row.engagement > force.engagement || (row.engagement === force.engagement && row.attempt >= force.attempt);
+export type HistoryResolution = { ok: true; rows: ResolvedRow[] } | { ok: false; reason: string; identity: boolean };
+/** Row 337 (D-2181 D3 D4): the ONE whole-history resolver every force, reuse-source and wording decision reads,
+ * validating EVERY row before any filter by task or gate. `identity: false` — a force whose task, subject or attempt
+ * cannot be read, so whose obligation it is cannot be established — outranks the rest. */
+export function resolveTestHistory(events: readonly unknown[], runId: string): HistoryResolution {
+  let soft: { reason: string; identity: boolean } | undefined;
+  const rows: ResolvedRow[] = [];
+  const seen = new Set<string>(); // every invocation token an earlier gate-result row journaled
+  // Engagements (row 337, D-2181 D3): a task's execution order restarts only where ITS attempt counter actually resets
+  // (Journal.replayResumeState; runDaemon's retryFailed): an EFFECTIVE attempt-cap or review-upheld release of that task
+  // — by the decision fold over physical lines, so a refused or unsound one resets nothing — or a retry-failed resume
+  // while that task stood failed by dispatch (recordedTaskFailureKind's rule: no red since its newest dispatch). A
+  // waive, a recheck, a plain resume and another task's reset keep counting.
+  let effective = new Set<number>();
+  try { effective = foldDecisions(events as JournalEvent[]).effective; }
+  catch { soft = { reason: "an approval row is unreadable", identity: true }; }
+  const engagements = new Map<string, number>();
+  const reset = (taskId: string) => engagements.set(taskId, (engagements.get(taskId) ?? 0) + 1);
+  const engagement = (taskId: string) => engagements.get(taskId) ?? 0;
+  const redSinceDispatch = new Map<string, boolean>(); // a dispatched task → a red gate-result since its newest dispatch
+  const failedByDispatch = new Set<string>(); // tasks whose newest status row is a task-failed by dispatch
+  for (const [at, e] of events.entries()) {
+    if (!isRecord(e) || !named(e.event)) { soft ??= { reason: "a journal row names no readable event", identity: true }; continue; }
+    const task = named(e.taskId) ? e.taskId : undefined;
+    if (task && ["task-dispatch", "task-done", "task-failed", "task-human"].includes(e.event)) failedByDispatch.delete(task);
+    if (task && e.event === "task-dispatch") redSinceDispatch.set(task, false);
+    if (task && e.event === "task-failed" && redSinceDispatch.get(task) === false) failedByDispatch.add(task);
+    if (task && e.event === "gate-result" && isRecord(e.data) && e.data.pass === false && redSinceDispatch.has(task)) redSinceDispatch.set(task, true);
+    if (task && e.event === "task-approved" && effective.has(physicalLine(events as JournalEvent[], at))) {
+      failedByDispatch.delete(task);
+      if (isRecord(e.data) && (e.data.release === ATTEMPT_CAP_RELEASE || e.data.release === REVIEW_UPHELD_RELEASE)) reset(task);
+    }
+    if (e.event === "run-resume" && isRecord(e.data) && e.data.retryFailed === true) {
+      for (const id of failedByDispatch) reset(id);
+      failedByDispatch.clear();
+    }
+    if (e.event === "gate-fresh-forced") {
+      const f = ForceRowSchema.safeParse(e);
+      if (!f.success) {
+        const d = isRecord(e.data) ? e.data : {};
+        return { ok: false, identity: false, reason: named(e.taskId) && d.gate === "test" && named(d.commit)
+          ? "a fresh-force row names no readable attempt" : "a fresh-force row names no readable task, gate or subject" };
+      }
+      rows.push({ kind: "force", at, taskId: f.data.taskId, commit: f.data.data.commit, attempt: f.data.data.attempt, engagement: engagement(f.data.taskId) });
+      continue;
+    }
+    if (e.event !== "gate-result") continue;
+    const d = isRecord(e.data) ? e.data : undefined;
+    const invocations = d ? invocationTokens(d) : [];
+    const owned = !invocations.some((k) => seen.has(k));
+    for (const k of invocations) seen.add(k);
+    if (!d || !named(e.taskId) || !named(d.gate)) { soft ??= { reason: "a gate-result row names no readable task or gate", identity: true }; continue; }
+    if (d.gate !== "test") continue;
+    const p = TestRowSchema.safeParse(e);
+    if (!p.success) { soft ??= { reason: "a test gate-result row does not match the accounting schema", identity: true }; continue; }
+    const row = p.data;
+    const proof = executionProof(row, runId);
+    let exec: ResolvedTest["exec"];
+    if (reuseFlagged(row.data)) exec = "reused";
+    else if (proof === "proof") {
+      // FULL: fullSuite exactly true, or no fullSuite flag and no selected tests with no selection decision or the
+      // battery's own readable full-scope one (its in-battery full job records scope, not the flag); fullSuite false,
+      // any non-boolean, a selected scope or an unreadable decision is never full. A refusal is no result either: a
+      // dirty-tree refusal, a blocked recovery or an infra non-verdict by the ONE shared predicate (a stale proof, a
+      // runner that died, an infra classification, a ceiling kill or hang) — only an interrupted red, which D2 bounds,
+      // is an executed result among the infra rows
+      const decision = row.data.selectionDecision;
+      const verdict = { pass: row.data.pass, meta: row.data, ...(typeof row.data.details === "string" ? { details: row.data.details } : {}) };
+      const refused = row.data.dirtyWorktree === true || row.data.recoveryBlocked !== undefined
+        || (isInfraResult(verdict) && !isInterruptedResult(verdict));
+      const full = typeof row.data.pass === "boolean" && row.data.skipped !== true && !refused && (row.data.fullSuite === true
+        || (row.data.fullSuite === undefined && row.data.selectedTests === undefined
+          && (decision === undefined || (isRecord(decision) && decision.scope === "full"))));
+      exec = !owned ? "copy" : full ? "full" : "partial";
+    } else if (proof === "none") exec = "unexecuted";
+    else { soft ??= { reason: "a test row's receipt names another run, task, attempt, nonce or subject commit", identity: true }; continue; }
+    // a new row's stated execution must agree with its evidence
+    const stated = row.data.testExecution;
+    if (stated !== undefined && stated !== (exec === "reused" ? "reused" : exec === "unexecuted" ? "unexecuted" : "executed")) {
+      soft ??= { reason: "a test row's testExecution contradicts its evidence", identity: true }; continue;
+    }
+    rows.push({ kind: "test", at, taskId: row.taskId, commit: row.data.commit, attempt: row.data.attempt, engagement: engagement(row.taskId), data: row.data, exec });
+  }
+  return soft ? { ok: false, ...soft } : { ok: true, rows };
+}
+/** Row 337 (D-2181 D3, OBS-1178): the strict accounting read the force fold and the park wording take, each row keeping
+ * its PHYSICAL journal line so the decision fold binds approvals and refusals by the line an operator's token names —
+ * never a compacted index a blank line shifts. A whole strict read's rows are the journal reader's own line-stamped
+ * rows (their prefix: the journal is append-only); a read with an unreadable line is unprovable whatever its lines,
+ * and a journal that shrank between the two reads fails the read. */
+export function readTestHistory(path: string): ReturnType<typeof readAccountingJournal> {
+  const read = readAccountingJournal(path);
+  if (!read.ok || read.unreadable > 0) return read;
+  try {
+    const sourced = parseJournalText(readFileSync(path, "utf8"));
+    return sourced.length < read.events.length ? { ok: false, error: "the journal shrank under the read" }
+      : { ...read, events: sourced.slice(0, read.events.length) };
+  } catch (error) {
+    return { ok: false, error: error instanceof Error ? error.message : String(error) };
+  }
+}
+/** `unprovable` with `identity: true`: only the history is unreadable — no reuse answers, the test measures.
+ * With `identity: false` a subject is unreadable, so nothing can be measured on it: park infra. */
+export type FreshForce = { kind: "none" } | { kind: "pending"; attempt: number } | { kind: "unprovable"; reason: string; identity: boolean };
+/** Row 337 (D-2181 D3): whether the subject's fresh test force is still owed, folded over the task's WHOLE history
+ * in journal order — never the latest round, a boolean in memory or an approval. Only an owned FULL execution on the
+ * same subject journaled after the force, in a later engagement or at an attempt no earlier than every force it answers
+ * (`reaches`), consumes it (whatever its verdict); duplicate force rows are one obligation. Unreadable lines or an
+ * unprovable history: never none. */
+export function pendingFreshForce(events: readonly JournalEvent[], runId: string, taskId: string, subject: unknown, unreadable = 0): FreshForce {
+  if (typeof subject !== "string" || !subject) return { kind: "unprovable", reason: "the gate subject is unreadable", identity: false };
+  const history = resolveTestHistory(events, runId);
+  if (!history.ok && !history.identity) return { kind: "unprovable", reason: history.reason, identity: false };
+  if (unreadable > 0) return { kind: "unprovable", reason: `${unreadable} unreadable journal line(s) could hide a force or its consumer`, identity: true };
+  if (!history.ok) return { kind: "unprovable", reason: history.reason, identity: true };
+  let owed: ResolvedRow | undefined; // the pending set's latest force; undefined when none is owed
+  for (const r of history.rows) {
+    if (r.taskId !== taskId || r.commit !== subject) continue;
+    if (r.kind === "force") owed = owed && !reaches(r, owed) ? owed : r;
+    else if (owed !== undefined && r.exec === "full" && reaches(r, owed)) owed = undefined;
+  }
+  return owed === undefined ? { kind: "none" } : { kind: "pending", attempt: owed.attempt };
+}
+/** Row 337 (D-2181 D4, D-2184 add.46): a reused row's source is its OWN stamped `originAttempt`, read from that field
+ * alone — no receipt it carries, no neighbouring row and no unprovable history can name, veto or erase it. */
+const stampedOrigin = (d: Record<string, unknown>): number | undefined =>
+  AttemptNo.safeParse(d.originAttempt).success ? d.originAttempt as number : undefined;
+/** The test gate-result row at `at`'s data, read leniently (for its reuse flags and stamp only). */
+const testRowData = (e: unknown): Record<string, unknown> | undefined =>
+  isRecord(e) && e.event === "gate-result" && isRecord(e.data) && e.data.gate === "test" ? e.data : undefined;
+/** Row 337 (D-2181 D3 D4, D-2184 add.46): the source a journal replay of the test row at journal index `at` carries
+ * unchanged — a reused row lends its own stamped `originAttempt` or none, an owned execution (full or selected screen
+ * alike) lends its own attempt, and a copy, an unexecuted row or an unprovable history lends none. Ownership decides
+ * only whether the lender EXECUTED; no receipt join ever names, vetoes or replaces a source. */
+export function replaySource(events: readonly JournalEvent[], runId: string, at: number): number | undefined {
+  const data = testRowData(events[at]);
+  if (data && reuseFlagged(data)) return stampedOrigin(data);
+  const history = resolveTestHistory(events, runId);
+  const lender = history.ok ? history.rows.find((r): r is ResolvedTest => r.kind === "test" && r.at === at) : undefined;
+  return lender?.exec === "full" || lender?.exec === "partial" ? lender.attempt : undefined;
+}
+/** Row 337 (D-2181 D4): what a test red row PROVES about its own execution, for park wording. */
+export type TestRedEvidence =
+  | { kind: "fresh" | "executed" | "screen" | "unproved"; interrupted: boolean }
+  | { kind: "reused"; source: number | undefined; interrupted: boolean };
+/** Row 337 (D-2181 D4): the subject's latest test red. A reuse names its own stamped originAttempt, else unknown,
+ * whatever any receipt or other row says (D-2184 add.46: the closed source rule — never a journal receipt join).
+ * Execution is classified from the strict resolver — fresh only for an owned full execution after the subject's
+ * force; an unprovable history, an unexecuted row or a copy proves nothing. Never details prose, timing, a
+ * phase-start, an approval or a force row. */
+export function testRedEvidence(events: readonly JournalEvent[], runId: string, taskId: string, subject: string, unreadable = 0): TestRedEvidence {
+  let at = events.length - 1;
+  for (; at >= 0; at--) {
+    const d = testRowData(events[at]);
+    if (d && events[at]!.taskId === taskId && d.commit === subject && d.pass === false && d.skipped !== true) break;
+  }
+  if (at < 0) return { kind: "unproved", interrupted: false };
+  const data = events[at]!.data;
+  const interrupted = isInterruptedResult({ pass: false, meta: data });
+  if (reuseFlagged(data)) return { kind: "reused", source: stampedOrigin(data), interrupted };
+  // a dropped line could hide a force, a contradicting receipt or the consumer: never executed, fresh or screen
+  if (unreadable > 0) return { kind: "unproved", interrupted: false };
+  const history = resolveTestHistory(events, runId);
+  const row = history.ok ? history.rows.find((r): r is ResolvedTest => r.kind === "test" && r.at === at) : undefined;
+  if (!history.ok || !row) return { kind: "unproved", interrupted: false };
+  // fresh only for a red executed AFTER the subject's force: an older attempt journaled late never is
+  const forces = history.rows.filter((r) => r.kind === "force" && r.at < at && r.taskId === taskId && r.commit === subject);
+  const forced = forces.length > 0 && forces.every((f) => reaches(row, f));
+  if (row.exec === "full") return { kind: forced ? "fresh" : "executed", interrupted };
+  // a partial run is worded a screen only from selection evidence; any other not-full shape proves nothing
+  const screen = row.exec === "partial" && (Array.isArray(row.data.selectedTests)
+    || (isRecord(row.data.selectionDecision) && row.data.selectionDecision.scope === "selected"));
+  return { kind: screen ? "screen" : "unproved", interrupted };
+}
+/** Row 337 (D-2181 D4): the closed park wording table over that evidence. `outside` is the red's proven
+ * attribution wholly outside files[]; the fresh sentence is the existing outside-scope reason, byte-for-byte. */
+export function testRedWording(evidence: TestRedEvidence, outside: boolean): string {
+  const tail = outside ? " only in files outside files[] — no repair can reach them" : " (not attributed wholly outside files[])";
+  if (evidence.kind === "reused") {
+    const source = evidence.source === undefined ? "reused verdict; source attempt unknown" : `reused attempt ${evidence.source}'s verdict`;
+    return evidence.interrupted ? `test: ${source}; interrupted, inconclusive and not re-executed`
+      : `test: ${source}; not re-executed — its recorded red failed${tail}`;
+  }
+  if (evidence.kind === "unproved") return "test: the red's execution and attribution are unproved (no started full-suite invocation or reuse source is recorded)";
+  if (evidence.kind === "screen") return evidence.interrupted
+    ? "test: an executed selected-test screen was interrupted — inconclusive infrastructure, not a worker defect; no full run of this subject was journaled"
+    : "test: an executed selected-test screen failed; no full run of this subject was journaled";
+  if (evidence.interrupted) return "test: an executed full test run was interrupted — inconclusive infrastructure, not a worker defect";
+  if (evidence.kind === "fresh" && outside) return `test: a fresh re-execution of the unchanged subject failed again${tail}`;
+  return `test: an executed full test run failed${tail}`;
 }
 /** C: every test red a round journaled on `commit` is an out-of-scope red (none means none). */
 const allOutsideScopeReds = (t: Task, rows: readonly JournalEvent[], commit: string): boolean => {
@@ -661,6 +939,24 @@ const GATE_TELEMETRY_KEYS = ["durationMs", "load1Start", "load1End", "load1Max",
 
 const gateMeasurement = (meta: Record<string, unknown> = {}): Record<string, unknown> =>
   Object.fromEntries(GATE_TELEMETRY_KEYS.filter((k) => meta[k] !== undefined).map((k) => [k, meta[k]]));
+
+/** Row 337 (D-2181 D2): an interrupted red is inconclusive — never an occurrence of a behavioral failure
+ * fingerprint, so it neither spends an escalation rung, arms the repeated-failure guard nor suppresses a
+ * timeout refresh. Every fingerprint-accounting caller reads through this. */
+const conclusiveGateFailures = (events: JournalEvent[], taskId: string, gate: string, normalized: string): number =>
+  identicalGateFailures(events.filter((e) => !(e.event === "gate-result" && isInterruptedResult({ pass: e.data.pass, meta: e.data }))),
+    taskId, gate, normalized);
+
+/** Row 337 (D-2181 D2): a persisted gate row settled as the result it recorded — never re-measured. An
+ * explicit interrupted disposition outranks a contradicting pass: it is restored red, never green proof. */
+const restoreGateRow = (data: Record<string, unknown>): GateResult => {
+  const restored: GateResult = { gate: data.gate as GateName, pass: data.pass === true && !isInterruptedResult({ pass: data.pass, meta: data }),
+    details: String(data.details ?? ""),
+    meta: Object.fromEntries(Object.entries(data).filter(([key]) =>
+      !(GATE_TELEMETRY_KEYS as readonly string[]).includes(key) && key !== "capacity")) };
+  classifyInfraResult(restored);
+  return restored;
+};
 
 /**
  * T4 (OBS-265): the journal with the review objections a round did NOT hinge on removed. Judge and
@@ -3602,7 +3898,32 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
   // The base each task was dispatched on: the integration branch moves when a sibling merges, the pin does not.
   const taskBases = new Map<string, string>();
 
+  // Row 337 (D-2181 D4): the ONE renderer at the park seam. Whatever triggers a gate-chain park — a gate red, a
+  // consult's human or decompose verdict, the fingerprint cap, an exhausted reroute or ladder — when the parking
+  // round's latest red is a test red it names what that red PROVES (executed, screen, reused and from which
+  // source, or unproved) beside the trigger's own reason, never per caller. An infra park keeps its settlement
+  // wording; a round a later worker launch superseded is not the parking round.
+  const TEST_RED_PARKS: ReadonlySet<ParkKind> = new Set(["gate-fail", "reroute-exhausted", "ladder-exhausted", "attempt-cap"]);
+  // The park's evidence reads the journal STRICTLY, as the force fold does: a failed read or a dropped line
+  // proves nothing, so the wording is unproved, never executed, fresh or screen (row 337, D-2181 D3 D4).
+  const parkTestEvidence = (t: Task, subject: string): TestRedEvidence => {
+    const read = readTestHistory(join(journal.dir, "journal.jsonl"));
+    return read.ok ? testRedEvidence(read.events, runId, t.id, subject, read.unreadable) : { kind: "unproved", interrupted: false };
+  };
+  const withTestRedWording = (t: Task, reason: string): string => {
+    const own = journal.read().filter((e) => e.taskId === t.id);
+    const round = own.slice(own.map((e) => e.event === "phase-start" && e.data.phase === "gates").lastIndexOf(true) + 1);
+    const red = round.filter((e) => e.event === "gate-result" && e.data.pass === false && e.data.skipped !== true).at(-1);
+    if (red?.data.gate !== "test" || round.some((e) => e.event === "worker-launch")) return reason;
+    const subject = typeof red.data.commit === "string" ? red.data.commit : "";
+    const wording = testRedWording(parkTestEvidence(t, subject), allOutsideScopeReds(t, round, subject));
+    if (reason.includes(wording)) return reason;
+    const at = reason.indexOf(" — release with `");
+    return at < 0 ? `${reason} — ${wording}` : `${reason.slice(0, at)} — ${wording}${reason.slice(at)}`;
+  };
+
   const park = async (t: Task, reason: string, kind: ParkKind, assignment: Assignment | null, attempts: number, startMs: number, gateFails = 0, consults = 0, tokens?: TokenUsage, metered = 0, retryMode: RetryMode = "fresh", details: Record<string, unknown> = {}) => {
+    if (TEST_RED_PARKS.has(kind)) reason = withTestRedWording(t, reason);
     // OBS-979: a worker refusal can identify the missing authoring scope even when gates
     // subsequently supply the park's disposition. Keep that actionable path on the park itself.
     const worker = journal.read().reverse().find((e) => e.taskId === t.id && e.event === "worker-result");
@@ -3654,7 +3975,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     const red = priorRows.find((e) => e.event === "gate-result" && e.data.gate === "test" && e.data.pass === false
       && e.data.skipped !== true && e.data.commit === commit && typeof e.data.details === "string" && timeoutShaped(e.data.details));
     return red !== undefined
-      && identicalGateFailures(journal.read(), t.id, "test", normalizeGateFailure(String(red.data.details))) < GATE_FINGERPRINT_CAP;
+      && conclusiveGateFailures(journal.read(), t.id, "test", normalizeGateFailure(String(red.data.details))) < GATE_FINGERPRINT_CAP;
   };
   // C: an unchanged cached test red attributed wholly outside files[] is re-executed ONCE per journaled
   // subject — the worker cannot repair those files, so a copy of the red would only buy another round.
@@ -3668,8 +3989,10 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     const own = journal.read().filter((e) => e.taskId === t.id);
     return allOutsideScopeReds(t, own.slice(own.map((e) => e.event === "phase-start" && e.data.phase === "gates").lastIndexOf(true) + 1), commit);
   };
-  const outsideScopePark = (t: Task) => gateFailApprovalReason(t.id,
-    "test: a fresh re-execution of the unchanged subject failed again only in files outside files[] — no repair can reach them");
+  // Row 337 (D-2181 D4): worded from what the subject's latest test red PROVES (testRedEvidence), never from a
+  // force marker: the fresh re-execution sentence only for a full execution after the subject's force.
+  const outsideScopePark = (t: Task, commit: string) => gateFailApprovalReason(t.id,
+    testRedWording(parkTestEvidence(t, commit), true));
 
   // OBS-1106 residual: before a timeout or wall-budget red accompanied by runner infra diagnostics is
   // charged, its attributed failing files are re-run ONCE, on the same checkout, under the suite
@@ -3678,7 +4001,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
   // diagnostic, never a verdict, so it can neither green the gate nor permit a merge. Returns true
   // when it parked.
   const adjudicateInfraShapedRed = async (t: Task, results: GateResult[], wt: string, subject: string, attempt: number,
-    replayed: boolean, parkInfra: (reason: string) => Promise<void>): Promise<boolean> => {
+    replayed: boolean, parkInfra: (reason: string) => Promise<void>, singleExecution?: true): Promise<boolean> => {
     const red = results.find((g) => g.gate === "test" && gateFailed(g) && !isInfraResult(g)
       && timeoutShaped(g.details) && RUNNER_INFRA_DIAGNOSTIC_RE.test(g.details));
     if (!red || commands.test === undefined) return false;
@@ -3698,6 +4021,13 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     let files: string[] = [];
     let outcome: "reproduced" | "passed" | "ambiguous" | "unattributed" = "unattributed";
     let selection: string[] | undefined;
+    if (!recorded && singleExecution) {
+      // Row 337 (D-2181 D2): the reserved interruption retry and an interrupted subject's operator recheck
+      // are each ONE full execution; an isolated re-observation would be another. Unadjudicated, the red
+      // keeps the fail-closed side of this table: an infra park, never a worker charge or a rerun.
+      await parkInfra(`test: timeout-shaped red with runner infra diagnostics on the single interruption retry or operator recheck execution; no isolated rerun adds another execution (row 337, D-2181 D2), so the red stands unresolved — recheck to re-measure:\n${readableExcerpt(red.details)}`);
+      return true;
+    }
     if (recorded) {
       files = Array.isArray(recorded.data.files) ? recorded.data.files.filter((f): f is string => typeof f === "string") : [];
       outcome = ["reproduced", "passed", "unattributed"].includes(String(recorded.data.outcome)) ? recorded.data.outcome as typeof outcome : "ambiguous";
@@ -4107,8 +4437,12 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     // Keep the measured siblings, including a red judge, while replacing only a missing review.
     // Every seat that returned no verdict is excluded for this task — a launch failure for this round only,
     // after its one bounded relaunch — and a retired seat for the run, so the loop is bounded by the eligible pool.
-    const runReviewRecovery = async (task: Task, ctx: GateContext, allowSelection = true) => {
-      ctx.authorizeInfraRetry = cfg.executionPolicy?.boundedInfrastructure
+    const runReviewRecovery = async (task: Task, ctx: GateContext, allowSelection = true, singleExecution = false) => {
+      // Row 337 (D-2181 D2): the reserved interruption retry and an interrupted subject's operator recheck
+      // are each exactly ONE full execution — no in-gate infra or host-starved remeasurement and no
+      // stale-proof replacement job adds another (runGates enforces it from this one flag).
+      ctx.singleExecution = singleExecution ? true : undefined;
+      ctx.authorizeInfraRetry = !singleExecution && cfg.executionPolicy?.boundedInfrastructure
         ? (subject, cause) => reserveInfrastructureRetry(journal.read(), task.id, subject, journal.append.bind(journal), cause) : undefined;
       if (repairSelection && allowSelection) {
         const decision = repairSelectionDecision(journal.read(), task.id, true);
@@ -4125,6 +4459,8 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       ctx.priorJudgments = priorJudgments(journal.read(), task.id);
       // Resume and ordinary verification share this boundary. Count persisted rounds so a
       // resumed daemon cannot reuse a previous round's identity within the same attempt.
+      // Row 337 (D-2181 D3): the attempt and subject a verdict this round executes is stored under.
+      ctx.provenance = gateSubject ? { runId, taskId: task.id, attempt: gateSubject.attempt, subject: gateSubject.commit } : undefined;
       ctx.buildReceiptIdentity = {
         runId, taskId: task.id, attempt: gateSubject?.attempt ?? 0,
         gateRound: journal.read().filter((row) => row.taskId === task.id
@@ -4247,7 +4583,18 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     // decision reads identity instead of re-parsing prose, and line-number churn is not a new finding.
     // One helper, both onGate sites (satisfied-gate resume + main attempt loop).
     // `journaledGates` narrows replayMeasurement to the gates an interrupted round already journaled (C).
-    let gateSubject: { commit: string; attempt: number; replayMeasurement?: true; journaledGates?: readonly string[]; replayedFromAttempt?: number } | undefined;
+    let gateSubject: { commit: string; head?: string; attempt: number; replayMeasurement?: true; journaledGates?: readonly string[]; replayedFromAttempt?: number } | undefined;
+    // Row 337 (D-2181 D2): the reserved retry is ONE fresh, complete, test-only job on the same subject
+    // through the ordinary gate round (suite admission, lease, cleanup). Its row is journaled on its own
+    // as an executed measurement — never a replay of the round that reserved it — and selects nothing.
+    const retestInterrupted = (task: Task, ctx: GateContext) => async (): Promise<GateResult | undefined> => {
+      if (gateSubject) gateSubject = { commit: gateSubject.commit, head: gateSubject.head, attempt: gateSubject.attempt };
+      journal.phaseStart(task.id, "gates");
+      const { results } = await withCommandContext(task.id, async () =>
+        runReviewRecovery({ ...task, gates: ["test"] }, { ...ctx, selectTests: false, cachedRedBypass: undefined }, false, true));
+      results.forEach(classifyInfraResult);
+      return results.find((g) => g.gate === "test");
+    };
     const journalGateResult = (g: GateResult) => {
       const blocking = g.meta?.infra !== true && gateFailed(g) && (g.gate === "review" || g.gate === "acceptance");
       // T2: a review that PASSED while DEFERRING a concern still recorded a defect — the prompt
@@ -4276,7 +4623,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       // row instead of reading a missing `pass` as a PASS that settles every open blocking finding.
       const noVerdictReview = g.gate === "review" && g.meta?.noVerdict === true;
       const unverdicted = (g.meta?.skipped === true && !g.pass) || noVerdictReview;
-      journal.append("gate-result", t.id, {
+      journal.append("gate-result", t.id, withTestProvenance(g, {
         gate: g.gate, ...(unverdicted ? {} : { pass: g.pass }), details: g.details,
         // R41: the protocol + effective lifecycle policy the gate MEASURED under, stamped by run-gates
         // for the worktree it ran in; absent only for a row that never went through the battery.
@@ -4298,9 +4645,10 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           ...(typeof g.meta.producer === "string" ? { producer: g.meta.producer } : {}),
           ...(typeof g.meta.producerAttempt === "number" ? { producerAttempt: g.meta.producerAttempt } : {}),
         } : {}),
-        ...((cfg.executionPolicy || repairSelection) && !g.pass ? { disposition: failureDisposition(g) } : {}),
+        ...((cfg.executionPolicy || repairSelection || isInterruptedResult(g)) && !g.pass ? { disposition: failureDisposition(g) } : {}),
         ...Object.fromEntries(["runnerInfraRerun", "judgeIndependent", "hostStarvedRerun", "recoveryBlocked", "failingFiles", "selectionDecision", "failureEvidence",
-          "forgivenFingerprints", "freshFingerprints", "baselineProvenance", "oracles", "judgment", "adjudication", "judgeDisagreement", "interruptions"]
+          "forgivenFingerprints", "freshFingerprints", "baselineProvenance", "oracles", "judgment", "adjudication", "judgeDisagreement", "interruptions",
+          "failureWindows", "interruptedReason"]
           .filter((key) => g.meta?.[key] !== undefined).map((key) => [key, g.meta![key]])),
         // OBS-540: preserve terminal-vs-retryable infra exactly. normalizeGateOutcome deliberately
         // defaults a legacy infra row to retryable, so dropping an explicit false here reverses the
@@ -4380,7 +4728,21 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         // nothing.
         ...(g.capacity ? { capacity: g.capacity }
           : g.meta?.dirtiedBy === g.gate ? { capacity: resolvedCapacity() } : {}),
-      });
+      }));
+    };
+    // Row 337 (D-2181 D3): a test row names its own execution, and a reused one the attempt that EXECUTED it
+    // when that is proven for this run, task and subject — its cache record's origin or the replayed row's —
+    // never the current attempt. Diagnostic provenance only: verification identity checks stay authoritative.
+    const withTestProvenance = (g: GateResult, data: Record<string, unknown>): Record<string, unknown> => {
+      if (g.gate !== "test") return data;
+      // the git commit this round's canonical subject was measured on: a receipt binds only to it (row 337, D-2181 D3)
+      const stamped = gateSubject?.head ? { ...data, subjectHead: gateSubject.head } : data;
+      const testExecution = testExecutionOf(stamped, t.id, runId);
+      const origin = verdictOrigin(g.meta);
+      const originAttempt = testExecution !== "reused" ? undefined
+        : data.replayedFromAttempt !== undefined ? (Number.isInteger(g.meta?.originAttempt) ? g.meta!.originAttempt : undefined)
+        : origin && origin.runId === runId && origin.taskId === t.id && origin.subject === data.commit ? origin.attempt : undefined;
+      return { ...stamped, testExecution, ...(originAttempt === undefined ? {} : { originAttempt }) };
     };
     // R3 (OBS-186): judge ‖ review are launched together and publish in COMPLETION order
     // (run-gates.ts) — a race. Three oracles assert the opposite: a scripted run's journal is
@@ -4489,7 +4851,8 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     // survives all three (same read as upheldFeedbackByTask above).
     let testGateFailed = journal.read().some((e) =>
       e.event === "gate-result" && e.taskId === t.id && e.data.gate === "test" && e.data.pass === false
-      && !(cfg.executionPolicy?.boundedInfrastructure && e.data.disposition === "infrastructure"));
+      && !(cfg.executionPolicy?.boundedInfrastructure && e.data.disposition === "infrastructure")
+      && !isInterruptedResult({ pass: e.data.pass, meta: e.data })); // row 337: inconclusive, never selection distrust
     let retryMode: RetryMode = "fresh";
     // v2.6.6 A: the ONE post-result settlement both gate loops call. Order is the contract:
     // satisfied → merge (tip-moved once regates, twice parks; a conflict goes back to the caller), else
@@ -4497,6 +4860,51 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     // is the caller's "red". Every declared resume/live difference arrives as a parameter; nothing here
     // normalizes one. Preparation, replay, conflict handling, repair funding, feedback and cleanup stay
     // in the callers.
+    // Row 337 (D-2181 D2): this task's interruption retry accounting on one subject, read STRICTLY: an
+    // unreadable journal or a dropped line proves nothing, and a consumed reservation is never replenished.
+    // Row 337 (D-2181 D3): the subject's pending fresh force, folded over the journal read STRICTLY: a dropped
+    // line or a failed read is unprovable — never a silently consumed, refilled or absent force — so no cached
+    // or replayed test verdict answers and the subject measures; an unreadable subject parks infra.
+    const freshForce = (subject: string): FreshForce => {
+      const read = readTestHistory(join(journal.dir, "journal.jsonl"));
+      return read.ok ? pendingFreshForce(read.events, runId, t.id, subject, read.unreadable)
+        : { kind: "unprovable", reason: `the journal could not be read: ${read.error}`, identity: true };
+    };
+    const forceUnprovable = (force: Extract<FreshForce, { kind: "unprovable" }>) =>
+      `test: the pending fresh-force accounting is unprovable (${force.reason}); no cached or replayed verdict answers and no test runs on a guessed identity (row 337, D-2181 D3)`;
+    const interruptedAccounting = (subject: string): InterruptedLedger =>
+      interruptedLedger(readAccountingJournal(join(journal.dir, "journal.jsonl")), t.id, subject);
+    const interruptedParkReason = (ledger: InterruptedLedger, operatorRun: boolean): string => {
+      const { state } = ledger;
+      const seen = ledger.observations.map((o) => `attempt ${String(o.attempt)}: ${o.interruptions
+        .map((i) => `${i.kind} ${Math.round(i.wallMs)}ms wall / ${Math.round(i.monoMs)}ms monotonic`).join(", ") || "interruption record unreadable"}`)
+        .join("; ") || (state.kind === "unprovable" ? "unreadable" : "none recorded");
+      const why = state.kind === "unprovable" ? `interruption retry accounting is unprovable (${state.reason}); no retry on a guessed identity`
+        : state.kind === "reserved" ? `the interruption retry reserved at attempt ${state.attempt} has no executed full test result (missing result); the reservation is not reset and no further automatic test job is bought`
+        : state.kind === "consumed" ? `interrupted again after the one automatic retry reserved at attempt ${state.attempt} was consumed; no third automatic test job`
+        : operatorRun ? "the operator-funded fresh full test job was interrupted"
+        : "interrupted without an executed full result or beside another unsatisfied gate; no automatic retry";
+      return `test: interrupted, inconclusive infrastructure and not a worker defect: ${why}; interruption observations: ${seen}`
+        + (state.kind === "unprovable" ? " — no approval executes over it while the journal cannot prove it" : " — approve a recheck to fund one fresh full test job");
+    };
+    const interruptedParkDetails = (ledger: InterruptedLedger) => ({ interruptedRetry: ledger.state.kind, interruptedObservations: ledger.observations });
+    // Row 337 (D-2181 D2): an interrupted subject's operator recheck is ONE execution across restart. Its
+    // claim is journaled BEFORE its battery launches; from then until that round settles (a park, merge,
+    // repair or dispatch) or a newer decision supersedes it, no restart launches another battery under the
+    // same approval — before or after its recheck-battery enactment. An executed full test row after the
+    // decision proves a started execution as the claim does (one an older daemon never claimed). Read on the
+    // requested subject only: another subject's valid claim or execution is not this one's. The task's whole
+    // accounting was already validated at its boundary (refusedLedger), before any claim was looked up.
+    const recheckClaim = (subject: string): { kind: "none" } | { kind: "open"; rows: JournalEvent[] } => {
+      const events = journal.read();
+      const decision = effectiveEvents(events).filter((e) => e.taskId === t.id && e.event === "task-approved").at(-1);
+      if (decision?.data.release !== RECHECK_RELEASE) return { kind: "none" };
+      const own = events.slice(events.indexOf(decision) + 1).filter((e) => e.taskId === t.id);
+      const started = own.findIndex((e) => e.data.commit === subject
+        && (e.event === INTERRUPTED_RECHECK_EVENT || (e.event === "gate-result" && executedFullTest(e.data))));
+      return started < 0 || own.slice(started).some((e) => RECHECK_SETTLED.has(e.event)) ? { kind: "none" }
+        : { kind: "open", rows: own.filter((e) => e.event === "gate-result") };
+    };
     const settleResults = async (results: GateResult[], p: {
       wt: string; taskBase: string; taskBranch: string; gated: string; commit: string; outsideScopeForced: boolean;
       author: Assignment; attempts: number; infraReason: (g: GateResult) => string;
@@ -4505,9 +4913,29 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       beforeMerge?: () => void; firstAttemptOk: boolean;
       metering: { tokens?: TokenUsage | undefined; meteredAttempts?: number | undefined };
       ancestorOnly?: true; // no gates ran: mergeTask may only find the commit already in E, never publish it
-    }): Promise<{ kind: "merged" | "regate" | "parked" | "red" } | { kind: "conflict"; conflict: string | undefined }> => {
+      /** Row 337 (D-2181 D2): the one fresh, complete, test-only execution an interrupted full red may
+       * buy. Absent on an operator recheck, which is its own single operator-funded execution. */
+      retest?: () => Promise<GateResult | undefined>;
+      /** Row 337 (D-2181 D2): these results ARE the reserved retry or an interrupted subject's operator
+       * recheck — exactly one full execution, so no isolated re-observation launches another. */
+      singleExecution?: true;
+    }): Promise<{ kind: "merged" | "regate" | "parked" } | { kind: "red"; results: GateResult[] } | { kind: "conflict"; conflict: string | undefined }> => {
       const parkAs = (reason: string, kind: ParkKind, details?: Record<string, unknown>) =>
         park(t, reason, kind, p.author, p.attempts, startMs, gateFails, consults, tokens, metered, retryMode, details);
+      // Row 337 (D-2181 D3): the merge seam every green battery crosses, live, recovery and resume alike. A battery
+      // that carried test merges only once the subject's fresh force is answered by a proven full execution — the
+      // whole-history fold reads none; under unprovable accounting only this battery's own executed full test does.
+      // A skipped (no test command), reused or refused test never answers it; the operator's waiver of the test
+      // gate itself leaves test out of the battery and still stands.
+      const test = results.find((g) => g.gate === "test");
+      const owed = test && results.every(gateSatisfied) ? freshForce(p.commit) : undefined;
+      if (owed && owed.kind !== "none" && (owed.kind === "pending" || !owed.identity
+        || !executedFullTest({ ...test!.meta, gate: "test", pass: test!.pass, evidenceReceipt: test!.evidenceReceipt, evidenceReceipts: test!.evidenceReceipts }))) {
+        await parkAs(`test: the subject's ${owed.kind === "pending" ? "pending fresh force" : `fresh-force accounting, which is unprovable (${owed.reason}),`}`
+          + " was not answered by a proven full test execution — a skipped, reused or refused test never answers it, so nothing merges"
+          + " (row 337, D-2181 D3) — configure a test command and approve a recheck to fund one fresh full test job", "infra");
+        return { kind: "parked" };
+      }
       if (results.every(gateSatisfied)) {
         p.beforeMerge?.();
         // §7.2: the author fold is taken BEFORE the serializer; a throw here propagates before any publication.
@@ -4560,6 +4988,29 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         await parkAs(gateFailApprovalReason(t.id, unavailableReview.details, true), "gate-fail");
         return { kind: "parked" };
       }
+      // Row 337 (D-2181 D2): an interrupted full test red is inconclusive. Its first observation buys
+      // exactly one durable, reserved, test-only re-execution of the same subject; anything else parks
+      // infra here — before worker charging, fingerprint caps, consult or the outside-scope park.
+      const interrupted = results.find((g) => g.gate === "test" && gateFailed(g) && isInterruptedResult(g));
+      if (interrupted) {
+        const ledger = interruptedAccounting(p.commit);
+        if (ledger.state.kind === "unreserved" && p.retest && executedFullTest({ ...interrupted.meta, gate: "test", pass: false,
+          evidenceReceipt: interrupted.evidenceReceipt, evidenceReceipts: interrupted.evidenceReceipts })
+          && results.every((g) => g === interrupted || gateSatisfied(g))) {
+          journal.append(INTERRUPTED_RETRY_EVENT, t.id, { commit: p.commit, attempt: gateSubject?.attempt ?? p.attempts });
+          const retried = await p.retest();
+          // Only an EXECUTED full result consumes the reservation; a refusal that ran no test leaves the
+          // missing-result cell, never a behavioral settlement of an unexecuted red.
+          const after = interruptedAccounting(p.commit);
+          if (retried && after.state.kind === "consumed") {
+            return settleResults(results.map((g) => g === interrupted ? retried : g), { ...p, retest: undefined, singleExecution: true });
+          }
+          await parkAs(interruptedParkReason(after, false), "infra", interruptedParkDetails(after));
+          return { kind: "parked" };
+        }
+        await parkAs(interruptedParkReason(ledger, !p.retest), "infra", interruptedParkDetails(ledger));
+        return { kind: "parked" };
+      }
       // OBS-1106: same predicate as classification — an infra replay is parked, never repaired.
       const infra = results.find((g) => gateFailed(g) && isInfraResult(g));
       if (infra) {
@@ -4577,9 +5028,9 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         return { kind: "parked" };
       }
       if (await adjudicateInfraShapedRed(t, results, p.wt, p.commit, p.reobserve.attempt, p.reobserve.replayed,
-        (reason) => parkAs(reason, "infra"))) return { kind: "parked" };
+        (reason) => parkAs(reason, "infra"), p.singleExecution)) return { kind: "parked" };
       if (p.outsideScopeForced && freshOutsideScopeRed(t, p.commit)) {
-        await parkAs(outsideScopePark(t), "gate-fail");
+        await parkAs(outsideScopePark(t, p.commit), "gate-fail");
         return { kind: "parked" };
       }
       // OBS-547: who pays for this red is decided by the run's collateral prediction (see
@@ -4587,7 +5038,9 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       const d = p.disposition();
       if (await dispositionScopeRed(t, results, d.author, d.attempt, startMs, gateFails, consults, tokens, metered,
         retryMode, await treeOrDiffPaths(p.taskBase, p.wt))) return { kind: "parked" };
-      return { kind: "red" };
+      // Row 337 (D-2181 D2): the EFFECTIVE results — a reserved retry's execution replaces the interrupted
+      // red it re-measured — so every repair brief and battery is built from the new evidence only.
+      return { kind: "red", results };
     };
     let lastContextTokens: number | undefined; // v1.23 reset signal, including stalled/quota attempts
     // v1.29: only a gate-failed attempt can seed same-session retry. The next attempt consumes this
@@ -4706,6 +5159,16 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     // OBS-130/T15: both gate-resume paths consume the persisted task branch with no worker dispatch.
     // An operator approval skips its exact failed gate by authority; observed results skip only the
     // contiguous green prefix whose recorded commit is still the task branch tip.
+    // Row 337 (D-2181 D2): the ONE validation boundary. A resumed or approved task's interruption accounting
+    // is read strictly here, before replay-candidate discovery, harvest, recheck-claim lookup or any choice
+    // between gate replay and worker dispatch; unprovable, it parks infra and executes nothing, whether or
+    // not any candidate, subject or claim would be found.
+    const refused = rs || approvalAction ? refusedLedger(readAccountingJournal(join(journal.dir, "journal.jsonl")), t.id) : undefined;
+    if (refused) {
+      await park(t, interruptedParkReason(refused, false), "infra", assignment, rs?.attempts ?? 0, startMs, gateFails, consults, tokens,
+        metered, retryMode, interruptedParkDetails(refused));
+      return;
+    }
     let satisfiedGate = satisfiedGates.get(t.id);
     const replayedGates = fundedRerun ? undefined : replayedGateResults.get(t.id);
     const recheck = approvalAction?.authority === "battery";
@@ -5001,6 +5464,8 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       const declaredGates = GATE_NAMES.filter((gate) => t.gates.includes(gate));
       const reused: GateName[] = [];
       let remainingGates: GateName[];
+      // Row 337 (D-2181 D2): false when T15 below refuses replayed rows measured in another world.
+      let replayComparable = true;
       if (recheck) {
         remainingGates = declaredGates.filter((gate) => gate !== satisfiedGate);
       } else if (harvestAuthor) {
@@ -5054,9 +5519,12 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
             commit: replayedGates!.commit, recorded: replayedVerifications, resolved: replayVerification,
           });
         }
+        replayComparable = sameWorld && sameProtocol;
         let reusable = sameWorld && sameProtocol && (exactCurrentCommit || canonicalCurrentCommit || recreatedLegacyCommit);
+        // Row 337 (D-2181 D3): a replayed test green never answers a fresh force still owed on its subject.
+        const forceOwed = freshForce(replayedGates!.commit).kind !== "none";
         for (const gate of declaredGates) {
-          if (!reusable || replayedGates!.results.get(gate) !== true) reusable = false;
+          if (!reusable || replayedGates!.results.get(gate) !== true || (gate === "test" && forceOwed)) reusable = false;
           else reused.push(gate);
         }
         remainingGates = declaredGates.slice(reused.length);
@@ -5094,6 +5562,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         const gated = await gitHead(wt);
         gateSubject = {
           commit: await gateCommitSubject(taskBase, gated, wt),
+          head: gated,
           attempt: rs?.attempts ?? 0,
           // This suffix is re-measured to decide whether resume may advance, but the interrupted
           // attempt already paid for its red result. The next worker-backed round remains the next
@@ -5123,39 +5592,138 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         const forcedUnmeasured = (outside: boolean) => lastRound.some((e) => e.event === "gate-fresh-forced"
           && e.data.commit === gateSubject!.commit && (e.data.reason === OUTSIDE_SCOPE_RED) === outside)
           && !measured.some((e) => e.data.gate === "test");
+        // Row 337 (D-2181 D2): a crash before/inside the reserved retry, or after its interrupted red but
+        // before its park, still owes that infra park — never a silently reset reservation or a possible
+        // third automatic run — and unprovable accounting launches no job. A crash after the first
+        // interrupted red but before its reservation reserves NOW, so this resume's re-measurement is the
+        // sole retry and is journaled after its reservation. An operator recheck is its own single fresh
+        // execution instead.
+        // Row 337 (D-2181 D2): an open operator-recheck claim on an interrupted subject settles THAT round from
+        // what it persisted — a crash after its executed full result, before or after its recheck-battery
+        // enactment, and independent of any automatic reservation — and never launches a second battery
+        // under one approval. A claim with no executed full test result after it is the missing-result cell:
+        // an infra red that parks, executing nothing. A remaining gate the round left without a row is
+        // unproven, never a guessed green or a worker charge.
+        // Row 337 (D-2181 D3): the subject's fresh force, from the whole history, ALWAYS evaluated before any
+        // persisted result is admitted — a waiver, uphold, recheck or restart never discharges it; only a later
+        // executed full test this subject owns does. A force whose identity is unreadable parks infra here.
+        const force = freshForce(gateSubject.commit);
+        if (force.kind === "unprovable" && !force.identity) {
+          await park(t, forceUnprovable(force), "infra", gateAuthor, rs?.attempts ?? 0, startMs, gateFails, consults, tokens, metered, retryMode);
+          return;
+        }
+        let persistedRecheck: GateResult[] | undefined;
+        const missingRecheck = (gate: GateName, when = ""): GateResult => ({ gate, pass: false, meta: { infra: true, classification: "infra", retryable: false },
+          details: `the operator recheck claimed its one execution on this subject${when}, but no executed full test result was journaled after it (missing result); no second execution runs under one recheck (row 337, D-2181 D2) — approve a recheck to fund one fresh full test job` });
+        const claim = interruptedAccounting(gateSubject.commit).involved ? recheckClaim(gateSubject.commit) : { kind: "none" as const };
+        if (claim.kind !== "none") {
+          const round = claim.rows.filter((e) => e.data.commit === gateSubject!.commit);
+          const executed = round.some((e) => executedFullTest(e.data));
+          // A persisted round is restored only as comparable proof — measured under this session's capacity
+          // and verification protocol, with any build provisioning this session owed green. Otherwise its
+          // one execution stays consumed and it parks infra: a stale green never reaches a merge.
+          const protocol = verificationProtocol(process.env, wt);
+          const stale = !executed ? undefined
+            : !replayComparable || !round.every((e) => sameCapacity(e.data.capacity, sessionCapacity) && sameVerification(e.data.verification, protocol))
+              ? "was measured under another capacity or verification protocol than this session's"
+              : provisionedRow !== undefined && provisionedRow.exitCode !== 0 ? "cannot stand: this session's build provisioning failed" : undefined;
+          // test first, and always unless the operator's carried waiver released it — even when every gate
+          // replayed green: the claim's one execution is the test's, so an unproven round's park names the
+          // test execution it is missing, never an empty merge.
+          persistedRecheck = [...(satisfiedGate === "test" ? [] : ["test" as GateName]), ...resumedTask.gates.filter((gate) => gate !== "test")].map((gate): GateResult => {
+            const row = round.filter((e) => e.data.gate === gate && (gate !== "test" || executedFullTest(e.data))).at(-1);
+            return row && executed && !stale ? restoreGateRow(row.data) : !stale ? missingRecheck(gate, " before the restart")
+              : { gate, pass: false, meta: { infra: true, classification: "infra", retryable: false },
+                details: `the operator recheck's persisted result ${stale}; its one execution is consumed and none re-runs under one recheck (row 337, D-2181 D2) — approve a recheck to fund one fresh full test job` };
+          });
+        }
+        let reservedRetry = false;
+        // Row 337 (D-2181 D2): a crash after the spent allowance's executed red but before its settlement
+        // settles THAT persisted result — never another battery on the subject, which would be a third
+        // automatic execution (with its own in-gate retries). Interrupted, it parks below as consumed.
+        let persistedRetry: GateResult[] | undefined;
+        if (!persistedRecheck && !recheck && satisfiedGate !== "test") {
+          const owed = interruptedAccounting(gateSubject.commit);
+          const { last } = owed;
+          const lastInterrupted = last !== undefined && isInterruptedResult({ pass: last.data.pass, meta: last.data });
+          // The subject's LATEST test row decides before any replayed prefix is trusted: an interrupted one
+          // that never executed (skipped, a replay copy or a screen, whatever its pass) parks, as live.
+          const latest = journal.read().filter((e) => e.taskId === t.id && e.event === "gate-result"
+            && e.data.gate === "test" && e.data.commit === gateSubject!.commit).at(-1);
+          const latestInterrupted = latest !== undefined && isInterruptedResult({ pass: latest.data.pass, meta: latest.data });
+          // The retry is test-only, as the live one is: every other remaining gate must already be green on
+          // this subject in a comparable world (and build provisioned), so no semantic gate runs ahead of
+          // the reserved test; otherwise, as live, an interrupted red beside an unsatisfied gate parks.
+          const others = resumedTask.gates.filter((gate) => gate !== "test");
+          const testOnly = replayComparable && replayedGates?.commit === gateSubject.commit
+            && others.every((gate) => replayedGates.results.get(gate) === true
+              && !(gate === "build" && provisionedRow !== undefined && provisionedRow.exitCode !== 0));
+          if (owed.state.kind === "unreserved" && lastInterrupted && testOnly) {
+            journal.append(INTERRUPTED_RETRY_EVENT, t.id, { commit: gateSubject.commit,
+              attempt: Number.isInteger(last.data.attempt) ? last.data.attempt : gateSubject.attempt });
+            for (const gate of others) journal.append("gate-reused", t.id, { gate, commit: gateSubject.commit });
+            resumedTask.gates = ["test"];
+            reservedRetry = true;
+            // A fresh execution, never this resume's replay measurement: its uninterrupted red is a
+            // conclusive fingerprint occurrence, exactly as the live retry's (retestInterrupted).
+            gateSubject = { commit: gateSubject.commit, head: gateSubject.head, attempt: gateSubject.attempt };
+          } else if (owed.state.kind === "reserved" || owed.state.kind === "unprovable" || lastInterrupted || latestInterrupted) {
+            await park(t, interruptedParkReason(owed, false), "infra", gateAuthor, rs?.attempts ?? 0,
+              startMs, gateFails, consults, tokens, metered, retryMode, interruptedParkDetails(owed));
+            return;
+          } else if (owed.state.kind === "consumed" && last !== undefined && last.data.pass !== true && !satisfiedGate && !harvestAuthor) {
+            persistedRetry = [restoreGateRow({ ...last.data, gate: "test", pass: false })];
+          }
+        }
+        const persisted = persistedRetry ?? persistedRecheck;
+        // Row 337 (D-2181 D3): a persisted test verdict executed before the subject's still-owed force (or under
+        // unprovable force accounting) never answers it, and D2's bound forbids another execution under the same
+        // recheck or reservation: park infra, executing nothing — never a restored green or red.
+        if (force.kind !== "none" && persisted?.some((g) => g.gate === "test")) {
+          await park(t, `test: the persisted test result cannot answer the subject's ${force.kind === "pending" ? "pending fresh force"
+            : `fresh-force accounting, which is unprovable (${force.reason})`} — it was not executed after that force, and no second execution runs under one recheck or reservation (row 337, D-2181 D2 D3) — approve a recheck to fund one fresh full test job`,
+          "infra", gateAuthor, rs?.attempts ?? 0, startMs, gateFails, consults, tokens, metered, retryMode);
+          return;
+        }
+        // Row 337 (D-2181 D3): the ONE admission predicate for a resumed round — a pending (or unprovable) force
+        // keeps test in it whatever left test out (the waive/uphold recovery's satisfied-gate selection after a
+        // reused full green, a recheck, a green prefix), so it executes fresh. Only the operator's own release
+        // of the test gate itself stands: approval semantics are unchanged.
+        if (force.kind !== "none" && satisfiedGate !== "test" && declaredGates.includes("test") && !resumedTask.gates.includes("test")) {
+          resumedTask.gates = declaredGates.filter((gate) => gate === "test" || resumedTask.gates.includes(gate));
+        }
         // C: a crash after the forced re-execution journaled its red but before its park still owes that
         // park — restored from the journaled subject and result, never re-measured, replayed or repaired.
         // Infra adjudication stays authoritative, exactly as it is ahead of the live park.
-        if (!recheck && !satisfiedGate && lastRound.some((e) => e.event === "gate-fresh-forced"
+        if (!persisted && !recheck && !satisfiedGate && force.kind === "none" && lastRound.some((e) => e.event === "gate-fresh-forced"
           && e.data.reason === OUTSIDE_SCOPE_RED && e.data.commit === gateSubject!.commit)
           && allOutsideScopeReds(t, lastRound, gateSubject.commit)) {
           const restored = lastRound.filter((e) => e.event === "gate-result" && e.data.gate === "test" && e.data.pass === false)
             .map((e): GateResult => ({ gate: "test", pass: false, details: String(e.data.details ?? ""), meta: e.data }));
           if (await adjudicateInfraShapedRed(t, restored, wt, gateSubject.commit, rs?.attempts ?? 0, true, (reason) =>
             park(t, reason, "infra", gateAuthor, rs?.attempts ?? 0, startMs, gateFails, consults, tokens, metered, retryMode))) return;
-          await park(t, outsideScopePark(t), "gate-fail", gateAuthor, rs?.attempts ?? 0, startMs, gateFails, consults, tokens, metered, retryMode);
+          await park(t, outsideScopePark(t, gateSubject.commit), "gate-fail", gateAuthor, rs?.attempts ?? 0, startMs, gateFails, consults, tokens, metered, retryMode);
           return;
         }
         // C: the same out-of-scope re-execution the live loop owes, and a crash inside it still owes it. It
         // takes precedence over a timeout refresh: a qualifying red keeps its own bypass and park.
-        outsideScopeForced = !recheck && !satisfiedGate && (
+        outsideScopeForced = !persisted && !recheck && !satisfiedGate && (
           (harvestAuthor !== undefined && owesOutsideScopeRefresh(t, lastRound, gateSubject.commit)) || forcedUnmeasured(true));
-        const freshTimeout = !recheck && !satisfiedGate && !outsideScopeForced && (
+        const freshTimeout = !persisted && !recheck && !satisfiedGate && !outsideScopeForced && (
           (harvestAuthor !== undefined && owesTimeoutRefresh(t, lastRound, gateSubject.commit)) || forcedUnmeasured(false));
         // C: a measurement this forced round EXECUTES fresh — its forced test above all — is independent
         // evidence, never a replay measurement; only a gate the interrupted round already journaled is.
         if (outsideScopeForced) {
           gateSubject = { ...gateSubject, journaledGates: measured.map((e) => String(e.data.gate)) };
         }
-        journal.phaseStart(t.id, "gates");
+        if (!persisted) journal.phaseStart(t.id, "gates");
         if (freshTimeout) {
           journal.append("gate-fresh-forced", t.id, { gate: "test", attempt: gateSubject.attempt, commit: gateSubject.commit, reason: "no-commit-timeout-red", resumed: true });
         }
         if (outsideScopeForced) {
           journal.append("gate-fresh-forced", t.id, { gate: "test", attempt: gateSubject.attempt, commit: gateSubject.commit, reason: OUTSIDE_SCOPE_RED, resumed: true });
         }
-        const { results } = await withCommandContext(t.id,
-          async () => runReviewRecovery(resumedTask, {
+        const resumedCtx: GateContext = {
           carriedAuthors: await subjectAuthors(journal.read(), t.id, wt, taskBase),
           producer: producerNow(),
           carriedFindings: outstandingReviewFindings(journal.read(), t.id),
@@ -5180,6 +5748,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           reviewNoVerdicts,
           recheck, // OBS-1055: a recheck discards cached reds — the battery re-measures what the operator questioned
           cachedRedBypass: freshTimeout ? "timeout-fresh" : outsideScopeForced ? "out-of-scope-fresh" : undefined,
+          ...(force.kind !== "none" || freshTimeout || outsideScopeForced ? { pendingFreshForce: true as const } : {}),
           onGate: async (e) => {
             if (!liveEngagement()) return;
             if (e.phase === "start") {
@@ -5200,8 +5769,34 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
               if (isGarbageReview(g)) badReviewers.push(g.meta.reviewer);
             });
           },
-        }, false));
+        };
+        const recheckInterrupted = recheck && interruptedAccounting(gateSubject.commit).involved;
+        const singleExecution = reservedRetry || persisted !== undefined || recheckInterrupted;
+        // Row 337 (D-2181 D2): the durable claim precedes the recheck's one execution (see recheckClaim).
+        if (!persisted && recheckInterrupted) journal.append(INTERRUPTED_RECHECK_EVENT, t.id, { commit: gateSubject.commit });
+        let { results } = persisted ? { results: persisted }
+          : await withCommandContext(t.id, async () => runReviewRecovery(resumedTask, resumedCtx, false, singleExecution));
         results.forEach(classifyInfraResult);
+        if (recheckInterrupted && !persisted && satisfiedGate !== "test") {
+          // Row 337 (D-2181 D2): the recheck's one execution must be an EXECUTED full test after its claim. A
+          // skipped (no test command), absent or refused test is the missing-result cell — an infra red that
+          // parks, never green proof, a merge or a worker charge — exactly as on restart (missingRecheck).
+          const events = journal.read(), subject = gateSubject.commit;
+          const claimedAt = events.map((e) => e.taskId === t.id && e.event === INTERRUPTED_RECHECK_EVENT).lastIndexOf(true);
+          if (!events.slice(claimedAt + 1).some((e) => e.taskId === t.id && e.event === "gate-result" && e.data.commit === subject && executedFullTest(e.data))) {
+            results = [missingRecheck("test"), ...results.filter((g) => g.gate !== "test")];
+          }
+        }
+        if (reservedRetry) {
+          // Row 337 (D-2181 D2): the same post-reservation check the live retry makes — only an EXECUTED
+          // full result consumes this reservation; a refusal that ran no test is the missing-result park.
+          const after = interruptedAccounting(gateSubject.commit);
+          if (after.state.kind !== "consumed") {
+            await park(t, interruptedParkReason(after, false), "infra", gateAuthor, rs?.attempts ?? 0,
+              startMs, gateFails, consults, tokens, metered, retryMode, interruptedParkDetails(after));
+            return;
+          }
+        }
         if (pendingDaemonApprovalActions(journal.read()).get(t.id)?.authority === "battery") {
           journal.append("recheck-battery", t.id, {
             commit: gateSubject.commit,
@@ -5216,7 +5811,9 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         const settled = await settleResults(results, {
           wt, taskBase, taskBranch, gated, commit: gateSubject.commit, outsideScopeForced,
           author: gateAuthor, attempts: n, infraReason: (g) => `${g.gate}: ${g.details}`,
-          reobserve: { attempt: n, replayed: false }, firstAttemptOk: false, metering: {},
+          reobserve: { attempt: n, replayed: persisted !== undefined }, firstAttemptOk: false, metering: {},
+          ...(recheck || reservedRetry || persisted ? {} : { retest: retestInterrupted(resumedTask, resumedCtx) }),
+          ...(singleExecution ? { singleExecution: true as const } : {}),
           // OBS-547: disposition FIRST, and through the same helper the ordinary attempt path uses. A
           // crash between a journaled scope red and its classification must not turn a predicted red
           // into a charged one just because a resume is what observed it.
@@ -5234,6 +5831,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           },
         });
         if (settled.kind === "red") {
+          results = settled.results; // row 337: a reserved retry's evidence, never the interrupted red it replaced
           gateFails++;
           // Observed green gates are only measurements. If the resumed suffix is red, preserve that
           // result in the journal and return to the ordinary attempt/consult ladder. A post-waive
@@ -5241,7 +5839,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           const postWaive = satisfiedGate !== undefined && !recheck;
           const failing = results.filter(gateFailed);
           if (postWaive && failing.every((g) => g.gate === "test") && freshOutsideScopeRed(t, gateSubject.commit)) {
-            await park(t, outsideScopePark(t), "gate-fail", gateAuthor, rs?.attempts ?? 0,
+            await park(t, outsideScopePark(t, gateSubject.commit), "gate-fail", gateAuthor, rs?.attempts ?? 0,
               startMs, gateFails, consults, tokens, metered, retryMode);
             return;
           }
@@ -5268,7 +5866,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
             const events = journal.read();
             const drawn = repairsSinceApproval(events, t.id);
             const repeated = failing.some((g) => isDeterministicFailure(g)
-              && identicalGateFailures(events, t.id, g.gate, normalizeGateFailure(g.details)) >= GATE_FINGERPRINT_CAP);
+              && conclusiveGateFailures(events, t.id, g.gate, normalizeGateFailure(g.details)) >= GATE_FINGERPRINT_CAP);
             if (narrowRepairBattery(battery) && landed.length > 0 && drawn < MAX_REPAIRS
                 && (rs?.attempts ?? 0) < MAX_ATTEMPTS && !repeated
                 && pendingRepairFindings(events, t.id) === undefined) {
@@ -5702,7 +6300,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       const promptFile = writePrompt(journal.dir, promptTask, attempt, feedback, nonce);
       // OBS-56: state the non-interactive, one-pass finish contract and the OBS-54 stall budget in every
       // worker prompt, not only consult retry guidance. Prepended so prompt.ts's completion trailer stays last.
-      const workerContract = `## Harness contract\n- This harness is non-interactive: make one continuous pass; do not stop for questions or follow-up input.\n- You have a ${taskTimeoutMinutes} minute stall window. The gates run the full suite for you — never spend this window on one; commit your work and emit the completion trailer inside it.\n- Each test: acceptance criterion must exist as a vitest test whose OWN title (the leaf, not counting enclosing describe titles) is the criterion string verbatim — never shortened, never decorated. Nesting under describe() is allowed.`; // OBS-64; OBS-511: leaf-title rule stated where the worker reads it; OBS-548: the suite is the GATES' job — this repo's own suite outlasts the output-silence windows the daemon polices, so a worker obeying "budget the full suite" was killed by construction
+      const workerContract = `## Harness contract\n- This harness is non-interactive: make one continuous pass; do not stop for questions or follow-up input.\n- You have a ${taskTimeoutMinutes} minute inactivity window. The harness holds while the model connection is open or CPU is accruing (and when liveness cannot be measured), up to a hard ceiling of ${(attemptHardTimeoutMs ?? taskTimeoutMinutes * 60_000 * 4) / 60_000} minutes. The gates run the full suite for you — never run it yourself; commit your work and emit the completion trailer.\n- Each test: acceptance criterion must exist as a vitest test whose OWN title (the leaf, not counting enclosing describe titles) is the criterion string verbatim — never shortened, never decorated. Nesting under describe() is allowed.`; // Row 364; D-2184 add.31/add.44/add.45; D-2185 add.3.
       // OBS-47: state the worktree layout contract in the worker prompt (cheap-tier workers were
       // committing/deleting node_modules and tripping the scope gate). The harness re-asserts the link
       // itself before gates regardless of what the worker does with it.
@@ -5816,9 +6414,8 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       };
       const noteWorkerLiveness = (event: "worker-dead" | "worker-dead-held", data: Record<string, unknown>) =>
         journal.append(event, t.id, { ...data, source: trackedDriver.readSource ?? "driver.read" });
-      let cpuFlat: { ms: number; since: number } | undefined;
+      const cpuReader = new CpuLegReader();
       let cpuAccountant: WorkerTreeCpuAccountant | undefined;
-      let cpuGapCount = 0;
       const unmeasurableNoted = new Set<string>();
       // Queue row 231 (D-2119): one line per reading per attempt, including the connection leg.
       // One CPU line per attempt, whichever way that leg turns out to be unmeasurable. A triad that
@@ -5840,9 +6437,6 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       // accountant re-bases its monotonic total and can then never read flat.
       // "accruing" also covers NOT YET PROVEN FLAT — until the flat window closes, the tree has not
       // been observed at rest, and no reader may conclude on it.
-      type CpuLeg =
-        | { state: "flat"; cpu: { ms: number; resolutionMs: number } }
-        | { state: "accruing" | "unmeasurable" };
       // The CPU leg needs a marker in the worker's own argv, and every launch path puts this
       // attempt's dispatch script there EXCEPT interactiveSeed: runInteractiveSeed launches the
       // TUI directly, by a command the ADAPTER owns (seed.launch(model)) which tickmarkr cannot
@@ -5855,8 +6449,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         if (!armed) {
           await cpuAccountant?.stop();
           cpuAccountant = undefined;
-          cpuFlat = undefined;
-          cpuGapCount = 0;
+          cpuReader.reset();
           return;
         }
         if (hasSeed || cpuAccountant !== undefined) return;
@@ -5869,29 +6462,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           return { state: "unmeasurable" };
         }
         if (cpuAccountant === undefined) return { state: "unmeasurable" }; // no window open: nothing measured yet
-        const observation = cpuAccountant.read();
-        if (observation.gaps !== cpuGapCount) {
-          cpuGapCount = observation.gaps;
-          cpuFlat = undefined;
-          noteUnmeasurable("one or more worker process snapshots could not be read");
-        }
-        const cpu = observation.cpu;
-        if (cpu === undefined) {
-          // Unmeasurable CPU is never evidence a worker stopped: RESET the observation rather than
-          // conclude on it, and name the gap — a probe whose snapshot never parses is the same
-          // structural hole as the seeded launch, and must not be the one that stays silent.
-          cpuFlat = undefined;
-          noteUnmeasurable("the worker process snapshot could not be read");
-          return { state: "unmeasurable" };
-        }
-        const now = Date.now();
-        if (cpu.ms !== cpuFlat?.ms) {
-          cpuFlat = { ms: cpu.ms, since: now };
-          return { state: "accruing" };
-        }
-        return now - cpuFlat.since < harvestCpuFlatWindowMs(cpu.resolutionMs)
-          ? { state: "accruing" }
-          : { state: "flat", cpu };
+        return cpuReader.read(cpuAccountant.read(), Date.now(), noteUnmeasurable);
       };
       const harvestConcludes = async (silentMs: number): Promise<boolean> => {
         if (silentMs < harvestSilentMs) return false;
@@ -5900,27 +6471,14 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         const carried = await commitsAheadOf(taskBase, wt);
         if (carried.length === 0) return false; // nothing landed: not this branch's population
         if (!interactive) {
-          // Queue row 231 (D-2119): query afresh only after the other legs hold. lsof ORs selections
-          // without -a; -g includes connector children in the owned group, not just the CLI root.
-          // No environment inspection. One async PATH lookup, bounded from invocation like the
-          // reap census (15 s); SIGKILL also retires a probe that ignores SIGTERM.
+          // Row 364; D-2184 add.31: the shared reading preserves the harvest's flat-CPU/commits/silence triad.
           const group = readOwnedProcessGroup(groupFile);
-          const connection = group === undefined ? "unreadable" : await new Promise<"connected" | "none" | "unreadable">((resolve) => {
-            try {
-              execFile("lsof", ["-nP", "-a", "-g", String(group), "-iTCP", "-sTCP:ESTABLISHED", "-Fp"],
-                { encoding: "utf8", timeout: 15_000, killSignal: "SIGKILL", maxBuffer: 4 * 1024 * 1024 },
-                (error, stdout, stderr) => {
-                  if (!error && stdout.trim()) resolve("connected");
-                  else if (error && error.code === 1 && !stdout && !stderr) resolve("none");
-                  else resolve("unreadable");
-                });
-            } catch { resolve("unreadable"); }
-          });
-          if (connection === "unreadable") {
+          const reading = await readOwnedProcessLiveness(group, leg);
+          if (reading.state === "unmeasurable") {
             noteUnmeasurable("the worker ESTABLISHED TCP connection reading could not be read", "connection");
             return false;
           }
-          if (connection === "connected") {
+          if (reading.state === "live") {
             if (!harvestHeldNoted) {
               harvestHeldNoted = true;
               journal.append("worker-harvest-held", t.id, { slot: slot.name, attempt, reason: "established-tcp-connection", processGroup: group });
@@ -6813,12 +7371,18 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         // high-water over the bounded tail; a driver reporting no count keeps the row measure.
         const stallWindowMs = taskTimeoutMinutes * 60_000;
         const hardDeadline = attemptStart + (attemptHardTimeoutMs ?? stallWindowMs * 4);
+        const completionTrailer = new RegExp(trailerPattern(nonce));
         const initialPane = await workerTransport.read(slot, 500);
+        let trailerSeen = completionTrailer.test(initialPane);
         startupFailure = startupFailureInWindow(initialPane, workerLaunchedAt);
         let everHadOutput = initialPane.length > 0;
         const stallProgress = new StallProgressTracker();
         stallProgress.observe({ paneText: initialPane, receivedBytes: (await workerTransport.transportState?.(slot))?.bytes, seedSubmitted: true, contextTokens });
         let lastProgressAt = Date.now();
+        // Row 364; D-2184 add.31/add.44: keep the CPU leg continuous before the first silence boundary.
+        await armCpuLeg(true);
+        readCpuLeg();
+        let stallHoldNoted = false;
         finished = false;
         // T2 review (material): the exit marker proves the PROCESS EXITED, never that the worker
         // emitted a trailer — the two were the same flag here, so a headless worker that committed
@@ -6827,10 +7391,22 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         // worker-result-harvested row. The interactive site has always kept them apart (`finished`
         // there is the trailer regex; the exit marker only sets exitCode), and the cause taxonomy
         // already names this shape "clean-exit-no-trailer" — unreachable in print mode until now.
-        while (!startupFailure && Date.now() - lastProgressAt < stallWindowMs && Date.now() < hardDeadline) {
+        while (!startupFailure && !trailerSeen && Date.now() < hardDeadline) {
           fatalStop.signal.throwIfAborted();
           executionSignal()?.throwIfAborted();
-          const remaining = Math.min(stallWindowMs - (Date.now() - lastProgressAt), hardDeadline - Date.now());
+          const silentMs = Date.now() - lastProgressAt;
+          if (silentMs >= stallWindowMs) {
+            const reading = await readOwnedProcessLiveness(readOwnedProcessGroup(groupFile), readCpuLeg(), hardDeadline - Date.now());
+            if (Date.now() >= hardDeadline) break;
+            if (reading.state === "silent") { timedOut = true; break; }
+            const leg = reading.state === "live" ? reading.leg : "unmeasurable";
+            heldLegs = [`stall:${leg}`];
+            if (!stallHoldNoted) {
+              stallHoldNoted = true;
+              journal.append("worker-stall-held", t.id, { slot: slot.name, attempt, leg, silentMs });
+            }
+          }
+          const remaining = Math.min(silentMs >= stallWindowMs ? BLOCKED_POLL_MS : stallWindowMs - silentMs, hardDeadline - Date.now());
           let slice = Math.min(BLOCKED_POLL_MS, Math.max(100, Math.min(stallWindowMs / 2, remaining)));
           const startupLeft = workerLaunchedAt === undefined
             ? 0
@@ -6843,11 +7419,16 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           // T2 (OBS-264): same probe cadence the interactive loop uses — see harvestSliceMs.
           slice = Math.min(slice, harvestSliceMs(Date.now() - lastProgressAt));
           slice = Math.min(slice, remainingExecutionMs() ?? slice);
-          if (await workerTransport.waitOutput(slot, `TICKMARKR_EXIT_${nonce}:\\d`, slice, { regex: true })) {
+          const matched = await workerTransport.waitOutput(slot, `TICKMARKR_EXIT_${nonce}:\\d`, slice, { regex: true });
+          if (Date.now() >= hardDeadline) break;
+          if (matched) {
             processExited = true;
             break;
           }
           const paneText = await workerTransport.read(slot, 500);
+          // The hold protects a live turn. Completion releases every holding leg before another probe.
+          trailerSeen = completionTrailer.test(paneText);
+          if (trailerSeen) break;
           if (paneText.length > 0) everHadOutput = true;
           if (startupFailureInWindow(paneText, workerLaunchedAt)) {
             startupFailure = true;
@@ -6865,7 +7446,6 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           // steer, driver.nudge is never consulted on this path), so there is no pending daemon
           // action for the triad to preempt — the asymmetry with the interactive call site above is
           // the absence of the thing being held for, not an oversight.
-          await armCpuLeg(Date.now() - lastProgressAt >= harvestSilentMs);
           if (await harvestConcludes(Date.now() - lastProgressAt)) break;
         }
         output = await workerTransport.read(slot, 500);
@@ -6873,21 +7453,26 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         // Completion is the trailer, exactly as in the interactive loop. A process that exited
         // without one is finished:false with a non-null exitCode — the harvest synthesis then owns
         // it when the worktree carries work, and classifyWorkerResultCause names it otherwise.
-        finished = new RegExp(trailerPattern(nonce)).test(output);
-        timedOut = !processExited && !finished && (Date.now() - lastProgressAt >= stallWindowMs || Date.now() >= hardDeadline);
+        // Row 364; D-2185 add.20: the nonce trailer ends the turn even if its process stays alive.
+        finished = completionTrailer.test(output);
+        hardTimedOut = !finished && !processExited && Date.now() >= hardDeadline;
+        timedOut = !processExited && !finished && (timedOut || hardTimedOut);
+        if (hardTimedOut) journal.append("worker-hard-timeout", t.id, { slot: slot.name, attempt, heldLegs });
       }
       } finally {
         await cpuAccountant?.stop();
       }
       // OBS-1169: the final pane read decides, at exit, whether the prefix is still the CLI's own startup.
       const bootstrapEvidence = processExited ? bootstrapDetector.sample(output, workerLaunchedAt) : undefined;
-      // SPEND-01 interactive metering race: the harvest loop breaks on the trailer, but the worker
-      // shell may still be running post-trailer bookkeeping (session-store flush, fake usage stamp,
-      // exit wrapper). Print mode already waits for TICKMARKR_EXIT, which follows that tail; drain
-      // interactive attempts to the same exit marker before close and the post-hoc usage disk read
-      // so a writer never races the reader (real CLIs can flush usage asynchronously after the trailer).
-      if (interactive && finished && !exitRe.test(output)) {
-        await workerTransport.waitOutput(slot, `TICKMARKR_EXIT_${nonce}:\\d`, 2_000, { regex: true }).catch(noteDriverUnreadable);
+      // SPEND-01; row 364; D-2185 add.21/add.22: print and interactive workers may flush their
+      // session store after the trailer. Drain the bounded exit grace before the reap and post-hoc
+      // disk read; a completion trailer releases liveness holds, including at the hard deadline.
+      if (finished && !exitRe.test(output)) {
+        if (await workerTransport.waitOutput(slot, `TICKMARKR_EXIT_${nonce}:\\d`, 2_000, { regex: true }).catch(noteDriverUnreadable)) {
+          output = await workerTransport.read(slot, 500);
+          processExited = true;
+          exitCode = Number(exitRe.exec(output)?.[1] ?? 1);
+        }
       }
       // Free availability reroutes deliberately reuse the charged-attempt ordinal. Stream artifacts
       // cannot: every dispatch owns bytes that must remain independently recoverable, so derive the
@@ -6907,10 +7492,10 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       const adapterCause = result.cause;
       // Law 46: there is one completion fact. A classified adapter result with no parse-failure cause
       // means its decoder found the nonce-bound trailer even when the raw JSON envelope escaped it.
-      const workerFinished = !unsettledTrailer && (finished || adapterCause === undefined);
+      const workerFinished = !(!interactive && hardTimedOut) && !unsettledTrailer && (finished || adapterCause === undefined);
       finished = workerFinished;
       const adapterStartupFailure = adapterCause === "startup-failure";
-      const workerCause = unsettledTrailer ? "premature-idle" : adapterStartupFailure
+      const workerCause = !interactive && hardTimedOut ? "hard-timeout" : unsettledTrailer ? "premature-idle" : adapterStartupFailure
         ? "startup-failure"
         : startupFailure
           ? "startup-failure"
@@ -6984,9 +7569,12 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         );
         return;
       }
+      // Row 364; D-2185 add.19: persist the live attribution fact once for history and replay.
+      const daemonKilled = !processExited && !workerFinished && (workerCause === "stall-timeout" || workerCause === "hard-timeout");
       journal.append("worker-result", t.id, {
         ok: result.ok, summary: result.summary, deviations: result.deviations, finished: workerFinished, exitCode,
         mode: interactive ? "interactive" : "print", stream: capturedStream.path,
+        ...(daemonKilled ? { daemonKilled: true } : {}),
         ...(workerCause ? { cause: workerCause } : {}),
       });
       if (reapFailure) {
@@ -7100,13 +7688,13 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       // pinned codex worker over for a diff line number (`429:`) 41 985 bytes before EOF and for
       // this repository's own fixture prose. The matched bytes and their stream offset ride the
       // row so a false positive is legible from the record alone.
-      const quotaMatch = (interactive ? !workerFinished : exitCode !== 0)
+      const quotaMatch = (interactive ? !workerFinished : (!workerFinished && exitCode !== 0))
         ? quotaSignal(stallSnapshotBannerRows(output))
         : null;
       // OBS-1161: transient capacity reads the SAME tail under the same guards — a live idle banner
       // and a no-trailer capacity exit classify identically — through the parse-boundary rule that a
       // parsed verdict (either way) is work, so a trailer QUOTING the phrase never lands here.
-      const capacityMatch = !quotaMatch && (interactive ? !workerFinished : exitCode !== 0)
+      const capacityMatch = !quotaMatch && (interactive ? !workerFinished : (!workerFinished && exitCode !== 0))
         ? classifyTransientCapacity({ ...preHarvestResult, raw: stallSnapshotBannerRows(output) })
         : null;
       // Q-1: a graph pin is an operator instruction — a quota match ALONE never overrides it; only a
@@ -7370,12 +7958,13 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         fatalStop.signal.throwIfAborted();
         executionSignal()?.throwIfAborted();
         const gated = await gitHead(wt);
-        gateSubject = { commit: await gateCommitSubject(taskBase, gated, wt), attempt };
+        gateSubject = { commit: await gateCommitSubject(taskBase, gated, wt), head: gated, attempt };
         await trackedDriver.project?.(t.id, "in-review");
         // Only the immediately preceding attempt can lend a red. Re-journal its results
         // as this attempt's verdicts so all existing disposition and fingerprint accounting
         // sees the replay, without buying another command or reviewer invocation.
-        const taskEvents = journal.read().filter((e) => e.taskId === t.id);
+        const allEvents = journal.read();
+        const taskEvents = allEvents.filter((e) => e.taskId === t.id);
         const previousRound = taskEvents.map((e) => e.event === "phase-start" && e.data.phase === "gates").lastIndexOf(true);
         const lastRoundRows = taskEvents.slice(previousRound + 1).filter((e) => e.event === "gate-result"
           && e.data.attempt === attempt - 1);
@@ -7392,16 +7981,29 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         if (outsideScopeForced) {
           journal.append("gate-fresh-forced", t.id, { gate: "test", attempt, priorAttempt: attempt - 1, commit: gateSubject.commit, reason: OUTSIDE_SCOPE_RED });
         }
-        const replay = !explicitlyFundedAttempt && !freshTimeout && !outsideScopeForced && previousRows.length > 0
+        // Row 337 (D-2181 D3): a force still pending on this subject — across parks, approvals and restarts —
+        // refuses the journal replay and every cached test verdict until a full execution is journaled.
+        const force = freshForce(gateSubject.commit);
+        if (force.kind === "unprovable" && !force.identity) {
+          await park(t, forceUnprovable(force), "infra", assignment, attempt + 1, startMs, gateFails, consults, tokens, metered, retryMode);
+          return;
+        }
+        const replay = !explicitlyFundedAttempt && !freshTimeout && !outsideScopeForced && force.kind === "none" && previousRows.length > 0
           && previousRows.every((e) => e.data.commit === gateSubject!.commit)
-          && previousRows.some((e) => e.data.pass === false && e.data.skipped !== true);
+          && previousRows.some((e) => e.data.pass === false && e.data.skipped !== true)
+          // Row 337 (D-2181 D2): an interrupted red is never copied forward; the subject is measured.
+          && !previousRows.some((e) => isInterruptedResult({ pass: e.data.pass, meta: e.data }));
+        let roundCtx: GateContext | undefined;
         if (replay) {
           gateSubject.replayedFromAttempt = attempt - 1;
-          results = previousRows.map(({ data }) => ({
-            gate: String(data.gate), pass: data.pass === true, details: String(data.details),
+          results = previousRows.map((row) => ({
+            gate: String(row.data.gate), pass: row.data.pass === true, details: String(row.data.details),
             // The verdict is reused; its old timing is not a measurement of this attempt.
-            meta: Object.fromEntries(Object.entries(data).filter(([key]) =>
+            meta: { ...Object.fromEntries(Object.entries(row.data).filter(([key]) =>
               !(GATE_TELEMETRY_KEYS as readonly string[]).includes(key) && key !== "capacity")),
+            // Row 337 (D-2181 D3, D-2184 add.46): the copy carries its lender's source unchanged (replaySource),
+            // never this attempt; unknown when the lender has none.
+            ...(row.data.gate === "test" ? { originAttempt: replaySource(allEvents, runId, allEvents.indexOf(row)) } : {}) },
           }));
           commits = await commitsAheadOf(taskBase, wt);
           // OBS-1106: a replayed legacy infra row lacking `infra` is re-classified before it is
@@ -7416,8 +8018,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
             journalGateResult(g);
           }
         } else {
-          ({ results, commits } = await withCommandContext(t.id,
-            async () => runReviewRecovery(t, {
+          roundCtx = {
             carriedAuthors: await subjectAuthors(journal.read(), t.id, wt, taskBase),
             producer: producerNow(),
             carriedFindings: outstandingFindings,
@@ -7427,6 +8028,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
             collateral: collateral.get(t.id) ?? [],
             selectTests: !testGateFailed,
             cachedRedBypass: explicitlyFundedAttempt ? "operator-rerun" : freshTimeout ? "timeout-fresh" : outsideScopeForced ? "out-of-scope-fresh" : undefined,
+            ...(force.kind !== "none" ? { pendingFreshForce: true as const } : {}),
             via: cfg.visibility.llm === "pane"
               ? {
                   driver: trackedDriver,
@@ -7447,12 +8049,14 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
             reviewHistory, demotedReviewers, priorReviewers: taskReviewers(t.id),
             reviewNoVerdicts, // Leg-2 (OBS-1052): see the recheck site above
             onGate,
-          })));
+          };
+          const ctx = roundCtx;
+          ({ results, commits } = await withCommandContext(t.id, async () => runReviewRecovery(t, ctx)));
         }
         results.forEach(classifyInfraResult);
         graph = addEvidence(graph, t.id, { commits, gateResults: results, artifacts: [promptFile] });
         saveGraph(repoRoot, graph);
-        if (results.some((g) => g.gate === "test" && !g.pass
+        if (results.some((g) => g.gate === "test" && !g.pass && !isInterruptedResult(g)
           && !(cfg.executionPolicy?.boundedInfrastructure && failureDisposition(g) === "infrastructure"))) testGateFailed = true;
 
         const live = assignment;
@@ -7462,6 +8066,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           infraReason: (g) => `${g.gate}: ${g.details}${g.meta?.recoveryBlocked ? ` — ${g.meta.recoveryBlocked}` : ""}`,
           reobserve: { attempt, replayed: gateSubject.replayedFromAttempt !== undefined },
           disposition: () => ({ author: live, attempt }),
+          ...(roundCtx ? { retest: retestInterrupted(t, roundCtx) } : {}),
           firstAttemptOk: attempt === 0, metering: { tokens, meteredAttempts: tokens ? metered : undefined },
           // T6: every gate — the review included — is satisfied on this commit, so the failure brief
           // this loop is still holding describes nothing outstanding. It is dropped HERE, before the
@@ -7501,6 +8106,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           await reconcile({ spareLiveLlm: true }); // task-done is a terminal event — sweep this task's leftovers
           return;
         }
+        if (settled.kind === "red") results = settled.results; // row 337: a reserved retry's evidence, never the interrupted red it replaced
         break gateLoop;
       }
 
@@ -7521,7 +8127,10 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         && !isDiffCapPark(reviewFail)
         && results.every((g) => gateSatisfied(g) || g.gate === "review");
       const failing = results.filter(gateFailed);
-      const deterministic = failing.find(isDeterministicFailure);
+      // Row 364; D-2184 add.45; D-2185 add.3: a daemon kill can interrupt an edit. Its dirty-tree refusal
+      // does not judge the worker, while a self-exited worker's dirt retains the ordinary attribution.
+      const ownedDeterministic = (g: GateResult) => isDeterministicFailure(g) && !(daemonKilled && g.meta?.dirtyWorktree === true);
+      const deterministic = failing.find(ownedDeterministic);
       if (deterministic) ownedGateFailures++;
       // Decided before the cap, because the cap's question is whether the NEXT move would re-buy a
       // measurement already made — and a funded repair is one of the moves that would.
@@ -7547,8 +8156,8 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       // It fires on the CROSSING, not as a latch: the consult it forces and the ban it sets govern the
       // next move, so re-firing on the third identical failure would only re-buy the round it just paid
       // for — and the ladder, whose rung this failure still spends, bounds the rest.
-      const repeated = failing.find((g) => isDeterministicFailure(g)
-        && identicalGateFailures(journal.read(), t.id, g.gate, normalizeGateFailure(g.details)) === GATE_FINGERPRINT_CAP);
+      const repeated = failing.find((g) => ownedDeterministic(g)
+        && conclusiveGateFailures(journal.read(), t.id, g.gate, normalizeGateFailure(g.details)) === GATE_FINGERPRINT_CAP);
       // The rung the cap spent, when it fired — the move below executes THIS instead of drawing a
       // second one, so a cap costs exactly the rung the failure would have cost anyway.
       let capStep: (typeof r.ladder)[number] | undefined;
@@ -7749,7 +8358,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
                 { disposition: "host-degraded", ...cleanupEvidence });
               return;
             }
-            if (err instanceof HeldProbeExhausted) {
+            if (err instanceof HeldProbeExhausted || err instanceof HcReadUnavailableError) {
               const wt = worktreePath(repoRoot, `${branch}--${t.id}`);
               const producer = knownProducer(journal.read(), t.id);
               let ref = await withoutExecutionBudget(() => preserveWorktree(wt, producer));

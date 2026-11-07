@@ -8,6 +8,7 @@ import { checkoutIncarnation, describeCapacity, inventoryDependencyLinks, type R
 import { shq } from "../adapters/types.js";
 import { trustedCommonDir } from "../run/git-trust.js";
 import { titleEnvironment } from "../run/title-environment.js";
+import { isInterruptedResult } from "../run/recovery.js";
 
 export const DEFAULT_VERDICT_CACHE_BOUND = 128;
 let testCacheBound: number | undefined;
@@ -303,6 +304,17 @@ export function formatReusedRow(cached: CachedVerdict, id: VerificationIdentity)
   };
 }
 
+/** Row 337 (D-2181 D3): the run, task, attempt and gate subject (a subject digest, never a git commit id)
+ * a stored verdict was EXECUTED for, written once at the store seam. A reused row keeps its record's origin,
+ * never the current attempt; an older record without a well-formed one has unknown origin. */
+export interface VerdictOrigin { runId: string; taskId: string; attempt: number; subject: string }
+export function verdictOrigin(meta: Record<string, unknown> | undefined): VerdictOrigin | undefined {
+  const o = meta?.origin as Record<string, unknown> | undefined;
+  return typeof o === "object" && o !== null && typeof o.runId === "string" && typeof o.taskId === "string"
+    && typeof o.subject === "string" && o.subject !== "" && Number.isInteger(o.attempt) && (o.attempt as number) >= 0
+    ? { runId: o.runId, taskId: o.taskId, attempt: o.attempt as number, subject: o.subject } : undefined;
+}
+
 export function reusedIdentity(id: VerificationIdentity): Record<string, unknown> {
   return {
     gate: id.gate ?? "gate",
@@ -317,8 +329,11 @@ export function reusedIdentity(id: VerificationIdentity): Record<string, unknown
   };
 }
 
-export function isInfraResult(result: GateResult | { meta?: Record<string, unknown>; details?: string; cause?: string; exitCode?: number }): boolean {
+export function isInfraResult(result: GateResult | { pass?: boolean; meta?: Record<string, unknown>; details?: string; cause?: string; exitCode?: number }): boolean {
   if (result.meta?.infra === true) return true;
+  // Row 337 (D-2181 D1): an interrupted red is inconclusive infrastructure even when its raw
+  // classification still reads regression — a pre-upgrade disk verdict included.
+  if (isInterruptedResult(result)) return true;
   if (result.meta?.classification === "infra") return true;
   if (result.meta?.kind === "ceiling-kill" || result.meta?.kind === "hang") return true;
   if ("cause" in result && result.cause === "infra") return true;
@@ -426,7 +441,8 @@ export class VerdictStore {
     if (existsSync(p)) {
       try {
         const raw = JSON.parse(readFileSync(p, "utf8")) as StoredVerdictRecord;
-        if (raw && raw.verdict) return raw.verdict;
+        // Row 337 (D-2181 D1): an interrupted verdict on disk is never an answer, whatever wrote it.
+        if (raw && raw.verdict) return isInterruptedResult(raw.verdict) ? undefined : raw.verdict;
       } catch {
         return undefined;
       }

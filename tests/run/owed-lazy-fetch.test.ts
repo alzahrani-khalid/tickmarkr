@@ -1,14 +1,17 @@
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
+import { verify } from "../../src/cli/commands/verify.js";
+import { saveGraph } from "../../src/graph/graph.js";
+import { validateGraph } from "../../src/graph/schema.js";
 import {
-  captureOwedCheck, foldOwedChecks, GATE_SATISFIED_RELEASE, type JournalEvent,
-  OWED_DISCHARGE_EVENT, owedSubject,
+  captureOwedCheck, foldOwedChecks, GATE_SATISFIED_RELEASE, Journal, type JournalEvent,
+  OWED_DISCHARGE_EVENT, owedSubject, supersedeContainment,
 } from "../../src/run/journal.js";
-import { makeRepo, makeTestTempDir } from "../helpers/tmprepo.js";
+import { makeRepo, makeTestTempDir, T } from "../helpers/tmprepo.js";
 
 beforeEach(() => {
   // Exercise the helper's forced value even when the caller explicitly permits lazy fetching.
@@ -80,9 +83,9 @@ const fixture = () => {
     } },
   ];
 
-  const clone = (name: string, blobless = true) => {
+  const clone = (name: string, blobless = true, extra: string[] = []) => {
     const repo = join(scratch, name);
-    git(scratch, "clone", "-q", "--no-checkout", ...(blobless ? ["--filter=blob:none"] : []), pathToFileURL(origin).href, repo);
+    git(scratch, "clone", "-q", "--no-checkout", ...(blobless ? ["--filter=blob:none"] : []), ...extra, pathToFileURL(origin).href, repo);
     const witness = join(scratch, `${name}.witness`);
     const uploadPack = join(scratch, `${name}-upload-pack`);
     writeFileSync(uploadPack, `#!/bin/sh\nprintf '%s\\n' "$*" >> ${quote(witness)}\nexec git upload-pack "$@"\n`, { mode: 0o755 });
@@ -145,3 +148,132 @@ test("test: the owed-check capture in a blobless clone needing a never-fetched b
   expect(obligation.unknownReason).toMatch(/^Command failed: git /);
   expect(obligation.unknownReason).toContain(`show --no-ext-diff --no-textconv --format= --binary ${f.head}`);
 });
+
+// Queue row 339 / D-2181 D5: a supersede's containment reads only commits, through the same no-lazy-fetch seam.
+test("test: a supersede containment proof in a blobless clone missing the fixing commit runs no transport and reads unreadable history, while an explicit lazy read in the same clone fetches it and the proof then holds", () => {
+  const f = fixture();
+  const partial = f.clone("supersede");
+  // The fixing commit lands on the origin after the clone, on top of the owed head.
+  git(f.origin, "checkout", "-q", "--detach", f.head);
+  writeFileSync(join(f.origin, "a.txt"), "one\n2\n3\n4\n5\n6\n7\n8\n9\nfix\n");
+  git(f.origin, "commit", "-q", "--no-gpg-sign", "-am", "fix");
+  const fixHead = git(f.origin, "rev-parse", "HEAD");
+  git(f.origin, "checkout", "-q", "main");
+  expect(supersedeContainment(partial.repo, f.obligation, f.base, fixHead)).toMatchObject({ ok: false, unreadable: true });
+  expect(read(partial.witness)).toBe("");
+  expect(localObjects(partial.repo)).not.toContain(fixHead);
+  // Endpoint equality on objects the clone holds proves without any transport.
+  expect(supersedeContainment(partial.repo, f.obligation, f.base, f.head)).toEqual({ ok: true });
+  expect(read(partial.witness)).toBe("");
+
+  // Positive transport control in this very clone: an explicit lazy read fetches the commit, then containment holds.
+  expect(git(partial.repo, "cat-file", "-t", fixHead)).toBe("commit");
+  expect(read(partial.witness)).toContain(f.origin);
+  expect(supersedeContainment(partial.repo, f.obligation, f.base, fixHead)).toEqual({ ok: true });
+});
+
+type Fixture = ReturnType<typeof fixture>;
+/** The run's journal (the outstanding obligation) and its compiled task, seeded into a clone; returns the journal path. */
+const seedRun = (f: Fixture, repo: string): string => {
+  saveGraph(repo, validateGraph({ version: 1, spec: { source: "prd", paths: ["p"], hash: "h" }, tasks: [T("T1", { files: ["a.txt"], acceptance: ["a"] })] }));
+  const journal = Journal.create(repo, f.obligation.runId);
+  // The waive, enacted by its merge and done rows; the discharge row is left out.
+  for (const e of f.folded.slice(0, 5)) journal.append(e.event, e.taskId, e.data);
+  expect(foldOwedChecks(journal.read(), repo)).toMatchObject({ known: true, debt: 1 });
+  return join(journal.dir, "journal.jsonl");
+};
+const supersedeArgv = (f: Fixture, base: string) => ["--record", f.obligation.runId, "--task", "T1", "--base", base, "--supersede", f.obligation.id, "--author", "human"];
+/** A commit the origin gains on top of `from`, left unreferenced so no clone ever fetches it. */
+const originCommit = (f: Fixture, from: string, text: string): string => {
+  git(f.origin, "checkout", "-q", "--detach", from);
+  writeFileSync(join(f.origin, "a.txt"), text);
+  git(f.origin, "commit", "-q", "--no-gpg-sign", "-am", text.trim());
+  const id = git(f.origin, "rev-parse", "HEAD");
+  git(f.origin, "checkout", "-q", "main");
+  return id;
+};
+
+// Queue row 339 / D-2181 D5: the supersede COMMAND measures its range through the same no-lazy-fetch seam, before
+// containment: an object the clone lacks is unreadable history, never a transport.
+test("test: verify --supersede in a blobless clone given a never-fetched base commit, and in a shallow blobless clone missing the owed base, runs no transport, refuses naming unreadable history and leaves the run journal byte identical, while an explicit lazy read in the same clone fetches", async () => {
+  const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+  const f = fixture();
+  const refusedUnreadable = async (repo: string, base: string, journalPath: string) => {
+    const before = readFileSync(journalPath);
+    const result = await verify(supersedeArgv(f, base), repo);
+    expect(result.code, result.out).toBe(2);
+    expect(result.out).toContain("verify --supersede refused: unreadable history (git merge-base exit");
+    expect(readFileSync(journalPath)).toEqual(before);
+  };
+
+  // A base commit the origin gained after the clone.
+  const unfetched = originCommit(f, f.base, "unfetched\n");
+  const partial = f.clone("command-unfetched");
+  await refusedUnreadable(partial.repo, unfetched, seedRun(f, partial.repo));
+  expect(read(partial.witness)).toBe("");
+  expect(localObjects(partial.repo)).not.toContain(unfetched);
+
+  // A shallow blobless clone holding only the integration tip: the owed base lies past its boundary.
+  const shallow = f.clone("command-shallow", true, ["--depth", "1"]);
+  expect(localObjects(shallow.repo)).not.toContain(f.base);
+  await refusedUnreadable(shallow.repo, f.base, seedRun(f, shallow.repo));
+  expect(read(shallow.witness)).toBe("");
+  expect(localObjects(shallow.repo)).not.toContain(f.base);
+
+  // Positive transport control in the first clone: an explicit lazy read fetches the never-fetched commit.
+  expect(git(partial.repo, "cat-file", "-t", unfetched)).toBe("commit");
+  expect(read(partial.witness)).toContain(f.origin);
+  errors.mockRestore();
+}, 60_000);
+
+// Queue row 339 / D-2181 D5 (D-2184 add.51): EVERY git read a supersede makes — rev-parse, the HEAD reflog witness,
+// merge-base, containment — runs through verify's one no-lazy-fetch seam, so a never-fetched commit that HEAD or its
+// reflog names is unreadable history: never a transport, never a later dirty-worktree message.
+test("test: verify --supersede in a blobless clone whose HEAD or HEAD reflog names a never-fetched commit runs no transport across the whole command and refuses naming unreadable history never a dirty worktree in plain and JSON output with the run journal byte identical", async () => {
+  const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+  const f = fixture();
+  const fixHead = originCommit(f, f.head, "one\n2\n3\n4\n5\n6\n7\n8\n9\nfix\n");
+  const stray = originCommit(f, f.base, "stray\n");
+  const unfetchedBase = originCommit(f, f.base, "unfetched base\n");
+  const refusedUnreadable = async (repo: string, base: string, journalPath: string, read: RegExp) => {
+    for (const json of [false, true]) {
+      const before = readFileSync(journalPath);
+      const result = await verify([...supersedeArgv(f, base), ...(json ? ["--json"] : [])], repo);
+      expect(result.code, result.out).toBe(2);
+      expect(result.out).not.toMatch(/dirty/);
+      if (json) {
+        expect(JSON.parse(result.out)).toMatchObject({ owed: { debt: 1, discharged: [], superseded: [], refused: expect.stringMatching(read) } });
+      } else {
+        expect(result.out.split("\n")[0]).toMatch(new RegExp(`^verify --supersede refused: ${read.source.slice(1)}`));
+      }
+      expect(readFileSync(journalPath)).toEqual(before);
+    }
+  };
+
+  // HEAD names the never-fetched fixing commit, as a checkout of it records: a detached HEAD and its reflog entry.
+  const headClone = f.clone("head-unfetched");
+  const headJournal = seedRun(f, headClone.repo);
+  const tip = git(headClone.repo, "rev-parse", "HEAD");
+  writeFileSync(join(headClone.repo, ".git", "HEAD"), `${fixHead}\n`);
+  appendFileSync(join(headClone.repo, ".git", "logs", "HEAD"), `${tip} ${fixHead} t <t@t> 1700000000 +0000\tcheckout: moving to ${fixHead}\n`);
+  await refusedUnreadable(headClone.repo, f.base, headJournal, /^unreadable history \(git reflog exit [1-9]/);
+  expect(read(headClone.witness)).toBe("");
+  expect(localObjects(headClone.repo)).not.toContain(fixHead);
+
+  // HEAD stays readable while an OLDER entry of its reflog names a never-fetched commit (moved there and back): the
+  // witness reads it with no transport, and the command runs on to the never-fetched base's unreadable merge-base.
+  const reflogClone = f.clone("reflog-unfetched");
+  const reflogJournal = seedRun(f, reflogClone.repo);
+  const main = git(reflogClone.repo, "rev-parse", "HEAD");
+  appendFileSync(join(reflogClone.repo, ".git", "logs", "HEAD"), `${main} ${stray} t <t@t> 1700000001 +0000\tcheckout: moving to ${stray}\n`
+    + `${stray} ${main} t <t@t> 1700000002 +0000\tcheckout: moving to main\n`);
+  await refusedUnreadable(reflogClone.repo, unfetchedBase, reflogJournal, /^unreadable history \(git merge-base exit [1-9]/);
+  expect(read(reflogClone.witness)).toBe("");
+  expect(localObjects(reflogClone.repo)).not.toContain(stray);
+  expect(localObjects(reflogClone.repo)).not.toContain(unfetchedBase);
+
+  // Positive transport control in the first clone: an explicit lazy read fetches the never-fetched fixing commit.
+  expect(git(headClone.repo, "cat-file", "-t", fixHead)).toBe("commit");
+  expect(read(headClone.witness)).toContain(f.origin);
+  errors.mockRestore();
+}, 60_000);

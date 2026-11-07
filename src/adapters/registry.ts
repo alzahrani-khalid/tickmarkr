@@ -424,6 +424,7 @@ export function declarativeAdapter(
     // v1.89 T1 / OBS-414: straight from the validated drive contract — no default and no fallback,
     // which is the only way this factory cannot reintroduce the optionality the type just removed.
     trustDialog: drive.trustDialog,
+    ...(drive.paneReviewBuffersOutput === true ? { paneReviewBuffersOutput: true } : {}),
     headlessCommand: (promptFile, model) => renderDriveTemplate(drive.headless, promptFile, model),
     interactiveCommand: (promptFile, model) => drive.interactive === null
       ? null

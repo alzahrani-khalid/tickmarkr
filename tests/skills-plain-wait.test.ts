@@ -109,10 +109,16 @@ test("Cite the replaced watcher line in each of the three plain-host sections, v
   // Queue row 340 (D-2180): the On the Herdr app scopes, their quoted recipes and the HC pair in each plain route move all three pins;
   // tests/skills-herdr-app.test.ts owns those additions. Its fail-closed list walk then found five universal lines
   // that rendered as lazy continuations inside a host bullet; a blank line before each moves the overseer pin.
+  // Queue row 359 (D-2184 add.16) changes app names/tab recipes; row 339 (D-2181) adds supersede guidance.
+  // The union's bounded app prose keeps those rules. Mutating either host scope must still fail this snapshot.
+  // Queue row 339 (D-2181 D6): the later-fix supersede recipe in the loop green rule and the overseer waive-debt
+  // paragraph (universal scope, plain section byte-unchanged) moves those two pins; tests/skills-run-truth.test.ts owns it.
+  // Row 359; D-2185 add.19: app lookup now names terminals[].terminal; hostile host edits still red.
+  // Row 359; D-2185 add.20: auto shares loop's condensed role section; keep the parity and hostile-edit pins.
   const baseline = {
-    loop: "1a49a9e0afa2c68920739d882b556244037ddb08d0023e91a28d8ecb5f0d8db2",
-    auto: "d6e257678ec555679675e9a3f9b4416f0a87af7831e5ec8441cada4a9140b499",
-    overseer: "d6eca93ed2bed35130066680f47fa1c5928e22f9914cc0b3cf7f5cc2249fd8ea",
+    loop: "d1bd9807906f68435920fb4f710163b2ff1fd18d732dfeee5cf231bbd8962742",
+    auto: "1b07e1eb72d5b4cf3620a086e6958fc50d0aa673ad231a02d2ad58bf4d560f93",
+    overseer: "7cf48feff7a63543b88fa55086503bf8f86bec5d797745da6ffd10aa854f23b2",
   };
   for (const name of SKILLS) {
     const markdown = readSkill(name);
@@ -124,6 +130,12 @@ test("Cite the replaced watcher line in each of the three plain-host sections, v
     expect(plugin, name).toHaveLength(1);
     assertPlugin(plugin[0]);
     const unchanged = markdown.replace(watcher[0], "  <PLAIN_HOST_WAITER>").replace(plugin[0], "");
-    expect(createHash("sha256").update(unchanged).digest("hex"), name).toBe(baseline[name]);
+    const assertSnapshot = (text: string) => expect(createHash("sha256").update(text).digest("hex"), name).toBe(baseline[name]);
+    assertSnapshot(unchanged);
+    for (const host of ["On herdr", "On Orca", "On the Herdr app"]) {
+      const mutant = unchanged.replace(host, "On an unapproved host");
+      expect(mutant, `${name}: ${host}`).not.toBe(unchanged);
+      expect(() => assertSnapshot(mutant), `${name}: ${host}`).toThrow();
+    }
   }
 });

@@ -7,7 +7,8 @@ import { describe, expect, test, vi } from "vitest";
 import { FakeAdapter } from "../../src/adapters/fake.js";
 import { claudeCode } from "../../src/adapters/claude-code.js";
 import { qwen } from "../../src/adapters/qwen.js";
-import { shq, type Assignment, type BillingChannel } from "../../src/adapters/types.js";
+import { adaptersFromCliEntries } from "../../src/adapters/registry.js";
+import { shq, type Assignment, type BillingChannel, type WorkerAdapter } from "../../src/adapters/types.js";
 import { PLAIN_BANNER } from "../../src/brand.js";
 import { DEFAULT_CONFIG } from "../../src/config/config.js";
 import { checkoutProofLine, inCheckout, OrcaDriver } from "../../src/drivers/orca.js";
@@ -214,7 +215,7 @@ const busyTree = (pane: ClockedPane) => ({
   async start() {}, async stop() {}, read: () => ({ cpu: { ms: 40 + pane.elapsed, resolutionMs: 10 }, gaps: 0 }),
 });
 
-async function clockedReview(text: string, ceiling: number, artifacts?: string, initialText?: string, tree = flatTree, seat = reviewer(), pane: ClockedPane = new ClockedPane(text, initialText)) {
+async function clockedReview(text: string, ceiling: number, artifacts?: string, initialText?: string, tree = flatTree, seat: WorkerAdapter = reviewer(), pane: ClockedPane = new ClockedPane(text, initialText)) {
   const { repo, base } = repoWithCommit();
   const cfg = structuredClone(DEFAULT_CONFIG);
   cfg.review.timeoutMs = ceiling;
@@ -364,6 +365,28 @@ test("test: a pane review by an adapter whose print mode buffers its whole outpu
   const plain = await clockedReview(ORCA_PREAMBLE, 900_000, undefined, ORCA_PREAMBLE, undefined, reviewer(), new BufferingPane(ORCA_PREAMBLE, 120_000));
   expect(plain.row.meta).toMatchObject({ cause: "launch-never-started", seatAuthoredBytes: 0, infra: true });
   expect(plain.pane.elapsed).toBe(REVIEW_FIRST_LIVENESS_MS);
+});
+
+test("row 358: a declared catalog reviewer survives the first pane liveness beat and approves at three minutes while an undeclared catalog reviewer is rerouted at that beat", async () => {
+  // Queue row 358; D-2184 add.14: reproduce omp's Working... pane with a catalog fixture and injected clock.
+  const catalogSeat = (buffers: boolean) => adaptersFromCliEntries([{
+    id: "fake", binary: "fake", identity: "^fake", vendor: "review-vendor",
+    drive: {
+      headless: "fake --model {model} --prompt-file {promptFile}", interactive: null,
+      trustDialog: { kind: "none", reason: "fake catalog reviewer; no process is launched" },
+      ...(buffers ? { paneReviewBuffersOutput: true as const } : {}),
+    },
+  }])[0]!;
+  const capture = `${ORCA_PREAMBLE}Working...\n`;
+  const buffered = await clockedReview(capture, 900_000, undefined, capture, undefined, catalogSeat(true), new BufferingPane(capture, 180_000));
+  expect(buffered.row.pass).toBe(true);
+  expect(buffered.pane.elapsed).toBe(180_000);
+  expect(buffered.pane.closed).toBe(0);
+
+  const undeclared = await clockedReview(capture, 900_000, undefined, capture, undefined, catalogSeat(false), new BufferingPane(capture, 180_000));
+  expect(undeclared.row.meta).toMatchObject({ cause: "silent", seatAuthoredBytes: 11, infra: true });
+  expect(undeclared.pane.elapsed).toBe(REVIEW_FIRST_LIVENESS_MS);
+  expect(undeclared.pane.closed).toBe(1);
 });
 
 test("test: every orca launch preamble measures zero seat-authored bytes at every read position after launch, bare and line-terminated, the checkout frame row with or without an empty row above it, the same frame still painting as the last row, and the launch echo naming the frame's own checkout directly above the frame, each followed by the banner, the blank row and the bare identity row, with qwen's SAFE MODE row and either recorded yolo wording or with no adapter rows, while each complete preamble followed by one seat word measures exactly that word's bytes", () => {

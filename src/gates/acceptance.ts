@@ -6,6 +6,7 @@ import { z } from "zod";
 import { channelKey, shq, type WorkerAdapter } from "../adapters/types.js";
 import { compileNative } from "../compile/native.js";
 import { DEFAULT_DIFF_CAP } from "../config/config.js";
+import { HcReadUnavailableError } from "../drivers/hc-client.js";
 import { type Effort, renderAcceptanceItem, type AcceptanceItem, type Task } from "../graph/schema.js";
 import { DEFAULT_SHELL_TIMEOUT_MS, sh, shell } from "../run/git.js";
 import { checkTaskDiffCaps, fetchTaskDiff, isProtectedEvidence, setAsideReceiptPath } from "./review.js";
@@ -658,6 +659,11 @@ The top-level comments array is optional. Use it only for actionable line-anchor
       ? runLlm(judge.adapter, judge.model, prompt, worktree, via, JUDGE_TIMEOUT_MS, judge.effort)
       : runLlm(judge.adapter, judge.model, prompt, worktree, via, JUDGE_TIMEOUT_MS));
   } catch (error) {
+    // Row 360; D-2184 add.19: unreadable transport supplies no judge verdict and stays on judge recovery.
+    if (error instanceof HcReadUnavailableError) {
+      return { gate: "acceptance", pass: false, details: `${warn}${detBlock}judge pane unreadable — ${error.message} — no verdict; failing closed`,
+        meta: { unparseable: true, cause: "no-verdict", judge: judgeKey } };
+    }
     if (!(error instanceof SeatLaunchError)) throw error;
     // OBS-1168(b): no seat, no verdict — run-gates re-routes the judge or parks infra; never a worker charge.
     return { gate: "acceptance", pass: false, details: `${warn}${detBlock}judge dispatch failed — ${error.message} — failing closed`,

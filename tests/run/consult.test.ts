@@ -13,6 +13,8 @@ import { extractPromptNonce, extractVerdictJson, gateExitTrailer, gatePaneName }
 import { sh } from "../../src/run/git.js";
 import { validateGraph } from "../../src/graph/schema.js";
 import { nextChannel } from "../../src/route/router.js";
+import { processLivenessHost } from "../../src/run/process-liveness.js";
+import { WorkerTreeCpuAccountant } from "../../src/run/stall.js";
 
 vi.mock("../../src/run/git.js", async (importOriginal) => {
   const actual = await importOriginal<{ sh: typeof sh }>();
@@ -372,8 +374,8 @@ describe("consult", () => {
     expect(v).toMatchObject({ action: "retry", notes: "headless bytes" });
     expect(built).toBeDefined();
     expect(shMock).toHaveBeenCalledTimes(1);
-    expect(shMock).toHaveBeenCalledWith(built!.command, "/tmp", cfg.consult.stallMinutes * 60_000 + 30_000, {
-      onSpawn: expect.any(Function), ownsLeader: expect.any(Function), seat: "consult",
+    expect(shMock).toHaveBeenCalledWith(built!.command, "/tmp", cfg.consult.stallMinutes * 60_000 * 4 + 30_000, {
+      onSpawn: expect.any(Function), onOutput: expect.any(Function), ownsLeader: expect.any(Function), signal: expect.any(AbortSignal), seat: "consult",
     });
     expect(readdirSync(join(runDir, "consults")).some((f) => f.endsWith(".sh"))).toBe(false);
     const promptFile = join(runDir, "consults", readdirSync(join(runDir, "consults")).find((f) => f.endsWith(".md"))!);
@@ -382,6 +384,13 @@ describe("consult", () => {
   });
 
   test("waitOutput deadline tracks cfg.consult.stallMinutes", async () => {
+    // Row 364; D-2184 add.44: a no-verdict seat now has a silence window and a four-window ceiling.
+    let elapsed = 0;
+    const time = { now: () => elapsed, sleep: async (ms: number) => { elapsed += ms; } };
+    const start = vi.spyOn(WorkerTreeCpuAccountant.prototype, "start").mockResolvedValue();
+    const stop = vi.spyOn(WorkerTreeCpuAccountant.prototype, "stop").mockResolvedValue();
+    const cpu = vi.spyOn(WorkerTreeCpuAccountant.prototype, "read").mockReturnValue({ cpu: { ms: 0, resolutionMs: 10 }, gaps: 0 });
+    const connection = vi.spyOn(processLivenessHost, "connection").mockResolvedValue("unreadable");
     const stubSlot: Slot = { id: "stub", name: gatePaneName("consult", "T1"), cwd: "/tmp" };
     let capturedMs = 0;
     let capturedOpts: unknown;
@@ -392,6 +401,7 @@ describe("consult", () => {
       run: async () => {},
       waitOutput: async (_slot, _marker, ms) => {
         capturedMs = ms;
+        elapsed += ms;
         return false;
       },
       waitAgentStatus: async () => false,
@@ -405,16 +415,20 @@ describe("consult", () => {
     const { cfg, fake, runDir } = setup({ action: "retry", notes: "unused" });
     cfg.visibility.llm = "pane";
     cfg.consult.stallMinutes = 3;
-    const v = await consult(dossier, cfg, [fake], stub, "/tmp", runDir);
-    expect(capturedMs).toBe(180_000);
-    expect(capturedMs).not.toBe(600_000);
-    expect(v.action).toBe("human");
-    // SUP-01: the consult slot gets a dedicated role tab labeled with its task id (opts forwarded, non-vacuous)
-    expect(capturedOpts).toEqual({ label: "CONSULT T1" });
+    try {
+      const v = await consult(dossier, cfg, [fake], stub, "/tmp", runDir, { time });
+      expect(capturedMs).toBeLessThanOrEqual(180_000);
+      expect(elapsed).toBe(4 * 180_000);
+      expect(v.action).toBe("human");
+      // SUP-01: the consult slot gets a dedicated role tab labeled with its task id (opts forwarded, non-vacuous)
+      expect(capturedOpts).toEqual({ label: "CONSULT T1" });
 
-    cfg.consult.stallMinutes = 1;
-    await consult(dossier, cfg, [fake], stub, "/tmp", runDir);
-    expect(capturedMs).toBe(60_000);
+      cfg.consult.stallMinutes = 1;
+      elapsed = 0;
+      await consult(dossier, cfg, [fake], stub, "/tmp", runDir, { time });
+      expect(capturedMs).toBeLessThanOrEqual(60_000);
+      expect(elapsed).toBe(4 * 60_000);
+    } finally { start.mockRestore(); stop.mockRestore(); cpu.mockRestore(); connection.mockRestore(); }
   });
 });
 

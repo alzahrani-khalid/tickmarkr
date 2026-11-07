@@ -334,6 +334,8 @@ export interface ShellOptions {
   unleased?: boolean;
   signal?: AbortSignal;
   onSpawn?: (pid: number | undefined) => void;
+  /** Row 364; D-2185 add.3: a consult's silence clock observes bytes on either pipe. */
+  onOutput?: () => void;
   onTimeout?: () => void;
   /** Independent of the legacy pid callback; started means the child emitted spawn. */
   onReceipt?: (receipt: ShellReceipt) => void;
@@ -578,11 +580,13 @@ function executeShell(cmd: string, cwd: string, timeoutMs: number, login: boolea
     // still decides whether a chunk-local decoder exposes the defect in any particular run.
     p.stdout!.on("data", (d) => {
       if (d.length > 0) outputSeen = true;
+      if (d.length > 0) options.onOutput?.();
       if (options.bytes) stdoutChunks.push(d);
       stdout += stdoutDecoder.write(d);
     });
     p.stderr!.on("data", (d) => {
       if (d.length > 0) outputSeen = true;
+      if (d.length > 0) options.onOutput?.();
       stderr += stderrDecoder.write(d);
     });
     p.on("error", (e: NodeJS.ErrnoException) => {

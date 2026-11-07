@@ -10,6 +10,7 @@ import { answerTrustDialog } from "../run/trust-dialog.js";
 import type { Effort } from "../graph/schema.js";
 import { formatOwnedName, parseOwnedName, type ExecutorDriver, type Slot } from "../drivers/types.js";
 import { SEAT_MARKER_ENV } from "../drivers/host-env.js";
+import { HcReadUnavailableError } from "../drivers/hc-client.js";
 import { CHECKOUT_MARK, checkoutProofLine, type SeatLaunchCause } from "../drivers/orca.js";
 import { bannerShell, paneDispatchCommand, PLAIN_BANNER } from "../brand.js";
 import { sh } from "../run/git.js";
@@ -682,6 +683,10 @@ async function runViaDriverDetailed(
       silentAtBeat,
       seatAuthoredBytes: turn?.seatAuthoredBytes ?? seatAuthoredBytes,
     };
+  } catch (error) {
+    // Row 360; D-2184 add.19: close an unreadable seat even when kept, before existing no-verdict recovery.
+    if (error instanceof HcReadUnavailableError) forceClose = true;
+    throw error;
   } finally {
     try {
       await accountant?.stop();

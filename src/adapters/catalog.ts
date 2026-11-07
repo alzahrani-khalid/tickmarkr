@@ -53,6 +53,8 @@ export const CliDriveSchema = z.object({
     error: (issue) => (issue.input === undefined ? DRIVE_TRUST_DIALOG_MESSAGE : undefined),
   }),
   listModels: ListModelsSchema.optional(),
+  // Queue row 358; D-2184 add.14: only a measured buffering print mode may skip the pane review beat.
+  paneReviewBuffersOutput: z.literal(true).optional(),
 }).strict().superRefine((drive, ctx) => {
   for (const [field, template] of [["headless", drive.headless], ["interactive", drive.interactive]] as const) {
     if (template === null) continue;
@@ -155,6 +157,9 @@ export const CLI_CATALOG: readonly CliEntry[] = [
       // the invisible configuration is the easier one to write — this one is written visible.
       headless: "omp -p --model {model} @{promptFile}",
       interactive: "omp --model {model} @{promptFile}",
+      // Queue row 358; D-2184 add.14: omp -p paints only "Working..." until its verdict (~3 min),
+      // so the 30 s pane review beat retired working reviewers; headless review reached approval.
+      paneReviewBuffersOutput: true,
       trustDialog: {
         kind: "none",
         reason: "omp 17.2.10 showed no workspace-trust prompt during the recorded interactive probe (PROBE-omp-v189.md, 2026-08-07)",

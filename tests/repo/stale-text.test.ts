@@ -82,8 +82,9 @@ test("test: the three shipped run skills keep the wake instruction without the j
   expect(namedAdapter(comment)).toBeUndefined();
   expect(namedAdapter("(`claude -p`) has written zero seat-authored bytes until its verdict")).toBe("claude");
   expect(namedAdapter("No streaming adapter declares this since claude seats stream")).toBe("claude");
-  // Only grok declares it: its plain print mode was measured silent past the first-liveness beat (D-2180).
-  for (const adapter of shipped) expect(adapter.paneReviewBuffersOutput === true, adapter.id).toBe(adapter.id === "grok");
+  // grok was measured silent past the first-liveness beat (D-2180); omp was measured losing pane reviews
+  // (queue row 358; D-2184 add.14).
+  for (const adapter of shipped) expect(adapter.paneReviewBuffersOutput === true, adapter.id).toBe(adapter.id === "grok" || adapter.id === "omp");
 });
 
 test("test: the shipped-skill provenance module's current snapshot equals the digests of the shipped skill files, so a skill edited without regenerating the module fails", () => {

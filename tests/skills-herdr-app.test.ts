@@ -41,7 +41,7 @@ function visibleSeatFindings(name: string, markdown: string, overseer: string): 
   if (!/two(?:-tier| visible tiers)/.test(own)) findings.push(`${name}: no two-tier app route`);
   if (name !== "overseer" && !own.includes(`(../tickmarkr-overseer/SKILL.md${APP_ANCHOR})`)) findings.push(`${name}: no delegation to the canonical app guidance`);
   if (!own.includes("hc run --bg --json --no-parent --no-notify")) findings.push(`${name}: no detached visible hc launch`);
-  for (const need of ["--name \"ORCH · <label>\"", "--cwd \"<", "tickmarkr.owner", "tickmarkr.repo", "herdr.space", "first task"]) {
+  for (const need of ["--name \"orch-<label-slug>\"", "--cwd \"<", "tickmarkr.owner", "tickmarkr.repo", "herdr.space", "first task"]) {
     if (!own.includes(need)) findings.push(`${name}: launch lacks ${need}`);
   }
   // Row 4: the seat launch table, held once in the canonical guidance.
@@ -87,6 +87,70 @@ test("all three app skill routes satisfy the closed visible-seat table while nei
   for (const [name, mutant, why] of mutants) {
     expect(mutant, why).not.toBe(read(name));
     expect(caught(() => visibleSeatFindings(name, mutant, name === "overseer" ? mutant : overseer)), why).toBe(true);
+  }
+});
+
+// Queue row 359; D-2184 add.16: hc names are terminal slugs; app tab labels require a separate operation.
+function hcNameFindings(markdown: string): string[] {
+  const commands = markdown.replace(/\\\n\s*/g, " ");
+  const names = [...commands.matchAll(/\bhc\s+run\b[^\n`]*?--name(?:=|\s+)(?:"([^"]*)"|'([^']*)'|(<[^>\n]+>|[^\s`]+))/g)];
+  return names.flatMap((match) => {
+    const name = (match[1] ?? match[2] ?? match[3]!).replace(/<[^>]+>/g, "token");
+    return /^[a-z0-9][a-z0-9_-]{0,31}$/.test(name) && !/^t[0-9][a-z0-9]*$/.test(name) ? [] : [name];
+  });
+}
+
+test("row 359: every named hc run in shipped skills uses a valid terminal slug after placeholder substitution", () => {
+  const sources = (dir: string): string[] => readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+    const path = join(dir, entry.name);
+    return entry.isDirectory() ? sources(path) : entry.isFile() ? [path] : [];
+  });
+  const files = sources(join(ROOT, "skills"));
+  expect(files.length).toBeGreaterThan(0);
+  let namedLaunches = 0;
+  for (const path of files) {
+    const markdown = readFileSync(path, "utf8");
+    namedLaunches += [...markdown.matchAll(/\bhc\s+run\b[^\n`]*?--name\b/g)].length;
+    expect(hcNameFindings(markdown), relative(ROOT, path)).toEqual([]);
+  }
+  expect(namedLaunches).toBeGreaterThanOrEqual(SKILLS.length);
+  for (const name of ["ORCH · <label>", "Uppercase", "two words", "-orch", "t7", "x".repeat(33)]) {
+    expect(hcNameFindings(`hc run --name "${name}" -- agent`), name).not.toEqual([]);
+  }
+  for (const name of ["orch-<label-slug>", "seat_1", "1-seat", "x".repeat(32)]) {
+    expect(hcNameFindings(`hc run --name "${name}" -- agent`), name).toEqual([]);
+  }
+});
+
+function appTabFindings(markdown: string): string[] {
+  const app = flat(skillReading(markdown, "app"));
+  return [
+    "At Setup", "`herdr-app ls`", "`terminals[].terminal`", "verified seat address",
+    'herdr-app do tab.rename --id "<tab-id>" --name "OVERSEER · <label>"',
+    "Right after", "ORCH spawn read-back",
+    'herdr-app do tab.rename --id "<tab-id>" --name "ORCH · <label>"',
+    "read-back", "on every state change", "tab's owner", "progress fraction", "one hot-state token",
+    "Never rename a tab you did not create or worker tabs (the daemon's)",
+  ].filter((need) => !app.toLowerCase().includes(need.toLowerCase()));
+}
+
+test("row 359: each Herdr app skill maps and reads back its own Setup and ORCH tab labels and makes later labels the owner's duty", () => {
+  for (const name of SKILLS) {
+    const markdown = read(name);
+    expect(appTabFindings(markdown), name).toEqual([]);
+    for (const [before, after] of [
+      ["herdr-app do tab.rename", "missing-tab-operation"],
+      ["herdr-app ls", "missing-app-map"],
+      ["terminals[].terminal", "terminals[].address"],
+      ['--name "OVERSEER · <label>"', '--name "missing-overseer-label"'],
+      ['--name "ORCH · <label>"', '--name "missing-orch-label"'],
+      ["Never rename a tab you did not create or", "Rename any idle tab or"],
+      ["tab's owner", "any observer"],
+    ]) {
+      const mutant = markdown.replaceAll(before!, after!);
+      expect(mutant, `${name}: ${before}`).not.toBe(markdown);
+      expect(appTabFindings(mutant), `${name}: ${before}`).not.toEqual([]);
+    }
   }
 });
 
@@ -172,7 +236,7 @@ function seatLaunchArgv(template: string): { argv: string[]; checkout: string; r
   writeFileSync(fake, `#!/usr/bin/env node\nrequire("fs").writeFileSync(${JSON.stringify(out)}, JSON.stringify(process.argv.slice(2)));\n`);
   chmodSync(fake, 0o755);
   const checkout = join(dir, "my checkout"), repo = join(dir, "my repo");
-  const command = template.replace(/^hc /, `${JSON.stringify(fake)} `).replaceAll("<label>", "2.20.0").replaceAll("<checkout>", checkout)
+  const command = template.replace(/^hc /, `${JSON.stringify(fake)} `).replaceAll("<label-slug>", "2-20-0").replaceAll("<label>", "2.20.0").replaceAll("<checkout>", checkout)
     .replaceAll("<seat>", "ORCH").replaceAll("<repo>", repo).replaceAll("<verified space>", "work space")
     .replaceAll("<fleet-selected agent command>", "claude --model opus").replaceAll("<first task>", "Read the brief and follow it.");
   execFileSync("/bin/sh", ["-c", command], { env: { PATH: process.env.PATH }, stdio: "pipe" });
@@ -229,7 +293,7 @@ test("scope-cleared app run and resume preserve the recorded ORCH address while 
   // The canonical seat launch hands hc the exact checkout, owner, repo and space values, and the agent its first task.
   const template = SEAT.exec(read("overseer"))![1]!;
   const seat = seatLaunchArgv(template);
-  expect(seat.argv).toEqual(["run", "--bg", "--json", "--no-parent", "--no-notify", "--name", "ORCH · 2.20.0", "--cwd", seat.checkout,
+  expect(seat.argv).toEqual(["run", "--bg", "--json", "--no-parent", "--no-notify", "--name", "orch-2-20-0", "--cwd", seat.checkout,
     "--label", "tickmarkr.owner=ORCH", "--label", `tickmarkr.repo=${seat.repo}`, "--label", "herdr.space=work space",
     "--", "claude", "--model", "opus", "Read the brief and follow it."]);
   // Pre-fix control: the unquoted template truncates the cwd and repo label.

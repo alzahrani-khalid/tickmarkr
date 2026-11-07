@@ -7,11 +7,13 @@ import { DEFAULT_CONFIG } from "../../src/config/config.js";
 import { CLAUDE_ALIAS_IDENTITY_STAMPS } from "../../src/adapters/claude-code.js";
 import {
   SHIPPED_CLI_CATALOG,
+  CliDriveSchema,
   catalogEntries,
   discoverCliEntries,
   loadOperatorCliCatalog,
   parseOperatorCliCatalog,
   projectCliEntries,
+  isNativeCliDrive,
   type CliEntry,
 } from "../../src/adapters/catalog.js";
 import {
@@ -71,6 +73,26 @@ const discoverySources = (): Array<{ source: string; entries: CliEntry[]; id: st
 };
 
 describe("declarative CLI catalog", () => {
+  test("row 358: a catalog drive accepts an omitted or literal true buffering declaration and rejects every non-true value", () => {
+    const drive = CliDriveSchema.parse(driven("fixture").drive);
+    expect(drive).not.toHaveProperty("paneReviewBuffersOutput");
+    expect(CliDriveSchema.parse({ ...drive, paneReviewBuffersOutput: true }).paneReviewBuffersOutput).toBe(true);
+    for (const value of [false, "true", 1, null]) {
+      expect(CliDriveSchema.safeParse({ ...drive, paneReviewBuffersOutput: value }).success, String(value)).toBe(false);
+    }
+  });
+
+  test("row 358: omp alone among shipped declarative adapters carries the measured pane review buffering declaration through the catalog factory", () => {
+    const entries = SHIPPED_CLI_CATALOG.filter((entry) => entry.drive && !isNativeCliDrive(entry.drive));
+    expect(entries.filter((entry) => !isNativeCliDrive(entry.drive) && entry.drive?.paneReviewBuffersOutput === true)
+      .map((entry) => entry.id)).toEqual(["omp"]);
+    const adapters = adaptersFromCliEntries(entries);
+    expect(adapters.filter((adapter) => adapter.paneReviewBuffersOutput === true).map((adapter) => adapter.id)).toEqual(["omp"]);
+    for (const adapter of adapters.filter((adapter) => adapter.id !== "omp")) {
+      expect(adapter, adapter.id).not.toHaveProperty("paneReviewBuffersOutput");
+    }
+  });
+
   test("test: no advisory-only entry is ever executed, proven member by member over the closed set of discovery sources — a catalog-entry fixture with no drive block, an operator-YAML fixture with no drive block, and a herdr-nominated-name fixture — each resolved for presence only, and each proven unexecuted by an injected exec tracker recording zero invocations rather than by the absence of a version string in a rendered row", () => {
     for (const { source, entries, id } of discoverySources()) {
       const execute = vi.fn();

@@ -4,8 +4,8 @@ import { execFile } from "node:child_process";
 // `herdr-app` (spaces/tabs/panes). Every call is argv (no shell, no login profile), bounded by a deadline and an
 // output cap; a timed-out call is killed and awaited before it answers. Only the closed consumed fields of each
 // response family are validated; unknown extra fields are allowed. Every failure names its family and keeps bounded
-// diagnostics (operation, exit, signal, timeout, stdout, stderr). Nothing here retries: a failed mutation is never
-// replayed, and no parser guesses text, ids or focused targets.
+// diagnostics (operation, exit, signal, timeout, stdout, stderr). A failed mutation is never replayed, and no parser
+// guesses text, ids or focused targets. Only unreadable read responses permit bounded re-reads (row 360; D-2184 add.19).
 
 export const HC_FAMILIES = ["status", "run", "ls", "terminal", "read", "send", "keys", "wait", "rm"] as const;
 export const APP_FAMILIES = ["app-ls", "pane-split", "tab-rename"] as const;
@@ -60,6 +60,14 @@ export class HcError extends Error {
     super(`${family} response family failed — ${reason} [op ${d.op}; exit ${d.exit ?? "none"}; signal ${d.signal ?? "none"}; ` +
       `timedOut ${d.timedOut}]${d.stderr ? `\nstderr: ${d.stderr}` : ""}${d.stdout ? `\nstdout: ${d.stdout}` : ""}`);
     this.name = "HcError";
+  }
+}
+
+/** Row 360; D-2184 add.19: an unreadable transport response supplies no pane text or verdict. */
+export class HcReadUnavailableError extends HcError {
+  constructor(reason: string, diagnostics: HcDiagnostics) {
+    super("read", reason, diagnostics);
+    this.name = "HcReadUnavailableError";
   }
 }
 
@@ -159,6 +167,8 @@ export interface HcClientOpts {
   /** Ceiling for herdr-app placement calls (default 30 s). */
   placementTimeoutMs?: number;
   outputCap?: number;
+  /** Clock shared with a caller's deadline; injectable for bounded read recovery. */
+  now?: () => number;
 }
 
 const clip = (s: string): string => (s.length > DIAG_CAP ? `${s.slice(0, DIAG_CAP)}…[${s.length - DIAG_CAP} more bytes]` : s);
@@ -192,6 +202,10 @@ export class HcClient {
     const r = await this.exec(bin, args, timeoutMs);
     const diag: HcDiagnostics = { op: `${bin.split("/").pop()} ${args.slice(0, 2).join(" ")}`, exit: r.exit, signal: r.signal, timedOut: r.timedOut, stdout: clip(r.stdout), stderr: clip(r.stderr) };
     const fail = (reason: string, kind?: string): never => { throw new HcError(family, reason, diag, kind); };
+    const unreadable = (reason: string): never => {
+      if (family === "read") throw new HcReadUnavailableError(reason, diag);
+      return fail(reason);
+    };
     if (r.spawnError) fail(`could not be invoked (${r.spawnError})`);
     if (r.capped) fail(`output exceeded the ${this.cap}-byte cap (killed)`);
     if (r.timedOut) fail(`timed out after ${timeoutMs} ms (killed)`);
@@ -203,13 +217,13 @@ export class HcClient {
       fail(`exited ${r.exit}${kind ? ` (${kind})` : ""}`, kind);
     }
     const text = r.stdout.trim();
-    if (!text) fail("empty response");
+    if (!text) unreadable("empty response");
     let parsed: unknown;
-    try { parsed = JSON.parse(text); } catch (e) { fail(`malformed JSON (${(e as Error).message})`); }
-    if (!isObj(parsed)) fail("response is not a JSON object");
+    try { parsed = JSON.parse(text); } catch (e) { unreadable(`malformed JSON (${(e as Error).message})`); }
+    if (!isObj(parsed)) unreadable("response is not a JSON object");
     const body = parsed as O;
     if ("error" in body) fail(`error body on exit 0 (${errorKind(text) ?? "unstructured"})`);
-    try { return PARSE[family](body); } catch (e) { if (e instanceof Shape) fail(e.message); throw e; }
+    try { return PARSE[family](body); } catch (e) { if (e instanceof Shape) unreadable(e.message); throw e; }
   }
 
   hc<F extends HcFamily>(family: F, args: string[], timeoutMs = this.timeoutMs): Promise<Parsed[F]> {
@@ -233,9 +247,28 @@ export class HcClient {
   async kill(address: string, ms?: number): Promise<HcTerminal> { return pinned("terminal", address, await this.hc("terminal", ["kill", address], ms)); }
   async keepOff(address: string, ms?: number): Promise<HcTerminal> { return pinned("terminal", address, await this.hc("terminal", ["keep", address, "--off"], ms)); }
   async label(address: string, pairs: string[], ms?: number): Promise<HcTerminal> { return pinned("terminal", address, await this.hc("terminal", ["label", address, ...pairs], ms)); }
-  read(address: string, lines: number, ms?: number): Promise<HcRead> {
+  async read(address: string, lines: number, ms?: number): Promise<HcRead> {
     if (!Number.isInteger(lines) || lines < 0) throw new Error(`hc read: lines must be a nonnegative integer, got ${lines}`);
-    return this.hc("read", ["read", address, "--lines", String(lines)], ms);
+    // Row 360; D-2184 add.19: at most two re-reads, sharing the ORIGINAL call budget. Refusals, timeouts, signals,
+    // output caps and every mutation retain their existing behavior; malformed bytes never become an empty pane.
+    const now = this.o.now ?? Date.now;
+    const deadline = now() + (ms ?? this.timeoutMs);
+    let last: HcReadUnavailableError | undefined;
+    for (let attempt = 0; ; attempt++) {
+      const left = deadline - now();
+      if (left <= 0) {
+        throw last ?? new HcReadUnavailableError("read deadline reached before a call could be issued",
+          { op: "hc read", exit: null, signal: null, timedOut: false, stdout: "", stderr: "" });
+      }
+      try { return await this.hc("read", ["read", address, "--lines", String(lines)], left); }
+      catch (error) {
+        if (last && error instanceof HcError && error.diagnostics.timedOut) {
+          throw new HcReadUnavailableError(`read recovery budget exhausted (${error.reason})`, error.diagnostics);
+        }
+        if (!(error instanceof HcReadUnavailableError) || attempt === 2) throw error;
+        last = error;
+      }
+    }
   }
   send(address: string, text: string, ms?: number): Promise<HcSend> { return this.hc("send", ["send", address, text], ms); } // never --force
   keys(address: string, keys: string[], ms?: number): Promise<HcKeys> { return this.hc("keys", ["keys", address, ...keys], ms); }

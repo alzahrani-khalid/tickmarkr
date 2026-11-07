@@ -4,6 +4,7 @@ import {
   closeSync, existsSync, linkSync, mkdirSync, openSync, readdirSync, readFileSync, readlinkSync, realpathSync, renameSync, rmdirSync, rmSync, statSync, writeFileSync,
 } from "node:fs";
 import { basename, dirname, join } from "node:path";
+import { HC_SCOPE_ENV } from "../drivers/host-env.js";
 import { stateDirName, tickmarkrDir } from "../graph/graph.js";
 import {
   SUPERVISION_BEAT_MS, isSeatTier, publishStandDown, readSupervisionArm, supervisionArmPath, supervisionBeatPath, supervisionStandDownPath,
@@ -1309,8 +1310,11 @@ async function launch(repoRoot: string, tier: SupervisionTier, seat: string, gen
   try {
     const fd = guard(() => deps.openLog(log), owned);
     try {
+      const childEnv: NodeJS.ProcessEnv = { ...deps.env, [BEAT_GENERATION_ENV]: generation };
+      // Queue row 366 (D-2185 add.5/add.7): the beat must outlive its arming hc terminal while retaining its host address.
+      delete childEnv[HC_SCOPE_ENV];
       child = guard(() => deps.spawn(deps.cli[0], [...deps.cli.slice(1), "beat", tier, "--seat", seat, "--loop", "--arm-id", generation], {
-        cwd: repoRoot, detached: true, stdio: ["ignore", fd, fd], env: { ...deps.env, [BEAT_GENERATION_ENV]: generation },
+        cwd: repoRoot, detached: true, stdio: ["ignore", fd, fd], env: childEnv,
       }), owned);
     } finally { closeSync(fd); }
   } catch (error) {

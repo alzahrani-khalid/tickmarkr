@@ -143,6 +143,11 @@ function normJournal(events: JournalEvent[], repo: string, runId: string, baseRe
       expect(judgment.commit).toMatch(/^[0-9a-f]{40}$/);
       row = { ...row, data: { ...row.data, judgment: { ...judgment, commit: "<COMMIT>" } } };
     }
+    // Row 337 (D-2181 D3): a test row names the git commit its subject was measured on — repository-specific too.
+    if (row.event === "gate-result" && row.data.gate === "test" && row.data.subjectHead !== undefined) {
+      expect(row.data.subjectHead).toMatch(/^[0-9a-f]{40}$/);
+      row = { ...row, data: { ...row.data, subjectHead: "<COMMIT>" } };
+    }
     if (row.event === "worktree-recreation") {
       const d = row.data as { attempted?: string[]; carried?: string[] };
       row = {

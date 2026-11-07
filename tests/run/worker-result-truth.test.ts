@@ -18,7 +18,8 @@ import {
   WORKER_STARTUP_WINDOW_MS,
 } from "../../src/run/daemon.js";
 import { Journal, WORKER_RESULT_CAUSES } from "../../src/run/journal.js";
-import { PANE_READ_ROWS } from "../../src/run/stall.js";
+import { processLivenessHost } from "../../src/run/process-liveness.js";
+import { PANE_READ_ROWS, resetHarvestCpuFlatMsForTests, setHarvestCpuFlatMsForTests, WorkerTreeCpuAccountant } from "../../src/run/stall.js";
 import { COMMIT, setupRepo, T } from "../helpers/tmprepo.js";
 
 interface EnvelopeStep {
@@ -168,16 +169,28 @@ test("test: a stall-timeout harvest reaps the still-running worker before it rea
   const inner = new SubprocessDriver();
   const driver = wrappedDriver(inner);
 
-  const summary = await runDaemon(repo, { approvalWindowMs: 1, adapters: [fake], runId: "run-reap-before-harvest", driver });
-  expect(summary.done).toEqual(["T1"]);
-  await new Promise((resolve) => setTimeout(resolve, 2_100));
-  expect(execSync(`git show ${shq(summary.branch)}:late.txt`, { cwd: repo, encoding: "utf8" })).toBe("first\n");
-  const events = Journal.open(repo, "run-reap-before-harvest").read();
-  const reaped = events.filter((event) => event.event === "worker-reaped-before-harvest");
-  expect(reaped).toHaveLength(1);
-  expect(events.filter((event) => event.event === "tip-moved")).toEqual([]);
-  expect(events.findIndex((event) => event.event === "worker-reaped-before-harvest"))
-    .toBeLessThan(events.findIndex((event) => event.event === "worker-result-harvested"));
+  // Row 364; D-2185 add.3: this harvest case requires measurable silence, not a liveness hold.
+  const start = vi.spyOn(WorkerTreeCpuAccountant.prototype, "start").mockResolvedValue();
+  const stop = vi.spyOn(WorkerTreeCpuAccountant.prototype, "stop").mockResolvedValue();
+  const cpu = vi.spyOn(WorkerTreeCpuAccountant.prototype, "read").mockReturnValue({ cpu: { ms: 0, resolutionMs: 10 }, gaps: 0 });
+  const connection = vi.spyOn(processLivenessHost, "connection").mockResolvedValue("none");
+  setHarvestCpuFlatMsForTests(0);
+  try {
+    const summary = await runDaemon(repo, { approvalWindowMs: 1, adapters: [fake], runId: "run-reap-before-harvest", driver });
+    expect(summary.done).toEqual(["T1"]);
+    await new Promise((resolve) => setTimeout(resolve, 2_100));
+    expect(execSync(`git show ${shq(summary.branch)}:late.txt`, { cwd: repo, encoding: "utf8" })).toBe("first\n");
+    const events = Journal.open(repo, "run-reap-before-harvest").read();
+    expect(events.find((event) => event.event === "worker-result")?.data.cause).toBe("stall-timeout");
+    expect(events.filter((event) => event.event === "worker-stall-held")).toEqual([]);
+    const reaped = events.filter((event) => event.event === "worker-reaped-before-harvest");
+    expect(reaped).toHaveLength(1);
+    expect(events.filter((event) => event.event === "tip-moved")).toEqual([]);
+    expect(events.findIndex((event) => event.event === "worker-reaped-before-harvest"))
+      .toBeLessThan(events.findIndex((event) => event.event === "worker-result-harvested"));
+  } finally {
+    start.mockRestore(); stop.mockRestore(); cpu.mockRestore(); connection.mockRestore(); resetHarvestCpuFlatMsForTests();
+  }
 }, 30_000);
 
 test("test: a worker whose driver cannot stop it at harvest parks stall naming the failure instead of gating a moving tip and a task's second dispatch sweeps its first attempt's pane before the new worker launches whereas a daemon that gates the unstopped tree or leaves the superseded pane until task-done fails", async () => {
@@ -238,7 +251,7 @@ test("test: a worker whose driver cannot stop it at harvest parks stall naming t
   expect(closeFirst).toBeLessThan(launchSecond);
 }, 30_000);
 
-test("test: a model-not-found banner that first appears after the startup window concludes nothing while the same banner inside the window concludes startup-failure within one poll and the worker-result causes vocabulary lists startup-failure beside the five prior causes whereas a detector that reads every slice or a vocabulary without the word fails", async () => {
+test("test: a model-not-found banner that first appears after the startup window concludes nothing while the same banner inside the window concludes startup-failure within one poll and the worker-result causes vocabulary lists startup-failure and hard-timeout beside the prior causes whereas a detector that reads every slice or a vocabulary without the word fails", async () => {
   setWorkerStartupWindowMsForTests(100);
   const late = setupRepo(
     [T("T1")],
@@ -296,7 +309,7 @@ test("test: a model-not-found banner that first appears after the startup window
     .find((event) => event.event === "worker-result")?.data.cause).toBe("startup-failure");
   expect(WORKER_STARTUP_WINDOW_MS).toBeGreaterThanOrEqual(EARLY_LAUNCH_LIVENESS_MS);
   expect(WORKER_RESULT_CAUSES).toEqual([
-    "provider-death", "dead-channel", "stall-timeout", "malformed-trailer", "clean-exit-no-trailer", "startup-failure",
+    "provider-death", "dead-channel", "stall-timeout", "hard-timeout", "malformed-trailer", "clean-exit-no-trailer", "startup-failure",
   ]);
 }, 30_000);
 

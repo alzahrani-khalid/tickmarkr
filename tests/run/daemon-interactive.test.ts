@@ -382,7 +382,9 @@ describe("daemon v1.2 interactive workers (fake adapter, zero tokens)", () => {
       "taskTimeoutMinutes: 17\n",
     );
     await runDaemon(repo, { adapters: [fake], runId: "run-prompt-budget", driver: idriver() });
-    expect(readFileSync(join(Journal.open(repo, "run-prompt-budget").dir, "prompts", "T1-a0.md"), "utf8")).toContain("17 minute stall window");
+    const prompt = readFileSync(join(Journal.open(repo, "run-prompt-budget").dir, "prompts", "T1-a0.md"), "utf8");
+    expect(prompt).toContain("17 minute inactivity window");
+    expect(prompt).toContain("hard ceiling of 68 minutes");
   }, 30_000);
 
   // OBS-82: a wedged codex pane repaints only a braille glyph + elapsed-time cell forever. The

@@ -162,7 +162,8 @@ describe("Queue row 224(b) (D-2118) and row 230", () => {
     expect(prompt).toContain(String(funded[1]!.data.findings));
     const park = of(rows, "task-human");
     expect(park).toHaveLength(1);
-    expect(park[0]!.data).toMatchObject({ kind: "gate-fail", reason: "pin fake:fake-1 held: repair-exhausted" });
+    // row 337 (D-2181 D4): the park seam names what the parking round's test red proves beside the hold
+    expect(park[0]!.data).toMatchObject({ kind: "gate-fail", reason: "pin fake:fake-1 held: repair-exhausted — test: an executed full test run failed (not attributed wholly outside files[])" });
     expect(of(rows, "repair-exhausted")[0]!.data.repairs).toBe(2);
     expect(repairsSinceApproval(journal.read(), "T1")).toBe(2);
     expect(rows.indexOf(park[0]!)).toBeGreaterThan(rows.indexOf(thirdLaunch));
@@ -201,7 +202,7 @@ describe("Queue row 224(b) (D-2118) and row 230", () => {
     expect(of(capped.rows, "task-dispatch")).toHaveLength(2);
     expect(of(capped.rows, "repair-attempt")).toHaveLength(1);
     expect(of(capped.rows, "gate-fingerprint-cap")).toHaveLength(1);
-    expect(of(capped.rows, "task-human")[0]!.data.reason).toBe("pin fake:fake-1 held: gate-fingerprint-cap");
+    expect(of(capped.rows, "task-human")[0]!.data.reason).toBe("pin fake:fake-1 held: gate-fingerprint-cap — test: an executed full test run failed (not attributed wholly outside files[])");
     const free = await repairRun("run-pin-funded-free", { unpinned: true });
     const climb = of(free.rows, "tier-escalated");
     expect(climb).toHaveLength(1);
@@ -213,7 +214,9 @@ describe("Queue row 224(b) (D-2118) and row 230", () => {
     expect(of(spent.rows, "task-dispatch")).toHaveLength(1);
     expect(of(spent.rows, "repair-attempt")).toHaveLength(0);
     expect(of(spent.rows, "repair-exhausted")[0]!.data.repairs).toBe(2);
-    expect(of(spent.rows, "task-human")[0]!.data.reason).toBe("pin fake:fake-1 held: repair-exhausted");
+    // row 337 (D-2181 D3, D-2184 add.43): the pre-spent budget's seeded test rows name no subject or attempt, so they
+    // match no accounting shape and the history proves nothing about the parking red
+    expect(of(spent.rows, "task-human")[0]!.data.reason).toBe("pin fake:fake-1 held: repair-exhausted — test: the red's execution and attribution are unproved (no started full-suite invocation or reuse source is recorded)");
   }, 180_000);
 
   test("a pinned task whose funded repair worker refuses an edit to an out-of-scope test parks as a scope request whose approve command names that file, so a pinned repair that never runs, or a park offering only waive and recheck, fails", async () => {
