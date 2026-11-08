@@ -3,6 +3,7 @@ import { closeSync, constants, fstatSync, openSync, readSync, statSync } from "n
 import { join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { parseArgs } from "node:util";
+import { SEAT_MARKER_ENV } from "../../drivers/host-env.js";
 import { graphDefinitionHash, loadGraph, stateDirName } from "../../graph/graph.js";
 import { GATE_NAMES } from "../../graph/schema.js";
 import { decisionCommands, permittedDecisionVerbs } from "../../run/decision-verbs.js";
@@ -15,7 +16,7 @@ import { currentOwed } from "./report.js";
 import { daemonLiveness, recordProjection } from "./status.js";
 import { StatusSnapshotSchema, type StatusSnapshot } from "./status-snapshot.js";
 
-export type WaitOpts = { now?: () => number; sleep?: (ms: number) => Promise<void> };
+export type WaitOpts = { now?: () => number; sleep?: (ms: number) => Promise<void>; env?: NodeJS.ProcessEnv };
 export type Cause = "run-end" | "park" | "task-failed" | "daemon-death" | "timeout";
 const EXIT = { "run-end": 0, park: 3, "task-failed": 4, "daemon-death": 5, timeout: 6 } as const;
 const causes: Readonly<Record<string, Cause | undefined>> = { "run-end": "run-end", "task-human": "park", "task-failed": "task-failed" };
@@ -198,6 +199,15 @@ function snapshot(cwd: string, runId: string, tail: JournalTail, observedAt: num
 
 export async function wait(argv: string[], cwd = process.cwd(), opts: WaitOpts = {}): Promise<{ out: string; code: number }> {
   if (hasHelpFlag(argv)) return { out: commandHelp("wait"), code: 0 };
+  // Queue row 371 (D-2186): a seat (judge, review, consult, scope) never waits on a run. A seat session's SessionStart
+  // hook waiting on the live run held the seat open while the run waited on the seat. Decided before any other flag is
+  // parsed, before the lock or journal is opened and before any sleep; a blank marker is absent (an operator still waits).
+  const seat = (opts.env ?? process.env)[SEAT_MARKER_ENV];
+  if (seat?.trim()) {
+    const end = argv.indexOf("--"); // as hasHelpFlag: nothing after a terminator is a flag
+    return { code: 8, out: (end < 0 ? argv : argv.slice(0, end)).includes("--json") ? JSON.stringify({ cause: "seat", seat })
+      : visibleControls(`tickmarkr wait: this process is a tickmarkr seat (${SEAT_MARKER_ENV}=${seat}); a seat never waits on a run`) };
+  }
   const { values, positionals } = parseArgs({ args: argv, allowPositionals: true, options: {
     after: { type: "string" }, timeout: { type: "string" }, json: { type: "boolean" },
   } });

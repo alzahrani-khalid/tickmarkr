@@ -12,7 +12,7 @@ import { sh } from "../../src/run/git.js";
 import { makeTestTempDir, reapTestTempDirs } from "../helpers/tmprepo.js";
 
 // Queue row 340; D-2180 — contract E/C: every agent CLI launched through runHeadlessDetailed (the default headless
-// transport of runLlm: judge, review, and role-less callers such as the scope draft in src/plan/scope.ts) is sealed
+// transport of runLlm: judge, review, the scope draft in src/plan/scope.ts, and role-less callers) is sealed
 // from the caller's host addressing whether or not a seat role can be read from its prompt. The environment is read
 // in the agent's own process, never from a Node-side copy.
 
@@ -49,10 +49,11 @@ test("every headless agent launch including role-less callers receives the expli
     expect(env[SEAT_MARKER_ENV], `${label} seat marker`).toBe(seat);
   };
 
-  // Judge and review read a seat role from the prompt; the role-less callers (a scope draft, a free-form prompt, or a
-  // prompt that only MENTIONS a seat prefix) have none — and are sealed all the same, with no fabricated marker.
+  // Judge, review and the scope draft (queue row 371, D-2186) read a seat role from the prompt; the role-less callers (a
+  // free-form prompt, or a prompt that only MENTIONS a seat prefix) have none — and are sealed all the same, with no
+  // fabricated marker.
   for (const [prefix, seat] of [
-    ["TICKMARKR-JUDGE", "judge"], ["TICKMARKR-REVIEW", "review"], ["TICKMARKR-SCOPE", undefined],
+    ["TICKMARKR-JUDGE", "judge"], ["TICKMARKR-REVIEW", "review"], ["TICKMARKR-SCOPE", "scope"],
     ["Draft a spec for this intent", undefined], ["ordinary draft mentioning TICKMARKR-JUDGE", undefined],
   ] as const) {
     await runLlm(fake, "fake-1", `${prefix}\n## Task T1: seal\nVERDICT_NONCE: abc12345`, dir, undefined, 10_000);

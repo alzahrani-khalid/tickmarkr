@@ -347,8 +347,9 @@ export interface ShellOptions {
    * post-exit signals are each sent only after it confirms the leader still bears the identity recorded at spawn, and a
    * refused post-exit reap drains the pipes instead. Ordinary shells leave it unset and signal as before. */
   ownsLeader?: (pid: number) => Promise<boolean>;
-  /** D-2174 (queue row 267): the seat role this shell's child carries as its marker; unset, an inherited marker is stripped. */
-  seat?: "judge" | "review" | "consult";
+  /** D-2174 (queue row 267): the seat role this shell's child carries as its marker; unset, an inherited marker is stripped.
+   * Queue row 371 (D-2186): scope is the scope drafting launch's role. */
+  seat?: "judge" | "review" | "consult" | "scope";
   /** Queue row 340 (D-2180): this shell launches an agent CLI. Like a seat it drops the host control vars (herdr, Orca
    * and the hc pair plus HC_SCOPE) from its child copy, but sets no seat marker. Non-agent shells keep them. */
   agent?: boolean;

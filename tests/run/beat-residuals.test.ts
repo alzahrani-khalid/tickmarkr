@@ -122,7 +122,10 @@ const deps = (over: Partial<BeatLifecycleDeps> = {}, host: IdentityHost = {}): B
 });
 const run = (repo: string, argv: string[], d: BeatLifecycleDeps = deps()) => dispatch("beat", argv, { beat: (a) => beat(a, repo, d) });
 const put = (path: string, content: string) => { mkdirSync(join(path, ".."), { recursive: true }); writeFileSync(path, content); };
-const bytes = (path: string) => existsSync(path) ? readFileSync(path, "utf8") : undefined;
+// Row 382: ONE read, ENOENT reads as absent — an existence check first races the product's claim rename (TOCTOU).
+const bytes = (path: string) => {
+  try { return readFileSync(path, "utf8"); } catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw error; }
+};
 const owner = (repo: string, tier: SupervisionTier) => JSON.parse(readFileSync(beatOwnerPath(repo, tier), "utf8")) as { pid: number; generation: string };
 const alive = (pid: number) => readProcessIdentity(pid) !== "DEAD";
 /** Synchronise on a recorded filesystem/process event; the deadline is only a safety ceiling. */
@@ -284,6 +287,18 @@ exec ${real ? `'${real}'` : "false"} "$@"
   chmodSync(bin, 0o755);
   return { bin, fail, doom, missing: join(dir, "absent-lsof") };
 }
+
+// Row 382 (D-2185 add.45): bytes() reads a claim the product may rename away at any moment, so a file removed between
+// an existence check and the read must read as absent, never throw ENOENT out of until(); any other error still throws.
+test("test: bytes() reads a file removed at its own read as absent while any other read error still throws (row 382)", () => {
+  const repo = mkRepo();
+  const gone = join(repo, "overseer.claim");
+  put(gone, "claim\n");
+  fsHooks.read = (path, real) => { if (path === gone) rmSync(path, { force: true }); return real(); };
+  try { expect(bytes(gone)).toBeUndefined(); } finally { fsHooks.read = undefined; }
+  expect(() => bytes(repo)).toThrow(/EISDIR/);
+  rmSync(repo, { recursive: true, force: true });
+});
 
 test("test: each of the five closed real-kill seams, routed through one guard, throws naming the pid and records the attempt without sending any signal when handed the worker's own pid, its parent's pid or its group, while each seam handed a child the test spawned signals it, and the file's other tests still run (T-F6)", async () => {
   expect(Object.keys(realKillSeams)).toEqual(["displacedAt", "teardownIdentity", "legacyMigration", "counted", "darwinReadback"]);

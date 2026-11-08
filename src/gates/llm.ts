@@ -427,10 +427,12 @@ function gateStreamDecoder(adapter: WorkerAdapter, prompt: string): WorkerAdapte
     ? adapter.streamTurn?.bind(adapter) : undefined;
 }
 
-// SHIP (queue row 267): mark only verdict seats; scope drafts share this runner but are not seats.
-function seatRoleFromPrompt(prompt: string): "judge" | "review" | undefined {
+// SHIP (queue row 267): mark the verdict seats. Queue row 371 (D-2186): the scope draft is marked too, as role scope, so
+// a wait its session's SessionStart hook runs at the repository root returns at once instead of holding the draft open.
+function seatRoleFromPrompt(prompt: string): "judge" | "review" | "scope" | undefined {
   if (prompt.startsWith("TICKMARKR-JUDGE")) return "judge";
   if (prompt.startsWith("TICKMARKR-REVIEW")) return "review";
+  if (prompt.startsWith("TICKMARKR-SCOPE")) return "scope";
   return undefined;
 }
 
@@ -454,7 +456,7 @@ async function runHeadlessDetailed(
     const role = seatRoleFromPrompt(prompt);
     const r = await (async () => {
       // Queue row 340 (D-2180): every agent this launches is sealed from the caller's host addressing, including a
-      // role-less caller (scope/start drafting) the prompt cannot name a seat for; only a seat role sets its marker.
+      // role-less caller the prompt cannot name a seat for; only a seat role (judge, review, scope) sets its marker.
       try { return await sh(command, cwd, timeoutMs + 30_000, {
         onSpawn: ceiling.onSpawn, ownsLeader: ceiling.ownsLeader, agent: true,
         ...(role ? { seat: role } : {}),
@@ -522,7 +524,7 @@ async function runViaDriverDetailed(
     const role = seatRoleFromPrompt(prompt);
     writeFileSync(scriptPath, [
       "export BASH_SILENCE_DEPRECATION_WARNING=1",
-      // D-2174: the pane shell's host may carry an inherited marker; only a judge or review seat names a role.
+      // D-2174: the pane shell's host may carry an inherited marker; only a judge, review or scope seat names a role.
       `unset ${SEAT_MARKER_ENV}`,
       ...(role ? [`export ${SEAT_MARKER_ENV}=${role}`] : []),
       bannerShell(),

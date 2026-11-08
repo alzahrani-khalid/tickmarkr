@@ -69,6 +69,8 @@ function hostedPane(marker: string): { driver: ExecutorDriver; scripts: string[]
   return { driver, scripts };
 }
 
+// Queue row 371 (D-2186): the scope draft is now marked as role scope on both paths, so a wait under it returns at once;
+// the titles below are v2.10.1 criteria and keep their wording, while the assertions follow the v2.23.0 contract.
 test("test: every judge, review and consult seat launched headless or in a pane runs with the seat marker naming its role, while a worker launch and the scope draft run without it, so a seat run that cannot be told from a worker's fails", async () => {
   vi.stubEnv("TICKMARKR_SEAT", undefined);
   const dir = makeTestTempDir("seat-marker-");
@@ -78,7 +80,7 @@ test("test: every judge, review and consult seat launched headless or in a pane 
   expect(inherited).toBeUndefined();
   const driver = new SubprocessDriver();
   for (const transport of ["headless", "pane"] as const) {
-    for (const [prefix, role] of [["TICKMARKR-JUDGE", "judge"], ["TICKMARKR-REVIEW", "review"], ["TICKMARKR-SCOPE", "absent"], ["ordinary draft mentioning TICKMARKR-JUDGE", "absent"]]) {
+    for (const [prefix, role] of [["TICKMARKR-JUDGE", "judge"], ["TICKMARKR-REVIEW", "review"], ["TICKMARKR-SCOPE", "scope"], ["ordinary draft mentioning TICKMARKR-JUDGE", "absent"]]) {
       const output = await runLlm(fake, "fake-1", `${prefix}\n## Task T1: marker\nVERDICT_NONCE: abc12345`, dir,
         transport === "pane" ? { driver, name: "judge · misleading-fallback" } : undefined, 5_000);
       expect(output, `${transport} ${prefix}`).toContain(`"notes":"${role}:${role}"`);
@@ -108,7 +110,7 @@ test("under an inherited review seat marker a worker on either transport, the sc
   const fake = markerFake(dir);
   const driver = new SubprocessDriver();
   for (const transport of ["headless", "pane"] as const) {
-    for (const [prefix, role] of [["TICKMARKR-JUDGE", "judge"], ["TICKMARKR-REVIEW", "review"], ["TICKMARKR-SCOPE", "absent"]]) {
+    for (const [prefix, role] of [["TICKMARKR-JUDGE", "judge"], ["TICKMARKR-REVIEW", "review"], ["TICKMARKR-SCOPE", "scope"]]) {
       const output = await runLlm(fake, "fake-1", `${prefix}\n## Task T1: marker\nVERDICT_NONCE: abc12345`, dir,
         transport === "pane" ? { driver, name: "seat" } : undefined, 5_000);
       expect(output, `${transport} ${prefix}`).toContain(`"notes":"${role}:${role}"`);
@@ -140,7 +142,7 @@ test("under an inherited review seat marker the herdr pane seal unsets it, and i
   const dir = makeTestTempDir("seat-marker-hosted-");
   const fake = markerFake(dir);
   const seats = hostedPane("review");
-  for (const [prefix, role] of [["TICKMARKR-JUDGE", "judge"], ["TICKMARKR-REVIEW", "review"], ["TICKMARKR-SCOPE", "absent"]]) {
+  for (const [prefix, role] of [["TICKMARKR-JUDGE", "judge"], ["TICKMARKR-REVIEW", "review"], ["TICKMARKR-SCOPE", "scope"]]) {
     const output = await runLlm(fake, "fake-1", `${prefix}\n## Task T1: marker\nVERDICT_NONCE: abc12345`, dir, { driver: seats.driver, name: "seat" }, 5_000);
     expect(output, prefix).toContain(`"notes":"${role}:${role}"`);
   }

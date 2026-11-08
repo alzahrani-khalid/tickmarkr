@@ -106,7 +106,7 @@ export const COMMAND_HELP = {
   },
   wait: {
     usage: "wait [<run>] [--after <line>] [--timeout <n>s|m|h] [--json]",
-    description: "Wait once for a run to need attention or end. Without a run, attach to the live graph lock owner. Poll once per second; the earliest new run-end, task-human or task-failed row wins, then proven daemon death, then timeout. Exit codes: run-end 0 (including an already ended run), park 3, task-failed 4, daemon-death 5, timeout 6, no live lock unnamed 7; unknown run, unreadable journal or bad flag 1. Prints the green-rule fields and each open park's admitted commands for you to run.",
+    description: "Wait once for a run to need attention or end. Without a run, attach to the live graph lock owner. Poll once per second; the earliest new run-end, task-human or task-failed row wins, then proven daemon death, then timeout. Exit codes: run-end 0 (including an already ended run), park 3, task-failed 4, daemon-death 5, timeout 6, no live lock unnamed 7, seat 8 (a nonblank TICKMARKR_SEAT returns at once: a seat never waits); unknown run, unreadable journal or bad flag 1. Prints the green-rule fields and each open park's admitted commands for you to run.",
     options: {
       "--after <line>": "Consider qualifying rows after this physical journal line; defaults to the line count when called.",
       "--timeout <n>s|m|h": "Exit once with code 6 after this duration unless a row or proven daemon death wins at that tick.",
@@ -129,7 +129,9 @@ export const COMMAND_HELP = {
   resume: {
     usage: "resume <run-id> [options]", description: "Continue a run from its journal through production preflight and gates.",
     options: {
-      "--graph-changed": "Accept and journal a changed graph identity for this run.",
+      // Queue row 372 (D-2186): the flag still accepts and journals the changed graph identity. The
+      // sentences after that name only the release src/run/split-release.ts ships.
+      "--graph-changed": "Accept and journal a changed graph identity for this run. A parked task whose definition changed is released at that resume as a new engagement with reset round counters when the change is proved, the read of its work proves a committed head or no commits, and the park is not a human-gate or an attempt-cap park. Its committed head is re-gated with no worker or, with no commits, a fresh worker is dispatched. A human-gate park whose definition keeps the gate, an attempt-cap park and an unproved change (a definition unrecorded at the park, or a task-work read that proves neither a committed head nor that there are no commits) keep their park and say so. The release output names the stop path: the run had ended, or the run was stopped before it ended.",
       "--retry-failed": "Retry failed tasks.",
       "--driver <auto|herdr|subprocess|orca|herdr-app>": "Choose the execution driver; auto picks herdr, then herdr-app, then orca from host markers, else subprocess.",
     }, examples: ["resume run-example --driver subprocess", "resume run-example --retry-failed"],

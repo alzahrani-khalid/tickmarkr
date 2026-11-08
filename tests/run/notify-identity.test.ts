@@ -194,8 +194,10 @@ async function identityPair(script: object, runTag: string) {
   const runIdA = `run-id-a-${runTag}`;
   const runIdB = `run-id-b-${runTag}`;
   const captured: string[] = [];
-  await runDaemon(repoA, { approvalWindowMs: 1, adapters: [fakeA], runId: runIdA, driver: driverWithNotify(captured) });
-  await runDaemon(repoB, { approvalWindowMs: 1, adapters: [fakeB], runId: runIdB, driver: noopDriver() });
+  await Promise.all([
+    runDaemon(repoA, { approvalWindowMs: 1, adapters: [fakeA], runId: runIdA, driver: driverWithNotify(captured) }),
+    runDaemon(repoB, { approvalWindowMs: 1, adapters: [fakeB], runId: runIdB, driver: noopDriver() }),
+  ]);
   const baseA = (await gitHead(repoA)) as string;
   const baseB = (await gitHead(repoB)) as string;
   const jA = normJournal(Journal.open(repoA, runIdA).read(), repoA, runIdA, baseA);

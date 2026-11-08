@@ -2,6 +2,26 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v2.23.0 — the run does not deadlock its own seats or re-park a split task
+
+**v2.23.0** was delivered by one tickmarkr run of three tasks (run-20261107-234110-0000000000002209) plus a verified
+tests-only hand leg. Every task passed build, lint, evidence and scope, its acceptance criteria, a review by a model from
+another vendor and the full test suite before it merged, and the run's tip verify passed.
+
+- **A tickmarkr seat's wait returns at once.** `tickmarkr wait` run inside a seat tickmarkr launched (a judge, a reviewer,
+  a consult or a scope draft) exits with code 8 and one plain line, or one JSON object under `--json`, instead of waiting
+  on the run that launched it and waking it again. An operator session still waits as before. The scope drafting launch
+  now carries the seat marker on its headless and pane paths, as judge and review seats already did; workers stay unmarked.
+- **A graph-changed resume releases a parked task whose definition changed.** After you split or amend a parked task and
+  recompile, `tickmarkr resume <runId> --graph-changed` ends that park and starts the task as a new engagement with reset
+  round counters: a task with committed work is re-gated at its head with no worker, and one with no commits gets a fresh
+  worker. Both semantic gates run fresh, whatever older waiver exists. The task's work is read from the repository's own
+  refs, so a missing or damaged task checkout never counts as "no work". A human-gate park whose definition still sets the
+  gate, and an attempt-cap park, keep their park and say which decision they need; turning a task's human gate off and
+  resuming still dispatches it. The output names which stop path you are on, and `tickmarkr resume --help` describes it.
+- **Test reliability (hand leg):** the beat-residuals test reads each file once and treats a missing file as absent, and
+  the identity-pair test starts its two daemons concurrently.
+
 ## v2.22.0 — the run tells the truth about tests and owed checks
 
 **v2.22.0** was delivered by one tickmarkr run of four tasks (run-20261106-053243-0000000000001724) plus a verified fix leg.

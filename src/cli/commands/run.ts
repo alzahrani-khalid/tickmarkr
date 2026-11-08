@@ -100,12 +100,13 @@ export const RAIL_ROWS: Record<string, { label: string; tone: RailTone }> = {
   "channel-demotion": { label: "channel demoted", tone: "attention" },
   "channel-exclusion": { label: "channel excluded", tone: "attention" },
   "consult-verdict": { label: "consult", tone: "attention" },
-  // NOT on this rail: `task-approved`. It is an operator decision and it reads like a rail row, but
-  // its only producer is `tickmarkr approve` — a SEPARATE CLI process appending through its own
-  // Journal (src/cli/commands/approve.ts), and the daemon reads that event back without ever
-  // re-appending it, so no `narrate` callback in this process can ever see it. A retained row for it
-  // renders only for a synthetic event. It belongs here the day `approve` delivers to the live run
-  // instead of only to the file — see the producer-reachability guard in tests/cli/brand-surfaces.
+  // `task-approved` joined this rail when a RUN-OWNED producer appeared (queue row 372, D-2186): a
+  // graph-changed resume appends its own release of a park whose definition changed through THIS sink.
+  // `tickmarkr approve` still appends from a separate CLI process the daemon only reads back, so an
+  // operator's approval never reaches a narrate callback — the producer-reachability guard in
+  // tests/cli/brand-surfaces pins both facts. The kept-park row is the same resume's other answer.
+  "task-approved": { label: "released", tone: "attention" },
+  "graph-change-park-kept": { label: "park kept", tone: "attention" },
   // the daemon ACCEPTED a trust dialog on the operator's behalf and the worker now runs with
   // whatever that dialog was granting. It is a decision, it is automatic, and it is the one the
   // operator is least likely to expect — it is on the rail for exactly the reason the rest are.
@@ -352,6 +353,14 @@ const RAIL_PROJECTION: Record<string, (data: Record<string, unknown>) => string 
   // both rehash hashes: the ladder reaches `from` (null on an unbound journal) and never `to`
   "scope-request": (d) => Array.isArray(d.paths) ? `files[]: ${d.paths.join(", ")}` : undefined,
   "graph-rehash": (d) => (typeof d.to === "string" ? `to ${d.to.slice(0, 12)}` : undefined),
+  // Queue row 372 (D-2186): the resume's release names the park it ended, the stop path and what it does next
+  "task-approved": (d) => {
+    const engagement = d.engagement as Record<string, unknown> | undefined;
+    const line = (d.park as { line?: unknown } | undefined)?.line;
+    if (engagement?.cause !== "graph-changed" || typeof line !== "number" || typeof engagement.path !== "string") return undefined;
+    return `released the park at journal line ${line} — ${engagement.path} — ${typeof engagement.head === "string"
+      ? `re-gating its head ${engagement.head.slice(0, 12)}` : "dispatching a fresh worker"}`;
+  },
   "repair-dispatch": (d) =>
     typeof d.diffBytes === "number" ? `diff ${d.diffBytes}B${d.capped === true ? ", capped" : ""}` : undefined,
   "tip-moved": (d) =>

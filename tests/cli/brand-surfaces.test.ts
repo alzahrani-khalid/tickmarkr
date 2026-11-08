@@ -229,6 +229,14 @@ const RAIL_SPEC: RailSpec[] = [
   { event: "channel-demotion", label: "channel demoted", tone: "attention", salient: "channel claude-code:sonnet", data: { channel: "claude-code:sonnet", streak: 3 } },
   { event: "channel-exclusion", label: "channel excluded", tone: "attention", salient: "channel claude-code:sonnet", data: { channel: "claude-code:sonnet", reason: "no output twice", kind: "dead-channel" } },
   { event: "consult-verdict", label: "consult", tone: "attention", data: { action: "retry", notes: "the failing assertion is the fixture, not the code" } },
+  // queue row 372 (D-2186): a graph-changed resume's OWN release of a park whose definition changed
+  // (src/run/daemon.ts), and its kept-park answer where it may not release — both run-owned rows
+  { event: "task-approved", label: "released", tone: "attention", salient: "released the park at journal line 1085 — the run had ended — re-gating its head 9f3c2a1b7d4e",
+    data: { by: "resume --graph-changed", via: "resume", release: "recheck", park: { line: 1085, ts: "2026-11-06T09:12:44.120Z" },
+      engagement: { cause: "graph-changed", rehash: { from: "f2909a1fa36e0edf", to: "dcf0bb60f626be53" }, from: { fingerprint: "a1a1a1a1a1a1a1a1", files: ["src/a.ts"] },
+        to: { fingerprint: "b2b2b2b2b2b2b2b2", files: ["src/a.ts", "src/b.ts"] }, path: "the run had ended", head: "9f3c2a1b7d4e5f60718293a4b5c6d7e8f9012345" } } },
+  { event: "graph-change-park-kept", label: "park kept", tone: "attention",
+    data: { park: 1085, reason: "park at journal line 1085 kept — human-gate park — release with `tickmarkr approve run-rail T1`" } },
   // the daemon accepted a trust dialog FOR the operator (src/run/daemon.ts): a decision, automatic,
   // and the one an operator is least likely to expect — it names the adapter it answered for.
   { event: "trust-auto-answer", label: "trust accepted", tone: "attention", salient: "claude-code seed", data: { slot: "tickmarkr:worker:T1:0:run-rail", adapter: "claude-code", phase: "seed" } },
@@ -310,7 +318,8 @@ const specIdentity = (spec: RailSpec) =>
 const RETAINED_EVENTS = RAIL_SPEC.map(specEvent);
 // Keep the existing golden's event corpus stable. The new row is covered by the complete rail
 // specification below and by the real journal event in gates/seat-litter.test.ts.
-const GOLDEN_RETAINED_EVENTS = RETAINED_EVENTS.filter((event) => event.event !== "worktree-litter-cleared");
+// Row 372's release and kept-park rows are likewise covered by the specification, not the golden bytes.
+const GOLDEN_RETAINED_EVENTS = RETAINED_EVENTS.filter((event) => !["worktree-litter-cleared", "task-approved", "graph-change-park-kept"].includes(event.event));
 
 /**
  * The ONE rejection oracle every rail row is judged by — the shipped rows and every control alike.
@@ -461,12 +470,12 @@ describe("T4 v1.50 brand pass — plan, run narration, report", () => {
     expect(narrationLine(verdict)).not.toBeNull();
   });
 
-  // The retained set is only as real as its PRODUCERS. `task-approved` was on this rail and could
-  // never render on it: `tickmarkr approve` is a separate CLI process appending through its own
+  // The retained set is only as real as its PRODUCERS. `task-approved` was once on this rail with no
+  // run-owned producer: `tickmarkr approve` is a separate CLI process appending through its own
   // Journal (src/cli/commands/approve.ts) and the daemon reads that event back without re-appending
-  // it, so no `narrate` callback in the running process ever sees it — a synthetic event fed to
-  // `narrationLine` was the only thing that made it look retained. Every remaining row is written
-  // by the daemon itself or by the driver whose journal `bindNarration` binds to this sink.
+  // it. It is back because the daemon now appends it itself — a graph-changed resume's release of a
+  // park whose definition changed (queue row 372, D-2186). Every row is written by the daemon itself
+  // or by the driver whose journal `bindNarration` binds to this sink.
   test("test: the gate-replayed row renders one labelled narrator row with a non-empty label and the run narration golden regenerated for it is byte-identical to the shipped fixture, so a journal row the narrator cannot label fails", () => {
     onTTY();
     const replay = RAIL_SPEC.find((spec) => spec.event === "gate-replayed")!;
@@ -550,11 +559,13 @@ describe("T4 v1.50 brand pass — plan, run narration, report", () => {
         && src("src/run/daemon.ts").includes("journal.append(e.name, t.id, e.payload)");
       expect(appends(RUN_OWNED, event) || gateNote, `${event} has no run-owned producer`).toBe(true);
     }
-    // the recorded instance this guard exists for: an event whose ONLY producer is a separate CLI
-    // command. It appends, it is a real journal event — and it is not on the rail.
+    // the recorded instance this guard exists for: `task-approved` was a real journal event whose ONLY
+    // producer was a separate CLI command, and it stayed off the rail until a run-owned producer existed.
+    // Queue row 372 (D-2186): the daemon's graph-changed release is that producer, so the row is retained.
     expect(appends(["src/cli/commands/approve.ts"], "task-approved")).toBe(true);
-    expect(appends(RUN_OWNED, "task-approved")).toBe(false);
-    expect(RAIL_ROWS["task-approved"]).toBeUndefined();
+    expect(appends(RUN_OWNED, "task-approved")).toBe(true);
+    expect(appends(RUN_OWNED, "graph-change-park-kept")).toBe(true);
+    expect(RAIL_ROWS["task-approved"]).toEqual({ label: "released", tone: "attention" });
   });
 
   test("test: every retained TTY narration row uses the quiet semantic glyph hierarchy and fits the current terminal width without wrapping; a raw event label or over-width worker summary fails", () => {

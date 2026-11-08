@@ -2,9 +2,10 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { once } from "node:events";
 import * as fs from "node:fs";
 import { join } from "node:path";
-import { afterEach, expect, test, vi } from "vitest";
+import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { wait, type WaitOpts } from "../../src/cli/commands/wait.js";
 import { StatusSnapshotSchema, statusSnapshot } from "../../src/cli/commands/status-snapshot.js";
+import { SEAT_MARKER_ENV } from "../../src/drivers/host-env.js";
 import { COMMANDS, dispatch, USAGE } from "../../src/cli/index.js";
 import { graphDefinitionHash, saveGraph } from "../../src/graph/graph.js";
 import { validateGraph, type RunGraph } from "../../src/graph/schema.js";
@@ -70,7 +71,10 @@ function diesDuringProbe(onDeath: () => void, atProbe = 1) {
     throw Object.assign(new Error("daemon exited"), { code: "ESRCH" });
   });
 }
-afterEach(() => { vi.restoreAllMocks(); vi.clearAllMocks(); });
+// Queue row 371 (D-2186): a seat marker makes wait return exit 8 at once, so no result here may depend on whether a
+// seat launched the suite.
+beforeEach(() => { vi.stubEnv(SEAT_MARKER_ENV, undefined); });
+afterEach(() => { vi.restoreAllMocks(); vi.clearAllMocks(); vi.unstubAllEnvs(); });
 
 test("wait run-deps --timeout 0s --json returns the entire status snapshot including a dependent task's blocker", async () => {
   const f = fixture([T("T1"), { ...T("T2"), deps: ["T1"] }]);

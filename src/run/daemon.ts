@@ -49,6 +49,7 @@ import { classifyRepairDisposition, namedPaths, resolveScopeHints } from "./repa
 import { applyScopeAmendments, activeRetryBan, interruptedAttempt, RESUME_HARVEST_SOURCE, resumeHarvestAuthor, approvalAction, APPROVAL_REFUSED, ATTEMPT_CAP_RELEASE, REVIEW_UPHELD_RELEASE, effectiveEvents, foldDecisions, physicalLine, staleApprovals, classifyTaskFailure, classifyWorkerResultCause, deferredReviewFindings, engagementComparable, formatPriorFindingEvidence, GATE_FINGERPRINT_CAP, GATE_SATISFIED_RELEASE, identicalGateFailures, isDeferredFinding, journaledFailureBrief, Journal, loadRoutingProfile, newRunId, normalizeGateFailure, outstandingConsultGuidance, readableExcerpt, receiptOrigin, outstandingReviewFindings, pendingApprovalActions, pendingRechecks, pendingRepairFindings, phaseForGate, priorJudgments, readPriorRunEvidence, recordedTaskFailureKind, reraisedReviewChains, RECHECK_RELEASE, renderStructuredReviewFinding, repairReachSinceApproval, repairsSinceApproval, reviewRoundsSinceApproval, runHasEnded, standingRulings, structuredFindings, upheldFeedbackByTask, type CurrentAttemptGateReplay, type JournalEvent, type ParkKind, type ResumeState, type RetryMode, type StructuredFinding } from "./journal.js";
 import { decisionCommands, type DecisionPark } from "./decision-verbs.js";
 import { foldOwedChecks, parseJournalText } from "./journal.js";
+import { decideSplitRelease, parkDefinition, splitReleaseReads, type TaskWorkRead } from "./split-release.js";
 import { readOperatorState } from "./operator-state.js";
 import { newestPark } from "../cli/commands/approve.js";
 import { carriedAuthorVendors, gateReviewerFloor, isDiffCapPark, isGarbageReview, pickReviewer } from "../gates/review.js";
@@ -3480,6 +3481,8 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
   };
 
   let baseRef: string;
+  // Queue row 372 (D-2186): the graph-rehash THIS launch journaled — what makes it a graph-changed resume.
+  let graphRehash: { from: string | null; to: string } | undefined;
   let baseline!: Baseline;
   let baselinePending = false;
   const waitForBaseline = async (taskId: string) => {
@@ -3543,6 +3546,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     // The SAME comparator status uses (engagementComparable); one decision, two consumers. Fail closed:
     // no resume path silently accepts a mismatched or unbound journal. --graph-changed is the operator's
     // audited release for the stop-amend-resume workflow, journaling a graph-rehash naming both hashes.
+    const launchRows = journal.read().length;
     graph = applyScopeAmendments(graph, journal, true, opts.graphChanged === true);
     const loadedHash = graphDefinitionHash(graph);
     const cmp = engagementComparable(journal.read(), loadedHash);
@@ -3552,10 +3556,13 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           ? `refusing to resume ${runId}: journal has no recorded graph definition hash (older tickmarkr) — pass --graph-changed to override`
           : `refusing to resume ${runId}: graph changed since this run (recorded ${cmp.recorded} ≠ loaded ${loadedHash}) — pass --graph-changed to override`);
       }
-      journal.append("graph-rehash", undefined, {
-        from: cmp.reason === "mismatch" ? cmp.recorded : null,
-        to: loadedHash,
-      });
+      journal.append("graph-rehash", undefined, { from: cmp.reason === "mismatch" ? cmp.recorded : null, to: loadedHash });
+    }
+    // Queue row 372 (D-2186): ANY graph-rehash this --graph-changed launch journaled makes it a graph-changed
+    // resume — the scope-amendment replay's audited rehash included, which leaves the comparison comparable.
+    const launchRehash = opts.graphChanged ? journal.read().slice(launchRows).filter((e) => e.event === "graph-rehash").at(-1) : undefined;
+    if (launchRehash && typeof launchRehash.data.to === "string") {
+      graphRehash = { from: typeof launchRehash.data.from === "string" ? launchRehash.data.from : null, to: launchRehash.data.to };
     }
     // B (D-812): a daemon interrupted inside its capture leaves run-start without baseline.json. Only
     // that absence recaptures; existing bytes that do not parse fail closed and are never written over.
@@ -3942,7 +3949,9 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     }
     graph = setStatus(graph, t.id, "human");
     saveGraph(repoRoot, graph);
-    journal.append("task-human", t.id, { ...details, reason, kind });
+    // Queue row 372 (D-2186): the park definition record — the task as this daemon held it when it parked
+    // (after approved scope amendments) — is what a later graph-changed resume compares to release it.
+    journal.append("task-human", t.id, { ...details, reason, kind, definition: parkDefinition(t) });
     // Read the just-journaled park, including its failed gate and immutable physical token.
     const { events: parkEvents, lines: parkLines } = journal.readSourced();
     const parked = newestPark(parkEvents, t.id, parkLines.map(line => line - 1));
@@ -4187,6 +4196,120 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     if (changed) saveGraph(repoRoot, graph);
   };
 
+  // Queue row 372 (D-2186): lifted out of execTask so a graph-changed resume reads a parked task's work by the same rules.
+  // Queue row 240 (D-2138): absence of a directory says nothing about its recorded work.
+  type TaskWork = { head?: string; commits: string[]; snapshot?: string; rebuiltFrom?: "removal" | "branch"; preservedRef?: string; error?: string };
+  // `strict` (row 372, D-2186 add.14): a graph-changed release reads the work it releases on from the repository's own
+  // refs — the task branch, its removal row and its preserved ref, run against the main repository — never from the
+  // checkout's HEAD or .git file. An unresolvable ref proves neither a committed head nor its absence — it returns
+  // `error`, never zero commits — and a preserved ref holding the task's newest work is recovered as approve's recheck does.
+  const taskWorkReader = (taskId: string, strict = false) => async (taskBase: string, priorWt: string, events = journal.read()): Promise<TaskWork> => {
+    const read = async (command: string, cwd = repoRoot): Promise<string> => {
+      const result = await shGit(command, cwd);
+      if (result.code !== 0) throw new Error(result.stderr || result.stdout || `git exited ${result.code}`);
+      return result.stdout.trim();
+    };
+    const taskBranch = `${branch}--${taskId}`;
+    const branchRef = `refs/heads/${taskBranch}`;
+    const branchTip = async (): Promise<string | undefined> => {
+      const exists = await shGit(`git show-ref --verify --quiet ${shq(branchRef)}`, repoRoot);
+      if (exists.code !== 0 && exists.code !== 1) throw new Error(exists.stderr || exists.stdout || `branch read exited ${exists.code}`);
+      return exists.code === 0 ? await read(`git rev-parse --verify ${shq(`${branchRef}^{commit}`)}`) : undefined;
+    };
+    const ahead = async (head: string) => (await read(`git log --reverse --format=%H ${shq(taskBase)}..${shq(head)}`)).split("\n").filter(Boolean);
+    // Row 372 (D-2186): the newest worktree-preserved row, read only for a release; an unresolvable one fails the read.
+    const preserved = strict ? [...events].reverse()
+      .find((e) => e.event === "worktree-preserved" && e.taskId === taskId && typeof e.data.ref === "string" && e.data.ref !== "") : undefined;
+    const preservedHead = async (ref: string): Promise<string> => {
+      const resolved = await shGit(`git rev-parse --verify ${shq(`${ref}^{commit}`)}`, repoRoot);
+      const head = resolved.stdout.trim();
+      if (resolved.code !== 0 || !head) throw new Error(`the preserved ref ${ref} does not resolve: ${resolved.stderr.trim()}`);
+      return head;
+    };
+    let checkout = existsSync(priorWt);
+    if (strict && !checkout) {
+      try {
+        statSync(priorWt);
+        checkout = true;
+      } catch (error) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code !== "ENOENT" && code !== "ENOTDIR") return { commits: [], error: `Queue row 372 (D-2186): cannot stat the task checkout ${priorWt}: ${code ?? String(error)}` };
+      }
+    }
+    if (checkout) {
+      if (!strict) return { head: await gitHead(priorWt), commits: await commitsAheadOf(taskBase, priorWt) };
+      try {
+        // Row 372 (D-2186 add.14): the work is the task branch tip, read from this repository's refs. The checkout never
+        // proves work; it can only REFUSE a release, because the battery and the dispatch path act on it. So it must be
+        // the task's own linked worktree at that tip: Git resolves it under this repository's common dir, through the
+        // administrative record whose back-pointer names THIS checkout's .git, with HEAD at the branch tip. A missing
+        // .git (discovery reaches the parent repository), one redirected to the main git dir or to a sibling worktree's
+        // record, or a HEAD that left the branch would otherwise read another tree's HEAD as zero commits and fund a
+        // worker over the task's surviving committed work — each keeps the park instead.
+        const tip = await branchTip();
+        if (preserved) await preservedHead(String(preserved.data.ref));
+        const [top, gitDir, common] = (await read("git rev-parse --path-format=absolute --show-toplevel --absolute-git-dir --git-common-dir", priorWt)).split("\n");
+        const ours = realpathSync(await read("git rev-parse --path-format=absolute --git-common-dir"));
+        const pointsBack = (admin: string): boolean => {
+          try { return realpathSync(resolve(admin, readFileSync(join(admin, "gitdir"), "utf8").trim())) === realpathSync(join(priorWt, ".git")); }
+          catch { return false; }
+        };
+        const head = await read(`git rev-parse --verify ${shq("HEAD^{commit}")}`, priorWt);
+        if (!tip || !top || !gitDir || !common || realpathSync(top) !== realpathSync(priorWt) || realpathSync(common) !== ours
+          || realpathSync(gitDir) === ours || !pointsBack(gitDir) || head !== tip) {
+          throw new Error(`git resolves it as ${top ?? "?"} (git dir ${gitDir ?? "?"}, HEAD ${head.slice(0, 12)}), not this task's own linked worktree at its branch ${taskBranch} (${tip?.slice(0, 12) ?? "absent"}) — its .git is missing or points elsewhere, or its HEAD left the branch`);
+        }
+        return { head: tip, commits: await ahead(tip) };
+      } catch (error) {
+        return { commits: [], error: `Queue row 372 (D-2186): cannot read the task checkout ${priorWt}: ${(error instanceof Error ? error.message : String(error)).trim()}` };
+      }
+    }
+    try {
+      const ancestor = async (base: string, head: string): Promise<boolean> => {
+        const result = await shGit(`git merge-base --is-ancestor ${shq(base)} ${shq(head)}`, repoRoot);
+        if (result.code !== 0 && result.code !== 1) throw new Error(result.stderr || result.stdout || `ancestry exited ${result.code}`);
+        return result.code === 0;
+      };
+      const tip = await branchTip();
+      const removalAt = events.map((e) => e.event === "worktree-removed" && e.data.task === taskId).lastIndexOf(true);
+      const removal = events[removalAt];
+      if (removal && !events.slice(removalAt + 1).some((e) => e.event === "worktree-recreation" && e.taskId === taskId)
+        && typeof removal.data.head === "string") {
+        const resolved = await shGit(`git rev-parse --verify ${shq(`${removal.data.head}^{commit}`)}`, repoRoot);
+        const head = resolved.stdout.trim();
+        if (strict && (resolved.code !== 0 || !head)) throw new Error(`the recorded removal head ${removal.data.head} does not resolve: ${resolved.stderr.trim()}`);
+        if (resolved.code === 0 && head && (!tip || await ancestor(tip, head))) {
+          const commits = await ahead(head);
+          let snapshot: string | undefined;
+          if (typeof removal.data.ref === "string") {
+            const pinned = await read(`git rev-parse --verify ${shq(`${removal.data.ref}^{commit}`)}`);
+            if (pinned !== head) snapshot = removal.data.ref;
+          }
+          return { head, commits, snapshot, rebuiltFrom: "removal" };
+        }
+      }
+      // Row 372 (D-2186): the preserved ref holds the task's work when no task branch remains or it extends the
+      // branch tip (OBS-1022's rule).
+      if (preserved) {
+        const preservedRef = String(preserved.data.ref);
+        const head = await preservedHead(preservedRef);
+        if (!tip || (head !== tip && await ancestor(tip, head))) return { head, commits: await ahead(head), preservedRef };
+      }
+      if (!tip) return { commits: [] };
+      const commits = await ahead(tip);
+      if (commits.length === 0) return { commits: [] };
+      const dispatch = [...events].reverse().find((e) => e.event === "task-dispatch" && e.taskId === taskId);
+      const base = dispatch?.data.base === undefined ? events.find((e) => e.event === "run-start")?.data.baseRef : dispatch.data.base;
+      if (typeof base !== "string" || !await ancestor(base, tip)) throw new Error("tip does not descend from its recorded dispatch base");
+      const ref = `refs/tickmarkr/preserved/${tip}`;
+      await read(`git update-ref ${shq(ref)} ${shq(tip)}`);
+      journal.append("worktree-preserved", taskId, { ref, ...producerFields(knownProducer(journal.read(), taskId)) });
+      return { head: tip, commits, rebuiltFrom: "branch" };
+    } catch (error) {
+      return { commits: [], error: `Queue row 240 (D-2138): cannot rebuild task branch ${taskBranch}: ${error instanceof Error ? error.message : String(error)}` };
+    }
+  };
+
   // OBS-1168(c): every gate callback is bound to the engagement that asked for it. Once the scheduler
   // settles that engagement (done, parked or failed), a late sibling's event is dropped, never journaled.
   const engagements = new Map<string, object>();
@@ -4216,57 +4339,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     // row is deliberately written before the later worktree-recreation row so the journal cannot
     // describe only the commits it carried while omitting uncommitted work the removal destroyed.
     const producerNow = (): PreserveProducer => knownProducer(journal.read(), t.id);
-    // Queue row 240 (D-2138): absence of a directory says nothing about its recorded work.
-    type TaskWork = { head?: string; commits: string[]; snapshot?: string; rebuiltFrom?: "removal" | "branch"; error?: string };
-    const readTaskWork = async (taskBase: string, priorWt: string, events = journal.read()): Promise<TaskWork> => {
-      if (existsSync(priorWt)) return { head: await gitHead(priorWt), commits: await commitsAheadOf(taskBase, priorWt) };
-      const taskBranch = `${branch}--${t.id}`;
-      try {
-        const read = async (command: string): Promise<string> => {
-          const result = await shGit(command, repoRoot);
-          if (result.code !== 0) throw new Error(result.stderr || result.stdout || `git exited ${result.code}`);
-          return result.stdout.trim();
-        };
-        const ahead = async (head: string) => (await read(`git log --reverse --format=%H ${shq(taskBase)}..${shq(head)}`)).split("\n").filter(Boolean);
-        const ancestor = async (base: string, head: string): Promise<boolean> => {
-          const result = await shGit(`git merge-base --is-ancestor ${shq(base)} ${shq(head)}`, repoRoot);
-          if (result.code !== 0 && result.code !== 1) throw new Error(result.stderr || result.stdout || `ancestry exited ${result.code}`);
-          return result.code === 0;
-        };
-        const branchRef = `refs/heads/${taskBranch}`;
-        const exists = await shGit(`git show-ref --verify --quiet ${shq(branchRef)}`, repoRoot);
-        if (exists.code !== 0 && exists.code !== 1) throw new Error(exists.stderr || exists.stdout || `branch read exited ${exists.code}`);
-        const tip = exists.code === 0 ? await read(`git rev-parse --verify ${shq(`${branchRef}^{commit}`)}`) : undefined;
-        const removalAt = events.map((e) => e.event === "worktree-removed" && e.data.task === t.id).lastIndexOf(true);
-        const removal = events[removalAt];
-        if (removal && !events.slice(removalAt + 1).some((e) => e.event === "worktree-recreation" && e.taskId === t.id)
-          && typeof removal.data.head === "string") {
-          const resolved = await shGit(`git rev-parse --verify ${shq(`${removal.data.head}^{commit}`)}`, repoRoot);
-          const head = resolved.stdout.trim();
-          if (resolved.code === 0 && head && (!tip || await ancestor(tip, head))) {
-            const commits = await ahead(head);
-            let snapshot: string | undefined;
-            if (typeof removal.data.ref === "string") {
-              const pinned = await read(`git rev-parse --verify ${shq(`${removal.data.ref}^{commit}`)}`);
-              if (pinned !== head) snapshot = removal.data.ref;
-            }
-            return { head, commits, snapshot, rebuiltFrom: "removal" };
-          }
-        }
-        if (!tip) return { commits: [] };
-        const commits = await ahead(tip);
-        if (commits.length === 0) return { commits: [] };
-        const dispatch = [...events].reverse().find((e) => e.event === "task-dispatch" && e.taskId === t.id);
-        const base = dispatch?.data.base === undefined ? events.find((e) => e.event === "run-start")?.data.baseRef : dispatch.data.base;
-        if (typeof base !== "string" || !await ancestor(base, tip)) throw new Error("tip does not descend from its recorded dispatch base");
-        const ref = `refs/tickmarkr/preserved/${tip}`;
-        await read(`git update-ref ${shq(ref)} ${shq(tip)}`);
-        journal.append("worktree-preserved", t.id, { ref, ...producerFields(producerNow()) });
-        return { head: tip, commits, rebuiltFrom: "branch" };
-      } catch (error) {
-        return { commits: [], error: `Queue row 240 (D-2138): cannot rebuild task branch ${taskBranch}: ${error instanceof Error ? error.message : String(error)}` };
-      }
-    };
+    const readTaskWork = taskWorkReader(t.id);
     const recreateTaskWorktree = async (taskBranch: string, taskBase: string, priorWt: string) => {
       const producer = producerNow();
       const ref = await preserveWorktree(priorWt, producer);
@@ -5384,6 +5457,12 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       // Recheck carries the newest non-tool waiver for the exact subject being gated.
       if (recheck) {
         satisfiedGate = journal.replaySatisfiedGates(new Map([[t.id, currentTaskSubject]])).get(t.id);
+        // Queue row 372 (D-2186 add.7): a graph-change engagement executes acceptance and review fresh under the
+        // changed definition, so an older semantic waiver on this subject is not carried onto it. An ordinary
+        // operator recheck keeps today's carry.
+        const engagement = effectiveEvents(journal.read()).reverse()
+          .find((e) => e.taskId === t.id && e.event === "task-approved")?.data.engagement as { cause?: unknown } | undefined;
+        if (engagement?.cause === "graph-changed" && (satisfiedGate === "acceptance" || satisfiedGate === "review")) satisfiedGate = undefined;
       }
       journal.append("worktree-recreation", t.id, {
         ...(work?.rebuiltFrom ? { rebuiltFrom: work.rebuiltFrom } : {}),
@@ -8301,6 +8380,31 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       }
     });
   };
+
+  // Queue row 372 (D-2186): a graph-changed resume releases each open park whose definition changed as a new
+  // engagement, before any task is scheduled — src/run/split-release.ts decides; the daemon only reads the work
+  // and appends. A release binds to its park as an operator decision does, so the first boundary sweep enacts
+  // it through the existing recheck battery or dispatch path, and every fold ends the park at that row.
+  if (graphRehash) {
+    const split = { runId, events: journal.read(), tasks: graph.tasks, rehash: graphRehash };
+    const work = new Map<string, TaskWorkRead>();
+    for (const taskId of splitReleaseReads(split)) {
+      const read = await taskWorkReader(taskId, true)(published, worktreePath(repoRoot, `${branch}--${taskId}`));
+      work.set(taskId, read.error !== undefined ? { error: read.error }
+        : { head: read.head, commits: read.commits.length, ...(read.preservedRef ? { ref: read.preservedRef } : {}) });
+    }
+    for (const decision of decideSplitRelease(split, work)) {
+      if (decision.event === "task-approved") journal.append("task-approved", decision.taskId, decision.data);
+      else journal.append("graph-change-park-kept", decision.taskId, decision.data);
+      // D-2186 add.7: an exempt park stays parked although the recompile wrote it pending, so this resume schedules it
+      // nowhere — no gate replay, battery, worker, re-park or merge before its approve (add.11: a human-gate park whose
+      // loaded definition drops humanGate is not exempt; the decider returns nothing for it and it dispatches as at base).
+      if (decision.event !== "task-approved" && decision.hold) {
+        graph = setStatus(graph, decision.taskId, "human");
+        saveGraph(repoRoot, graph);
+      }
+    }
+  }
 
   taskLoopStarted = true;
   fatalPhase = "scheduler";
