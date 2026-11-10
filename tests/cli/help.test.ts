@@ -320,6 +320,20 @@ test("Command help describes every flag accepted by each production parser and t
   }
 });
 
+// Queue row 367 Phase 2 (D-2187 add.18): doctor and init help both name the key recipe.
+test("doctor and init help name the Artificial Analysis key recipe: the environment variable, or the Keychain line whose trailing -w prompts, and the ask-once rule", async () => {
+  for (const command of ["doctor", "init"]) {
+    const help = (await dispatch(command, ["--help"])).out;
+    expect(help, command).toContain("free key: artificialanalysis.ai");
+    expect(help, command).toContain("export ARTIFICIAL_ANALYSIS_API_KEY");
+    expect(help, command).toContain('security add-generic-password -a "$USER" -s ARTIFICIAL_ANALYSIS_API_KEY -w (the trailing -w prompts, so the value stays out of argv)');
+    expect(help, command).toContain("an interactive terminal is asked once with hidden input");
+    expect(help, command).toContain("without a terminal, in CI, in a seat or in a task checkout nothing is asked");
+    // D-2187 add.21 (2): one line says agents never receive the key, and that payload commands keep it.
+    expect(help, command).toContain("Agents never receive the key: workers, judge, review and consult seats and doctor's model probes run without ARTIFICIAL_ANALYSIS_API_KEY, while build, test, lint and oracle commands keep your environment.");
+  }
+});
+
 test("the end-of-options marker preserves data and legacy help scans cannot reinterpret it", async () => {
   const handler = vi.fn(async (argv: string[]) => JSON.stringify(argv));
   const argv = ["--", "--help", "-h"];

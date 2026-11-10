@@ -146,9 +146,9 @@ describe("row 372 — the split release decider", () => {
     unreaped[parkIndex(unreaped)]!.data.reapFailure = "census unreadable";
     expect(decide(unreaped).decisions).toEqual([releaseOf(unreaped, ENDED_PATH, { release: "recheck", reapFailure: "census unreadable" })]);
     expect(decide(unreaped, { work: { T1: { head: "b".repeat(40), commits: 0 } } }).decisions).toEqual([releaseOf(unreaped, ENDED_PATH, {}, null)]);
-    // Only an exempt kept park is held out of scheduling; a read-failure or unrecorded kept park keeps its base.
-    expect(failed[0]).not.toHaveProperty("hold");
-    expect(decide(legacy).decisions[0]).not.toHaveProperty("hold");
+    // Row 389 (D-2186 add.18): every kept park is held out of scheduling, a read-failure or unrecorded one included.
+    expect(failed[0]).toMatchObject({ hold: true });
+    expect(decide(legacy).decisions[0]).toMatchObject({ hold: true });
 
     // Every non-exempt kind is released by the same rule (a consult's human verdict parks on its trigger kind).
     for (const [kind, reason] of [["gate-fail", undefined], ["stall", "worker stalled"], ["infra", "runner infra"],

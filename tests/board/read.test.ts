@@ -83,8 +83,9 @@ function runGolden(read: typeof readRunBoard, c: Io): void {
     expect(got.atEpoch, c.name).toBe(c.now);
     return;
   }
-  const { version: _v, readAt: _r, spec, ...rest } = got;
+  const { version: _v, readAt: _r, spec, supersededBy, ...rest } = got;
   expect(spec, c.name).toBeNull(); // the fixture graphs record no spec path (R1, queue row 335)
+  expect(supersededBy, c.name).toBeNull(); // no golden run ended before its card's newest file (R12, queue row 393)
   expect(placeholder(rest, tmp), c.name).toStrictEqual(c.expected);
 }
 const journal = (runId: string, ts = "2026-11-01T00:00:00Z") => JSON.stringify({ ts, event: "run-start", data: { runId } }) + "\n";
@@ -241,7 +242,8 @@ test("readAt equals now formatted in the local zone, globs never cross a separat
   expect(given(vis, vis, `${tmp}/w/*/.tickmarkr`, `${tmp}/w/vis/../vis/.tickmarkr`, `${tmp}/alias/.tickmarkr`)).toEqual([vis]);
   mkdirSync(join(tmp, ".tickmarkr"));
   expect(stateRoots(tmp, [join(tmp, ".tickmarkr"), `${tmp}/.tickmarkr`])).toEqual([join(tmp, ".tickmarkr")]);
-  expect(given("~")).toEqual([homedir()]);
+  expect(given("~")).toEqual([]); // inside a repository, the home folder is outside every checkout (R11, queue row 394)
+  expect(stateRoots(temp(false), ["~"]).slice(1)).toEqual([homedir()]); // a session outside every repository expands it
   const empty = readRunBoard(tmp, [`${tmp}/w/*/.tickmarkr`, `${tmp}/missing/.tickmarkr`], [`${tmp}/rel-*`], now);
   expect(empty).toStrictEqual({ version: 1, empty: `no tickmarkr run under ${join(tmp, ".tickmarkr")}, ${vis}` });
   expect(Object.keys(empty)).toEqual(["version", "empty"]);
@@ -425,7 +427,11 @@ test("with no earlier run in any pooled folder the snapshot carries no ETA, and 
   expect(etaAt(fresh)).toBeNull();
   const { main } = repoWithWorktree();
   history(join(main, ".tickmarkr"));
-  const elsewhere = join(temp(false), "named", ".tickmarkr");
+  // the one hop needs the main checkout's own origin readable: an UNREADABLE one compares by common directory alone
+  put(join(main, ".git", "config"), '[remote "origin"]\n\turl = https://example.org/acme/main.git\n');
+  const clone = temp(false); // a clone whose origin is the main checkout: the same project (R11), not one of R2's checkouts
+  put(join(clone, ".git", "config"), `[remote "origin"]\n\turl = ${main}\n`);
+  const elsewhere = join(clone, "named", ".tickmarkr");
   liveRun(elsewhere);
   utimesSync(join(elsewhere, "runs", LIVE, "journal.jsonl"), T0 + 50, T0 + 50); // newer than every sibling, so it is the run read
   const board = readRunBoard(main, [elsewhere], [], T0 + 90) as { runId: string; eta: unknown };

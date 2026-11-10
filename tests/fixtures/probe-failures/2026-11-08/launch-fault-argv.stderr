@@ -1,0 +1,8 @@
+error: unexpected argument '--no-daemon' found
+
+  tip: to pass '--no-daemon' as a value, use '-- --no-daemon'
+
+Usage: codex exec [OPTIONS] [PROMPT]
+       codex exec [OPTIONS] <COMMAND> [ARGS]
+
+For more information, try '--help'.

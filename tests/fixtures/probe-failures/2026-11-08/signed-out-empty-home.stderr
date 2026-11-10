@@ -1,0 +1,33 @@
+OpenAI Codex v0.167.0
+--------
+workdir: /private/var/folders/xz/s67kmj4x68n4qlkkbrvfhvfr0000gn/T/tmp.SylcJe2Tmt
+model: gpt-6.1-sol
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: none
+reasoning summaries: none
+session id: 01a1b9e3-ca50-77c3-a74e-356cc777ca85
+--------
+user
+Reply with OK
+
+2026-11-08T06:41:16.281407Z ERROR codex_api::endpoint::responses_websocket: failed to connect to Responses WebSocket stage=Unknown
+2026-11-08T06:41:16.488273Z ERROR codex_api::endpoint::responses_websocket: failed to connect to Responses WebSocket stage=Unknown
+2026-11-08T06:41:16.896348Z ERROR codex_api::endpoint::responses_websocket: failed to connect to Responses WebSocket stage=Unknown
+ERROR: Reconnecting... 2/5
+2026-11-08T06:41:17.470625Z ERROR codex_api::endpoint::responses_websocket: failed to connect to Responses WebSocket stage=Unknown
+ERROR: Reconnecting... 3/5
+2026-11-08T06:41:18.745685Z ERROR codex_api::endpoint::responses_websocket: failed to connect to Responses WebSocket stage=Unknown
+ERROR: Reconnecting... 4/5
+2026-11-08T06:41:20.416764Z ERROR codex_api::endpoint::responses_websocket: failed to connect to Responses WebSocket stage=Unknown
+ERROR: Reconnecting... 5/5
+2026-11-08T06:41:24.069742Z ERROR codex_api::endpoint::responses_websocket: failed to connect to Responses WebSocket stage=Unknown
+warning: Falling back from WebSockets to HTTPS transport. unexpected status 401 Unauthorized: Missing bearer or basic authentication in header, url: wss://api.openai.com/v1/responses, cf-ray: a572977d481678b3-JED
+ERROR: Reconnecting... 1/5
+ERROR: Reconnecting... 2/5
+ERROR: Reconnecting... 3/5
+ERROR: Reconnecting... 4/5
+ERROR: Reconnecting... 5/5
+ERROR: unexpected status 401 Unauthorized: Missing bearer or basic authentication in header, url: https://api.openai.com/v1/responses, cf-ray: a57297b22a5c788c-JED, request id: req_9308f40df34b4914bc2e211d6bc587fc
+ERROR: unexpected status 401 Unauthorized: Missing bearer or basic authentication in header, url: https://api.openai.com/v1/responses, cf-ray: a57297b22a5c788c-JED, request id: req_9308f40df34b4914bc2e211d6bc587fc

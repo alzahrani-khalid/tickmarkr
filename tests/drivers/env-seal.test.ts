@@ -112,12 +112,31 @@ describe("sealHerdrEnv (pure)", () => {
       "HC_TERMINAL_ID",
       "HC_TERMINAL_SOCKET",
       "HC_SCOPE",
+      "REX_BIN_DIR",
+      "REX_BLOCK",
+      "REX_SERVER",
+      "REX_SESSION",
     ]);
   });
 
   test("herdrSealShellPrefix unsets every control var", () => {
     const p = herdrSealShellPrefix();
     for (const k of HERDR_CONTROL_VARS) expect(p).toContain(`unset ${k}`);
+  });
+
+  test("test: queue row 390 each Rex addressing name REX_BIN_DIR REX_BLOCK REX_SERVER and REX_SESSION is stripped by the pure seal and unset by the shell-prefix seal while TERM_PROGRAM and TERM_PROGRAM_VERSION stay, so a seal missing any Rex name fails", () => {
+    const rex = ["REX_BIN_DIR", "REX_BLOCK", "REX_SERVER", "REX_SESSION"] as const;
+    const input: NodeJS.ProcessEnv = { ...Object.fromEntries(rex.map((k) => [k, `fixture-${k}`])), TERM_PROGRAM: "Rex", TERM_PROGRAM_VERSION: "1.0" };
+    const sealed = sealHerdrEnv(input);
+    const prefix = herdrSealShellPrefix();
+    for (const k of rex) {
+      expect(sealed[k], k).toBeUndefined();
+      expect(input[k], k).toBe(`fixture-${k}`);
+      expect(prefix.split(/[\s;]+/), k).toContain(k);
+    }
+    expect(sealed.TERM_PROGRAM).toBe("Rex");
+    expect(sealed.TERM_PROGRAM_VERSION).toBe("1.0");
+    expect(prefix).not.toMatch(/\bTERM_PROGRAM(_VERSION)?\b/);
   });
 });
 
@@ -198,6 +217,8 @@ describe("vitest process seal (ambient inheritance dies at the boundary)", () =>
     expect(process.env.HERDR_SOCKET_PATH).toBeUndefined();
     // Queue row 340 (D-2180): nor the Herdr app's HC pair or the launching terminal's HC_SCOPE.
     for (const k of ["HC_TERMINAL_ID", "HC_TERMINAL_SOCKET", "HC_SCOPE"]) expect(process.env[k], k).toBeUndefined();
+    // Queue row 390 (D-2187 add.9): nor the Rex addressing names (tests/setup.ts clears them).
+    for (const k of ["REX_BIN_DIR", "REX_BLOCK", "REX_SERVER", "REX_SESSION"]) expect(process.env[k], k).toBeUndefined();
   });
 });
 

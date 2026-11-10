@@ -94,6 +94,8 @@ function rig(overrides: RigOptions = {}) {
   const $ = {
     command: { register: async (spec: Record<string, unknown>) => { world.commands.push(spec); } },
     session: { cwd: async () => world.cwd },
+    // row 395 (D-2187 add.23): the seat guard reads TICKMARKR_SEAT; an operator session has none
+    env: { get: async (_name: string) => undefined },
     fs: { stat: async (path: string) => {
       world.stats.push(path);
       if (world.kind === "reject") throw new Error("stat refused");

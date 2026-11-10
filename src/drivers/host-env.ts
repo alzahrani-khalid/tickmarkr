@@ -74,14 +74,17 @@ export const HOST_SESSION_VARS = [
   "CLAUDE_CODE_BRIDGE_SESSION_ID",
 ] as const;
 
-// OBS-17 / v1.22 T3, OBS-843 and queue row 340 (D-2180): host control-plane vars that let a process address the
-// operator's herdr, Orca or Herdr app session. Workers and agent seats (worker/judge/review/consult and every headless
-// agent CLI) must never inherit them; only the daemon and its driver calls keep the live session. The HC pair addresses
-// the launching hc terminal and HC_SCOPE is that terminal's scope token: inherited, a role could act as ORCH, type into
-// it or become its child. Removing them is not a security boundary — any same-user process can still address the
-// default socket or app explicitly; core isolation is out of scope. TERM_PROGRAM is host description, not an
-// addressing capability, and ORCA_AGENT_HOOK_* belongs to agent status transport, so both stay. Lives in this leaf
-// module so git.ts and subprocess.ts share it without an import cycle; subprocess.ts re-exports the historical name.
+// OBS-17 / v1.22 T3, OBS-843, queue row 340 (D-2180) and queue row 390 (D-2187 add.9): host control-plane vars that
+// let a process address the operator's herdr, Orca, Herdr app or Rex session. Workers and agent seats
+// (worker/judge/review/consult and every headless agent CLI) must never inherit them; only the daemon and its driver
+// calls keep the live session. The HC pair addresses the launching hc terminal and HC_SCOPE is that terminal's scope
+// token: inherited, a role could act as ORCH, type into it or become its child. The four REX_ names are the closed set
+// a live Rex pane carries (D-2187 add.9, names read first-hand): REX_SERVER, REX_SESSION and REX_BLOCK address the
+// operator's Rex session and pane, and REX_BIN_DIR locates Rex's own CLI, so all four are sealed. Removing them is not
+// a security boundary — any same-user process can still address the default socket or app explicitly; core isolation
+// is out of scope. TERM_PROGRAM and TERM_PROGRAM_VERSION are host description, not an addressing capability, and
+// ORCA_AGENT_HOOK_* belongs to agent status transport, so they stay. Lives in this leaf module so git.ts and
+// subprocess.ts share it without an import cycle; subprocess.ts re-exports the historical name.
 export const HERDR_CONTROL_VARS = [
   "HERDR_ENV",
   "HERDR_SOCKET_PATH",
@@ -91,6 +94,10 @@ export const HERDR_CONTROL_VARS = [
   "HC_TERMINAL_ID",
   "HC_TERMINAL_SOCKET",
   "HC_SCOPE",
+  "REX_BIN_DIR",
+  "REX_BLOCK",
+  "REX_SERVER",
+  "REX_SESSION",
 ] as const;
 
 /** Queue row 340 (D-2180): the inherited hc scope token. Its presence is recorded as a boolean only, never its value. */

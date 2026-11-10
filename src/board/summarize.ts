@@ -1,6 +1,6 @@
 // The run board's summarizer (queue rows 331 and 332): a port of the operator's run board summarizer, the frozen oracle
 // tests/fixtures/board/reference/summarize.py lines 15–422 (constants through summarize), under tests/fixtures/board/PORT-RULES.md
-// rules S1–S7. It is pure: no file, process or clock — the caller passes events, graph, lock, now, history and suites.
+// rules S1–S8. It is pure: no file, process or clock — the caller passes events, graph, lock, now, history and suites.
 // Names follow the reference so the two read side by side; every Python idiom goes through a helper below that keeps
 // Python's semantics (truthiness, `or`, `get`, `int`, `round`, `str`, `splitlines`, code-point slices and order).
 
@@ -715,7 +715,8 @@ export function summarize(events: readonly unknown[], graph: unknown, lockPid: n
       if (gate === "test") row.suiteWaiting = false;
       if (!truthy(get(d, "pass"))) lastFail.set(tid, cut(`${gate} ✖ ${firstRedLine(d)}`, 70));
       const inv = channels(d);
-      if (gate === "acceptance" && inv.length) row.judge = inv[inv.length - 1];
+      // S8 (queue row 394, D-2187 add.16): an oracles-only acceptance round writes no invocations field
+      if (gate === "acceptance" && (inv.length || !Object.hasOwn(d, "invocations"))) row.judge = inv.length ? inv[inv.length - 1] : "oracles";
       if (gate === "review" && (truthy(get(d, "reviewer")) || inv.length)) row.reviewer = str(or(get(d, "reviewer"), inv[inv.length - 1]));
     } else if (ev === "suite-wait") {
       row.suiteWaiting = true;

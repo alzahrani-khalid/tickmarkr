@@ -14,18 +14,23 @@ export async function resume(argv: string[], cwd = process.cwd()): Promise<{ out
     options: {
       "graph-changed": { type: "boolean" },
       "retry-failed": { type: "boolean" },
+      readmit: { type: "string", multiple: true },
       driver: { type: "string" },
     },
     allowPositionals: true,
   });
   const runId = positionals[0];
-  if (!runId) throw new Error("usage: tickmarkr resume <run-id> [--graph-changed] [--retry-failed] [--driver <auto|herdr|subprocess|orca|herdr-app>]");
+  if (!runId) throw new Error("usage: tickmarkr resume <run-id> [--graph-changed] [--retry-failed] [--readmit <adapter:model>]... [--driver <auto|herdr|subprocess|orca|herdr-app>]");
   const driverOverride = parseDriverOverride(values.driver);
   // T3: --graph-changed is the operator's audited release of the engagement-identity guard (Sol #2 /
   // Fable F2) — the daemon refuses a mismatched/unbound journal unless this is set, then journals a
   // graph-rehash event naming both hashes. Strip the flag before runId resolution so a bare id still wins.
   const graphChanged = values["graph-changed"] ?? false;
   const retryFailed = values["retry-failed"] ?? false;
+  // Queue row 397 (D-2187 add.23): each --readmit names one run-wide excluded channel as adapter:model.
+  const readmit = values.readmit ?? [];
+  const malformed = readmit.find((channel) => !/^[^:\s]+:\S+$/u.test(channel));
+  if (malformed !== undefined) throw new Error(`tickmarkr resume --readmit takes <adapter:model>, got ${JSON.stringify(malformed)}`);
   const cfg = loadConfig(cwd);
   // v1.87 T3 (OBS-162, twice-carried workaround): the preflight runs AFTER the graph is read and
   // sees only the shapes the resumed graph carries. A deny∩prefer collision on a shape no resumed
@@ -47,6 +52,7 @@ export async function resume(argv: string[], cwd = process.cwd()): Promise<{ out
     resume: true,
     graphChanged,
     retryFailed,
+    readmit,
     // bound to the same sink the daemon gets, so a driver-journaled recovery reaches this rail too
     driver: bindNarration(pickDriver(cfg, driverOverride, snapshot.host), narrate),
     inheritedHcScope: snapshot.inheritedScope,

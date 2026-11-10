@@ -2,6 +2,61 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v2.24.0 — picks tell the truth
+
+**v2.24.0** ships 25 of its spec's 31 tasks. Twenty-two merged in run-20261108-153320-0000000000002493, two of them
+carried in from run-20261108-125547-0000000000002405, which ended not green on rows 395–397; those rows ship in this
+release. Two more were verified by hand with the same gates after their in-run review seat was lost to a local proxy
+outage, and one merged in run-20261110-065138-0000000000000043. Every task that ships passed build, lint, evidence and
+scope, its acceptance criteria, a review by a model from another vendor and the full test suite. Six tasks do not ship and
+move to 2.25.0: the identity probe that admits a discovered proxy model, routing and journaling of admitted models, the
+doctor warning for a key in the environment, and the run-end copy of the run folder, which was removed after its review
+stayed red.
+
+- **Fleet pick and plan tell you what a run would choose.**
+  - One seat resolver now picks the judge, the review seat and the consult seat for both `tickmarkr fleet --pick` and a run.
+  - `fleet --pick judge|review` needs `--author <adapter:model>`. Without it the command exits 2 and prints nothing on
+    stdout.
+  - The pick receipt names every channel it skipped and the doctor cache's age. A stale cache produces a warning, not a
+    refusal. Stdout is still exactly one JSON object.
+  - `tickmarkr plan` prints the seat pools.
+  - A consult reroute that has no other eligible channel is journaled and says so. It never silently reuses the same seat.
+  - The overseer skill seats an independent reviewer with `--author` and stops on any refusal.
+- **Doctor names the real fault.**
+  - A failed model probe records `launch-fault` or `timeout` instead of reading as signed out. A failed Kimi turn no
+    longer flips the adapter's sign-in.
+  - Doctor and the fleet editor flag a `prefer` entry that names a dead channel.
+- **Model proxies behind the Claude base URL.** When `ANTHROPIC_BASE_URL` points at a model proxy, doctor:
+  - detects the proxy, lists its models and reports listing failures by type;
+  - records each claude-code model under its true vendor.
+
+  pi can carry the proxy's non-Anthropic models through a shipped extension. A model that doctor only discovered on the
+  proxy is listed and never routed in this release; admission by identity probe comes in 2.25.0.
+- **Benchmark tiers for new models.**
+  - Doctor reads Terminal-Bench evidence, where every row needs its measuring agent.
+  - A model with no tier gets one from the standing bands on both benchmarks. An existing tier is never touched.
+  - A missing or stale score gives a provisional cheap tier that names the missing leg.
+- **The Artificial Analysis key.**
+  - The key is read from `ARTIFICIAL_ANALYSIS_API_KEY`, then from the macOS Keychain.
+  - Interactive `doctor` and `init` ask for a missing key once, with hidden input. A skip is remembered per workspace;
+    `doctor --ask-keys` asks again. A yes saves the key to the Keychain and re-reads it to confirm.
+  - The key never reaches an agent child, argv or any output. A run drops the key from its own environment at start and
+    warns when it was set.
+- **The board tells the truth.**
+  - It reads only the session's own project.
+  - It flags a run older than the newest release, says when no run is live and how long ago a run ended, and names an
+    oracles-only judge.
+  - It never auto-opens inside a tickmarkr seat or a task worktree. `/tickmarkr-board` still opens it by hand.
+  - A run that cannot finish reads "cannot finish" and names its stopped roots, with one needs-you entry per stop.
+  - A dependent of a failed or parked task reads blocked, matching the run-end classification.
+  - Each run-wide exclusion gets one line, and each failure reason is shown once and whole.
+  - The board measures what it draws against the host's four size bounds. Over budget it collapses merged tasks, then
+    leaves the last tasks out behind one "more tasks" line, so the largest run still draws.
+- **Runs recover instead of failing.**
+  - A harvested no-trailer window counts toward demotion unless its gate round ends all green.
+  - An exclusion that empties a task's floor pool parks the task with its verbs instead of failing it.
+    `tickmarkr resume <runId> --readmit <adapter:model>` readmits the channel.
+
 ## v2.23.0 — the run does not deadlock its own seats or re-park a split task
 
 **v2.23.0** was delivered by one tickmarkr run of three tasks (run-20261107-234110-0000000000002209) plus a verified

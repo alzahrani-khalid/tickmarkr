@@ -37,6 +37,26 @@ const isReopened = (events: { event: string }[]): boolean => {
   return reopened;
 };
 
+/** S8 (queue row 394, D-2187 add.16), walked from the cut's own events: per task, whether its latest judge-setting
+ *  acceptance result had no invocations field (oracles) or named a channel (the base's judge), and whether an oracles
+ *  result was later overridden by a channel. */
+const s8Judges = (events: { event: string; taskId?: unknown; data?: unknown }[], graph: { tasks: { id: string }[] }) => {
+  const ids = new Set(graph.tasks.map((t) => t.id));
+  const oracles = new Map<string, boolean>();
+  let overridden = false;
+  for (const e of events) {
+    const d = e.data as Record<string, unknown> | undefined;
+    if (e.event !== "gate-result" || typeof e.taskId !== "string" || !ids.has(e.taskId) || !d || d.gate !== "acceptance") continue;
+    const channels = Array.isArray(d.invocations) ? d.invocations.filter((i) => i && typeof i === "object" && (i as { channel?: unknown }).channel) : [];
+    if (!Object.hasOwn(d, "invocations")) oracles.set(e.taskId, true);
+    else if (channels.length) {
+      if (oracles.get(e.taskId)) overridden = true;
+      oracles.set(e.taskId, false);
+    }
+  }
+  return { oracles: [...oracles].filter(([, o]) => o).map(([id]) => id), overridden };
+};
+
 const savedTz = process.env.TZ;
 afterEach(() => {
   if (savedTz === undefined) delete process.env.TZ;
@@ -49,20 +69,66 @@ test("golden cuts that are not reopened stay exactly equal while every reopened 
   for (const c of cases) {
     process.env.TZ = c.tz;
     const events = eventsOf(journalLines(c.run).slice(0, c.cut));
-    const got = summarize(events, JSON.parse(runFile(c.run, "graph.json")), c.pid, c.alive, c.now,
-      c.hist, telemetryOf(c.run), c.suites);
+    const graph = JSON.parse(runFile(c.run, "graph.json"));
+    const got = summarize(events, graph, c.pid, c.alive, c.now, c.hist, telemetryOf(c.run), c.suites);
     if (isReopened(events)) {
       expect(got.ended, c.name).toBeNull();
       expect(got.endEpoch, c.name).toBeNull();
       expect(got.atEpoch, c.name).toBe(c.now);
       reopened++;
-    } else {
+    } else if (!s8Judges(events, graph).oracles.length) { // S8's cuts: the oracles test below
       expect(got, c.name).toStrictEqual(c.expected);
     }
     compared++;
   }
   expect(compared).toBe(cases.length);
   expect(reopened).toBeGreaterThan(0);
+});
+
+test("an acceptance result with no invocations field names the judge oracles while every other golden cut keeps exact equality", () => {
+  let withOracles = 0;
+  let without = 0;
+  let laterChannelWins = 0;
+  let reopenedWithOracles = 0;
+  for (const c of cases) {
+    process.env.TZ = c.tz;
+    const events = eventsOf(journalLines(c.run).slice(0, c.cut));
+    const graph = JSON.parse(runFile(c.run, "graph.json"));
+    const got = summarize(events, graph, c.pid, c.alive, c.now, c.hist, telemetryOf(c.run), c.suites);
+    const { oracles, overridden } = s8Judges(events, graph);
+    if (overridden) laterChannelWins++;
+    /** S8's judge on each oracles task: every other field and every other task untouched */
+    const s8 = (s: typeof got): typeof got => ({ ...s, tasks: s.tasks.map((t) => (oracles.includes(t.id) ? { ...t, judge: "oracles" } : t)) });
+    for (const id of oracles) expect(c.expected.tasks.find((t) => t.id === id)?.judge, `${c.name} ${id}`).toBe(""); // the base left it blank: no frozen fixture follows a channel with an oracles round
+    if (isReopened(events)) {
+      // S7's differences only, the consequences of clearing the end: no end record or time, atEpoch at now, the live
+      // clock and ETA, and tokens on done tasks alone; every other field exactly the golden's
+      const s7 = { ...c.expected, ended: null, endEpoch: null, atEpoch: c.now, elapsedMin: got.elapsedMin, eta: got.eta,
+        tasks: c.expected.tasks.map((t) => ({ ...t, tokens: t.state === "done" ? t.tokens : null })) };
+      expect(got, c.name).toStrictEqual(s8(s7));
+      // and S8 moves nothing else: the cut with each oracles round's field present but empty is the base's S7 summary
+      const base = events.map((e) => (e.event === "gate-result" && e.data?.gate === "acceptance" && !Object.hasOwn(e.data, "invocations")
+        ? { ...e, data: { ...e.data, invocations: [] } } : e));
+      expect(got, c.name).toStrictEqual(s8(summarize(base, graph, c.pid, c.alive, c.now, c.hist, telemetryOf(c.run), c.suites)));
+      if (oracles.length) reopenedWithOracles++;
+    } else {
+      expect(got, c.name).toStrictEqual(s8(c.expected));
+    }
+    if (oracles.length) withOracles++;
+    else without++;
+  }
+  expect([withOracles > 0, without > 0, laterChannelWins > 0]).toEqual([true, true, true]);
+  expect(reopenedWithOracles).toBe(3); // failed-task@775 (Asia/Riyadh) and failed-task@1143 in both zones
+
+  // the control, a synthetic cut: no invocations field names oracles, an empty list keeps the base, a channel wins later
+  const at = (s: number) => `2026-11-02T10:00:${String(s).padStart(2, "0")}.000Z`;
+  const gate = (s: number, data: Record<string, unknown>) => ({ ts: at(s), event: "gate-result", taskId: "T1", data: { gate: "acceptance", pass: true, ...data }, _line: s });
+  const judge = (...results: object[]) => summarize([{ ts: at(0), event: "run-start", data: { runId: "run-s8" }, _line: 1 }, ...results],
+    { tasks: [{ id: "T1", title: "one" }] }, null, null, Date.parse(at(59)) / 1000).tasks[0].judge;
+  const channel = { invocations: [{ channel: "codex:gpt-6.1-sol" }] };
+  expect([judge(gate(2, {})), judge(gate(2, { invocations: [] })), judge(gate(2, channel)), judge(gate(2, {}), gate(3, channel)),
+    judge(gate(2, channel), gate(3, {})), judge(gate(2, channel), gate(3, { invocations: [] }))])
+    .toEqual(["oracles", "", "codex:gpt-6.1-sol", "codex:gpt-6.1-sol", "oracles", "codex:gpt-6.1-sol"]);
 });
 
 test("the golden cases run in full with none skipped and include both time zones, the synthetic run, a suite waiting on a named holder, a failed cheap check, a park and an open approval window, so a trimmed golden file fails", () => {

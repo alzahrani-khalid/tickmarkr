@@ -1,12 +1,13 @@
 // The run board's reader (queue rows 331 and 332): a port of the operator's run board reader, the frozen oracle
 // tests/fixtures/board/reference/summarize.py lines 425–560 (history_p50, suite_progress, expand, release_status and
-// main), under tests/fixtures/board/PORT-RULES.md rules R1–R10. It reads files only: never git, never a process (R10).
+// main), under tests/fixtures/board/PORT-RULES.md rules R1–R13. It reads files only: never git, never a process (R10).
 // The one call beyond the file system is the lock's `process.kill(pid, 0)` liveness probe (R5), which spawns nothing.
 import { readdirSync, readFileSync, realpathSync, statSync, lstatSync, type Dirent } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, resolve } from "node:path";
 import { TaskSchema } from "../graph/schema.js";
-import { summarize, tsEpoch, type PhaseHistory, type RunSummary, type SuiteProgress } from "./summarize.js";
+import { summarize, tsEpoch, type PhaseHistory, type SuiteProgress } from "./summarize.js";
+import { runTruth, type RunTruth } from "./run-truth.js";
 
 export type ReleaseStage = { name: string; state: "pending" | "running" | "done" | "failed"; detail: string };
 export type ReleaseSnapshot = {
@@ -14,7 +15,11 @@ export type ReleaseSnapshot = {
   stages: ReleaseStage[];
 };
 /** Wire contract version 1 (R1): a full snapshot, or exactly the empty answer. */
-export type RunBoard = (RunSummary & { version: 1; readAt: string; release: ReleaseSnapshot | null; spec: string | null }) | { version: 1; empty: string };
+export type RunBoard = (RunTruth & { // R13 (queue row 398): the summary with run-truth applied
+  version: 1; readAt: string; release: ReleaseSnapshot | null; spec: string | null;
+  /** R12 (queue row 393, D-2187 add.16): the release card's version when it is newer than this ended run, else null */
+  supersededBy: string | null;
+}) | { version: 1; empty: string };
 
 // ---- Python semantics the reader needs (S1–S5; summarize.ts keeps its own copies private) ----
 
@@ -102,7 +107,18 @@ const lexists = (p: string): boolean => { try { return lstatSync(p, { throwIfNoE
 const isDir = (p: string): boolean => { try { return statSync(p, { throwIfNoEntry: false })?.isDirectory() ?? false; } catch { return false; } };
 const isFile = (p: string): boolean => { try { return statSync(p, { throwIfNoEntry: false })?.isFile() ?? false; } catch { return false; } };
 const mtimeNs = (p: string): bigint | null => { try { return statSync(p, { bigint: true, throwIfNoEntry: false })?.mtimeNs ?? null; } catch { return null; } };
-const realOr = (p: string): string => { try { return realpathSync(p); } catch { return resolve(p); } };
+/** A path's PHYSICAL target (queue row 394, D-2187 add.52): libc realpath, as the kernel and Python resolve it, never
+ *  node's realpathSync, which collapses `..` as text first (so `A/alias/..`, alias -> B/src, would read as A, not B).
+ *  A path that does not exist is its longest existing prefix's real path with the rest appended. */
+const realOr = (p: string): string => {
+  try { return realpathSync.native(p); } catch {
+    const up = dirname(p);
+    return up === p ? resolve(p) : resolve(realOr(up), basename(p));
+  }
+};
+/** A session path made absolute. A `..` segment names the parent of what the kernel reaches, so such a path is its
+ *  physical target (D-2187 add.52); any other keeps its spelling, tidied (R2 shows its roots as the session spells them). */
+const sessionPath = (cwd: string): string => (/(^|\/)\.\.(\/|$)/.test(cwd) ? realOr(cwd) : resolve(cwd));
 const read = (p: string): string => readFileSync(p, "utf8");
 /** Lines split on LF only (R4). */
 const lfLines = (text: string): string[] => text.split("\n");
@@ -113,6 +129,8 @@ function pySplit(p: string): [string, string] {
   return [head && !/^\/+$/.test(head) ? head.replace(/\/+$/, "") : head, p.slice(i)];
 }
 const pyJoin = (a: string, b: string): string => (b.startsWith("/") ? b : a === "" || a.endsWith("/") ? a + b : `${a}/${b}`);
+/** os.path.join, never node's join: no `..` collapses as text, so every read goes where the kernel goes (D-2187 add.52). */
+const join = (...parts: string[]): string => parts.reduce(pyJoin);
 
 // ---- expand (R3): ~, then glob.glob's rules, each pattern's matches sorted by code point ----
 
@@ -206,26 +224,40 @@ function once(paths: readonly string[]): string[] {
 
 // ---- R2: the repository's checkouts, from git's own files ----
 
-/** A git pointer file's path (after `prefix`, trailing CR and LF stripped) resolved against `base`; null when absent. */
+/** A git pointer file's path (after `prefix`, trailing CR and LF stripped) joined to `base` unnormalized, then read
+ *  physically first (queue row 394, D-2187 add.52): its tidy spelling only when that names the same real path, else the
+ *  real path, so `A/alias/../.git` (alias -> B/src) is B's `.git`, never A's. Null when absent. */
 function pointer(file: string, prefix: string, base: string): string | null {
   let text: string;
   try { text = read(file).replace(/[\r\n]+$/, ""); } catch { return null; }
-  return text.startsWith(prefix) && text.length > prefix.length ? resolve(base, text.slice(prefix.length)) : null;
+  if (!text.startsWith(prefix) || text.length === prefix.length) return null;
+  const raw = join(base, text.slice(prefix.length));
+  const real = realOr(raw);
+  return realOr(resolve(raw)) === real ? resolve(raw) : real;
 }
 
-/** The git-file worktree walk (R2), never running git: the enclosing checkout (the nearest `.git` entry, a submodule's
- *  included), the main checkout when the common directory is a `.git`, then each `<common>/worktrees/<name>/gitdir`
- *  checkout whose `.git` entry still exists. Outside a repository (a bare one included) it is `<cwd>` alone. */
-function checkouts(cwd: string): string[] {
-  let checkout = cwd;
+/** The checkout enclosing `path` (the nearest `.git` entry, a submodule's included), its git directory (null for an
+ *  unreadable `.git` file, whose common directory is then that entry itself) and its common directory. Null outside
+ *  every checkout, a bare repository included (R2). */
+function enclosing(path: string): { checkout: string; gitDir: string | null; common: string } | null {
+  let checkout = path;
   while (!lexists(join(checkout, ".git"))) {
-    if (dirname(checkout) === checkout) return [cwd];
+    if (dirname(checkout) === checkout) return null;
     checkout = dirname(checkout);
   }
   const dotGit = join(checkout, ".git");
   const gitDir = isDir(dotGit) ? dotGit : pointer(dotGit, "gitdir: ", checkout);
-  if (gitDir === null) return [checkout];
-  const common = pointer(join(gitDir, "commondir"), "", gitDir) ?? gitDir;
+  return { checkout, gitDir, common: gitDir === null ? dotGit : pointer(join(gitDir, "commondir"), "", gitDir) ?? gitDir };
+}
+
+/** The git-file worktree walk (R2), never running git: the enclosing checkout, the main checkout when the common
+ *  directory is a `.git`, then each `<common>/worktrees/<name>/gitdir` checkout whose `.git` entry still exists.
+ *  Outside a repository (a bare one included) it is `<cwd>` alone. */
+function checkouts(cwd: string): string[] {
+  const at = enclosing(cwd);
+  if (at === null) return [cwd];
+  if (at.gitDir === null) return [at.checkout];
+  const { checkout, common } = at;
   const admins = join(common, "worktrees");
   let names: string[] = [];
   try { names = readdirSync(admins).sort(byCodePoint); } catch { /* no linked worktrees */ }
@@ -236,10 +268,112 @@ function checkouts(cwd: string): string[] {
   return [checkout, ...(basename(common) === ".git" ? [dirname(common)] : []), ...linked];
 }
 
-/** The state roots, searched in this order: the repository's checkouts (R2), then each given root's expansion (R3). */
+// ---- R11 (queue row 394, D-2187 add.16, add.29 and add.52): only the session's own project, identity read from git's own files ----
+
+type Identity = { common: string; readable: boolean; hop: string | null };
+
+/** The origin URL by R11's closed FORMAT table (D-2187 add.29), a whitelist and never a git-config parser: the one
+ *  `url = <value>` line under the line that is exactly `[remote "origin"]`, its value bare (no quote or backslash; a
+ *  whitespace-prefixed trailing `#` or `;` comment stripped, so a `#` or `;` with none before it, and inner whitespace,
+ *  stay in the value) or one fully double-quoted string with no quote or backslash inside. Every other input is
+ *  UNREADABLE (null): no config, any continuation line, an include or includeIf section, origin's section spelled any
+ *  other way (the single-line form included), a header line that is not wholly `[name]` or `[name "sub"]` (trailing
+ *  text included), no url line, two url lines, or a value in neither form (partial quotes, escapes, only a comment). */
+function originUrl(common: string): string | null {
+  let text: string;
+  try { text = read(join(common, "config")); } catch { return null; }
+  const lines = text.split(/\r?\n/);
+  if (lines.some((l) => l.endsWith("\\"))) return null; // a continuation folds the next line, a header included, into a value
+  let inOrigin = false;
+  const urls: string[] = [];
+  for (const line of lines) {
+    const t = line.trim();
+    if (t.startsWith("[")) {
+      inOrigin = t === '[remote "origin"]';
+      if (inOrigin) continue;
+      const head = /^\[\s*([A-Za-z0-9.-]+)(?:\s+"([^"\\]*)")?\s*\]$/.exec(t); // the whole line
+      if (!head) return null;
+      const [section, ...dotted] = head[1].toLowerCase().split(".");
+      const sub = head[2] ?? dotted.join(".");
+      if (section === "include" || section === "includeif" || (section === "remote" && sub === "origin")) return null;
+    } else if (inOrigin && /^url(?![A-Za-z0-9-])/i.test(t)) urls.push(t);
+  }
+  const value = urls.length === 1 ? /^url\s*=(.*)$/.exec(urls[0])?.[1].trim() : undefined;
+  if (value === undefined) return null;
+  const quoted = /^"([^"\\]+)"$/.exec(value);
+  if (quoted) return quoted[1];
+  const bare = value.replace(/(?:^|\s)[#;].*$/, "").trim(); // the first whitespace-prefixed comment, to the line's end
+  return bare && !/["\\]/.test(bare) ? bare : null;
+}
+
+/** What an origin read by the FORMAT table says (D-2187 add.29 row 4, add.52 points 2b and 3): an ABSOLUTE local path
+ *  is a hop to the PHYSICAL common directory of the checkout enclosing its real path (that real path outside every
+ *  checkout); a network URL (a `scheme://` URL other than `file://`, or an scp-like `host:path` whose first `:` has no
+ *  `/` before it) is readable but never matches, so its hop is null; anything else (a relative path, a `file://` URL,
+ *  an absolute path that does not resolve) is UNREADABLE (null). No URL is normalized: none is ever compared. */
+function originHop(url: string): { hop: string | null } | null {
+  if (url.startsWith("/")) {
+    let real: string;
+    try { real = realpathSync.native(url); } catch { return null; } // `..` resolved physically (D-2187 add.52)
+    const at = enclosing(real);
+    return { hop: at ? realOr(at.common) : real };
+  }
+  const scheme = /^([a-z][a-z0-9+.-]*):\/\//i.exec(url);
+  if (scheme) return scheme[1].toLowerCase() === "file" ? null : { hop: null };
+  const colon = url.indexOf(":");
+  return colon > 0 && !url.slice(0, colon).includes("/") ? { hop: null } : null;
+}
+
+/** The project of a checkout walk's result: its physical common directory, whether its config is READABLE by the FORMAT
+ *  table, and its local origin's hop; null outside every checkout. */
+function identity(at: ReturnType<typeof enclosing>): Identity | null {
+  if (at === null) return null;
+  const url = originUrl(at.common);
+  const origin = url === null ? null : originHop(url);
+  return { common: realOr(at.common), readable: origin !== null, hop: origin?.hop ?? null };
+}
+
+/** R11's narrowed rule (queue row 394, D-2187 add.52), which replaces every earlier one: the same project ONLY when the
+ *  physical common directories are equal, or, with BOTH configs readable, one side's absolute local origin hops to the
+ *  other's common directory (one hop, never a chain). A network URL never matches; UNREADABLE on either side is the
+ *  common directory alone, checked first. */
+const sameProject = (a: Identity, b: Identity): boolean => a.common === b.common
+  || (a.readable && b.readable && (a.hop === b.common || b.hop === a.common));
+
+/** The given paths split into the session's project and the rest; a session outside every repository counts all (R3).
+ *  The session path and each given path are read at their physical targets (D-2187 add.29, add.52), so a symlink counts as the
+ *  project it points into, never the one it sits in or its spelling; R2's own roots are read the same way. */
+function ownProject(cwd: string, paths: readonly string[]): { counted: string[]; ignored: string[] } {
+  const own = identity(enclosing(realOr(cwd)));
+  if (own === null) return { counted: [...paths], ignored: [] };
+  const keep = paths.map((p) => { const id = identity(enclosing(realOr(p))); return id !== null && sameProject(own, id); });
+  return { counted: paths.filter((_, i) => keep[i]), ignored: paths.filter((_, i) => !keep[i]) };
+}
+
+/** R2's state roots, of the session's own project (queue row 394, D-2187 add.29). The walk starts at `<cwd>` as given
+ *  when its physical target sits in the same checkout (or both sit outside every checkout), so its spelling is kept;
+ *  a symlink into another checkout, or out of every checkout, walks from the real path, since the target decides. A
+ *  root that is itself a symlink to another project's state, or out of every checkout, is ignored like a given root. */
+function ownCheckoutRoots(at: string): { counted: string[]; ignored: string[] } {
+  const lexical = enclosing(at);
+  const physical = enclosing(realOr(at));
+  const same = lexical === null || physical === null ? lexical === physical : realOr(lexical.checkout) === realOr(physical.checkout);
+  return ownProject(at, checkouts(same ? at : realOr(at)).map((c) => join(c, ".tickmarkr")));
+}
+
+/** The state roots in search order: the session's own R2 roots (always first), then each given root's expansion (R3)
+ *  that is the session's own project (R11); `ignored` names every root another project's, R2's first; `repo` is R2's
+ *  counted roots (R6a's history pool). */
+function searchRoots(cwd: string, roots: readonly string[]): { counted: string[]; ignored: string[]; repo: string[] } {
+  const at = sessionPath(cwd);
+  const repo = ownCheckoutRoots(at);
+  const given = ownProject(at, expand(at, roots));
+  return { counted: once([...repo.counted, ...given.counted]), ignored: once([...repo.ignored, ...given.ignored]), repo: repo.counted };
+}
+
+/** The state roots, searched in this order: the repository's checkouts (R2), then each counted given root (R3, R11). */
 export function stateRoots(cwd: string, roots: readonly string[]): string[] {
-  const at = resolve(cwd);
-  return once([...checkouts(at).map((c) => join(c, ".tickmarkr")), ...expand(at, roots)]);
+  return searchRoots(cwd, roots).counted;
 }
 
 // ---- history_p50 (R6) and suite_progress (R7) ----
@@ -421,11 +555,17 @@ function releaseCard(folder: string, now: number): ReleaseSnapshot {
   ] };
 }
 
-/** The card follows the release being worked on (R8a): among the expanded folders holding a regular file, the one
- *  whose newest file is newest, the later name winning a tie. Null when none holds a file. */
-export function readRelease(cwd: string, releases: readonly string[], now: number): ReleaseSnapshot | null {
+/** The expanded release folders, split into the session's project and the rest (R11). */
+function releaseFolders(cwd: string, releases: readonly string[]): { counted: string[]; ignored: string[] } {
+  const at = sessionPath(cwd);
+  return ownProject(at, once(expand(at, releases)));
+}
+
+/** The card follows the release being worked on (R8a): among the counted folders holding a regular file, the one
+ *  whose newest file is newest (`t`), the later name winning a tie. Null when none holds a file. */
+function chooseRelease(dirs: readonly string[]): { dir: string; t: bigint; name: string } | null {
   let best: { dir: string; t: bigint; name: string } | null = null;
-  for (const dir of once(expand(resolve(cwd), releases))) {
+  for (const dir of dirs) {
     let names: string[];
     try { names = readdirSync(dir); } catch { continue; }
     const times = names.filter((n) => isFile(join(dir, n))).map((n) => mtimeNs(join(dir, n))).filter((t): t is bigint => t !== null);
@@ -434,6 +574,12 @@ export function readRelease(cwd: string, releases: readonly string[], now: numbe
     const name = basename(dir);
     if (!best || t > best.t || (t === best.t && byCodePoint(name, best.name) > 0)) best = { dir, t, name };
   }
+  return best;
+}
+
+/** The release card (R8a) over the session's own project's release folders (R11). */
+export function readRelease(cwd: string, releases: readonly string[], now: number): ReleaseSnapshot | null {
+  const best = chooseRelease(releaseFolders(cwd, releases).counted);
   return best && releaseCard(best.dir, now);
 }
 
@@ -449,7 +595,8 @@ function specName(graph: unknown): string | null {
 /** The newest run across the state roots, as wire contract version 1 (R1), at `now` (epoch seconds). Invalid input
  *  throws a nonempty error (R9). */
 export function readRunBoard(cwd: string, roots: readonly string[], releases: readonly string[], now: number): RunBoard {
-  const searched = stateRoots(cwd, roots);
+  const { counted: searched, ignored, repo } = searchRoots(cwd, roots);
+  const releaseDirs = releaseFolders(cwd, releases);
   let best: { root: string; runs: string; name: string; t: bigint } | null = null;
   for (const root of searched) {
     const runs = join(root, "runs");
@@ -459,7 +606,11 @@ export function readRunBoard(cwd: string, roots: readonly string[], releases: re
       if (t !== null && (!best || t > best.t || (t === best.t && byCodePoint(name, best.name) > 0))) best = { root, runs, name, t };
     }
   }
-  if (!best) return { version: 1, empty: `no tickmarkr run under ${searched.join(", ")}` };
+  if (!best) {
+    const foreign = [...ignored, ...releaseDirs.ignored]; // R11: never searched, but named so the empty board says why
+    const under = searched.length ? ` under ${searched.join(", ")}` : ""; // every R2 root may be another project's (row 394)
+    return { version: 1, empty: `no tickmarkr run${under}${foreign.length ? `; ignored as another project's: ${foreign.join(", ")}` : ""}` };
+  }
   const runDir = join(best.runs, best.name);
   // The line is the --park token. The reader numbers every line itself, overriding any `_line` the journal carries, so
   // each park line is a positive integer before summarizing (R9).
@@ -474,14 +625,22 @@ export function readRunBoard(cwd: string, roots: readonly string[], releases: re
   const { pid, alive } = lockState(best.root, best.name);
   // R6a (queue row 334): a run in one of the repository's checkouts reads history from every checkout's runs folder, so
   // a fresh worktree still gets the repository's typical times; a run under a named root reads only its own folder.
-  const repo = checkouts(resolve(cwd)).map((c) => join(c, ".tickmarkr"));
   const pool = repo.includes(best.root) ? once(repo).map((r) => join(r, "runs")) : [best.runs];
   const hist = historyP50(pool, best.name);
-  const summary = summarize(events, graph, pid, alive, now, hist, telemetry, suiteProgress(runDir));
+  // R13 (queue row 398, D-2187 add.24): a run that cannot finish says so and names its roots, and each failed task
+  // adds its retry entry beside the park entries
+  const summary = runTruth(summarize(events, graph, pid, alive, now, hist, telemetry, suiteProgress(runDir)), events);
   const needsYou = summary.needsYou.map((n) => ({ ...n, cmd: n.cmd.replaceAll("{run}", () => runId) }));
   const at = new Date(Math.floor(now) * 1000);
   const readAt = `${two(at.getHours())}:${two(at.getMinutes())}:${two(at.getSeconds())}`;
   // R6b (queue row 334): without a worker sample every phase would schedule at 0 s and floor at a minute, so no ETA.
-  const eta = hist.worker === null || hist.worker === undefined ? null : summary.eta;
-  return { version: 1, ...summary, runId, needsYou, eta, readAt, release: readRelease(cwd, releases, now), spec: specName(graph) };
+  // R13 (queue row 398, D-2187 add.24): a run that cannot finish promises no time, so it needs no sample and keeps its
+  // stop and roots (its critical path is the graph's alone)
+  const eta = summary.eta?.cannotFinish || (hist.worker !== null && hist.worker !== undefined) ? summary.eta : null;
+  const chosen = chooseRelease(releaseDirs.counted);
+  const release = chosen && releaseCard(chosen.dir, now);
+  // R12 (queue row 393): an ended run older than the chosen card's newest file is not the newest run the release made
+  const supersededBy = release && chosen && summary.ended && summary.endEpoch !== null
+    && chosen.t > BigInt(Math.round(summary.endEpoch * 1000)) * 1_000_000n ? release.version || chosen.name : null; // ms-exact ts
+  return { version: 1, ...summary, runId, needsYou, eta, readAt, release, spec: specName(graph), supersededBy };
 }

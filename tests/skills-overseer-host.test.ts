@@ -35,8 +35,8 @@ test("the shipped overseer skill carries no section, ledger or dispatch for a re
     "subagents is rejected on read",
     "Buy seat diversity through Fleet, at every dispatch and respawn",
     "tickmarkr fleet --pick consult",
-    "tickmarkr fleet --pick review --exclude-vendor <author-vendor>",
-    "adding every applicable vendor exclusion under the Fleet selection contract",
+    "tickmarkr fleet --pick review --author <author adapter:model>",
+    "adding a `--exclude-vendor <prior-reviewer-vendor>` for every prior reviewer of the round and every mission exclusion under the Fleet selection contract",
     "Consume the successful JSON adapter/model before using the visible-seat recipes; never select directly from doctor data",
     "A codex seat inside a git WORKTREE cannot commit and cannot write outside the worktree",
     "report INSIDE the worktree and to commit nothing",
@@ -110,10 +110,13 @@ test("Cite the changed engine-default paragraph, worker tab line and brief list 
   const skill = readShippedSkill();
   // Queue row 242; D-2141, D-2152: these digests pin the original items, including numbers and three-space wraps.
   // Queue row 286: exclude only the required author addition, pinned in skills-verify-author.test.ts.
+  // Rows 362 and 367, D-2187 condition 5: item 3 now passes --author and prior-reviewer exclusions to Fleet.
   // Queue row 340; D-2180: one blank line ends the Orca bullet whose lazy continuation carried the codex worktree rule
   // into the Orca scope, so it reads on every host; the rescued bytes are otherwise identical.
   const seats = rescuedSeats(skill).replace(" --author <adapter:model of the agent that wrote it>", "")
-    .replace("time pressure.\n\n   **A codex seat", "time pressure.\n   **A codex seat");
+    .replace("time pressure.\n\n   **A codex seat", "time pressure.\n   **A codex seat")
+    .replace("`tickmarkr fleet --pick review --author <author adapter:model>`, adding a `--exclude-vendor <prior-reviewer-vendor>` for every prior reviewer of the round and every mission exclusion",
+      "`tickmarkr fleet --pick review --exclude-vendor <author-vendor>`, adding every applicable vendor exclusion");
   const digests = [
     "2bd2610bc3b024ef984e1a5ae915fec5de05c8dc9afcb0a3729c6dd30b85ce86",
     "0e6ce44042ad45cadc27fc9d1c0ccc9762af22e29078f18528ce77961f4f3fd4",
@@ -359,6 +362,49 @@ test("replaying D-265 (4) against the changed beat section finds the stand-down 
 });
 
 
+test("test: the overseer skill seats an independent reviewer with the author flag records the pick skips and cache age and stops on the context required exit", () => {
+  // Rows 362 and 367; ruling Q-a; D-2187 condition 5. fleet.ts pickSeat requires --author for
+  // review (exit 2 without it), passes excludeVendors to resolveSeats, writes resolver skips and
+  // cache { ageMs, stale } in its successful JSON, reports staleness on stderr, and refuses other
+  // nonzero outcomes. These assertions pin each corresponding instruction at the seat recipe.
+  const assertRecipe = (markdown: string) => {
+    const start = markdown.indexOf("**Fleet selection contract (OBS-1165)");
+    const end = markdown.indexOf("Fleet pick never starts a seat.", start) + "Fleet pick never starts a seat.".length;
+    expect(start).toBeGreaterThan(0);
+    expect(end).toBeGreaterThan(start);
+    const contract = markdown.slice(start, end);
+    expect(contract).toContain("| independent reviewer (including checker and verifier) | review | Every vendor already used by independent reviewers in this round, and mission exclusions; the pick excludes the author's vendor |");
+    expect(contract).toContain("`tickmarkr fleet --pick review --author <author adapter:model> --exclude-vendor <prior-reviewer-vendor>`");
+    expect(contract).toContain("omit the prior-reviewer argument only for the first reviewer");
+    expect(contract).toContain("for every applicable exclusion on either role; for review, this covers every prior reviewer of the\nround and every mission exclusion");
+    expect(contract).toContain("The pick excludes the author's own vendor using `--author`");
+    expect(contract).toContain("Track the author's `adapter:model` and actual vendor and each reviewer's\nreturned vendor in the seat record");
+    expect(contract).toContain("plus `skips` and `cache: { ageMs, stale }`");
+    expect(contract).toContain("record the receipt's skips and cache age with the seat");
+    expect(contract).toContain("A stale cache is reported in the\nreceipt and on stderr; it does not refuse the pick");
+    expect(contract).toContain("A nonzero refusal, including exit 2 for\n`context-required`, missing probe data");
+    expect(contract).toContain("stops the spawn: report the named reason");
+    expect(contract).not.toContain("--exclude-vendor <author-vendor>");
+    expect(contract).not.toContain("stale\nprobe data) stops the spawn");
+    const diversity = markdown.slice(markdown.indexOf("3. **Buy seat diversity through Fleet"), markdown.indexOf("When one vendor's model", markdown.indexOf("3. **Buy seat diversity through Fleet")));
+    expect(diversity).toContain("`tickmarkr fleet --pick review --author <author adapter:model>`");
+    expect(diversity).toContain("adding a `--exclude-vendor <prior-reviewer-vendor>` for every prior reviewer of the round and every mission exclusion");
+    expect(diversity).not.toContain("--exclude-vendor <author-vendor>");
+  };
+  const skill = readShippedSkill();
+  assertRecipe(skill);
+  for (const host of ["herdr", "orca", "app"] as const) assertRecipe(skillReading(skill, host));
+  for (const [before, after] of [
+    ["--pick review --author <author adapter:model> --exclude-vendor <prior-reviewer-vendor>", "--pick review --exclude-vendor <author-vendor> --exclude-vendor <prior-reviewer-vendor>"],
+    ["receipt and on stderr; it does not refuse the pick", "receipt and on stderr; stale probe data refuses the pick"],
+    ["plus `skips` and `cache: { ageMs, stale }`", "with no diagnostics"],
+    ["including exit 2 for\n`context-required`", "including missing author context"],
+  ]) {
+    expect(skill).toContain(before);
+    expect(() => assertRecipe(skill.replace(before, after)), before).toThrow();
+  }
+});
+
 test("The changed canonical overseer spawn/respawn contract requires every mapped seat purpose to consume a successful Fleet pick with the applicable vendor exclusions before using the existing visible-seat transport safeguards.", () => {
   const skill = readShippedCorpus();
   const contract = skill.slice(skill.indexOf("**Fleet selection contract (OBS-1165)"), skill.indexOf("- **On herdr", skill.indexOf("**Fleet selection contract (OBS-1165)")));
@@ -368,7 +414,7 @@ test("The changed canonical overseer spawn/respawn contract requires every mappe
   expect(contract).toContain("| independent reviewer (including checker and verifier) | review |");
   expect(contract).toContain("including every respawn, replacement, delegated spawn and Leg-2 dispatch");
   expect(contract).toContain("Never reuse a prior pick at respawn");
-  expect(contract).toContain("--pick review --exclude-vendor <author-vendor> --exclude-vendor <prior-reviewer-vendor>");
+  expect(contract).toContain("--pick review --author <author adapter:model> --exclude-vendor <prior-reviewer-vendor>");
   expect(contract).toContain("Consume only exit status zero and one complete JSON identity");
   for (const field of ["role", "adapter", "model", "vendor", "channel"]) expect(contract).toContain(`\`${field}\``);
   expect(contract).toContain("A nonzero refusal");

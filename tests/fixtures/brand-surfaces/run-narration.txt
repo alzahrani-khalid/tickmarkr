@@ -25,6 +25,7 @@
 ! T1 channel excluded — no output twice, channel claude-code:sonnet
 ! T1 consult — retry
 ! T1 trust accepted — claude-code seed
+! T1 reroute unavailable — no other eligible channel in routing.map.implement.pool (ordered: claude-code:sonnet), chann…
 ! T1 channel recycled — channel claude-code:sonnet
 ! T1 retry banned — review
 ! T1 repeat capped — test, channel claude-code:sonnet

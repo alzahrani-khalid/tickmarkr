@@ -1196,6 +1196,24 @@ describe("D-1 documentation half: the AA key is advertised where the catalog is 
     expect(after).not.toMatch(/^ #/m);
     expect(parse(after).routing.mode).toBe("staff-led");
   });
+
+  // Queue row 367 Phase 2 (D-2187 add.18): the key recipe rides the same tier-evidence note.
+  test("the written config template's tier-evidence note carries the key recipe: the environment variable, or the Keychain line whose trailing -w prompts so the value stays out of argv", async () => {
+    vi.spyOn(registry, "allAdapters").mockReturnValue([]);
+    const repo = makeRepo({ "keep.txt": "x" });
+    stampDoctor(repo, 5 * 60 * 1000);
+    await withoutTTY(async () => {
+      await runInit(repo);
+    });
+    const lines = readFileSync(join(tickmarkrDir(repo), "config.yaml"), "utf8").split("\n");
+    const start = lines.findIndex((l) => l.startsWith("# tier evidence:"));
+    expect(start).toBeGreaterThanOrEqual(0);
+    const note = lines.slice(start, lines.slice(start + 1).findIndex((l) => !l.startsWith("#   ")) + start + 1).join("\n");
+    expect(note).toContain("export ARTIFICIAL_ANALYSIS_API_KEY");
+    expect(note).toContain('#   security add-generic-password -a "$USER" -s ARTIFICIAL_ANALYSIS_API_KEY -w   (the trailing -w');
+    expect(note).toContain("prompts, so the value stays out of argv). With neither, an interactive doctor or init asks once.");
+    expect(note).toContain("free key: artificialanalysis.ai");
+  });
 });
 
 describe("a judge the repository overlay holds is saved in that overlay", () => {

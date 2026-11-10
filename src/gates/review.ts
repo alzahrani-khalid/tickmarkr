@@ -13,8 +13,8 @@ import { HcReadUnavailableError } from "../drivers/hc-client.js";
 import { shGitOk } from "../run/git.js";
 import { carryReviewFindings, isDeferredFinding, observedReviewFingerprints, reviewFingerprintMatches, structuredFindings, type StructuredFinding, UNIDENTIFIED } from "../run/journal.js";
 import { redactSecrets } from "../run/redact.js";
-import { rankPreferredChannels, reviewPreferenceTieBreak } from "../route/role-pick.js";
 import { disallowedBy, modelProvider } from "../route/preference.js";
+import { carriedAuthorVendors, modelId, resolveSeats } from "../route/seat-resolver.js";
 import { resolveStateDir } from "./cache.js";
 import { appendAnchoredReview, COMPLETION_FAKING_CHECKLIST, dewrapPaneVerdict, extractVerdictJson, generateVerdictNonce, type GateVia, parseAnchoredComments, runLlmDetailed, SeatLaunchError, verdictNonceLine } from "./llm.js";
 import type { GateResult } from "./types.js";
@@ -290,13 +290,9 @@ export function diffCapParkReason(results: GateResult[]): string | null {
 // FLEET-05: canonical model identity = the segment after the last "/". Provider-prefixed ids name ONE
 // base model behind two harnesses (zai-coding-plan/glm-5.2, zai/glm-5.2 → "glm-5.2"); vendor alone (mixed vs
 // zhipu) is not a diversity signal. Suffix-stripping over-excludes only if two genuinely different
-// models share a bare suffix — that errs fail-closed, acceptable per "gates never trust". Local to
-// review.ts (not a global identity concept).
-export function modelId(model: string): string {
-  return model.slice(model.lastIndexOf("/") + 1);
-}
-
-export { modelProvider };
+// models share a bare suffix — that errs fail-closed, acceptable per "gates never trust". Row 367 R1:
+// it lives beside the reviewer ranking in the seat resolver, not as a global identity concept.
+export { carriedAuthorVendors, modelId, modelProvider };
 
 /**
  * One function decides whether a reviewer's `resolved` or `reraised` id names a carried fingerprint,
@@ -429,32 +425,15 @@ export function pickReviewer(
   excludeVendors: ReadonlySet<string> = new Set(),
   authors: readonly string[] = [channelKey(author)],
 ): BillingChannel | null {
-  // Resolve every actual author, never guess a vendor from an adapter id.
-  const authorChannels = authors.map((key) => channels.find((c) => channelKey(c) === key));
-  if (authorChannels.some((c) => !c)) return null;
-  // RF-1: every caller inherits the author-tier floor — a reviewer is never seated below its author.
-  const effectiveFloor = resolveReviewerFloor(author.tier, floor).floor;
-  const eligible = channels
-    // Three independent axes: different vendor, different resolved provider identity (OBS-946: on initial pick
-    // as well as failover, so an aggregator channel stamped "mixed" never seats the author's own provider),
-    // and different base-model identity (ADDED TO the vendor rule, never replacing it). The diversity
-    // filter runs BEFORE preference ranking, so prefer cannot resurrect an excluded channel.
-    .filter((c) => c.vendor !== "unknown" && authorChannels.every((a) => a && c.vendor !== a.vendor
-      && modelProvider(c.model, c.vendor) !== modelProvider(a.model, a.vendor)
-      && modelId(c.model) !== modelId(a.model))
-      && !exclude.includes(channelKey(c))
-      && !excludeVendors.has(c.vendor)
-      && TIER_RANK[c.tier] >= TIER_RANK[effectiveFloor]);
-  const ranked = rankPreferredChannels(eligible, prefer, {
-    includeUnpreferred: true,
-    tieBreak: reviewPreferenceTieBreak,
+  // Row 367 R1 (D-2187): the review entry point of the one seat resolver. Every actual author resolves,
+  // never a vendor guessed from an adapter id; RF-1 floors the reviewer at the author's tier; vendor,
+  // resolved provider (OBS-946) and base model must all differ from every author, and that diversity
+  // filter runs BEFORE preference ranking, so prefer cannot resurrect an excluded channel.
+  const { pick, seat } = resolveSeats({
+    role: "review", pool: channels, prefer, author, authors, floor, exclude, history, demoted, excludeVendors,
   });
-  const reviewer = [...ranked].sort((a, b) =>
-    Number(demoted.has(channelKey(a))) - Number(demoted.has(channelKey(b)))
-    || history.lastIndexOf(channelKey(a)) - history.lastIndexOf(channelKey(b))
-    || ranked.indexOf(a) - ranked.indexOf(b))[0] ?? null;
-  if (reviewer) onSeat?.(ranked.indexOf(reviewer) + 1, ranked.length);
-  return reviewer;
+  if (seat) onSeat?.(seat.seat, seat.count);
+  return pick;
 }
 
 // OBS-196: the two observed unparseable causes are different defects — a cutoff/empty output is
@@ -518,18 +497,6 @@ function explicitSuitePaths(entry: string): string[] {
   const explicit = paths?.every((path) => !/[*?[\]{}()!\\]/.test(path)
     && path.split("/").every((segment) => segment !== "" && segment !== "." && segment !== ".."));
   return explicit ? paths!.filter((path) => TEST_FILE_RE.test(path)) : [];
-}
-
-/**
- * OBS-1033: the vendors of the seats that authored commits inside the accumulated diff. A seat is
- * never handed its own earlier work to approve. Unresolved channels are refused by reviewGate.
- */
-export function carriedAuthorVendors(channels: BillingChannel[], carriedAuthors: readonly string[] = []): Set<string> {
-  const vendors = new Set<string>();
-  for (const key of carriedAuthors) {
-    for (const c of channels.filter((c) => channelKey(c) === key)) vendors.add(c.vendor);
-  }
-  return vendors;
 }
 
 /**

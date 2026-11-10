@@ -13,6 +13,11 @@ import { DEFAULT_CONFIG, loadConfig } from "../../src/config/config.js";
 
 const roots: string[] = [];
 const old = "2020-01-02T03:04:05.000Z";
+// Rows 362 and 367 R5 (D-2187): fleet pick reads the doctor cache at any age, as run start does — a stale
+// cache is reported in the receipt (cache.stale) and never refused for its age.
+const stalePick = (pick: string | { out: string; code: number }) =>
+  typeof pick === "string" ? (JSON.parse(pick) as { cache: unknown }).cache : pick.out.replace(/^.*?: /u, "");
+const STALE = expect.objectContaining({ stale: true });
 const root = () => {
   const path = mkdtempSync(join(tmpdir(), "doctor-scope-"));
   roots.push(path);
@@ -119,8 +124,8 @@ test("recorded routable opus identities keep init reuse and fleet pick stale and
 
       expect.soft(doctorAgeMs(f.repo, f.cfg), context).toBeGreaterThan(60 * 60_000);
       expect.soft(initDoctorReuse(f.repo, false, f.cfg).reuse, context).toBe(false);
-      expect.soft(await fleet(["--pick", "consult", "--global-dir", f.globalDir], f.repo, f.adapters), context)
-        .toMatchObject({ code: 1, out: expect.stringContaining("stale") });
+      expect.soft(stalePick(await fleet(["--pick", "consult", "--global-dir", f.globalDir], f.repo, f.adapters)), context)
+        .toEqual(policy === "allow" ? "consult.prefer: no-eligible-preferred-channel" : STALE);
       expect.soft(await runDoctor(f, ["--probe-preflight"]), context).toContain("scope: 2 models — claude-code:opus, fake:fake-1");
 
       const before = readFileSync(f.path, "utf8");
@@ -320,7 +325,8 @@ test("test: doctor with a model scope probes exactly that model, even when routi
   }
   expect(initDoctorReuse(f.repo, false, f.cfg)).toMatchObject({ reuse: false, health: null });
   expect(initDoctorReuse(f.repo, false, f.cfg).ageMs).toBeGreaterThanOrEqual(before);
-  expect(await fleet(["--pick", "consult", "--global-dir", f.globalDir], f.repo, f.adapters)).toMatchObject({ code: 1, out: expect.stringContaining("stale") });
+  // The stale cache is read: the pick refuses on fake-1's cached unauthed verdict, never on the cache's age.
+  expect(stalePick(await fleet(["--pick", "consult", "--global-dir", f.globalDir], f.repo, f.adapters))).toBe("consult.prefer: no-eligible-preferred-channel");
 });
 
 test("test: kimi's separate turn runs when kimi-code/k3 is in scope and not for a denied kimi, another adapter's selection or a model-only selection of another kimi model, so a probe that still pays for the fixed model out of scope fails", async () => {
@@ -382,8 +388,7 @@ test("worker-only model denies keep role-reachable verdicts stale until a defaul
   await runDoctor(f, ["--model", "fake:fake-1"]);
   expect.soft(doctorAgeMs(f.repo, f.cfg)).toBeGreaterThan(60 * 60_000);
   expect.soft(initDoctorReuse(f.repo, false, f.cfg).reuse).toBe(false);
-  expect.soft(await fleet(["--pick", "consult", "--global-dir", f.globalDir], f.repo, f.adapters))
-    .toMatchObject({ code: 1, out: expect.stringContaining("stale") });
+  expect.soft(stalePick(await fleet(["--pick", "consult", "--global-dir", f.globalDir], f.repo, f.adapters))).toEqual(STALE);
   const beforeConsent = readFileSync(f.path, "utf8");
   const input = Object.assign(new PassThrough(), { isTTY: true, setRawMode: vi.fn() });
   const writes: string[] = [];
@@ -543,11 +548,15 @@ test.each(kimiSweepCases)("skipped Kimi model sweeps release in-scope history ac
     expect(JSON.parse(pick as string), context).toMatchObject({ adapter: "fake", model: "fake-1" });
   } else {
     expect(doctorAgeMs(f.repo, f.cfg), context).toBeGreaterThan(60 * 60_000);
-    expect(pick, context).toMatchObject({ code: 1, out: expect.stringContaining("stale") });
+    expect(stalePick(pick), context).toEqual(STALE);
   }
   const after = readDoctor(f.repo)!;
   for (const model of ["kimi-code/k3", "kimi-code/other"]) {
-    if (selected.includes(model)) expect(after.kimi?.modelAuth?.[model], context).toBeUndefined();
+    // Queue rows 353 and 367 R3 (D-2187 condition 2): a failed turn is recorded on the turn model's verdict.
+    if (failure === "turn" && model === "kimi-code/k3" && selected.includes(model)) {
+      expect(after.kimi?.modelAuth?.[model], context).toMatchObject({ authed: false, reason: "earned-green turn failed" });
+      expect(after.kimi?.authed, context).toBe(true);
+    } else if (selected.includes(model)) expect(after.kimi?.modelAuth?.[model], context).toBeUndefined();
     else expect(JSON.stringify(after.kimi?.modelAuth?.[model]), context).toBe(JSON.stringify(f.health.kimi.modelAuth![model]));
   }
   if (!selected.length) expect(JSON.stringify(after.kimi), context).toBe(JSON.stringify(f.health.kimi));
@@ -582,7 +591,7 @@ test.each(unavailableCases)("unavailable adapters release only the selected hist
   expect(initDoctorReuse(f.repo, false, f.cfg).reuse, context).toBe(reusable);
   const pick = await fleet(["--pick", "consult", "--global-dir", f.globalDir], f.repo, f.adapters);
   if (reusable) expect(JSON.parse(pick as string), context).toMatchObject({ adapter: "fake", model: "fake-1" });
-  else expect(pick, context).toMatchObject({ code: 1, out: expect.stringContaining("stale") });
+  else expect(stalePick(pick), context).toEqual(STALE);
   const after = readDoctor(f.repo)!;
   for (const model of ["other-1", "other-2"]) {
     if (selected.includes(model)) expect(after.other.modelAuth?.[model], context).toBeUndefined();

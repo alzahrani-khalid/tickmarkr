@@ -59,6 +59,19 @@
     "setup": {
       "type": "string"
     },
+    "cliproxy": {
+      "type": "object",
+      "properties": {
+        "detect": {
+          "type": "boolean"
+        },
+        "baseUrl": {
+          "type": "string",
+          "pattern": "^https?:\\/\\/[^\\s]+$"
+        }
+      },
+      "additionalProperties": false
+    },
     "routing": {
       "type": "object",
       "properties": {

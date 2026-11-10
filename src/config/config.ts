@@ -408,6 +408,12 @@ export const TickmarkrConfigSchema = z.object({
   // Default 170_000 matches the overseer's proven ctx-watch.sh threshold.
   contextWarnTokens: z.number().int().positive(),
   setup: z.string().optional(),
+  // Queue row 392 R6 (D-2187 add.11): the only gateway override. detect:false = no detection, no request;
+  // baseUrl replaces the detected Claude base URL (source config). Absent = detection runs.
+  cliproxy: z.object({
+    detect: z.boolean().optional(),
+    baseUrl: z.string().regex(/^https?:\/\/[^\s]+$/i, "cliproxy.baseUrl must be an http(s) URL").optional(),
+  }).strict().optional(),
   routing: z.object({
     // v1.51 T1: preset expanded into floors by loadConfig — absent ⇒ risk-based ⇒ byte-identical routing.
     mode: ModeEnum.optional(),
@@ -1042,6 +1048,10 @@ export function configTemplate(overlay?: InitConfigOverlay): string {
 #   carries ARTIFICIAL_ANALYSIS_API_KEY (free key: artificialanalysis.ai) — unset, AA contributes
 #   nothing and suggestions fall back to LiveBench's agentic-coding rank, then price. Not a config
 #   key: an API credential belongs in the environment, never in a tracked overlay.
+#   Key recipe: export ARTIFICIAL_ANALYSIS_API_KEY, or save it once in the macOS Keychain (read when
+#   the variable is unset) with
+#   security add-generic-password -a "$USER" -s ARTIFICIAL_ANALYSIS_API_KEY -w   (the trailing -w
+#   prompts, so the value stays out of argv). With neither, an interactive doctor or init asks once.
 # visibility:
 #   llm: headless         # headless (default): judge/review/consult run silently | pane: visible agents
 #   keepPanes: run        # run (default): ephemeral judge/review/consult panes close when read; a merged task's worker pane closes on done; other worker panes persist until run end | attempt | forever (keep everything for debugging)

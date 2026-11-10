@@ -123,7 +123,8 @@ test("a doctor report and the report init prints from a reused doctor record eac
           expect(section.filter((line) => line === NOTE)).toHaveLength(1);
           const firstTimeout = section.findIndex((line) => /^    first-timeout\s/.test(line));
           expect(firstTimeout).toBeGreaterThan(0);
-          expect(section[firstTimeout]).toContain("unauthed: probe timed out");
+          // Queue rows 353 and 367 R3 (D-2187 condition 2): a timer kill renders as a timeout, never a sign-out.
+          expect(section[firstTimeout]).toContain("timed out: probe timed out");
           expect(section[firstTimeout + 1]).toBe(NOTE);
         } else {
           expect(section).not.toContain(NOTE);

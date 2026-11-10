@@ -37,10 +37,11 @@ export interface SplitReleaseInput {
 
 export type SplitDecision =
   | { taskId: string; event: "task-approved"; data: Record<string, unknown> }
-  // `hold` is not row data: an exempt (human-gate or attempt-cap) park the resume keeps out of scheduling although
-  // the recompile wrote it pending — execTask's humanGate guard would open a second park over the kept one, and an
-  // attempt-cap park's gate replay would run before the cap check (D-2186 add.7, add.11).
-  | { taskId: string; event: typeof PARK_KEPT_EVENT; data: { park: number; reason: string }; hold?: true };
+  // `hold` is not row data: every kept park the resume keeps out of scheduling although the recompile wrote it
+  // pending — execTask's humanGate guard would open a second park over an exempt one, an attempt-cap park's gate
+  // replay would run before the cap check (D-2186 add.7, add.11), and an unproved change would run as if released
+  // (row 389, D-2186 add.18, D-2187: kept means kept until an operator decision on the park).
+  | { taskId: string; event: typeof PARK_KEPT_EVENT; data: { park: number; reason: string }; hold: true };
 
 const CLOSES_PARK = new Set(["task-dispatch", "task-done", "task-failed"]);
 
@@ -53,8 +54,8 @@ const recordOf = (value: unknown): ParkDefinition | undefined => {
     ? { fingerprint, files: [...files] } : undefined;
 };
 
-const kept = (taskId: string, park: number, reason: string, hold = false): SplitDecision =>
-  ({ taskId, event: PARK_KEPT_EVENT, data: { park, reason: `park at journal line ${park} kept — ${reason}` }, ...(hold ? { hold: true as const } : {}) });
+const kept = (taskId: string, park: number, reason: string): SplitDecision =>
+  ({ taskId, event: PARK_KEPT_EVENT, data: { park, reason: `park at journal line ${park} kept — ${reason}` }, hold: true });
 
 /** Every open park's decision, with the releasable ones still waiting on their work read. */
 function classify({ runId, events, tasks, rehash }: SplitReleaseInput): Array<SplitDecision | Releasable> {
@@ -82,11 +83,11 @@ function classify({ runId, events, tasks, rehash }: SplitReleaseInput): Array<Sp
     // is exempt only while the loaded definition still sets humanGate; one that turns it off is the operator's own
     // release and dispatches as at the base, with no kept or released row.
     if (park.kind === "human-gate") {
-      if (task.humanGate) out.push(kept(task.id, park.line, `human-gate park: the spec's approval-before-dispatch gate is never released automatically, whatever its definition change — ${next}`, true));
+      if (task.humanGate) out.push(kept(task.id, park.line, `human-gate park: the spec's approval-before-dispatch gate is never released automatically, whatever its definition change — ${next}`));
       continue;
     }
     if (park.kind === "attempt-cap") {
-      out.push(kept(task.id, park.line, `attempt-cap park: its exhausted attempt budget is refilled only by the operator's fresh-budget approve decision, never by a definition change — ${next}`, true));
+      out.push(kept(task.id, park.line, `attempt-cap park: its exhausted attempt budget is refilled only by the operator's fresh-budget approve decision, never by a definition change — ${next}`));
       continue;
     }
     if (!(PARK_KINDS as readonly string[]).includes(park.kind ?? "")) continue; // an unlisted kind keeps the base

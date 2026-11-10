@@ -22,6 +22,7 @@ import {
   type ModeResolution, type RoutingMode, type TickmarkrConfig,
 } from "../config/config.js";
 import { HC_SCOPE_ENV, HC_SCOPE_WARNING, hcScopePresent, SEAT_MARKER_ENV } from "../drivers/host-env.js";
+import { stripArtificialAnalysisKeyFromDaemon } from "../drivers/agent-env.js";
 import { DeliveryReadinessError } from "../drivers/herdr.js";
 import { HcReadUnavailableError } from "../drivers/hc-client.js";
 import { driverEvidence, type DriverChoice } from "../drivers/index.js";
@@ -46,6 +47,7 @@ import { MASK } from "./redact.js";
 import { runInteractiveSeed, type InteractiveSeedResult } from "./interactive-seed.js";
 import { answerTrustDialog, type TrustAnswer } from "./trust-dialog.js";
 import { classifyRepairDisposition, namedPaths, resolveScopeHints } from "./repair-disposition.js";
+import { poolExcludedPark, poolExclusionPark } from "./pool-exclusion.js";
 import { applyScopeAmendments, activeRetryBan, interruptedAttempt, RESUME_HARVEST_SOURCE, resumeHarvestAuthor, approvalAction, APPROVAL_REFUSED, ATTEMPT_CAP_RELEASE, REVIEW_UPHELD_RELEASE, effectiveEvents, foldDecisions, physicalLine, staleApprovals, classifyTaskFailure, classifyWorkerResultCause, deferredReviewFindings, engagementComparable, formatPriorFindingEvidence, GATE_FINGERPRINT_CAP, GATE_SATISFIED_RELEASE, identicalGateFailures, isDeferredFinding, journaledFailureBrief, Journal, loadRoutingProfile, newRunId, normalizeGateFailure, outstandingConsultGuidance, readableExcerpt, receiptOrigin, outstandingReviewFindings, pendingApprovalActions, pendingRechecks, pendingRepairFindings, phaseForGate, priorJudgments, readPriorRunEvidence, recordedTaskFailureKind, reraisedReviewChains, RECHECK_RELEASE, renderStructuredReviewFinding, repairReachSinceApproval, repairsSinceApproval, reviewRoundsSinceApproval, runHasEnded, standingRulings, structuredFindings, upheldFeedbackByTask, type CurrentAttemptGateReplay, type JournalEvent, type ParkKind, type ResumeState, type RetryMode, type StructuredFinding } from "./journal.js";
 import { decisionCommands, type DecisionPark } from "./decision-verbs.js";
 import { foldOwedChecks, parseJournalText } from "./journal.js";
@@ -54,6 +56,7 @@ import { readOperatorState } from "./operator-state.js";
 import { newestPark } from "../cli/commands/approve.js";
 import { carriedAuthorVendors, gateReviewerFloor, isDiffCapPark, isGarbageReview, pickReviewer } from "../gates/review.js";
 import { acquireApprovalSerialization, acquireRunLock, isPidLive, releaseRunLock } from "./lock.js";
+import { NoTrailerStreak } from "./no-trailer-streak.js";
 import { checkIntegrationIdentity, ensureIntegration, integrationBranch, type IntegrationLeg, type IntegrationRefState, integrationRepairText, mergeTask, readIntegrationRef, reusedTipEvidence, type TipVerifyResult, verifyIntegrationTip } from "./merge.js";
 import { channelExclusion, climbChannel, inTaskPool, marginalCostRank, nextChannel, poolExhaustion, route, taskPool } from "../route/router.js";
 import { desiredPanes } from "./reconcile.js";
@@ -194,6 +197,8 @@ export interface RunOptions {
   // OBS-123: explicit recovery for tasks terminally failed during dispatch. Resume keeps every other
   // failure terminal and clears this task's replayed attempt seed so the new dispatch is fresh.
   retryFailed?: boolean;
+  // Queue row 397 (D-2187 add.23): channels the operator readmits at this resume (adapter:model).
+  readmit?: string[];
   concurrency?: number;
   /** Bounded wait at a drain caused solely by parked tasks. */
   approvalWindowMs?: number;
@@ -2749,6 +2754,7 @@ function newestCapturePriors(repoRoot: string, currentRunId: string): Record<str
 }
 
 export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promise<RunSummary> {
+  stripArtificialAnalysisKeyFromDaemon(); // queue row 407 (D-2187 add.35): first, before any child spawns
   // OBS-1045: a daemon launched from inside a leased command (a nested runner, an operator's test
   // shell) inherits its ancestor's lease token through the environment, and every gate it ran would
   // ride that lease instead of taking its own. Clear it at run-start so the first gate leases itself.
@@ -2799,6 +2805,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
   const hostChecks = new Set<Promise<unknown>>();
   const inflight = new Map<string, Promise<void>>();
   let retireFatalSlots: (() => Promise<void>) | undefined;
+  let noTrailer: NoTrailerStreak | undefined; // queue row 396: the fatal close and a deliberate stop flush its deferred windows
   let branch = "";
   let releaseApprovalSerialization: (() => void) | undefined;
   let baselineCapture: Promise<void> = Promise.resolve();
@@ -3053,6 +3060,13 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
   onTermination = (sig: NodeJS.Signals) => {
     termSignal = sig;
     deliberateTermination = true;
+    // Row 396 (D-2187): a deliberate stop counts every window still deferred before exit, as late as it
+    // can so a round merging during the reap is discharged first; it still writes no run-end.
+    const countDeferred = () => {
+      try { noTrailer?.flush(); } catch (error) {
+        console.error(`tickmarkr ${runId}: deferred no-trailer windows could not be journalled (${error instanceof Error ? error.message : String(error)})`);
+      }
+    };
     void (async () => {
       if (!reaping) {
         reaping = true;
@@ -3081,8 +3095,9 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           }
           try { await driver.reconcile?.(new Set(), runId, { endedRunIds }); } catch { /* cosmetic — visibility is never a gate */ }
         }
+        countDeferred();
         releaseRunLock(repoRoot); // the process dies at exit() below — the finally never runs on this path
-      }
+      } else countDeferred(); // a second signal exits before the first reaper finishes
       exit(sig === "SIGINT" ? 130 : 143);
     })();
   };
@@ -3519,7 +3534,9 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
   // carries what run-gates measured for the task worktree the gate ran in (meta.verification), and
   // the replay guard below compares against a fresh measurement for the recreated worktree.
   const sessionVerification = verificationProtocol(process.env, repoRoot);
-  const replayedExclusions = opts.resume ? journal.replayExcludedChannels() : new Set<string>();
+  // Queue row 397 (D-2187 add.23): replayed in the resume block below, after every refusal, so a refused
+  // resume journals no channel-readmit row.
+  let replayedExclusions = new Set<string>();
   // Stamp each daemon session, including resumes with changed configuration or CLI overrides.
   // Keep the loaded-config hash's existing meaning; resolved execution inputs are explicit beside it.
   // Journal.append applies the normal credential redaction to the readable policy snapshot.
@@ -3586,6 +3603,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       }
       recapture = true;
     }
+    replayedExclusions = journal.replayExcludedChannels(opts.readmit);
     const replayEvents = journal.read();
     // journal.replayStatuses predates typed releases and re-pends even inert rows. Keep that
     // legacy reader intact; scheduling accepts only the fold's recognised authorities.
@@ -3611,6 +3629,11 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         // worker with the uphold's findings silently gone.
         const prior = resume.get(id);
         resume.set(id, { attempts: 0, tried: [], ...(prior?.upheldFeedback ? { upheldFeedback: prior.upheldFeedback } : {}) });
+        continue;
+      }
+      // Queue row 397 (D-2187 add.23): every resume re-queues a pool-excluded park; a pool still emptied parks again.
+      if (st === "human" && poolExcludedPark(replayEvents, id)) {
+        graph = setStatus(graph, id, "pending");
         continue;
       }
       // operator release: a graph.json edit back to "pending" beats a replayed human/failed park (locked decision 12)
@@ -3778,7 +3801,13 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
   // OBS-57: per-run in-run demotion — channels that burn consecutive no-trailer windows route around for later attempts.
   // v1.71 OBS-119: on resume, re-seed from the journal fold (replayedExclusions) before any dispatch.
   const demotedChannels = new Set(replayedExclusions);
-  const noTrailerStreak = new Map<string, number>();
+  const noTrailerStreak = noTrailer = new NoTrailerStreak((taskId, ck, streak) => {
+    // OBS-57: two consecutive no-trailer windows in one run demote the channel for later attempts.
+    if (streak >= NO_TRAILER_DEMOTION_STREAK && !demotedChannels.has(ck)) {
+      demotedChannels.add(ck);
+      journal.append("channel-demotion", taskId, { channel: ck, streak });
+    }
+  });
 
   // OBS-17 T2: reconcile at every safe point — run start/resume (just journaled above), each task
   // terminal event, and run-end. The desired set is the pure journal fold (reconcile.ts); the driver
@@ -3862,6 +3891,9 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       executionSignal()?.throwIfAborted();
       journal.phaseStart(t.id, "merge");
       const setDone = () => {
+        // Row 396 (D-2187): the all-green work is published, so its harvested window is discharged here,
+        // before any fallible projection or telemetry can strand it deferred for the run-end flush.
+        noTrailerStreak.roundEnded(t.id, "merged");
         graph = setStatus(graph, t.id, "done");
         saveGraph(repoRoot, graph);
         journal.append("task-done", t.id, done);
@@ -3968,7 +4000,13 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       journal.telemetry({ taskId: t.id, shape: t.shape, adapter: assignment.adapter, model: assignment.model, channel: assignment.channel, attempts, outcome: "human", durationMs: Date.now() - startMs, parkKind: kind, gateFails, consults, tokens, meteredAttempts: tokens && metered ? metered : undefined, retryMode });
     }
     await reconcile({ spareLiveLlm: true }); // task-human is a terminal event — sweep, sparing sibling tasks' live LLM panes
+    // Queue row 363 (D-2187 add.3): a park of an engagement (the rows after its newest task-approved) that
+    // recycled its seat for want of another channel names that reroute, so the ruling seat can widen the pool.
+    const own = effectiveEvents(parkEvents).filter((e) => e.taskId === t.id);
+    const unavailable = own.slice(own.map((e) => e.event).lastIndexOf("task-approved") + 1)
+      .filter((e) => e.event === "reroute-unavailable").at(-1);
     const notice = [`tickmarkr ${runId}: ${t.id} needs a human — ${noticeReason}`,
+      ...(unavailable ? [`Reroute unavailable at journal line ${physicalLine([unavailable], 0)}: the consult reroute found no other eligible channel in ${String(unavailable.data.pool)}, so ${String(unavailable.data.channel)} was re-dispatched.`] : []),
       ...commands.map(({ verb, command }) => `${verb}: ${command}`),
     ].join("\n");
     driver.postSync?.({ kind: "park", text: notice });
@@ -4375,7 +4413,16 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       return { state, ref };
     };
 
-    const r = route(t, cfg, channels, profile, undefined, demotedChannels);
+    let r: ReturnType<typeof route>;
+    try {
+      r = route(t, cfg, channels, profile, undefined, demotedChannels);
+    } catch (err) {
+      // Queue row 397 (D-2187 add.23): a refusal only the in-run exclusion set caused parks, recoverably.
+      const pooled = poolExclusionPark(err, runId, t, cfg, channels, profile, demotedChannels, journal.readSourced());
+      if (!pooled) throw err;
+      await park(t, pooled.reason, "infra", null, 0, startMs, 0, 0, undefined, 0, "fresh", pooled.details);
+      return;
+    }
     for (const lint of r.lints) journal.append("routing-lint", t.id, { lint });
     // VIS-02: journal a deviation from the static choice ONLY when one occurred (greppable absence = no deviation)
     if (r.deviation) journal.append("route-deviation", t.id, { ...r.deviation, provenance: r.provenance });
@@ -5151,13 +5198,24 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     // OBS-1187: shared with the demotion seam's pooled recycle so neither relaunches an escalated adapter.
     const recycleExcluded = (): string[] =>
       [channelKey(assignment), ...channels.filter((c) => escalatedAdapters.has(c.adapter)).map(channelKey)];
-    const failoverOrRecycle = (site: "consult-reroute" | "dead-channel"): Assignment | null => {
+    const failoverOrRecycle = (site: "consult-reroute" | "dead-channel", reroute?: { attempt: number; excludeAdapter?: string }): Assignment | null => {
       const next = failover(site);
       if (next) return next;
       // OBS-1169: a vendor escalated away from stays out of the recycle pool until its release —
       // recycling any of its channels, launched or not, would launch the broken bootstrap again.
-      const recycled = nextChannel(assignment, t, cfg, channels, recycleExcluded(), profile, demotedChannels)
-        ?? (demotedChannels.has(channelKey(assignment)) ? null : assignment);
+      const other = nextChannel(assignment, t, cfg, channels, recycleExcluded(), profile, demotedChannels);
+      const recycled = other ?? (demotedChannels.has(channelKey(assignment)) ? null : assignment);
+      // Queue row 363 (D-2187 add.3, ruling A): a consult reroute that falls back to the current assignment
+      // is said, never a silent same-seat recycle; the same-channel re-dispatch is kept.
+      if (reroute && recycled && !other) {
+        const pool = taskPool(t, cfg);
+        journal.append("reroute-unavailable", t.id, {
+          pool: pool ? `routing.map.${t.shape}.pool (${pool.mode}: ${pool.channels.join(", ")})`
+            : `the discovered worker fleet (${channels.map(channelKey).join(", ")})`,
+          channel: channelKey(recycled), attempt: reroute.attempt,
+          ...(reroute.excludeAdapter ? { excludeAdapter: reroute.excludeAdapter } : {}),
+        });
+      }
       if (recycled) journal.append("channel-recycle", t.id, { site, channel: channelKey(recycled) });
       return recycled;
     };
@@ -5215,7 +5273,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         // (zero matches) is a no-op expansion ⇒ ordinary channel-level reroute. Task-scoped:
         // `tried` lives inside execTask, so a sibling task is unaffected.
         if (v.excludeAdapter) escalateAdapter(v.excludeAdapter, `vendor escalated: consult excluded ${v.excludeAdapter}`);
-        const next = failoverOrRecycle("consult-reroute");
+        const next = failoverOrRecycle("consult-reroute", { attempt: attempts, excludeAdapter: v.excludeAdapter });
         if (next) {
           assignment = next;
           const k = channelKey(next);
@@ -7784,17 +7842,12 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       const pinRefusesQuota = !!quotaMatch && onPin && !channelError;
       // a refused quota window is not a no-trailer verdict on the pinned channel: counting it would
       // demote the pin two tails in and the demotion re-dispatch would move the task off it.
-      if (preHarvestResult.ok && workerFinished) noTrailerStreak.set(channelKey(assignment), 0);
-      else if (!workerFinished && cause !== "provider-death" && !pinRefusesQuota && !capacityMatch) {
-        const ck = channelKey(assignment);
-        const streak = (noTrailerStreak.get(ck) ?? 0) + 1;
-        noTrailerStreak.set(ck, streak);
-        // OBS-57: two consecutive no-trailer windows in one run demote the channel for later attempts.
-        if (streak >= NO_TRAILER_DEMOTION_STREAK && !demotedChannels.has(ck)) {
-          demotedChannels.add(ck);
-          journal.append("channel-demotion", t.id, { channel: ck, streak });
-        }
-      }
+      // Queue row 396 (D-2187 add.25): a harvested window's decision waits for its gate round.
+      noTrailerStreak.window(t.id, channelKey(assignment), {
+        certifies: preHarvestResult.ok && workerFinished,
+        counts: !workerFinished && cause !== "provider-death" && !pinRefusesQuota && !capacityMatch,
+        harvested: harvestedCommits.length > 0,
+      });
 
       // v1.46 T1: provider-outage requeue — same assignment, no attempt burn, no consult, capped.
       if (cause === "provider-death" && providerDeathRequeues < PROVIDER_DEATH_REQUEUE_CAP) {
@@ -8161,6 +8214,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
             executionSignal()?.throwIfAborted();
           },
         });
+        noTrailerStreak.roundEnded(t.id, settled.kind); // row 396: only an all-green merged round drops the window
         if (settled.kind === "regate") continue gateLoop;
         if (settled.kind === "parked") return;
         if (settled.kind === "conflict") {
@@ -8396,9 +8450,9 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     for (const decision of decideSplitRelease(split, work)) {
       if (decision.event === "task-approved") journal.append("task-approved", decision.taskId, decision.data);
       else journal.append("graph-change-park-kept", decision.taskId, decision.data);
-      // D-2186 add.7: an exempt park stays parked although the recompile wrote it pending, so this resume schedules it
-      // nowhere — no gate replay, battery, worker, re-park or merge before its approve (add.11: a human-gate park whose
-      // loaded definition drops humanGate is not exempt; the decider returns nothing for it and it dispatches as at base).
+      // D-2186 add.7; row 389 (add.18, D-2187): every kept park stays parked although the recompile wrote it pending, so
+      // this resume schedules it nowhere — no gate replay, battery, worker, re-park or merge before its approve (add.11: a
+      // human-gate park whose loaded definition drops humanGate is not kept; it dispatches as at base).
       if (decision.event !== "task-approved" && decision.hold) {
         graph = setStatus(graph, decision.taskId, "human");
         saveGraph(repoRoot, graph);
@@ -8670,6 +8724,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         for (const { id, verdict } of tipClose.deferred) store.set(id, verdict);
       }
     }
+    noTrailerStreak.flush(); // row 396: a window still deferred at run-end counts
     journal.append("run-end", undefined, { ...summary });
     postRunEnd();
     await reconcile(); // run-end boundary: nothing in flight — full sweep (empty desired set)
@@ -8706,6 +8761,8 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       await Promise.allSettled(inflight.values());
       await baselineCapture.catch(() => {});
       if (runStarted && !deliberateTermination) {
+        // Row 396: the run ended first, so a deferred window counts; a dead sink never replaces the crash record.
+        try { noTrailer?.flush(); } catch { /* recordFatalRunEnd reports the sink */ }
         const tipProof = recordFatalRunEnd(journal, runId, branch, err,
           taskLoopStarted || opts.resume ? failedGraph : undefined, phase);
         // The fatal close states its proof too; a dead notifier never replaces the original error.

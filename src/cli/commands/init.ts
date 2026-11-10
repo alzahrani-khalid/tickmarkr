@@ -22,6 +22,7 @@ import { doctor, hostRows, packageManagerFinding } from "./doctor.js";
 import { readinessCard } from "./init-card.js";
 import { assembleFleetEditor } from "./fleet.js";
 import { SHIPPED_DIGESTS, SHIPPED_SNAPSHOTS } from "../shipped-skill-files.js";
+import { askArtificialAnalysisKey, type AskKeyOptions } from "../ask-keys.js";
 
 const SCAFFOLD_SPEC = "tickmarkr.spec.md";
 
@@ -740,7 +741,7 @@ const cardVerdict = (row: string) =>
   row.startsWith("ready:") ? "pass" : row.startsWith("not ready:") ? "fail" : row.startsWith("action:") ? "warn" : "neutral";
 
 /** Test seam mirroring FleetIO: production callers get the process streams and environment. */
-export type InitIO = { input?: NodeJS.ReadStream; output?: NodeJS.WriteStream; env?: NodeJS.ProcessEnv };
+export type InitIO = { input?: NodeJS.ReadStream; output?: NodeJS.WriteStream; env?: NodeJS.ProcessEnv; askKey?: AskKeyOptions };
 
 export async function init(argv: string[], cwd = process.cwd(), io: InitIO = {}): Promise<string> {
   const env = io.env ?? process.env;
@@ -754,6 +755,9 @@ export async function init(argv: string[], cwd = process.cwd(), io: InitIO = {})
   // banner at START on the visual surface — every init path, not just the wizard, and never trailing the probe (operator report 2026-07-17)
   emitBanner();
 
+  // Queue row 367 Phase 2 (D-2187 add.18): init has no --json, but a JSON caller is never interactive: it gets the
+  // missing-key hint, never a prompt, before the parse refuses the flag.
+  if (argv.includes("--json")) await askArtificialAnalysisKey(argv, { input: io.input, output: io.output, env, cwd, ...io.askKey });
   const { values } = parseArgs({
     args: argv,
     options: {
@@ -895,6 +899,8 @@ export async function init(argv: string[], cwd = process.cwd(), io: InitIO = {})
   // probe reads the config the operator just chose. Reuse keeps init fast; --fresh forces the probe.
   // Interactive journeys get the COMPACT surface (status rows + pointer) — the full matrix between
   // two TUIs was the operator's clutter report; non-TTY keeps the complete machine surface.
+  // Queue row 367 Phase 2 (D-2187 add.18): this entry point asks once for a missing key; the doctor call below reuses the answer.
+  const askedKey = await askArtificialAnalysisKey(argv, { input, output, env, cwd, ...io.askKey });
   const fresh = values.fresh ?? false;
   const adapters = allAdapters();
   const cfg = loadConfig(cwd, { globalDir: gdir });
@@ -909,7 +915,7 @@ export async function init(argv: string[], cwd = process.cwd(), io: InitIO = {})
     ? interactive
       ? `using probe results from ${formatDoctorAgeForInit(ageMs)} ago — full matrix: tickmarkr doctor · refresh: init --fresh`
       : `using probe results from ${formatDoctorAgeForInit(ageMs)} ago — run tickmarkr doctor to refresh (or init --fresh)`
-    : await doctor([], cwd, adapters, { banner: false, compact: interactive, globalDir: gdir });
+    : await doctor([], cwd, adapters, { banner: false, compact: interactive, globalDir: gdir, askKey: io.askKey, askedKey });
   // Non-interactive surfaces end with the readiness card: doctor's returned report is discarded
   // (its stderr disclosure already ran) and the card reads the health doctor recorded.
   const card = interactive ? [] : initCardRows(cwd, cfg, adapters, (reused ? health : readDoctor(cwd)) ?? {});

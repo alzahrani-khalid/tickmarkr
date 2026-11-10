@@ -101,6 +101,8 @@ test("test: a subprocess worker child, a herdr worker seed and an Orca worker te
   const rec = recorder();
   const control: Record<string, string> = {
     HERDR_ENV: "1", HERDR_SOCKET_PATH: "/tmp/herdr.sock", ORCA_TERMINAL_HANDLE: "term-x", ORCA_PANE_KEY: "pane-x", ORCA_TAB_ID: "tab-x",
+    // Queue row 390 (D-2187 add.9): a Rex terminal's addressing names, named explicitly.
+    REX_BIN_DIR: "/tmp/rex-bin", REX_BLOCK: "block-x", REX_SERVER: "/tmp/rex.sock", REX_SESSION: "session-x",
   };
   await withParent({ ...control, HERDR_WORKSPACE_ID: "wHOST", HOME: rec.dir, [SEAT_MARKER_ENV]: "review" }, async () => {
     // Subprocess driver: the worker child itself.
@@ -150,10 +152,11 @@ esac
       expectSealed(byName[name]!);
       expect(byName[name]![SEAT_MARKER_ENV], name).toBeUndefined();
     }
-    for (const k of HERDR_CONTROL_VARS) {
+    for (const k of new Set([...HERDR_CONTROL_VARS, ...Object.keys(control)])) {
       expect(byName.subprocess![k], k).toBeUndefined();
       expect(byName.herdr![k], k).toBeUndefined();
-      expect(seed).toContain(`unset ${k}`);
+      expect(seed.split(/[\s;]+/), k).toContain(k);
+      expect(process.env[k], k).toBe(control[k]);
     }
     expect(byName.orca![FORK_CAP_ENV]).toBeDefined();
     expect(process.env[SEAT_MARKER_ENV]).toBe("review");

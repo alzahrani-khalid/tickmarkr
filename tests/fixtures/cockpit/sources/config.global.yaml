@@ -41,6 +41,10 @@
 #   carries ARTIFICIAL_ANALYSIS_API_KEY (free key: artificialanalysis.ai) — unset, AA contributes
 #   nothing and suggestions fall back to LiveBench's agentic-coding rank, then price. Not a config
 #   key: an API credential belongs in the environment, never in a tracked overlay.
+#   Key recipe: export ARTIFICIAL_ANALYSIS_API_KEY, or save it once in the macOS Keychain (read when
+#   the variable is unset) with
+#   security add-generic-password -a "$USER" -s ARTIFICIAL_ANALYSIS_API_KEY -w   (the trailing -w
+#   prompts, so the value stays out of argv). With neither, an interactive doctor or init asks once.
 # visibility:
 #   llm: headless         # headless (default): judge/review/consult run silently | pane: visible agents
 #   keepPanes: run        # run (default): ephemeral judge/review/consult panes close when read; a merged task's worker pane closes on done; other worker panes persist until run end | attempt | forever (keep everything for debugging)

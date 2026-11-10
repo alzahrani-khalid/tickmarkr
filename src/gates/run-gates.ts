@@ -4,7 +4,7 @@ import { existsSync, lstatSync, mkdtempSync, readFileSync, readlinkSync, rmSync,
 import { loadavg, tmpdir } from "node:os";
 import { join, posix } from "node:path";
 import { type Assignment, type AuthHealth, type BillingChannel, channelKey, configuredEffort, shq, type WorkerAdapter, type WorkerResult } from "../adapters/types.js";
-import { type TickmarkrConfig, TIER_RANK } from "../config/config.js";
+import { type TickmarkrConfig } from "../config/config.js";
 import { getAdapter } from "../adapters/registry.js";
 import { type Effort, GATE_NAMES, type GateName, type Task } from "../graph/schema.js";
 import { acceptanceGate, type JudgedCriterion } from "./acceptance.js";
@@ -13,8 +13,7 @@ import { evidenceGate } from "./evidence.js";
 import { captureLlmOutput, type GateVia, SeatLaunchError } from "./llm.js";
 import { withLaunchGuard } from "../drivers/orca.js";
 import type { Slot } from "../drivers/types.js";
-import { disallowedBy, observedSeat } from "../route/preference.js";
-import { marginalCostRank } from "../route/router.js";
+import { isIndependentJudge, type JudgeStage, resolveSeats } from "../route/seat-resolver.js";
 import { carriedAuthorVendors, gateReviewerFloor, pickReviewer, type PriorReviewer, reviewGate } from "./review.js";
 import { scopeGate } from "./scope.js";
 import { discoverTestManifest, evaluateManifestedTest, isVitestTestCommand, manifestChildEnv } from "./test-manifest.js";
@@ -37,14 +36,8 @@ import {
   type VerificationScope,
 } from "./cache.js";
 
-export function isIndependentJudge(
-  seat: BillingChannel,
-  authorVendors: ReadonlySet<string>,
-  authors: readonly string[],
-): boolean {
-  return !!seat.vendor && seat.vendor !== "unknown"
-    && !authorVendors.has(seat.vendor) && !authors.includes(channelKey(seat));
-}
+// Row 367 R1 (D-2187): judge independence lives beside the judge ranking in the seat resolver.
+export { isIndependentJudge };
 
 // v2.0 T2 (OBS-554): the host one-minute load average — the decision variable the parked load-aware
 // scheduler would key on. Injectable so a test can state the load a gate ran under; production always
@@ -1363,12 +1356,16 @@ export async function runGates(
 
   // acceptance judge — LLM spend, so everything deterministic has already passed when this runs
   const runAcceptance = async (): Promise<{ result: GateResult; invocations: JudgeInvocationEvidence[] }> => {
-    // v1.87 T2: the judge is a configured seat like any other — check it against the operator's
-    // policy BEFORE spending a dispatch on it. disallowedBy carries the whole deny grammar (adapter,
-    // model, or adapter:model), so a model-scoped deny cannot slip past an adapter-id-only read.
-    // OBS-1186: under the exact cached identity of that channel, as compile, doctor and route read it.
-    const judgeSeat = observedSeat(ctx.health, ctx.cfg.judge.adapter, ctx.cfg.judge.model);
-    const judgeDenied = disallowedBy(judgeSeat, ctx.cfg.routing, "judge");
+    // Row 367 R1 (D-2187): every judge seat — primary, GATE-09 failover and adjudicator — is drawn by the
+    // one seat resolver: the configured judge, then an independent automatic pick, then the same-vendor
+    // fallback (annotated not independent below). v1.87 T2 / OBS-1186: the configured judge is checked
+    // against the operator's policy under its cached identity BEFORE any dispatch; a disallowed one is
+    // refused with no pick.
+    // Queue row 34(a) (D-2134 R5): resolve every lifetime author through both role pools.
+    const authors = ctx.carriedAuthors?.length ? ctx.carriedAuthors : [channelKey(ctx.author)];
+    const judgeSeats = (stage: JudgeStage) =>
+      resolveSeats({ role: "judge", cfg: ctx.cfg, pool: ctx.judgeChannels ?? [], authorPool: ctx.channels, health: ctx.health, authors, stage });
+    const { pick: primary, disallowed: judgeDenied } = judgeSeats({ kind: "primary" });
     if (judgeDenied) {
       return {
         result: {
@@ -1380,22 +1377,9 @@ export async function runGates(
         invocations: [],
       };
     }
-    // Queue row 34(a) (D-2134 R5): resolve every lifetime author through both role pools.
     const channels = [...(ctx.judgeChannels ?? []), ...ctx.channels];
-    const authors = ctx.carriedAuthors?.length ? ctx.carriedAuthors : [channelKey(ctx.author)];
     const authorVendors = carriedAuthorVendors(channels, authors);
     const independent = (seat: BillingChannel) => isIndependentJudge(seat, authorVendors, authors);
-    const judgePool = () => (ctx.judgeChannels ?? []).filter((c) => c.vendor !== "unknown"
-      && disallowedBy(c, ctx.cfg.routing, "judge") === null);
-    const rankJudges = (pool: BillingChannel[]) => [...pool]
-      .sort((x, y) => TIER_RANK[y.tier] - TIER_RANK[x.tier] || marginalCostRank(x) - marginalCostRank(y));
-    const pickJudge = (pool: BillingChannel[], adapter: string) =>
-      rankJudges(pool.filter((c) => c.adapter !== adapter))[0] ?? rankJudges(pool)[0];
-    const configured = channels.find((c) => channelKey(c) === channelKey(ctx.cfg.judge));
-    const primary = authors.includes(channelKey(ctx.cfg.judge)) || (configured && !independent(configured))
-      ? pickJudge(judgePool().filter(independent), ctx.cfg.judge.adapter)
-        ?? (configured?.vendor === "unknown" ? pickJudge(judgePool(), ctx.cfg.judge.adapter) : ctx.cfg.judge)
-      : ctx.cfg.judge;
     if (!primary) {
       return {
         result: {
@@ -1487,10 +1471,8 @@ export async function runGates(
         meta: { classification: "infra", infra: true, retryable: false, cause: "judge-disagreement", judge: primary, ...independence(),
           judgeDisagreement: { primary, ...(adjudicator ? { adjudicator } : {}), disputed, outcome: why } },
       });
-      const primaryAdapter = primary.slice(0, primary.indexOf(":"));
       // One DISTINCT seat: never the primary channel, a different adapter when the pool has one.
-      const pool = judgePool().filter((c) => channelKey(c) !== primary);
-      const seat = pickJudge(pool.filter(independent), primaryAdapter) ?? pickJudge(pool, primaryAdapter);
+      const seat = judgeSeats({ kind: "adjudicate", avoid: primary }).pick;
       if (!seat) return park("no distinct eligible judge is available");
       const adjudicator = channelKey(seat);
       const seatAdapter = getAdapter(seat.adapter, ctx.adapters);
@@ -1534,11 +1516,9 @@ export async function runGates(
     // degradation path).
     if (!cancelled && a.meta?.unparseable === true && typeof a.meta.judge === "string") {
       const flakedKey = a.meta.judge;
-      const flakedAdapter = flakedKey.slice(0, flakedKey.indexOf(":"));
-      // Queue row 34(a) (D-2134 R5): keep GATE-09's exclusions and fallback when independence is unavailable.
-      const pool = judgePool().filter((c) => channelKey(c) !== flakedKey);
-      const retry = pickJudge(pool.filter(independent), flakedAdapter)
-        ?? pickJudge(pool, flakedAdapter) ?? (configured?.vendor === "unknown" ? primary : judgeSeat);
+      // Queue row 34(a) (D-2134 R5): keep GATE-09's exclusions and fallback when independence is unavailable;
+      // the failover always ends on a seat (the primary or the configured judge), so it is never null.
+      const retry = judgeSeats({ kind: "failover", avoid: flakedKey }).pick!;
       const retryAdapter = getAdapter(retry.adapter, ctx.adapters);
       const retryJvia = via
         // unconditional -r1 suffix: under keepPanes:forever a same-channel retry cannot collide with the

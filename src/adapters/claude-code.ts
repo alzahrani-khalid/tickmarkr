@@ -9,28 +9,51 @@ import { parseWorkerResult } from "./prompt.js";
 import { decodeClaudeStream } from "./claude-stream.js";
 import { type Assignment, type AuthHealth, type BillingChannel, channelsFromConfig, type ContextUsage, declareInputBox, type Invocation, MODEL_ID_RE, promptFitsArgv, type SessionRef, shq, type TokenUsage, TokenUsageSchema, type TrustDialog, type WorkerAdapter } from "./types.js";
 
-/** User-scope base URL only; explicit inputs let tests avoid the operator's settings. */
-export function claudeGatewayHost(
+/** Under VITEST, the process environment with no injected settings path names no gateway, so no suite
+ *  reaches a real one. The one guard claudeBaseUrl and the cliproxy override share (queue row 392 R6). */
+export function vitestProcessInputs(env: NodeJS.ProcessEnv = process.env, settingsPath?: string): boolean {
+  return Boolean(process.env.VITEST) && env === process.env && settingsPath === undefined;
+}
+
+/** The Claude CLI's base URL and the place it came from: ANTHROPIC_BASE_URL in the environment, else
+ *  env.ANTHROPIC_BASE_URL in the user-scope settings file. `vars` is that place, so a caller reads the
+ *  credential from where the URL came from. The ONE read claudeGatewayHost and the gateway listing
+ *  (cliproxy.ts) share — queue row 392 R6, D-2187 add.11. Explicit inputs let tests avoid the
+ *  operator's settings. */
+export function claudeBaseUrl(
   env: NodeJS.ProcessEnv = process.env,
   settingsPath?: string,
-): string | undefined {
-  if (process.env.VITEST && env === process.env && settingsPath === undefined) return undefined;
-  let baseUrl: unknown = env.ANTHROPIC_BASE_URL;
-  if (!baseUrl) {
-    try {
-      const path = settingsPath ?? join(env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude"), "settings.json");
-      baseUrl = JSON.parse(readFileSync(path, "utf8"))?.env?.ANTHROPIC_BASE_URL;
-    } catch {
-      return undefined;
-    }
+): { baseUrl: string; source: "env" | "claude-settings"; vars: Readonly<Record<string, unknown>> } | undefined {
+  if (vitestProcessInputs(env, settingsPath)) return undefined;
+  if (env.ANTHROPIC_BASE_URL) return { baseUrl: env.ANTHROPIC_BASE_URL, source: "env", vars: env };
+  let vars: unknown;
+  try {
+    const path = settingsPath ?? join(env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude"), "settings.json");
+    vars = JSON.parse(readFileSync(path, "utf8"))?.env;
+  } catch {
+    return undefined;
   }
-  if (typeof baseUrl !== "string") return undefined;
+  const baseUrl = (vars as { ANTHROPIC_BASE_URL?: unknown } | null | undefined)?.ANTHROPIC_BASE_URL;
+  return typeof baseUrl === "string" ? { baseUrl, source: "claude-settings", vars: vars as Record<string, unknown> } : undefined;
+}
+
+/** A base URL's host when it names a gateway: api.anthropic.com and an unparseable URL name none. */
+export function gatewayHostOf(baseUrl: string): string | undefined {
   try {
     const host = new URL(baseUrl).hostname;
     return host && host !== "api.anthropic.com" ? host : undefined;
   } catch {
     return undefined;
   }
+}
+
+/** User-scope base URL only; explicit inputs let tests avoid the operator's settings. */
+export function claudeGatewayHost(
+  env: NodeJS.ProcessEnv = process.env,
+  settingsPath?: string,
+): string | undefined {
+  const claude = claudeBaseUrl(env, settingsPath);
+  return claude && gatewayHostOf(claude.baseUrl);
 }
 
 // SPEND-01/SPEND-11: claude writes a per-session JSONL to ~/.claude/projects/<slug>/ where slug is the
@@ -177,12 +200,20 @@ function newestSessionFiles(dir: string): string[] {
     .map((x) => x.f);
 }
 
-const belongsToAliasFamily = (identity: string, alias: ClaudeAlias): boolean =>
+export const belongsToAliasFamily = (identity: string, alias: string): boolean =>
   identity === alias || identity.split(/[^A-Za-z0-9]+/).includes(alias);
 
 // Zero-token first choice: Claude assistant records state the resolved message.model. The newest
 // matching family record in this cwd wins. Every failure is advisory/unknown, never an exception.
-export function readClaudeAliasIdentity(cwd: string, alias: ClaudeAlias): string | undefined {
+// Queue row 392 R6 law 3 (D-2187 add.11): behind a confirmed proxy the caller passes `classified` (the
+// gateway family table). A proxy may serve a model from another family, which the family match alone can
+// never attribute, so a record is attributed by the model the CLI requested ONLY: it is ours when its
+// requestedModel names this model and its identity is classified or in this family. A record naming another
+// model, or none, is never evidence (an unattributed gemini-3-pro may be fable's), so it can neither answer
+// nor supersede an attributed one; with no attributed record the caller asks the stated-identity turn.
+// The CLI records the id it sent, so an alias it resolves client-side matches no record and gets the turn.
+// Without `classified` the read is exactly as at the base.
+export function readClaudeAliasIdentity(cwd: string, alias: string, classified?: (identity: string) => boolean): string | undefined {
   try {
     const real = realpathSync(cwd);
     const dir = join(homedir(), ".claude", "projects", claudeSlug(real));
@@ -202,11 +233,14 @@ export function readClaudeAliasIdentity(cwd: string, alias: ClaudeAlias): string
         } catch {
           continue;
         }
-        const rec = raw as { cwd?: unknown; timestamp?: unknown; message?: { model?: unknown } };
+        const rec = raw as { cwd?: unknown; timestamp?: unknown; requestedModel?: unknown; message?: { model?: unknown } };
         if (rec.cwd !== real || typeof rec.message?.model !== "string") continue;
         const identity = rec.message.model;
         const timestamp = Date.parse(String(rec.timestamp));
-        if (!MODEL_ID_RE.test(identity) || !belongsToAliasFamily(identity, alias) || !Number.isFinite(timestamp)) continue;
+        const ours = classified
+          ? rec.requestedModel === alias && (classified(identity) || belongsToAliasFamily(identity, alias))
+          : belongsToAliasFamily(identity, alias);
+        if (!MODEL_ID_RE.test(identity) || !ours || !Number.isFinite(timestamp)) continue;
         if (!newest || timestamp > newest.timestamp) newest = { identity, timestamp };
       }
     }
@@ -216,27 +250,33 @@ export function readClaudeAliasIdentity(cwd: string, alias: ClaudeAlias): string
   }
 }
 
-// Store silence earns one minimal stated-identity turn. The output contract is intentionally strict:
-// one safe model id from the requested alias family, otherwise unknown/fail-open. Vitest never spawns
-// a real agent CLI; tests inject the probe callback at resolveClaudeAliasIdentity instead.
-export function probeClaudeAliasIdentity(cwd: string, alias: ClaudeAlias): string | undefined {
+// The stated-identity turn's trimmed reply, unfiltered, or undefined on any failure. Vitest never spawns
+// a real agent CLI; tests inject the turn instead. Shared with the confirmed-proxy resolver (cliproxy.ts).
+export function statedClaudeIdentity(cwd: string, model: string): string | undefined {
   if (process.env.VITEST) return undefined;
   try {
     const r = spawnSync("claude", [
       "-p",
       "State the exact model identifier serving this request. Reply with only that identifier.",
-      "--model", alias,
+      "--model", model,
       "--permission-mode", "bypassPermissions",
       "--strict-mcp-config",
       "--mcp-config", '{"mcpServers":{}}',
       "--output-format", "text",
     ], { cwd, encoding: "utf8", timeout: 60000, stdio: ["ignore", "pipe", "pipe"], env: withoutHostSession() });
     if (r.error || r.status !== 0) return undefined;
-    const identity = (r.stdout || "").trim();
-    return MODEL_ID_RE.test(identity) && belongsToAliasFamily(identity, alias) ? identity : undefined;
+    return (r.stdout || "").trim();
   } catch {
     return undefined;
   }
+}
+
+// Store silence earns one minimal stated-identity turn. The output contract is intentionally strict:
+// one safe model id from the requested alias family, otherwise unknown/fail-open. Vitest never spawns
+// a real agent CLI; tests inject the probe callback at resolveClaudeAliasIdentity instead.
+export function probeClaudeAliasIdentity(cwd: string, alias: ClaudeAlias): string | undefined {
+  const identity = statedClaudeIdentity(cwd, alias);
+  return identity !== undefined && MODEL_ID_RE.test(identity) && belongsToAliasFamily(identity, alias) ? identity : undefined;
 }
 
 export function resolveClaudeAliasIdentity(

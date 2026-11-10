@@ -114,7 +114,8 @@ test("test: closed table — probe replies naming an unknown model id (grok's in
     expect(classifyProbeReply(1, output, "").cause, output).toBe("unknown-model");
   }
   expect(classifyProbeReply(0, "OK", "")).toEqual({ authed: true });
-  expect(classifyProbeReply(1, "unknown model id", "", true)).toEqual({ authed: false, reason: "probe timed out after 60000ms" });
+  // Queue rows 353 and 367 R3 (D-2187 condition 2): the timer kill carries the typed timeout class.
+  expect(classifyProbeReply(1, "unknown model id", "", true)).toEqual({ authed: false, failure: "timeout", reason: "probe timed out after 60000ms" });
 });
 
 test("test: closed table — a succeeded listing that differs from the configured ids prints both drift counts with names, a failed or timed-out or missing listing prints listing unavailable with no drift line, a declarative surface's succeeded empty listing reports zero offered and a native adapter's empty array infers nothing, while agy no longer prints the seeds-stamped line, so drift inferred from a failed listing or silent drift fails", async () => {

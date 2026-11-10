@@ -39,6 +39,7 @@ import {
   restoresUpheldFeedback,
   visibleControls,
 } from "../../run/journal.js";
+import { poolExcludedPark } from "../../run/pool-exclusion.js";
 import { isPidLive, runLockRunId, runStatusLine } from "../../run/lock.js";
 import { normalizeGateOutcome, type GateOutcomeKind } from "../../run/outcome.js";
 import { desiredPanes } from "../../run/reconcile.js";
@@ -1182,6 +1183,26 @@ const judgeIndependenceNotes = (events: readonly JournalEvent[]): string[] => {
     .map(([id]) => `${sanitizeTaskText(id)} judge not independent`);
 };
 
+// Queue row 363 (D-2187 add.3): one note per task whose current engagement (the rows after its newest
+// task-approved) holds a reroute-unavailable row, until that task is done.
+const rerouteUnavailableNotes = (events: readonly JournalEvent[]): string[] => {
+  const engagements = new Map<string, JournalEvent[]>();
+  for (const event of effectiveEvents(events)) {
+    if (!event.taskId) continue;
+    const rows = event.event === "task-approved" ? [] : engagements.get(event.taskId) ?? [];
+    if (event.event !== "task-approved") rows.push(event);
+    engagements.set(event.taskId, rows);
+  }
+  return [...engagements].flatMap(([id, rows]) => {
+    const row = rows.filter((e) => e.event === "reroute-unavailable").at(-1);
+    if (!row || rows.some((e) => e.event === "task-done")) return [];
+    return [sanitizeTaskText(`${id} reroute unavailable — no other eligible channel in ${String(row.data.pool)}; ${String(row.data.channel)} re-dispatched (journal line ${physicalLine([row], 0)})`)];
+  });
+};
+
+/** Every note printed wherever the judge independence notes print (plain body, board, one-line summary). */
+const statusNotes = (events: readonly JournalEvent[]): string[] => [...judgeIndependenceNotes(events), ...rerouteUnavailableNotes(events)];
+
 const renderFrame = (
   cwd: string,
   // No default: the version is the binary's, resolved once by its caller, and a frame that had to
@@ -1197,7 +1218,7 @@ const renderFrame = (
   const record = readRunRecord(cwd, g, namedRunId);
   const runId = record?.runId;
   const events = record?.events ?? [];
-  const judgeNotes = judgeIndependenceNotes(events);
+  const judgeNotes = statusNotes(events);
   const runLine = runId && record ? runStatusLine(cwd, runId, events) : null;
   // The header and every live-phase consumer share this exact process reading. Proved death retires
   // stale phase markers; unknown identity deliberately does not, preserving pre-identity journals.
@@ -1332,7 +1353,9 @@ const renderFrame = (
     const terminal = st === "failed" || st === "human";
     // Unknown legacy task-failed events stay red. Typed availability noise is warn-tier only while
     // the run is live; verified quality parks and every unresolved task in an ended run are red.
-    const redTier = terminal && (
+    // Queue row 397 (D-2187 add.23): a pool-excluded park is recoverable by a readmit or a pool change
+    // and a resume, so it stays warn-tier even once the run has ended — never terminal red.
+    const redTier = terminal && !(comparable && st === "human" && poolExcludedPark(events, t.id)) && (
       ended
       || (failureKind !== undefined && isQualityFailureParkKind(failureKind))
       || (st === "failed" && failureKind === undefined)
@@ -1696,7 +1719,7 @@ const oneLine = (cwd: string, namedRunId?: string): string => {
   // A fatal run-end leads right after the run id: no completion fraction or verify state reads first.
   const crash = fatalRunEndCause(events);
   return sanitizeTaskText([
-    record.runId, ...(crash ? [`run crashed — ${crash}`] : []), ...claims, firstPassText(endToEndFirstPass(events)), wallText(events), needsYouText(events, currentOwed(events, cwd)), ...judgeIndependenceNotes(events),
+    record.runId, ...(crash ? [`run crashed — ${crash}`] : []), ...claims, firstPassText(endToEndFirstPass(events)), wallText(events), needsYouText(events, currentOwed(events, cwd)), ...statusNotes(events),
   ].join(" · "));
 };
 

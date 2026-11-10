@@ -3,11 +3,11 @@ import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { parseArgs } from "node:util";
-import { allAdapters, discoverChannels, doctorAgeMs, initDoctorReuse, modelAuthExclusions, PREFERENCE_ROLES, readDoctor } from "../../adapters/registry.js";
+import { allAdapters, discoverChannels, doctorAgeMs, formatDoctorAgeForInit, INIT_DOCTOR_REUSE_MS, initDoctorReuse, modelAuthExclusions, PREFERENCE_ROLES, readDoctor, rolePools } from "../../adapters/registry.js";
 import { catalogModelAdvisory, catalogTierRanking, declaredModelWindow, fleetUnclassifiedModels } from "../../adapters/model-lints.js";
 import { CATALOG_REFRESH_TIMEOUT_MS, formatCatalogRefreshLegs, type CatalogFetcher, type CatalogModelEvidence, type CatalogReadResult, readCachedCatalog, refreshCatalogCommand } from "../../adapters/catalog-remote.js";
 import { CLAUDE_ALIAS_IDENTITY_STAMPS, type ClaudeAlias, readClaudeAliasIdentity } from "../../adapters/claude-code.js";
-import { channelKey, channelsFromConfig, type BillingChannel, type WorkerAdapter } from "../../adapters/types.js";
+import { channelKey, channelsFromConfig, failedVerdictLabel, type BillingChannel, type ModelAuth, type WorkerAdapter } from "../../adapters/types.js";
 import {
   ConfigError,
   DEFAULT_CONFIG,
@@ -43,10 +43,12 @@ import {
 import { exclusionReason, projectFleetWhy, renderFleetWhy, type FleetWhyValue, type ShapeWhy } from "../../config/fleet-why.js";
 import { fleetPoolPrune, overlayHoldingLine, overlayHoldsMap } from "../../config/fleet-overlay.js";
 import { SHAPES, TIERS, type Shape, type Task } from "../../graph/schema.js";
-import { doctor, probeScope } from "./doctor.js";
+import { deadPreferenceLine, doctor, probeScope } from "./doctor.js";
 import { candidateRow, costSignal, shapeCandidates } from "./fleet-picker.js";
 import { preferIndex, route } from "../../route/router.js";
 import { pickRole } from "../../route/role-pick.js";
+import { carriedAuthorVendors, deadPreferences, isIndependentJudge, resolveSeats, type Seat, type SeatSkip } from "../../route/seat-resolver.js";
+import { gateReviewerFloor } from "../../gates/review.js";
 import { deadPoolEntries, deadPoolEntryLine, denyPreferCollisionLine, denyPreferCollisions, disallowedBy, entryMatchesChannel, exclusionCollector, observedSeat } from "../../route/preference.js";
 import { resolveRunMode, type ResolvedRunMode } from "../../run/daemon.js";
 import { loadRoutingProfile, readReviewNoVerdictHistory, reviewNoVerdictRows } from "../../run/journal.js";
@@ -333,6 +335,87 @@ const MODE_GLOSS: Record<RoutingMode, string> = {
   "staff-led": "implement/refactor one band down · integrity shapes hold frontier",
 };
 
+type PickValues = { pick: string; author?: string; "exclude-vendor"?: string[]; print?: boolean; why?: boolean; fresh?: boolean };
+
+/**
+ * Rows 362 and 367 R2/R5, ruling Q-a (D-2187 conditions 4 and 5): `fleet --pick` ranks only through the
+ * seat resolver. Its receipt names every skipped preference and the doctor cache's age (read at any age,
+ * as run start reads it); the skip and stale lines go to stderr so stdout stays exactly one JSON object.
+ * A judge or review seat exists only for an author: without --author it exits 2 and invents no seat.
+ */
+function pickSeat(values: PickValues, cwd: string, adapters: WorkerAdapter[], globalDir: string): string | { out: string; code: number } {
+  const role = PREFERENCE_ROLES.find((role) => role === values.pick);
+  const refuse = (reason: string) => ({ out: `tickmarkr fleet --pick ${values.pick}: ${reason}`, code: 1 });
+  if (!role) return refuse("unsupported-role — expected worker, judge, review or consult; no role prefer resolved");
+  if (values.print || values.why || values.fresh) return refuse("incompatible options — --pick cannot use --print, --why or --fresh");
+  const say = (line: string) => process.stderr.write(`tickmarkr fleet --pick ${role}: ${line}\n`);
+  const contextual = role === "judge" || role === "review";
+  if (!contextual && values.author !== undefined) return refuse("incompatible options — --author applies only to --pick judge or review");
+  if (role === "judge" && values["exclude-vendor"]?.length) return refuse("incompatible options — --exclude-vendor does not apply to the judge seat");
+  if (contextual && values.author === undefined) {
+    say("context-required — pass --author <adapter:model>, the worker whose diff this seat would judge");
+    return { out: "", code: 2 };
+  }
+  const { cfg } = resolveRunMode(cwd, { globalDir });
+  const health = readDoctor(cwd);
+  const excludeVendors = new Set(values["exclude-vendor"] ?? []);
+  const missing = "probe data missing — run tickmarkr doctor first";
+  const sayAll = (skips: SeatSkip[]) => {
+    for (const s of skips) say(`skipped ${s.entry}${s.channel ? ` (${s.channel})` : ""} — ${s.reason}${s.detail ? `: ${s.detail}` : ""}`);
+    return skips;
+  };
+  let pick: Seat;
+  let skips: SeatSkip[] = [];
+  let independent = true;
+  let seats: BillingChannel[] = [];
+  // The channels a receipt's vendor and channel are read from: the role pools, then every configured
+  // channel, since the judge's configured pin is dispatched even when it is outside the eligible pools.
+  let known: BillingChannel[] = [];
+  if (!contextual) {
+    const selection = pickRole(role, cfg, adapters, health ?? {}, { excludeVendors });
+    // The same consult request with the configured view the skip rows read; worker ranks nothing.
+    if (role === "consult" && health) {
+      skips = sayAll(resolveSeats({ role, cfg, pool: discoverChannels(cfg, adapters, health, role), excludeVendors, adapters, health }).skips);
+    }
+    if (!selection.ok) return refuse(`${role}.prefer: ${selection.reason === "missing-prefer" || health ? selection.reason : missing}`);
+    pick = selection.channel;
+  } else {
+    if (!health) return refuse(missing);
+    const pools = rolePools(cfg, adapters, health);
+    seats = [...pools.judge, ...pools.review];
+    known = [...seats, ...adapters.flatMap((a) => a.channels(cfg))];
+    const author = [...pools.worker, ...known].find((c) => channelKey(c) === values.author);
+    if (!author) return refuse(`unknown-author — --author ${values.author} names no configured channel (expected <adapter:model>)`);
+    const authors = [channelKey(author)];
+    if (role === "review") {
+      // The review gate's first round: its floor for a task with no routing hints, review.prefer, no
+      // rotation history and no exclusions beyond the --exclude-vendor values.
+      const { floor } = gateReviewerFloor({}, cfg, author, pools.review);
+      const r = resolveSeats({ role, pool: pools.review, prefer: cfg.review.prefer ?? [], author, authors, floor, excludeVendors, cfg, adapters, health });
+      skips = sayAll(r.skips);
+      if (!r.pick) return refuse(`no-eligible-reviewer — no cross-vendor reviewer at the ${floor} floor for author ${authors[0]}`);
+      pick = r.pick;
+    } else {
+      // The run's primary judge (run-gates): the configured judge, then an independent automatic pick,
+      // then the same-vendor fallback, annotated as not independent exactly as the run annotates it.
+      const r = resolveSeats({ role, cfg, pool: pools.judge, authorPool: pools.review, health, authors });
+      if (r.disallowed) return refuse(`judge ${channelKey(cfg.judge)} is disallowed by routing.${r.disallowed.by} (${r.disallowed.entry})`);
+      if (!r.pick) return refuse("no judge with a known vendor is available");
+      pick = r.pick;
+      const seat = seats.find((c) => channelKey(c) === channelKey(r.pick!));
+      independent = !!seat && isIndependentJudge(seat, carriedAuthorVendors(seats, authors), authors);
+    }
+  }
+  const { adapter, model, vendor, channel } = { ...pick, ...known.find((c) => channelKey(c) === channelKey(pick)) } as Partial<BillingChannel>;
+  // Every successful receipt names the seat's vendor and channel; a seat no configured channel describes
+  // is refused rather than printed half-known (rows 362 and 367 R2/R5, D-2187).
+  if (!vendor || !channel) return refuse(`${channelKey(pick)} names no configured channel — its vendor and channel are unknown`);
+  const ageMs = doctorAgeMs(cwd, cfg) ?? 0;
+  const stale = ageMs >= INIT_DOCTOR_REUSE_MS;
+  if (stale) say(`doctor cache is ${formatDoctorAgeForInit(ageMs)} old (stale) — picked from cached verdicts; run tickmarkr doctor to refresh`);
+  return JSON.stringify({ role, adapter, model, vendor, channel, skips, cache: { ageMs, stale }, ...(independent ? {} : { judgeIndependent: false }) });
+}
+
 export async function fleet(
   argv: string[],
   cwd = process.cwd(),
@@ -343,6 +426,7 @@ export async function fleet(
     args: argv,
     options: {
       pick: { type: "string" },
+      author: { type: "string" },
       "exclude-vendor": { type: "string", multiple: true },
       print: { type: "boolean" },
       why: { type: "boolean" },
@@ -351,24 +435,8 @@ export async function fleet(
     },
   });
   const globalDir = values["global-dir"] ?? globalConfigDir();
-  if (values.pick !== undefined) {
-    const role = PREFERENCE_ROLES.find((role) => role === values.pick);
-    const refuse = (reason: string) => ({ out: `tickmarkr fleet --pick ${values.pick}: ${reason}`, code: 1 });
-    if (!role) return refuse("unsupported-role — expected worker, judge, review or consult; no role prefer resolved");
-    if (values.print || values.why || values.fresh) return refuse("incompatible options — --pick cannot use --print, --why or --fresh");
-    const { cfg } = resolveRunMode(cwd, { globalDir });
-    const { reuse, health } = initDoctorReuse(cwd, false, cfg);
-    const selection = pickRole(role, cfg, adapters, reuse && health ? health : {}, {
-      excludeVendors: new Set(values["exclude-vendor"] ?? []),
-    });
-    if (!selection.ok) {
-      return refuse(selection.reason === "missing-prefer" ? `${role}.prefer: missing-prefer`
-        : !reuse || !health ? `${role}.prefer: probe data missing or stale — run tickmarkr doctor first`
-        : `${role}.prefer: ${selection.reason}`);
-    }
-    const { adapter, model, vendor, channel } = selection.channel;
-    return JSON.stringify({ role, adapter, model, vendor, channel });
-  }
+  if (values.pick !== undefined) return pickSeat({ ...values, pick: values.pick }, cwd, adapters, globalDir);
+  if (values.author !== undefined) return { out: "tickmarkr fleet: --author requires --pick judge or review", code: 1 };
   if (values["exclude-vendor"]?.length) return { out: "tickmarkr fleet: --exclude-vendor requires --pick <role>", code: 1 };
   const print = values.print ?? false;
   const why = values.why ?? false;
@@ -603,7 +671,7 @@ export async function assembleFleetEditor(
   const resolvedModelIdentity = (adapter: string, model: string): string | undefined =>
     health[adapter]?.modelAuth?.[model]?.identity ?? health[adapter]?.modelIdentities?.[model];
   const rowEvidence = (adapter: string, model: string, evidence?: CatalogModelEvidence): FleetModelEvidence | undefined => {
-    const probed = health[adapter]?.modelAuth?.[model] as { durationMs?: number; authed?: boolean; reason?: string } | undefined;
+    const probed = health[adapter]?.modelAuth?.[model] as (Partial<ModelAuth> & { durationMs?: number }) | undefined;
     // D-2178 F3: without a model verdict, the adapter's signed-out verdict is the row's verdict.
     // Keep its source so the glyph can fail even when policy also excludes this channel.
     const inherited = probed?.authed === undefined && health[adapter]?.authed === false;
@@ -618,6 +686,8 @@ export async function assembleFleetEditor(
       // OBS-519: doctor already recorded the failed verdict — a rate-limited/unauthed model must
       // not render identically to a healthy row on the surface that edits its fleet membership.
       ...(probed?.authed === false ? { unauthed: probed.reason ?? "probe failed" } : {}),
+      // Rows 353 and 367 R3 (D-2187 condition 2): a launch fault or timeout is never rendered as a sign-out.
+      ...(probed?.authed === false && probed.failure ? { failure: probed.failure } : {}),
       ...(inherited ? { unauthed: `${adapter} adapter signed out${health[adapter]?.note ? ` — ${health[adapter].note}` : ""}`, unauthedAdapter: adapter } : {}),
       // the browser decides deny coverage itself, over the STAGED policy (LEG2-T3 finding 1)
       ...(identity !== undefined ? { identity } : {}),
@@ -652,9 +722,10 @@ export async function assembleFleetEditor(
                   model,
                   ...(identity !== undefined ? { identity } : {}),
                   ...(verdict?.unauthed !== undefined ? { unauthed: verdict.unauthed } : {}),
+                  ...(verdict?.failure !== undefined ? { failure: verdict.failure } : {}),
                 };
               }) : undefined;
-              const { unauthed: _unauthed, unauthedAdapter: _unauthedAdapter, ...authedEvidence } = found ?? {};
+              const { unauthed: _unauthed, unauthedAdapter: _unauthedAdapter, failure: _failure, ...authedEvidence } = found ?? {};
               const evidence = members?.some((member) => member.unauthed === undefined) && found?.unauthed !== undefined
                 ? (Object.keys(authedEvidence).length ? authedEvidence : undefined)
                 : found;
@@ -1188,7 +1259,7 @@ export async function assembleFleetEditor(
         const reasons = scopes.map(exclusionReason);
         if (!h?.installed) reasons.push("adapter not installed");
         else if (!h.authed) reasons.push("adapter unauthed");
-        else if (h.modelAuth?.[seat.model]?.authed === false) reasons.push(`unauthed (${h.modelAuth[seat.model].reason ?? "probe failed"})`);
+        else if (h.modelAuth?.[seat.model]?.authed === false) reasons.push(`${failedVerdictLabel(h.modelAuth[seat.model].failure)} (${h.modelAuth[seat.model].reason ?? "probe failed"})`);
         else if (!live.some((channel) => channelKey(channel) === id)) reasons.push("not available in doctor-discovered channels");
         // Config floors are advisory for map pins/pools, exactly as route() treats them.
         if (kind !== "pin" && kind !== "pool" && c && TIER_RANK[c.tier] < TIER_RANK[floor]) {
@@ -1380,7 +1451,9 @@ export async function assembleFleetEditor(
     };
     const failedProbes = unauthedModels.filter(({ key }) => !discovered.has(key)).flatMap(({ key, adapter, reason }) => {
       const declared = adapters.find((a) => a.id === adapter)?.channels(cfgPreview).find((c) => `${c.adapter}:${c.model}` === key);
-      return declared ? [{ ...withIdentity(adapter, declared), authReason: `unauthed (${reason}) — re-probe with tickmarkr doctor` }] : [];
+      // Rows 353 and 367 R3 (D-2187 condition 2): the picker ledger names a launch fault or timeout by its class
+      const failed = failedVerdictLabel(health[adapter]?.modelAuth?.[declared?.model ?? ""]?.failure);
+      return declared ? [{ ...withIdentity(adapter, declared), authReason: `${failed} (${reason}) — re-probe with tickmarkr doctor` }] : [];
     });
     // T2 review round 6: an installed-but-unauthed CLI is dropped by discovery AND by the model
     // probe list, so its configured channels are rebuilt from the adapter's own declaration too —
@@ -1782,7 +1855,9 @@ export async function assembleFleetEditor(
   return {
     props,
     commit,
-    renderWhy: () => renderFleetWhy(projectedShapeRows(rm.mode.mode, editable.map, stagedDenyOf(editable))),
+    // Rows 362 and 367 R2 (D-2187): a DEAD consult or review preference is named under the why print.
+    renderWhy: () => [renderFleetWhy(projectedShapeRows(rm.mode.mode, editable.map, stagedDenyOf(editable))),
+      ...deadPreferences(cfg, adapters, health).map(deadPreferenceLine)].join("\n"),
     // T8: the memoized candidate every preview callback ranks — read-only, so its identity is checkable
     previewConfig: previewCfg,
   };

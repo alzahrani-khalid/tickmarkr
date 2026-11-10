@@ -1,7 +1,7 @@
 import { Box, render, Text, useApp, useInput } from "ink";
 import { useRef, useState } from "react";
 import { GLYPHS } from "../../brand.js";
-import { MODEL_ID_RE, type AuthHealth, type WorkerAdapter } from "../../adapters/types.js";
+import { failedVerdictLabel, MODEL_ID_RE, type AuthHealth, type ModelProbeFailure, type WorkerAdapter } from "../../adapters/types.js";
 import { retiredModelReason } from "../../adapters/model-lints.js";
 import { DENY_SCOPES, EFFORT_ADAPTERS, denyBlockFrom, denyEntriesAt, initialDenyPropOf, stagedDenyKeyOf, type DenyScope, type DenyScopeKey, type InitialDenyProps, type MapEntry, type RoutingMode, type StagedDenyKey, type Tier, type TickmarkrConfig } from "../../config/config.js";
 import { fleetFirstTouchProvenance } from "../../config/fleet-overlay.js";
@@ -107,6 +107,8 @@ export type FleetModelEvidence = {
   probeMs?: number;
   /** Doctor's failed model verdict or inherited adapter verdict — never a healthy-looking row. */
   unauthed?: string;
+  /** Rows 353 and 367 R3 (D-2187 condition 2): the failed verdict's class — never rendered as a sign-out. */
+  failure?: ModelProbeFailure;
   /** D-2178 F3: a verdictless model inherits this signed-out adapter's verdict. */
   unauthedAdapter?: string;
   /** OBS-972/FL-1: a floating alias's resolved concrete model id (e.g. "opus" → "claude-opus-5") */
@@ -128,7 +130,7 @@ export const openStagedDeny = (): FleetStagedDeny => ({
 
 /** T5: one real channel a displayed row stands for — a collapsed variant or catalog-fold constituent doctor
  * served, with its own recorded identity and failed-probe reason */
-export type FleetGroupMember = { model: string; identity?: string; unauthed?: string };
+export type FleetGroupMember = { model: string; identity?: string; unauthed?: string; failure?: ModelProbeFailure };
 
 export type FleetModelGroup = {
   adapter: string;
@@ -335,7 +337,9 @@ export function modelMark(row: Pick<ModelRow, "partial" | "reach" | "evidence" |
   if (row.evidence?.unauthedAdapter !== undefined) return "fail";
   if (row.partial) return "warn";
   if (row.reach === "out-all" || row.reach === "out-allow") return "off";
-  if (row.evidence?.unauthed !== undefined || row.reach === "unknown") return "fail";
+  // Rows 353 and 367 R3: a launch fault or timeout takes the attention glyph; a sign-out keeps the fail glyph.
+  if (row.evidence?.unauthed !== undefined) return row.evidence.failure ? "warn" : "fail";
+  if (row.reach === "unknown") return "fail";
   if (row.reach === "out-workers") return "warn";
   return row.tier ? "on" : "unknown";
 }
@@ -882,6 +886,9 @@ export function FleetApp({
 
   // Member auth controls routing independently; only the row's own failure limits reach edits.
   const failedVerdict = (row: ModelRow): string | undefined => row.evidence?.unauthed;
+  // Rows 353 and 367 R3 (D-2187 condition 2): how a reach notice names the failed verdict — a launch fault or a
+  // timeout by its class, never as a sign-out; a signed-out row keeps "is unauthed".
+  const failedIs = (row: ModelRow): string => (row.evidence?.failure ? `— ${failedVerdictLabel(row.evidence.failure)}` : "is unauthed");
 
   // ── state transitions ──────────────────────────────────────────────────────
 
@@ -1216,7 +1223,7 @@ export function FleetApp({
     // Moving an all-seats exclusion to workers-only would re-admit the steering seats.
     const widensReach = choice === "in" || (choice === "out-workers" && (row.reach === "out-all" || row.reach === "out-allow"));
     if (failed !== undefined && widensReach) {
-      ui.notice = `${id} is unauthed (${failed}) — cannot set ${label}; re-probe with tickmarkr doctor`;
+      ui.notice = `${id} ${failedIs(row)} (${failed}) — cannot set ${label}; re-probe with tickmarkr doctor`;
       return;
     }
     // T5: a grouped row's act is the same one-reason act on EVERY real member, each decided from the reach
@@ -1305,13 +1312,13 @@ export function FleetApp({
     const made = outcomes.flatMap((outcome) => ("edit" in outcome ? [outcome.edit] : []));
     const refused = outcomes.flatMap((outcome) => ("refused" in outcome ? [outcome.refused] : []));
     if (!made.length) {
-      ui.notice = `${refused[0] ?? `${id} is already ${label}`}${failed === undefined ? "" : ` — unauthed (${failed})`}`;
+      ui.notice = `${refused[0] ?? `${id} is already ${label}`}${failed === undefined ? "" : ` — ${failedVerdictLabel(row.evidence?.failure)} (${failed})`}`;
       return;
     }
     const after = rowReach(members);
     const still = reached(after.reach, choice) && !after.partial ? "" : ` — still out: ${after.reasons.join("; ")}`;
     ui.lastEdit = { id, text: `space: ${made.join("; ")}${still}` };
-    if (failed !== undefined) ui.notice = `${id} is unauthed (${failed}) — set ${label}; re-probe with tickmarkr doctor before setting in`;
+    if (failed !== undefined) ui.notice = `${id} ${failedIs(row)} (${failed}) — set ${label}; re-probe with tickmarkr doctor before setting in`;
   };
 
   // OBS-1065: Enter on a greyed picker row lifts exactly its row-owned covering entry, then the
@@ -2069,7 +2076,7 @@ export function FleetApp({
         setOverlay({ kind: "reach", target: { adapter: row.adapter, model: row.model }, at: 0 });
         const failed = failedVerdict(row);
         if (failed !== undefined) {
-          ui.notice = `${row.adapter}:${row.model} is unauthed (${failed}) — out only; re-probe with tickmarkr doctor before setting in`;
+          ui.notice = `${row.adapter}:${row.model} ${failedIs(row)} (${failed}) — out only; re-probe with tickmarkr doctor before setting in`;
           bump();
         }
         return;
@@ -2283,7 +2290,7 @@ export function FleetApp({
   // OBS-994/FL-1: the reach line — every collector scope that excludes this row, each with its
   // config path and matching entry (an unauthed row instead points at the doctor re-probe).
   const reachDetail = (row: ModelRow): string => {
-    if (row.evidence?.unauthed !== undefined) return `unauthed — ${row.evidence.unauthed} — Space sets out only; re-probe with tickmarkr doctor before setting in`;
+    if (row.evidence?.unauthed !== undefined) return `${failedVerdictLabel(row.evidence.failure)} — ${row.evidence.unauthed} — Space sets out only; re-probe with tickmarkr doctor before setting in`;
     // T10: the reasons, then where each scope is held — the overlay a reviewed w writes
     const reasons = `${row.reasons.join("; ")}${row.held.length ? ` — held: ${row.held.join("; ")}` : ""}`;
     // T5: members disagree — never a whole-group state; each member-specific reason names its real id
@@ -2329,9 +2336,11 @@ export function FleetApp({
       `${row.adapter}:${row.model}`,
       row.tier ?? "unclassified",
       ui.efforts[row.adapter]?.[row.model] ? `effort ${ui.efforts[row.adapter][row.model]}` : "",
+      // Rows 353 and 367 R3: the row's own failed verdict by class (LAUNCH FAULT, TIMED OUT, UNAUTHED) — up front too
+      row.evidence?.unauthed !== undefined ? `${failedVerdictLabel(row.evidence.failure).toUpperCase()} — ${row.evidence.unauthed}` : "",
       // T5: a grouped row names each member doctor recorded unauthed — up front, before the line clips
       ...(row.evidence?.unauthed === undefined ? (row.members ?? []).filter((member) => member.unauthed !== undefined)
-        .map((member) => `${row.adapter}:${member.model} UNAUTHED — ${member.unauthed} — re-probe with tickmarkr doctor`) : []),
+        .map((member) => `${row.adapter}:${member.model} ${failedVerdictLabel(member.failure).toUpperCase()} — ${member.unauthed} — re-probe with tickmarkr doctor`) : []),
       ui.lastEdit?.id === `${row.adapter}:${row.model}` ? ui.lastEdit.text : "",
       identityDetail(row),
       row.tier ? reachDetail(row) : "",
@@ -2340,7 +2349,6 @@ export function FleetApp({
       row.members?.length ? `classify writes ${row.members.map((member) => member.model).join(", ")}`
         : row.classifyModel ? `classify writes ${row.classifyModel}` : "",
       row.foldedModels?.length ? `${row.foldedModels.length} gateway ids folded: ${row.foldedModels.join(", ")}` : "",
-      row.evidence?.unauthed !== undefined ? `UNAUTHED — ${row.evidence.unauthed}` : "",
       row.evidence?.contextWindow !== undefined ? `${fmtCtx(row.evidence.contextWindow)} ctx` : "",
       row.evidence?.outputWindow !== undefined ? `${fmtCtx(row.evidence.outputWindow)} out` : "",
       row.evidence?.inputCostPerMtok !== undefined || row.evidence?.outputCostPerMtok !== undefined

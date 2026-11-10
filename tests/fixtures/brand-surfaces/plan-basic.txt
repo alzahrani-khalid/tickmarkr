@@ -5,8 +5,14 @@ harness: /opt/tickmarkr/lib/node_modules/tickmarkr/dist/cli/index.js (unresolved
 
 alias identity unknown: claude-code:fable, opus, sonnet, haiku — doctor persisted no resolved identity (run tickmarkr doctor)
 
+seat pools:
+  worker: claude-code:fable, claude-code:opus, claude-code:sonnet, claude-code:haiku, codex:gpt-6-astra, codex:gpt-6-sol, codex:gpt-6-luna, codex:gpt-5.6-sol, codex:gpt-5.6-terra, codex:gpt-5.6-luna, cursor-agent:composer-2.5, cursor-agent:composer-2.5-fast, cursor-agent:claude-fable-5-1, cursor-agent:gemini-3.8-flash, opencode:zai-coding-plan/glm-5.2, pi:zai/glm-5.2, pi:zai/glm-5.3, pi:zai/glm-5.3-flash
+  judge: claude-code:fable, codex:gpt-6-astra, codex:gpt-6-sol, codex:gpt-5.6-sol, cursor-agent:claude-fable-5-1, pi:zai/glm-5.3, codex:gpt-5.6-terra, cursor-agent:composer-2.5, cursor-agent:gemini-3.8-flash, opencode:zai-coding-plan/glm-5.2, pi:zai/glm-5.2, pi:zai/glm-5.3-flash, codex:gpt-6-luna, codex:gpt-5.6-luna, cursor-agent:composer-2.5-fast, claude-code:opus, claude-code:sonnet, claude-code:haiku
+  review: none preferred — each task's review line names its author's reviewer
+  consult: claude-code:fable
+
   T1     chore      c2  → claude-code:haiku [sub/cheap] — floor cheap (config floors), marginal-cost auto (cheapest sufficient tier)
-    judge: claude-code:fable
+    judge: codex:gpt-6-astra
     review: codex:gpt-6-astra (seat 1 of 13 — rotation applies at run time) — reviewPolicy full
     chain: depth 0 · wave 1 at concurrency 3
     floor cheap ← mode risk-based

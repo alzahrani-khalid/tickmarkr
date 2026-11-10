@@ -35,7 +35,13 @@ export interface Assignment { adapter: string; model: string; channel: "sub" | "
 export interface BillingChannel { adapter: string; vendor: string; model: string; channel: "sub" | "api"; tier: Tier; identity?: string; effort?: Effort }
 export const MODEL_PROBE_ERRORS = ["EMFILE", "EAGAIN", "ENFILE", "ENOMEM", "ENOSPC"] as const;
 export type ModelProbeError = typeof MODEL_PROBE_ERRORS[number];
-export interface ModelAuth { authed: boolean; reason?: string; cause?: "unknown-model"; probeError?: ModelProbeError; probedAt: string; identity?: string }
+// Queue rows 353, 362 and 367 R3 (D-2187 condition 2): the probe's typed failure class. Every class stays
+// unroutable (authed false); it changes only the record and the word each surface renders for it.
+export type ModelProbeFailure = "launch-fault" | "timeout";
+export interface ModelAuth { authed: boolean; reason?: string; cause?: "unknown-model"; failure?: ModelProbeFailure; probeError?: ModelProbeError; probedAt: string; identity?: string }
+/** Rows 353 and 367 R3: the failed verdict's word — a launch fault or a timeout is never rendered as a sign-out. */
+export const failedVerdictLabel = (failure: ModelProbeFailure | undefined): string =>
+  failure === "launch-fault" ? "launch fault" : failure === "timeout" ? "timed out" : "unauthed";
 export interface ModelListingOutcome { status: "succeeded" | "unavailable"; reason?: string }
 export interface ModelListing extends ModelListingOutcome { models: string[] }
 // v2.6.4 T2 (B1a): a model's retirement notice — a listed row's, or (v2.6.9) a hidden row's dated one —

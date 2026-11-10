@@ -461,19 +461,23 @@ The purpose-to-role mapping is explicit:
 | author (including planner, executor and scout) | consult | Any vendors excluded for this mission |
 | consultant | consult | Any vendors excluded for this mission or consultation round |
 | lab-rater | consult | Any vendors excluded for this rating round |
-| independent reviewer (including checker and verifier) | review | Author vendor plus every vendor already used by independent reviewers in this round, and mission exclusions |
+| independent reviewer (including checker and verifier) | review | Every vendor already used by independent reviewers in this round, and mission exclusions; the pick excludes the author's vendor |
 
 For example, an independent reviewer runs
-`tickmarkr fleet --pick review --exclude-vendor <author-vendor> --exclude-vendor <prior-reviewer-vendor>`;
+`tickmarkr fleet --pick review --author <author adapter:model> --exclude-vendor <prior-reviewer-vendor>`;
 omit the prior-reviewer argument only for the first reviewer. Repeat `--exclude-vendor <vendor>`
-for every applicable exclusion on either role. Track the author's actual vendor and each reviewer's
-returned vendor in the seat record; if the author vendor is unknown, stop before review selection.
+for every applicable exclusion on either role; for review, this covers every prior reviewer of the
+round and every mission exclusion. The pick excludes the author's own vendor using `--author`.
+Track the author's `adapter:model` and actual vendor and each reviewer's
+returned vendor in the seat record; if the author channel or vendor is unknown, stop before review selection.
 Unknown seat purposes require an explicit mapping decision; never silently map them to consult.
 
 Consume only exit status zero and one complete JSON identity with `role`, `adapter`, `model`, `vendor`
-and `channel`. Validate the role and exclusions against the request and record this receipt with the
-seat. A nonzero refusal (including missing `<role>.prefer`, exhausted eligible preferences, or stale
-probe data) stops the spawn: report the named reason, never invent a default, auto-write preferences,
+and `channel`, plus `skips` and `cache: { ageMs, stale }`. Validate the role and exclusions against the
+request and record the receipt's skips and cache age with the seat. A stale cache is reported in the
+receipt and on stderr; it does not refuse the pick. A nonzero refusal, including exit 2 for
+`context-required`, missing probe data, missing `<role>.prefer` or exhausted eligible preferences,
+stops the spawn: report the named reason, never invent a default, auto-write preferences,
 or fall back to a remembered model. `fleet --print` and a preference list are not a resolved pick.
 
 Build the launch command from the returned `adapter` and `model`, shell-quoting the model as one
@@ -553,7 +557,7 @@ For Leg-2 (both hosts), a Codex reviewer under `workspace-write` must be briefed
      pane. Headless is for exit-code probes — a quota check that wants `rc`, never work anyone must watch.
    - **On Orca (`TERM_PROGRAM=Orca` and non-empty `ORCA_TERMINAL_HANDLE`)**: **Seats are interactive TUI,
      never headless `-p`**, for every reason the herdr branch gives, in a visible named terminal.
-3. **Buy seat diversity through Fleet, at every dispatch and respawn.** Resolve authors with `tickmarkr fleet --pick consult` and independent checkers/verifiers with `tickmarkr fleet --pick review --exclude-vendor <author-vendor>`, adding every applicable vendor exclusion under the Fleet selection contract. Consume the successful JSON adapter/model before using the visible-seat recipes; never select directly from doctor data. When one vendor's model
+3. **Buy seat diversity through Fleet, at every dispatch and respawn.** Resolve authors with `tickmarkr fleet --pick consult` and independent checkers/verifiers with `tickmarkr fleet --pick review --author <author adapter:model>`, adding a `--exclude-vendor <prior-reviewer-vendor>` for every prior reviewer of the round and every mission exclusion under the Fleet selection contract. Consume the successful JSON adapter/model before using the visible-seat recipes; never select directly from doctor data. When one vendor's model
    quota collapses, the reflex is to collapse every seat onto the surviving model and hold the
    cross-vendor CLI back for a late probe — P97 ran planner, checker and verifier as one family that
    way, and three same-family passes confirmed one wrong anchored conclusion with the refuting fact in

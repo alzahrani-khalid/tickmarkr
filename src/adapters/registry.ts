@@ -10,15 +10,18 @@ import { disallowedBy, entryMatchesChannel, excludedChannels, exclusionLine, mod
 import { sh } from "../run/git.js";
 import { FakeAdapter } from "./fake.js";
 import { claudeGatewayHost } from "./claude-code.js";
+import { confirmedClaudeProxy, containDoctorReport, proxiedClaudeVendor } from "./cliproxy.js";
 import { parseWorkerResult } from "./prompt.js";
+import { KIMI_DOCTOR_TURN_MODEL, KIMI_DOCTOR_TURN_TIMEOUT_MS, type KimiDoctorTurnResult } from "./kimi.js";
 import { sealHerdrEnv } from "../drivers/subprocess.js";
 import { withoutHostSession } from "../drivers/host-env.js";
+import { agentEnv } from "../drivers/agent-env.js";
 import {
   catalogEntries, isNativeCliDrive, projectCliEntries, SHIPPED_CLI_CATALOG,
   type CatalogEntriesOptions, type CliEntry, type DeclarativeCliDrive, type ModelIdField,
 } from "./catalog.js";
 import {
-  type AuthHealth, type BillingChannel, channelKey, channelsFromConfig, type ModelAuth, type ModelListing,
+  type AuthHealth, type BillingChannel, channelKey, channelsFromConfig, failedVerdictLabel, type ModelAuth, type ModelListing,
   modelAuthed, MODEL_ID_RE, MODEL_PROBE_ERRORS, type ModelProbeError, QUOTA_PHRASE_RE, shq, STATUS_LABEL, type WorkerAdapter,
 } from "./types.js";
 
@@ -563,18 +566,38 @@ function probeFailure(
 // These are model-error shapes shared by CLIs, with no adapter names or offered model ids.
 const UNKNOWN_MODEL_RE = /\b(?:unknown|unrecognized|unsupported|invalid|unserved)\s+model(?:\s+id)?\b|\bmodel(?:\s+id)?\s+(?:["'`]?[^\s"'`]+["'`]?\s+)?(?:(?:is|was)\s+)?(?:not\s+(?:found|available|offered|served|supported|recognized)|does\s+not\s+exist|unavailable|unserved|unsupported|unknown|unrecognized)\b|\bnot\s+a\s+valid\s+model\b/i;
 
+// Queue rows 353 and 367 R3 (D-2187 condition 2): exactly the two captured argv-parser rejections — clap's
+// (codex) and commander's (claude) — anchored at the start of the first non-blank stderr line.
+const LAUNCH_FAULT_RE = /^error: (?:unexpected argument '[^'\n]+' found|unknown option '[^'\n]+')/;
+
 export function classifyProbeReply(
   code: number,
   stdout: string,
   stderr: string,
   timedOut?: boolean,
   timeoutMs = MODEL_PROBE_TIMEOUT_MS,
-): Pick<ModelAuth, "authed" | "reason" | "cause"> {
-  if (!timedOut && UNKNOWN_MODEL_RE.test(`${stderr}\n${stdout}`)) {
+): Pick<ModelAuth, "authed" | "reason" | "cause" | "failure"> {
+  // Rows 353 and 367 R3: a timeout is the runner's own timer kill, never inferred from text.
+  if (timedOut) return { authed: false, failure: "timeout", reason: probeFailure(code, stdout, stderr, timedOut, timeoutMs) };
+  if (UNKNOWN_MODEL_RE.test(`${stderr}\n${stdout}`)) {
     return { authed: false, cause: "unknown-model", reason: "unknown model id" };
   }
+  // A launch fault is tickmarkr's own launch argument rejected (2.20.0's argv defect), never a sign-out.
+  const firstLine = stderr.split("\n").find((line) => line.trim())?.trimEnd();
+  if (code !== 0 && firstLine && LAUNCH_FAULT_RE.test(firstLine)) return { authed: false, failure: "launch-fault", reason: firstLine };
   const reason = probeFailure(code, stdout, stderr, timedOut, timeoutMs);
   return reason ? { authed: false, reason } : { authed: true };
+}
+
+// Queue rows 353 and 367 R3 (D-2187 condition 2): a failed Kimi doctor turn is the turn model's verdict,
+// classified by the shared classifier from the raw runner facts; it never changes the adapter's authed flag.
+export function recordKimiDoctorTurn(h: AuthHealth, turn: KimiDoctorTurnResult, probedAt = new Date().toISOString()): AuthHealth {
+  const note = `${h.note ? `${h.note}; ` : ""}${turn.ok ? turn.evidence : `model turn failed: ${turn.evidence}`}`;
+  if (turn.ok) return { ...h, note };
+  const r = turn.runner;
+  const reply = r ? classifyProbeReply(r.code, r.stdout, r.stderr, r.timedOut, KIMI_DOCTOR_TURN_TIMEOUT_MS) : undefined;
+  const verdict: ModelAuth = reply && !reply.authed ? { ...reply, probedAt } : { authed: false, reason: turn.evidence, probedAt };
+  return { ...h, note, modelAuth: { ...h.modelAuth, [KIMI_DOCTOR_TURN_MODEL]: verdict } };
 }
 
 const PROBE_ERROR_RE = new RegExp(`\\b(${MODEL_PROBE_ERRORS.join("|")})\\b`);
@@ -624,30 +647,31 @@ export async function probeModels(
       const attempt = async (model: string, retry?: { firstTimedOut: boolean }): Promise<{ verdict: ProbedModelAuth | null; timedOut: boolean }> => {
         const t0 = Date.now();
         const probedAt = new Date().toISOString();
-        const v = (authed: boolean, reason?: string, error?: ModelProbeError, cause?: ModelAuth["cause"]): ProbedModelAuth =>
-          ({ authed, ...(reason !== undefined ? { reason } : {}), ...(error ? { probeError: error } : {}), ...(cause ? { cause } : {}), probedAt, durationMs: Date.now() - t0 });
+        const v = (authed: boolean, reason?: string, error?: ModelProbeError, cause?: ModelAuth["cause"], failure?: ModelAuth["failure"]): ProbedModelAuth =>
+          ({ authed, ...(reason !== undefined ? { reason } : {}), ...(error ? { probeError: error } : {}), ...(cause ? { cause } : {}), ...(failure ? { failure } : {}), probedAt, durationMs: Date.now() - t0 });
         try {
           if (typeof a.headlessCommand !== "function") return { verdict: v(false, "headless probe unavailable"), timedOut: false };
           const promptDir = mkdtempSync(join(tmpdir(), "tickmarkr-auth-"));
           try {
             const promptFile = join(promptDir, "probe.md");
             writeFileSync(promptFile, MODEL_PROBE_PROMPT);
-            const r = await sh(a.headlessCommand(promptFile, model), probeRoot, MODEL_PROBE_TIMEOUT_MS);
+            const r = await sh(a.headlessCommand(promptFile, model), probeRoot, MODEL_PROBE_TIMEOUT_MS, { env: agentEnv() }); // queue row 367
             // T2 rule unchanged: a prior doctor.json timeout skips the retry — a persistently dead
             // model (e.g. opencode glm-5.2) costs one attempt instead of two every run.
             if (r.timedOut && !retry && priorModelAuth?.[model]?.reason?.includes("timed out") === true) {
-              return { verdict: v(false, `probe timed out (repeat — retry skipped) (${MODEL_PROBE_TIMEOUT_MS}ms)`), timedOut: true };
+              return { verdict: v(false, `probe timed out (repeat — retry skipped) (${MODEL_PROBE_TIMEOUT_MS}ms)`, undefined, undefined, "timeout"), timedOut: true };
             }
             const output = `${r.stderr}\n${r.stdout}`.trim();
             const reply = classifyProbeReply(r.code, r.stdout, r.stderr, r.timedOut, MODEL_PROBE_TIMEOUT_MS);
-            const reason = reply.cause ? reply.reason : parsedStartupFailureReason(a, output) ?? reply.reason;
+            const reason = reply.cause || reply.failure ? reply.reason : parsedStartupFailureReason(a, output) ?? reply.reason;
             if (!reason) return { verdict: v(true), timedOut: false };
             if (!retry) return { verdict: null, timedOut: r.timedOut === true };
-            const error = reply.cause ? undefined : probeError(r.code, r.stdout, r.stderr, r.timedOut);
+            const error = reply.cause || reply.failure ? undefined : probeError(r.code, r.stdout, r.stderr, r.timedOut);
             return {
               verdict: error
                 ? v(priorModelAuth?.[model]?.authed === true, undefined, error)
-                : r.timedOut && retry.firstTimedOut ? v(false, `probe timed out twice (${MODEL_PROBE_TIMEOUT_MS}ms)`) : v(false, reason, undefined, reply.cause),
+                : r.timedOut && retry.firstTimedOut ? v(false, `probe timed out twice (${MODEL_PROBE_TIMEOUT_MS}ms)`, undefined, undefined, "timeout")
+                : v(false, reason, undefined, reply.cause, reply.failure),
               timedOut: r.timedOut === true,
             };
           } finally {
@@ -714,7 +738,11 @@ function readDoctorFile(repoRoot: string): Record<string, unknown> | null {
   }
 }
 
-export function writeDoctor(repoRoot: string, health: Record<string, AuthHealth>, scope?: { adapter: string; model: string }[]): void {
+// Queue row 392 R6 (D-2187): `contain` is credential containment at the sink, applied to the FINAL merged report.
+export function writeDoctor(
+  repoRoot: string, health: Record<string, AuthHealth>, scope?: { adapter: string; model: string }[],
+  contain: (report: Record<string, AuthHealth>) => Record<string, AuthHealth> = containDoctorReport,
+): void {
   if (scope) {
     const merged = readDoctor(repoRoot) ?? {};
     for (const id of new Set(scope.map((c) => c.adapter))) {
@@ -736,6 +764,7 @@ export function writeDoctor(repoRoot: string, health: Record<string, AuthHealth>
     }
     health = merged;
   }
+  health = contain(health);
   tickmarkrDir(repoRoot);
   const path = doctorPath(repoRoot);
   const tmp = `${path}.tmp`;
@@ -763,6 +792,8 @@ export function discoverChannels(
   role: PreferenceRole = "worker",
   gateway: string | undefined = claudeGatewayHost(),
 ): BillingChannel[] {
+  // Queue row 392 R6 law 3 (D-2187 add.11): the latest doctor's confirmed proxy, read from doctor.json's gateway key.
+  const proxy = confirmedClaudeProxy((health as Record<string, unknown>).gateway);
   const base = adapters
     .filter((a) => health[a.id]?.installed && health[a.id]?.authed)
     .flatMap((a) => {
@@ -778,7 +809,11 @@ export function discoverChannels(
         .map((c) => {
           const identity = observedIdentity(health, a.id, c.model);
           const observed = identity ? { ...c, identity } : c;
-          if (c.adapter !== "claude-code" || !gateway) return observed;
+          if (c.adapter !== "claude-code") return observed;
+          // Behind a confirmed proxy the served family is the recorded vendor; undefined keeps the base reading.
+          const served = proxy && proxiedClaudeVendor(c.model, identity);
+          if (served) return { ...observed, vendor: served };
+          if (!gateway) return observed;
           // A gateway's requested model name is an alias, never vendor provenance.
           const vendor = cfg.tiers["claude-code"]?.modelOverrides?.[c.model]?.vendor
             ?? (identity && modelProvider(identity) === "anthropic" ? "anthropic" : "unknown");
@@ -905,6 +940,17 @@ export function formatDoctorProbeTimeoutNote(adapter: Pick<WorkerAdapter, "probe
   return "      note: probed from this repository's root — a timeout here may be a false negative on a large repository (OBS-31); re-run tickmarkr doctor";
 }
 
+// Queue rows 353 and 367 R3 (D-2187 condition 2): one footer line per launch-faulted adapter, naming the
+// full rejected line (the model row truncates it) and that it is tickmarkr's own launch argument.
+export function launchFaultFooters(cfg: TickmarkrConfig, health: Record<string, AuthHealth>, adapters: WorkerAdapter[]): string[] {
+  return adapters.flatMap((a) => {
+    const h = health[a.id];
+    const fault = h?.installed ? Object.keys(cfg.tiers[a.id]?.models ?? {}).map((m) => h.modelAuth?.[m])
+      .find((v) => v?.authed === false && v.failure === "launch-fault") : undefined;
+    return fault ? [`launch fault: ${a.id} rejected tickmarkr's own launch argument — ${fault.reason} — this is not a sign-out`] : [];
+  });
+}
+
 // Report body shared by init's cached-doctor path — mirrors doctor.ts formatting without probing.
 export function formatDoctorReport(cwd: string, cfg: TickmarkrConfig, health: Record<string, AuthHealth>, adapters: WorkerAdapter[], opts: { wrote?: boolean } = {}): string {
   const rows = adapters.map((a) => {
@@ -969,7 +1015,7 @@ export function formatDoctorReport(cwd: string, cfg: TickmarkrConfig, health: Re
       const v = h.modelAuth?.[m];
       const auth = !v ? "unknown" : v.authed ? "authed" : v.cause === "unknown-model"
         ? `${m} is not served by ${a.id} (${dateOf(v.probedAt)})`
-        : `unauthed: ${trunc(v.reason ?? "probe failed", 40)} (${dateOf(v.probedAt)})`;
+        : `${failedVerdictLabel(v.failure)}: ${trunc(v.reason ?? "probe failed", 40)} (${dateOf(v.probedAt)})`;
       const d = disallowedBy(observedSeat(health, a.id, m), cfg.routing);
       const denied = d?.by === "deny" ? d.entry : "—";
       const pref = preferRanks({ adapter: a.id, model: m }, cfg).map((p) => `${p.shape}#${p.rank}`).join(",") || "—";
@@ -983,7 +1029,8 @@ export function formatDoctorReport(cwd: string, cfg: TickmarkrConfig, health: Re
     if (unclassified.length) statusRows.push(`    (${unclassified.length} more listed, unclassified)`);
     return statusRows;
   });
-  const modelSummary = modelStatus.length ? `\nmodel status:\n${modelStatus.join("\n")}` : "";
+  const faultFooters = launchFaultFooters(cfg, health, adapters).map((line) => `\n  ! ${line}`).join("");
+  const modelSummary = modelStatus.length ? `\nmodel status:\n${modelStatus.join("\n")}${faultFooters}` : "";
   const wrote = opts.wrote === false ? "" : `\nwrote ${stateDirName(cwd)}/doctor.json`;
   return `tickmarkr doctor — capability matrix:\n${rows.join("\n")}${modelSummary}${drift}${wrote}`;
 }

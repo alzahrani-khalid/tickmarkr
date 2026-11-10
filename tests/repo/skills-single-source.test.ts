@@ -213,7 +213,7 @@ const SKILL_SIZE_CAPS: Record<string, number> = {
   "tickmarkr-auto/SKILL.md": 36864, // 34875 bytes (queue row 340; D-2180: On the Herdr app scopes)
   "tickmarkr-loop/SKILL.md": 36864, // 34553 bytes (queue row 340; D-2180: On the Herdr app scopes)
   "tickmarkr-loop/references/cockpit.md": 12288, // 8879 bytes
-  "tickmarkr-overseer/SKILL.md": 110592, // 106906 bytes (queue row 340; D-2180: canonical Herdr app guidance; row 380: placement)
+  "tickmarkr-overseer/SKILL.md": 110592, // 107361 bytes (rows 362 and 367; D-2187 condition 5: Fleet seat recipe)
   "tickmarkr-overseer/references/context-supervision.md": 20480, // 16553 bytes
   "tickmarkr-overseer/references/evidence-discipline.md": 45056, // 41385 bytes
   "tickmarkr-overseer/references/pane-mechanics.md": 16384, // 13303 bytes

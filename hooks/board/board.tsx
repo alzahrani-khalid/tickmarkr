@@ -11,8 +11,9 @@ import type { AttemptLine, AttemptPart, RunSnapshot, TaskRow } from "./state"
  * `fit`: text characters per layout cell. Desktop measures the pane in its code font's advance but draws this text in a
  * narrower proportional font, so a line cut at the cell count ends well short of the edge.
  */
-export type BoardProps = { snap: RunSnapshot; error: string | null; fit?: number; marks?: 'glyph' | 'devicons' }
-type BoardState = { ticks: number; seen: number; live: boolean; sel: string | null; readAt: string; unreadSec: number; readTicks: number }
+/** `more` (queue row 408, D-2187 add.48 and add.49): the count of last tasks the board budget left out of `snap`. */
+export type BoardProps = { snap: RunSnapshot; error: string | null; fit?: number; marks?: 'glyph' | 'devicons'; more?: number }
+type BoardState = { ticks: number; seen: number; live: boolean; sel: string | null; readAt: string; unreadSec: number; readTicks: number; anchor: number }
 type Layout = 'wide' | 'medium' | 'narrow'
 type Mark = 'pass' | 'fail' | 'running' | 'queued' | 'pending'
 type Piece = { text: string; color?: string; bold?: boolean }
@@ -63,6 +64,19 @@ const clip = (s: string, n: number): string => (n <= 0 ? '' : len(s) > n ? [...s
 const dur = (sec: number): string => {
   const s = Math.max(0, Math.floor(sec))
   return s >= 3600 ? `${Math.floor(s / 3600)}h ${String(Math.floor((s % 3600) / 60)).padStart(2, '0')}m` : s >= 60 ? `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, '0')}s` : `${s}s`
+}
+/** Age of an ended run (queue row 393, D-2187 add.16): the frame clock minus endEpoch, floored. A negative difference reads `0m`. */
+const ageOf = (sec: number): string => {
+  const s = Math.max(0, Math.floor(sec))
+  if (s >= 48 * 3600) return `${Math.floor(s / 86400)}d`
+  if (s >= 3600) return `${Math.floor(s / 3600)}h`
+  return `${Math.floor(s / 60)}m`
+}
+/** Local `HH:MM` of an epoch, rounded the way the reader formats `readAt`. */
+const hmOf = (epoch: number): string => {
+  const d = new Date(Math.floor(Math.round(epoch * 1e6) / 1000))
+  const two = (n: number) => String(n).padStart(2, '0')
+  return `${two(d.getHours())}:${two(d.getMinutes())}`
 }
 const fill = (text: string, since: number | null | undefined, now: number): string => (since == null ? text : text.replace('{since}', dur(now - since)))
 const sentence = (s: string): string => s.toLowerCase().replace(/^\w/, c => c.toUpperCase())
@@ -173,19 +187,24 @@ const seats = (t: TaskRow, logos: BoardProps['marks']): Piece[] => {
     const tone = { color: s.active ? INK.warn : 'subtle', bold: s.active }
     const lead = { text: `${i ? ' · ' : ''}${s.role} `, ...tone }
     if (!s.id) return [{ ...lead, text: `${lead.text}…` }]
+    // queue row 393 (D-2187 add.16): an oracles judge is not a harness, so the seat has no mark
+    if (s.id === 'oracles') return [{ ...lead, text: `${lead.text}oracles` }]
     const { harness, model } = splitSeat(s.id)
     const m = markOf(harness, logos)
     return [lead, { text: m.glyph, color: m.color, bold: true }, ...(model ? [{ text: ` ${model}`, ...tone }] : [])]
   })
 }
 
-/** The harnesses seated anywhere in the run, in first-seen order, for the legend under the board. */
+/** The harnesses seated anywhere in the run, in first-seen order, for the legend under the board. `oracles` is not one (row 393, D-2187 add.16). */
 const harnessesOf = (s: RunSnapshot): string[] =>
-  [...new Set(s.tasks.flatMap(t => [t.worker, t.judge, t.reviewer]).filter(Boolean).map(id => splitSeat(id).harness))]
+  [...new Set(s.tasks.flatMap(t => [t.worker, t.judge, t.reviewer]).filter(id => id !== '' && id !== 'oracles').map(id => splitSeat(id).harness))]
+
+/** Queue row 398 (D-2187 add.24): a blocked task has not started either, so its pill and colour read as pending's. */
+const idle = (t: TaskRow): boolean => t.state === 'pending' || t.state === 'blocked'
 
 /** A pill's glyph, so the strip never reads by colour alone. */
 const pillGlyph = (t: TaskRow): string =>
-  t.state === 'done' ? '✔' : t.state === 'parked' ? '◍' : t.state === 'failed' ? '✖' : t.state === 'pending' ? '○' : t.suiteWaiting ? '◎' : '●'
+  t.state === 'done' ? '✔' : t.state === 'parked' ? '◍' : t.state === 'failed' ? '✖' : idle(t) ? '○' : t.suiteWaiting ? '◎' : '●'
 
 /** A bar of `frac` of `width` cells, its last cell in eighths so short durations still differ. */
 const EIGHTHS = ['', '▏', '▎', '▍', '▌', '▋', '▊', '▉']
@@ -212,13 +231,14 @@ const statusOf = (t: TaskRow): { word: string; color: string } =>
   t.state === 'done' ? { word: 'MERGED', color: INK.pass }
   : t.state === 'parked' ? { word: 'PARKED', color: INK.park }
   : t.state === 'failed' ? { word: 'FAILED', color: INK.fail }
+  : t.state === 'blocked' ? { word: 'BLOCKED', color: INK.fail } // row 398 (D-2187 add.24): stranded behind a stop
   : t.state === 'worker' ? { word: 'RUNNING', color: INK.warn }
   : t.state === 'gates' ? { word: 'VERIFYING', color: t.suiteWaiting ? INK.accent : INK.warn }
   : t.state === 'waiting' || /^waits on /.test(t.now) ? { word: 'WAITING', color: 'subtle' }
   : { word: 'QUEUED', color: 'subtle' }
 
 const stateColor = (t: TaskRow): string =>
-  t.state === 'done' ? INK.pass : t.state === 'parked' ? INK.park : t.state === 'failed' ? INK.fail : t.state === 'pending' ? 'subtle' : t.suiteWaiting ? INK.accent : INK.warn
+  t.state === 'done' ? INK.pass : t.state === 'parked' ? INK.park : t.state === 'failed' ? INK.fail : idle(t) ? 'subtle' : t.suiteWaiting ? INK.accent : INK.warn
 
 
 const featured = (s: RunSnapshot): TaskRow | undefined =>
@@ -233,7 +253,7 @@ const Board: ClientModule<JsonValue, BoardState> = (raw, surface: ClientSurface<
   // One step below body for the whole board, set once here so no Text can miss it; a Text that names a size keeps it.
   // The terminal has one size and ignores the step.
   const Text: typeof surface.elements.Text = p => surface.elements.Text({ size: TEXT_SIZE, ...p })
-  const { snap: s, error, fit = 1, marks: logos = 'glyph' } = raw as unknown as BoardProps
+  const { snap: s, error, fit = 1, marks: logos = 'glyph', more = 0 } = raw as unknown as BoardProps
   const live = s.ended === null
 
   // The frame clock counts time since the last read even for ended runs; live ticks keep their atEpoch-based meaning.
@@ -243,16 +263,20 @@ const Board: ClientModule<JsonValue, BoardState> = (raw, surface: ClientSurface<
       const cur = surface.state
       if (cur) surface.setState({ ...cur, ticks: cur.ticks + (cur.live ? 1 : 0), unreadSec: cur.unreadSec + 1 })
     })
-    st = { ticks: 0, seen: s.atEpoch, live, sel: null, readAt: s.readAt, unreadSec: 0, readTicks: 0 }
+    st = { ticks: 0, seen: s.atEpoch, live, sel: null, readAt: s.readAt, unreadSec: 0, readTicks: 0, anchor: Math.floor(Date.now() / 1000) }
     surface.setState(st)
   } else if (st.seen !== s.atEpoch || st.live !== live || st.readAt !== s.readAt) {
     const newRead = st.readAt !== s.readAt
     const ticks = st.seen !== s.atEpoch || st.live !== live ? 0 : st.ticks
-    st = { ...st, ticks, seen: s.atEpoch, live, readAt: s.readAt, unreadSec: newRead ? 0 : st.unreadSec, readTicks: newRead ? ticks : st.readTicks }
+    st = { ...st, ticks, seen: s.atEpoch, live, readAt: s.readAt, unreadSec: newRead ? 0 : st.unreadSec, readTicks: newRead ? ticks : st.readTicks, anchor: newRead ? Math.floor(Date.now() / 1000) : st.anchor }
     surface.setState(st)
   }
   const stale = st.unreadSec >= 30
   const now = s.atEpoch + (live ? stale ? st.readTicks : st.ticks : 0)
+  // queue row 393 (D-2187 add.16): atEpoch is the run's end once ended, so the age clock is wall time
+  // anchored at this read plus the frame timer. Live durations keep `now`.
+  const frame = st.anchor + st.unreadSec
+  const age = ageOf(frame - (s.endEpoch ?? frame))
   const cols = surface.columns
   const layout = layoutFor(cols)
   const W = Math.max(30, (cols || 110) - 2) // the room inside the 1-cell side padding
@@ -268,12 +292,14 @@ const Board: ClientModule<JsonValue, BoardState> = (raw, surface: ClientSurface<
   // green only when every clause of the green rule holds: empty buckets, tip verify passed, owed checks known and zero
   const life = stale ? { word: `STALE · read ${s.readAt}`, color: INK.warn } : s.ended
     ? {
-        word: s.ended.owed === null ? 'ENDED · owed unknown' : s.ended.owed > 0 ? `ENDED · owes ${s.ended.owed}` : 'ENDED',
+        word: `${s.ended.owed === null ? 'ENDED · owed unknown' : s.ended.owed > 0 ? `ENDED · owes ${s.ended.owed}` : 'ENDED'} · ended ${hmOf(s.endEpoch ?? s.atEpoch)} · ${age} ago`,
         color: s.ended.failed.length || s.ended.human.length || s.ended.blocked.length || s.ended.pending.length
           || s.ended.tipVerify !== 'passed' || s.ended.owed !== 0 ? INK.fail : INK.pass,
       }
     : s.alive ? { word: 'LIVE', color: INK.pass } : { word: 'DAEMON DOWN', color: INK.fail }
-  const eta = s.eta
+  // queue row 398 (D-2187 add.24): a run that cannot finish names its stopped roots instead of promising a time
+  const eta = s.eta?.cannotFinish ? `cannot finish · stopped by ${s.eta.stoppedBy.join(', ')}`
+    : s.eta
     ? `ETA ${dur(s.eta.cleanMin * 60).replace(/ 00s$/, '')} – ${dur(s.eta.oneRepairMin * 60).replace(/ 00s$/, '')}${s.eta.stoppedBy.length ? ` · clock stopped on ${s.eta.stoppedBy.join(', ')}` : ''}`
     : null
   const elapsed = s.startEpoch == null ? '' : `${dur((s.endEpoch ?? now) - s.startEpoch)} elapsed`
@@ -346,7 +372,8 @@ const Board: ClientModule<JsonValue, BoardState> = (raw, surface: ClientSurface<
               {timeOf(t).map((x, i) => <Text color="subtle">{(i ? ' · ' : '') + x}</Text>)}
             </Box>
             {t.state === 'done' ? null : <Text color={stateColor(t)} wrap="wrap">{nowOf(t)}</Text>}
-            {red && t.note ? <Text color={stateColor(t)} wrap="truncate-end">{clip(`↳ ${t.note}`, room)}</Text> : null}
+            {/* row 398 (D-2187 add.24): the reason is drawn once (no ↳ line when the now-sentence already carries it) and wraps whole */}
+            {red && t.note && !nowOf(t).includes(t.note) ? <Text color={stateColor(t)} wrap="wrap">{`↳ ${t.note}`}</Text> : null}
             {need ? (
               <Box key={`need-c-${t.id}`} flexDirection="row" columnGap={1}>
                 <Button key={`copy-${t.id}`} label="Copy" variant="primary" {...(copyKey ? { hotkey: 'c' } : {})} onPress={() => surface.post({ copy: need.cmd })} />
@@ -399,11 +426,15 @@ const Board: ClientModule<JsonValue, BoardState> = (raw, surface: ClientSurface<
           <Text color={life.color} bold>● {life.word}</Text>
         </Box>
         {stale ? <Text color={INK.warn}>not refreshed since {s.readAt} — /tickmarkr-board reloads it</Text> : null}
+        {s.ended ? <Text color={INK.warn}>{`no run live — showing the last run, ${s.runId}, ended ${age} ago`}</Text> : null}
+        {s.ended && s.supersededBy ? <Text color={INK.warn}>{`older than release ${s.supersededBy} — a newer run left no journal under these roots`}</Text> : null}
+        {/* queue row 398 (D-2187 add.24): one line per channel excluded run-wide; none without an entry */}
+        {(s.exclusions ?? []).map(x => <Text color={INK.warn}>{`excluded run-wide: ${x.channel} — ${x.cause} (journal line ${x.line})`}</Text>)}
         <Box key="head-2" flexDirection={layout === 'narrow' ? 'column' : 'row'} columnGap={1}>
           {[
             <Text color={INK.pass} bold>{done} of {s.tasks.length} merged</Text>,
             elapsed ? <Text color="subtle">{elapsed}</Text> : null,
-            eta ? <Text color="subtle">{eta}</Text> : null,
+            eta ? <Text color={s.eta?.cannotFinish ? INK.fail : 'subtle'}>{eta}</Text> : null,
           ].filter(x => x !== null).flatMap((x, i) => (i && layout !== 'narrow' ? [<Text color={INK.chrome}>│</Text>, x] : [x]))}
         </Box>
       </Box>
@@ -411,7 +442,7 @@ const Board: ClientModule<JsonValue, BoardState> = (raw, surface: ClientSurface<
       <Box key="strip" flexDirection="row" flexWrap="wrap" columnGap={1}>
         {s.tasks.map(t => (
           <Box key={`pill-${t.id}`} flexShrink={0}>
-            {t.state === 'pending'
+            {idle(t)
               ? <Text color="inactive">{` ${pillGlyph(t)} ${t.id} `}</Text>
               : <Text backgroundColor={stateColor(t)} color={INK.ink} bold>{` ${pillGlyph(t)} ${t.id} `}</Text>}
           </Box>
@@ -453,6 +484,8 @@ const Board: ClientModule<JsonValue, BoardState> = (raw, surface: ClientSurface<
       <Box key="tasks" flexDirection="row" flexWrap="wrap" columnGap={1}>
         {s.tasks.map(t => card(t, t.id === s.needsYou[0]?.task))}
       </Box>
+      {/* queue row 408 (D-2187 add.48 and add.49): the budget left the last tasks out; one line counts them */}
+      {more > 0 ? <Text key="more" color="subtle" wrap="truncate-end">{`+${more} more tasks (see tickmarkr status)`}</Text> : null}
 
       {s.ended ? (
         <Text bold wrap="truncate-end">

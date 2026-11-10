@@ -5,10 +5,11 @@ import { existsSync, readFileSync, readdirSync, realpathSync } from "node:fs";
 import { extname, join, normalize, resolve } from "node:path";
 import { detectPackageManager, turboContinueFindings } from "../../gates/baseline.js";
 import { version } from "./version.js";
-import { allAdapters, binaryShadowWarnings, detectCandidateClis, doctorAgeMs, flagDriftWarnings, formatDoctorProbeTimeoutNote, modelAliasExclusions, modelAliasLine, probeAll, probeModels, probeScope, type ProbeScopeOpts, readDoctor, resolveShellBinary, servableExclusions, servabilityLine, writeDoctor } from "../../adapters/registry.js";
+import { allAdapters, binaryShadowWarnings, detectCandidateClis, doctorAgeMs, flagDriftWarnings, formatDoctorProbeTimeoutNote, launchFaultFooters, modelAliasExclusions, modelAliasLine, probeAll, probeModels, probeScope, type ProbeScopeOpts, readDoctor, recordKimiDoctorTurn, resolveShellBinary, servableExclusions, servabilityLine, writeDoctor } from "../../adapters/registry.js";
 import { CLAUDE_ALIAS_IDENTITY_STAMPS, claudeCode, type ClaudeAlias, resolveClaudeAliasIdentity } from "../../adapters/claude-code.js";
-import { shq } from "../../adapters/types.js";
-import { BANNER, compactTokens, dim, fail, kvRow, legend, ok, rule, statusRow, title } from "../../brand.js";
+import { failedVerdictLabel, shq } from "../../adapters/types.js";
+import { confirmedClaudeProxy, containLines, containReport, type CredentialWithheld, credentialWithheldLine, gatewayCredential, type GatewaySeam, gatewayLine, gatewayNotes, listGateway, proxiedIdentityModels, proxiedIdentityResolver, recordGateway } from "../../adapters/cliproxy.js";
+import { BANNER, compactTokens, dim, fail, kvRow, legend, ok, rule, statusRow, title, warn } from "../../brand.js";
 import { graphPath, loadGraph, tickmarkrDir, stateDirName } from "../../graph/graph.js";
 import { catalogModelAdvisory, catalogTierRanking, declaredModelWindow, hasWindowsConfig, modelLints, modelListingLints, suggestOverlay, ttyVisual } from "../../adapters/model-lints.js";
 import { loadConfig, overlayPreferShapes } from "../../config/config.js";
@@ -22,11 +23,13 @@ import { kimi, type KimiDoctorTurnResult, probeKimiDoctorTurn } from "../../adap
 import { type CodexSandbox, recordCodexCommit } from "../../adapters/codex-commit-check.js";
 import { codex } from "../../adapters/codex.js";
 import { denyPreferCollisionLine, denyPreferCollisions, disallowedBy, excludedChannels, exclusionLine, observedSeat, preferRanks } from "../../route/preference.js";
-import { CATALOG_REFRESH_TIMEOUT_MS, LIVEBENCH_TABLE_DATE, formatCatalogRefreshLegs, readCachedCatalog, refreshCatalogCommand, type CatalogFetcher, type CatalogReadResult } from "../../adapters/catalog-remote.js";
+import { type DeadPreference, deadPreferences } from "../../route/seat-resolver.js";
+import { CATALOG_REFRESH_TIMEOUT_MS, LIVEBENCH_TABLE_DATE, formatCatalogRefreshLegs, readCachedCatalog, type CatalogFetcher, type CatalogReadResult } from "../../adapters/catalog-remote.js";
 import { sh, type ShResult } from "../../run/git.js";
 import { auditNamedTestOracles, listVitestTests, type VitestListResult } from "../../gates/acceptance.js";
 import { readReviewNoVerdictHistory, reviewNoVerdictRows } from "../../run/journal.js";
 import { checkModelDiscovery } from "../../adapters/model-discovery-check.js";
+import { askArtificialAnalysisKey, recordKeyPromptSkip, refreshCatalogWithAskedKey, type AskKeyOptions, type AskKeyResult } from "../ask-keys.js";
 import { LAUNCHSERVICES_PORT_ADVISORY, probeLaunchServicesPorts, recordLaunchServices } from "../../run/launchservices-check.js";
 
 /** Where a newer `table_<date>.csv` is discovered — the deployed site builds filenames by
@@ -39,6 +42,10 @@ const visual = () => process.stdout.isTTY === true && process.env.NO_COLOR === u
 const alignedStatusRow = (verdict: "pass" | "fail" | "warn", key: string, value: string) =>
   `  ${statusRow(verdict, kvRow(key, value).slice(2))}`;
 const attentionRow = (text: string) => `  ${statusRow("warn", text)}`;
+
+/** Queue rows 362 and 367 R2 (D-2187): the one DEAD line doctor and `fleet --print --why` print per dead entry. */
+export const deadPreferenceLine = ({ role, entry, disallowed: { by, entry: held } }: DeadPreference): string =>
+  `DEAD: ${role}.prefer entry ${entry} is disallowed for the ${role} seat by routing.${by} (${held}) — it is never chosen; remove it or the ${by} entry`;
 
 /** A capability row's verdict: installed; kimi also needs auth; missing health is not healthy.
  *  v2.6.6 T9 (K): a Codex sandbox escape is a BLOCKING security warning — never a passing row. */
@@ -107,6 +114,12 @@ export type DoctorOpts = {
   listTests?: (cwd: string) => Promise<VitestListResult>;
   /** Clock for model-knowledge lints (retirement notices, knowledge age); absent = the wall clock. */
   now?: () => Date;
+  /** Queue row 392 R6 (D-2187 add.11): gateway detection inputs and request transport. */
+  gateway?: GatewaySeam;
+  /** Queue row 367 Phase 2 (D-2187 add.18): the ask-once key prompt's seams. */
+  askKey?: AskKeyOptions;
+  /** init's own answer to that prompt: doctor called from init never asks again. */
+  askedKey?: AskKeyResult;
 };
 
 type OrcaCapability = { verdict: "pass" | "fail" | "warn"; detail: string };
@@ -1461,8 +1474,10 @@ export async function doctor(
   if (_argv.includes("--probe-preflight") || _argv.includes("--preflight")) {
     return doctorProbePreflight(cwd, loadConfig(cwd, { globalDir: opts.globalDir }), adapters, scopeOpts);
   }
+  // Queue row 367 Phase 2 (D-2187 add.18): this entry point asks once for a missing key; the refresh uses its answer.
+  const askedKey = opts.askedKey ?? await askArtificialAnalysisKey(_argv, { cwd, askAgain: _argv.includes("--ask-keys"), ...opts.askKey });
   if (_argv.length === 1 && (_argv[0] === "--refresh-catalog" || _argv[0] === "--catalog-only")) {
-    const refreshed = await refreshCatalogCommand({ repoRoot: cwd, fetcher: opts.catalogFetcher, now: opts.catalogNow });
+    const refreshed = await refreshCatalogWithAskedKey({ repoRoot: cwd, fetcher: opts.catalogFetcher, now: opts.catalogNow }, askedKey);
     return refreshed.updated
       ? `tickmarkr doctor --refresh-catalog: model catalog refreshed — ${formatCatalogRefreshLegs(refreshed.legs)}${refreshed.warning ? `; ${refreshed.warning}` : ""}`
       : `tickmarkr doctor --refresh-catalog: catalog refresh unavailable — ${formatCatalogRefreshLegs(refreshed.legs)}${refreshed.warning ? `; ${refreshed.warning}` : ""}`;
@@ -1483,12 +1498,12 @@ export async function doctor(
     || opts.catalogNow !== undefined
     || globalThis.fetch !== initialFetch;
   if (!opts.catalog && catalog.stale && catalogRefreshAllowed) {
-    const refreshed = await refreshCatalogCommand({
+    const refreshed = await refreshCatalogWithAskedKey({
       repoRoot: cwd,
       fetcher: opts.catalogFetcher,
       timeoutMs: CATALOG_REFRESH_TIMEOUT_MS,
       now: opts.catalogNow,
-    });
+    }, askedKey);
     catalog = refreshed.catalog;
     catalogRefreshLine = formatCatalogRefreshLegs(refreshed.legs);
   }
@@ -1496,7 +1511,12 @@ export async function doctor(
   if (opts.banner !== false && visual()) process.stdout.write(BANNER);
   // stderr, live: disclose the paid boundary before the first adapter/model call. The separate
   // --probe-preflight route exposes these same bytes without crossing that boundary.
-  console.error(`${doctorProbePreflight(cwd, cfg, adapters, scopeOpts)}\nprobing installed agent CLIs — one short LLM call per in-scope model, may take a minute...`);
+  // Queue row 392 R6 (D-2187 add.11): the one gateway request (no model call), only when a gateway is detected.
+  // It precedes the first printed line so every printed line and the FINAL doctor.json report pass the
+  // credential sink behind a confirmed proxy; without one the sink has no credential and every byte is the base.
+  const gateway = await listGateway(cfg, opts.gateway);
+  const credential = confirmedClaudeProxy(gateway) ? gatewayCredential(cfg, opts.gateway) : undefined;
+  console.error(containLines(`${doctorProbePreflight(cwd, cfg, adapters, scopeOpts)}\nprobing installed agent CLIs — one short LLM call per in-scope model, may take a minute...`, credential));
   const probeProgressTTY = process.stderr.isTTY === true;
   let health = await probeAll(adapters, { cwd });
   for (const [id, h] of Object.entries(health)) {
@@ -1519,6 +1539,7 @@ export async function doctor(
   const kimiTurnEnabled = kimiAdapter !== undefined
     && scope.some((c) => c.adapter === kimi.id && c.model === "kimi-code/k3")
     && (kimiAdapter === kimi || opts.kimiTurnProbe !== undefined);
+  let kimiTurnFailed = false;
   if (kimiTurnEnabled) {
     const h = health.kimi;
     if (h.installed && h.authed) {
@@ -1528,11 +1549,9 @@ export async function doctor(
       } catch (e) {
         turn = { ok: false, evidence: e instanceof Error ? e.message : String(e) };
       }
-      health.kimi = {
-        ...h,
-        authed: turn.ok,
-        note: `${h.note ? `${h.note}; ` : ""}${turn.ok ? turn.evidence : `model turn failed: ${turn.evidence}`}`,
-      };
+      // Rows 353 and 367 R3 (D-2187 condition 2): the turn model's verdict records the failure; authed stays.
+      health.kimi = recordKimiDoctorTurn(h, turn);
+      kimiTurnFailed = !turn.ok;
     }
   }
   await recordCodexCommit(adapters, health, cwd, opts.codexSandbox);
@@ -1566,7 +1585,7 @@ export async function doctor(
   }
   // A free Kimi auth failure or failed earned-green turn must not spend more probes. Every other
   // adapter keeps the exact existing model-sweep path.
-  const modelProbeAdapters = kimiTurnEnabled && health.kimi.authed === false
+  const modelProbeAdapters = kimiTurnEnabled && (health.kimi.authed === false || kimiTurnFailed)
     ? adapters.filter((a) => a !== kimiAdapter)
     : adapters;
   // One rewriting stderr line instead of a scrolling line per model (operator report 2026-08-14:
@@ -1577,14 +1596,17 @@ export async function doctor(
     ? (adapter, model, status, durationMs) => {
       if (status === "ok") probeOk += 1;
       else probeBad += 1;
-      process.stderr.write(`\r\x1b[2K  probed ${probeOk + probeBad} channels · ${probeOk} ok${probeBad ? ` · ${probeBad} failed` : ""} · ${adapter}:${model} ${status} (${(durationMs / 1000).toFixed(1)}s)`);
+      process.stderr.write(containLines(`\r\x1b[2K  probed ${probeOk + probeBad} channels · ${probeOk} ok${probeBad ? ` · ${probeBad} failed` : ""} · ${adapter}:${model} ${status} (${(durationMs / 1000).toFixed(1)}s)`, credential));
     }
     : undefined, scopeOpts);
   if (probeProgressTTY && probeOk + probeBad > 0) {
     process.stderr.write(`\r\x1b[2K  probed ${probeOk + probeBad} channels · ${probeOk} ok${probeBad ? ` · ${probeBad} failed` : ""}\n`);
   }
-  const identityResolver = opts.resolveClaudeAliasIdentity
-    ?? (adapters.some((a) => a.id === claudeCode.id) ? resolveClaudeAliasIdentity : undefined);
+  // Queue row 392 R6 law 3: behind a confirmed proxy EVERY configured claude-code model, in any classified family.
+  const claudeProxy = adapters.some((a) => a.id === claudeCode.id) ? confirmedClaudeProxy(gateway) : undefined;
+  const identityResolver = claudeProxy
+    ? proxiedIdentityResolver(cfg, opts.gateway)
+    : opts.resolveClaudeAliasIdentity ?? (adapters.some((a) => a.id === claudeCode.id) ? resolveClaudeAliasIdentity : undefined);
   const aliasDriftFindings: string[] = [];
   // Single pre-write snapshot of the resolver's outcome per alias (including undefined/failure).
   // Catalog rendering below reads only this map — never calls the resolver again — so a transient
@@ -1593,16 +1615,19 @@ export async function doctor(
   const resolvedIdentitySnapshot: Partial<Record<ClaudeAlias, string | undefined>> = {};
   if (identityResolver && health["claude-code"]?.installed) {
     const configured = cfg.tiers["claude-code"]?.models ?? {};
-    for (const [alias, stampedIdentity] of Object.entries(CLAUDE_ALIAS_IDENTITY_STAMPS) as [ClaudeAlias, string][]) {
+    const models = claudeProxy ? proxiedIdentityModels(cfg) : Object.keys(CLAUDE_ALIAS_IDENTITY_STAMPS);
+    for (const alias of models as ClaudeAlias[]) {
       if (!(alias in configured) || !scope.some((c) => c.adapter === claudeCode.id && c.model === alias)) continue;
+      const stampedIdentity: string | undefined = Object.hasOwn(CLAUDE_ALIAS_IDENTITY_STAMPS, alias) ? CLAUDE_ALIAS_IDENTITY_STAMPS[alias] : undefined;
+      const stamped = stampedIdentity !== undefined;
       let resolvedIdentity: string | undefined;
       try {
         resolvedIdentity = identityResolver(cwd, alias);
       } catch {
-        resolvedIdentitySnapshot[alias] = undefined;
+        if (stamped) resolvedIdentitySnapshot[alias] = undefined;
         continue; // advisory source failure is unknown, never a doctor failure
       }
-      resolvedIdentitySnapshot[alias] = resolvedIdentity;
+      if (stamped) resolvedIdentitySnapshot[alias] = resolvedIdentity;
       if (resolvedIdentity) {
         if (!health["claude-code"].modelAuth) {
           health["claude-code"].modelAuth = {};
@@ -1616,7 +1641,7 @@ export async function doctor(
           identity: resolvedIdentity,
         };
       }
-      if (resolvedIdentity && resolvedIdentity !== stampedIdentity) {
+      if (stamped && resolvedIdentity && resolvedIdentity !== stampedIdentity) {
         aliasDriftFindings.push(
           `resolved-identity drift: claude-code:${alias} resolved to ${resolvedIdentity}, stamped identity ${stampedIdentity} — reclassify per benchmark policy (advisory — routing unchanged)`,
         );
@@ -1630,16 +1655,28 @@ export async function doctor(
   const launchServices = await recordLaunchServices(readDoctor(cwd), health, portProbe.observation);
   // Only scoped runs merge with the prior report. A full refresh must not revive
   // adapters absent from this run (for example, a no-longer-registered CLI).
-  writeDoctor(cwd, launchServices.health, explicitSelection && !scopeOpts.all ? scope : undefined);
+  let withheld: CredentialWithheld[] = [];
+  writeDoctor(cwd, launchServices.health, explicitSelection && !scopeOpts.all ? scope : undefined, (report) => {
+    const sunk = containReport(report, credential);
+    withheld = sunk.withheld;
+    return sunk.report;
+  });
   // A scoped probe's report must use the merged verdict set it just wrote. In particular,
   // an unselected judge or consult adapter is not missing merely because it was not probed.
   if (explicitSelection && !scopeOpts.all) health = readDoctor(cwd) ?? health;
+  else health = containReport(health, credential).report;
+  recordGateway(cwd, gateway);
+  recordKeyPromptSkip(cwd, askedKey); // row 367 Phase 2 (D-2187 add.18): the skip record outlives this rewrite
   const rows = adapters.map((a) => {
     const h = health[a.id];
     // OBS-503: a crash-on-version verdict carries its reason in note — print it instead of the lie.
     const state = !h.installed ? (h.note ?? "not installed") : `${h.version ?? "installed"}${h.note ? ` (${h.note})` : ""}`;
     return alignedStatusRow(adapterHealthy(a.id, h) ? "pass" : "fail", a.id, state);
   });
+  // A failed listing, or one withheld for carrying the credential, is shown and never fatal: the exit code is unchanged.
+  if (gateway) rows.push(`  ${statusRow("listing" in gateway && gateway.listing.status === "succeeded" ? "pass" : "warn", gatewayLine(gateway))}`);
+  for (const note of gatewayNotes(gateway, cfg, health, opts.gateway)) rows.push(`  ${statusRow("warn", note)}`);
+  for (const w of withheld) rows.push(`  ${statusRow("warn", credentialWithheldLine(w))}`);
   const ports = portProbe.ports;
   const portLine = ports.status === "non-darwin" ? "launchservicesd ports: not applicable"
     : ports.status === "read" ? `launchservicesd pid ${ports.pid}: ${ports.count} ports`
@@ -1785,6 +1822,9 @@ export async function doctor(
   const excluded = excludedChannels(cfg, adapters, health);
   if (excluded.length) lintRows.push(attentionRow(exclusionLine(excluded, listAllModels)));
   lintRows.push(...denyPreferCollisions(cfg, undefined, health).map((c) => attentionRow(denyPreferCollisionLine(c))));
+  // ponytail: an adapter that declares no channels configures none, so it cannot hold a dead entry
+  lintRows.push(...deadPreferences(cfg, adapters.filter((a) => typeof a.channels === "function"), health)
+    .map((d) => attentionRow(deadPreferenceLine(d))));
   const aliasExcluded = modelAliasExclusions(cfg, adapters, health);
   if (aliasExcluded.length) lintRows.push(attentionRow(modelAliasLine(aliasExcluded)));
   lintRows.push(...binaryShadowWarnings(adapters, health, cwd).map(attentionRow));
@@ -1868,7 +1908,7 @@ export async function doctor(
           ? `${ok("authed")}${probed}`
           : v.cause === "unknown-model"
           ? `${fail(`${m} is not served by ${a.id}`)} (${dateOf(v.probedAt)})`
-          : `${fail("unauthed:")} ${trunc(v.reason ?? "probe failed", 40)} (${dateOf(v.probedAt)})`;
+          : `${(v.failure ? warn : fail)(`${failedVerdictLabel(v.failure)}:`)} ${trunc(v.reason ?? "probe failed", 40)} (${dateOf(v.probedAt)})`;
       const d = disallowedBy(observedSeat(health, a.id, m), cfg.routing);
       const denied = d?.by === "deny" ? d.entry : "—";
       const pref = preferRanks({ adapter: a.id, model: m }, cfg).map((p) => `${p.shape}#${p.rank}`).join(",") || "—";
@@ -1911,8 +1951,9 @@ export async function doctor(
     }
     return rows;
   });
+  const faultFooters = launchFaultFooters(cfg, health, adapters).map((line) => `\n${attentionRow(line)}`).join("");
   const modelSummary = modelStatus.length
-    ? `\n${legend("model status:")}\n${modelStatus.join("\n")}`
+    ? `\n${legend("model status:")}\n${modelStatus.join("\n")}${faultFooters}`
     : "";
   const header = visual()
     ? `${statusRow("pass", `${title("tickmarkr doctor")} ${legend("· capability matrix")}`)}\n${rule()}`
@@ -1926,12 +1967,12 @@ export async function doctor(
       ...(lintRows.length ? [`${lintRows.length} advisory lint${lintRows.length === 1 ? "" : "s"}`] : []),
       "model matrix",
     ].join(" and ");
-    return `${header}\n${rows.join("\n")}\n  ${dim(`${elided} elided — \`tickmarkr doctor\` prints them in full${drift ? "; drift overlay written" : ""}`)}\nwrote ${stateDirName(cwd)}/doctor.json`;
+    return containLines(`${header}\n${rows.join("\n")}\n  ${dim(`${elided} elided — \`tickmarkr doctor\` prints them in full${drift ? "; drift overlay written" : ""}`)}\nwrote ${stateDirName(cwd)}/doctor.json`, credential);
   }
   // Attention rows earn a counted section header so the matrix, the lints, and the model table
   // read as three sections instead of one undifferentiated wall (operator report 2026-08-14).
   const lintSection = lintRows.length
     ? `\n${legend(`attention (${lintRows.length}):`)}\n${lintRows.join("\n")}`
     : "";
-  return `${header}\n${rows.join("\n")}${lintSection}${modelSummary}${drift}\nwrote ${stateDirName(cwd)}/doctor.json`;
+  return containLines(`${header}\n${rows.join("\n")}${lintSection}${modelSummary}${drift}\nwrote ${stateDirName(cwd)}/doctor.json`, credential);
 }

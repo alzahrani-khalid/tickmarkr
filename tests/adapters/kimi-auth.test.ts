@@ -13,7 +13,8 @@ vi.mock("../../src/run/git.js", () => ({ sh: vi.fn() }));
 import { spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { sh } from "../../src/run/git.js";
-import { invalidConfiguredModels, modelAliasExclusions } from "../../src/adapters/registry.js";
+import { invalidConfiguredModels, modelAliasExclusions, recordKimiDoctorTurn } from "../../src/adapters/registry.js";
+import type { AuthHealth } from "../../src/adapters/types.js";
 
 const nowMs = Date.parse("2026-07-17T12:00:00Z");
 
@@ -65,10 +66,58 @@ describe("OBS-141 kimi doctor turn", () => {
       stderr: "[config.invalid] Model \"kimi-code/k3\" is not configured in config.toml",
     });
 
-    await expect(probeKimiDoctorTurn("/repo")).resolves.toEqual({
+    await expect(probeKimiDoctorTurn("/repo")).resolves.toMatchObject({
       ok: false,
       evidence: "[config.invalid] Model \"kimi-code/k3\" is not configured in config.toml",
     });
+  });
+
+  // Queue rows 353 and 367 R3 (D-2187 condition 2): the REAL turn, fed raw runner results through its one
+  // injected seam (sh), carries exit code, separate streams and the timer fact to the shared classifier.
+  test("the real kimi doctor turn fed a raw runner timeout records its class and leaves the adapter signed in while timeout text without a timer kill does not", async () => {
+    const fs = await vi.importActual<typeof import("node:fs")>("node:fs");
+    const fixture = (cell: string, stream: string) =>
+      fs.readFileSync(join(__dirname, "..", "fixtures", "probe-failures", "2026-11-08", `${cell}.${stream}`), "utf8");
+    const signedIn: AuthHealth = {
+      installed: true, authed: true, version: "0.29.0", models: [], note: "auth file valid",
+      modelAuth: { "kimi-code/other": { authed: true, probedAt: "2026-11-08T00:00:00.000Z" } },
+    };
+    const turn = async (runner: { code: number; stdout: string; stderr: string; timedOut?: boolean }) => {
+      mockedSh.mockResolvedValueOnce(runner);
+      const result = await probeKimiDoctorTurn("/repo");
+      return { result, health: recordKimiDoctorTurn(signedIn, result, "2026-11-08T12:00:00.000Z") };
+    };
+
+    // The runner's timer kill: the turn model records a timeout; the adapter stays signed in.
+    const timedOut = await turn({ code: 142, stdout: "", stderr: fixture("timeout-stdin-held", "stderr"), timedOut: true });
+    expect(timedOut.result).toMatchObject({ ok: false, runner: { code: 142, timedOut: true } });
+    expect(timedOut.result.runner?.stderr).toBe(fixture("timeout-stdin-held", "stderr"));
+    expect(timedOut.health.authed).toBe(true);
+    expect(timedOut.health.modelAuth?.["kimi-code/k3"]).toMatchObject({ authed: false, failure: "timeout", probedAt: "2026-11-08T12:00:00.000Z" });
+    expect(timedOut.health.modelAuth?.["kimi-code/k3"]?.reason).toContain("60000ms");
+    expect(timedOut.health.modelAuth?.["kimi-code/other"]).toEqual(signedIn.modelAuth!["kimi-code/other"]);
+    expect(timedOut.health.note).toContain("model turn failed: turn timed out after 60000ms");
+
+    // The captured launch-fault text with a nonzero exit is a launch fault, on stderr only.
+    const launch = await turn({ code: 1, stdout: "", stderr: fixture("launch-fault-argv-claude", "stderr") });
+    expect(launch.health.authed).toBe(true);
+    expect(launch.health.modelAuth?.["kimi-code/k3"]).toMatchObject({
+      authed: false, failure: "launch-fault", reason: "error: unknown option '--tickmarkr-no-such-flag'",
+    });
+
+    // Bait: timeout text on stderr, exit 1, no timer kill — not a timeout; the base classification.
+    const bait = await turn({ code: 1, stdout: "", stderr: "turn timed out after 60000ms\nprobe timed out after 60000ms\n" });
+    expect(bait.result.runner?.timedOut).toBeUndefined();
+    expect(bait.health.authed).toBe(true);
+    const baitVerdict = bait.health.modelAuth?.["kimi-code/k3"];
+    expect(baitVerdict).toMatchObject({ authed: false, reason: "turn timed out after 60000ms probe timed out after 60000ms" });
+    expect(baitVerdict?.failure).toBeUndefined();
+    expect(baitVerdict?.cause).toBeUndefined();
+
+    // Control: a successful turn is as at the base — no verdict written, the flag and the note as before.
+    const success = await turn({ code: 0, stdout: "• OK\n", stderr: "" });
+    expect(success.result).toEqual({ ok: true, evidence: "model turn returned OK with kimi-code/k3" });
+    expect(success.health).toEqual({ ...signedIn, note: "auth file valid; model turn returned OK with kimi-code/k3" });
   });
 });
 

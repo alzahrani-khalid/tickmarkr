@@ -133,7 +133,7 @@ const basisScore = (evidence: CatalogModelEvidence, basis: RankedBasis): number 
 const priceTier = (outputPerMtok: number): Tier => outputPerMtok >= 12 ? "frontier" : outputPerMtok >= 2 ? "mid" : "cheap";
 const round1 = (n: number): number => Math.round(n * 10) / 10;
 
-function catalogEvidenceFor(
+export function catalogEvidenceFor(
   cfg: TickmarkrConfig,
   catalog: CatalogReadResult,
   row: CatalogAdvisoryRow,

@@ -73,11 +73,13 @@ describe("plan per-task callback", () => {
       shape: "chore",
       acceptance: 2,
       worker: { adapter: "fake", model: "fake-1", channel: "sub", tier: "frontier" },
-      judge: "fake:fake-1",
+      // Rows 362 and 367 R5 (D-2187): the configured judge fake:fake-1 is the routed author, so the run's
+      // judge — and plan's — is the seat resolver's independent pick, as at the base.
+      judge: "fake:fake-2",
       review: "fake:fake-2 — reviewPolicy full",
     });
     // The seat strings are exactly what plan prints after "judge: " / "review: ", minus the cost suffix.
-    expect(out).toContain(`    judge: ${routed!.judge}\n`);
+    expect(out).toContain(`    judge: ${routed!.judge} ~$`);
     expect(out).toContain(`    review: ${routed!.review} ~$`);
 
     expect(unroutable!.worker).toBeUndefined();

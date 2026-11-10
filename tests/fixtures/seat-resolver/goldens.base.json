@@ -1,0 +1,604 @@
+{
+  "s01-healthy-default": {
+    "pick": {
+      "worker": {
+        "refused": "missing-prefer",
+        "code": 1
+      },
+      "consult": {
+        "adapter": "alpha",
+        "model": "a-hi",
+        "vendor": "va",
+        "channel": "sub"
+      }
+    },
+    "review": {
+      "reviewer": "gamma:c-hi",
+      "seat": 1,
+      "count": 2
+    },
+    "consult": {
+      "seats": [
+        "alpha:a-hi",
+        "beta:b-hi",
+        "gamma:c-hi"
+      ],
+      "action": "human",
+      "notes": "consult verdict unparseable — failing safe to human"
+    },
+    "judge": {
+      "seats": [
+        "gamma:c-hi",
+        "alpha:a-hi"
+      ],
+      "pass": false
+    }
+  },
+  "s02-judge-pin-is-the-author": {
+    "pick": {
+      "worker": {
+        "refused": "missing-prefer",
+        "code": 1
+      },
+      "consult": {
+        "adapter": "alpha",
+        "model": "a-hi",
+        "vendor": "va",
+        "channel": "sub"
+      }
+    },
+    "review": {
+      "reviewer": "gamma:c-hi",
+      "seat": 1,
+      "count": 2
+    },
+    "consult": {
+      "seats": [
+        "alpha:a-hi",
+        "beta:b-hi",
+        "gamma:c-hi"
+      ],
+      "action": "human",
+      "notes": "consult verdict unparseable — failing safe to human"
+    },
+    "judge": {
+      "seats": [
+        "alpha:a-hi",
+        "gamma:c-hi"
+      ],
+      "pass": false
+    }
+  },
+  "s03-judge-pin-same-vendor-as-author": {
+    "pick": {
+      "worker": {
+        "refused": "missing-prefer",
+        "code": 1
+      },
+      "consult": {
+        "adapter": "alpha",
+        "model": "a-hi",
+        "vendor": "va",
+        "channel": "sub"
+      }
+    },
+    "review": {
+      "reviewer": "gamma:c-hi",
+      "seat": 1,
+      "count": 2
+    },
+    "consult": {
+      "seats": [
+        "alpha:a-hi",
+        "beta:b-hi",
+        "gamma:c-hi"
+      ],
+      "action": "human",
+      "notes": "consult verdict unparseable — failing safe to human"
+    },
+    "judge": {
+      "seats": [
+        "alpha:a-hi",
+        "gamma:c-hi"
+      ],
+      "pass": false
+    }
+  },
+  "s04-judge-pin-denied-by-model": {
+    "pick": {
+      "worker": {
+        "refused": "missing-prefer",
+        "code": 1
+      },
+      "consult": {
+        "adapter": "beta",
+        "model": "b-hi",
+        "vendor": "vb",
+        "channel": "api"
+      }
+    },
+    "review": {
+      "reviewer": "gamma:c-hi",
+      "seat": 1,
+      "count": 1
+    },
+    "consult": {
+      "seats": [
+        "beta:b-hi",
+        "gamma:c-hi"
+      ],
+      "action": "human",
+      "notes": "consult verdict unparseable — failing safe to human"
+    },
+    "judge": {
+      "seats": [],
+      "pass": false,
+      "details": "judge alpha:a-hi is disallowed by routing.deny (a-hi) — remove the deny entry or re-point cfg.judge at an allowed channel"
+    }
+  },
+  "s05-judge-pin-unknown-vendor": {
+    "pick": {
+      "worker": {
+        "refused": "missing-prefer",
+        "code": 1
+      },
+      "consult": {
+        "adapter": "alpha",
+        "model": "a-hi",
+        "vendor": "va",
+        "channel": "sub"
+      }
+    },
+    "review": {
+      "reviewer": "gamma:c-hi",
+      "seat": 1,
+      "count": 2
+    },
+    "consult": {
+      "seats": [
+        "alpha:a-hi",
+        "beta:b-hi",
+        "gamma:c-hi"
+      ],
+      "action": "human",
+      "notes": "consult verdict unparseable — failing safe to human"
+    },
+    "judge": {
+      "seats": [
+        "alpha:a-hi",
+        "gamma:c-hi"
+      ],
+      "pass": false
+    }
+  },
+  "s06-no-independent-judge-left": {
+    "pick": {
+      "worker": {
+        "refused": "missing-prefer",
+        "code": 1
+      },
+      "consult": {
+        "adapter": "beta",
+        "model": "b-hi",
+        "vendor": "vb",
+        "channel": "api"
+      }
+    },
+    "review": {
+      "reviewer": null
+    },
+    "consult": {
+      "seats": [
+        "beta:b-hi"
+      ],
+      "action": "human",
+      "notes": "consult verdict unparseable — failing safe to human"
+    },
+    "judge": {
+      "seats": [
+        "beta:b-mid",
+        "beta:b-hi"
+      ],
+      "pass": false
+    }
+  },
+  "s07-first-preference-adapter-unauthed": {
+    "pick": {
+      "worker": {
+        "refused": "missing-prefer",
+        "code": 1
+      },
+      "consult": {
+        "adapter": "beta",
+        "model": "b-hi",
+        "vendor": "vb",
+        "channel": "api"
+      }
+    },
+    "review": {
+      "reviewer": "gamma:c-hi",
+      "seat": 1,
+      "count": 1
+    },
+    "consult": {
+      "seats": [
+        "beta:b-hi",
+        "gamma:c-hi"
+      ],
+      "action": "human",
+      "notes": "consult verdict unparseable — failing safe to human"
+    },
+    "judge": {
+      "seats": [
+        "gamma:c-hi",
+        "beta:b-hi"
+      ],
+      "pass": false
+    }
+  },
+  "s08-first-preference-model-unauthed": {
+    "pick": {
+      "worker": {
+        "refused": "missing-prefer",
+        "code": 1
+      },
+      "consult": {
+        "adapter": "beta",
+        "model": "b-hi",
+        "vendor": "vb",
+        "channel": "api"
+      }
+    },
+    "review": {
+      "reviewer": "gamma:c-hi",
+      "seat": 1,
+      "count": 1
+    },
+    "consult": {
+      "seats": [
+        "beta:b-hi",
+        "gamma:c-hi"
+      ],
+      "action": "human",
+      "notes": "consult verdict unparseable — failing safe to human"
+    },
+    "judge": {
+      "seats": [
+        "gamma:c-hi",
+        "alpha:a-mid"
+      ],
+      "pass": false
+    }
+  },
+  "s09-first-preference-not-installed": {
+    "pick": {
+      "worker": {
+        "refused": "missing-prefer",
+        "code": 1
+      },
+      "consult": {
+        "adapter": "alpha",
+        "model": "a-hi",
+        "vendor": "va",
+        "channel": "sub"
+      }
+    },
+    "review": {
+      "reviewer": "alpha:a-hi",
+      "seat": 1,
+      "count": 1
+    },
+    "consult": {
+      "seats": [
+        "alpha:a-hi",
+        "gamma:c-hi"
+      ],
+      "action": "human",
+      "notes": "consult verdict unparseable — failing safe to human"
+    },
+    "judge": {
+      "seats": [
+        "gamma:c-hi",
+        "alpha:a-hi"
+      ],
+      "pass": false
+    }
+  },
+  "s10-no-preference-eligible-pin-fallback": {
+    "pick": {
+      "worker": {
+        "refused": "missing-prefer",
+        "code": 1
+      },
+      "consult": {
+        "refused": "no-eligible-preferred-channel",
+        "code": 1
+      }
+    },
+    "review": {
+      "reviewer": "alpha:a-hi",
+      "seat": 1,
+      "count": 2
+    },
+    "consult": {
+      "seats": [
+        "gamma:c-hi"
+      ],
+      "action": "human",
+      "notes": "consult verdict unparseable — failing safe to human"
+    },
+    "judge": {
+      "seats": [
+        "gamma:c-hi",
+        "alpha:a-hi"
+      ],
+      "pass": false
+    }
+  },
+  "s11-missing-prefer": {
+    "pick": {
+      "worker": {
+        "refused": "missing-prefer",
+        "code": 1
+      },
+      "consult": {
+        "refused": "missing-prefer",
+        "code": 1
+      }
+    },
+    "review": {
+      "reviewer": "alpha:a-hi",
+      "seat": 1,
+      "count": 2
+    },
+    "consult": {
+      "seats": [
+        "gamma:c-hi"
+      ],
+      "action": "human",
+      "notes": "consult verdict unparseable — failing safe to human"
+    },
+    "judge": {
+      "seats": [
+        "gamma:c-hi",
+        "alpha:a-hi"
+      ],
+      "pass": false
+    }
+  },
+  "s12-worker-only-deny-keeps-seats": {
+    "pick": {
+      "worker": {
+        "refused": "missing-prefer",
+        "code": 1
+      },
+      "consult": {
+        "adapter": "alpha",
+        "model": "a-hi",
+        "vendor": "va",
+        "channel": "sub"
+      }
+    },
+    "review": {
+      "reviewer": "gamma:c-hi",
+      "seat": 1,
+      "count": 2
+    },
+    "consult": {
+      "seats": [
+        "alpha:a-hi",
+        "beta:b-hi",
+        "gamma:c-hi"
+      ],
+      "action": "human",
+      "notes": "consult verdict unparseable — failing safe to human"
+    },
+    "judge": {
+      "seats": [
+        "gamma:c-hi",
+        "alpha:a-hi"
+      ],
+      "pass": false
+    }
+  },
+  "s13-excluded-vendor": {
+    "pick": {
+      "worker": {
+        "refused": "missing-prefer",
+        "code": 1
+      },
+      "consult": {
+        "adapter": "beta",
+        "model": "b-hi",
+        "vendor": "vb",
+        "channel": "api"
+      }
+    },
+    "review": {
+      "reviewer": "gamma:c-hi",
+      "seat": 1,
+      "count": 1
+    },
+    "consult": {
+      "seats": [
+        "alpha:a-hi",
+        "beta:b-hi",
+        "gamma:c-hi"
+      ],
+      "action": "human",
+      "notes": "consult verdict unparseable — failing safe to human"
+    },
+    "judge": {
+      "seats": [
+        "gamma:c-hi",
+        "alpha:a-hi"
+      ],
+      "pass": false
+    }
+  },
+  "s14-floor-history-demoted": {
+    "pick": {
+      "worker": {
+        "refused": "missing-prefer",
+        "code": 1
+      },
+      "consult": {
+        "adapter": "alpha",
+        "model": "a-hi",
+        "vendor": "va",
+        "channel": "sub"
+      }
+    },
+    "review": {
+      "reviewer": "gamma:c-hi",
+      "seat": 1,
+      "count": 2
+    },
+    "consult": {
+      "seats": [
+        "alpha:a-hi",
+        "beta:b-hi",
+        "gamma:c-hi"
+      ],
+      "action": "human",
+      "notes": "consult verdict unparseable — failing safe to human"
+    },
+    "judge": {
+      "seats": [
+        "gamma:c-hi",
+        "alpha:a-hi"
+      ],
+      "pass": false
+    }
+  },
+  "s15-carried-authors": {
+    "pick": {
+      "worker": {
+        "refused": "missing-prefer",
+        "code": 1
+      },
+      "consult": {
+        "adapter": "alpha",
+        "model": "a-hi",
+        "vendor": "va",
+        "channel": "sub"
+      }
+    },
+    "review": {
+      "reviewer": "alpha:a-hi",
+      "seat": 1,
+      "count": 1
+    },
+    "consult": {
+      "seats": [
+        "alpha:a-hi",
+        "beta:b-hi",
+        "gamma:c-hi"
+      ],
+      "action": "human",
+      "notes": "consult verdict unparseable — failing safe to human"
+    },
+    "judge": {
+      "seats": [
+        "alpha:a-hi",
+        "alpha:a-mid"
+      ],
+      "pass": false
+    }
+  },
+  "s16-every-consult-seat-denied": {
+    "pick": {
+      "worker": {
+        "refused": "missing-prefer",
+        "code": 1
+      },
+      "consult": {
+        "refused": "no-eligible-preferred-channel",
+        "code": 1
+      }
+    },
+    "review": {
+      "reviewer": null
+    },
+    "consult": {
+      "seats": [],
+      "action": "human",
+      "notes": "every consult seat is disallowed by routing.deny (c-hi) — failing safe to human"
+    },
+    "judge": {
+      "seats": [],
+      "pass": false,
+      "details": "judge gamma:c-hi is disallowed by routing.deny (c-hi) — remove the deny entry or re-point cfg.judge at an allowed channel"
+    }
+  },
+  "s17-adapter-form-review-prefer": {
+    "pick": {
+      "worker": {
+        "refused": "missing-prefer",
+        "code": 1
+      },
+      "consult": {
+        "adapter": "beta",
+        "model": "b-mid",
+        "vendor": "vb",
+        "channel": "sub"
+      }
+    },
+    "review": {
+      "reviewer": "alpha:a-hi",
+      "seat": 1,
+      "count": 2
+    },
+    "consult": {
+      "seats": [
+        "beta:b-mid",
+        "alpha:a-hi",
+        "gamma:c-hi"
+      ],
+      "action": "human",
+      "notes": "consult verdict unparseable — failing safe to human"
+    },
+    "judge": {
+      "seats": [
+        "gamma:c-hi",
+        "alpha:a-hi"
+      ],
+      "pass": false
+    }
+  },
+  "s18-exclude-list-and-mid-author": {
+    "pick": {
+      "worker": {
+        "refused": "missing-prefer",
+        "code": 1
+      },
+      "consult": {
+        "adapter": "alpha",
+        "model": "a-hi",
+        "vendor": "va",
+        "channel": "sub"
+      }
+    },
+    "review": {
+      "reviewer": "beta:b-hi",
+      "seat": 1,
+      "count": 2
+    },
+    "consult": {
+      "seats": [
+        "alpha:a-hi",
+        "beta:b-hi",
+        "gamma:c-hi"
+      ],
+      "action": "human",
+      "notes": "consult verdict unparseable — failing safe to human"
+    },
+    "judge": {
+      "seats": [
+        "gamma:c-hi",
+        "beta:b-hi"
+      ],
+      "pass": false
+    }
+  }
+}

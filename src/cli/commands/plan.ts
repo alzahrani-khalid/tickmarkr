@@ -16,6 +16,8 @@ import { disallowedBy, excludedChannels, exclusionLine, observedSeat, routingEnt
 import { decayWeight, HALF_LIFE_RUNS, staffLedEvidence } from "../../route/profile.js";
 import { resolvedFloor, route, RoutingError } from "../../route/router.js";
 import { auditNamedTestOracles, listVitestTests, type VitestListResult } from "../../gates/acceptance.js";
+import { deadPreferences, isIndependentJudge, resolveSeats, type SeatSkip } from "../../route/seat-resolver.js";
+import { deadPreferenceLine } from "./doctor.js";
 import { carriedAuthorVendors, gateReviewerFloor, modelId, modelProvider, pickReviewer } from "../../gates/review.js";
 import { Journal, loadRoutingProfile, readProfileCursor, recordedGraphDefinitionHash, RUNS_WINDOW, type JournalEvent } from "../../run/journal.js";
 import { harnessLine, resolveHarness } from "../harness.js";
@@ -428,12 +430,20 @@ export async function plan(
 
   let cost = 0;
   const seatCost = (seat: BillingChannel | undefined): number => seat?.channel === "api" ? cfg.pricing[seat.tier] : 0;
-  const judgeSeat = (task: Task): { line: string; cost: number } => {
+  // Rows 362 and 367 R5 (D-2187 condition 5): the run's primary judge for this task's routed author, from
+  // the one seat resolver (run-gates' request), annotated as the run annotates a not-independent judge.
+  const judgeSeats = [...pools.judge, ...pools.review];
+  const judgeSeat = (task: Task, author: Assignment): { line: string; cost: number } => {
     const shapeGates = cfg.gates.byShape?.[task.shape];
     if (!task.gates.includes("acceptance") || shapeGates?.acceptance === false) return { line: "none — acceptance gate disabled", cost: 0 };
     if (!judgeOracle(task)) return { line: "none — no judge oracle", cost: 0 };
-    const seat = pools.judge.find((c) => c.adapter === cfg.judge.adapter && c.model === cfg.judge.model);
-    return { line: `${cfg.judge.adapter}:${cfg.judge.model}`, cost: seatCost(seat) };
+    const authors = [channelKey(author)];
+    const { pick, disallowed } = resolveSeats({ role: "judge", cfg, pool: pools.judge, authorPool: pools.review, health, authors });
+    if (disallowed) return { line: `none — ${channelKey(cfg.judge)} is disallowed by routing.${disallowed.by} (${disallowed.entry})`, cost: 0 };
+    if (!pick) return { line: "none — no judge with a known vendor is available", cost: 0 };
+    const seat = judgeSeats.find((c) => channelKey(c) === channelKey(pick));
+    const independent = !!seat && isIndependentJudge(seat, carriedAuthorVendors(judgeSeats, authors), authors);
+    return { line: `${channelKey(pick)}${independent ? "" : " (not independent)"}`, cost: seatCost(pools.judge.find((c) => c === seat)) };
   };
   const reviewSeat = (task: Task, author: Assignment): { line: string; cost: number } => {
     const shapeGates = cfg.gates.byShape?.[task.shape];
@@ -504,6 +514,27 @@ export async function plan(
         : `no wave (pending; blocked by ${t.deps.filter((d) => byId.get(d)?.status !== "done").map((d) => `${d}:${byId.get(d)?.status ?? "missing"}`).join(", ")})`;
     return `    chain: depth ${depths.get(t.id)} · ${tail}`;
   };
+  // Rows 362 and 367 R5 (D-2187 condition 5): each role's seats in the seat resolver's order, the
+  // preferences it skipped and every DEAD entry beneath the role. Plan ranks no seat of its own.
+  const view = { cfg, adapters: adapters.filter((a) => typeof a.channels === "function"), health };
+  const seatList = (seats: readonly { adapter: string; model: string }[], none = "none") => seats.map(channelKey).join(", ") || none;
+  const beneath = (role: "review" | "consult", skips: SeatSkip[]) => [
+    ...skips.map((s) => `    skipped ${s.entry}${s.channel ? ` (${s.channel})` : ""} — ${s.reason}${s.detail ? `: ${s.detail}` : ""}`),
+    ...deadPreferences(cfg, view.adapters, health).filter((d) => d.role === role).map((d) => `    ${deadPreferenceLine(d)}`),
+  ];
+  const judgePool = resolveSeats({ role: "judge", cfg, pool: pools.judge, authorPool: pools.review, health, authors: [] });
+  const reviewPool = resolveSeats({ role: "review", pool: pools.review, prefer: cfg.review.prefer ?? [], ...view });
+  const consultPool = resolveSeats({ role: "consult", pool: pools.consult, pin: { adapter: cfg.consult.adapter, model: cfg.consult.model }, ...view });
+  lines.push(
+    "seat pools:",
+    `  worker: ${seatList(resolveSeats({ role: "worker", pool: pools.worker }).ranked)}`,
+    `  judge: ${judgePool.disallowed ? `none — ${channelKey(cfg.judge)} is disallowed by routing.${judgePool.disallowed.by} (${judgePool.disallowed.entry})` : seatList(judgePool.ranked)}`,
+    `  review: ${seatList(reviewPool.ranked, cfg.review.prefer?.length ? "none" : "none preferred — each task's review line names its author's reviewer")}`,
+    ...beneath("review", reviewPool.skips),
+    `  consult: ${seatList(consultPool.ranked)}`,
+    ...beneath("consult", consultPool.skips),
+    "",
+  );
   const routed: RoutedAssignment[] = [];
   for (const t of g.tasks) {
     const refusals = [...(oracleRefusals.get(t.id) ?? []), ...(inputRefusals.get(t.id) ?? [])];
@@ -524,7 +555,7 @@ export async function plan(
         lints.push(suf ? `${l}${suf}` : l);
       }
       const est = r.assignment.channel === "sub" ? 0 : cfg.pricing[r.assignment.tier];
-      const judge = judgeSeat(t);
+      const judge = judgeSeat(t, r.assignment);
       const review = reviewSeat(t, r.assignment);
       const { adapter, model, channel, tier } = r.assignment;
       row = { ...base, worker: { adapter, model, channel, tier }, judge: judge.line, review: review.line };

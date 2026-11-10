@@ -2,12 +2,16 @@ import { spawnSync } from "node:child_process";
 import { readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { TickmarkrConfig } from "../config/config.js";
-import type { Task } from "../graph/schema.js";
+import { stateDirName } from "../graph/graph.js";
+import type { Effort, Task } from "../graph/schema.js";
 import { withoutHostSession } from "../drivers/host-env.js";
 import { probeVersion } from "./claude-code.js";
+import { gatewayFamily, type GatewayRecord, servesFamily } from "./cliproxy.js";
+import { CLIPROXY_BASE_URL_ENV, CLIPROXY_MODEL_ENV, CLIPROXY_PROVIDER } from "./pi-cliproxy-extension.js";
 import { parseWorkerResult } from "./prompt.js";
-import { type Assignment, type BillingChannel, channelsFromConfig, type ContextUsage, type Invocation, MODEL_ID_RE, type SessionRef, shq, type TokenUsage, TokenUsageSchema, type WorkerAdapter } from "./types.js";
+import { type Assignment, type BillingChannel, channelsFromConfig, type ContextUsage, type Invocation, MODEL_ID_RE, type SessionRef, shq, type TokenUsage, TokenUsageSchema, type WorkerAdapter, type WorkerLaunchContext } from "./types.js";
 
 // SPEND-10: pi writes per-session JSONL to ~/.pi/agent/sessions/<slug>/ where slug is EMPIRICAL
 // (reverse-engineered: "-" + realpath'd cwd with every "/" replaced by "-" + "--", 29-RESEARCH.md Pitfall 7).
@@ -142,8 +146,46 @@ const PI_PROVIDER_VENDORS: Readonly<Record<string, string>> = {
   zai: "zhipu",
 };
 
+// Queue row 392 R6 law 4 (D-2187 add.13, add.21): `cliproxy/<proxy id>` is a model proxy's id carried by the
+// shipped extension. Its vendor is the id's family in the closed table, never pi's own; unclassified → undefined.
+const cliproxyId = (model: string): string | undefined =>
+  model.startsWith(`${CLIPROXY_PROVIDER}/`) ? model.slice(CLIPROXY_PROVIDER.length + 1) : undefined;
+
 export function piModelVendor(model: string): string | undefined {
+  const proxied = cliproxyId(model);
+  if (proxied !== undefined) return gatewayFamily(proxied) ?? undefined;
   return PI_PROVIDER_VENDORS[model.split("/", 1)[0]];
+}
+
+/** The shipped extension module beside this one: .ts under the test runner, .js in dist. */
+export const piCliproxyExtensionPath = fileURLToPath(new URL(`./pi-cliproxy-extension.${import.meta.url.endsWith(".ts") ? "ts" : "js"}`, import.meta.url));
+
+/** The base URL of the doctor cache's gateway record that admits a proxy id: a succeeded listing that lists the id
+ *  and serves its family. "" otherwise — the extension then refuses to load, so the launch fails closed. */
+export function cliproxyBaseUrl(id: string, repoRoot: string = process.cwd()): string {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(readFileSync(join(repoRoot, stateDirName(repoRoot), "doctor.json"), "utf8"))?.gateway;
+  } catch {
+    return "";
+  }
+  if (raw === null || typeof raw !== "object" || "installed" in raw) return "";
+  const r = raw as Partial<GatewayRecord>;
+  const family = gatewayFamily(id);
+  const admits = r.listing?.status === "succeeded" && typeof r.baseUrl === "string" && Array.isArray(r.models)
+    && family !== null && servesFamily(r as GatewayRecord, family) && r.models.some((m) => m?.id === id);
+  return admits ? r.baseUrl as string : "";
+}
+
+/** A proxied model's launch: the quoted base URL and proxy id as an environment prefix, and `-e` with the quoted
+ *  extension path. Never a credential (the extension reads it at load). Any other model: "" for both, the base. */
+function cliproxyLaunch(model: string, repoRoot?: string): { prefix: string; extension: string } {
+  const id = cliproxyId(model);
+  if (id === undefined) return { prefix: "", extension: "" };
+  return {
+    prefix: `${CLIPROXY_BASE_URL_ENV}=${shq(cliproxyBaseUrl(id, repoRoot))} ${CLIPROXY_MODEL_ENV}=${shq(id)} `,
+    extension: ` -e ${shq(piCliproxyExtensionPath)}`,
+  };
 }
 
 export const pi: WorkerAdapter = {
@@ -167,10 +209,13 @@ export const pi: WorkerAdapter = {
     const note = `auth verified via pi --list-models (free; auth-filtered by pi)${drift ? `; ${drift}` : ""}`;
     return { ...h, servable: parsePiModels(r.stdout || ""), note };
   },
-  channels: (cfg: TickmarkrConfig): BillingChannel[] => channelsFromConfig("pi", cfg).map((channel) => ({
-    ...channel,
-    vendor: cfg.tiers.pi?.modelOverrides?.[channel.model]?.vendor ?? piModelVendor(channel.model) ?? channel.vendor,
-  })),
+  channels: (cfg: TickmarkrConfig): BillingChannel[] => channelsFromConfig("pi", cfg)
+    // an unclassified proxied id is refused, never stamped with pi's own vendor (queue row 392 R6, D-2187)
+    .filter((channel) => cliproxyId(channel.model) === undefined || piModelVendor(channel.model) !== undefined)
+    .map((channel) => ({
+      ...channel,
+      vendor: cfg.tiers.pi?.modelOverrides?.[channel.model]?.vendor ?? piModelVendor(channel.model) ?? channel.vendor,
+    })),
   // v1.65 T3: every flag the command builders below hardcode — verified in `pi --help` 2026-07-22.
   hardcodedFlags: { binary: "pi", flags: ["-p", "--approve", "--model"] },
   // --approve: pi's per-directory trust prompt would stall fresh worktrees (herdr scrapes the dialog
@@ -179,10 +224,14 @@ export const pi: WorkerAdapter = {
   // hermetic --no-approve so repo-local pi config behaves normally (research Pitfall 5 decision).
   // Live-checked 2026-07-10, pi 0.80.3 — headless trailer intact, interactive --approve accepted,
   // no trust prompt; non-blocking update banners render in output (trailer parse tolerates chrome).
-  headlessCommand: (promptFile: string, model: string) =>
-    `pi -p --approve --model ${shq(model)} "$(cat ${shq(promptFile)})"`,
-  interactiveCommand: (promptFile: string, model: string) =>
-    `pi --approve --model ${shq(model)} "$(cat ${shq(promptFile)})"`,
+  headlessCommand: (promptFile: string, model: string) => {
+    const { prefix, extension } = cliproxyLaunch(model);
+    return `${prefix}pi -p --approve${extension} --model ${shq(model)} "$(cat ${shq(promptFile)})"`;
+  },
+  interactiveCommand: (promptFile: string, model: string, _effort?: Effort, ctx?: WorkerLaunchContext) => {
+    const { prefix, extension } = cliproxyLaunch(model, ctx?.repoRoot);
+    return `${prefix}pi --approve${extension} --model ${shq(model)} "$(cat ${shq(promptFile)})"`;
+  },
   invoke(task: Task, _cwd: string, a: Assignment, ctx: { promptFile: string }): Invocation {
     return { command: this.headlessCommand(ctx.promptFile, a.model) };
   },

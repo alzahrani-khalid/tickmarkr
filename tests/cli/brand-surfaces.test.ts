@@ -240,6 +240,10 @@ const RAIL_SPEC: RailSpec[] = [
   // the daemon accepted a trust dialog FOR the operator (src/run/daemon.ts): a decision, automatic,
   // and the one an operator is least likely to expect — it names the adapter it answered for.
   { event: "trust-auto-answer", label: "trust accepted", tone: "attention", salient: "claude-code seed", data: { slot: "tickmarkr:worker:T1:0:run-rail", adapter: "claude-code", phase: "seed" } },
+  // queue row 363 (D-2187 add.3): a consult reroute with no other eligible channel, journaled right before
+  // the channel-recycle row that names the same channel (src/run/daemon.ts)
+  { event: "reroute-unavailable", label: "reroute unavailable", tone: "attention", salient: "no other eligible channel in routing.map.implement.pool (ordered: claude-code:sonnet), channel claude-code:sonnet",
+    data: { pool: "routing.map.implement.pool (ordered: claude-code:sonnet)", channel: "claude-code:sonnet", attempt: 2 } },
   { event: "channel-recycle", label: "channel recycled", tone: "attention", salient: "channel claude-code:sonnet", data: { site: "gate-fail", channel: "claude-code:sonnet" } },
   { event: "retry-same-banned", label: "retry banned", tone: "attention", data: { gate: "review", from: "claude-code:sonnet", to: "codex:gpt-5.6-sol" } },
   { event: "gate-fingerprint-cap", label: "repeat capped", tone: "attention", salient: "channel claude-code:sonnet", data: { gate: "test", occurrences: 2, fingerprint: "expected 7 to be 6", retrySameBanned: true, channel: "claude-code:sonnet", attempt: 3 } },
@@ -364,6 +368,12 @@ describe("T4 v1.50 brand pass — plan, run narration, report", () => {
     setTTY(false);
     expect(await goldenPlan(mkBasicRepo())).toBe(golden("plan-basic.txt"));
     expect(await goldenPlan(mkLintRepo())).toBe(golden("plan-lints.txt"));
+    // Rows 362 and 367 R5 (D-2187): the goldens carry the seat pools block, and the routed author
+    // claude-code:haiku shares the configured judge's vendor, so the run's judge is the independent pick.
+    expect(golden("plan-basic.txt")).toContain("\nseat pools:\n  worker: claude-code:fable, ");
+    expect(golden("plan-basic.txt")).toContain("\n  judge: claude-code:fable, codex:gpt-6-astra, ");
+    expect(golden("plan-basic.txt")).toContain("\n    judge: codex:gpt-6-astra\n");
+    expect(golden("plan-basic.txt")).not.toContain("\n    judge: claude-code:fable\n");
   });
 
   test("test: production plan rendering the chained fixture graph prints depth three counted by downstream edges and wave one for the chain root, wave one for the first declared leaf and later waves for the remaining leaves at concurrency two with depth zero on every leaf, its output equals the independently authored committed expected bytes under the brand-surfaces fixtures without the oracle regenerating them, and a graph with no chains prints depth zero on every row, so a plan whose depth or wave disagrees with readyTasks or an oracle that writes its own expected file fails", async () => {
@@ -543,6 +553,18 @@ describe("T4 v1.50 brand pass — plan, run narration, report", () => {
       expect(stripAnsi(row)).toContain(RAIL_ROWS[event]!.label);
       expect(stripAnsi(row)).toContain(spec.salient!);
     }
+    const regenerated = GOLDEN_RETAINED_EVENTS.map((event) => stripAnsi(narrationRow(event, 120)!)).join("\n") + "\n";
+    expect(regenerated).toBe(golden("run-narration.txt"));
+  });
+
+  test("test: reroute-unavailable renders one labelled attention narrator row naming the pool and the channel and the run narration golden regenerated for it is byte-identical to the shipped fixture, so a journal row the narrator cannot label fails", () => {
+    onTTY();
+    const spec = RAIL_SPEC.find((s) => s.event === "reroute-unavailable")!;
+    expect(RAIL_ROWS["reroute-unavailable"]).toEqual({ label: "reroute unavailable", tone: "attention" });
+    const row = narrationRow(specEvent(spec), 200)!;
+    expect(row.split("\n")).toHaveLength(1);
+    expect(railViolations(row, spec, 200)).toEqual([]);
+    expect(stripAnsi(row)).toBe(`${TONE_SIGNAL.attention.glyph} T1 reroute unavailable — ${spec.salient}`);
     const regenerated = GOLDEN_RETAINED_EVENTS.map((event) => stripAnsi(narrationRow(event, 120)!)).join("\n") + "\n";
     expect(regenerated).toBe(golden("run-narration.txt"));
   });

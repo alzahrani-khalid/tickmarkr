@@ -2750,8 +2750,13 @@ describe("Fleet role selection", () => {
       });
       expect(typeof result).toBe("string");
       const identity = JSON.parse(result as string);
-      expect(identity).toEqual({ role: "consult", adapter: "fake", model: "fake-2", vendor: "fake-b", channel: "api" });
-      if (shared.ok) expect(identity).toEqual({ role: "consult", ...Object.fromEntries(
+      // Rows 362 and 367 R2/R5 (D-2187): the receipt also carries the resolver's skips and the cache age.
+      expect(identity).toEqual({
+        role: "consult", adapter: "fake", model: "fake-2", vendor: "fake-b", channel: "api",
+        skips: [{ entry: "fake:fake-1", channel: "fake:fake-1", reason: "excluded-vendor", detail: "fake-a" }],
+        cache: { ageMs: expect.any(Number), stale: false },
+      });
+      if (shared.ok) expect(identity).toMatchObject({ role: "consult", ...Object.fromEntries(
         ["adapter", "model", "vendor", "channel"].map((key) => [key, shared.channel[key as keyof typeof shared.channel]]),
       ) });
     }
@@ -2768,18 +2773,26 @@ describe("Fleet role selection", () => {
     const { repo, adapter } = setup();
     const globalDir = userDirOf(repo);
     const pick = (role: string, extra: string[] = []) => fleet(["--pick", role, "--global-dir", globalDir, ...extra], repo, [adapter]);
-    for (const role of ["consult", "review", "worker", "judge"]) {
+    for (const role of ["consult", "worker"]) {
       expect(await pick(role)).toEqual({ code: 1, out: expect.stringContaining(`${role}.prefer: missing-prefer`) });
     }
+    // Ruling Q-a (D-2187): a judge or review seat needs the author whose diff it would judge.
+    for (const role of ["review", "judge"]) expect(await pick(role)).toEqual({ code: 2, out: "" });
     expect(await pick("orchestrator")).toEqual({ code: 1, out: expect.stringMatching(/orchestrator: unsupported-role/) });
-    for (const role of ["consult", "review"]) {
-      withOverlay(repo, `${FAKE_TIERS}${role}:\n  prefer: [fake:fake-1, fake:fake-2]\nrouting:\n  deny:\n    models: [fake:fake-1]\n`);
-      expect(JSON.parse(await pick(role) as string)).toEqual({ role, adapter: "fake", model: "fake-2", vendor: "fake-b", channel: "api" });
-      expect(await pick(role, ["--exclude-vendor", "fake-a", "--exclude-vendor", "fake-b"]))
-        .toEqual({ code: 1, out: expect.stringContaining(`${role}.prefer: no-eligible-preferred-channel`) });
-      withOverlay(repo, `${FAKE_TIERS}${role}:\n  prefer: [fake:fake-1]\nrouting:\n  allow:\n    models: [fake:fake-2]\n`);
-      expect(await pick(role)).toEqual({ code: 1, out: expect.stringContaining("no-eligible-preferred-channel") });
-    }
+    withOverlay(repo, `${FAKE_TIERS}review:\n  prefer: [fake:fake-1, fake:fake-2]\n`);
+    expect(JSON.parse(await pick("review", ["--author", "fake:fake-1"]) as string))
+      .toMatchObject({ role: "review", adapter: "fake", model: "fake-2", vendor: "fake-b", channel: "api" });
+    expect(await pick("review", ["--author", "fake:fake-1", "--exclude-vendor", "fake-b"]))
+      .toEqual({ code: 1, out: expect.stringContaining("review: no-eligible-reviewer") });
+    withOverlay(repo, `${FAKE_TIERS}consult:\n  prefer: [fake:fake-1, fake:fake-2]\nrouting:\n  deny:\n    models: [fake:fake-1]\n`);
+    expect(JSON.parse(await pick("consult") as string)).toMatchObject({
+      role: "consult", adapter: "fake", model: "fake-2", vendor: "fake-b", channel: "api",
+      skips: [{ entry: "fake:fake-1", channel: "fake:fake-1", reason: "denied", detail: "routing.deny (fake:fake-1)" }],
+    });
+    expect(await pick("consult", ["--exclude-vendor", "fake-a", "--exclude-vendor", "fake-b"]))
+      .toEqual({ code: 1, out: expect.stringContaining("consult.prefer: no-eligible-preferred-channel") });
+    withOverlay(repo, `${FAKE_TIERS}consult:\n  prefer: [fake:fake-1]\nrouting:\n  allow:\n    models: [fake:fake-2]\n`);
+    expect(await pick("consult")).toEqual({ code: 1, out: expect.stringContaining("no-eligible-preferred-channel") });
     withOverlay(repo, `${FAKE_TIERS}consult:\n  prefer: [fake:fake-1]\n`);
     const health = registry.readDoctor(repo)!;
     health.fake.modelAuth!["fake-1"].authed = false;
@@ -2787,7 +2800,8 @@ describe("Fleet role selection", () => {
     expect(await pick("consult")).toEqual({ code: 1, out: expect.stringContaining("consult.prefer: no-eligible-preferred-channel") });
     const stale = new Date(0);
     utimesSync(join(repo, ".tickmarkr", "doctor.json"), stale, stale);
-    expect(await pick("consult")).toEqual({ code: 1, out: expect.stringContaining("consult.prefer: probe data missing or stale") });
+    // Row 367 R5: a stale cache is read, as run start reads it; the unauthed entry still refuses.
+    expect(await pick("consult")).toEqual({ code: 1, out: expect.stringContaining("consult.prefer: no-eligible-preferred-channel") });
   });
 });
 

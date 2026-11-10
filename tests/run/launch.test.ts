@@ -12,7 +12,9 @@ import { childEnv, launchDaemon } from "../../src/run/launch.js";
 import * as locks from "../../src/run/lock.js";
 import { makeTestTempDir, T } from "../helpers/tmprepo.js";
 
-const denied = [...HOST_SESSION_VARS, ...HERDR_CONTROL_VARS, SEAT_MARKER_ENV];
+// Queue row 390 (D-2187 add.9): the Rex addressing names are named here, not only read from the list under test.
+const REX = ["REX_BIN_DIR", "REX_BLOCK", "REX_SERVER", "REX_SESSION"] as const;
+const denied = [...new Set([...HOST_SESSION_VARS, ...HERDR_CONTROL_VARS, ...REX, SEAT_MARKER_ENV])];
 const controls = denied.flatMap(name => [`${name}_LOOKALIKE`, `PREFIX_${name}`, name.toLowerCase()]);
 const digest = (value: string) => createHash("sha256").update(value).digest("hex");
 const pause = (ms = 10) => new Promise(resolve => setTimeout(resolve, ms));

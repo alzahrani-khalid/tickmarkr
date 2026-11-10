@@ -2,6 +2,9 @@ import type { RegisteredCommand } from "./index.js";
 
 type Help = { usage: string; description: string; options: Record<string, string>; examples: string[] };
 
+// Queue row 367 Phase 2 (D-2187 add.18, add.21 (2)): the Artificial Analysis key recipe doctor and init both carry.
+const AA_KEY_RECIPE = "Artificial Analysis key (free key: artificialanalysis.ai), for new-model tier evidence: export ARTIFICIAL_ANALYSIS_API_KEY, or save it once in the macOS Keychain with security add-generic-password -a \"$USER\" -s ARTIFICIAL_ANALYSIS_API_KEY -w (the trailing -w prompts, so the value stays out of argv). With neither, an interactive terminal is asked once with hidden input; without a terminal, in CI, in a seat or in a task checkout nothing is asked and the missing-key hint is printed. Agents never receive the key: workers, judge, review and consult seats and doctor's model probes run without ARTIFICIAL_ANALYSIS_API_KEY, while build, test, lint and oracle commands keep your environment.";
+
 // Descriptions live beside dispatch, not in mutating command bodies. The parser/registry drift
 // test checks these option names against production source; adding a command requires help here.
 export const COMMAND_HELP = {
@@ -10,7 +13,7 @@ export const COMMAND_HELP = {
     options: {}, examples: ["acp"],
   },
   init: {
-    usage: "init [options]", description: "Set up repository/global config, a starter spec and adapter health.",
+    usage: "init [options]", description: `Set up repository/global config, a starter spec and adapter health. ${AA_KEY_RECIPE}`,
     options: {
       "--global-dir <path>": "Use this global configuration directory.",
       "--agent": "Install skills; remove leftovers only with shipped-bytes proof (one complete snapshot for directories, same-path released bytes for retired files); name every removal. Keep complete earlier snapshots intact until a forced or consented refresh is applied. Keep and report unproven content; never follow links, dangling links or linked host ancestors.",
@@ -22,7 +25,7 @@ export const COMMAND_HELP = {
     }, examples: ["init --yes", "init --agent --force --docs", "init --remove"],
   },
   doctor: {
-    usage: "doctor [options]", description: "Probe configured adapters and models and print diagnostics. Default probing may make model calls and refresh a stale catalog.",
+    usage: "doctor [options]", description: `Probe configured adapters and models and print diagnostics. Default probing may make model calls and refresh a stale catalog. ${AA_KEY_RECIPE}`,
     options: {
       "--models": "Include full per-model diagnostics.",
       "--adapter <id>": "Probe this adapter's configured models; repeatable, unioned with --model, including routing exclusions.",
@@ -36,18 +39,20 @@ export const COMMAND_HELP = {
       "--preflight": "Alias for --probe-preflight.",
       "--refresh-catalog": "Refresh only the model catalog; use as the sole option.",
       "--catalog-only": "Alias for --refresh-catalog; use as the sole option.",
-    }, examples: ["doctor --probe-preflight", "doctor --fix-only", "doctor --models", "doctor --refresh-catalog"],
+      "--ask-keys": "Ask again for a missing Artificial Analysis key even though this workspace recorded a skip (Enter at the prompt records one in doctor.json, never the key). On macOS a yes saves the entered key to the Keychain through security on stdin, never argv; elsewhere it serves this command only.",
+    }, examples: ["doctor --probe-preflight", "doctor --fix-only", "doctor --models", "doctor --refresh-catalog", "doctor --ask-keys"],
   },
   fleet: {
     usage: "fleet [options]", description: "Edit fleet configuration interactively, or print it for scripts. A plain TTY run asks before probing models when the cache is stale (60 minutes): probe now, open cached verdicts, or quit.",
     options: {
-      "--pick <role>": "Resolve one role preference as JSON without launching a seat (review or consult; roles without prefer refuse).",
+      "--pick <role>": "Resolve one role seat as exactly one JSON object on stdout without launching it (worker and consult without prefer refuse). The JSON adds skips and cache { ageMs, stale }; each skipped preference also prints one stderr line `skipped <entry> (<channel>) — <reason>: <detail>`. The doctor cache is read at any age: a cache 60 minutes or older is reported stale in the JSON and by one stderr line `doctor cache is <age> old (stale)`; a missing cache refuses. Judge and review require --author: without it the pick exits 2 with stdout empty and one stderr context-required line.",
+      "--author <adapter:model>": "The worker whose diff the judge or review seat would judge; returns the seat the run would choose for that author (a same-vendor judge fallback adds judgeIndependent: false). Only with --pick judge or review.",
       "--exclude-vendor <vendor>": "Exclude a vendor from --pick; repeat for multiple vendors.",
       "--print": "Print fleet configuration without opening the editor.",
       "--why": "Include routing eligibility explanations in printed output.",
       "--global-dir <path>": "Use this global configuration directory.",
       "--fresh": "Force an adapter/model health probe; may make model calls. A plain run asks before a stale-cache probe.",
-    }, examples: ["fleet --print --why", "fleet"],
+    }, examples: ["fleet --print --why", "fleet", "fleet --pick consult", "fleet --pick review --author claude-code:opus --exclude-vendor openai"],
   },
   start: {
     usage: 'start "<what you want built>" [options]', description: "Turn one sentence into specs/<slug>.intent.md, a drafted native spec, a compiled graph and a routed plan shown as a card. Drafting requires TTY confirmation or --yes and may make model calls; start never runs the graph.",
@@ -133,6 +138,7 @@ export const COMMAND_HELP = {
       // sentences after that name only the release src/run/split-release.ts ships.
       "--graph-changed": "Accept and journal a changed graph identity for this run. A parked task whose definition changed is released at that resume as a new engagement with reset round counters when the change is proved, the read of its work proves a committed head or no commits, and the park is not a human-gate or an attempt-cap park. Its committed head is re-gated with no worker or, with no commits, a fresh worker is dispatched. A human-gate park whose definition keeps the gate, an attempt-cap park and an unproved change (a definition unrecorded at the park, or a task-work read that proves neither a committed head nor that there are no commits) keep their park and say so. The release output names the stop path: the run had ended, or the run was stopped before it ended.",
       "--retry-failed": "Retry failed tasks.",
+      "--readmit <adapter:model>": "Readmit a channel this run excluded run-wide (a no-trailer demotion, a channel exclusion or a dead-channel failover): one channel-readmit journal row per channel is written before the exclusion replay, so the channel routes again and its no-trailer streak starts at zero. Every resume re-queues a task parked because those exclusions emptied its routing pool; a pool still empty parks it again. Repeatable.",
       "--driver <auto|herdr|subprocess|orca|herdr-app>": "Choose the execution driver; auto picks herdr, then herdr-app, then orca from host markers, else subprocess.",
     }, examples: ["resume run-example --driver subprocess", "resume run-example --retry-failed"],
   },

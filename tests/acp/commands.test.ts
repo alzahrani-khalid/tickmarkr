@@ -19,7 +19,9 @@ import { validateAgentMessage } from "../helpers/acp-schema.js";
 import { makeRepo, makeTestTempDir, T } from "../helpers/tmprepo.js";
 
 const tick = () => new Promise<void>(resolve => setImmediate(resolve));
-const denied = [...HOST_SESSION_VARS, ...HERDR_CONTROL_VARS, SEAT_MARKER_ENV];
+// Queue row 390 (D-2187 add.9): the Rex addressing names are named here, not only read from the list under test.
+const REX = ["REX_BIN_DIR", "REX_BLOCK", "REX_SERVER", "REX_SESSION"] as const;
+const denied = [...new Set([...HOST_SESSION_VARS, ...HERDR_CONTROL_VARS, ...REX, SEAT_MARKER_ENV])];
 const lookalikes = denied.flatMap(name => [`${name}_LOOKALIKE`, `PREFIX_${name}`, name.toLowerCase()]);
 const digest = (value: string) => createHash("sha256").update(value).digest("hex");
 

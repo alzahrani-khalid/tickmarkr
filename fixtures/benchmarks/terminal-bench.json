@@ -1,0 +1,263 @@
+{
+  "source": "Terminal-Bench",
+  "version": "4.0",
+  "maxAgeDays": 30,
+  "rows": [
+    {
+      "model": "claude-fable-5",
+      "effort": "max",
+      "agent": "Claude Code",
+      "score": 44.55,
+      "sourceUrl": "https://www.tbench.ai/",
+      "retrievedAt": "2026-11-08"
+    },
+    {
+      "model": "claude-fable-5-1",
+      "effort": "high",
+      "agent": "Claude Code",
+      "score": 54.55,
+      "sourceUrl": "https://www.tbench.ai/",
+      "retrievedAt": "2026-11-08"
+    },
+    {
+      "model": "claude-fable-5-1",
+      "effort": "low",
+      "agent": "Claude Code",
+      "score": 43.33,
+      "sourceUrl": "https://www.tbench.ai/",
+      "retrievedAt": "2026-11-08"
+    },
+    {
+      "model": "claude-fable-5-1",
+      "effort": "max",
+      "agent": "Claude Code",
+      "score": 57.88,
+      "sourceUrl": "https://www.tbench.ai/",
+      "retrievedAt": "2026-11-08"
+    },
+    {
+      "model": "claude-fable-5-1",
+      "effort": "medium",
+      "agent": "Claude Code",
+      "score": 53.94,
+      "sourceUrl": "https://www.tbench.ai/",
+      "retrievedAt": "2026-11-08"
+    },
+    {
+      "model": "claude-fable-5-1",
+      "effort": "xhigh",
+      "agent": "Claude Code",
+      "score": 57.88,
+      "sourceUrl": "https://www.tbench.ai/",
+      "retrievedAt": "2026-11-08"
+    },
+    {
+      "model": "claude-opus-4-8",
+      "effort": "max",
+      "agent": "Claude Code",
+      "score": 23.64,
+      "sourceUrl": "https://www.tbench.ai/",
+      "retrievedAt": "2026-11-08"
+    },
+    {
+      "model": "claude-opus-5",
+      "effort": "high",
+      "agent": "Claude Code",
+      "score": 50.3,
+      "sourceUrl": "https://www.tbench.ai/",
+      "retrievedAt": "2026-11-08"
+    },
+    {
+      "model": "claude-opus-5",
+      "effort": "low",
+      "agent": "Claude Code",
+      "score": 34.85,
+      "sourceUrl": "https://www.tbench.ai/",
+      "retrievedAt": "2026-11-08"
+    },
+    {
+      "model": "claude-opus-5",
+      "effort": "max",
+      "agent": "Claude Code",
+      "score": 51.82,
+      "sourceUrl": "https://www.tbench.ai/",
+      "retrievedAt": "2026-11-08"
+    },
+    {
+      "model": "claude-opus-5",
+      "effort": "medium",
+      "agent": "Claude Code",
+      "score": 44.85,
+      "sourceUrl": "https://www.tbench.ai/",
+      "retrievedAt": "2026-11-08"
+    },
+    {
+      "model": "claude-opus-5",
+      "effort": "xhigh",
+      "agent": "Claude Code",
+      "score": 53.94,
+      "sourceUrl": "https://www.tbench.ai/",
+      "retrievedAt": "2026-11-08"
+    },
+    {
+      "model": "claude-opus-5-5",
+      "effort": "max",
+      "agent": "Claude Code",
+      "score": 64.85,
+      "sourceUrl": "https://www.tbench.ai/",
+      "retrievedAt": "2026-11-08"
+    },
+    {
+      "model": "claude-sonnet-5",
+      "effort": "max",
+      "agent": "Claude Code",
+      "score": 12.42,
+      "sourceUrl": "https://www.tbench.ai/",
+      "retrievedAt": "2026-11-08"
+    },
+    {
+      "model": "claude-sonnet-5-5",
+      "effort": "max",
+      "agent": "Claude Code",
+      "score": 61.82,
+      "sourceUrl": "https://www.tbench.ai/",
+      "retrievedAt": "2026-11-08"
+    },
+    {
+      "model": "gemini-3.8-flash",
+      "effort": "high",
+      "agent": "mini-SWE-agent",
+      "score": 19.09,
+      "sourceUrl": "https://www.tbench.ai/",
+      "retrievedAt": "2026-11-08"
+    },
+    {
+      "model": "glm-5.3",
+      "effort": "max",
+      "agent": "Claude Code",
+      "score": 41.82,
+      "sourceUrl": "https://www.tbench.ai/",
+      "retrievedAt": "2026-11-08"
+    },
+    {
+      "model": "glm-5.3-flash",
+      "effort": "none",
+      "agent": "Claude Code",
+      "score": 35.76,
+      "sourceUrl": "https://www.tbench.ai/",
+      "retrievedAt": "2026-11-08"
+    },
+    {
+      "model": "gpt-5.6-luna",
+      "effort": "max",
+      "agent": "Codex",
+      "score": 17.27,
+      "sourceUrl": "https://www.tbench.ai/",
+      "retrievedAt": "2026-11-08"
+    },
+    {
+      "model": "gpt-5.6-sol",
+      "effort": "max",
+      "agent": "Codex",
+      "score": 37.27,
+      "sourceUrl": "https://www.tbench.ai/",
+      "retrievedAt": "2026-11-08"
+    },
+    {
+      "model": "gpt-5.6-terra",
+      "effort": "max",
+      "agent": "Codex",
+      "score": 21.52,
+      "sourceUrl": "https://www.tbench.ai/",
+      "retrievedAt": "2026-11-08"
+    },
+    {
+      "model": "gpt-6-astra",
+      "effort": "high",
+      "agent": "Codex",
+      "score": 57.88,
+      "sourceUrl": "https://www.tbench.ai/",
+      "retrievedAt": "2026-11-08"
+    },
+    {
+      "model": "gpt-6-astra",
+      "effort": "low",
+      "agent": "Codex",
+      "score": 50.61,
+      "sourceUrl": "https://www.tbench.ai/",
+      "retrievedAt": "2026-11-08"
+    },
+    {
+      "model": "gpt-6-astra",
+      "effort": "max",
+      "agent": "Codex",
+      "score": 58.18,
+      "sourceUrl": "https://www.tbench.ai/",
+      "retrievedAt": "2026-11-08"
+    },
+    {
+      "model": "gpt-6-astra",
+      "effort": "medium",
+      "agent": "Codex",
+      "score": 54.24,
+      "sourceUrl": "https://www.tbench.ai/",
+      "retrievedAt": "2026-11-08"
+    },
+    {
+      "model": "gpt-6-astra",
+      "effort": "xhigh",
+      "agent": "Codex",
+      "score": 57.88,
+      "sourceUrl": "https://www.tbench.ai/",
+      "retrievedAt": "2026-11-08"
+    },
+    {
+      "model": "gpt-6-luna",
+      "effort": "max",
+      "agent": "Codex",
+      "score": 16.36,
+      "sourceUrl": "https://www.tbench.ai/",
+      "retrievedAt": "2026-11-08"
+    },
+    {
+      "model": "gpt-6-sol",
+      "effort": "max",
+      "agent": "Codex",
+      "score": 49.39,
+      "sourceUrl": "https://www.tbench.ai/",
+      "retrievedAt": "2026-11-08"
+    },
+    {
+      "model": "gpt-6.1-sol",
+      "effort": "max",
+      "agent": "Codex",
+      "score": 58.18,
+      "sourceUrl": "https://www.tbench.ai/",
+      "retrievedAt": "2026-11-08"
+    },
+    {
+      "model": "grok-4.5",
+      "effort": "high",
+      "agent": "Grok Build",
+      "score": 12.42,
+      "sourceUrl": "https://www.tbench.ai/",
+      "retrievedAt": "2026-11-08"
+    },
+    {
+      "model": "grok-4.6",
+      "effort": "high",
+      "agent": "Grok Build",
+      "score": 20.3,
+      "sourceUrl": "https://www.tbench.ai/",
+      "retrievedAt": "2026-11-08"
+    },
+    {
+      "model": "grok-4.7",
+      "effort": "xhigh",
+      "agent": "Grok Build",
+      "score": 37.58,
+      "sourceUrl": "https://www.tbench.ai/",
+      "retrievedAt": "2026-11-08"
+    }
+  ]
+}

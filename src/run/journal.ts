@@ -2650,7 +2650,10 @@ export class Journal {
 
   // v1.71 OBS-119: run-wide exclusion fold — same replay discipline as replayResumeState().
   // channel-exclusion is the typed event; dead-channel-failover.from is the pre-v1.71 compat seam.
-  replayExcludedChannels(): Set<string> {
+  // Queue row 397 (D-2187 add.23): `resume --readmit` appends one channel-readmit row per channel BEFORE the
+  // replay, which applies rows in journal order — a readmit removes the channel, a later exclusion adds it again.
+  replayExcludedChannels(readmit: readonly string[] = []): Set<string> {
+    for (const channel of readmit) this.append("channel-readmit", undefined, { channel });
     const excluded = new Set<string>();
     for (const e of this.read()) {
       // OBS-1010: an in-run no-trailer demotion is a WORKER exclusion too; review-pool-demotion is
@@ -2659,6 +2662,8 @@ export class Journal {
         excluded.add(e.data.channel);
       } else if (e.event === "dead-channel-failover" && typeof e.data.from === "string") {
         excluded.add(e.data.from);
+      } else if (e.event === "channel-readmit" && typeof e.data.channel === "string") {
+        excluded.delete(e.data.channel);
       }
     }
     return excluded;

@@ -5,11 +5,12 @@ import { join } from "node:path";
 import type { TickmarkrConfig } from "../config/config.js";
 import type { Task } from "../graph/schema.js";
 import { withoutHostSession } from "../drivers/host-env.js";
+import { agentEnv } from "../drivers/agent-env.js";
 import { probeVersion } from "./claude-code.js";
 import { parseWorkerResult } from "./prompt.js";
 import type { ExecutorDriver, Slot } from "../drivers/types.js";
 import { runInteractiveSeed } from "../run/interactive-seed.js";
-import { sh } from "../run/git.js";
+import { sh, type ShResult } from "../run/git.js";
 import { type Assignment, type BillingChannel, channelsFromConfig, declareInputBox, type InteractiveSeed, type Invocation, MODEL_ID_RE, shq, type TokenUsage, TokenUsageSchema, type TrustDialog, type WorkerAdapter, type WorkerResult } from "./types.js";
 
 // KIMI-03 → v1.58 T5: the "no harness-readable counter" block (research F-6, 2026-07-17) is
@@ -71,26 +72,31 @@ export function parseKimiResult(raw: string, nonce: string): WorkerResult {
   return parseWorkerResult(stripped, nonce);
 }
 
-const KIMI_DOCTOR_TURN_MODEL = "kimi-code/k3";
+export const KIMI_DOCTOR_TURN_MODEL = "kimi-code/k3";
 const KIMI_DOCTOR_TURN_PROMPT = "Reply with exactly OK and nothing else.";
-const KIMI_DOCTOR_TURN_TIMEOUT_MS = 60000;
+export const KIMI_DOCTOR_TURN_TIMEOUT_MS = 60000;
 
 export interface KimiDoctorTurnResult {
   ok: boolean;
   evidence: string;
+  /** Rows 353 and 367 R3 (D-2187 condition 2): a failed turn's raw runner facts — exit code, separate
+   *  streams and the timer fact — carried unflattened to the shared probe classifier (registry.ts). */
+  runner?: Pick<ShResult, "code" | "stdout" | "stderr" | "timedOut">;
 }
 
 // OBS-141: intentionally separate from probe() so plan/run remain free file checks. Only doctor
 // calls this one-turn contract probe; its test seam stubs sh and never launches a real agent CLI.
 export async function probeKimiDoctorTurn(cwd: string): Promise<KimiDoctorTurnResult> {
   const command = `kimi -p ${shq(KIMI_DOCTOR_TURN_PROMPT)} --model ${shq(KIMI_DOCTOR_TURN_MODEL)} --output-format text`;
-  const r = await sh(command, cwd, KIMI_DOCTOR_TURN_TIMEOUT_MS);
+  // Queue row 367 (D-2187 add.21 (2)): the turn is an agent child, so it never receives the Artificial Analysis key.
+  const r = await sh(command, cwd, KIMI_DOCTOR_TURN_TIMEOUT_MS, { env: agentEnv() });
+  const runner = { code: r.code, stdout: r.stdout, stderr: r.stderr, ...(r.timedOut ? { timedOut: true } : {}) };
   if (r.timedOut) {
-    return { ok: false, evidence: `turn timed out after ${KIMI_DOCTOR_TURN_TIMEOUT_MS}ms` };
+    return { ok: false, evidence: `turn timed out after ${KIMI_DOCTOR_TURN_TIMEOUT_MS}ms`, runner };
   }
   const output = `${r.stderr}\n${r.stdout}`.trim().replace(/\s+/g, " ");
   if (r.code !== 0) {
-    return { ok: false, evidence: output || `turn exited ${r.code}` };
+    return { ok: false, evidence: output || `turn exited ${r.code}`, runner };
   }
   const returnedOk = r.stdout.split("\n")
     .map((line) => line.replace(/^[\s]*[•*-]\s+/, "").trim())

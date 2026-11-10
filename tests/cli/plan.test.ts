@@ -111,11 +111,13 @@ describe("T10 plan headline names the dispatched channel", () => {
     }
 
     expect(out).toContain("T1     implement");
-    expect(out).toContain("    judge: fake:fake-1");
+    // Rows 362 and 367 R5 (D-2187): the configured judge fake:fake-1 is T1's routed author, so the run
+    // judges with the seat resolver's independent pick fake:fake-2 (metered) — plan names and counts it.
+    expect(out).toContain("    judge: fake:fake-2 ~$2.50");
     expect(out).toContain("T2     implement");
     expect(out).toContain("    judge: none — no judge oracle");
     expect(out).toContain("    review: fake:fake-2 — reviewPolicy full ~$2.50");
-    expect(out).toContain("est. cost (API LLM seats, rough): ~$5.00 + consult calls");
+    expect(out).toContain("est. cost (API LLM seats, rough): ~$7.50 + consult calls");
   });
 
   const taskRow = (out: string) => out.split("\n").find((l) => /^\s+T1\s+chore/.test(l) && l.includes("→"))!;
@@ -188,8 +190,11 @@ describe("V-10 fleet preference visibility", () => {
     withOverlay(repo, "routing:\n  allow:\n    adapters: []\n");
     const out = await plan([], repo);
     expect(out).toMatch(/routing preference active:/);
-    expect(out).toContain("not in routing.allow:");
-    expect(out).not.toContain("(empty allowlist)");
+    // The exclusion block groups by the allowlist-miss reason. Rows 362 and 367 R5 (D-2187): the seat pools
+    // block's judge line names the configured judge's refusal with its routing entry, as run-gates does.
+    const exclusion = out.slice(out.indexOf("routing preference active:")).split("\n\n")[0]!;
+    expect(exclusion).toContain("not in routing.allow:");
+    expect(exclusion).not.toContain("(empty allowlist)");
     expect(out).toMatch(/dry run \(0 channels available\)/);
   });
 
@@ -1405,7 +1410,8 @@ routing: { deny: { workers: { adapters: [${(opts.deniedWorkers ?? ["rv", "rc"]).
     const demoted = await scenario({ "rev-a": "frontier", "rev-b": "frontier" }, {}, [dispatchedT0, ["review-pool-demotion", { gate: "review", reviewer: "rv:rev-b", reviewerTier: "frontier" }, "T0"]], {}, { prefer: ["rv:rev-b"] });
     expect(demoted).not.toContain("exactly one eligible cross-vendor review seat");
     expect(demoted).toContain("    review: rv:rev-a");
-    expect(demoted).not.toContain("review: rv:rev-b");
+    // The task's review line (the seat pools block's review line lists review.prefer's strict order, rows 362 and 367 R5).
+    expect(demoted).not.toContain("    review: rv:rev-b");
     // D-858 parity, one regression per production input (run-gates floor and pick, daemon.ts excludeReviewers):
     // (1) floor = this task's reviewers ∪ excludeReviewers — excludeReviewers starts empty at resume, so a replayed
     // demoted frontier seat never lifts the mid author's floor: the mid seat stays eligible beside both frontier ones
@@ -1445,7 +1451,7 @@ routing: { deny: { workers: { adapters: [${(opts.deniedWorkers ?? ["rv", "rc"]).
       const soft = await scenario({ "rev-a": "frontier", "rev-b": "frontier" }, {}, [dispatchedT0, ...journal], {}, { prefer: ["rv:rev-b"] });
       expect(soft).not.toContain("exactly one eligible cross-vendor review seat");
       expect(soft).toContain("    review: rv:rev-a");
-      expect(soft).not.toContain("review: rv:rev-b");
+      expect(soft).not.toContain("    review: rv:rev-b");
     }
     // (5) prefer only reorders: it moves the previewed seat, never the count
     const preferred = await scenario({ "rev-a": "frontier", "rev-b": "frontier" }, {}, [], {}, { prefer: ["rv:rev-b"] });

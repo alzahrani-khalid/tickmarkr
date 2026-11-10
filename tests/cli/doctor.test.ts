@@ -109,11 +109,18 @@ describe("OBS-141 kimi doctor turn probe", () => {
     expect(turnProbe).toHaveBeenCalledOnce();
     expect(turnProbe).toHaveBeenCalledWith(repo);
     expect(adapter.headlessCommand).not.toHaveBeenCalled();
+    // Queue rows 353 and 367 R3 (D-2187 condition 2): the failed turn is the turn model's verdict and never
+    // overwrites the adapter's authenticated flag; no further Kimi model probe is spent.
     expect(saved.kimi).toMatchObject({
-      authed: false,
+      authed: true,
       note: expect.stringContaining("[config.invalid]"),
     });
-    expect(out).toMatch(/✗ kimi\s+0\.29\.0.*model turn failed.*\[config\.invalid\]/);
+    expect(saved.kimi.modelAuth["kimi-code/k3"]).toMatchObject({
+      authed: false,
+      reason: expect.stringContaining("[config.invalid]"),
+    });
+    expect(out).toMatch(/✓ kimi\s+0\.29\.0.*model turn failed.*\[config\.invalid\]/);
+    expect(out).toMatch(/kimi-code\/k3\s.*unauthed: \[config\.invalid\]/);
   });
 
   test("test: a missing or invalid auth file reports unhealthy without attempting any turn", async () => {

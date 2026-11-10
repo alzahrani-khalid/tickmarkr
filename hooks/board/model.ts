@@ -1,4 +1,5 @@
 import type { BoardProps } from "./board";
+import { budget } from "./budget";
 import type { BoardState, RunSnapshot } from "./state";
 
 /**
@@ -78,8 +79,9 @@ const shape = (fields: Record<string, Check>, optional: Record<string, Check> = 
   && Object.entries(optional).every(([key, check]) => !Object.hasOwn(value, key) || check(value[key]));
 const strs = list(str);
 const PART = shape({ text: str, tone: oneOf("pass", "fail", "wait", "open") }, { reason: str, since: num });
+// queue row 398 (D-2187 add.24): a task row may read blocked, behind a failed or parked task
 const TASK = shape({
-  id: str, title: str, state: oneOf("pending", "worker", "waiting", "gates", "parked", "done", "failed"),
+  id: str, title: str, state: oneOf("pending", "worker", "waiting", "gates", "parked", "done", "failed", "blocked"),
   attempt: num, dispatched: bool, budget: num, launches: num,
   gates: value => isRecord(value) && Object.values(value).every(oneOf("pass", "fail")),
   note: str, deps: strs, blocks: strs, worker: str, judge: str, reviewer: str, suiteWaiting: bool, now: str,
@@ -91,6 +93,7 @@ const RELEASE = shape({
   version: str, dir: str, ciRun: nullable(str), mirror: nullable(str), status: str, conclusion: str, polledAt: str,
   stages: list(shape({ name: str, state: oneOf("pending", "running", "done", "failed"), detail: str })),
 });
+// queue row 393 (D-2187 add.16): supersededBy is optional, so a pane over an older CLI still draws; absent reads as null
 const SNAPSHOT = shape({
   version: oneOf(1), runId: str, alive: nullable(bool), pid: nullable(num), elapsedMin: num,
   ended: nullable(shape({
@@ -99,10 +102,13 @@ const SNAPSHOT = shape({
   tasks: list(TASK),
   needsYou: list(shape({ task: str, kind: str, reason: str, since: num, blocks: strs, cmd: str })),
   approvalWindow: nullable(shape({ closesAt: num, parked: strs })),
-  eta: nullable(shape({ cleanMin: num, oneRepairMin: num, criticalPath: strs, stoppedBy: strs })),
+  // queue row 398 (D-2187 add.24): cannotFinish is optional, so a snapshot from an older CLI still draws
+  eta: nullable(shape({ cleanMin: num, oneRepairMin: num, criticalPath: strs, stoppedBy: strs }, { cannotFinish: bool })),
   atEpoch: num, startEpoch: nullable(num), endEpoch: nullable(num), readAt: str, release: nullable(RELEASE),
   spec: nullable(str),
-});
+  // queue row 398 (D-2187 add.24): exclusions is optional, sent only while a channel stands excluded run-wide; absent
+  // reads as none, so a snapshot from an older CLI still draws
+}, { supersededBy: nullable(str), exclusions: list(shape({ channel: str, cause: str, line: num })) });
 
 /**
  * The raw command a Copy press may copy: the board shows (and so posts) `visible(cmd)`, which two raw commands can
@@ -131,11 +137,15 @@ export const EMPTY_TAIL = "Compile a spec and review its plan, then run tickmark
 export const WAITING = "Waiting for the first read of the run…";
 const EMPTY_PREFIX = "no tickmarkr run under ";
 
-/** What the pane draws: the board over the shown snapshot, or one block of visible text. */
+/**
+ * What the pane draws: the board over the shown snapshot, or one block of visible text. Queue row 408 (D-2187 add.48,
+ * add.49): the props pass the board budget before they reach the pane, so the host never refuses them; a snapshot
+ * within every bound passes as the same value.
+ */
 export type BoardView = { props: BoardProps } | { text: string };
 export function view(state: BoardState, marks: "glyph" | "devicons" = "glyph", fit?: number): BoardView {
   if (state.snapshot !== null) {
-    return { props: { snap: shown(state.snapshot), error: null, marks, ...(fit === undefined ? {} : { fit }) } };
+    return { props: budget({ snap: shown(state.snapshot), error: null, marks, ...(fit === undefined ? {} : { fit }) }).props };
   }
   if (state.empty !== null) {
     const roots = state.empty.startsWith(EMPTY_PREFIX) ? state.empty.slice(EMPTY_PREFIX.length) : state.empty;

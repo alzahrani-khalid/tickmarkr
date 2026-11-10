@@ -1,5 +1,7 @@
+import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { userInfo } from "node:os";
 import { dirname, join } from "node:path";
 
 export const MODELS_DEV_CATALOG_URL = "https://models.dev/api.json";
@@ -61,8 +63,87 @@ export interface RefreshCatalogOptions {
   repoRoot: string;
   fetcher?: CatalogFetcher;
   artificialAnalysisKey?: string;
+  /** Seams for the environment-then-Keychain key lookup (queue row 367 Phase 2). */
+  keyLookup?: ArtificialAnalysisKeyLookupOptions;
   timeoutMs?: number;
   now?: () => Date;
+}
+
+// Queue row 367 Phase 2; D-2187 add.17 (2), add.18, add.20. The Artificial Analysis key is
+// ARTIFICIAL_ANALYSIS_API_KEY from the environment, else (darwin only) the current user's Keychain
+// generic password of that service. The Keychain argv carries only the service and account NAMES; the
+// value is read from the child's stdout in-process and never reaches argv, output, the cache or an error.
+export const ARTIFICIAL_ANALYSIS_KEY_NAME = "ARTIFICIAL_ANALYSIS_API_KEY";
+// `security find-generic-password` exits 44 (errSecItemNotFound) for a missing item: absent, not a failed read.
+const KEYCHAIN_ITEM_NOT_FOUND_EXIT = 44;
+
+export interface KeychainSpawnResult {
+  status: number | null;
+  stdout: string;
+  signal?: string | null;
+  error?: { code?: string };
+}
+export type KeychainSpawner = (command: "security", args: readonly string[]) => KeychainSpawnResult;
+/** ok with no key = no Keychain item; not ok = the read itself failed, with its exit code. */
+export type KeychainReadResult = { ok: true; key?: string } | { ok: false; exit: string };
+export type KeychainReader = (account: string) => KeychainReadResult;
+
+export interface ArtificialAnalysisKeyLookupOptions {
+  platform?: NodeJS.Platform;
+  account?: string;
+  /** Under the test runner no Keychain read is spawned unless a reader is injected. */
+  keychainReader?: KeychainReader;
+}
+export type ArtificialAnalysisKeyLookup =
+  | { ok: true; key: string; source: "environment" | "keychain" | "option" }
+  | { ok: false; error: string };
+
+export const artificialAnalysisMissingKeyLine = (account: string): string =>
+  `no Artificial Analysis key: ${ARTIFICIAL_ANALYSIS_KEY_NAME} unset and no Keychain item ${ARTIFICIAL_ANALYSIS_KEY_NAME} for ${account} — set it with: security add-generic-password -a "$USER" -s ${ARTIFICIAL_ANALYSIS_KEY_NAME} -w`;
+export const artificialAnalysisKeychainFailedLine = (exit: string): string =>
+  `no Artificial Analysis key: Keychain read failed (exit ${exit})`;
+
+const currentAccount = (): string => {
+  try {
+    return userInfo().username;
+  } catch {
+    return process.env.USER ?? "";
+  }
+};
+
+// stdin ignored and a timeout, so a Keychain access dialog can never block a non-interactive path;
+// stderr is captured so the not-found notice never reaches the screen.
+const spawnSecurity: KeychainSpawner = (command, args) => {
+  const r = spawnSync(command, [...args], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: CATALOG_REFRESH_TIMEOUT_MS });
+  return { status: r.status, stdout: r.stdout ?? "", signal: r.signal, ...(r.error ? { error: r.error as NodeJS.ErrnoException } : {}) };
+};
+
+/** The production Keychain read: names-only argv, value from stdout, never throws. */
+export function readKeychainKey(account: string, spawner: KeychainSpawner = spawnSecurity): KeychainReadResult {
+  let r: KeychainSpawnResult;
+  try {
+    r = spawner("security", ["find-generic-password", "-s", ARTIFICIAL_ANALYSIS_KEY_NAME, "-a", account, "-w"]);
+  } catch (error) {
+    return { ok: false, exit: String((error as NodeJS.ErrnoException)?.code ?? "spawn error") };
+  }
+  if (r.error || r.status === null) return { ok: false, exit: String(r.error?.code ?? r.signal ?? "spawn error") };
+  if (r.status === KEYCHAIN_ITEM_NOT_FOUND_EXIT) return { ok: true };
+  if (r.status !== 0) return { ok: false, exit: String(r.status) };
+  const key = r.stdout.trim();
+  return key ? { ok: true, key } : { ok: true };
+}
+
+/** Environment first, then the darwin Keychain; a miss or a failed read is one typed line, never a throw. */
+export function lookupArtificialAnalysisKey(opts: ArtificialAnalysisKeyLookupOptions = {}): ArtificialAnalysisKeyLookup {
+  const fromEnv = process.env[ARTIFICIAL_ANALYSIS_KEY_NAME]?.trim();
+  if (fromEnv) return { ok: true, key: fromEnv, source: "environment" };
+  const account = opts.account ?? currentAccount();
+  const read: KeychainReadResult = (opts.platform ?? process.platform) !== "darwin" ? { ok: true }
+    : opts.keychainReader ? opts.keychainReader(account)
+      : process.env.VITEST ? { ok: true }
+        : readKeychainKey(account);
+  if (!read.ok) return { ok: false, error: artificialAnalysisKeychainFailedLine(read.exit) };
+  return read.key ? { ok: true, key: read.key, source: "keychain" } : { ok: false, error: artificialAnalysisMissingKeyLine(account) };
 }
 
 export type CatalogLegName = "models.dev" | "Artificial Analysis" | "LiveBench";
@@ -665,8 +746,14 @@ export async function refreshCatalogCommand(opts: RefreshCatalogOptions): Promis
 
   let artificialAnalysis = current.catalog.artificialAnalysis;
   let artificialAnalysisUpdated = false;
-  const apiKey = opts.artificialAnalysisKey ?? process.env.ARTIFICIAL_ANALYSIS_API_KEY?.trim();
-  if (apiKey) {
+  // An explicit option is the key of record (an empty one means none); otherwise the row 367 lookup.
+  const keyLookup: ArtificialAnalysisKeyLookup = opts.artificialAnalysisKey === undefined
+    ? lookupArtificialAnalysisKey(opts.keyLookup)
+    : opts.artificialAnalysisKey
+      ? { ok: true, key: opts.artificialAnalysisKey, source: "option" }
+      : { ok: false, error: artificialAnalysisMissingKeyLine(opts.keyLookup?.account ?? currentAccount()) };
+  if (keyLookup.ok) {
+    const apiKey = keyLookup.key;
     try {
       artificialAnalysis = await fetchArtificialAnalysis(fetcher, apiKey, timeoutMs);
       artificialAnalysisUpdated = true;
@@ -679,7 +766,7 @@ export async function refreshCatalogCommand(opts: RefreshCatalogOptions): Promis
     }
   } else {
     delete legAt.artificialAnalysis;
-    legs.push({ leg: "Artificial Analysis", status: "skipped", detail: "no API key", retry: "retry when ARTIFICIAL_ANALYSIS_API_KEY is set" });
+    legs.push({ leg: "Artificial Analysis", status: "skipped", detail: keyLookup.error, retry: "retry when ARTIFICIAL_ANALYSIS_API_KEY is set" });
   }
 
   let liveBench = current.catalog.liveBench;

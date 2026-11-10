@@ -1,4 +1,5 @@
 import { parseArgs } from "node:util";
+import { ARTIFICIAL_ANALYSIS_KEY_NAME } from "../../adapters/catalog-remote.js";
 import { allAdapters, discoverChannels, probeAll, readDoctor } from "../../adapters/registry.js";
 import { ROUTING_MODES, type RoutingMode } from "../../config/config.js";
 import { captureHost, parseDriverOverride, pickDriver, preflightHostDriver } from "../../drivers/index.js";
@@ -111,6 +112,8 @@ export const RAIL_ROWS: Record<string, { label: string; tone: RailTone }> = {
   // whatever that dialog was granting. It is a decision, it is automatic, and it is the one the
   // operator is least likely to expect — it is on the rail for exactly the reason the rest are.
   "trust-auto-answer": { label: "trust accepted", tone: "attention" },
+  // queue row 363 (D-2187 add.3): a consult reroute that found no other eligible channel
+  "reroute-unavailable": { label: "reroute unavailable", tone: "attention" },
   "channel-recycle": { label: "channel recycled", tone: "attention" },
   "retry-same-banned": { label: "retry banned", tone: "attention" },
   // an identical gate failure hit the fingerprint cap: the daemon forces a consult and bans the
@@ -352,6 +355,8 @@ const RAIL_PROJECTION: Record<string, (data: Record<string, unknown>) => string 
       : undefined,
   // both rehash hashes: the ladder reaches `from` (null on an unbound journal) and never `to`
   "scope-request": (d) => Array.isArray(d.paths) ? `files[]: ${d.paths.join(", ")}` : undefined,
+  // queue row 363 (D-2187 add.3): the pool that had no other eligible channel for the consult reroute
+  "reroute-unavailable": (d) => (typeof d.pool === "string" ? `no other eligible channel in ${d.pool}` : undefined),
   "graph-rehash": (d) => (typeof d.to === "string" ? `to ${d.to.slice(0, 12)}` : undefined),
   // Queue row 372 (D-2186): the resume's release names the park it ended, the stop path and what it does next
   "task-approved": (d) => {
@@ -497,6 +502,16 @@ const QUALITY_ALIAS_NOTICE =
   "tickmarkr: --quality is a compatibility alias for --mode partner-led (this run only) — "
   + "the v1.47 one-band floor raise is retired (deprecated); use --mode partner-led";
 
+// Queue row 407 (D-2187 add.35): the one stderr line run writes, before it calls runDaemon, when the environment carries the
+// Artificial Analysis key with a non-empty value. It names the key, never its value; a key kept only in the Keychain is not
+// in the environment, so it prints nothing.
+export const AA_KEY_ENV_WARNING =
+  `warning: ${ARTIFICIAL_ANALYSIS_KEY_NAME} is set in the environment, so every process started from it inherits the key `
+  + "and a process listing can show it; on macOS keep it in the Keychain only: "
+  + `security add-generic-password -a "$USER" -s ${ARTIFICIAL_ANALYSIS_KEY_NAME} -w, then: launchctl unsetenv ${ARTIFICIAL_ANALYSIS_KEY_NAME}`;
+export const aaKeyEnvWarning = (env: NodeJS.ProcessEnv = process.env): string | undefined =>
+  env[ARTIFICIAL_ANALYSIS_KEY_NAME]?.trim() ? AA_KEY_ENV_WARNING : undefined;
+
 export async function run(argv: string[], cwd = process.cwd()): Promise<{ out: string; code: number }> {
   const { values } = parseArgs({
     args: argv,
@@ -524,6 +539,8 @@ export async function run(argv: string[], cwd = process.cwd()): Promise<{ out: s
     throw new Error(`--mode must be one of ${ROUTING_MODES.join(" | ")} (got ${values.mode})`);
   }
   if (values.quality) console.warn(QUALITY_ALIAS_NOTICE);
+  const keyWarning = aaKeyEnvWarning();
+  if (keyWarning) process.stderr.write(`${keyWarning}\n`);
   const flagMode = (values.mode as RoutingMode | undefined) ?? (values.quality ? "partner-led" : undefined);
   const refusal = (() => {
     try {

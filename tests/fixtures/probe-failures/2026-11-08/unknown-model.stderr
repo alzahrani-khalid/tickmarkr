@@ -1,0 +1,30 @@
+OpenAI Codex v0.167.0
+--------
+workdir: /private/var/folders/xz/s67kmj4x68n4qlkkbrvfhvfr0000gn/T/tmp.SylcJe2Tmt
+model: tickmarkr-no-such-model
+provider: openai
+approval: never
+sandbox: workspace-write [workdir, /tmp, $TMPDIR]
+reasoning effort: xhigh
+reasoning summaries: none
+session id: 01a1b9e4-0d14-7310-9e0f-9be741e57ada
+--------
+user
+Reply with OK
+
+warning: Configured service tier `priority` is not advertised as supported for model `tickmarkr-no-such-model` and will be omitted from requests.
+warning: Model metadata for `tickmarkr-no-such-model` not found. Defaulting to fallback metadata; this can degrade performance and cause issues.
+hook: SessionStart
+hook: SessionStart
+hook: SessionStart
+hook: SessionStart
+hook: SessionStart Completed
+hook: SessionStart Completed
+hook: SessionStart Completed
+hook: SessionStart Completed
+hook: UserPromptSubmit
+hook: UserPromptSubmit
+hook: UserPromptSubmit Completed
+hook: UserPromptSubmit Completed
+ERROR: The 'tickmarkr-no-such-model' model is not supported when using Codex with a ChatGPT account.
+ERROR: The 'tickmarkr-no-such-model' model is not supported when using Codex with a ChatGPT account.

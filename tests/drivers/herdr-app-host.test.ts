@@ -453,12 +453,17 @@ describe("Herdr app host — contract H and E (queue row 340; D-2180)", () => {
     const inherited: Env = { HERDR_ENV: "1", HERDR_SOCKET_PATH: "/tmp/herdr.sock", ORCA_TERMINAL_HANDLE: "term-x", ORCA_PANE_KEY: "pane-x",
       ORCA_TAB_ID: "tab-x", ...HC, HC_SCOPE: TOKEN, HC_SESSION: "own-session", TERM_PROGRAM: "ghostty" };
     stubHost(inherited);
+    // Queue row 390 (D-2187 add.9): a Rex terminal's addressing names, named explicitly, plus its descriptive version.
+    const rex = { REX_BIN_DIR: "/tmp/rex-bin", REX_BLOCK: "block-x", REX_SERVER: "/tmp/rex.sock", REX_SESSION: "session-x" };
+    for (const [k, v] of Object.entries(rex)) vi.stubEnv(k, v);
+    vi.stubEnv("TERM_PROGRAM_VERSION", "9.9");
     vi.stubEnv("HOME", home); // login shells: keep the operator's profile out of the recorded environment
     vi.stubEnv("ANTHROPIC_API_KEY", "user-auth-value");
     vi.stubEnv(SEAT_MARKER_ENV, "review");
-    const kept = { HC_SESSION: "own-session", TERM_PROGRAM: "ghostty", ANTHROPIC_API_KEY: "user-auth-value" };
+    const kept = { HC_SESSION: "own-session", TERM_PROGRAM: "ghostty", TERM_PROGRAM_VERSION: "9.9", ANTHROPIC_API_KEY: "user-auth-value" };
     const expectSealed = (env: Record<string, string>, label: string) => {
       for (const k of HERDR_CONTROL_VARS) expect(env[k], `${label} ${k}`).toBeUndefined();
+      for (const k of Object.keys(rex)) expect(env[k], `${label} ${k}`).toBeUndefined();
       for (const [k, v] of Object.entries(kept)) expect(env[k], `${label} ${k}`).toBe(v);
     };
 
@@ -501,6 +506,7 @@ describe("Herdr app host — contract H and E (queue row 340; D-2180)", () => {
     // The daemon's own environment is never mutated by any of these seals.
     expect(process.env.HC_SCOPE).toBe(TOKEN);
     expect(process.env.HC_TERMINAL_ID).toBe(HC.HC_TERMINAL_ID);
+    for (const [k, v] of Object.entries(rex)) expect(process.env[k], k).toBe(v);
   }, 60_000);
 
   test("an inherited-scope snapshot emits one journal row and one warning line without its token while a scope-cleared launch emits neither", async () => {

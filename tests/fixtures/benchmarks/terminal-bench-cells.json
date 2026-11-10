@@ -1,0 +1,20 @@
+{
+  "source": "Terminal-Bench",
+  "version": "4.0",
+  "maxAgeDays": 30,
+  "rows": [
+    { "model": "tb-top", "effort": "high", "agent": "Claude Code", "score": 60, "sourceUrl": "https://www.tbench.ai/", "retrievedAt": "2026-11-01" },
+    { "model": "tb-54", "effort": "high", "agent": "Codex", "score": 54, "sourceUrl": "https://www.tbench.ai/", "retrievedAt": "2026-11-01" },
+    { "model": "tb-42", "effort": "high", "agent": "Grok Build", "score": 42, "sourceUrl": "https://www.tbench.ai/", "retrievedAt": "2026-11-01" },
+    { "model": "tb-36", "effort": "high", "agent": "mini-SWE-agent", "score": 36, "sourceUrl": "https://www.tbench.ai/", "retrievedAt": "2026-11-01" },
+    { "model": "tb-24", "effort": "high", "agent": "Muse Code", "score": 24, "sourceUrl": "https://www.tbench.ai/", "retrievedAt": "2026-11-01" },
+    { "model": "tb-effort", "effort": "high", "agent": "Codex", "score": 50.25, "sourceUrl": "https://www.tbench.ai/", "retrievedAt": "2026-11-01" },
+    { "model": "tb-effort", "agent": "Codex", "score": 45, "sourceUrl": "https://www.tbench.ai/", "retrievedAt": "2026-11-01" },
+    { "model": "tb-stale", "effort": "high", "agent": "Claude Code", "score": 70, "sourceUrl": "https://www.tbench.ai/", "retrievedAt": "2026-09-01" },
+    { "model": "tb-agentless", "effort": "high", "score": 58, "sourceUrl": "https://www.tbench.ai/", "retrievedAt": "2026-11-01" },
+    { "model": "tb-agentless", "effort": "low", "agent": "Codex", "score": 44, "sourceUrl": "https://www.tbench.ai/", "retrievedAt": "2026-11-01" },
+    { "model": "tb-twin", "effort": "high", "agent": "Claude Code", "score": 52, "sourceUrl": "https://www.tbench.ai/", "retrievedAt": "2026-11-01" },
+    { "model": "tb-twin", "effort": "high", "agent": "mini-SWE-agent", "score": 48, "sourceUrl": "https://www.tbench.ai/", "retrievedAt": "2026-11-01" },
+    { "model": "tb-twin", "effort": "low", "agent": "Claude Code", "score": 30, "sourceUrl": "https://www.tbench.ai/", "retrievedAt": "2026-11-01" }
+  ]
+}

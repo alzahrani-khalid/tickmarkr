@@ -9,8 +9,8 @@ import { bannerShell, paneDispatchCommand } from "../brand.js";
 import { dewrapPaneVerdict, extractVerdictJson, gateExitTrailer, gatePaneName, generateVerdictNonce, verdictNonceLine } from "../gates/llm.js";
 import type { GateResult } from "../gates/types.js";
 import { classifyVerdictCause, type VerdictUnparseableCause } from "../gates/verdict-cause.js";
-import { rankPreferredChannels } from "../route/role-pick.js";
 import { disallowedBy, observedSeat, routingModelProvider } from "../route/preference.js";
+import { resolveSeats } from "../route/seat-resolver.js";
 import { sh } from "./git.js";
 import { redactSecrets } from "./redact.js";
 import { filterLlmTranscript, readOwnedProcessGroup, reapSeatTree, seatShellCeiling, StallProgressTracker, WorkerTreeCpuAccountant } from "./stall.js";
@@ -362,20 +362,15 @@ export async function consult(
   };
 
   // Rank only exact live models from the daemon's role-scoped discovery pool.
-  // The explicit pin remains a caller-owned fallback, outside strict preference selection.
   const live = (opts.channels ?? []).filter(
     (c): c is typeof c & { model: string } => typeof c.model === "string",
   );
-  // Ranking keeps each live channel's observed identity; the pin carries its cached identity too.
-  const seats: Array<{ adapter: string; model: string; identity?: string }> = rankPreferredChannels(
-    live.filter((c) => disallowedBy(c, cfg.routing, "consult") === null), cfg.consult.prefer,
-  );
-  seats.push(observedSeat(opts.health, cfg.consult.adapter, cfg.consult.model));
-  // v1.87 T2: a consult seat reads the code, so it passes through the operator's policy exactly like
-  // a worker does. The filter runs AFTER the pin is pushed, so the final pinned seat is checked by
-  // the same rule as every prefer entry — and disallowedBy carries the full deny grammar (adapter,
-  // model, or adapter:model), so a model-scoped deny cannot slip past an adapter-id-only read.
-  const allowedSeats = seats.filter((s) => disallowedBy(s, cfg.routing, "consult") === null);
+  // Row 367 R1 (D-2187): the seat resolver walks strict consult.prefer order with the explicit pin
+  // appended last (Q-b), each seat under its observed identity; v1.87 T2: every seat, the pin included,
+  // passes the operator's consult policy with the full deny grammar. Its skips are only reported.
+  const allowedSeats = resolveSeats({
+    role: "consult", cfg, pool: live, health: opts.health, pin: { adapter: cfg.consult.adapter, model: cfg.consult.model },
+  }).ranked;
   const seatIdentity = (seat: { adapter: string; model: string }) => {
     let vendor = opts.channels?.find((candidate) =>
       candidate.adapter === seat.adapter && candidate.model === seat.model)?.vendor;
@@ -388,7 +383,8 @@ export async function consult(
     return { adapter: seat.adapter, model: seat.model, vendor: vendor ?? "unknown" };
   };
   if (!allowedSeats.length) {
-    const d = disallowedBy(seats[seats.length - 1]!, cfg.routing, "consult")!;
+    // Only an all-disallowed walk is empty: the pin is always appended, so it names the refusal.
+    const d = disallowedBy(observedSeat(opts.health, cfg.consult.adapter, cfg.consult.model), cfg.routing, "consult")!;
     return {
       action: "human",
       notes: `every consult seat is disallowed by routing.${d.by} (${d.entry}) — failing safe to human`,

@@ -2,6 +2,7 @@ import { type ChildProcess, spawn, spawnSync, type SpawnSyncOptions, type SpawnS
 import { shq } from "../adapters/types.js";
 import { createWorktree, FORK_CAP_ENV, resolvedForkCap } from "../run/git.js";
 import { HERDR_CONTROL_VARS, HOST_SESSION_VARS, SEAT_MARKER_ENV, withoutHostSession } from "./host-env.js";
+import { agentEnv, agentEnvShellPrefix, agentShellCommand } from "./agent-env.js";
 import { workerReapHost } from "../run/stall.js";
 import type { ExecutorDriver, NotificationPost, NotifyOpts, Slot, TransportState } from "./types.js";
 
@@ -26,7 +27,7 @@ export { HERDR_CONTROL_VARS };
  * (D-2174): a pane seat's own script exports its role after this seal.
  */
 export function sealHerdrEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
-  const out = withoutHostSession(env); // queue row 193
+  const out = agentEnv(withoutHostSession(env)); // queue row 193; queue row 367 (D-2187 add.21 (2))
   if (!(FORK_CAP_ENV in out)) out[FORK_CAP_ENV] = resolvedForkCap();
   for (const k of HERDR_CONTROL_VARS) delete out[k];
   delete out[SEAT_MARKER_ENV];
@@ -37,7 +38,8 @@ export function sealHerdrEnv(env: NodeJS.ProcessEnv = process.env): NodeJS.Proce
  * environment from its host, not the daemon's seal, so the inherited seat marker is unset here too (D-2174). */
 export function herdrSealShellPrefix(env: NodeJS.ProcessEnv = process.env): string {
   const forkCap = sealHerdrEnv(env)[FORK_CAP_ENV] ?? resolvedForkCap();
-  return `export ${FORK_CAP_ENV}=${shq(forkCap)}; ` +
+  // Queue row 367 (D-2187 add.21 (2)): no agent this pane starts receives the Artificial Analysis key.
+  return `export ${FORK_CAP_ENV}=${shq(forkCap)}; ${agentEnvShellPrefix()}` +
     HERDR_CONTROL_VARS.map((k) => `unset ${k}`).join("; ") + `; unset ${HOST_SESSION_VARS.join(" ")}; unset ${SEAT_MARKER_ENV}; `;
 }
 
@@ -101,7 +103,7 @@ export class SubprocessDriver implements ExecutorDriver {
     // read that never EOFs. One spawn site covers every adapter (D-06).
     // v1.22 T3 / OBS-843: seal host control vars so worker/judge/review/consult children cannot
     // address the operator's herdr or Orca UI. process.env of the daemon is untouched.
-    const p = spawn("bash", ["-lc", cmd], {
+    const p = spawn("bash", ["-lc", agentShellCommand(cmd)], { // queue row 367: after the login profile, too
       cwd: slot.cwd,
       stdio: ["ignore", "pipe", "pipe"],
       env: sealHerdrEnv(process.env),

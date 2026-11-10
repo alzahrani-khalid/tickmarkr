@@ -25,8 +25,13 @@ test("every headless agent launch including role-less callers receives the expli
   const inherited = {
     HC_TERMINAL_ID: "t4", HC_TERMINAL_SOCKET: "/tmp/hc-headless.sock", HC_SCOPE: "launcher-scope-token",
     HERDR_ENV: "1", HERDR_SOCKET_PATH: "/tmp/herdr.sock", ORCA_TERMINAL_HANDLE: "term-x", ORCA_PANE_KEY: "pane-x", ORCA_TAB_ID: "tab-x",
+    // Queue row 390 (D-2187 add.9): a Rex terminal's addressing names.
+    REX_BIN_DIR: "/tmp/rex-bin", REX_BLOCK: "block-x", REX_SERVER: "/tmp/rex.sock", REX_SESSION: "session-x",
   };
+  const rex = ["REX_BIN_DIR", "REX_BLOCK", "REX_SERVER", "REX_SESSION"] as const;
   for (const [k, v] of Object.entries(inherited)) vi.stubEnv(k, v);
+  vi.stubEnv("TERM_PROGRAM", "Rex");
+  vi.stubEnv("TERM_PROGRAM_VERSION", "9.9");
   vi.stubEnv("HOME", dir); // login shells: keep the operator's profile out of the recorded environment
   vi.stubEnv("ANTHROPIC_API_KEY", "user-auth-value");
   vi.stubEnv(SEAT_MARKER_ENV, undefined);
@@ -45,6 +50,9 @@ test("every headless agent launch including role-less callers receives the expli
   const envOf = (label: string) => JSON.parse(readFileSync(join(dir, `${label}.env.json`), "utf8")) as Record<string, string | undefined>;
   const expectSealed = (env: Record<string, string | undefined>, label: string, seat: string | undefined) => {
     for (const k of HERDR_CONTROL_VARS) expect(env[k], `${label} ${k}`).toBeUndefined();
+    for (const k of rex) expect(env[k], `${label} ${k}`).toBeUndefined();
+    expect(env.TERM_PROGRAM, `${label} TERM_PROGRAM`).toBe("Rex");
+    expect(env.TERM_PROGRAM_VERSION, `${label} TERM_PROGRAM_VERSION`).toBe("9.9");
     expect(env.ANTHROPIC_API_KEY, `${label} auth`).toBe("user-auth-value");
     expect(env[SEAT_MARKER_ENV], `${label} seat marker`).toBe(seat);
   };

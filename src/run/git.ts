@@ -13,6 +13,7 @@ import { shq } from "../adapters/types.js";
 import { tickmarkrDir } from "../graph/graph.js";
 import { ROUTING_ENV_SEAMS } from "../route/router.js";
 import { HERDR_CONTROL_VARS, HOST_SESSION_VARS, SEAT_MARKER_ENV } from "../drivers/host-env.js";
+import { agentEnv, agentShellCommand, isAgentEnv } from "../drivers/agent-env.js";
 import { titleEnvironment } from "./title-environment.js";
 import { npmLockKeeps } from "./npm-range.js";
 import { assertGitTrust, GitTrustRefusal, ownGitPin, protectedGitEnv, trustedCommonDir, type DetachedAddCapability, type OwnGitCapability, type TrustedStoreCapability, type WorktreeRollback } from "./git-trust.js";
@@ -432,7 +433,11 @@ function executeShell(cmd: string, cwd: string, timeoutMs: number, login: boolea
   // an inert hooksPath whatever the repository or inherited GIT_CONFIG_* say; payload children keep the
   // operator's config. Every other parent, capability and explicit value survives.
   const payloadEnv = verificationJobEnvironment(repositoryLeaseEnvironment(commandLeaseEnvironment(options.env ?? process.env)));
-  const env = ownGit ? protectedGitEnv(payloadEnv) : payloadEnv;
+  const sealed = ownGit ? protectedGitEnv(payloadEnv) : payloadEnv;
+  // Queue row 367 (D-2187 add.21 (2)): an agent or seat child — or a probe handed an agentEnv() copy — never receives the
+  // Artificial Analysis key, neither from this environment nor from a startup file its shell sources; payloads keep it.
+  const agentChild = Boolean(options.seat || options.agent) || isAgentEnv(options.env);
+  const env = agentChild ? agentEnv(sealed) : sealed;
   for (const k of ROUTING_ENV_SEAMS) delete env[k];
   // Queue row 193 (D-2102 add.1): no gate or agent child inherits the launching agent session's host variables.
   for (const k of HOST_SESSION_VARS) delete env[k];
@@ -485,7 +490,7 @@ function executeShell(cmd: string, cwd: string, timeoutMs: number, login: boolea
       throw error;
     }
     try {
-      p = (spawnChild ?? spawn)("bash", [login ? "-lc" : "-c", cmd], { cwd, env: childEnv, stdio: ["ignore", "pipe", "pipe"], detached: true });
+      p = (spawnChild ?? spawn)("bash", [login ? "-lc" : "-c", agentChild ? agentShellCommand(cmd) : cmd], { cwd, env: childEnv, stdio: ["ignore", "pipe", "pipe"], detached: true });
     } catch (error) {
       observation.emit({ outcome: "spawn-failed", exitCode: null, signal: null, error: String(error) });
       throw error;
