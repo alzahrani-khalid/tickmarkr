@@ -188,7 +188,8 @@ describe("row 367 Phase 2: the ask-once prompt's skip and save rows", () => {
     expect(await initReusing(reused, { ...INTERACTIVE, keyLookup: kc.lookup, readHidden: initEnter, now: now() })).toContain("using probe results from 5m ago");
     expect(initEnter).toHaveBeenCalledTimes(1);
     expect(record(reused)).toEqual({ skippedAt: SKIPPED_AT });
-    expect(statSync(doctorPath(reused)).mtimeMs).toBe(when.getTime());
+    // whole milliseconds: Node 22 returns mtimeMs a float one microsecond low for a time utimes set (queue row 429)
+    expect(statSync(doctorPath(reused)).mtime.getTime()).toBe(when.getTime());
     expect(JSON.parse(doctorJson(reused)).fake).toEqual({ installed: true, authed: true, models: [] });
     const next = blockingReader();
     expect(await withinBound(doctorFull(reused, { ...INTERACTIVE, keyLookup: kc.lookup, readHidden: next }))).not.toBe(BLOCKED);
@@ -238,7 +239,7 @@ describe("row 367 Phase 2: the ask-once prompt's skip and save rows", () => {
         if (initial === REPORT) {
           expect(record(repo), cell).toEqual({ skippedAt: SKIPPED_AT });
           expect(registry.readDoctor(repo)?.fake, cell).toEqual(REPORT.fake);
-          expect(statSync(doctorPath(repo)).mtimeMs, cell).toBe(reportTime.getTime());
+          expect(statSync(doctorPath(repo)).mtime.getTime(), cell).toBe(reportTime.getTime());
           continue;
         }
         // A skip-only record never reads as a probed doctor cache: every report reader finds no report (run and its
