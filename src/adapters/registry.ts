@@ -699,7 +699,10 @@ export async function probeModels(
         const second = await attempt(model, { firstTimedOut });
         if (second.verdict) store(model, second.verdict);
       }
-      h.modelAuth = { ...priorModelAuth, ...verdicts };
+      // Keys in the scope's own model order, not probe completion order (queue row 430): two probes race, and
+      // doctor.json must not change bytes between two runs with the same verdicts.
+      const ordered = Object.fromEntries(models.flatMap((m) => (verdicts[m] ? [[m, verdicts[m]] as const] : [])));
+      h.modelAuth = { ...priorModelAuth, ...ordered };
     };
     if (a.probeCwd !== "neutral") return runProbes(repoRoot);
     const probeRoot = mkdtempSync(join(tmpdir(), "tickmarkr-probe-"));

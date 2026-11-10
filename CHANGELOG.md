@@ -9,7 +9,7 @@ carried in from run-20261108-125547-0000000000002405, which ended not green on r
 release. Two more were verified by hand with the same gates after their in-run review seat was lost to a local proxy
 outage, and one merged in run-20261110-065138-0000000000000043. Every task that ships passed build, lint, evidence and
 scope, its acceptance criteria, a review by a model from another vendor and the full test suite. Six tasks do not ship and
-move to 2.25.0: the identity probe that admits a discovered proxy model, routing and journaling of admitted models, the
+move to a later release: the identity probe that admits a discovered proxy model, routing and journaling of admitted models, the
 doctor warning for a key in the environment, and the run-end copy of the run folder, which was removed after its review
 stayed red.
 
@@ -26,6 +26,8 @@ stayed red.
   - A failed model probe records `launch-fault` or `timeout` instead of reading as signed out. A failed Kimi turn no
     longer flips the adapter's sign-in.
   - Doctor and the fleet editor flag a `prefer` entry that names a dead channel.
+  - `doctor.json` lists each adapter's model verdicts in the configured model order. Two doctor runs with the same
+    results now write the same file; before, the order followed whichever probe finished first.
 - **Model proxies behind the Claude base URL.** When `ANTHROPIC_BASE_URL` points at a model proxy, doctor:
   - detects the proxy, lists its models and reports listing failures by type;
   - records each claude-code model under its true vendor.

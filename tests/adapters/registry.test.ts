@@ -117,6 +117,33 @@ describe("doctor cache hardening", () => {
 });
 
 describe("model auth probes", () => {
+  test("per-model verdicts are recorded in the configured model order, not in probe completion order", async () => {
+    // Queue row 430: two probes run at once, so the slower first model used to land after the second and
+    // doctor.json changed bytes between two runs with the same verdicts.
+    const repo = mkdtempSync(join(tmpdir(), "tickmarkr-auth-order-"));
+    const script = join(repo, "fake.json");
+    writeFileSync(script, JSON.stringify({ tasks: {} }));
+    const fake = new FakeAdapter(script);
+    // Sequenced, not timed: the first model's probe cannot exit before the second model's verdict is stored.
+    const stored = join(repo, "quick-stored");
+    vi.spyOn(fake, "headlessCommand").mockImplementation((_prompt, model) =>
+      // bounded at 5 s: if the quick probe itself fails to run, this ends and the control below reds, with no hang
+      model === "fake-slow" ? `i=0; until [ -e ${shq(stored)} ] || [ $i -ge 100 ]; do sleep 0.05; i=$((i+1)); done; printf OK` : "printf OK");
+    const cfg = structuredClone(DEFAULT_CONFIG);
+    cfg.tiers.fake = { vendor: "fake", channel: "sub", models: { "fake-slow": "mid", "fake-quick": "cheap" } };
+    const health = await probeAll([fake]);
+    const finished: string[] = [];
+
+    await probeModels(cfg, repo, [fake], health, (_adapter, model) => {
+      finished.push(model);
+      if (model === "fake-quick") writeFileSync(stored, "");
+    });
+
+    // control: the quick model did finish first, so completion order is the other order
+    expect(finished).toEqual(["fake-quick", "fake-slow"]);
+    expect(Object.keys(health.fake.modelAuth ?? {})).toEqual(["fake-slow", "fake-quick"]);
+  });
+
   test("probes only classified fake models and records the per-model verdict", async () => {
     const repo = mkdtempSync(join(tmpdir(), "tickmarkr-auth-probe-"));
     const script = join(repo, "fake.json");
