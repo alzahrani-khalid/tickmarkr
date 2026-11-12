@@ -117,10 +117,12 @@ test("Cite the replaced watcher line in each of the three plain-host sections, v
   // Row 359; D-2185 add.20: auto shares loop's condensed role section; keep the parity and hostile-edit pins.
   // Row 380; D-2185 add.35: the overseer app scope gains the placement bullet; that moves the overseer pin only.
   // Rows 362 and 367, D-2187 condition 5: the overseer Fleet reviewer recipe now passes --author and records pick diagnostics.
+  // Row 418, D-2187 add.84: the overseer's park-verb paragraph teaches the no-verdict review infra waive; overseer pin only.
+  // Row 419, D-2187 add.89: the overseer's park-verb paragraph teaches approve --ruling; overseer pin only.
   const baseline = {
     loop: "d1bd9807906f68435920fb4f710163b2ff1fd18d732dfeee5cf231bbd8962742",
     auto: "1b07e1eb72d5b4cf3620a086e6958fc50d0aa673ad231a02d2ad58bf4d560f93",
-    overseer: "935d06e0330d3a267c399b563f8ef5ef71b9d685d6a05d1efabeffb29b703248",
+    overseer: "30254d1096d641d589fa5cbb8222d0cb6284fda918e169e2496f3724ed66b4d4",
   };
   for (const name of SKILLS) {
     const markdown = readSkill(name);

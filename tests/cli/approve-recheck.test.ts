@@ -3,12 +3,13 @@
 // gate suite, for the case where the gate failed against a stale task DECLARATION (spec files[]) rather
 // than a bad diff. Fail-closed like every approve path: refusals are loud and append nothing.
 import { execFileSync } from "node:child_process";
-import { rmSync, writeFileSync } from "node:fs";
+import { readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, test, vi } from "vitest";
 import { approve, newestPark, parkToken, permittedDecisionVerbs, readJournalEvents } from "../../src/cli/commands/approve.js";
 import { SubprocessDriver } from "../../src/drivers/subprocess.js";
 import { formatOwnedName } from "../../src/drivers/types.js";
+import { commandHelp } from "../../src/cli/help.js";
 import { graphDefinitionHash, loadGraph } from "../../src/graph/graph.js";
 import { runDaemon } from "../../src/run/daemon.js";
 import { gitHead } from "../../src/run/git.js";
@@ -281,4 +282,39 @@ describe("approve --recheck on a reapFailure stall park (OBS-1202, zero-token)",
       expect(j.read().filter((e) => e.event === "task-approved")).toEqual([]);
     }
   }, 120_000);
+});
+
+// Row 413 (D-2187 add.69, add.99 (6)): the park default, its usage refusals and the sentences that state it.
+test("approve refuses the on red flag without recheck or with an unknown value and the help enactment and skill sentences state the park default", async () => {
+  const { repo } = setupRepo([T("T1")], { tasks: {} });
+  const j = scopeParkedRun(repo, "run-on-red");
+  const rows = () => j.read().length;
+  const before = rows();
+  await expect(approve(["run-on-red", "T1", "--on-red", "park"], repo)).rejects.toThrow(/--on-red applies only to --recheck/);
+  await expect(approve(["run-on-red", "T1", "--waive", "--on-red", "repair"], repo)).rejects.toThrow(/--on-red applies only to --recheck/);
+  await expect(approve(["run-on-red", "T1", "--recheck", "--on-red", "later"], repo)).rejects.toThrow(/--on-red requires one of park, repair/);
+  await expect(approve(["run-on-red", "T1", "--recheck", "--on-red"], repo)).rejects.toThrow(/--on-red requires one of park, repair/);
+  expect(rows()).toBe(before);
+
+  // approve applies the default when it WRITES the decision, and an explicit value rides verbatim
+  const parked = await approve(["run-on-red", "T1", "--recheck"], repo);
+  expect(j.read().filter((e) => e.event === "task-approved").at(-1)!.data.onRed).toBe("park");
+  expect(parked).toContain("re-run the whole declared battery on the parked commit before any worker; if it is red, park on the first red gate for the next decision");
+  expect(parked).not.toContain("re-dispatch against the full gate suite");
+  const { repo: repo2 } = setupRepo([T("T1")], { tasks: {} });
+  const j2 = scopeParkedRun(repo2, "run-on-red-repair");
+  const repaired = await approve(["run-on-red-repair", "T1", "--recheck", "--on-red", "repair"], repo2);
+  expect(j2.read().filter((e) => e.event === "task-approved").at(-1)!.data.onRed).toBe("repair");
+  expect(repaired).toContain("re-dispatch against the full gate suite only if re-running the whole declared battery on the parked commit before any worker is red");
+
+  const help = commandHelp("approve").replace(/\s+/g, " ");
+  expect(help).toContain("Request rechecking an infra or failed-gate park; satisfies no gate. A red recheck parks the task on its first red gate unless --on-red repair is given.");
+  expect(help).toContain("On a red recheck, park (the default) waits for your next decision; repair dispatches a repair at once.");
+
+  const sentence = "A red recheck parks the task on its first red gate by default; pass --on-red repair to fund a repair at once.";
+  for (const file of ["skills/tickmarkr-loop/references/cockpit.md", "skills/tickmarkr-overseer/SKILL.md"]) {
+    const text = readFileSync(join(process.cwd(), file), "utf8").replace(/\s+/g, " ");
+    expect(text.split(sentence)).toHaveLength(2);
+    expect(text).not.toMatch(/red recheck re-dispatches/i);
+  }
 });

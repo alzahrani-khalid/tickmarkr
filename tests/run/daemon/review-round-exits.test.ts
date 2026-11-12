@@ -74,7 +74,10 @@ class MidAuthor extends FakeAdapter {
 // ---- scripted gate rounds: the closed exit table at the daemon's own publication seam ----------------
 type Semantic = { review?: GateResult; acceptance?: "pass" | "cancelled" | "throw"; reviewFirst?: boolean };
 const DETERMINISTIC: GateName[] = ["build", "test", "lint", "evidence", "scope"];
-const pass = (gate: GateName): GateResult => ({ gate, pass: true, details: "ok" });
+// Row 418 (D-2187 add.84): the scripted full test carries a started invocation's receipt, so a seatless
+// park whose every other enabled gate passed is a PROVED infra review park (its waive proof reads it).
+const TEST_RECEIPT = { invocationId: "scripted-test", subject: { gate: "test" }, termination: { kind: "exit", exitCode: 0 } };
+const pass = (gate: GateName): GateResult => ({ gate, pass: true, details: "ok", ...(gate === "test" ? { evidenceReceipt: TEST_RECEIPT } : {}) } as GateResult);
 /** Replays one round through ctx.onGate exactly as run-gates publishes it: the deterministic battery in
  * sequence, then acceptance ‖ review stamped with one parent. A `cancelled` acceptance never ends; a
  * `throw` acceptance kills the round after whatever already ended. */
@@ -191,12 +194,15 @@ describe("C — each failed review round has its lawful exit (production daemon,
     const permutations = [["held", { reviewFirst: true, acceptance: "cancelled" }], ["none", { reviewFirst: false, acceptance: "pass" }]] as const;
     const table = [
       { row: "no-eligible", kind: "gate-fail", verbs: ["waive", "uphold", "recheck"], seats: [] as string[], review: () => noEligible, calls: 1 },
-      { row: "seatless", kind: "infra", verbs: ["approve", "recheck"], seats: [], review: () => noVerdict("seat-a:seat-a"), calls: 1 },
+      // row 418: a qualifying seatless or exhausted park (acceptance passed, executed full test) adds the
+      // review waive; its cancelled-sibling permutation (acceptance absent) keeps approve and recheck
+      { row: "seatless", kind: "infra", verbs: ["approve", "waive", "recheck"], seats: [], review: () => noVerdict("seat-a:seat-a"), calls: 1 },
       // the recovery picker re-seats seat-b on a review-only round, which also returns no verdict
-      { row: "exhausted", kind: "infra", verbs: ["approve", "recheck"], seats: ["seat-b"], review: (call: number) => noVerdict(call % 2 === 0 ? "seat-a:seat-a" : "seat-b:seat-b"), calls: 2 },
+      { row: "exhausted", kind: "infra", verbs: ["approve", "waive", "recheck"], seats: ["seat-b"], review: (call: number) => noVerdict(call % 2 === 0 ? "seat-a:seat-a" : "seat-b:seat-b"), calls: 2 },
     ] as const;
     for (const exit of table) {
       for (const [held, order] of permutations) {
+        const exitVerbs = exit.kind === "infra" && held === "held" ? ["approve", "recheck"] : exit.verbs;
         const runId = `run-exit-${exit.row}-${held}`;
         const { repo, scriptPath } = setupRepo([T("T1")], { tasks: { T1: [work("w0")] } }, CMDS);
         const adapters = [new Author(scriptPath), ...exit.seats.map((id) => new Seat(scriptPath, id))];
@@ -224,7 +230,7 @@ describe("C — each failed review round has its lawful exit (production daemon,
             expect(review.data.pass, runId).toBeUndefined(); // never a fabricated pass:false, never a pass
           }
         }
-        expect(verbs(rows), runId).toEqual(exit.verbs);
+        expect(verbs(rows), runId).toEqual(exitVerbs);
         expect(of(rows, "task-failed"), runId).toEqual([]);
         // ---- the resumed site: a recheck re-gates through the resume battery and exits the same way ----
         calls = 0;
@@ -236,7 +242,7 @@ describe("C — each failed review round has its lawful exit (production daemon,
         expect(resumedReviews.length, runId).toBe(calls);
         expect(calls, runId).toBeGreaterThan(0);
         expect(of(rows, "task-human").at(-1)!.data.kind, runId).toBe(exit.kind);
-        expect(verbs(rowsOf(repo, runId)), runId).toEqual(exit.verbs);
+        expect(verbs(rowsOf(repo, runId)), runId).toEqual(exitVerbs);
         vi.restoreAllMocks();
       }
     }
@@ -274,7 +280,7 @@ describe("C — each failed review round has its lawful exit (production daemon,
       expect(calls, runId).toBe(1);
       expect(of(rows, "review-infra-retry"), runId).toEqual([]);
       expect(of(rows, "task-human").at(-1)!.data.kind, runId).toBe("infra");
-      expect(verbs(rows), runId).toEqual(["approve", "recheck"]);
+      expect(verbs(rows), runId).toEqual(["approve", "waive", "recheck"]); // row 418: a proved exhausted-recovery park
     }
   });
 

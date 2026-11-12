@@ -1,4 +1,4 @@
-import { mkdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
+import { lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { checkedAuthority } from "../run/git-trust.js";
@@ -279,6 +279,34 @@ export function codexMcpSuppressionFlags(configPath?: string): string {
 // Queue row 2 (D-2112): non-worker seats omit the grant; workers carry the rendered argument.
 const codexExec = (promptFile: string, model: string, effort: Effort | undefined, grant: string): string =>
   `codex ${CODEX_NO_DAEMON} exec --sandbox workspace-write ${CODEX_HOOK_TRUST} ${codexMcpSuppressionFlags()}${grant}${codexEffortFlag(effort)} --model ${shq(model)} - < ${shq(promptFile)}`;
+
+// Queue row 406; D-2187 add.99 and add.100: a judge or review seat that starts the task's suite needs Vite's
+// config-bundle temp folder writable, and the worktree's node_modules is the provisioned link into the main checkout.
+// The grant is exactly ONE root: the `.vite-temp` leaf directly under the RESOLVED dependency root, created before
+// launch. A pre-existing leaf that is a symlink, not a directory, or resolves anywhere but that exact path throws
+// (the caller's seat-launch failure) — never a fallback to the dependency root or the link target. A worktree with no
+// dependency directory keeps the base grantless launch. Residual (add.100 M8): the seat may write or remove other
+// generated config modules in that shared temp folder; no installed package and no git metadata becomes writable.
+export function codexSeatViteLeaf(cwd: string): string | undefined {
+  let deps: string;
+  try {
+    deps = realpathSync(join(cwd, "node_modules"));
+    if (!statSync(deps).isDirectory()) return undefined;
+  } catch { return undefined; }
+  const leaf = join(deps, ".vite-temp");
+  try { mkdirSync(leaf); } catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+  const st = lstatSync(leaf);
+  if (st.isSymbolicLink() || !st.isDirectory() || realpathSync(leaf) !== leaf || /[\x00-\x1f\x7f"\\]/.test(leaf)) {
+    throw new Error(`refusing the seat's Vite temp grant: ${leaf} is not a real directory directly under ${deps}`);
+  }
+  return leaf;
+}
+
+/** Row 406: the judge/review seat launch — the headless seat form plus only the checked leaf grant. */
+export const codexSeatCommand = (promptFile: string, model: string, effort: Effort | undefined, cwd: string): string => {
+  const leaf = codexSeatViteLeaf(cwd);
+  return codexExec(promptFile, model, effort, leaf ? ` -c ${shq(`sandbox_workspace_write.writable_roots=["${leaf}"]`)}` : "");
+};
 
 export const codex: WorkerAdapter = {
   id: "codex",

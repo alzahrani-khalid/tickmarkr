@@ -64,10 +64,12 @@ Per release:
    filename, 15 fewer models on raw.
 2. In the private repository, bump `version` in `package.json` and commit it. The proof and mirror push
    are step 3; do not tag or publish from the private repository.
-3. Produce and retain the release proof, including lint, before grading CI. From the private tree run:
+3. Produce and retain the release proof, including lint, before grading CI. From the private tree run,
+   passing the persistent mirror. `verify:export` runs the exporter's `--onto` target checks first and
+   refuses, before `npm ci`, with that script's own message when the mirror is unclean (ignored files included):
 
    ```bash
-   VITEST_MAX_FORKS=6 npm run-script verify:export
+   VITEST_MAX_FORKS=6 npm run-script verify:export -- --onto /path/to/tickmarkr-public-mirror
    ```
 
    The captured proof must show the exported candidate complete `npm ci`, `npm run build`,
@@ -109,7 +111,7 @@ Per release:
    in-progress run — with the shipped tri-state grader, giving it the mirror clone that holds the commit:
 
    ```bash
-   bash skills/tickmarkr-overseer/scripts/grade-ci.sh <run-id> "$MIRROR_COMMIT" /path/to/tickmarkr-public-mirror v2.24.0
+   bash skills/tickmarkr-overseer/scripts/grade-ci.sh <run-id> "$MIRROR_COMMIT" /path/to/tickmarkr-public-mirror v2.25.0
    ```
 
    The grader is bound to that head: a run of any other commit, or one not yet at run-end, reads
@@ -130,7 +132,7 @@ Per release:
 
    ```bash
    npx --no-install tsx scripts/ci/cli.ts release subject /path/to/tickmarkr-public-mirror "$MIRROR_COMMIT"
-   npx --no-install tsx scripts/ci/cli.ts release tag-absent /path/to/tickmarkr-public-mirror v2.24.0
+   npx --no-install tsx scripts/ci/cli.ts release tag-absent /path/to/tickmarkr-public-mirror v2.25.0
    ```
 
    Only after the grader prints `VERDICT rc=0` (GREEN for every job of the inventory), tag `MIRROR_COMMIT` in the **public**
@@ -139,8 +141,8 @@ Per release:
 
    ```bash
    cd /path/to/tickmarkr-public-mirror
-   git tag -a v2.24.0 "$MIRROR_COMMIT" -m "v2.24.0"
-   git push origin v2.24.0
+   git tag -a v2.25.0 "$MIRROR_COMMIT" -m "v2.25.0"
+   git push origin v2.25.0
    ```
 
 5. The tag push runs `release.yml` in the public repository:
@@ -198,8 +200,8 @@ Per release:
    ```bash
    cd /path/to/tickmarkr-private-main
    PRIVATE_RELEASE_COMMIT=$(git -C /path/to/tickmarkr-private-main rev-parse main)
-   npx --no-install tsx scripts/ci/cli.ts release trees-equal /path/to/tickmarkr-private-main "$PRIVATE_RELEASE_COMMIT" /path/to/tickmarkr-public-mirror v2.24.0
-   git -C /path/to/tickmarkr-private-main tag -a v2.24.0 "$PRIVATE_RELEASE_COMMIT" -m "v2.24.0"
+   npx --no-install tsx scripts/ci/cli.ts release trees-equal /path/to/tickmarkr-private-main "$PRIVATE_RELEASE_COMMIT" /path/to/tickmarkr-public-mirror v2.25.0
+   git -C /path/to/tickmarkr-private-main tag -a v2.25.0 "$PRIVATE_RELEASE_COMMIT" -m "v2.25.0"
    ```
 
 ### 8. Branch deletion after the private tag
@@ -211,7 +213,7 @@ Per release:
    by hand only after `GREEN` (exit 0):
 
    ```bash
-   BRANCHES_TO_DELETE=(spec/v2.24.0 tickmarkr/run-<run-id>)
+   BRANCHES_TO_DELETE=(spec/v2.25.0 tickmarkr/run-<run-id>)
    npx --no-install tsx scripts/ci/cli.ts release prune-safe /path/to/tickmarkr-private-main "$PRIVATE_RELEASE_COMMIT" "${BRANCHES_TO_DELETE[@]}"
    git -C /path/to/tickmarkr-private-main branch -d "${BRANCHES_TO_DELETE[@]}"
    ```
@@ -230,7 +232,7 @@ registry shows the new version:
 
    ```bash
    cd /path/to/tickmarkr-private-main
-   npx --no-install tsx scripts/ci/cli.ts release installed-version tickmarkr 2.24.0
+   npx --no-install tsx scripts/ci/cli.ts release installed-version tickmarkr 2.25.0
    ```
 
    `tickmarkr version` must report exactly the just-published version. A mismatch is a hard

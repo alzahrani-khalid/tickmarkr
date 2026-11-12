@@ -19,6 +19,7 @@ import { resolveStateDir } from "./cache.js";
 import { appendAnchoredReview, COMPLETION_FAKING_CHECKLIST, dewrapPaneVerdict, extractVerdictJson, generateVerdictNonce, type GateVia, parseAnchoredComments, runLlmDetailed, SeatLaunchError, verdictNonceLine } from "./llm.js";
 import type { GateResult } from "./types.js";
 import { classifyVerdictCause, type VerdictUnparseableCause } from "./verdict-cause.js";
+import { renderRulingsSection, type RuledTask } from "../run/rulings.js";
 import {
   captureDiffCapFor,
   measureArtifactDiff,
@@ -441,7 +442,9 @@ export function pickReviewer(
 // evidence about the WORK, which is why run-gates retries the review, never the worker (OBS-193).
 // OBS-1013 add.3: a parseable verdict whose closure ids match no carried fingerprint is a
 // `closure-mismatch` — a no-verdict about the carried materials (infra: re-route), never a parse defect.
-export type ReviewUnparseableCause = VerdictUnparseableCause | "launch-never-started" | "truncated" | "silent" | "closure-mismatch" | "seat-launch-failed";
+export type ReviewUnparseableCause = VerdictUnparseableCause | "launch-never-started" | "truncated" | "silent" | "closure-mismatch" | "seat-launch-failed"
+  // Row 417; D-2187 add.77: a reconnect-only stream (transport-death.ts), killed fast or ended so.
+  | "transport";
 
 /**
  * This shows the reviewer what the task DECLARED, never what the diff may actually reach. The diff
@@ -598,7 +601,7 @@ function anchorParent(
 }
 
 export async function reviewGate(
-  task: Task,
+  task: RuledTask, // row 419 (D-2187 add.89): the daemon and a run-bound verify attach the run's folded rulings
   worktree: string,
   baseRef: string,
   author: Assignment,
@@ -779,7 +782,7 @@ ${priorMaterials.length ? `${renderPriorMaterials(priorMaterials)}
 The task declares these items out of scope. A finding inside these declared bounds is not material and must not block approval.
 ${task.outOfScope.map((item) => `- ${item}`).join("\n")}
 
-` : ""}## Diff
+` : ""}${renderRulingsSection(task.rulings)}## Diff
 \`\`\`diff
 ${diff}
 \`\`\`
@@ -917,6 +920,7 @@ ${responseRequirement}
     // evidence cannot be audited, and a cutoff must never be indistinguishable from a parse defect.
     const bytes = llm.seatAuthoredBytes ?? Buffer.byteLength(raw.trim(), "utf8");
     const cause: ReviewUnparseableCause = closureMismatch ? "closure-mismatch" : closureInvalid ? "malformed-verdict"
+      : llm.transport ? "transport"
       : llm.launchNeverStarted ? "launch-never-started"
       : llm.silentAtBeat ? "silent"
       : llm.timedOut ? (bytes > 0 ? "truncated" : "silent")

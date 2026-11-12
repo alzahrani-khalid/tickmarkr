@@ -159,7 +159,16 @@ export function recordedBinding(value: unknown): DecisionBinding | undefined {
  * does not end the walk; refusals are read here directly, never through foldDecisions (which calls this).
  */
 export function failedGateBeforePark(events: readonly JournalEvent[], taskId: string, parkIndex: number): GateName | undefined {
+  return failedGateRowBeforePark(events, taskId, parkIndex)?.gate;
+}
+
+/** failedGateBeforePark's answer with the index of the gate-result row it read (row 418: the waive reads that row). */
+export function failedGateRowBeforePark(events: readonly JournalEvent[], taskId: string, parkIndex: number): { gate: GateName; index: number } | undefined {
   let inherits = events[parkIndex]?.data.kind === "gate-fail";
+  const infra = events[parkIndex]?.data.kind === "infra";
+  // Row 413 (D-2187 add.69): a red recheck parked under onRed park names its FIRST red gate in declaration
+  // order; the walk binds that gate's red row, never a later-declared gate journaled after it.
+  let pinned = events[parkIndex]?.data.firstRedGate;
   let refused: Set<unknown> | "all" = new Set();
   for (let i = parkIndex - 1; i >= 0; i -= 1) {
     const event = events[i]!;
@@ -169,6 +178,7 @@ export function failedGateBeforePark(events: readonly JournalEvent[], taskId: st
       if (!inherits || event.data.kind !== "gate-fail") return undefined;
       // The walk now reads the previous park's own span, under that park's own refusals.
       refused = new Set();
+      pinned = event.data.firstRedGate;
     } else if (event.event === APPROVAL_REFUSED) {
       if (refused !== "all") refused = Array.isArray(event.data.lines) ? new Set([...refused, ...event.data.lines]) : "all";
     } else if (event.event === "task-approved") {
@@ -176,14 +186,21 @@ export function failedGateBeforePark(events: readonly JournalEvent[], taskId: st
     } else if (event.event === "task-dispatch") {
       return undefined;
     } else if (event.event === "gate-result") {
+      if (typeof pinned === "string" && event.data.gate !== pinned) continue;
       if (event.data.pass === false && typeof event.data.gate === "string" && (GATE_NAMES as readonly string[]).includes(event.data.gate)) {
-        return event.data.gate as GateName;
+        return { gate: event.data.gate as GateName, index: i };
       }
+      // Row 418 (D-2187 add.84): an infra park's no-verdict review row is that park's failed gate.
+      if (infra && noVerdictReview(event.data)) return { gate: "review", index: i };
       inherits = false; // a passing gate-result keeps the park's own span
     }
   }
   return undefined;
 }
+
+/** Row 418 (D-2187 add.84): a review row that produced no verdict — no pass field, skipped as infra. */
+export const noVerdictReview = (data: Record<string, unknown>): boolean =>
+  data.gate === "review" && data.noVerdict === true && data.pass === undefined;
 
 // OBS-1178: every row read from a journal file remembers its PHYSICAL 1-based line, so a decision
 // fold keys bindings and refusals by the line an operator's token names — never by a compacted index
@@ -1813,9 +1830,45 @@ export const ScopeAmendmentSchema = z.object({
  * older than v2.5.7): the caller reads it from the run's materialized graph snapshot.
  */
 export function replayScopeAmendments(graph: RunGraph, events: JournalEvent[], release = false, approvedDefinitions: ReadonlyMap<string, string> = new Map()): RunGraph {
-  const amendments = effectiveEvents(events).filter((e) => e.event === "task-approved" && e.data.amendment !== undefined)
-    .map((event) => ({ event, amendment: ScopeAmendmentSchema.parse(event.data.amendment) }));
-  if (!amendments.length) return graph;
+  return replayWithLapses(graph, events, release, approvedDefinitions).graph;
+}
+
+/** Row 409 (D-2187 add.100 N1): one row per grant that lapsed under a --graph-changed resume. */
+export const SCOPE_LAPSE_EVENT = "scope-amendment-lapsed";
+const lapseKey = (taskId: string | undefined, park: unknown): string => `${taskId}\0${String(park)}`;
+
+/** The active grants: effective scope amendments minus every grant a recorded lapse row names (durable in every fold). */
+function activeAmendments(events: JournalEvent[]): { event: JournalEvent; amendment: z.infer<typeof ScopeAmendmentSchema> }[] {
+  const lapsed = new Set(events.filter((e) => e.event === SCOPE_LAPSE_EVENT).map((e) => lapseKey(e.taskId, e.data.park)));
+  return effectiveEvents(events).filter((e) => e.event === "task-approved" && e.data.amendment !== undefined)
+    .map((event) => ({ event, amendment: ScopeAmendmentSchema.parse(event.data.amendment) }))
+    .filter(({ event, amendment }) => !lapsed.has(lapseKey(event.taskId, amendment.parkLine)));
+}
+
+type Lapse = { taskId: string; data: { park: number; from: string; to: string; files: string[] } };
+
+function replayWithLapses(graph: RunGraph, events: JournalEvent[], release: boolean, approvedDefinitions: ReadonlyMap<string, string>): { graph: RunGraph; lapses: Lapse[]; survived: boolean } {
+  let amendments = activeAmendments(events);
+  const lapses: Lapse[] = [];
+  if (release) {
+    // Row 409 (D-2187 add.100 N1): under --graph-changed a grant whose task's loaded definition fingerprint or
+    // files[] changed LAPSES instead of refusing: not applied, one row per grant, refusing nothing. Files are
+    // checked per task (a files-only change leaves the fingerprint equal), the fingerprint per grant; a grant
+    // with no recorded fingerprint is left to the refusal below.
+    for (const { event, amendment } of amendments) {
+      const task = graph.tasks.find((t) => t.id === event.taskId);
+      const history = amendments.filter((a) => a.event.taskId === event.taskId);
+      const filesChanged = task !== undefined && ![history[0]!.amendment.beforeFiles, ...history.map((a) => a.amendment.files)]
+        .some((files) => JSON.stringify(files) === JSON.stringify(task.files));
+      const approved = amendment.definition ?? approvedDefinitions.get(event.taskId ?? "");
+      const current = task === undefined ? undefined : taskDefinitionFingerprint(task);
+      if (task === undefined || approved === undefined || (!filesChanged && current === approved)) continue;
+      lapses.push({ taskId: event.taskId!, data: { park: amendment.parkLine, from: approved, to: current!, files: amendment.files.filter((f) => !amendment.beforeFiles.includes(f)) } });
+    }
+    const gone = new Set(lapses.map((l) => lapseKey(l.taskId, l.data.park)));
+    amendments = amendments.filter(({ event, amendment }) => !gone.has(lapseKey(event.taskId, amendment.parkLine)));
+  }
+  if (!amendments.length) return { graph, lapses, survived: false };
   let result = graph;
   // Accept any materialized revision, including a fresh compilation of the original definition.
   // Undo only recognized files[] values. Everything else must still hash to the approved definition.
@@ -1835,7 +1888,18 @@ export function replayScopeAmendments(graph: RunGraph, events: JournalEvent[], r
   // replay — never reaches its own release. Under that audited release the amended task's files[]
   // recognition above still holds and the caller journals the rehash; only the whole-graph identity
   // asserts are waived. Without the release nothing changes: fail closed.
+  // Row 409 (D-2187 add.100 N1, add.144): outside the release, an active grant recorded BEFORE the latest audited
+  // transition (a rehash a --graph-changed resume journaled) skips the whole-graph from/to asserts: that transition
+  // superseded the identity they name and its release checked the grant against its own task's definition. The
+  // files[] recognition above still applies. The identity itself is the shared comparator's (never moved here).
+  const transition = events.reduce((at, e, i) => e.event === "graph-rehash" && (e.data.source !== "approval" || e.data.released === true) ? i : at, -1);
+  let survived = false;
   for (const { event, amendment } of amendments) {
+    if (!release && events.indexOf(event) < transition) {
+      result = { ...result, tasks: result.tasks.map((t) => t.id === event.taskId ? { ...t, files: amendment.files } : t) };
+      survived = true;
+      continue;
+    }
     if (release) {
       // The release waives the WHOLE-GRAPH identity (another task may lawfully have moved), never the
       // amended task's own definition: goal, acceptance, deps, floor must still be what was approved.
@@ -1854,14 +1918,15 @@ export function replayScopeAmendments(graph: RunGraph, events: JournalEvent[], r
     result = { ...result, tasks: result.tasks.map((t) => t.id === event.taskId ? { ...t, files: amendment.files } : t) };
     if (!release && graphDefinitionHash(result) !== amendment.to) throw new Error("refusing invalid scope amendment hash");
   }
-  return result;
+  return { graph: result, lapses, survived };
 }
 
 /** Publish/recover the audit before dispatch, even after a crash between approval and rehash. */
 export function applyScopeAmendments(graph: RunGraph, journal: Journal, auditReplay = false, release = false): RunGraph {
   const events = journal.read();
-  const result = replayScopeAmendments(graph, events, release, release ? snapshotDefinitions(journal) : new Map()); // validate all before moving any identity
-  const approvals = effectiveEvents(events).filter((e) => e.event === "task-approved" && e.data.amendment !== undefined);
+  const { graph: result, lapses, survived } = replayWithLapses(graph, events, release, release ? snapshotDefinitions(journal) : new Map()); // validate all before moving any identity
+  for (const lapse of lapses) journal.append(SCOPE_LAPSE_EVENT, lapse.taskId, lapse.data); // row 409: journaled once, skipped by every later fold
+  const approvals = activeAmendments(journal.read()).map(({ event }) => event);
   for (const approval of approvals) {
     const amendment = ScopeAmendmentSchema.parse(approval.data.amendment);
     if (!events.some((e) => e.event === "graph-rehash" && e.data.approval === approval.ts && e.taskId === approval.taskId
@@ -1871,11 +1936,13 @@ export function applyScopeAmendments(graph: RunGraph, journal: Journal, auditRep
       });
     }
   }
-  if (auditReplay && graphDefinitionHash(graph) !== graphDefinitionHash(result) && approvals.length) {
-    const recorded = recordedGraphDefinitionHash(journal.read());
+  const recorded = recordedGraphDefinitionHash(journal.read());
+  // Row 409 (add.144): a replay that skipped a survivor's asserts never adopts an identity: its rehash is journaled
+  // only onto the recorded identity, else nothing and the comparator refuses. A released one marks the transition.
+  if (auditReplay && graphDefinitionHash(graph) !== graphDefinitionHash(result) && approvals.length && (!survived || graphDefinitionHash(result) === recorded)) {
     journal.append("graph-rehash", approvals.at(-1)!.taskId, {
       from: recorded, to: graphDefinitionHash(result), approval: approvals.at(-1)!.ts, source: "approval", replay: true,
-      loaded: graphDefinitionHash(graph),
+      loaded: graphDefinitionHash(graph), ...(release ? { released: true } : {}),
     });
   }
   return result;
@@ -2570,7 +2637,8 @@ export class Journal {
         }
         if (typeof e.data.gate === "string") {
           const failed = failedSubjects.get(e.taskId) ?? new Map<string, string>();
-          if (commit && e.data.pass === false) failed.set(e.data.gate, commit);
+          // Row 418: a no-verdict review is a failed review a waive may carry, as a pass:false one is.
+          if (commit && (e.data.pass === false || noVerdictReview(e.data))) failed.set(e.data.gate, commit);
           else failed.delete(e.data.gate);
           failedSubjects.set(e.taskId, failed);
         }

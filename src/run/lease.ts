@@ -170,6 +170,23 @@ const alive = (pid: number): boolean => {
 };
 const isCode = (error: unknown, code: string) => (error as NodeJS.ErrnoException).code === code;
 
+/** Queue row 406; D-2187 add.99 (7), add.100 and add.131 (amendment D): an acquisition's FIRST filesystem mutation —
+ * creating the lock directory, or publishing this acquisition's owner entry when that directory already exists — was
+ * denied (EPERM or EACCES). Typed at that one site only, so a caller never infers it from an errno a lease read, a
+ * process census or any later mutation raised; a denial after an earlier mutation succeeded keeps its original error. */
+export class LeaseWriteDenied extends Error {
+  constructor(public readonly path: string, public readonly cause: NodeJS.ErrnoException) {
+    super(`runner lease write denied (${cause.code}): ${path}`);
+    this.name = "LeaseWriteDenied";
+  }
+}
+const leaseWrite = <T>(path: string, write: () => T): T => {
+  try { return write(); } catch (error) {
+    if (isCode(error, "EPERM") || isCode(error, "EACCES")) throw new LeaseWriteDenied(path, error as NodeJS.ErrnoException);
+    throw error;
+  }
+};
+
 /** OBS-1057: dev+ino alone is not an identity across unlink/recreate — Linux hands the freed inode
  * number straight to the next file, so a stale observation of a dead or corrupt reservation matched
  * the fresh reservation that replaced it and reclaimDead removed the live winner (public CI, ubuntu).
@@ -237,14 +254,22 @@ const releaseMutationLock = (lock: string, entry: string, target: string, inheri
   }
   try { rmdirSync(lock); } catch { /* ENOTEMPTY: a successor owns the directory */ }
 };
-const withMutationLock = async <T>(path: string, pollMs: number, signal: AbortSignal | undefined, run: () => T | Promise<T>): Promise<T> => {
+const withMutationLock = async <T>(path: string, pollMs: number, signal: AbortSignal | undefined, run: () => T | Promise<T>,
+  acquisition?: { first: boolean; mutated: () => void }): Promise<T> => {
   const lock = mutationLock(path);
+  // Row 406 (add.131): only an acquisition's first mutation is typed; every later one fails as at the base.
+  let first = acquisition?.first ?? false;
+  const mutate = (write: () => void): void => {
+    if (first) leaseWrite(lock, write); else write();
+    first = false;
+    acquisition?.mutated();
+  };
   const target = `${process.pid}:${randomUUID()}`;
   let entry = "";
   let inherited: string[] = [];
   for (;;) {
     signal?.throwIfAborted();
-    try { mkdirSync(lock); } catch (error) { if (!isCode(error, "EEXIST")) throw error; }
+    try { mutate(() => mkdirSync(lock)); } catch (error) { if (!isCode(error, "EEXIST")) throw error; }
     const holder = mutationHolder(lock);
     if (holder?.pid !== undefined && alive(holder.pid)) {
       await new Promise((wake) => setTimeout(wake, pollMs));
@@ -252,7 +277,7 @@ const withMutationLock = async <T>(path: string, pollMs: number, signal: AbortSi
     }
     entry = `owner.${(holder?.gen ?? -1) + 1}`;
     try {
-      symlinkSync(target, join(lock, entry));
+      mutate(() => symlinkSync(target, join(lock, entry)));
       inherited = readdirSync(lock).filter((name) => name !== entry && lockGeneration(name) !== undefined);
       break;
     } catch (error) {
@@ -438,11 +463,13 @@ async function repositoryLease<T>(cwd: string, run: () => Promise<T>, opts: Repo
       opts.onWait?.(holder, blocking.length ? await describeLeaseBlockers(blocking) : undefined);
     }
   };
+  let mutated = false; // row 406: has this acquisition mutated the filesystem yet
   try {
     for (;;) {
       opts.signal?.throwIfAborted();
       if (queue.values().next().value === ticket) {
-        const attempt = await withMutationLock(path, pollMs, opts.signal, () => inspectAndReserve(path, mine));
+        const attempt = await withMutationLock(path, pollMs, opts.signal, () => inspectAndReserve(path, mine),
+          { first: !mutated, mutated: () => { mutated = true; } });
         if (attempt.acquired) { repositoryBlocking.delete(path); break; }
         if (attempt.holder) repositoryBlocking.set(path, { token: attempt.holder.token, blocking: attempt.blocking ?? [] });
         await waitOn(attempt.holder, attempt.blocking);

@@ -56,7 +56,9 @@ const check = (repo: string) => dispatch("version", ["--check"], {
 });
 
 // Queue row 242; D-2141, D-2152: the cockpit body is the original 104 lines, each newline retained.
-const cockpitHash = "92e7c27db6c39de2023dc94e83135b8e0f75dd227f665c8f02524051cf30d747";
+// Row 418 (D-2187 add.84): its infra verb sentence gains the no-verdict review waive (two lines).
+// Row 413 (D-2187 add.69): its recheck sentence states the park default (same line count).
+const cockpitHash = "cb9f4ff664ce0bce1839c58db7816a29736212390bab76a20cf40545168de6e8";
 const cockpitHeading = "## Cockpit, parked decisions and printed twins\n";
 const cockpitPointer = "Read [the cockpit walkthrough](references/cockpit.md) before operating the cockpit, deciding a park or reading a printed twin.";
 
@@ -84,8 +86,10 @@ test("test: an agent init into a scratch consumer installs the loop's cockpit re
   const repo = await consumer(true);
   const loopSource = join(dirname(source), "tickmarkr-loop");
   const packaged = readFileSync(join(loopSource, "references/cockpit.md"));
-  expect(packaged.byteLength).toBe(8879);
-  expect(packaged.toString("utf8").split("\n")).toHaveLength(105);
+  // Row 418 (D-2187 add.84): the infra verb sentence gains the no-verdict review waive.
+  // Row 413 (D-2187 add.69): the recheck sentence states the park default.
+  expect(packaged.byteLength).toBe(9194);
+  expect(packaged.toString("utf8").split("\n")).toHaveLength(107);
   assertCockpitPointer(loopSource);
   for (const host of [".agents", ".claude"]) {
     const skillsDir = join(repo, host, "skills");

@@ -44,6 +44,17 @@ export interface RepairDispositionInput {
 
 const failed = (g: GateResult) => !(g.pass || g.meta?.skipped === true) || g.meta?.infra === true;
 const REFUSAL_RE = /outside|out.of.scope|allowlist|scope expansion|not (?:in|own)|unowned/i;
+/** Queue row 410: the repair brief's lawful report, read up to its first delimiter and no further. */
+const LAWFUL_RE = /infeasible inside files\[\]:(.*?)(?: — | - |;|$)/is;
+
+/** Queue row 410: the paths of the lawful `infeasible inside files[]: <paths>` form, comma or space
+ * separated; undefined when the summary does not carry the form. Text after the delimiter is never read. */
+export const lawfulInfeasiblePaths = (summary: string): string[] | undefined => {
+  const list = LAWFUL_RE.exec(summary)?.[1];
+  // A path token is a maximal run of non-comma, non-whitespace characters, passed exactly as written
+  // (src/trailing., 'leading.ts, Dockerfile, src/über.ts): no character is trimmed or cleaned.
+  return list === undefined ? undefined : list.match(/[^\s,]+/g) ?? [];
+};
 
 /** Queue row 230: tsc's position, numeric or baseline-normalized (#), ends a path; named parentheses stay. */
 export const namedPaths = (text: string): string[] => [...text.matchAll(/(?:^|[\s`'"])((?:[A-Za-z0-9_@.()[\]-]+\/)+(?:[A-Za-z0-9_@.[\]-]|\([A-Za-z0-9_@.[\]-]*\))+|(?:[A-Za-z0-9_@-]|\([A-Za-z0-9_@.[\]-]*\))+(?:\.(?:[A-Za-z0-9_-]|\([A-Za-z0-9_@.[\]-]*\))+)+)(?=$|[\s`'"),:;.!?]|\((?:\d+|#),\s*(?:\d+|#)\))/g)]
@@ -85,8 +96,8 @@ export function classifyRepairDisposition(input: RepairDispositionInput): Repair
 
   const allowed = filesGlob([...input.files]);
   const inventory = [...input.inventory];
-  const unowned = (text: string) => {
-    const r = resolveScopeHints(namedPaths(text).filter((path) => !allowed(path)), inventory);
+  const unowned = (text: string, candidates = namedPaths(text)) => {
+    const r = resolveScopeHints(candidates.filter((path) => !allowed(path)), inventory);
     return { paths: r.resolved.filter((path) => !allowed(path)), diagnostics: r.diagnostics };
   };
   const owned = (text: string) => resolveScopeHints(namedPaths(text), inventory).resolved.some(allowed);
@@ -113,8 +124,10 @@ export function classifyRepairDisposition(input: RepairDispositionInput): Repair
     return { paths, landings: [] };
   };
 
-  const refusal = input.refusalSummary !== undefined && REFUSAL_RE.test(input.refusalSummary)
-    ? unowned(input.refusalSummary) : { paths: [], diagnostics: [] };
+  const summary = input.refusalSummary;
+  const lawful = summary === undefined ? undefined : lawfulInfeasiblePaths(summary);
+  const refusal = lawful !== undefined ? unowned("", lawful)
+    : summary !== undefined && REFUSAL_RE.test(summary) ? unowned(summary) : { paths: [], diagnostics: [] };
   // A test gate names where the ASSERTION lives — a detection site, not the code that needs fixing.
   const sites = reds.filter((g) => g.gate === "test").map((g) => unowned(g.details));
   const others = reds.filter((g) => g.gate !== "test");

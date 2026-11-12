@@ -11,7 +11,7 @@
 import { execFileSync, spawnSync } from "node:child_process";
 import { rmSync } from "node:fs";
 import { parseCLI, type TestProject } from "vitest/node";
-import { describeLeaseWait, readHolder, REPOSITORY_LEASE_TOKEN_ENV, repositoryLeasePath, withRepositoryLease } from "../src/run/lease.js";
+import { describeLeaseWait, LeaseWriteDenied, readHolder, REPOSITORY_LEASE_TOKEN_ENV, repositoryLeasePath, withRepositoryLease } from "../src/run/lease.js";
 
 /** `vitest list` (manifest discovery) collects and never executes a test body: it takes no lease, so a
  * listing issued while its own parent holds the lease can never block on it. The command is read the way
@@ -139,6 +139,14 @@ export default async function vitestLease(project: TestProject): Promise<(() => 
       },
     });
     try { await Promise.race([holding, done]); }
+    catch (error) {
+      // Queue row 406; D-2187 add.99 (7) and add.100: a fail-open on a lock is never general behaviour. Only a judge or
+      // review seat, whose sandbox leaves git metadata read-only, runs unleased, and only when the lease's OWN write was
+      // denied as typed by src/run/lease.ts; a read, a census, another errno or any other caller stays fatal.
+      if (!(seatWait && error instanceof LeaseWriteDenied)) throw error;
+      console.error(`tickmarkr: a ${role} seat cannot write this repository's runner lease (read-only git metadata) — running its named files unleased`);
+      return undefined;
+    }
     finally { clearTimeout(waitTimer); }
     // Cancellation: Vitest answers SIGINT/SIGTERM with process.exit() and never runs global teardown or
     // closes its pool, so forks and their nested runners would outlive it. Prepended so it runs before

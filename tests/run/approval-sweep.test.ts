@@ -162,7 +162,7 @@ async function recheckPark(kind: "gate-fail" | "infra") {
   });
   journal.append("task-human", "T1", { kind, reason: "parked" });
   writeFileSync(join(journal.dir, "baseline.json"), JSON.stringify(baseline));
-  await approve([runId, "T1", "--recheck", "--by", "test"], repo);
+  await approve([runId, "T1", "--recheck", "--on-red", "repair", "--by", "test"], repo);
   await runDaemon(repo, { approvalWindowMs: 1, adapters: [fake], runId, resume: true });
   return { events: journal.read(), declared: loadGraph(repo).tasks[0]!.gates };
 }

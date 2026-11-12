@@ -110,7 +110,7 @@ describe("v2.5.6 — a recheck re-measures: cached reds are discarded, the pin h
       expect(first.human).toEqual(["T1"]);
       for (const d of of(rows(repo, runId), "task-dispatch")) expect(seatOf(d)).toBe("fake:fake-1");
       expect(existsSync(flag)).toBe(false); // still red: the recheck re-measures and reds again
-      await approve([runId, "T1", "--recheck", "--by", "op"], repo);
+      await approve([runId, "T1", "--recheck", "--on-red", "repair", "--by", "op"], repo);
       await runDaemon(repo, { adapters: [fake], runId, resume: true });
       const post = afterResume(rows(repo, runId));
       expect(of(post, "recheck-rerun").map((e) => e.data)).toEqual([{ gate: "test", reason: "cached-red-discarded" }]);
@@ -125,7 +125,7 @@ describe("v2.5.6 — a recheck re-measures: cached reds are discarded, the pin h
       const runId = "run-recheck-pin-unavailable";
       const first = await runDaemon(repo, { adapters: [fake], runId });
       expect(first.human).toEqual(["T1"]);
-      await approve([runId, "T1", "--recheck", "--by", "op"], repo);
+      await approve([runId, "T1", "--recheck", "--on-red", "repair", "--by", "op"], repo);
       const resumed = await runDaemon(repo, { adapters: [fake], runId, resume: true });
       expect(resumed.human).toEqual(["T1"]);
       const post = afterResume(rows(repo, runId));

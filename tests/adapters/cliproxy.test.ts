@@ -1,6 +1,7 @@
 // Queue row 392 R6 laws 1 to 3 (D-2187 add.11, add.12, add.21): gateway detection, the API root, the one
 // listing request and its typed failures, and the closed vendor family table. Every request reaches only
 // the fake proxy on 127.0.0.1.
+import dns from "node:dns";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -148,15 +149,30 @@ test("with no gateway source a disabled detection or the anthropic url no reques
   const base = await doctor(["--"], repo, [stub], { banner: false });
   const path = join(repo, ".tickmarkr", "doctor.json");
   const baseBytes = readFileSync(path, "utf8");
+  // Row 435; D-2187 add.130: doctor feeds the endpoint probe the gateway's inputs, so a cell with a Claude base URL
+  // gains exactly the endpoint line; a name host resolves to nothing here, so no packet leaves the machine.
+  const down = (url: string, reason: string) =>
+    `  ✗ endpoint claude-code: ${url} down (${reason}) — every claude-code seat will fail as transport until it answers`;
+  const endpointLines: Record<string, string> = {
+    "detect false over an env gateway": `  ✓ endpoint claude-code: ${proxy.url} listening`,
+    "the anthropic url in env": down("https://api.anthropic.com", "ENOTFOUND"),
+    "the anthropic url in the settings env": down("https://api.anthropic.com", "ENOTFOUND"),
+    "an unparseable base URL": down("<unparseable base_url>", "unparseable"),
+  };
+  const notFound = vi.spyOn(dns, "lookup").mockImplementation(((host: string, _o: unknown, cb: (...a: unknown[]) => void) =>
+    process.nextTick(() => cb(Object.assign(new Error(`getaddrinfo ENOTFOUND ${host}`), { code: "ENOTFOUND" })))) as never);
   for (const c of cells) {
     const seam = { ...(c.env ? { env: c.env } : {}), ...(c.settingsPath ? { settingsPath: c.settingsPath } : {}), request };
     writeFileSync(join(repo, ".tickmarkr", "config.yaml"), c.cfg.cliproxy ? JSON.stringify({ cliproxy: c.cfg.cliproxy }) : "{}\n");
     const out = await doctor(["--"], repo, [stub], { banner: false, gateway: seam });
     expect(out, c.cell).not.toContain("gateway:");
-    expect(out, c.cell).toBe(base);
+    const isEndpoint = (l: string) => l.includes("endpoint claude-code:");
+    expect(out.split("\n").filter(isEndpoint), c.cell).toEqual(endpointLines[c.cell] ? [endpointLines[c.cell]] : []);
+    expect(out.split("\n").filter((l) => !isEndpoint(l)).join("\n"), c.cell).toBe(base);
     expect(readFileSync(path, "utf8"), c.cell).toBe(baseBytes);
     expect(JSON.parse(readFileSync(path, "utf8")), c.cell).not.toHaveProperty("gateway");
   }
+  notFound.mockRestore();
   writeFileSync(path, JSON.stringify({ ...JSON.parse(baseBytes), gateway: { host: "stale" } }, null, 2) + "\n");
   recordGateway(repo, undefined);
   expect(readFileSync(path, "utf8")).toBe(baseBytes);

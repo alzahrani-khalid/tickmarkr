@@ -69,7 +69,9 @@ const DISPOSITION_PARKS: Array<{ taskId: string; flags: string[]; token: Approva
   { taskId: "plain", flags: [], token: "dispatch", enacts: "dispatch it" },
   { taskId: "cap", flags: [], token: "fresh-budget", enacts: "dispatch it on a fresh attempt budget" },
   { taskId: "waive", flags: ["--waive"], token: "waive-gate", enacts: "continue past the approved gate" },
-  { taskId: "recheck", flags: ["--recheck"], token: "re-dispatch", enacts: "re-dispatch against the full gate suite only if re-running the whole declared battery on the parked commit before any worker is red" },
+  // Row 413 (D-2187 add.69): a recheck with no --on-red parks on red; only an explicit repair re-dispatches.
+  { taskId: "recheck", flags: ["--recheck"], token: "re-dispatch", enacts: "re-run the whole declared battery on the parked commit before any worker; if it is red, park on the first red gate for the next decision" },
+  { taskId: "recheckRepair", flags: ["--recheck", "--on-red", "repair"], token: "re-dispatch", enacts: "re-dispatch against the full gate suite only if re-running the whole declared battery on the parked commit before any worker is red" },
   { taskId: "uphold", flags: ["--uphold"], token: "fund-fixed-attempt", enacts: "dispatch a fixed attempt carrying the findings" },
 ];
 
@@ -79,7 +81,7 @@ const fiveDispositionRun = (runId: string): string => {
   const j = Journal.create(repo, runId);
   j.append("task-human", "plain", { kind: "human-gate", reason: "approval required" });
   j.append("task-human", "cap", { kind: "attempt-cap", reason: "attempt cap (10) reached" });
-  for (const taskId of ["waive", "recheck"]) {
+  for (const taskId of ["waive", "recheck", "recheckRepair"]) {
     j.append("gate-result", taskId, { gate: "acceptance", pass: false, details: "judge failed" });
     j.append("task-human", taskId, { kind: "gate-fail", reason: "gate failed" });
   }

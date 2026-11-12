@@ -42,18 +42,24 @@ import { executionSignal, remainingExecutionMs, withExecutionBudget, withoutExec
 import { repairSelectionDecision, repairSelectionEnabled } from "./repair-selection.js";
 import { executedFullTest, failureDisposition, INTERRUPTED_RECHECK_EVENT, INTERRUPTED_RETRY_EVENT, interruptedLedger, isInterruptedResult, LISTING_INVOCATION_SUFFIX, readAccountingJournal, refusedLedger, reserveInfrastructureRetry, type InterruptedLedger } from "./recovery.js";
 import { runEnvironment } from "./environment.js";
-import { addDetachedWorktree, changeRepresented, cleanupRunWorktrees, declaredBaseContainment, dependencyLinkRefusal, deriveForkCap, FORK_CAP_ENV, gitHead, linkNodeModules, npmDependencyInstallCommand, npmDependencyManifestChanged, PRESERVE_COMMIT_SUBJECT, PRESERVE_PRODUCER_TRAILER, preserveWorktree, type PreserveProducer, producerFields, reflogWitness, removeWorktree, resolvedCapacity, runWithForkBudget, runWithVerificationBudget, type RunCapacity, sameCapacity, sameVerification, sh, shell, shGit, SUITE_PARENT_ENV, verificationProtocol, WorktreeAdminRaceError, WORKTREE_LAYOUT_CONTRACT, WORKTREES_DIR, worktreePath } from "./git.js";
+import { isRegisteredWorktree, ownSafetyRefs, withKeptSafetyRefs, quarantineAndRetry, WorktreeInfraError, WorktreePathExistsError } from "./worktree-quarantine.js";
+import { addDetachedWorktree, changeRepresented, cleanupRunWorktrees, declaredBaseContainment, dependencyLinkRefusal, deriveForkCap, FORK_CAP_ENV, gitHead, linkNodeModules, npmDependencyInstallCommand, npmDependencyManifestChanged, PRESERVE_COMMIT_SUBJECT, PRESERVE_PRODUCER_TRAILER, preserveWorktree as preserveInRepository, type PreserveProducer, producerFields, reflogWitness, removeWorktree, resolvedCapacity, runWithForkBudget, runWithVerificationBudget, type RunCapacity, sameCapacity, sameVerification, sh, shell, shGit, SUITE_PARENT_ENV, verificationProtocol, WorktreeAdminRaceError, WORKTREE_LAYOUT_CONTRACT, WORKTREES_DIR, worktreePath } from "./git.js";
 import { MASK } from "./redact.js";
 import { runInteractiveSeed, type InteractiveSeedResult } from "./interactive-seed.js";
 import { answerTrustDialog, type TrustAnswer } from "./trust-dialog.js";
 import { classifyRepairDisposition, namedPaths, resolveScopeHints } from "./repair-disposition.js";
 import { poolExcludedPark, poolExclusionPark } from "./pool-exclusion.js";
+import { firstRedGate, recheckParkInForce } from "./recheck-disposition.js";
 import { applyScopeAmendments, activeRetryBan, interruptedAttempt, RESUME_HARVEST_SOURCE, resumeHarvestAuthor, approvalAction, APPROVAL_REFUSED, ATTEMPT_CAP_RELEASE, REVIEW_UPHELD_RELEASE, effectiveEvents, foldDecisions, physicalLine, staleApprovals, classifyTaskFailure, classifyWorkerResultCause, deferredReviewFindings, engagementComparable, formatPriorFindingEvidence, GATE_FINGERPRINT_CAP, GATE_SATISFIED_RELEASE, identicalGateFailures, isDeferredFinding, journaledFailureBrief, Journal, loadRoutingProfile, newRunId, normalizeGateFailure, outstandingConsultGuidance, readableExcerpt, receiptOrigin, outstandingReviewFindings, pendingApprovalActions, pendingRechecks, pendingRepairFindings, phaseForGate, priorJudgments, readPriorRunEvidence, recordedTaskFailureKind, reraisedReviewChains, RECHECK_RELEASE, renderStructuredReviewFinding, repairReachSinceApproval, repairsSinceApproval, reviewRoundsSinceApproval, runHasEnded, standingRulings, structuredFindings, upheldFeedbackByTask, type CurrentAttemptGateReplay, type JournalEvent, type ParkKind, type ResumeState, type RetryMode, type StructuredFinding } from "./journal.js";
+import { waiveProof } from "./waive-proof.js";
 import { decisionCommands, type DecisionPark } from "./decision-verbs.js";
 import { foldOwedChecks, parseJournalText } from "./journal.js";
+import { withRulings } from "./rulings.js";
+import { productionSeatProbes, readmitRetiredSeats, readmittedSeat, recordReadmitVerdict, retiredSeats as retiredReviewSeats, type SeatProbes } from "./seat-readmit.js";
 import { decideSplitRelease, parkDefinition, splitReleaseReads, type TaskWorkRead } from "./split-release.js";
 import { readOperatorState } from "./operator-state.js";
 import { newestPark } from "../cli/commands/approve.js";
+import { grantedDiffCapReason, hasActiveGrant } from "../cli/files-flag.js";
 import { carriedAuthorVendors, gateReviewerFloor, isDiffCapPark, isGarbageReview, pickReviewer } from "../gates/review.js";
 import { acquireApprovalSerialization, acquireRunLock, isPidLive, releaseRunLock } from "./lock.js";
 import { NoTrailerStreak } from "./no-trailer-streak.js";
@@ -199,6 +205,8 @@ export interface RunOptions {
   retryFailed?: boolean;
   // Queue row 397 (D-2187 add.23): channels the operator readmits at this resume (adapter:model).
   readmit?: string[];
+  /** Row 417; D-2187 add.78: test seam for the recheck's retired-review-seat re-probe (production probes when absent). */
+  seatProbes?: SeatProbes;
   concurrency?: number;
   /** Bounded wait at a drain caused solely by parked tasks. */
   approvalWindowMs?: number;
@@ -2754,6 +2762,8 @@ function newestCapturePriors(repoRoot: string, currentRunId: string): Record<str
 }
 
 export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promise<RunSummary> {
+  // Row 412 (D-2187 add.67, add.156): a task checkout's registration is asked of the run's repository
+  const preserveWorktree = (cwd: string, producer: PreserveProducer) => preserveInRepository(cwd, producer, repoRoot);
   stripArtificialAnalysisKeyFromDaemon(); // queue row 407 (D-2187 add.35): first, before any child spawns
   // OBS-1045: a daemon launched from inside a leased command (a nested runner, an operator's test
   // shell) inherits its ancestor's lease token through the environment, and every gate it ran would
@@ -3124,8 +3134,13 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
   // unless they are delivered closure violations, matching the live tally.
   const reviewNoVerdicts = new Map<string, string[]>();
   for (const event of journal.read()) {
+    // Row 417; D-2187 add.78: a readmit row clears the strikes journaled before it for that seat only.
+    const readmitted = readmittedSeat(event);
+    if (readmitted !== undefined) reviewNoVerdicts.delete(readmitted);
     if (event.event !== "review-no-verdict" || typeof event.data.reviewer !== "string") continue;
     if (launchFailureNote(event.data)) continue;
+    // Row 417; D-2187 add.78: a transport death never seeds the run-wide tally, matching the live tally.
+    if (event.data.cause === "transport") continue;
     if (event.data.noVerdict !== true
       && !(event.data.unparseable === true && event.data.cause === "malformed-verdict" && event.data.closureInvalid !== true)) continue;
     reviewNoVerdicts.set(event.data.reviewer, [...(reviewNoVerdicts.get(event.data.reviewer) ?? []), String(event.data.cause)]);
@@ -3983,7 +3998,8 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     saveGraph(repoRoot, graph);
     // Queue row 372 (D-2186): the park definition record — the task as this daemon held it when it parked
     // (after approved scope amendments) — is what a later graph-changed resume compares to release it.
-    journal.append("task-human", t.id, { ...details, reason, kind, definition: parkDefinition(t) });
+    // Row 418 (D-2187 add.84): an infra park records the task's enabled gates, so every surface's waive proof reads them.
+    journal.append("task-human", t.id, { ...details, reason, kind, definition: parkDefinition(t), ...(kind === "infra" ? { enabledGates: [...t.gates] } : {}) });
     // Read the just-journaled park, including its failed gate and immutable physical token.
     const { events: parkEvents, lines: parkLines } = journal.readSourced();
     const parked = newestPark(parkEvents, t.id, parkLines.map(line => line - 1));
@@ -4274,6 +4290,8 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         if (code !== "ENOENT" && code !== "ENOTDIR") return { commits: [], error: `Queue row 372 (D-2186): cannot stat the task checkout ${priorWt}: ${code ?? String(error)}` };
       }
     }
+    // Row 412 (D-2187 add.67, add.156): a stray at the path is no checkout to read; recreation quarantines it.
+    if (checkout && !strict && !await isRegisteredWorktree(priorWt, repoRoot)) checkout = false;
     if (checkout) {
       if (!strict) return { head: await gitHead(priorWt), commits: await commitsAheadOf(taskBase, priorWt) };
       try {
@@ -4357,6 +4375,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     const liveEngagement = () => engagements.get(t.id) === engagement;
     const approvalAction = pendingDaemonApprovalActions(journal.read()).get(t.id);
     const fundedRerun = approvalAction?.authority === "worker";
+    let seatsReprobed = false; // row 417: one retired-seat sweep per recheck enactment, never again on a regate
     const startMs = Date.now();
     let stallSeat: string | undefined;
     let stallReaps = 0;
@@ -4386,13 +4405,16 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       const addWorktree = () => {
         return driver.worktree(repoRoot, taskBranch, taskBase);
       };
-      for (let attempt = 1; ; attempt++) {
+      // Row 412 (D-2187 add.67): a safety ref one attempt created is removed by a later attempt's success.
+      return ownSafetyRefs(async () => { for (let attempt = 1; ; attempt++) {
         try { return await addWorktree(); }
         catch (error) {
+          // Row 412 (D-2187 add.67): one quarantine and ONE plain retry, outside the admin-race loop.
+          if (error instanceof WorktreePathExistsError) return quarantineAndRetry(error, addWorktree, (data) => journal.append("worktree-quarantine", t.id, data));
           if (!(error instanceof WorktreeAdminRaceError) || attempt >= 3) throw error;
           journal.append("worktree-add-retry", t.id, { attempt, nextAttempt: attempt + 1, evidence: error.evidence });
         }
-      }
+      } }, priorWt);
     };
 
     // A dead worker with a clean checkout still needs a durable recovery handle: there may be no
@@ -4544,6 +4566,8 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       const e = note.name === "review-infra-retry" && gateSubject ? { ...note, payload: { ...note.payload, commit: gateSubject.commit } } : note;
       journal.append(e.name, t.id, e.payload);
       if (e.name === "review-no-verdict" && typeof e.payload.reviewer === "string") {
+        // Row 417; D-2187 add.78: a transport death (cause transport) is a task-local strike here — the seat
+        // sits out the rest of this task's round — and nothing run-wide, so the next task may pick it.
         const strikes = launchFailureNote(e.payload) ? roundTimeouts : badReviewers;
         if (!strikes.includes(e.payload.reviewer)) strikes.push(e.payload.reviewer);
       }
@@ -4600,7 +4624,8 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       const gateRound = async (subject: Task) => {
         const parked = new Map<GateResult, GateResult>();
         try {
-          const done = await runGates(subject, { ...ctx, ownsWorktree: true, excludeReviewers: [...badReviewers, ...roundTimeouts], launchRetried: launchRetried(),
+          // Row 419 (D-2187 add.89): every round's review brief carries the run's rulings for this task, folded fresh.
+          const done = await runGates(withRulings(subject, journal.read()), { ...ctx, ownsWorktree: true, excludeReviewers: [...badReviewers, ...roundTimeouts], launchRetried: launchRetried(),
             onGate: async (e) => {
               const park = e.phase === "end" && e.gate === "review" ? retiredOnly(e.result) : undefined;
               if (park === undefined || e.phase !== "end") return ctx.onGate?.(e);
@@ -5135,7 +5160,9 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       const infra = results.find((g) => gateFailed(g) && isInfraResult(g));
       if (infra) {
         await parkAs(infra.gate === "review"
-          ? parkApprovalReason(t.id, p.infraReason(infra), { kind: "infra", failedGate: "review", tombstone: false })
+          ? parkApprovalReason(t.id, p.infraReason(infra), { kind: "infra", failedGate: "review", tombstone: false,
+            // Row 418 (D-2187 add.84): the reason's verbs read the same proof the park's menu will.
+            ...(infra.meta?.noVerdict === true ? { reviewWaiveProof: waiveProof([...journal.read(), { event: "task-human", taskId: t.id, ts: "", data: { kind: "infra" } }], t.id, t.gates) } : {}) })
           : p.infraReason(infra), "infra");
         return { kind: "parked" };
       }
@@ -5144,7 +5171,9 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       // used to lift `gates.diffCap` out of the cap prose as a files[] hint.
       const capTrip = results.find(isDiffCapPark);
       if (capTrip) {
-        await parkAs(`${capTrip.gate}: ${capTrip.details}`, "diff-cap");
+        // Row 411 (D-2187 add.65, add.70): a granted task can only raise the cap; any other keeps the gate text.
+        const capReason = `${capTrip.gate}: ${capTrip.details}`;
+        await parkAs(hasActiveGrant(journal.read(), t.id) ? grantedDiffCapReason(capReason) : capReason, "diff-cap");
         return { kind: "parked" };
       }
       if (await adjudicateInfraShapedRed(t, results, p.wt, p.commit, p.reobserve.attempt, p.reobserve.replayed,
@@ -5303,6 +5332,9 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
     let satisfiedGate = satisfiedGates.get(t.id);
     const replayedGates = fundedRerun ? undefined : replayedGateResults.get(t.id);
     const recheck = approvalAction?.authority === "battery";
+    // Row 413 (D-2187 add.151): while a recheck's park disposition is in force (the journal fold, never the
+    // consumed approval), a resume is an UNSETTLED RECHECK: the gate path, never the worker path.
+    const unsettledRecheck = recheckParkInForce(journal.read(), t.id);
     // OBS-1109: finished work is harvested, never redone — on resume too. A daemon that died while its
     // worker ran leaves an owned attempt between worker-launch and worker-result: its pane may hold the
     // attempt's own nonce-bound trailer, its branch the committed work. Only after the attempt's owned
@@ -5405,7 +5437,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       recordHarvest(commits, finished, parsed.summary);
       return found.assignment;
     };
-    const harvestAuthor = rs && !satisfiedGate && !replayedGates && !recheck ? await harvestInterruptedAttempt() : undefined;
+    const harvestAuthor = rs && !satisfiedGate && !replayedGates && !recheck && !unsettledRecheck ? await harvestInterruptedAttempt() : undefined;
     if (harvestAuthor === "parked") return;
     // OBS-1202: a recheck bound to a stall park that recorded a reapFailure re-verifies the parked
     // attempt's owned census through the same reapWorker a live harvest uses, BEFORE any gate reads
@@ -5447,7 +5479,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         }
       }
     }
-    resumeGateReplay: if (satisfiedGate || replayedGates || recheck || harvestAuthor) {
+    resumeGateReplay: if (satisfiedGate || replayedGates || recheck || unsettledRecheck || harvestAuthor) {
       const taskBase = published;
       taskBases.set(t.id, taskBase);
       const taskBranch = `${branch}--${t.id}`;
@@ -5464,13 +5496,13 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         return;
       }
       if (!work?.head && !preservedRef) {
-        if (satisfiedGate || recheck) throw new Error(`${recheck ? "recheck" : `approved gate ${satisfiedGate}`} cannot resume: task worktree is missing`);
+        if (satisfiedGate || recheck || unsettledRecheck) throw new Error(`${recheck || unsettledRecheck ? "recheck" : `approved gate ${satisfiedGate}`} cannot resume: task worktree is missing`);
         // Observed passes are an optimization, never authority: without the task worktree there is no
         // commit to compare and no landed work to gate, so fall through to the ordinary worker path.
         replayedGateResults.delete(t.id);
         break resumeGateReplay;
       }
-      const resumeReason = recheck
+      const resumeReason = recheck || unsettledRecheck
         ? "operator recheck"
         : harvestAuthor
           ? "harvested interrupted attempt"
@@ -5562,7 +5594,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         .find((e) => e.event === "worker-result" && e.taskId === t.id);
       // OBS-1022: a task that FAILED before its harvest has no worker-result; a recheck judges the
       // committed tree on its own evidence, so the missing claim is recorded as exactly that.
-      if (!workerEvent && !recheck) throw new Error(`${resumeReason} cannot resume: worker result is missing`);
+      if (!workerEvent && !recheck && !unsettledRecheck) throw new Error(`${resumeReason} cannot resume: worker result is missing`);
       const priorResult: WorkerResult = workerEvent ? {
         ok: workerEvent.data.ok === true,
         summary: typeof workerEvent.data.summary === "string" ? workerEvent.data.summary : "",
@@ -5603,7 +5635,7 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
       let remainingGates: GateName[];
       // Row 337 (D-2181 D2): false when T15 below refuses replayed rows measured in another world.
       let replayComparable = true;
-      if (recheck) {
+      if (recheck || (unsettledRecheck && !replayedGates)) { // row 413: no recorded results re-runs the battery
         remainingGates = declaredGates.filter((gate) => gate !== satisfiedGate);
       } else if (harvestAuthor) {
         remainingGates = declaredGates; // the harvested attempt was never gated: every declared gate runs
@@ -5860,6 +5892,23 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         if (outsideScopeForced) {
           journal.append("gate-fresh-forced", t.id, { gate: "test", attempt: gateSubject.attempt, commit: gateSubject.commit, reason: OUTSIDE_SCOPE_RED, resumed: true });
         }
+        // Row 417; D-2187 add.78: an enacted recheck whose battery reviews re-probes each retired review seat once,
+        // in order; a readmitted seat's strikes leave the live tally run-gates reads.
+        if (recheck && !persisted && !seatsReprobed && resumedTask.gates.includes("review")) {
+          seatsReprobed = true;
+          // Each readmit persists the fresh verdict FIRST (a failed write throws: no row, the seat stays retired), then
+          // journals its row, drops that seat's strikes and makes its model routable again AT ONCE — never after the
+          // sweep, which would erase a strike a concurrent review recorded after the row.
+          await readmitRetiredSeats(retiredReviewSeats(reviewNoVerdicts),
+            opts.seatProbes ?? productionSeatProbes(cfg, repoRoot, adapters, health), (seat, row, verdict) => {
+              // D-2187 add.132: the fresh verdict merges into doctor.json; health is rebuilt from the merged record
+              const adapter = seat.slice(0, seat.indexOf(":"));
+              health[adapter] = recordReadmitVerdict(repoRoot, health, seat, verdict);
+              journal.append(row.event, t.id, row.data);
+              reviewNoVerdicts.delete(seat);
+              pools.review = rolePools(cfg, adapters, health).review; // the review pool's own policy filters still apply
+            });
+        }
         const resumedCtx: GateContext = {
           carriedAuthors: await subjectAuthors(journal.read(), t.id, wt, taskBase),
           producer: producerNow(),
@@ -5975,6 +6024,16 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           // worker red may buy that same bounded repair; review reds still require the operator.
           const postWaive = satisfiedGate !== undefined && !recheck;
           const failing = results.filter(gateFailed);
+          // Row 413 (D-2187 add.69): a recheck whose decision recorded onRed park holds for the operator —
+          // it parks gate-fail on its FIRST red gate in declaration order, with no task-dispatch,
+          // repair-attempt or repair-dispatch row; an unrecorded onRed (older journals) stays the base repair.
+          // D-2187 add.151: asked of the journal fold, so a resumed battery or regate takes this same branch.
+          const parkOn = recheckParkInForce(journal.read(), t.id) ? firstRedGate(failing) : undefined;
+          if (parkOn) {
+            await park(t, gateFailApprovalReason(t.id, `recheck red on ${parkOn}`, parkOn === "review"), "gate-fail", gateAuthor,
+              rs?.attempts ?? 0, startMs, gateFails, consults, tokens, metered, retryMode, { firstRedGate: parkOn });
+            return;
+          }
           if (postWaive && failing.every((g) => g.gate === "test") && freshOutsideScopeRed(t, gateSubject.commit)) {
             await park(t, outsideScopePark(t, gateSubject.commit), "gate-fail", gateAuthor, rs?.attempts ?? 0,
               startMs, gateFails, consults, tokens, metered, retryMode);
@@ -7661,6 +7720,8 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
             });
           }
         } catch (error) {
+          // Row 412 (D-2187 add.156): preserve's unknown registration parks infra, never a stall
+          if (error instanceof WorktreeInfraError) throw error;
           reapFailure = error instanceof Error ? error.message : String(error);
         }
       } else {
@@ -8506,14 +8567,22 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
             }
             if (fatalStop.signal.aborted) return;
             const cleanupEvidence = cleanupErrors.length ? { cleanupErrors } : {};
+            // Row 412 (D-2187 add.67, add.159): every park below prints the creation's recovery record
+            const recordKey = worktreePath(repoRoot, `${branch}--${t.id}`);
             if (err instanceof WorktreeAdminRaceError) {
-              await park(t, err.message, "infra", null, 0, Date.now(), 0, 0, undefined, 0, "fresh",
-                { evidence: err.evidence, ...cleanupEvidence });
+              const kept = withKeptSafetyRefs(recordKey, err.message, { evidence: err.evidence, ...cleanupEvidence });
+              await park(t, kept.message, "infra", null, 0, Date.now(), 0, 0, undefined, 0, "fresh", kept.data);
+              return;
+            }
+            // Row 412 (D-2187 add.67, add.156): a stray, an unknown git probe or a safety ref fault parks infra with its recovery.
+            if (err instanceof WorktreeInfraError) {
+              const kept = withKeptSafetyRefs(worktreePath(repoRoot, `${branch}--${t.id}`), err.message, { ...err.data, ...cleanupEvidence });
+              await park(t, kept.message, "infra", null, 0, Date.now(), 0, 0, undefined, 0, "fresh", kept.data);
               return;
             }
             if (err instanceof HostDegradedError) {
-              await park(t, err.message, "infra", null, 0, Date.now(), 0, 0, undefined, 0, "fresh",
-                { disposition: "host-degraded", ...cleanupEvidence });
+              const kept = withKeptSafetyRefs(recordKey, err.message, { disposition: "host-degraded", ...cleanupEvidence });
+              await park(t, kept.message, "infra", null, 0, Date.now(), 0, 0, undefined, 0, "fresh", kept.data);
               return;
             }
             if (err instanceof HeldProbeExhausted || err instanceof HcReadUnavailableError) {
@@ -8527,8 +8596,9 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
                 if (saved.code !== 0) throw new Error(`could not preserve ${head}: ${saved.stderr}`);
               }
               journal.append("worktree-preserved", t.id, { ref, ...producerFields(producer) });
-              await park(t, err.message, "infra", null, 0, Date.now(), 0, 0, undefined, 0, "fresh",
+              const kept = withKeptSafetyRefs(wt, err.message,
                 { disposition: err instanceof ContactUnreadableExhausted ? "contact-unreadable" : "transport-uncertain", ref, ...cleanupEvidence });
+              await park(t, kept.message, "infra", null, 0, Date.now(), 0, 0, undefined, 0, "fresh", kept.data);
               return;
             }
             if (err instanceof ExecutionBudgetExceeded) {
@@ -8537,11 +8607,13 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
               const ref = await preserveWorktree(wt, producer);
               if (ref) journal.append("worktree-preserved", t.id, { ref, ...producerFields(producer) });
               const dispatch = journal.read().reverse().find((e) => e.taskId === t.id && e.event === "task-dispatch");
-              await park(t, err.message, "infra", null, 0, Date.now(), 0, 0, undefined, 0, "fresh",
+              // Row 412 (D-2187 add.67, add.156): a safety ref the failed add kept is named with its recovery
+              const kept = withKeptSafetyRefs(wt, err.message,
                 { disposition: "execution-budget-exhausted", limitMs: cfg.executionPolicy!.taskExecutionLimitMs,
                   ...cleanupEvidence,
                   ...(Number.isInteger(dispatch?.data.attempt) ? { attempt: dispatch!.data.attempt } : {}),
                   ...(dispatch?.data.assignment ? { assignment: dispatch.data.assignment } : {}) });
+              await park(t, kept.message, "infra", null, 0, Date.now(), 0, 0, undefined, 0, "fresh", kept.data);
               return;
             }
             const taskEvents = journal.read().filter((e) => e.taskId === t.id);
@@ -8551,9 +8623,16 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
             const attempts = dispatch && Number.isInteger(dispatch.data.attempt) ? dispatch.data.attempt as number : 0;
             graph = setStatus(graph, t.id, "failed");
             saveGraph(repoRoot, graph);
-            journal.append("task-failed", t.id, { error: String(err), kind, attempts, ...cleanupEvidence });
+            // a trust refusal keeps its task-failed ending; the record rides in its error text (D-2187 add.159)
+            journal.append("task-failed", t.id, { error: withKeptSafetyRefs(recordKey, String(err), {}).message, kind, attempts, ...cleanupEvidence });
             journal.telemetry({ taskId: t.id, shape: t.shape, adapter: "-", model: "-", channel: "-", attempts: 0, outcome: "failed", durationMs: 0 });
             await reconcile({ spareLiveLlm: true }); // task-failed is a terminal event
+          })
+          // Row 412 (D-2187 add.156): preserve's unknown registration during a park's cleanup parks infra, never a crash
+          .catch(async (err) => {
+            if (!(err instanceof WorktreeInfraError) || fatalStop.signal.aborted) throw err;
+            const kept = withKeptSafetyRefs(worktreePath(repoRoot, `${branch}--${t.id}`), err.message, { ...err.data });
+            await park(t, kept.message, "infra", null, 0, Date.now(), 0, 0, undefined, 0, "fresh", kept.data);
           })
           .finally(() => { inflight.delete(t.id); engagements.delete(t.id); });
         inflight.set(t.id, p);
@@ -8767,7 +8846,11 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
           taskLoopStarted || opts.resume ? failedGraph : undefined, phase);
         // The fatal close states its proof too; a dead notifier never replaces the original error.
         if (tipProof) {
-          postRunEnd(phase);
+          // Queue row 420 (D-2187 add.95): a driver's post failure is reported beside the crash.
+          try { postRunEnd(phase); }
+          catch (postErr) {
+            console.error(`tickmarkr: run-end post failed: ${postErr instanceof Error ? postErr.message : String(postErr)} — original error: ${err instanceof Error ? err.message : String(err)}`);
+          }
           await driver.notify(`tickmarkr ${runId}: run crashed — ${formatTipProof(tipProof)} — integration branch ${branch}`,
             { tier: "attention" }).catch(() => {});
         }

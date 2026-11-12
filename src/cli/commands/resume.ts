@@ -5,7 +5,7 @@ import { captureHost, parseDriverOverride, pickDriver, preflightHostDriver } fro
 import { loadGraph } from "../../graph/graph.js";
 import { formatSummary, runDaemon } from "../../run/daemon.js";
 import { denyPreferCollisionLine, denyPreferCollisions } from "../../route/preference.js";
-import { finalRail, narrationSink, bindNarration, summaryGreen } from "./run.js";
+import { endpointPreflight, finalRail, narrationSink, bindNarration, summaryGreen } from "./run.js";
 import { assertRefsWritable } from "../../run/git.js";
 
 export async function resume(argv: string[], cwd = process.cwd()): Promise<{ out: string; code: number }> {
@@ -46,7 +46,8 @@ export async function resume(argv: string[], cwd = process.cwd()): Promise<{ out
   // Queue row 340 (D-2180): the ONE host snapshot; selection, evidence and the daemon's scope warning all read it.
   const snapshot = captureHost();
   await preflightHostDriver(cfg, driverOverride, snapshot.host, cwd);
-  const narrate = narrationSink(runId);
+  const driver = pickDriver(cfg, driverOverride, snapshot.host);
+  const narrate = await endpointPreflight(driver, narrationSink(runId));
   const s = await runDaemon(cwd, {
     runId,
     resume: true,
@@ -54,7 +55,7 @@ export async function resume(argv: string[], cwd = process.cwd()): Promise<{ out
     retryFailed,
     readmit,
     // bound to the same sink the daemon gets, so a driver-journaled recovery reaches this rail too
-    driver: bindNarration(pickDriver(cfg, driverOverride, snapshot.host), narrate),
+    driver: bindNarration(driver, narrate),
     inheritedHcScope: snapshot.inheritedScope,
     // v1.99 T2: the ONE narration sink — the quiet rail on a TTY, the raw journal formatter on a
     // pipe. A resumed run meets the same surface a fresh one does; printing the raw formatter here

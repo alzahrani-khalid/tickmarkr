@@ -863,9 +863,19 @@ describe("T1 stall detection (OBS-262/263, fake adapter, zero tokens)", () => {
     const summary = await runDaemon(repo, { adapters: [fake], runId: "run-t2-dead-one-poll", driver });
 
     expect(summary.human).toEqual(["T1"]);
-    expect(polls).toBe(1);
     const events = Journal.open(repo, "run-t2-dead-one-poll").read();
-    expect(events.some((e) => e.event === "task-human" && e.taskId === "T1")).toBe(true);
+    // Queue row 431: one poll is the quiet-host case, not the guarantee. The daemon concludes death only in a poll
+    // where every leg is readable (the pane, the process census twice, the worktree delta, the transport) AND the
+    // worker's own shell has already left the process table; on a loaded runner that is the second poll (CI
+    // 42821032478, 42840976755), and holding for it is lawful. What must hold: the park is the dead-worker park
+    // (it carries the preserved ref), no worker-result precedes it, and it arrives inside this test's 30 s bound
+    // instead of the task's 30 minutes. A later poll prints the liveness rows, so the next occurrence names its leg.
+    if (polls !== 1) {
+      console.warn(`queue row 431: ${polls} polls before the dead-worker park; liveness rows: ${JSON.stringify(
+        events.filter((e) => e.event.startsWith("worker-dead")).map((e) => e.data))}`);
+    }
+    expect(polls).toBeGreaterThanOrEqual(1);
+    expect(events.some((e) => e.event === "task-human" && e.taskId === "T1" && e.data.ref !== undefined)).toBe(true);
     expect(events.some((e) => e.event === "worker-result" && e.taskId === "T1")).toBe(false);
   }, 30_000);
 

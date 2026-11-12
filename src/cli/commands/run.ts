@@ -1,5 +1,6 @@
 import { parseArgs } from "node:util";
 import { ARTIFICIAL_ANALYSIS_KEY_NAME } from "../../adapters/catalog-remote.js";
+import { downEndpoints, type EndpointSeam } from "../../adapters/provider-endpoint.js";
 import { allAdapters, discoverChannels, probeAll, readDoctor } from "../../adapters/registry.js";
 import { ROUTING_MODES, type RoutingMode } from "../../config/config.js";
 import { captureHost, parseDriverOverride, pickDriver, preflightHostDriver } from "../../drivers/index.js";
@@ -474,6 +475,33 @@ export function bindNarration<D extends ExecutorDriver>(driver: D, narrate: (eve
   return driver;
 }
 
+/**
+ * Row 417; D-2187 add.77: run and resume probe each configured provider endpoint before the first dispatch. A down
+ * one prints its line on stderr now, and journals one `endpoint-down {adapter, url, reason}` row right after the
+ * run's run-start / run-resume row (so a refused resume journals nothing). Routing is unchanged: the run starts.
+ * Returns the narration sink to hand both the driver and the daemon.
+ */
+export async function endpointPreflight(
+  driver: ExecutorDriver,
+  narrate: (event: JournalEvent) => void,
+  seam?: EndpointSeam,
+): Promise<(event: JournalEvent) => void> {
+  const down = await downEndpoints(seam);
+  if (!down.length) return narrate;
+  for (const d of down) process.stderr.write(`${d.line}\n`);
+  let append: Parameters<NonNullable<ExecutorDriver["journalWith"]>>[0] | undefined;
+  const inner = driver.journalWith?.bind(driver);
+  // local: the driver was built by this command for this run
+  driver.journalWith = (a) => { append = a; inner?.(a); };
+  let journaled = false;
+  return (event) => {
+    narrate(event);
+    if (journaled || !append || (event.event !== "run-start" && event.event !== "run-resume")) return;
+    journaled = true;
+    for (const { adapter, url, reason } of down) append("endpoint-down", undefined, { adapter, url, reason });
+  };
+}
+
 /** Execution green: the exit-code predicate run and resume share. Users' scripts read it; debt never moves it. */
 export const summaryGreen = (s: RunSummary) =>
   s.failed.length === 0 && s.human.length === 0 && s.blocked.length === 0 && s.pending.length === 0
@@ -606,11 +634,12 @@ export async function run(argv: string[], cwd = process.cwd()): Promise<{ out: s
     // handed an event and nothing else, and `run-start` carries no run id). `runDaemon` uses the id
     // it is given exactly as it would use the one it would otherwise mint itself.
     const runId = newRunId();
-    const narrate = narrationSink(runId);
+    const driver = pickDriver(cfg, driverOverride, snapshot.host);
+    const narrate = await endpointPreflight(driver, narrationSink(runId));
     const s = await runDaemon(cwd, {
       runId,
       concurrency: values.concurrency ? Number(values.concurrency) : undefined,
-      driver: bindNarration(pickDriver(cfg, driverOverride, snapshot.host), narrate),
+      driver: bindNarration(driver, narrate),
       inheritedHcScope: snapshot.inheritedScope,
       mode: flagMode,
       supersedes: values.supersedes,

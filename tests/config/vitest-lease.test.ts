@@ -2,6 +2,7 @@
 // (scripts/vitest-lease.ts), exercised through real Vitest processes over fixture repositories.
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import * as childProcesses from "node:child_process";
+import * as fs from "node:fs";
 import { copyFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { dirname, join, relative } from "node:path";
 import { afterEach, expect, test, vi } from "vitest";
@@ -11,9 +12,13 @@ import { discoverTestManifest } from "../../src/gates/test-manifest.js";
 import { COMMAND_LEASE_TOKEN_ENV, REPOSITORY_LEASE_TOKEN_ENV, readHolder, repositoryLeasePath, withRepositoryLease } from "../../src/run/lease.js";
 import vitestLease, { CLOSE_DEADLINE_ENV, SEAT_LEASE_WAIT_ENV, isListingInvocation, seatLeaseWaitMs, stopOwnedRunners } from "../../scripts/vitest-lease.js";
 import { makeRepo, makeTestTempDir } from "../helpers/tmprepo.js";
+import { sh } from "../../src/run/git.js";
 
 vi.mock("node:child_process", async importOriginal => ({
   ...await importOriginal<typeof import("node:child_process")>(),
+}));
+vi.mock("node:fs", async importOriginal => ({
+  ...await importOriginal<typeof import("node:fs")>(),
 }));
 
 const root = process.cwd();
@@ -661,3 +666,130 @@ test("stopOwnedRunners kills the processes it froze when a later ps census throw
   if (sig === "alive") child.kill("SIGKILL");
   expect(sig).toBe("SIGKILL");
 });
+
+// Queue row 406; D-2187 add.99 (7) and add.100: the hook over the REAL lease in a disposable repository, with only the
+// one filesystem call a cell names made to fail; the errno is raised where the sandbox raises it.
+const errno = (code: string) => Object.assign(new Error(`${code}: operation not permitted`), { code });
+const UNLEASED = (role: string) => `tickmarkr: a ${role} seat cannot write this repository's runner lease (read-only git metadata) — running its named files unleased`;
+type FsCall = "mkdirSync" | "openSync" | "writeFileSync" | "linkSync" | "unlinkSync" | "rmSync" | "symlinkSync";
+type Fault = { call: FsCall; code: string; when: (args: string[]) => boolean };
+const at = (suffix: string) => (args: string[]) => String(args[0]).endsWith(suffix);
+const DEAD_PID = 999_999; // above macOS's pid ceiling and Linux's default: kill(0) answers ESRCH
+/** The hook over the REAL lease in a disposable repository. `plant` seeds the lease path first (a corrupt record makes
+ * acquisition reclaim it; a dead protecting holder makes it run the process census); each fault fails one call. */
+async function leaseHook(role: string | undefined, faults: Fault[], plant?: string | object, census?: string, lockDir = false): Promise<{ outcome: unknown; lines: string[] }> {
+  const repo = makeRepo({ "a.txt": "x" });
+  if (plant !== undefined) writeFileSync(await repositoryLeasePath(repo), typeof plant === "string" ? plant : JSON.stringify(plant) + "\n");
+  // An existing (ownerless) lock directory makes the owner entry the acquisition's first mutation.
+  if (lockDir) mkdirSync(`${await repositoryLeasePath(repo)}.lock`);
+  const project = { vitest: { onClose: () => {} } } as unknown as TestProject;
+  vi.spyOn(process, "cwd").mockReturnValue(repo);
+  const lines: string[] = [];
+  vi.spyOn(console, "error").mockImplementation((line: string) => { lines.push(line); });
+  for (const call of new Set(faults.map(f => f.call))) {
+    const real = fs[call] as (...args: unknown[]) => unknown;
+    vi.spyOn(fs, call).mockImplementation(((...args: unknown[]) => {
+      const hit = faults.find(f => f.call === call && f.when(args.map(String)));
+      if (hit) throw errno(hit.code);
+      return real(...args);
+    }) as never);
+  }
+  if (census) {
+    // The process census's own `ps` read is denied at its boundary; every other execFile runs for real.
+    const real = childProcesses.execFile as (...args: unknown[]) => childProcesses.ChildProcess;
+    vi.spyOn(childProcesses, "execFile").mockImplementation(((...args: unknown[]) => {
+      if (args[0] === "ps" && (args[1] as string[])[0] === "eww") {
+        const cb = args.at(-1) as (e: unknown, out: string) => void;
+        setImmediate(() => cb(errno(census), ""));
+        return { pid: undefined } as never;
+      }
+      return real(...args);
+    }) as never);
+  }
+  vi.stubEnv("TICKMARKR_SEAT", role);
+  try {
+    const outcome = await vitestLease(project).then(v => v ?? "unleased", (e: unknown) => e);
+    return { outcome, lines };
+  } finally { vi.restoreAllMocks(); vi.unstubAllEnvs(); }
+}
+
+test("a judge or review marked seat whose lease write fails with a permission error runs unleased with one line while the same error from a lease read stays fatal", async () => {
+  const corrupt = "not a lease record";
+  const ownerLink = (a: string[]) => /\.lease\.lock\/owner\.\d+$/.test(a[1]!);
+  // D-2187 add.131 (amendment D): ONLY the acquisition's first mutation is typed — creating the lock directory, or
+  // publishing the owner entry when that directory already exists.
+  for (const role of ["judge", "review"]) {
+    for (const code of ["EPERM", "EACCES"]) {
+      for (const [name, fault, lockDir] of [["lock mkdir", { call: "mkdirSync", code, when: at(".lease.lock") }, false],
+        ["owner entry in an existing lock directory", { call: "symlinkSync", code, when: ownerLink }, true]] as const) {
+        const { outcome, lines } = await leaseHook(role, [fault], undefined, undefined, lockDir);
+        expect(outcome, `${role} ${code} ${name}`).toBe("unleased");
+        expect(lines, `${role} ${code} ${name}`).toEqual([UNLEASED(role)]);
+      }
+    }
+  }
+  // The first mutation succeeds and a LATER mutation is denied: fatal with its original error, no fallback line.
+  const later: Array<[string, (code: string) => Fault[], string?]> = [
+    ["owner entry after the lock mkdir", (code) => [{ call: "symlinkSync", code, when: ownerLink }]],
+    ["draft write", (code) => [{ call: "writeFileSync", code, when: at(".draft") }]],
+    ["publication link", (code) => [{ call: "linkSync", code, when: at(".draft") }]],
+    ["draft removal after publication", (code) => [{ call: "rmSync", code, when: at(".draft") }]],
+    ["draft removal after a publication collision", (code) => [{ call: "linkSync", code: "EEXIST", when: at(".draft") }, { call: "rmSync", code, when: at(".draft") }]],
+    ["stale tombstone link", (code) => [{ call: "linkSync", code, when: (a) => /\.dead-[^/]+$/.test(a[1]!) }], corrupt],
+    ["stale unlink", (code) => [{ call: "unlinkSync", code, when: at("tickmarkr-runner.lease") }], corrupt],
+  ];
+  for (const code of ["EPERM", "EACCES"]) {
+    for (const [name, faults, plant] of later) {
+      const { outcome, lines } = await leaseHook("review", faults(code), plant);
+      expect(outcome, `review ${code} ${name}`).toMatchObject({ code });
+      expect(outcome, `review ${code} ${name}`).not.toBeInstanceOf(lease.LeaseWriteDenied);
+      expect(lines, `review ${code} ${name}`).toEqual([]);
+    }
+  }
+  // The typed failure is raised by the lease itself, at its write.
+  const repo = makeRepo({ "a.txt": "x" });
+  vi.spyOn(fs, "mkdirSync").mockImplementation((() => { throw errno("EPERM"); }) as never);
+  try {
+    const denied = await withRepositoryLease(repo, async () => "ran", { isolated: true }).catch((e: unknown) => e);
+    expect(denied).toBeInstanceOf(lease.LeaseWriteDenied);
+    expect((denied as lease.LeaseWriteDenied).cause.code).toBe("EPERM");
+  } finally { vi.restoreAllMocks(); }
+  // The same errno from the lease READ or from the production process census stays fatal, untyped, with no line.
+  const deadHolder = { pid: DEAD_PID, cwd: "/elsewhere", at: 1, token: "stale-token", protectOrphans: true, roots: [] };
+  for (const code of ["EPERM", "EACCES"]) {
+    const read = await leaseHook("review", [{ call: "openSync", code, when: at("tickmarkr-runner.lease") }]);
+    expect(read.outcome).toMatchObject({ code });
+    expect(read.outcome).not.toBeInstanceOf(lease.LeaseWriteDenied);
+    expect(read.lines.join("\n")).not.toContain("unleased");
+    const census = await leaseHook("review", [], deadHolder, code);
+    expect(census.outcome, `census ${code}`).toMatchObject({ code });
+    expect(census.outcome).not.toBeInstanceOf(lease.LeaseWriteDenied);
+    expect(census.lines).toEqual([]);
+  }
+  // Another errno from the same lease write stays fatal.
+  for (const code of ["EROFS", "ENOSPC"]) {
+    const other = await leaseHook("review", [{ call: "mkdirSync", code, when: at(".lease.lock") }]);
+    expect(other.outcome).toMatchObject({ code });
+    expect(other.lines).toEqual([]);
+  }
+}, 120_000);
+
+test("an unmarked or consult marked caller stays fatal on a denied lease write and worker and gate children carry no judge or review marker", async () => {
+  for (const role of [undefined, "consult", "worker", "scope"]) {
+    for (const code of ["EPERM", "EACCES"]) {
+      const { outcome, lines } = await leaseHook(role, [{ call: "mkdirSync", code, when: at(".lease.lock") }]);
+      expect(outcome, `${role} ${code}`).toBeInstanceOf(lease.LeaseWriteDenied);
+      expect(lines).toEqual([]);
+    }
+  }
+  // Children launched under an inherited review marker, through the production shell seam.
+  vi.stubEnv("TICKMARKR_SEAT", "review");
+  try {
+    const dir = makeTestTempDir("seat-marker-children-");
+    const probe = `printf '%s' "\${TICKMARKR_SEAT-absent}"`;
+    expect((await sh(probe, dir)).stdout, "gate child").toBe("absent");
+    expect((await sh(probe, dir, 30_000, { agent: true })).stdout, "worker child").toBe("absent");
+    expect((await sh(probe, dir, 30_000, { agent: true, seat: "scope" })).stdout, "scope draft").toBe("scope");
+    expect((await sh(probe, dir, 30_000, { agent: true, seat: "consult" })).stdout, "consult").toBe("consult");
+  } finally { vi.unstubAllEnvs(); }
+}, 60_000);

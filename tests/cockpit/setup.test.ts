@@ -1066,7 +1066,7 @@ describe("setup tab decisions surface", () => {
       { verb: "approve" as const, taskId: "approve", enacts: "dispatch it" },
       { verb: "approve" as const, taskId: "cap", enacts: "dispatch it on a fresh attempt budget" },
       { verb: "waive" as const, taskId: "waive", enacts: "continue past the approved gate" },
-      { verb: "recheck" as const, taskId: "recheck", enacts: "re-dispatch against the full gate suite" },
+      { verb: "recheck" as const, taskId: "recheck", enacts: "re-run the whole declared battery on the parked commit before any worker; if it is red, park on the first red gate" }, // row 413 (D-2187 add.69): the park default
       { verb: "uphold" as const, taskId: "uphold", enacts: "dispatch a fixed attempt carrying the findings" },
     ];
     const linesFor = (command: SetupDecisionCommand, run: ApprovalRunOwner): string =>

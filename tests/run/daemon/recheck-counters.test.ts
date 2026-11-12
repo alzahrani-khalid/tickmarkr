@@ -215,7 +215,7 @@ describe("v2.5.6 T5 — zero-spend verbs and honest counters", () => {
         { event: "task-human", taskId: "T1", data: { kind: "gate-fail", reason: "consult verdict: human" } },
       ]);
       await seedTaskWorktree(repo, runId);
-      await approve([runId, "T1", "--recheck"], repo);
+      await approve([runId, "T1", "--recheck", "--on-red", "repair"], repo);
       expect(Journal.open(repo, runId).replayResumeState().get("T1")).toMatchObject({ attempts: 6, tried: ["fake:fake-1", "fake:fake-2"] });
       const s = await runDaemon(repo, { adapters: [fake], runId, resume: true });
       expect(s.human).toEqual(["T1"]);

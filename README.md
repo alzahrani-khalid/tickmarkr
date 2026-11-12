@@ -259,7 +259,7 @@ worker. Other parks have different permitted decisions:
 |---|---|
 | Human gate / other non-gate park | Plain approve records permission to dispatch. |
 | Attempt cap | Plain approve grants a fresh attempt budget; prior routing exclusions remain. |
-| Infrastructure | Plain approve or `--recheck`; recheck reruns the declared battery and satisfies no gate. |
+| Infrastructure | Plain approve or `--recheck`; recheck reruns the declared battery and satisfies no gate. A park left by a review with no verdict also admits `--waive --gate review` when its executed full test and every other enabled gate passed on the parked commit (row 418, D-2187 add.84): it merges and owes the review — status reads `outstanding 1` until `tickmarkr verify --record <runId>` discharges that owed check. |
 | Stall with a recorded `reapFailure` (the worker's process census was unreadable or had survivors) | `--recheck` bound to that park's token re-verifies the parked attempt's owned census: only an explicitly recorded empty survivors array (`[]`) releases its harvested commits to the declared battery, with no worker; a missing, unreadable or surviving census re-parks the stall (new token, still approve/recheck). Plain approve dispatches a worker. |
 | Ordinary stall (no `reapFailure`) | Plain approve only — it dispatches a worker; `--recheck` refuses. |
 | Failed review gate | `--waive` satisfies only that identified gate; `--uphold` funds one fixed attempt carrying findings; `--recheck` reruns the battery. |

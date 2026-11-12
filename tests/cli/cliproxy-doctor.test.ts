@@ -143,6 +143,12 @@ test("the gateway credential travels only in request headers and never appears i
     await run({ env: { ANTHROPIC_BASE_URL: c.url, ANTHROPIC_AUTH_TOKEN: c.credential ?? token }, lookup });
     expect(leaky.requests.length - sent, c.cell).toBe(c.request ? 1 : 0);
     expect(lookup.calls, c.cell).toEqual([]);
+    // Row 435; D-2187 add.130: a host carrying the credential withholds the endpoint line too (never resolved); a
+    // credential only in the query, fragment or path leaves the shown scheme://host[:port] line
+    const endpoint = outputs.at(-1)?.split("\n").filter((l) => l.includes("endpoint claude-code:"));
+    expect(endpoint, c.cell).toEqual([c.cell.startsWith("a host")
+      ? "  ✗ endpoint claude-code: withheld — the base URL carries the gateway credential: not probed"
+      : `  ✓ endpoint claude-code: ${leaky.url} listening`]);
     if (c.request) expect(leaky.requests.at(-1)?.path, c.cell).toBe("/v1/models");
     if (c.models) {
       expect(gatewayOf(repo), c.cell).toMatchObject({ baseUrl: c.baseUrl, listing: { status: "succeeded" } });
@@ -204,7 +210,10 @@ test("doctor records the gateway with its typed listing result and prints its li
   const keys = Object.keys(JSON.parse(cache(repo)));
   expect(keys.at(-1)).toBe("gateway");
   expect(keys).toContain("fixture");
-  const okWithoutLine = ok.split("\n").filter((l) => !l.includes("gateway:")).join("\n");
+  // Row 435; D-2187 add.130: doctor feeds the endpoint probe the gateway's inputs, so the endpoint line is printed
+  const endpointOf = (out: string) => out.split("\n").filter((l) => l.includes("endpoint claude-code:"));
+  expect(endpointOf(ok)).toEqual([`  ✓ endpoint claude-code: ${proxy.url} listening`]);
+  const okWithoutLine = ok.split("\n").filter((l) => !l.includes("gateway:") && !l.includes("endpoint claude-code:")).join("\n");
 
   const down = await refusedUrl();
   const slow = await fake({ ...modelList(ids), delayMs: 2000 });
@@ -224,7 +233,10 @@ test("doctor records the gateway with its typed listing result and prints its li
     });
     // never fatal: doctor resolves, sets no exit code, and every other line is as with a working proxy
     expect(process.exitCode, shown).toBe(exitBefore);
-    expect(out.split("\n").filter((l) => !l.includes("gateway:")).join("\n"), shown).toBe(okWithoutLine);
+    expect(endpointOf(out), shown).toEqual([url === down
+      ? `  ✗ endpoint claude-code: ${down} down (ECONNREFUSED) — every claude-code seat will fail as transport until it answers`
+      : `  ✓ endpoint claude-code: ${url} listening`]);
+    expect(out.split("\n").filter((l) => !l.includes("gateway:") && !l.includes("endpoint claude-code:")).join("\n"), shown).toBe(okWithoutLine);
   }
   expect([slow, denied, missing].map((p) => p.requests.length)).toEqual([1, 1, 1]);
 

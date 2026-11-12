@@ -2,6 +2,68 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v2.25.0 — a run finishes what it starts
+
+**v2.25.0** ships all 19 of its spec's tasks, all merged in run-20261110-182027-0000000000003405. Every task
+passed build, lint, evidence and scope, its acceptance criteria, a review by a model from another vendor and the full
+test suite. The spec was amended ten times while the run worked. Each
+amendment closed a rule that a review had shown to be open, and two added a task: the endpoint line's credential check,
+and the rule that keeps a red recheck parked across a restart.
+
+- **A dead review endpoint no longer stalls a run.**
+  - A review or judge seat whose stream only reports that it is reconnecting now fails fast as a transport failure. It
+    used to sit until the seat timed out.
+  - A transport failure counts against the seat for that task's gate round only. It never retires the seat for the
+    rest of the run, live or after a resume.
+  - `tickmarkr doctor` probes each adapter's configured provider endpoint (the Claude base URL, the codex model
+    provider's base URL) with one bounded connect and names a dead one. `run` and `resume` print the same line before
+    dispatch, journal it, and still start.
+  - The endpoint line never shows a base URL that carries the gateway credential. It prints a withheld line instead.
+  - A recheck with review re-probes each retired review seat and readmits one only when its endpoint and its model
+    both answer.
+  - A codex review or judge seat can run the task's test suite. The seat is granted exactly the test runner's own
+    temporary directory, and nothing wider.
+- **A park that no reviewer can reach can still be released.**
+  - When no review seat could give a verdict, and the candidate already has a passed full test run and every other
+    gate green, `tickmarkr approve --waive` merges it and records the review as owed. Without that proof the waive is
+    refused and names what is missing. Help, the README and the skills describe it.
+    Known limit: in a repository with no build or lint command the waive is refused, because a gate skipped for lack
+    of a command is not counted as passed. The plain approve and the recheck still work there.
+  - `tickmarkr approve --ruling <text>` records a ruling apart from the reason. It may be repeated. Rulings reach the
+    task's later review briefs and a `verify` bound to the run, word for word.
+  - Every `verify` carries the spec's out-of-scope list.
+- **Changing the spec while a run is parked.**
+  - `tickmarkr resume --graph-changed` keeps an open park whose own task definition did not change. The task stays
+    parked for your decision and is not dispatched again.
+  - A scope grant on a task whose definition or files changed now lapses with one journal row. It used to refuse the
+    resume every time.
+  - Compile and `approve --files` refuse two unordered tasks whose glob patterns can name the same file, and name it.
+  - All of a task's approved scope grants now count as one slot against the acceptance × files bound, whatever their
+    number of paths. A two-file grant on a task near the bound is no longer refused.
+  - `approve --files` keeps a brace glob whole: `--files 'tests/cli/{doctor,vendor-truth}.test.ts'` is one pattern.
+    A value whose braces or commas the glob matcher reads differently is refused, naming the value. A file whose name
+    holds a brace or a comma cannot be named exactly; put `?` in its place.
+  - A diff-cap park on a task that holds a grant names the one remedy that works: raise `gates.diffCap`, then
+    `approve --recheck`.
+- **A red recheck waits for you.**
+  - A red operator recheck now parks on its first red gate and prints the command that reopens it. It no longer
+    spends a repair dispatch you did not ask for. `approve --recheck --on-red repair` asks for the repair.
+  - That park holds across a daemon restart and a regate: an interrupted recheck resumes into the same park and
+    never dispatches a worker before your next decision.
+- **Smaller fixes.**
+  - A worker's refusal written in the repair prompt's own form is recognised, and only its path list is read.
+  - If posting the run-end message fails after a crash, the failure is printed beside the crash and never replaces it.
+  - A stray directory at a task's worktree path is moved aside and the worktree add is retried once. If that fails
+    the task parks as an infrastructure park with a recovery command; it is never marked failed.
+  - A failed worktree add restores the branch's previous head, and the park names the ref that holds it.
+  - Preserving a worktree refuses in a directory that is not a registered worktree.
+  - A git check that fails is never read as "no": the task parks as an infrastructure park naming the path and the
+    failed check, and nothing in the directory is deleted, moved or recreated. Uncommitted work stays.
+  - For maintainers: `scripts/verify-export.sh --onto <mirror>` refuses an unclean mirror before the proof suite
+    starts.
+  - Tests: two tests that failed only on loaded CI runners are fixed. The repository-tree lint test has an explicit
+    timeout, and the dead-worker test checks the park itself instead of counting polls.
+
 ## v2.24.0 — picks tell the truth
 
 **v2.24.0** ships 25 of its spec's 31 tasks. Twenty-two merged in run-20261108-153320-0000000000002493, two of them

@@ -944,7 +944,9 @@ ${thresholds}
     },
   );
 
-  test("no suite can be disabled THROUGH AN ALIAS this lint cannot name, at either binding level — a disabled describe or a disabled test — every residual category is enumerated in the test file rather than summarised as dynamic aliases, and the lint is pointed at this repository's own tests tree rather than only at its fixtures", () => {
+  test("no suite can be disabled THROUGH AN ALIAS this lint cannot name, at either binding level — a disabled describe or a disabled test — every residual category is enumerated in the test file rather than summarised as dynamic aliases, and the lint is pointed at this repository's own tests tree rather than only at its fixtures", { timeout: 420_000 }, () => {
+    // Queue row 356: this test parses the repository's whole tests tree — 3.4 s on a quiet host, but on the 20 s default it
+    // timed out four times on a loaded Linux CI runner (spawn EAGAIN in the same shard). Its coverage sibling's bound.
     // the lint names both binding levels: a describe rebound to a skip, and a test rebound to one
     const bothLevels = `import { describe as d, test as t } from "vitest";
 

@@ -239,3 +239,12 @@ test("hinted grants retain scope-request surface, task budget and sibling confli
     expect(loadGraph(repo).tasks[0]!.files).toEqual([owned]);
   }
 });
+
+test("row 411: a repair hint grant naming a recorded hint path that holds a closing brace is granted as at the base", async () => {
+  // Control (D-2187 add.148): the two-reader count is never applied to hint grants; they keep the comma split.
+  const braced = "tests/a}.test.ts";
+  const { repo, journal } = seed([braced]);
+  await approve([journal.runId, "T1", "--uphold", "--files", braced], repo);
+  expect(approvals(journal).at(-1)!.data).toMatchObject({ amendment: { files: [owned, braced] } });
+  expect(loadGraph(repo).tasks[0]!.files).toEqual([owned, braced]);
+});

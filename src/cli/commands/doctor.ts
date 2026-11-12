@@ -8,6 +8,7 @@ import { version } from "./version.js";
 import { allAdapters, binaryShadowWarnings, detectCandidateClis, doctorAgeMs, flagDriftWarnings, formatDoctorProbeTimeoutNote, launchFaultFooters, modelAliasExclusions, modelAliasLine, probeAll, probeModels, probeScope, type ProbeScopeOpts, readDoctor, recordKimiDoctorTurn, resolveShellBinary, servableExclusions, servabilityLine, writeDoctor } from "../../adapters/registry.js";
 import { CLAUDE_ALIAS_IDENTITY_STAMPS, claudeCode, type ClaudeAlias, resolveClaudeAliasIdentity } from "../../adapters/claude-code.js";
 import { failedVerdictLabel, shq } from "../../adapters/types.js";
+import { type EndpointSeam, probeEndpoints } from "../../adapters/provider-endpoint.js";
 import { confirmedClaudeProxy, containLines, containReport, type CredentialWithheld, credentialWithheldLine, gatewayCredential, type GatewaySeam, gatewayLine, gatewayNotes, listGateway, proxiedIdentityModels, proxiedIdentityResolver, recordGateway } from "../../adapters/cliproxy.js";
 import { BANNER, compactTokens, dim, fail, kvRow, legend, ok, rule, statusRow, title, warn } from "../../brand.js";
 import { graphPath, loadGraph, tickmarkrDir, stateDirName } from "../../graph/graph.js";
@@ -116,6 +117,8 @@ export type DoctorOpts = {
   now?: () => Date;
   /** Queue row 392 R6 (D-2187 add.11): gateway detection inputs and request transport. */
   gateway?: GatewaySeam;
+  /** Row 417; D-2187 add.77: endpoint probe inputs; absent = the process environment, as the gateway reads it. */
+  endpoint?: EndpointSeam;
   /** Queue row 367 Phase 2 (D-2187 add.18): the ask-once key prompt's seams. */
   askKey?: AskKeyOptions;
   /** init's own answer to that prompt: doctor called from init never asks again. */
@@ -1676,6 +1679,9 @@ export async function doctor(
   // A failed listing, or one withheld for carrying the credential, is shown and never fatal: the exit code is unchanged.
   if (gateway) rows.push(`  ${statusRow("listing" in gateway && gateway.listing.status === "succeeded" ? "pass" : "warn", gatewayLine(gateway))}`);
   for (const note of gatewayNotes(gateway, cfg, health, opts.gateway)) rows.push(`  ${statusRow("warn", note)}`);
+  // Row 417; D-2187 add.77: one bounded TCP connect per configured provider endpoint, beside the unchanged gateway line.
+  // Row 435; D-2187 add.130: by default the probe reads the gateway's own inputs, so its credential check sees them.
+  for (const e of await probeEndpoints(opts.endpoint ?? opts.gateway)) rows.push(`  ${statusRow(e.probe.listening ? "pass" : "fail", e.line)}`);
   for (const w of withheld) rows.push(`  ${statusRow("warn", credentialWithheldLine(w))}`);
   const ports = portProbe.ports;
   const portLine = ports.status === "non-darwin" ? "launchservicesd ports: not applicable"

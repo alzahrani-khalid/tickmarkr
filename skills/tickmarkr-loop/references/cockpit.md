@@ -36,10 +36,12 @@ CURRENT status reads `outstanding 0` — even after run-end, whose record still 
 `outstanding unknown` (a legacy waiver) is never green. A mismatched graph is “not comparable.”
 
 Run offers only validated park verbs: human/attempt-cap/other non-gate parks allow approve;
-infra allows approve or `--recheck`; review gate-fail allows `--waive`, `--uphold` or
+infra allows approve or `--recheck`, plus `--waive --gate review` on a no-verdict review infra
+park whose executed full test and every other enabled gate passed (row 418, D-2187 add.84; it
+merges and owes the review until `verify --record`); review gate-fail allows `--waive`, `--uphold` or
 `--recheck`; other gate-fail allows waive/recheck. Waive satisfies only the identified
 failed gate, uphold funds a fixed attempt carrying review findings, and recheck reruns the
-declared battery without satisfying a gate. A waive needs EXECUTED evidence: mark every
+declared battery without satisfying a gate. A red recheck parks the task on its first red gate by default; pass --on-red repair to fund a repair at once. A waive needs EXECUTED evidence: mark every
 out-of-band (OOB) read behind it `OOB: static` (diff and source read, nothing run) or
 `OOB: executed` (the finding's claim run at the task's head commit, exit code and log on file).
 Static CLEAN never backs a waive — a static read that missed an executed material defect looks

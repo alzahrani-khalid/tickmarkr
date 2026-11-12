@@ -1,5 +1,4 @@
 import { graphDefinitionHash, loadGraph, saveGraph, taskDefinitionFingerprint } from "../../graph/graph.js";
-import { filesGlob } from "../../graph/files-glob.js";
 import { userInfo } from "node:os";
 import { allAdapters } from "../../adapters/registry.js";
 import { channelKey } from "../../adapters/types.js";
@@ -7,9 +6,9 @@ import { loadConfig } from "../../config/config.js";
 import { integrationBranch } from "../../run/merge.js";
 import { gitSync } from "../../run/git.js";
 import { integrationAnchor } from "../../run/daemon.js";
-import { separabilityErrors, surfaceErrors, taskBudgetErrors } from "../../compile/collateral.js";
+import { separabilityConflicts, surfaceErrors, taskBudgetErrors } from "../../compile/collateral.js";
 import { GATE_NAMES, type GateName, type Task } from "../../graph/schema.js";
-import { applyScopeAmendments, bindingToken, captureOwedCheck, engagementComparable, engagementReleased, failedGateBeforePark, parseBindingToken, physicalLine, ATTEMPT_CAP_RELEASE, GATE_SATISFIED_RELEASE, Journal, RECHECK_RELEASE, REVIEW_UPHELD_RELEASE, type DecisionBinding, type JournalEvent } from "../../run/journal.js";
+import { applyScopeAmendments, bindingToken, captureOwedCheck, engagementComparable, engagementReleased, failedGateRowBeforePark, noVerdictReview, parseBindingToken, physicalLine, ATTEMPT_CAP_RELEASE, GATE_SATISFIED_RELEASE, Journal, RECHECK_RELEASE, REVIEW_UPHELD_RELEASE, type DecisionBinding, type JournalEvent } from "../../run/journal.js";
 
 export const APPROVAL_DISPOSITIONS = ["dispatch", "waive-gate", "re-dispatch", "fund-fixed-attempt", "fresh-budget"] as const;
 export type ApprovalDisposition = (typeof APPROVAL_DISPOSITIONS)[number];
@@ -23,7 +22,8 @@ export type ApprovalDisposition = (typeof APPROVAL_DISPOSITIONS)[number];
 export const APPROVAL_ENACTS: Record<ApprovalDisposition, string> = {
   dispatch: "dispatch it",
   "waive-gate": "continue past the approved gate",
-  "re-dispatch": "re-dispatch against the full gate suite only if re-running the whole declared battery on the parked commit before any worker is red",
+  // Row 413 (D-2187 add.69): a recheck's preview is the park sentence; repair is selected only by an explicit --on-red repair.
+  "re-dispatch": RECHECK_ENACTS[DEFAULT_ON_RED],
   "fund-fixed-attempt": "dispatch a fixed attempt carrying the findings",
   "fresh-budget": "dispatch it on a fresh attempt budget",
 };
@@ -37,8 +37,15 @@ export function approvalDispositionForRelease(release: unknown): ApprovalDisposi
 }
 import { acquireApprovalSerialization, runLockOwner } from "../../run/lock.js";
 
-import { permittedDecisionVerbs, type DecisionVerb } from "../../run/decision-verbs.js";
+import { permittedDecisionVerbs, type DecisionPark, type DecisionVerb } from "../../run/decision-verbs.js";
+import { waiveProof } from "../../run/waive-proof.js";
+import { grantSlotFiles, readFilesValue } from "../files-flag.js";
+import { DEFAULT_ON_RED, parseOnRed, RECHECK_ENACTS, type OnRed } from "../../run/recheck-disposition.js";
 export { DECISION_VERBS, permittedDecisionVerbs, type DecisionVerb } from "../../run/decision-verbs.js";
+
+/** Row 418: the enabled gates an infra park recorded; absent or malformed → every gate (the strictest proof). */
+const parkGates = (v: unknown): readonly string[] =>
+  Array.isArray(v) && v.length > 0 && v.every((g) => typeof g === "string") ? v as string[] : GATE_NAMES;
 
 /** The newest park a decision binds to, read the one way this command reads it. */
 export interface NewestPark {
@@ -56,6 +63,7 @@ export interface NewestPark {
   tombstone: boolean;
   /** OBS-1202: a stall park's recorded reap failure (task-human data.reapFailure) — its census is unproven. */
   reapFailure?: string;
+  reviewWaiveProof?: DecisionPark["reviewWaiveProof"];
 }
 
 /**
@@ -82,11 +90,19 @@ export function newestPark(
     if (e.event !== "task-human" || e.taskId !== taskId) continue;
     const kind = typeof e.data.kind === "string" ? e.data.kind : undefined;
     const reason = typeof e.data.reason === "string" ? e.data.reason : undefined;
+    const failed = failedGateRowBeforePark(events, taskId, i);
+    const failedGate = failed?.gate;
     return {
       index: i, line: sourceIndexes?.[i] === undefined ? physicalLine(events, i) : sourceIndexes[i]! + 1, ts: typeof e.ts === "string" ? e.ts : undefined, kind, reason,
       approveCommand: typeof e.data.approveCommand === "string" ? e.data.approveCommand : undefined,
-      failedGate: failedGateBeforePark(events, taskId, i), tombstone: isTombstonePark(kind, reason),
+      failedGate, tombstone: isTombstonePark(kind, reason),
       ...(kind === "stall" && typeof e.data.reapFailure === "string" ? { reapFailure: e.data.reapFailure } : {}),
+      // Row 418 (D-2187 add.84): the proof reader decides whether this infra review park admits a waive.
+      // Only the row the park's failed gate was read from, and only a no-verdict one (a pass:false review
+      // of an infra park keeps approve and recheck); the enabled gates are the ones the park recorded,
+      // so every surface reads one proof — unrecorded → every gate, never a laxer proof.
+      ...(kind === "infra" && failed?.gate === "review" && noVerdictReview(events[failed.index]!.data)
+        ? { reviewWaiveProof: waiveProof(events.slice(0, i + 1), taskId, parkGates(e.data.enabledGates)) } : {}),
     };
   }
   return undefined;
@@ -201,19 +217,19 @@ export function approvalRunOwner(cwd: string, runId: string): ApprovalRunOwner {
 }
 
 /** The one sentence that says who enacts this release and what it buys. */
-export function approvalEnactment(token: ApprovalDisposition, run: ApprovalRunOwner): string {
+export function approvalEnactment(token: ApprovalDisposition, run: ApprovalRunOwner, enacts = APPROVAL_ENACTS[token]): string {
   if (run.live) {
-    return `the live daemon enacts this at its next task boundary — it will ${APPROVAL_ENACTS[token]}, including in the approval window or by cancelling an in-progress tip verify`;
+    return `the live daemon enacts this at its next task boundary — it will ${enacts}, including in the approval window or by cancelling an in-progress tip verify`;
   }
   if (run.blockingRunId) {
-    return `release recorded; live run \`${run.blockingRunId}\` holds the repository lock, so resume \`${run.runId}\` after it ends to ${APPROVAL_ENACTS[token]}`;
+    return `release recorded; live run \`${run.blockingRunId}\` holds the repository lock, so resume \`${run.runId}\` after it ends to ${enacts}`;
   }
-  return `run \`tickmarkr resume ${run.runId}\` to ${APPROVAL_ENACTS[token]}`;
+  return `run \`tickmarkr resume ${run.runId}\` to ${enacts}`;
 }
 
 /** The production command registered in COMMANDS; its returned bytes are what the CLI prints. */
 export async function approve(argv: string[], cwd = process.cwd()): Promise<string> {
-  const { runId, taskId, by, reason, waive, uphold, recheck, reviewRoundCeiling, files, park: namedPark, gate: namedGate } = parseArgs(argv);
+  const { runId, taskId, by, reason, ruling, waive, uphold, recheck, onRed, reviewRoundCeiling, files, park: namedPark, gate: namedGate } = parseArgs(argv);
   const decisions = [waive, uphold, recheck].filter(Boolean).length;
   if (decisions > 1) throw new Error("--waive, --uphold and --recheck are different decisions — pass one");
   // OBS-1178: the decision binds at COMMAND time — to the named --park, else to the park (or, for a
@@ -251,11 +267,11 @@ export async function approve(argv: string[], cwd = process.cwd()): Promise<stri
       throw new Error(`task ${taskId} is failed and ${ahead.ref} carries no commits ahead of ${ahead.base} — nothing to re-gate; use resume --retry-failed to fund a worker`);
     }
     journal.append("task-approved", taskId, {
-      by, ...(reason ? { reason } : {}), via: "cli", release: RECHECK_RELEASE,
-      recheckedRef: ahead.ref, commitsAhead: ahead.count, failure,
+      by, ...(reason ? { reason } : {}), ...rulingField(ruling), via: "cli", release: RECHECK_RELEASE,
+      recheckedRef: ahead.ref, commitsAhead: ahead.count, failure, onRed,
       ...(reviewRoundCeiling === undefined ? {} : { reviewRoundCeiling }),
     });
-    return disposition(cwd, runId, "re-dispatch", `re-checking failed ${taskId} in ${runId} — by ${by}; ${ahead.count} commit(s) on ${ahead.ref} ahead of ${ahead.base}; no worker funded`, serialization.contended);
+    return disposition(cwd, runId, "re-dispatch", `re-checking failed ${taskId} in ${runId} — by ${by}; ${ahead.count} commit(s) on ${ahead.ref} ahead of ${ahead.base}; no worker funded`, serialization.contended, RECHECK_ENACTS[onRed]);
   }
   if (status !== "human") {
     // a silent no-op would be worse than a loud refusal — name the actual status (D-05)
@@ -285,6 +301,8 @@ export async function approve(argv: string[], cwd = process.cwd()): Promise<stri
   let materializeAmendment: (() => void) | undefined;
   if ((park?.kind === "scope-request" && !decisions && !scopeRefusal) || files !== undefined) {
     const scopeRequest = park?.kind === "scope-request";
+    // Row 411 (D-2187 add.148): a scope-request value is read by the two agreeing readers; a hint grant keeps the comma split.
+    const grantFiles = scopeRequest && files !== undefined ? readFilesValue(files.join(",")) : files;
     if (!scopeRequest) {
       // Admit the verb BEFORE constructing an amendment. A hint grants no new decision authority.
       const verb = uphold ? "uphold" : recheck ? "recheck" : undefined;
@@ -302,11 +320,11 @@ export async function approve(argv: string[], cwd = process.cwd()): Promise<stri
     } else {
       // Preserve scope-request's comma-separated, trimmed glob parsing. Hint grants use raw paths.
       if (files?.join(",").startsWith("--") || files?.join(",") === "") throw new Error("--files requires <glob,…>");
-      if (files?.some((file) => !file.trim() || file.trim().startsWith("/") || file.trim().startsWith("!") || file.trim().split("/").includes(".."))) {
+      if (grantFiles?.some((file) => !file.trim() || file.trim().startsWith("/") || file.trim().startsWith("!") || file.trim().split("/").includes(".."))) {
         throw new Error("--files requires non-empty repository-relative globs");
       }
     }
-    if (!files?.length) {
+    if (!grantFiles?.length) {
       throw new Error(`scope-request for ${taskId} requires --files <glob,…> to widen files[], or \`tickmarkr approve ${runId} ${taskId} --reason <text>\` to refuse the expansion and continue within the current files[]`);
     }
     if (scopeRequest && decisions) throw new Error("--files cannot be combined with --waive, --uphold or --recheck");
@@ -322,14 +340,16 @@ export async function approve(argv: string[], cwd = process.cwd()): Promise<stri
     }
     const task = graph.tasks.find((t) => t.id === taskId);
     if (!task) return refuseGrant(`unknown task ${taskId}`);
-    const amendedFiles = [...new Set([...task.files, ...files.map((file) => scopeRequest ? file.trim() : file)])];
+    const amendedFiles = [...new Set([...task.files, ...grantFiles.map((file) => scopeRequest ? file.trim() : file)])];
     if (amendedFiles.length === task.files.length) refuseGrant("--files must extend the parked files[] revision");
     const amended = { ...graph, tasks: graph.tasks.map((t) => t.id === taskId ? { ...t, files: amendedFiles } : t) };
     const conflicts = scopeGrantConflicts(cwd, journal, runId, taskId, amended.tasks, events);
     if (conflicts.length) refuseGrant(`refusing scope-request approval for ${taskId}: ${conflicts.join("\n")}`);
     // C4: a live grant may not take a task past the bounds that fail every compile. The exception
     // list is EMPTY on purpose — a recorded historical compile exception confers no live authority.
-    const overBound = [...taskBudgetErrors([{ ...task, files: amendedFiles }]), ...surfaceErrors([{ ...task, files: amendedFiles }], [])];
+    // Row 411 (D-2187 add.65): compiled patterns plus ONE slot for every grant together.
+    const slotted = { ...task, files: grantSlotFiles(journal.read(), taskId, task.files) };
+    const overBound = [...taskBudgetErrors([slotted]), ...surfaceErrors([slotted], [])];
     if (overBound.length) {
       refuseGrant(`refusing scope-request approval for ${taskId}: ${overBound.join("\n")}\n`
         + `remedy: close the run, split the task in its spec, recompile, then \`tickmarkr resume ${runId} --graph-changed\``);
@@ -344,7 +364,7 @@ export async function approve(argv: string[], cwd = process.cwd()): Promise<stri
     };
     if (scopeRequest) {
       journal.append("task-approved", taskId, {
-        by, ...(reason ? { reason } : {}), via: "cli", release: "scope-request", park: parkBinding,
+        by, ...(reason ? { reason } : {}), ...rulingField(ruling), via: "cli", release: "scope-request", park: parkBinding,
         ...(reviewRoundCeiling === undefined ? {} : { reviewRoundCeiling }), // OBS-1083
         amendment,
       });
@@ -363,7 +383,7 @@ export async function approve(argv: string[], cwd = process.cwd()): Promise<stri
     }
     journal.append("task-approved", taskId, {
       by,
-      ...(reason ? { reason } : {}),
+      ...(reason ? { reason } : {}), ...rulingField(ruling),
       via: "cli",
       release: REVIEW_UPHELD_RELEASE,
       gate: "review",
@@ -383,9 +403,10 @@ export async function approve(argv: string[], cwd = process.cwd()): Promise<stri
     }
     journal.append("task-approved", taskId, {
       by,
-      ...(reason ? { reason } : {}),
+      ...(reason ? { reason } : {}), ...rulingField(ruling),
       via: "cli",
       release: RECHECK_RELEASE,
+      onRed, // row 413 (D-2187 add.69): the red battery's disposition, recorded where the daemon reads it
       park: parkBinding,
       // OBS-1084: failedGate names the runner report for every recheck. Authoring rechecks additionally
       // carry gate so their durable release row identifies the red tool gate that made recheck admissible.
@@ -397,12 +418,14 @@ export async function approve(argv: string[], cwd = process.cwd()): Promise<stri
       ...(amendment === undefined ? {} : { amendment }),
     });
     materializeAmendment?.();
-    return disposition(cwd, runId, "re-dispatch", `re-checking ${taskId} in ${runId} — by ${by}; ${failedGate ? `failed gate ${failedGate}` : reapFailurePark ? "reapFailure stall park; the owned census is re-verified before the gates" : `${park!.kind} park`}; no gate marked satisfied`, serialization.contended);
+    return disposition(cwd, runId, "re-dispatch", `re-checking ${taskId} in ${runId} — by ${by}; ${failedGate ? `failed gate ${failedGate}` : reapFailurePark ? "reapFailure stall park; the owned census is re-verified before the gates" : `${park!.kind} park`}; no gate marked satisfied`, serialization.contended, RECHECK_ENACTS[onRed]);
   }
   if (waive) {
     if (!permittedDecisionVerbs(park).includes("waive")) {
-      throw new Error(`--waive applies to a gate-fail park; ${taskId}'s newest park is ${String(lastHuman?.data.kind ?? "none")} with failed gate ${failedGate ?? "none"} — refusing`);
+      const proof = park?.reviewWaiveProof;
+      throw new Error(`--waive applies to a gate-fail park${proof?.ok === false ? ` or a proved infra review park (row 418: ${proof.reason})` : ""}; ${taskId}'s newest park is ${String(lastHuman?.data.kind ?? "none")} with failed gate ${park?.failedGate ?? "none"} — refusing`);
     }
+    const failedGate = park!.failedGate; // a gate-fail park's, or row 418's no-verdict review of an infra park
     // C1: the waiver's owed check rides the SAME row — one append, captured synchronously so a live
     // daemon's boundary never observes the decision without its obligation (or a second write).
     // The seats a review discharge may resolve to are this repository's declared channels, recorded on
@@ -427,7 +450,7 @@ export async function approve(argv: string[], cwd = process.cwd()): Promise<stri
       : { ...owed, known: false, unknownReason: `its journal names no readable published tip (${integration.unreadable})` };
     journal.append("task-approved", taskId, {
       by,
-      ...(reason ? { reason } : {}),
+      ...(reason ? { reason } : {}), ...rulingField(ruling),
       via: "cli",
       release: GATE_SATISFIED_RELEASE,
       gate: failedGate,
@@ -457,7 +480,7 @@ export async function approve(argv: string[], cwd = process.cwd()): Promise<stri
 
   journal.append("task-approved", taskId, {
     by,
-    ...(reason ? { reason } : {}),
+    ...(reason ? { reason } : {}), ...rulingField(ruling),
     via: "cli",
     ...(reviewRoundCeiling === undefined ? {} : { reviewRoundCeiling }),
     ...(capPark ? { release: ATTEMPT_CAP_RELEASE } : {}),
@@ -501,20 +524,18 @@ function scopeGrantConflicts(
   cwd: string, journal: Journal, runId: string, requesterId: string,
   tasks: ReadonlyArray<Pick<Task, "id" | "files" | "deps">>, events: readonly JournalEvent[],
 ): string[] {
-  const errors = separabilityErrors(tasks);
-  if (!errors.length) return errors;
-  const pairs = separabilityPairs(tasks);
-  if (pairs.length !== errors.length) return errors; // a misaligned local fold refuses everything
+  // Row 414 (D-2187 add.71): compile's own pair fold and overlap, so the two cannot misalign.
+  const conflicts = separabilityConflicts(tasks);
+  if (!conflicts.length) return [];
   const statuses = journal.replayStatuses();
   let taskRef: string | undefined;
   const requesterRef = () => (taskRef ??= `${integrationBase(events, () => integrationBranch(loadConfig(cwd), runId)).branch}--${requesterId}`);
   const kept: string[] = [];
-  for (let i = 0; i < errors.length; i++) {
-    const { a, b } = pairs[i]!;
+  for (const { a, b, error } of conflicts) {
     const sibling = a === requesterId ? b : b === requesterId ? a : undefined;
     if (sibling === undefined) continue;
     if (mergedSiblingExempt(cwd, events, statuses.get(sibling), sibling, requesterRef)) continue;
-    kept.push(errors[i]!);
+    kept.push(error);
   }
   return kept;
 }
@@ -540,47 +561,6 @@ function mergedSiblingExempt(
 
 /** Queue row 2 item b: approve's git runs through the protected path; a trust refusal throws, never reads as false. */
 const gitOk = (cwd: string, ...args: string[]): boolean => gitSync(cwd, args).status === 0;
-
-/** The conflicting unordered pairs of separabilityErrors, in its exact emission order. */
-function separabilityPairs(tasks: ReadonlyArray<Pick<Task, "id" | "files" | "deps">>): Array<{ a: string; b: string }> {
-  const byId = new Map(tasks.map((t) => [t.id, t.deps ?? []] as const));
-  const pairs: Array<{ a: string; b: string }> = [];
-  for (let i = 0; i < tasks.length; i++) {
-    for (let j = i + 1; j < tasks.length; j++) {
-      const a = tasks[i]!, b = tasks[j]!;
-      if (pairReachable(a.id, byId).has(b.id) || pairReachable(b.id, byId).has(a.id)) continue; // ordered
-      if (pairOverlap(a.files ?? [], b.files ?? []).length > 0) pairs.push({ a: a.id, b: b.id });
-    }
-  }
-  return pairs;
-}
-
-/** Tasks reachable from `id` through deps (transitive) — separabilityErrors' own fold. */
-function pairReachable(id: string, byId: Map<string, readonly string[]>): Set<string> {
-  const seen = new Set<string>();
-  const stack = [...(byId.get(id) ?? [])];
-  while (stack.length) {
-    const next = stack.pop()!;
-    if (seen.has(next)) continue;
-    seen.add(next);
-    stack.push(...(byId.get(next) ?? []));
-  }
-  return seen;
-}
-
-/** separabilityErrors' conservative overlap: identical patterns, or a glob matching the other's literal path. */
-function pairOverlap(a: readonly string[], b: readonly string[]): string[] {
-  const hits = new Set<string>();
-  const isGlob = (p: string) => /[*?[\]{}]/.test(p);
-  for (const pa of a) {
-    for (const pb of b) {
-      if (pa === pb) { hits.add(pa); continue; }
-      if (isGlob(pa) && !isGlob(pb) && filesGlob(pa)(pb)) hits.add(`${pb} ⊂ ${pa}`);
-      else if (isGlob(pb) && !isGlob(pa) && filesGlob(pb)(pa)) hits.add(`${pa} ⊂ ${pb}`);
-    }
-  }
-  return [...hits].sort();
-}
 
 /** The row a decision on this task answers right now: its newest failure when failed, else its newest park. */
 function openDecision(journal: Journal, taskId: string): DecisionBinding | undefined {
@@ -633,10 +613,10 @@ function failedTaskCommitsAhead(cwd: string, journal: Journal, runId: string, ta
 // token — machine consumers parse it — while its TEXT now names the boundary sweep. A recovery
 // command is emitted only with no live repository owner; a different run's live owner instead names
 // the blocker and waits until it ends.
-function disposition(cwd: string, runId: string, token: ApprovalDisposition, message: string, contended: boolean): string {
+function disposition(cwd: string, runId: string, token: ApprovalDisposition, message: string, contended: boolean, enacts?: string): string {
   const owner = runLockOwner(cwd);
   const run = ownedByLiveDaemon(owner, runId);
-  const out = `approval disposition ${token}: ${message}; ${approvalEnactment(token, run)}`;
+  const out = `approval disposition ${token}: ${message}; ${approvalEnactment(token, run, enacts)}`;
   if (!owner && !contended) return out;
   const status: ApprovalStatus = run.live ? "deferred-live" : "recorded-no-owner";
   const record = {
@@ -660,13 +640,20 @@ interface ParsedArgs {
   taskId: string;
   by: string;
   reason?: string;
+  /** Row 419 (D-2187 add.89): `--ruling <text>`, repeatable — recorded apart from the reason. */
+  ruling: string[];
   waive: boolean;
   uphold: boolean;
   recheck: boolean;
+  /** Row 413: `--on-red <park|repair>` — park when absent (approve applies the default when it writes). */
+  onRed: OnRed;
   reviewRoundCeiling?: number;
 }
 
-const USAGE = "usage: tickmarkr approve <run-id> <task-id> [--park <line>@<ts>] [--gate <gate>] [--files <glob,…>] [--waive|--uphold|--recheck] [--review-rounds <positive-integer>] [--by <name>] [--reason <text>]";
+/** Row 419: the decision row's `ruling` field — absent when none was passed. */
+const rulingField = (ruling: readonly string[]): { ruling?: string[] } => ruling.length ? { ruling: [...ruling] } : {};
+
+const USAGE = "usage: tickmarkr approve <run-id> <task-id> [--park <line>@<ts>] [--gate <gate>] [--files <glob,…>] [--waive|--uphold|--recheck [--on-red <park|repair>]] [--review-rounds <positive-integer>] [--by <name>] [--reason <text>] [--ruling <text>]…";
 
 // hand-parsed argv — no CLI framework (house style). Positionals are runId then taskId; decision,
 // ceiling, actor and reason are flags. Throws usage on missing positionals (mirrors resume.ts/unlock.ts).
@@ -677,9 +664,11 @@ function parseArgs(argv: string[]): ParsedArgs {
   let gate: string | undefined;
   let by: string | undefined;
   let reason: string | undefined;
+  const ruling: string[] = [];
   let waive = false;
   let uphold = false;
   let recheck = false;
+  let onRed: OnRed | undefined;
   let reviewRoundCeiling: number | undefined;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
@@ -700,12 +689,18 @@ function parseArgs(argv: string[]): ParsedArgs {
     } else if (a === "--reason") {
       reason = argv[++i];
       if (!reason) throw new Error(USAGE);
+    } else if (a === "--ruling") {
+      const value = argv[++i];
+      if (!value?.trim()) throw new Error("--ruling requires <text>");
+      ruling.push(value);
     } else if (a === "--waive") {
       waive = true;
     } else if (a === "--uphold") {
       uphold = true;
     } else if (a === "--recheck") {
       recheck = true;
+    } else if (a === "--on-red") {
+      onRed = parseOnRed(argv[++i]);
     } else if (a === "--review-rounds") {
       const value = argv[++i];
       if (value === undefined) throw new Error(USAGE);
@@ -721,5 +716,6 @@ function parseArgs(argv: string[]): ParsedArgs {
   if (!runId || !taskId) {
     throw new Error(USAGE);
   }
-  return { runId, taskId, by: by ?? userInfo().username, reason, waive, uphold, recheck, reviewRoundCeiling, files, park, gate };
+  if (onRed !== undefined && !recheck) throw new Error(`--on-red applies only to --recheck; ${USAGE}`);
+  return { runId, taskId, by: by ?? userInfo().username, reason, ruling, waive, uphold, recheck, onRed: onRed ?? DEFAULT_ON_RED, reviewRoundCeiling, files, park, gate };
 }

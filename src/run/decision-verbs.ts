@@ -1,3 +1,5 @@
+import type { WaiveProof } from "./waive-proof.js";
+
 /** The closed verb set every decision surface may name. Nothing outside it reaches this command. */
 export const DECISION_VERBS = ["approve", "waive", "uphold", "recheck"] as const;
 export type DecisionVerb = (typeof DECISION_VERBS)[number];
@@ -8,11 +10,13 @@ export interface DecisionPark {
   failedGate: string | undefined;
   tombstone: boolean;
   reapFailure?: string;
+  /** Row 418 (D-2187 add.84): the waive-proof reader's answer for an infra park whose failed gate is a no-verdict review. */
+  reviewWaiveProof?: WaiveProof;
 }
 
 /**
- * FINAL §3.3's decision menu as data: human-gate/attempt-cap/other non-gate parks → approve; infra, and
- * a stall park that recorded a reapFailure (OBS-1202), → approve or recheck; review gate-fail →
+ * FINAL §3.3's decision menu as data: human-gate/attempt-cap/other non-gate parks → approve; infra (plus
+ * waive for a proved no-verdict review, row 418), and a stall park that recorded a reapFailure (OBS-1202), → approve or recheck; review gate-fail →
  * waive/uphold/recheck; other gate-fail → waive/recheck; a
  * gate-fail park with no failed-gate evidence, or a tombstone → nothing (a diagnostic, never a
  * fabricated verb). The refusals in the `approve` command enforce the same table; this is the one place a
@@ -24,7 +28,11 @@ export function permittedDecisionVerbs(park: DecisionPark | undefined): readonly
     if (park.failedGate === undefined) return [];
     return park.failedGate === "review" ? ["waive", "uphold", "recheck"] : ["waive", "recheck"];
   }
-  if (park.kind === "infra") return ["approve", "recheck"];
+  // Row 418 (D-2187 add.84): an infra park left by a no-verdict review admits a waive owing the review,
+  // only when the proof reader proved its candidate (an executed full test, every other enabled gate passed).
+  if (park.kind === "infra") {
+    return park.failedGate === "review" && park.reviewWaiveProof?.ok === true ? ["approve", "waive", "recheck"] : ["approve", "recheck"];
+  }
   // OBS-1202: an unreadable reap census parks finished work; recheck re-verifies that census and gates the
   // harvested commits with no worker. An ordinary stall recorded no census failure: approve alone.
   if (park.kind === "stall" && park.reapFailure !== undefined) return ["approve", "recheck"];
@@ -62,14 +70,15 @@ export function decisionCommands(
     return none("untimed park — no park token is available; refusing an unbound decision");
   }
   if (verbs.length === 0 || (park.kind === "gate-fail" && !park.failedGate)) return none("parked on gate-fail with no failed gate result on the newest park — refusing to infer one");
-  const gate = bound && (park.kind === "gate-fail" || (park.kind === "authoring" && isToolGate(park.failedGate)))
-    ? park.failedGate : undefined;
+  // Row 418: an infra park's waive names the review it waives; its approve and recheck stay as at the base.
+  const gateFor = (verb: DecisionVerb) => bound && (park.kind === "gate-fail" || (park.kind === "authoring" && isToolGate(park.failedGate))
+    || (park.kind === "infra" && verb === "waive")) ? park.failedGate : undefined;
   return {
     commands: verbs.map(verb => ({
       verb,
       command: ["tickmarkr", "approve", runId, taskId,
         ...(verb === "approve" ? [] : [`--${verb}`]),
-        ...(gate === undefined ? [] : ["--gate", gate]),
+        ...(gateFor(verb) === undefined ? [] : ["--gate", gateFor(verb)!]),
         ...(bound ? ["--park", `${park.line}@${park.ts}`] : []),
       ].map(commandArg).join(" "),
     })),

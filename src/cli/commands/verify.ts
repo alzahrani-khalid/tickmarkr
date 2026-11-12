@@ -23,6 +23,7 @@ import {
 import { describeLeaseWait, withRepositoryLease } from "../../run/lease.js";
 import { isPidLive } from "../../run/lock.js";
 import { LAUNCHSERVICES_PORT_STOP, probeLaunchServicesPorts, recordLaunchServices } from "../../run/launchservices-check.js";
+import { withRulings } from "../../run/rulings.js";
 import { ceilingLine, manifestedBaseline, manifestedRow, resolveManifestedCeiling, verdictlessCommands } from "../verify-speed.js";
 
 /**
@@ -426,13 +427,15 @@ async function verifyCommand(argv: string[], cwd: string, options: { evidence?: 
   let acceptance: AcceptanceItem[] = [];
   let files = values.files ?? [];
   let goal = `independent verification of the ${values.base}..HEAD diff`;
+  let outOfScope: string[] | undefined; // row 419 (D-2187 add.89): every verify of a task carries its spec's outOfScope
   if (sup) {
-    ({ acceptance, files, goal } = sup.task);
+    ({ acceptance, files, goal, outOfScope } = sup.task);
   } else if (values.task) {
     const t = getTask(loadGraph(fileRoot("graph.json")), values.task);
     acceptance = t.acceptance;
     if (!files.length) files = t.files;
     goal = t.goal;
+    outOfScope = t.outOfScope;
   } else if (values.criteria) {
     acceptance = parseCriteria(readFileSync(values.criteria, "utf8"));
     if (!acceptance.length) throw new Error(`--criteria ${values.criteria}: no criteria found (bullets or command:/test:/judge: lines)`);
@@ -458,7 +461,12 @@ async function verifyCommand(argv: string[], cwd: string, options: { evidence?: 
     deps: [], files, context: [], acceptance: acceptance.length ? acceptance : ["(deterministic verification only)"],
     gates, humanGate: false, status: "pending",
     evidence: { commits: [], artifacts: [], gateResults: [] },
+    ...(outOfScope?.length ? { outOfScope } : {}),
   };
+  // Row 419: only `--record <run>` binds a run, so only then does the brief carry that run's rulings for
+  // the task — with or without --supersede. A task id alone never guesses a run (runs reuse task ids).
+  const ruled = values.record && values.task
+    ? withRulings(task, (sup?.journal ?? Journal.open(stateRoot, values.record)).read(), values.task) : task;
 
   const commands = detectGateCommands(cwd, cfg);
 
@@ -670,7 +678,7 @@ async function verifyCommand(argv: string[], cwd: string, options: { evidence?: 
     }
   }
 
-  const gateRun = async (phaseGates: GateName[], baseline: Baseline): Promise<GateResult[]> => (await runGates({ ...task, gates: phaseGates }, {
+  const gateRun = async (phaseGates: GateName[], baseline: Baseline): Promise<GateResult[]> => (await runGates({ ...ruled, gates: phaseGates }, {
     worktree: cwd, baseRef: mergeBase,
     result: { ok: true, summary: "standalone verify — no worker claims to trust", deviations: [], raw: "" },
     author, ...(carriedAuthors.length ? { carriedAuthors } : {}), commands, baseline, channels, modelAuthExclusions: reviewModelAuthExclusions, ...(judgeChannels ? { judgeChannels } : {}), adapters, cfg,

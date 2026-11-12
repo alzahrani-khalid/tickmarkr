@@ -608,21 +608,68 @@ function reachable(id: string, byId: Map<string, ReadonlyArray<string>>): Set<st
   return seen;
 }
 
-// Conservative overlap: identical patterns, or a glob that matches the other's literal path. Two
-// globs that merely COULD intersect are not flagged — false negatives are acceptable here, false
-// positives would reject legitimate graphs.
-function overlappingPatterns(a: ReadonlyArray<string>, b: ReadonlyArray<string>): string[] {
+const isGlobPattern = (p: string) => /[*?[\]{}]/.test(p);
+
+/** Row 414: the text before the first wildcard and after the last — both literal by construction. */
+function literalEnds(member: string): { prefix: string; suffix: string } {
+  const first = member.search(/[*?[\]]/);
+  if (first < 0) return { prefix: member, suffix: member };
+  let last = first;
+  for (let i = member.length - 1; i >= first; i--) if (/[*?[\]]/.test(member[i]!)) { last = i; break; }
+  return { prefix: member.slice(0, first), suffix: member.slice(last + 1) };
+}
+
+/** Row 414: brace members of one files[] pattern; undefined = over the bound or unexpandable (fail closed). */
+function overlapMembers(pattern: string): string[] | undefined {
+  if (!/[{}]/.test(pattern)) return [pattern];
+  const members = expandFilesPattern(pattern);
+  return members.length ? members : undefined;
+}
+
+/** Row 414: the member two expanded patterns may share, or undefined when they provably cannot. */
+function sharedMember(ma: string, mb: string): string | undefined {
+  const ga = isGlobPattern(ma), gb = isGlobPattern(mb);
+  if (!ga && !gb) return ma === mb ? ma : undefined;
+  if (ga && !gb) return filesGlob(ma)(mb) ? mb : undefined;
+  if (!ga && gb) return filesGlob(mb)(ma) ? ma : undefined;
+  if (ma === mb) return ma;
+  // Glob against glob: a possible intersection is an overlap unless the literal prefixes or the
+  // literal suffixes diverge (neither is a prefix / suffix of the other).
+  const ea = literalEnds(ma), eb = literalEnds(mb);
+  const prefixes = ea.prefix.startsWith(eb.prefix) || eb.prefix.startsWith(ea.prefix);
+  const suffixes = ea.suffix.endsWith(eb.suffix) || eb.suffix.endsWith(ea.suffix);
+  return prefixes && suffixes ? `${ma} ∩ ${mb}` : undefined;
+}
+
+/**
+ * Queue row 414 (D-2187 add.71; OBS-212): THE overlap of two files[] lists — compile's separability
+ * check and approve's grant-conflict fold both call it, so the two cannot misalign. Identical
+ * patterns and a glob matching the other's literal path report as before; two globs are
+ * brace-expanded and their members compared (literal by equality, glob against literal by the files
+ * matcher, glob against glob by the conservative prefix/suffix test). An expansion over the bound
+ * fails closed as an overlap of the unexpanded patterns.
+ */
+export function filesOverlap(a: ReadonlyArray<string>, b: ReadonlyArray<string>): string[] {
   const hits = new Set<string>();
-  const isGlob = (p: string) => /[*?[\]{}]/.test(p);
   for (const pa of a) {
     for (const pb of b) {
       if (pa === pb) { hits.add(pa); continue; }
-      if (isGlob(pa) && !isGlob(pb) && filesGlob(pa)(pb)) hits.add(`${pb} ⊂ ${pa}`);
-      else if (isGlob(pb) && !isGlob(pa) && filesGlob(pb)(pa)) hits.add(`${pa} ⊂ ${pb}`);
+      const ga = isGlobPattern(pa), gb = isGlobPattern(pb);
+      if (ga && !gb) { if (filesGlob(pa)(pb)) hits.add(`${pb} ⊂ ${pa}`); continue; }
+      if (gb && !ga) { if (filesGlob(pb)(pa)) hits.add(`${pa} ⊂ ${pb}`); continue; }
+      if (!ga) continue;
+      const ma = overlapMembers(pa), mb = overlapMembers(pb);
+      if (!ma || !mb) { hits.add(`${pa} ∩ ${pb}`); continue; }
+      for (const x of ma) for (const y of mb) {
+        const shared = sharedMember(x, y);
+        if (shared !== undefined) hits.add(shared);
+      }
     }
   }
   return [...hits].sort();
 }
+
+export interface SeparabilityConflict { a: string; b: string; error: string }
 
 /**
  * OBS-212: two tasks with no dependency path between them may run concurrently and are recreated
@@ -630,28 +677,34 @@ function overlappingPatterns(a: ReadonlyArray<string>, b: ReadonlyArray<string>)
  * false — and it comes due in the carry plumbing, which resets the task branch to the advanced tip
  * and silently drops whatever will not cherry-pick. run-20260728-110135 lost 32 verified commits in
  * two events that way (T2 17/17, T1 15/15), each after a sibling that shared its files merged.
+ * Row 414: the ONE pair fold — approve's scope grant reads these same pairs.
  */
-export function separabilityErrors(
+export function separabilityConflicts(
   tasks: ReadonlyArray<Pick<Task, "id" | "files" | "deps">>,
-): string[] {
+): SeparabilityConflict[] {
   const byId = new Map(tasks.map((t) => [t.id, t.deps ?? []] as const));
-  const errors: string[] = [];
+  const out: SeparabilityConflict[] = [];
   for (let i = 0; i < tasks.length; i++) {
     for (let j = i + 1; j < tasks.length; j++) {
       const a = tasks[i]!, b = tasks[j]!;
       if (reachable(a.id, byId).has(b.id) || reachable(b.id, byId).has(a.id)) continue; // ordered
-      const shared = overlappingPatterns(a.files ?? [], b.files ?? []);
+      const shared = filesOverlap(a.files ?? [], b.files ?? []);
       if (shared.length > 0) {
-        errors.push(
+        out.push({ a: a.id, b: b.id, error:
           `${a.id} and ${b.id} both write ${shared.join(", ")} but neither depends on the other — `
           + `add a dependency edge to order them, or split the shared path out. Concurrent tasks that `
           + `write the same file are not independent, and the loser's committed work is silently `
-          + `dropped when the integration tip advances (OBS-212).`,
-        );
+          + `dropped when the integration tip advances (OBS-212).` });
       }
     }
   }
-  return errors;
+  return out;
+}
+
+export function separabilityErrors(
+  tasks: ReadonlyArray<Pick<Task, "id" | "files" | "deps">>,
+): string[] {
+  return separabilityConflicts(tasks).map((c) => c.error);
 }
 
 /**

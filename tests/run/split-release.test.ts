@@ -75,7 +75,7 @@ const decide = (events: JournalEvent[], o: { tasks?: Task[]; work?: Record<strin
   const input = { runId: RUN, events, tasks: o.tasks ?? [AFTER], rehash: o.rehash === null ? undefined : o.rehash ?? REHASH };
   return { decisions: decideSplitRelease(input, new Map(Object.entries(o.work ?? { T1: { head: HEAD, commits: 2 } }))), reads: splitReleaseReads(input) };
 };
-const releaseOf = (events: JournalEvent[], path: string, extra: Record<string, unknown> = { release: "recheck" }, head: string | null = HEAD) => ({
+const releaseOf = (events: JournalEvent[], path: string, extra: Record<string, unknown> = { release: "recheck", onRed: "repair" }, head: string | null = HEAD) => ({
   taskId: "T1", event: "task-approved", data: {
     by: "resume --graph-changed", via: "resume", ...extra, park: binding(events, parkIndex(events)),
     engagement: { cause: "graph-changed", rehash: REHASH, from: parkDefinition(BEFORE), to: parkDefinition(AFTER), path, ...(head ? { head } : {}) },
@@ -123,7 +123,7 @@ describe("row 372 — the split release decider", () => {
     // names that ref, so the battery gates exactly that tree; a preserved ref proving no commits is plain.
     const ref = `refs/tickmarkr/preserved/${HEAD}`;
     expect(decide(ended, { work: { T1: { head: HEAD, commits: 1, ref } } }).decisions)
-      .toEqual([releaseOf(ended, ENDED_PATH, { release: "recheck", recheckedRef: ref })]);
+      .toEqual([releaseOf(ended, ENDED_PATH, { release: "recheck", onRed: "repair", recheckedRef: ref })]);
     expect(decide(ended, { work: { T1: { head: "b".repeat(40), commits: 0, ref } } }).decisions).toEqual([releaseOf(ended, ENDED_PATH, {}, null)]);
 
     // Reading the task work fails (or was never taken): kept, naming the read failure and the park's verbs.
@@ -144,7 +144,7 @@ describe("row 372 — the split release decider", () => {
     // before any gate; a plain release (no commits) carries none, as an operator's plain approve.
     const unreaped = parkedJournal({ kind: "stall", reason: "worker could not be reaped before harvest: census unreadable", after: [] });
     unreaped[parkIndex(unreaped)]!.data.reapFailure = "census unreadable";
-    expect(decide(unreaped).decisions).toEqual([releaseOf(unreaped, ENDED_PATH, { release: "recheck", reapFailure: "census unreadable" })]);
+    expect(decide(unreaped).decisions).toEqual([releaseOf(unreaped, ENDED_PATH, { release: "recheck", onRed: "repair", reapFailure: "census unreadable" })]);
     expect(decide(unreaped, { work: { T1: { head: "b".repeat(40), commits: 0 } } }).decisions).toEqual([releaseOf(unreaped, ENDED_PATH, {}, null)]);
     // Row 389 (D-2186 add.18): every kept park is held out of scheduling, a read-failure or unrecorded one included.
     expect(failed[0]).toMatchObject({ hold: true });
@@ -188,8 +188,12 @@ describe("row 372 — the split release decider", () => {
       expect(decide(gate, { tasks: [AFTER] })).toEqual({ decisions: [], reads: [] });
     }
 
-    // Controls. Definition unchanged: nothing. A files[]-only or definition-only change is a change.
-    expect(decide(ended, { tasks: [BEFORE] }).decisions).toEqual([]);
+    // Controls. Definition unchanged: kept and held (row 415, D-2187 add.73). A files[]-only or definition-only change is a change.
+    const same = decide(ended, { tasks: [BEFORE] });
+    expect(same.reads).toEqual([]);
+    expect(same.decisions.map((d) => d.event)).toEqual([PARK_KEPT_EVENT]);
+    expect(same.decisions[0]).toMatchObject({ hold: true });
+    expect(String(same.decisions[0]!.data.reason)).toContain("definition unchanged");
     expect(decide(ended, { tasks: [loaded({ ...ORIGINAL, files: ["f.txt"] })] }).decisions.map((d) => d.event)).toEqual(["task-approved"]);
     expect(decide(ended, { tasks: [loaded({ ...ORIGINAL, goal: "T1, split" })] }).decisions.map((d) => d.event)).toEqual(["task-approved"]);
     // Not a graph-changed resume (no rehash on this launch): nothing.
@@ -289,7 +293,7 @@ const endedPath = () => (endedRun ??= captured("ended"));
 function assertReleasedAndRegated(c: Captured, path: string): void {
   const { events, release, releaseAt, rehashAt } = c;
   expect(release.data).toEqual({
-    by: "resume --graph-changed", via: "resume", release: "recheck", park: { line: c.parkLine, ts: c.park.ts },
+    by: "resume --graph-changed", via: "resume", release: "recheck", onRed: "repair", park: { line: c.parkLine, ts: c.park.ts },
     engagement: {
       cause: "graph-changed", rehash: { from: events[rehashAt]!.data.from, to: events[rehashAt]!.data.to },
       from: parkDefinition(BEFORE), to: parkDefinition(AFTER), path, head: c.head,

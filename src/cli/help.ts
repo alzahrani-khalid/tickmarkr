@@ -25,7 +25,7 @@ export const COMMAND_HELP = {
     }, examples: ["init --yes", "init --agent --force --docs", "init --remove"],
   },
   doctor: {
-    usage: "doctor [options]", description: `Probe configured adapters and models and print diagnostics. Default probing may make model calls and refresh a stale catalog. ${AA_KEY_RECIPE}`,
+    usage: "doctor [options]", description: `Probe configured adapters and models and print diagnostics. Default probing may make model calls and refresh a stale catalog. Each configured provider endpoint (the Claude base URL, the codex model_provider base_url) gets one bounded TCP connect probe and a listening or down line. ${AA_KEY_RECIPE}`,
     options: {
       "--models": "Include full per-model diagnostics.",
       "--adapter <id>": "Probe this adapter's configured models; repeatable, unioned with --model, including routing exclusions.",
@@ -136,7 +136,7 @@ export const COMMAND_HELP = {
     options: {
       // Queue row 372 (D-2186): the flag still accepts and journals the changed graph identity. The
       // sentences after that name only the release src/run/split-release.ts ships.
-      "--graph-changed": "Accept and journal a changed graph identity for this run. A parked task whose definition changed is released at that resume as a new engagement with reset round counters when the change is proved, the read of its work proves a committed head or no commits, and the park is not a human-gate or an attempt-cap park. Its committed head is re-gated with no worker or, with no commits, a fresh worker is dispatched. A human-gate park whose definition keeps the gate, an attempt-cap park and an unproved change (a definition unrecorded at the park, or a task-work read that proves neither a committed head nor that there are no commits) keep their park and say so. The release output names the stop path: the run had ended, or the run was stopped before it ended.",
+      "--graph-changed": "Accept and journal a changed graph identity for this run. A parked task whose definition changed is released at that resume as a new engagement with reset round counters when the change is proved, the read of its work proves a committed head or no commits, and the park is not a human-gate or an attempt-cap park. Its committed head is re-gated with no worker or, with no commits, a fresh worker is dispatched. A human-gate park whose definition keeps the gate, an attempt-cap park, an open park whose own definition did not change and an unproved change (a definition unrecorded at the park, or a task-work read that proves neither a committed head nor that there are no commits) keep their park and say so. The release output names the stop path: the run had ended, or the run was stopped before it ended. A scope grant whose task definition or files changed lapses at that resume instead of refusing: it is not applied, one scope-amendment-lapsed row is journaled, and no later resume replays it, so a lapsed path is granted again through a scope request and approve --files.",
       "--retry-failed": "Retry failed tasks.",
       "--readmit <adapter:model>": "Readmit a channel this run excluded run-wide (a no-trailer demotion, a channel exclusion or a dead-channel failover): one channel-readmit journal row per channel is written before the exclusion replay, so the channel routes again and its no-trailer streak starts at zero. Every resume re-queues a task parked because those exclusions emptied its routing pool; a pool still empty parks it again. Repeatable.",
       "--driver <auto|herdr|subprocess|orca|herdr-app>": "Choose the execution driver; auto picks herdr, then herdr-app, then orca from host markers, else subprocess.",
@@ -178,12 +178,15 @@ export const COMMAND_HELP = {
     options: {
       "--park <line>@<ts>": "Bind the decision to the park token status prints (a failed task's recheck binds its failure token); refused once a newer park opens.",
       "--gate <gate>": "Bind a waive to the park's failed gate; refused when the park failed another gate.",
-      "--files <glob,…>": "Widen a scope-request park with comma-separated repository-relative globs, or grant exact recorded repair hint paths on a park released with --uphold or --recheck; required for scope approval.",
+      "--files <glob,…>": "Widen a scope-request park with comma-separated repository-relative globs (a comma inside braces stays in one glob, so brace globs stay whole; an unbalanced brace refuses), or grant exact recorded repair hint paths on a park released with --uphold or --recheck; required for scope approval.",
       "--by <name>": "Name the actor (default: current OS user).",
       "--reason <text>": "Record the decision reason.",
-      "--waive": "Waive only the identified failed gate.",
+      "--ruling <text>": "Record a binding ruling for this task that the run's review briefs and verify's brief carry verbatim; the worker's prompt and repair brief do not carry it.",
+      "--waive": "Waive only the identified failed gate. An infrastructure park left by a review with no verdict admits `--waive --gate review` only when its executed full test and every other enabled gate passed on the parked commit; it merges and owes the review until `verify --record` discharges it.",
       "--uphold": "Uphold a review failure and fund a fixed attempt.",
-      "--recheck": "Request rechecking an infra or failed-gate park; satisfies no gate.",
+      // Row 413 (D-2187 add.69): the park default flips a documented behaviour, so the option states it.
+      "--recheck": "Request rechecking an infra or failed-gate park; satisfies no gate. A red recheck parks the task on its first red gate unless --on-red repair is given.",
+      "--on-red <park|repair>": "On a red recheck, park (the default) waits for your next decision; repair dispatches a repair at once.",
       "--review-rounds <N>": "Set a positive integer review-round ceiling that binds only this approval engagement; a later approval without --review-rounds restores the built-in default.",
     }, examples: [
       "approve run-example T1 --park 42@2026-09-26T08:00:00.000Z --by operator --reason 'ready to proceed'",

@@ -10,6 +10,7 @@ import { answerTrustDialog } from "../run/trust-dialog.js";
 import type { Effort } from "../graph/schema.js";
 import { formatOwnedName, parseOwnedName, type ExecutorDriver, type Slot } from "../drivers/types.js";
 import { SEAT_MARKER_ENV } from "../drivers/host-env.js";
+import { codexSeatCommand } from "../adapters/codex.js";
 import { HcReadUnavailableError } from "../drivers/hc-client.js";
 import { CHECKOUT_MARK, checkoutProofLine, type SeatLaunchCause } from "../drivers/orca.js";
 import { bannerShell, paneDispatchCommand, PLAIN_BANNER } from "../brand.js";
@@ -21,6 +22,7 @@ import {
   seatShellCeiling,
   WorkerTreeCpuAccountant,
 } from "../run/stall.js";
+import { pollTransport, teePaneSeatCommand, teeSeatCommand, TransportWatch } from "./transport-death.js";
 
 export const GATE_PANE_SEP = " · ";
 
@@ -153,6 +155,9 @@ const llmOutputCapture = new AsyncLocalStorage<string[]>();
 export const GATE_INACTIVITY_WINDOW_MS = 12 * 60_000;
 const GATE_WAIT_SLICE_MS = 30_000;
 let gateInactivityWindowMs = GATE_INACTIVITY_WINDOW_MS;
+// The adaptive test-window arm keeps a seam-adjusted case sliced too; production stays 30s.
+const gateWaitSliceMs = (remaining: number): number =>
+  Math.max(1, Math.min(GATE_WAIT_SLICE_MS, Math.ceil(gateInactivityWindowMs / 4), remaining));
 
 /** Test seam — shrink only the calibrated inactivity window; production always reads 12 minutes. */
 export function setGateInactivityWindowMsForTests(ms: number): void {
@@ -204,6 +209,8 @@ export interface LlmRunResult {
   /** OBS-1039: seat-authored bytes stayed under REVIEW_SILENT_BYTE_FLOOR at the first liveness beat. */
   silentAtBeat?: boolean;
   seatAuthoredBytes?: number;
+  /** Row 417; D-2187 add.77: a reconnect-only judge/review stream (transport-death.ts) — killed fast or ended so. */
+  transport?: boolean;
 }
 
 // The harness preamble has a fixed row shape, in order: the dispatch echo rows (the identity export
@@ -436,6 +443,17 @@ function seatRoleFromPrompt(prompt: string): "judge" | "review" | "scope" | unde
   return undefined;
 }
 
+// Queue row 406; D-2187 add.99 and add.100: a codex judge or review seat carries only its checked Vite temp leaf grant
+// (codexSeatViteLeaf); a refused leaf is a seat-launch failure. Every other seat launches exactly as before.
+function seatLaunchCommand(adapter: WorkerAdapter, role: string | undefined, cwd: string, pf: string, model: string,
+  effort: Effort | undefined, decode: unknown): string {
+  if (adapter.id === "codex" && (role === "judge" || role === "review")) {
+    try { return codexSeatCommand(pf, model, effort, cwd); }
+    catch (error) { throw new SeatLaunchError(`${adapter.id}:${model}`, error); }
+  }
+  return decode ? adapter.headlessCommand(pf, model, effort, "stream") : adapter.headlessCommand(pf, model, effort);
+}
+
 async function runHeadlessDetailed(
   adapter: WorkerAdapter,
   model: string,
@@ -449,29 +467,43 @@ async function runHeadlessDetailed(
     const pf = join(dir, "prompt.md");
     writeFileSync(pf, prompt);
     const decode = gateStreamDecoder(adapter, prompt);
-    const command = decode
-      ? adapter.headlessCommand(pf, model, effort, "stream")
-      : adapter.headlessCommand(pf, model, effort);
-    const ceiling = seatShellCeiling(timeoutMs);
     const role = seatRoleFromPrompt(prompt);
+    const command = seatLaunchCommand(adapter, role, cwd, pf, model, effort, decode);
+    const ceiling = seatShellCeiling(timeoutMs);
+    const nonce = extractPromptNonce(prompt) ?? "";
+    // Row 417; D-2187 add.77: a judge/review seat's pipes are teed to a log the fail-fast check reads while it runs.
+    const watch = role === "judge" || role === "review" ? new TransportWatch(prompt, adapter.harnessBannerRows) : undefined;
+    const log = join(dir, "seat.log");
+    if (watch) writeFileSync(log, "");
+    const kill = new AbortController();
     const r = await (async () => {
+      const stopWatch = watch
+        ? pollTransport(watch, () => readFileSync(log, "utf8"),
+          () => kill.abort(), gateWaitSliceMs(timeoutMs))
+        : undefined;
       // Queue row 340 (D-2180): every agent this launches is sealed from the caller's host addressing, including a
       // role-less caller the prompt cannot name a seat for; only a seat role (judge, review, scope) sets its marker.
-      try { return await sh(command, cwd, timeoutMs + 30_000, {
-        onSpawn: ceiling.onSpawn, ownsLeader: ceiling.ownsLeader, agent: true,
+      try { return await sh(watch ? teeSeatCommand(command, log) : command, cwd, timeoutMs + 30_000, {
+        onSpawn: ceiling.onSpawn, ownsLeader: ceiling.ownsLeader, agent: true, signal: kill.signal,
         ...(role ? { seat: role } : {}),
       }); }
-      finally { await ceiling.stop(); }
+      finally { stopWatch?.(); await ceiling.stop(); }
     })();
+    // The ended reading is the same append-only seat log the live checks read, in its write order — never the
+    // pipes concatenated, which reorder an echo split across stdout and stderr (row 417; D-2187 add.77).
+    let transport = {};
+    if (watch) {
+      try { watch.observe(readFileSync(log, "utf8"), true); } catch { /* an unreadable log proves nothing */ }
+      transport = { transport: kill.signal.aborted || watch.reconnectOnly };
+    }
     if (decode) {
       const turn = decode(r.stdout);
       return { output: turn.output, streamRaw: turn.raw, seatAuthoredBytes: turn.seatAuthoredBytes,
-        exitCode: r.code, timedOut: ceiling.timedOut || r.timedOut === true };
+        exitCode: r.code, timedOut: ceiling.timedOut || r.timedOut === true, ...transport };
     }
     const output = r.stdout + "\n" + r.stderr;
-    const nonce = extractPromptNonce(prompt) ?? "";
     return { output, exitCode: r.code, timedOut: ceiling.timedOut || r.timedOut === true,
-      seatAuthoredBytes: Buffer.byteLength(reviewSeatOutput(output, nonce, adapter.harnessBannerRows).trim()) };
+      seatAuthoredBytes: Buffer.byteLength(reviewSeatOutput(output, nonce, adapter.harnessBannerRows).trim()), ...transport };
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -522,6 +554,13 @@ async function runViaDriverDetailed(
     // OBS-50: bootstrap in a script beside the prompt — pane sees one short bash line + banner, not the raw inline command
     const nonce = extractPromptNonce(prompt) ?? generateVerdictNonce();
     const role = seatRoleFromPrompt(prompt);
+    // Row 417; D-2187 add.77: a judge/review seat's pipes are teed to an append-only log the fail-fast check reads.
+    const seatLog = join(dir, "seat.log");
+    const gateSeat = prompt.startsWith("TICKMARKR-JUDGE") || prompt.startsWith("TICKMARKR-REVIEW");
+    const launch = seatLaunchCommand(adapter, role, cwd, pf, model, effort, decode);
+    const seatCommand = decode ? `( ${launch} ) | tee ${shq(streamPath)}` : launch;
+    if (gateSeat) writeFileSync(seatLog, "");
+    const readSeatLog = () => { try { return readFileSync(seatLog, "utf8"); } catch { return ""; } };
     writeFileSync(scriptPath, [
       "export BASH_SILENCE_DEPRECATION_WARNING=1",
       // D-2174: the pane shell's host may carry an inherited marker; only a judge, review or scope seat names a role.
@@ -529,9 +568,7 @@ async function runViaDriverDetailed(
       ...(role ? [`export ${SEAT_MARKER_ENV}=${role}`] : []),
       bannerShell(),
       ...(decode ? ["set -o pipefail"] : []),
-      decode
-        ? `( ${adapter.headlessCommand(pf, model, effort, "stream")} ) | tee ${shq(streamPath)}`
-        : adapter.headlessCommand(pf, model, effort),
+      gateSeat ? teePaneSeatCommand(seatCommand, seatLog) : seatCommand,
       gateExitTrailer(nonce),
     ].join("\n"));
     try {
@@ -576,8 +613,8 @@ async function runViaDriverDetailed(
     let launchNeverStarted = false;
     let silentAtBeat = false;
     let seatAuthoredBytes = 0;
-    const gatePrompt = prompt.startsWith("TICKMARKR-JUDGE") || prompt.startsWith("TICKMARKR-REVIEW");
-    if (!gatePrompt) {
+    let transport: boolean | undefined;
+    if (!gateSeat) {
       await via.driver.waitOutput(slot, exitPattern, timeoutMs, { regex: true });
       out = await via.driver.read(slot, 400);
     } else {
@@ -589,6 +626,9 @@ async function runViaDriverDetailed(
       const startedAt = Date.now();
       out = await via.driver.read(slot, 400);
       const reviewing = prompt.startsWith("TICKMARKR-REVIEW");
+      // Row 417; D-2187 add.77: the per-dispatch accumulated reading is the seat log; the pane's snapshot forgets.
+      const watch = new TransportWatch(prompt, adapter.harnessBannerRows);
+      watch.observe(readSeatLog());
       let turn = readTurn();
       seatAuthoredBytes = turn?.seatAuthoredBytes ?? Buffer.byteLength(reviewSeatOutput(out, nonce, adapter.harnessBannerRows));
       let firstLivenessObserved = false;
@@ -601,8 +641,7 @@ async function runViaDriverDetailed(
       let cpuFlatSince = initialCpu.cpu === undefined ? undefined : anchoredAt;
       while (Date.now() - startedAt < timeoutMs) {
         const remaining = timeoutMs - (Date.now() - startedAt);
-        // The adaptive test-window arm keeps a seam-adjusted case sliced too; production stays 30s.
-        const sliceMs = Math.max(1, Math.min(GATE_WAIT_SLICE_MS, Math.ceil(gateInactivityWindowMs / 4), remaining));
+        const sliceMs = gateWaitSliceMs(remaining);
         const matched = await via.driver.waitOutput(slot, exitPattern, sliceMs, { regex: true });
         const raw = await via.driver.read(slot, 400);
         out = raw;
@@ -612,6 +651,11 @@ async function runViaDriverDetailed(
         // wait timed out at the same boundary the marker landed; either way a trailer completes
         // normally and is never mistaken for inactivity.
         if (matched || new RegExp(exitPattern).test(raw)) break;
+        watch.observe(readSeatLog());
+        if (watch.dead) {
+          forceClose = true;
+          break;
+        }
 
         const now = Date.now();
         // The ceiling wins if it coincides with the first beat (or the read crosses it).
@@ -669,6 +713,8 @@ async function runViaDriverDetailed(
       }
       timedOut = Date.now() - startedAt >= timeoutMs && !new RegExp(exitPattern).test(out);
       if (timedOut && (reviewing || decode)) forceClose = true;
+      watch.observe(readSeatLog(), true);
+      transport = watch.reconnectOnly;
     }
     const exitCode = Number(new RegExp(`TICKMARKR_EXIT_${nonce}:(\\d+)`).exec(out)?.[1]);
     // Quiesce a killed stream before the final snapshot, including bytes tee wrote during close.
@@ -684,6 +730,7 @@ async function runViaDriverDetailed(
       launchNeverStarted,
       silentAtBeat,
       seatAuthoredBytes: turn?.seatAuthoredBytes ?? seatAuthoredBytes,
+      ...(transport === undefined ? {} : { transport }),
     };
   } catch (error) {
     // Row 360; D-2184 add.19: close an unreadable seat even when kept, before existing no-verdict recovery.

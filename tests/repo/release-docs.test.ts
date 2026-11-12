@@ -63,6 +63,11 @@ function postPublishScaffoldStep(): string {
 
 describe("release documentation", () => {
   describe("RELEASING.md", () => {
+    test("the releasing guide passes the mirror to verify export in step three", () => {
+      const step3 = perReleaseSteps().match(/(?:^|\n)3\. ([\s\S]*?)(?=\n4\. )/)?.[1] ?? "";
+      expect(step3).toContain("npm run-script verify:export -- --onto /path/to/tickmarkr-public-mirror");
+    });
+
     test("the releasing documentation describes committing each export on top of a persistent clone of the public repository instead of a recurring force push", () => {
       const content = readFile(RELEASING_MD);
       expect(content).toContain("append-only");

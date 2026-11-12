@@ -29,7 +29,13 @@ against one park is refused once a newer park opens (the daemon journals `approv
 again on the new token; never re-issue the old one (D-470: an unbound approve waived a RED test
 gate). A failed task keeps its recheck with its bound failure token: status prints
 `failed — T3 — failure <line>@<ts>`, and `tickmarkr approve <runId> T3 --recheck --park <line>@<ts>`
-re-gates its landed commits with no worker.
+re-gates its landed commits with no worker. A red recheck parks the task on its first red gate by default; pass --on-red repair to fund a repair at once. An infra park left by a review with no verdict takes
+approve or `--recheck`, and `--waive --gate review` only when its executed full test and every other
+enabled gate passed on the parked commit (row 418, D-2187 add.84): the waive merges and owes the
+review, discharged by `tickmarkr verify --record <runId>` as below.
+A ruling the reviewer must honour rides `--ruling <text>` (repeatable) on the decision, never the
+reason (row 419, D-2187 add.89): the run's review briefs for that task and a `verify --record <runId>`
+brief carry it verbatim; the worker's prompt and repair brief do not carry it, and a reason reaches no brief.
 
 **A waive is funded by EXECUTED evidence, never by a static read.** Every out-of-band (OOB) read
 behind a ruling records its mode: `OOB: static` — the diff and source were read and nothing ran — or

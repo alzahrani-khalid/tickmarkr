@@ -122,7 +122,7 @@ test("the production daemon funds exactly one repair carrying both findings for 
       j.append("gate-result", "T1", { gate: "review", pass: false, details: UPHELD });
       j.append("task-human", "T1", { kind: "gate-fail", reason: "recheck this subject" });
       writeFileSync(join(j.dir, "baseline.json"), JSON.stringify({ commands: {} }));
-      await approve([runId, "T1", "--recheck"], f.repo);
+      await approve([runId, "T1", "--recheck", "--on-red", "repair"], f.repo);
       before = j.read().length;
       const script = JSON.parse(readFileSync(f.scriptPath, "utf8"));
       script.tasks.T1.shift();
@@ -194,7 +194,7 @@ test("test and lint repairs keep the instance contract when review is excluded f
       j.append("gate-result", "T1", { gate: "review", pass: false, details: UPHELD });
       j.append("task-human", "T1", { kind: "gate-fail", reason: "recheck this subject" });
       writeFileSync(join(j.dir, "baseline.json"), JSON.stringify({ commands: {} }));
-      await approve([runId, "T1", "--recheck"], f.repo);
+      await approve([runId, "T1", "--recheck", "--on-red", "repair"], f.repo);
     }
     // Supply a mixed round at the gate boundary, retaining the real test/lint red.
     const original = gateRunner.runGates;

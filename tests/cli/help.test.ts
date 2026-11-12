@@ -354,3 +354,51 @@ test("the end-of-options marker preserves data and legacy help scans cannot rein
   expect((await dispatch("custom", ["--help"], { custom: handler })).out).toContain("usage: tickmarkr custom");
   expect(handler).toHaveBeenCalledOnce();
 });
+
+// Row 417; D-2187 add.77: the doctor help names the configured endpoint probe.
+test("doctor help names the configured endpoint probe", async () => {
+  const help = (await dispatch("doctor", ["--help"])).out;
+  expect(help).toContain("Each configured provider endpoint (the Claude base URL, the codex model_provider base_url) gets one bounded TCP connect probe and a listening or down line.");
+});
+
+// Row 418 (D-2187 add.84): approve help, README's Infrastructure row and the shipped loop cockpit and
+// overseer skill text teach the infra review waive and the owed check it leaves.
+test("approve help the readme infrastructure row and the shipped cockpit and overseer skills teach the infra review waive and its owed check", async () => {
+  const flat = (text: string) => text.replace(/\s+/g, " ");
+  const result = await dispatch("approve", ["--help"]);
+  expect(result.code).toBe(0);
+  const waive = COMMAND_HELP.approve.options["--waive"]!;
+  expect(result.out).toContain(`--waive  ${waive}`);
+  const readme = readFileSync(join(ROOT, "README.md"), "utf8");
+  const infra = readme.split("\n").find((line) => line.startsWith("| Infrastructure |"))!;
+  const cockpit = flat(readFileSync(join(ROOT, "skills/tickmarkr-loop/references/cockpit.md"), "utf8"));
+  const overseer = flat(readFileSync(join(ROOT, "skills/tickmarkr-overseer/SKILL.md"), "utf8"));
+  for (const [name, text] of [["help", waive], ["readme", infra], ["cockpit", cockpit], ["overseer", overseer]] as const) {
+    expect(text, name).toContain("--waive --gate review");
+    expect(text, name).toMatch(/no verdict|no-verdict/);
+    expect(text, name).toContain("executed full test and every other enabled gate passed");
+    expect(text, name).toContain("owes the review");
+    expect(text, name).toContain("verify --record");
+    // CLI help carries no private record ids (help-ids sweep); the shipped docs cite the row
+    if (name !== "help") expect(text, name).toContain("row 418, D-2187 add.84");
+    else expect(text, name).not.toMatch(/\bD-\d+/);
+  }
+  // the infrastructure row keeps approve and recheck for every other infra park
+  expect(infra).toContain("Plain approve or `--recheck`");
+  expect(infra).toContain("outstanding 1");
+});
+
+// Row 419 (D-2187 add.89): approve help states where a recorded ruling reaches and where it does not; the
+// shipped overseer skill teaches the flag apart from the reason.
+test("approve help says a recorded ruling reaches the review and verify briefs but not the worker's repair brief and the shipped overseer skill teaches the flag", async () => {
+  const line = "Record a binding ruling for this task that the run's review briefs and verify's brief carry verbatim; the worker's prompt and repair brief do not carry it.";
+  expect(COMMAND_HELP.approve.options["--ruling <text>"]).toBe(line);
+  const result = await dispatch("approve", ["--help"]);
+  expect(result.code).toBe(0);
+  expect(result.out).toContain(`--ruling <text>  ${line}`);
+  expect(result.out).not.toMatch(/\bD-\d+/);
+  const overseer = readFileSync(join(ROOT, "skills/tickmarkr-overseer/SKILL.md"), "utf8").replace(/\s+/g, " ");
+  for (const phrase of ["`--ruling <text>` (repeatable)", "never the reason", "row 419, D-2187 add.89",
+    "the run's review briefs for that task and a `verify --record <runId>` brief carry it verbatim",
+    "the worker's prompt and repair brief do not carry it", "a reason reaches no brief"]) expect(overseer).toContain(phrase);
+});

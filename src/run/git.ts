@@ -15,6 +15,7 @@ import { ROUTING_ENV_SEAMS } from "../route/router.js";
 import { HERDR_CONTROL_VARS, HOST_SESSION_VARS, SEAT_MARKER_ENV } from "../drivers/host-env.js";
 import { agentEnv, agentShellCommand, isAgentEnv } from "../drivers/agent-env.js";
 import { titleEnvironment } from "./title-environment.js";
+import { isRegisteredWorktree, pathPresent, withBranchSafety, WorktreePathExistsError } from "./worktree-quarantine.js";
 import { npmLockKeeps } from "./npm-range.js";
 import { assertGitTrust, GitTrustRefusal, ownGitPin, protectedGitEnv, trustedCommonDir, type DetachedAddCapability, type OwnGitCapability, type TrustedStoreCapability, type WorktreeRollback } from "./git-trust.js";
 
@@ -672,7 +673,7 @@ export function sh(cmd: string, cwd: string, timeoutMs = DEFAULT_SHELL_TIMEOUT_M
 // Git plumbing never needs an operator profile; skip login-shell startup and its side effects.
 // v2.6.8 T2: the explicit OWN-GIT entry — forced inert hooks/fsmonitor and, in a linked checkout, the trusted-path and
 // ref-store pin. Queue row 142: `bytes` is the one opt-in raw-stdout capture; every other caller's output is unchanged.
-export function shGit(cmd: string, cwd: string, timeoutMs = DEFAULT_SHELL_TIMEOUT_MS, own: OwnGitOptions = {}, options: Pick<ShellOptions, "bytes"> = {}): Promise<ShResult> {
+export function shGit(cmd: string, cwd: string, timeoutMs = DEFAULT_SHELL_TIMEOUT_MS, own: OwnGitOptions | TrustedStoreCapability = {}, options: Pick<ShellOptions, "bytes"> = {}): Promise<ShResult> {
   return shellEntry(cmd, cwd, timeoutMs, false, options, own);
 }
 
@@ -960,7 +961,7 @@ export async function cleanupRunWorktrees(
     try {
       const head = await gitHead(dir);
       const producer = opts.producer(task);
-      let ref = await preserveWorktree(dir, producer);
+      let ref = await preserveWorktree(dir, producer, repo);
       if (!ref) {
         const merged = await shGit(`git merge-base --is-ancestor ${shq(head)} ${shq(`refs/heads/${branch}`)}`, repo);
         if (merged.code !== 0 && merged.code !== 1) throw new Error(merged.stderr || merged.stdout || "ancestry comparison failed");
@@ -1027,8 +1028,10 @@ const producerLabel = (producer: PreserveProducer): string => {
  * neither a commit nor a ref, keeping meaningful deaths visible rather than minting one ref per
  * ordinary dispatch.
  */
-export async function preserveWorktree(cwd: string, producer: PreserveProducer = "unknown"): Promise<string | undefined> {
-  if (!existsSync(cwd)) return undefined;
+export async function preserveWorktree(cwd: string, producer: PreserveProducer = "unknown", repo?: string): Promise<string | undefined> {
+  // Row 412 (D-2187 add.67, add.156): never from a plain directory, where git resolves the PARENT repository; a failed
+  // registration probe or an unresolvable-but-present path (EACCES) throws GitProbeUnknownError, never "nothing to preserve".
+  if (!await isRegisteredWorktree(cwd, repo)) return undefined;
   const scratch = mkdtempSync(join(tmpdir(), "tickmarkr-preserve-index-"));
   const index = join(scratch, "index");
   const withIndex = (command: string) => `GIT_INDEX_FILE=${shq(index)} ${command}`;
@@ -1076,16 +1079,20 @@ export async function createWorktree(repo: string, branch: string, baseRef: stri
 async function createWorktreeHeld(repo: string, branch: string, baseRef: string): Promise<string> {
   branch = await resolveTaskBranch(repo, branch);
   const dir = join(tickmarkrDir(repo), WORKTREES_DIR, sanitize(branch));
-  if (existsSync(dir)) await removeWorktree(repo, dir);
   // the worktree capability: a branch add, whose symbolic HEAD keeps the ref-store pin (see OwnGitCapability); a raced
-  // add is rolled back, its branch restored to the value read here or deleted when it is new
-  const prior = (await shGit(`git rev-parse --verify -q ${shq(`refs/heads/${branch}`)}`, repo)).stdout.trim() || undefined;
+  // add is rolled back, its branch restored to the prior head withBranchSafety checked or deleted when it is new
   const cmd = `git worktree add -B ${shq(branch)} ${shq(dir)} ${shq(baseRef)}`;
-  const added = await shGit(cmd, repo, DEFAULT_SHELL_TIMEOUT_MS, { createsWorktree: "branch", rollback: { dir, branch: { name: branch, prior } } });
-  if (added.code !== 0) {
+  // Row 412 (D-2187 add.67, add.156): only a registered worktree is removed; a stray is left for the add to name and
+  // quarantine; an unknown registration throws before any safety ref is written or anything removed.
+  const registered = await isRegisteredWorktree(dir, repo);
+  await withBranchSafety(repo, branch, async (prior) => {
+    if (registered) await removeWorktree(repo, dir);
+    const added = await shGit(cmd, repo, DEFAULT_SHELL_TIMEOUT_MS, { createsWorktree: "branch", rollback: { dir, branch: { name: branch, prior } } });
+    if (added.code === 0) return;
     if (siblingAdminReadFailed(added.stderr)) throw new WorktreeAdminRaceError(added.stderr.trim());
+    if (pathPresent(dir) && !await isRegisteredWorktree(dir, repo)) throw new WorktreePathExistsError(dir, (added.stderr || added.stdout).trim());
     throw new Error(`command failed (${added.code}): ${cmd}\n${added.stderr || added.stdout}`);
-  }
+  });
   linkNodeModules(repo, dir);
   return dir;
 }

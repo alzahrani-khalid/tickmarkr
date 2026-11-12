@@ -77,7 +77,13 @@ function classify({ runId, events, tasks, rehash }: SplitReleaseInput): Array<Sp
       continue;
     }
     const to = parkDefinition(task);
-    if (from.fingerprint === to.fingerprint && JSON.stringify(from.files) === JSON.stringify(to.files)) continue;
+    // Row 415 (D-2187 add.73): an unchanged definition — fingerprint AND files — keeps its park, of every kind,
+    // before the exempt-kind branches. Under a graph-changed resume the recompile's `pending` cannot be told
+    // from an operator's graph.json release, so only an operator decision on the park releases it.
+    if (from.fingerprint === to.fingerprint && JSON.stringify(from.files) === JSON.stringify(to.files)) {
+      out.push(kept(task.id, park.line, `definition unchanged — ${next}`));
+      continue;
+    }
     // D-2186 add.7: the spec's approval-before-dispatch gate and an exhausted attempt budget (queue row 388 owns
     // any automatic reset) are operator decisions whatever the definition change. D-2186 add.11: a human-gate park
     // is exempt only while the loaded definition still sets humanGate; one that turns it off is the operator's own
@@ -124,7 +130,9 @@ export function decideSplitRelease(input: SplitReleaseInput, work: ReadonlyMap<s
       data: {
         by: RELEASED_BY,
         via: "resume",
-        ...(recheck ? { release: RECHECK_RELEASE } : {}),
+        // row 413 (D-2187 add.100 M2): the operator asked for this release by changing the spec, so its red
+        // battery funds a repair EXPLICITLY — the operator recheck's park default never applies here
+        ...(recheck ? { release: RECHECK_RELEASE, onRed: "repair" } : {}),
         // the battery gates a recovered preserved ref exactly, as it does approve's failed-task recheck (OBS-1022)
         ...(recheck && read.ref !== undefined ? { recheckedRef: read.ref } : {}),
         // OBS-1202: a stall park's recorded reap failure rides the recheck, so the battery's census guard runs first

@@ -96,7 +96,7 @@ describe("OBS-1106 — infrastructure rechecks repark without buying a repair", 
       const first = await runDaemon(repo, { adapters: [fake], runId });
       expect(first.human).toEqual(["T1"]);
       expect(of(rows(repo, runId), "task-human").at(-1)!.data.kind).not.toBe("infra");
-      await approve([runId, "T1", "--recheck", "--by", "op"], repo);
+      await approve([runId, "T1", "--recheck", "--on-red", "repair", "--by", "op"], repo);
       await runDaemon(repo, { adapters: [fake], runId, resume: true });
       const post = afterResume(rows(repo, runId));
       const funded = of(post, "repair-attempt");
@@ -120,7 +120,7 @@ describe("OBS-1106 — infrastructure rechecks repark without buying a repair", 
       const first = await runDaemon(repo, { adapters: [fake], runId });
       expect(first.human, runId).toEqual(["T1"]);
       expect(of(rows(repo, runId), "task-human").at(-1)!.data.kind === "infra", runId).toBe(infra);
-      await approve([runId, "T1", "--recheck", "--by", "op"], repo);
+      await approve([runId, "T1", "--recheck", ...(infra ? [] : ["--on-red", "repair"]), "--by", "op"], repo);
       await runDaemon(repo, { adapters: [fake], runId, resume: true });
       const post = afterResume(rows(repo, runId));
       const red137 = testRows(post)[0]!;

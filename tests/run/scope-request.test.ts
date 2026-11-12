@@ -235,14 +235,17 @@ test("test: an in-run scope amendment replays onto a graph where another task wa
   const released = replayScopeAmendments(repaired, events, true);
   expect(released.tasks.find((t) => t.id === "T1")!.files).toEqual(["owned.txt", "needed.txt"]);
   expect(released.tasks.find((t) => t.id === "T2")!.files).toEqual(["other.txt", "late.txt"]);
-  // the release waives whole-graph identity only: an amended task whose files[] drifted is still refused
+  // Row 409 (D-2187 add.100 N1) replaces the release's refusal of the amended task's own drift with a lapse:
+  // a files[] drift is not applied (the loaded files stand) and the plain replay still refuses it
   const drifted = { ...repaired, tasks: repaired.tasks.map((t) => t.id === "T1" ? { ...t, files: ["renamed.txt"] } : t) };
-  expect(() => replayScopeAmendments(drifted, events, true)).toThrow(/T1 files\[\] changed beyond the approved amendment/);
-  // …and never the amended task's own definition: every non-files drift is refused under the release
+  expect(replayScopeAmendments(drifted, events, true).tasks.find((t) => t.id === "T1")!.files).toEqual(["renamed.txt"]);
+  expect(() => replayScopeAmendments(drifted, events)).toThrow(/T1 files\[\] changed beyond the approved amendment/);
+  // …and every non-files drift of the amended task's own definition lapses the grant under the release
   const t1 = graph.tasks.find((t) => t.id === "T1")!;
   for (const change of [{ goal: "changed" }, { acceptance: ["changed"] }, { deps: ["T2"] }, { routingHints: { ...t1.routingHints, floor: "frontier" } }]) {
     const moved = { ...repaired, tasks: repaired.tasks.map((t) => t.id === "T1" ? { ...t, ...change } : t) };
-    expect(() => replayScopeAmendments(moved, events, true)).toThrow(/T1 definition changed beyond the approved amendment/);
+    expect(replayScopeAmendments(moved, events, true).tasks.find((t) => t.id === "T1")!.files).toEqual(["owned.txt"]);
+    expect(() => replayScopeAmendments(moved, events)).toThrow(/definition changed beyond approval for T1/);
   }
   // an older approval row carries no fingerprint: the caller supplies the run snapshot's, and without one the release refuses
   const legacy = journal.read().map((e) => e.event === "task-approved" ? { ...e, data: { ...e.data, amendment: { ...(e.data.amendment as object), definition: undefined } } } : e);

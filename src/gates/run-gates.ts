@@ -1597,7 +1597,9 @@ export async function runGates(
         `review dispatch withdrawn: ${seat} was retired for the run (two real no-verdicts) after it was picked, before it launched; picked again`).join("\n")}\n${picked.details}` };
       if (cancelled) return rv; // a cancelled seat's non-answer says nothing about the seat
       if (rv.meta?.noVerdict === true || rv.meta?.unparseable === true) {
-        await ctx.onGate?.({ phase: "note", gate: "review", name: "review-no-verdict", payload: { ...rv.meta }, result: rv });
+        // Row 417; D-2187 add.78: the note journals its row synchronously; the strike below joins the tally in the
+        // SAME tick, before the note is awaited, so a readmit landing meanwhile cannot erase a row it never saw.
+        const noted = ctx.onGate?.({ phase: "note", gate: "review", name: "review-no-verdict", payload: { ...rv.meta }, result: rv });
         // v2.6.8 T1: a seat that never LAUNCHED (any launchCause, checkout-proof-timeout or none) said
         // nothing about the work or about itself: no run-scoped strike and no soft demotion. It gets one
         // bounded same-seat launch retry below and is excluded for the rest of THIS round only.
@@ -1606,11 +1608,14 @@ export async function runGates(
           const cause = String(rv.meta.cause);
           // Keep every no-verdict strike, including closure mismatches. Malformed deliveries and
           // their re-emission also strike unless the delivered verdict breaks the closure protocol.
-          const strikes = rv.meta.noVerdict === true
-            || (rv.meta.unparseable === true && cause === "malformed-verdict" && rv.meta.closureInvalid !== true);
+          // Row 417; D-2187 add.78: a transport death is a task-local strike only (the daemon's badReviewers,
+          // fed by the note above) and never counts toward the run-wide two-strike tally.
+          const strikes = cause !== "transport" && (rv.meta.noVerdict === true
+            || (rv.meta.unparseable === true && cause === "malformed-verdict" && rv.meta.closureInvalid !== true));
           const causes = strikes && ctx.reviewNoVerdicts
             ? [...(ctx.reviewNoVerdicts.get(reviewer) ?? []), cause] : undefined;
           if (causes) ctx.reviewNoVerdicts!.set(reviewer, causes);
+          await noted;
           // OBS-1039: a seat below the byte floor at the beat is silent — demoted like a zero-byte seat.
           const silent = rv.meta.seatAuthoredBytes === 0 || cause === "silent" || cause === "launch-never-started";
           const twice = (causes?.length ?? 0) >= 2;
@@ -1620,6 +1625,7 @@ export async function runGates(
               payload: { reviewer, cause, seatAuthoredBytes: rv.meta.seatAuthoredBytes ?? 0, ...(twice ? { causes } : {}) }, result: rv });
           }
         }
+        await noted; // settled already on the strike path; a launch failure awaits it here
       }
       return rv;
     };

@@ -11,6 +11,7 @@ import { dispatch } from "../../src/cli/index.js";
 import { validateGraph, type Task } from "../../src/graph/schema.js";
 import {
   pendingApprovalActions, pendingRechecks, repairReachSinceApproval, reviewRoundsSinceApproval, type JournalEvent,
+  SCOPE_LAPSE_EVENT,
 } from "../../src/run/journal.js";
 import {
   decideSplitRelease, ENDED_PATH, PARK_KEPT_EVENT, parkDefinition, RELEASED_BY, splitReleaseReads, STOPPED_PATH,
@@ -63,6 +64,8 @@ const plain = (text: string | null): string => (text ?? "").replace(/\x1b\[[0-9;
 const railOf = (decision: SplitDecision): string =>
   plain(narrationRow({ ...row(decision.event, decision.taskId, decision.data) }, RUN, 4000));
 
+const LAPSE_SENTENCE = "A scope grant whose task definition or files changed lapses at that resume instead of refusing: it is not applied, one scope-amendment-lapsed row is journaled, and no later resume replays it, so a lapsed path is granted again through a scope request and approve --files.";
+
 const sentencesOf = (text: string): string[] => text.split(/(?<=\.)\s+/u).filter((sentence) => sentence.length > 0);
 
 /**
@@ -101,8 +104,9 @@ test("resume help describes the graph changed release of a parked task whose def
     "Accept and journal a changed graph identity for this run.",
     "A parked task whose definition changed is released at that resume as a new engagement with reset round counters when the change is proved, the read of its work proves a committed head or no commits, and the park is not a human-gate or an attempt-cap park.",
     "Its committed head is re-gated with no worker or, with no commits, a fresh worker is dispatched.",
-    "A human-gate park whose definition keeps the gate, an attempt-cap park and an unproved change (a definition unrecorded at the park, or a task-work read that proves neither a committed head nor that there are no commits) keep their park and say so.",
+    "A human-gate park whose definition keeps the gate, an attempt-cap park, an open park whose own definition did not change and an unproved change (a definition unrecorded at the park, or a task-work read that proves neither a committed head nor that there are no commits) keep their park and say so.",
     "The release output names the stop path: the run had ended, or the run was stopped before it ended.",
+    LAPSE_SENTENCE,
   ]);
 
   const rendered = commandHelp("resume");
@@ -154,7 +158,11 @@ test("resume help describes the graph changed release of a parked task whose def
   // The same sentence's limits, against a release of an unparked task or of an unproved change.
   const neverParked = validateGraph({ version: 1, spec: SPEC, tasks: [T("T2", { goal: "never parked", files: ["c.ts"] })] }).tasks[0]!;
   expect(decide(ended, COMMITS, [AFTER, neverParked]).map((d) => d.taskId)).toEqual(["T1"]);
-  expect(decide(parked("gate-fail", "ended", parkDefinition(AFTER)), COMMITS, [AFTER])).toEqual([]);
+  // Row 415 (D-2187 add.73): an unchanged gate-fail park is one kept decision, held, never a release.
+  const unchanged = decide(parked("gate-fail", "ended", parkDefinition(AFTER)), COMMITS, [AFTER]);
+  expect(unchanged.map((d) => d.event)).toEqual([PARK_KEPT_EVENT]);
+  expect(unchanged[0]).toMatchObject({ hold: true });
+  expect(String(unchanged[0]!.data.reason)).toContain("definition unchanged");
   expect(decide(ended, COMMITS, [AFTER], null)).toEqual([]);
   expect(release).toMatch(/parked task/);
   expect(release).toMatch(/change is proved/);
@@ -220,4 +228,22 @@ test("resume help describes the graph changed release of a parked task whose def
   expect(railOf(stopped[0]!)).not.toContain(ENDED_PATH);
   expect(railOf(keptGate[0]!)).not.toContain(ENDED_PATH);
   expect(railOf(keptGate[0]!)).not.toContain(STOPPED_PATH);
+});
+
+// Row 409 (D-2187 add.100 N1; add.104 C5): the lapse sentence and the kept unchanged park, each cited to the code.
+test("the resume help states that a grant lapses when its task definition or files changed and that an unchanged park keeps its park", () => {
+  const sentences = sentencesOf(COMMAND_HELP.resume.options["--graph-changed"]!);
+  expect(sentences.at(-1)).toBe(LAPSE_SENTENCE);
+  expect(LAPSE_SENTENCE).toContain(`one ${SCOPE_LAPSE_EVENT} row is journaled`);
+  expect(LAPSE_SENTENCE).toMatch(/task definition or files changed lapses/);
+  expect(LAPSE_SENTENCE).toMatch(/approve --files/);
+  expect(commandHelp("resume")).toContain(LAPSE_SENTENCE);
+  const kept = sentences[3]!;
+  expect(kept).toContain("an open park whose own definition did not change");
+  expect(kept).toMatch(/keep their park and say so\.$/u);
+  // the decider keeps an unchanged open park and says so
+  const unchanged = decide(parked("gate-fail", "ended", parkDefinition(AFTER)), COMMITS, [AFTER]);
+  expect(unchanged.map((d) => d.event)).toEqual([PARK_KEPT_EVENT]);
+  expect(String(unchanged[0]!.data.reason)).toContain("definition unchanged");
+  expect(releaseOverclaim(sentences)).toEqual([]);
 });
