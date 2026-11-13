@@ -5,6 +5,7 @@ import { join } from "node:path";
 import type { TickmarkrConfig } from "../config/config.js";
 import type { Effort, Task } from "../graph/schema.js";
 import { withoutHostSession } from "../drivers/host-env.js";
+import { agentEnv } from "../drivers/agent-env.js";
 import { parseWorkerResult } from "./prompt.js";
 import { decodeClaudeStream } from "./claude-stream.js";
 import { type Assignment, type AuthHealth, type BillingChannel, channelsFromConfig, type ContextUsage, declareInputBox, type Invocation, MODEL_ID_RE, promptFitsArgv, type SessionRef, shq, type TokenUsage, TokenUsageSchema, type TrustDialog, type WorkerAdapter } from "./types.js";
@@ -263,7 +264,7 @@ export function statedClaudeIdentity(cwd: string, model: string): string | undef
       "--strict-mcp-config",
       "--mcp-config", '{"mcpServers":{}}',
       "--output-format", "text",
-    ], { cwd, encoding: "utf8", timeout: 60000, stdio: ["ignore", "pipe", "pipe"], env: withoutHostSession() });
+    ], { cwd, encoding: "utf8", timeout: 60000, stdio: ["ignore", "pipe", "pipe"], env: agentEnv(withoutHostSession()) });
     if (r.error || r.status !== 0) return undefined;
     return (r.stdout || "").trim();
   } catch {
@@ -288,7 +289,7 @@ export function resolveClaudeAliasIdentity(
 }
 
 export function probeVersion(bin: string): AuthHealth {
-  const r = spawnSync(bin, ["--version"], { encoding: "utf8", timeout: 10000, env: withoutHostSession() });
+  const r = spawnSync(bin, ["--version"], { encoding: "utf8", timeout: 10000, env: agentEnv(withoutHostSession()) });
   if (r.error || r.status !== 0) return { installed: false, authed: false, models: [] };
   return {
     installed: true,

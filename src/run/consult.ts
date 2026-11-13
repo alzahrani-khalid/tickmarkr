@@ -5,6 +5,7 @@ import { type AuthHealth, configuredEffort, shq, type WorkerAdapter } from "../a
 import type { TickmarkrConfig } from "../config/config.js";
 import type { Effort } from "../graph/schema.js";
 import type { ExecutorDriver, Slot } from "../drivers/types.js";
+import { agentEnvShellPrefix } from "../drivers/agent-env.js";
 import { bannerShell, paneDispatchCommand } from "../brand.js";
 import { dewrapPaneVerdict, extractVerdictJson, gateExitTrailer, gatePaneName, generateVerdictNonce, verdictNonceLine } from "../gates/llm.js";
 import type { GateResult } from "../gates/types.js";
@@ -306,6 +307,8 @@ export async function consult(
         `seat_pgid=$(ps -o pgid= -p $$ 2>/dev/null); daemon_pgid=$(ps -o pgid= -p ${process.pid} 2>/dev/null)`,
         `if [ -n "$seat_pgid" ] && [ -n "$daemon_pgid" ] && [ "$seat_pgid" != "$daemon_pgid" ]; then printf '%s\\n' "$seat_pgid" > ${shq(groupFile)}; fi`,
         bannerShell(),
+        // Queue row 439; D-2187 add.176: the consult script seals its own agent, whatever terminal runs it.
+        agentEnvShellPrefix(),
         command,
         gateExitTrailer(nonce),
       ].join("\n"));

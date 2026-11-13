@@ -244,7 +244,7 @@ function setStringSequencePreservingComments(
 // T8 repair: an alias is no tombstone — `spec: *empty` resolves to a mapping. Each alias on the path
 // is replaced by an un-anchored copy of its target, so what it resolves to decides, and a write under
 // it never edits the anchored node its other aliases share.
-function materializeAliases(doc: OverlayDocument, path: OverlayPath): void {
+export function materializeAliases(doc: OverlayDocument, path: OverlayPath): void {
   for (let depth = 1; depth < path.length; depth++) {
     const node = doc.getIn(path.slice(0, depth), true);
     if (!isAlias(node)) continue;
@@ -258,7 +258,7 @@ function materializeAliases(doc: OverlayDocument, path: OverlayPath): void {
 // holds; any of those nodes may be an anchor other aliases share. Each such alias first becomes a
 // detached copy of what it resolved to, so the write never changes another consumer's value nor
 // leaves its alias dangling.
-function releaseAnchors(doc: OverlayDocument, path: OverlayPath): void {
+export function releaseAnchors(doc: OverlayDocument, path: OverlayPath): void {
   const held = new Set<YamlNode>();
   for (let depth = 1; depth <= path.length; depth++) {
     const node = doc.getIn(path.slice(0, depth), true);
@@ -358,7 +358,7 @@ function setAt(doc: OverlayDocument, path: OverlayPath, value: unknown): void {
 
 // T10 (D-987): Fleet writes through no YAML merge key — a membership write whose edited path (the edited
 // leaf or any map above it) takes keys through `<<` is refused, fail-closed, so nothing is published.
-function refuseMerge(doc: OverlayDocument, priorBytes: string, path: OverlayPath): void {
+export function refuseMerge(doc: OverlayDocument, priorBytes: string, path: OverlayPath): void {
   let node: unknown = doc.contents;
   for (let depth = 0; depth <= path.length && isMap(node); depth++) {
     const merge = node.items.find((item) => isScalar(item.key) && typeof item.key.value === "symbol");
@@ -696,6 +696,15 @@ export function renderFleetOverlayWrite(priorBytes: string, write: FleetOverlayW
   // document would write a literal `null` line into the file.
   if (doc.contents === null) return priorBytes;
 
+  return overlayDocBytes(doc, priorBytes);
+}
+
+/**
+ * An edited overlay document back to bytes, leaving every line the edit did not touch as it was.
+ * Every writer of an overlay goes through here: the fleet screen's edits (src/fleet/edits.ts) as
+ * well as the write above.
+ */
+export function overlayDocBytes(doc: OverlayDocument, priorBytes: string): string {
   // OBS-505: fleet's two-space note style (`tier: mid  # note`) applies to INLINE comments only.
   // The previous commentString prefixed " #" onto EVERY comment line, so block comments — the
   // whole init scaffold at column 0, and indented operator essays — each gained a stray leading

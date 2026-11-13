@@ -287,28 +287,30 @@ confirmation or `--yes` and can make model calls.
 
 ## Choosing your fleet: `tickmarkr fleet`
 
-Configure which agent CLIs and models tickmarkr may route before your first run:
-
 ```bash
-tickmarkr doctor          # probe auth + capabilities (run after install or credential changes)
-tickmarkr fleet           # interactive fleet browser (requires a TTY) — review diff to write
-tickmarkr fleet --print   # effective fleet state (repo > global > defaults), non-interactive
+tickmarkr doctor          # probe auth + capabilities (after install or credential changes)
+tickmarkr fleet           # your team, and what needs you — one screen (--plain, --json)
+tickmarkr fleet --print   # effective fleet state (repo > global > defaults)
 tickmarkr plan            # lint the resolved routing table against your spec
 tickmarkr run             # dispatch with the fleet you confirmed
 ```
 
-`tickmarkr doctor` probes and records health; `tickmarkr fleet` edits routing config. The browser is one
-two-pane surface: the left rail lists views (**All models**, **Shapes**, **Steering**) and every
-installed agent CLI with its auth state and model count; the right pane is a searchable model list
-with tier, context, price, and probe-latency columns. `Space` allows/denies, `Enter` classifies an
-unclassified model (with a required benchmark-provenance note) or pins a classified one to a shape,
-`m` opens the routing-mode presets, and `w` renders the unified diff of the one overlay the save
-lands in, named in the review: an allow/deny membership edit goes to the layer that holds it (the
-repo overlay when it declares that family, else your user overlay), everything else to the user
-overlay; a batch needing both is refused — save each half in its own session. Nothing is written
-until you confirm with `y`. A worker-only deny on a partially excluded adapter takes two rail
-presses: out · all seats, then out · workers. The Shapes view pins from a candidate picker ranked by
-the production router.
+`tickmarkr fleet` shows what the probe means for a run. **Your team**: the workers by shape, the
+gates in order (`acceptance` has a judge, `review` a reviewer from another vendor) and the consult,
+each line ending in `ok` or in what is wrong, measured through the router a run uses.
+**Needs you**: only what wants a yes or a no — a shape or the consult with no working model,
+a model the last run lost, a new model, shapes below their floor, rules that do nothing. `y` answers
+and redraws the team, `n` leaves it, `d` explains, `r` probes, `e` changes a line by hand (shapes,
+judge, review, consult, mode, deny lists), `Enter` reviews what changes and the
+config lines; nothing is written before `y` there, and only the lines shown change, in the config
+that holds them. `--yes <id>` and `--set <line>=<models>` with `--save` do the same without a terminal.
+
+`tickmarkr fleet --edit` opens the fleet browser for editing by hand: views **All models**,
+**Shapes**, **Steering** and every agent CLI on the left, a searchable model list on the right.
+`Space` allows/denies, `Enter` classifies or pins from a candidate picker ranked by the production
+router, `m` opens the routing-mode presets, `w` shows the diff of the one overlay the save lands in:
+an allow/deny membership edit goes to the layer that holds it, everything else to the user overlay.
+A worker-only deny on a partially excluded adapter takes two presses: out · all seats, then out · workers.
 
 Routing-mode semantics, pin/floor/prefer precedence, review and consult steering syntax,
 provenance rules, and `--quality` / `--mode` flags are documented in
@@ -316,8 +318,9 @@ provenance rules, and `--quality` / `--mode` flags are documented in
 
 ## Steering
 
-The fleet browser's **Steering** view sets `review.prefer` and `consult.prefer`; routing modes
-(`risk-based`, `partner-led`, `staff-led`) are applied from the presets overlay (`m`). Full
+The fleet browser's (`tickmarkr fleet --edit`) **Steering** view sets `review.prefer` and
+`consult.prefer`; routing modes (`risk-based`, `partner-led`, `staff-led`) are applied from the
+presets overlay (`m`). Full
 grammar — including when review
 prefer may name a **bare adapter** versus `adapter:model`, and why consult prefer entries
 require **`adapter:model`** form — plus `tickmarkr run --supersedes` rerun control, is in

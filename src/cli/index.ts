@@ -8,7 +8,7 @@ import { board } from "./commands/board.js";
 import { compile } from "./commands/compile.js";
 import { doctor } from "./commands/doctor.js";
 import { evalCommand } from "./commands/eval.js";
-import { fleet } from "./commands/fleet.js";
+import { fleetCommand as fleet } from "./commands/fleet-screen.js";
 import { init } from "./commands/init.js";
 import { plan } from "./commands/plan.js";
 import { profile } from "./commands/profile.js";
@@ -48,7 +48,7 @@ usage: tickmarkr <command>
   acp           serve Agent Client Protocol v1 over stdio (stdout is protocol only)
   init          guided setup + doctor; init --agent [--force] [--docs] adds agent skills/docs
   doctor        re-probe adapters, hosts, auth; print capability matrix (--fix writes the test-runner ignore when a safe edit exists)
-  fleet         interactive fleet editor (fleet --print for CI drift checks)
+  fleet         your team and what needs you (--plain, --json; --edit opens the model editor; --print for CI drift checks)
   start "<idea>" one sentence → drafted spec, compiled graph and routed plan card (--yes --force; never runs)
   compile <src> spec → .tickmarkr/graph.json (fails without acceptance criteria)
   scope <intent> preview locally with --preview; draft after confirmation or --yes (--force to overwrite)

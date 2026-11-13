@@ -239,7 +239,8 @@ describe("init's non-interactive readiness card", () => {
     const run = init(["--global-dir", makeTestTempDir("init-ready-global-")], repo, {
       input: io.input as unknown as NodeJS.ReadStream, output: io.output as unknown as NodeJS.WriteStream,
     });
-    await io.whenFrame("All models");
+    // act 3 is the fleet screen (YOUR TEAM, NEEDS YOU), no longer the 2.24.0 editor
+    await io.whenFrame("NEEDS YOU");
     io.input.write("q");
     const out = await run;
     io.input.destroy();

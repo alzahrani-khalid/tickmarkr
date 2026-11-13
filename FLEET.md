@@ -3,8 +3,10 @@
 Operator workflow lives in the README's [Choosing your fleet](README.md#choosing-your-fleet-tickmarkr-fleet)
 section. This document is the deep reference for routing-mode semantics, steering syntax,
 tier provenance, and run-time routing flags. Implementation anchors: `src/config/config.ts`
-(mode compilation), `src/route/router.ts` (production routing), `src/cli/commands/fleet.ts`
-(interactive editor), `src/cli/commands/run.ts` (run flags).
+(mode compilation), `src/route/router.ts` (production routing), `src/fleet/` and
+`src/cli/commands/fleet-screen.ts` (the `tickmarkr fleet` screen: your team, and what needs you),
+`src/cli/commands/fleet.ts` (the editor behind `tickmarkr fleet --edit`, and `--pick`, `--print`),
+`src/cli/commands/run.ts` (run flags).
 
 ## Routing precedence
 
@@ -131,14 +133,16 @@ press moves that same entry to `routing.deny.workers.adapters`. Only the final s
 written — the intermediate `routing.deny.adapters` entry never reaches the review or the file, so
 review, judge and consult seats keep that adapter.
 
-**Byte preservation.** A save rewrites only the nodes it changes; untouched block and flow lists,
-full-line and inline comments (including a flow list's `[codex]  # note` gap), authored entries and
-unknown subtrees keep their bytes. An aliased or anchored list is read as the config
-loader reads it, so its entries for channels this probe never served stay admitted; an edit through a
-shared anchor never changes the anchor's other aliases — each one is written out as a copy of its
-original value first. One pre-existing limit remains: the writer re-serializes the
-whole document, so a flow collection's comma spacing (`[one,two]` → `[one, two]`) and an anchored
-flow mapping can be reformatted. Fleet writes through no YAML merge key: a membership edit whose path
+**What a save keeps.** A save changes only what its answers name, and the review shows every line it will
+change, with its +N −M count, before anything is written. On the one screen (`tickmarkr fleet`, its `--yes` and `--set`)
+the saved files load and their merged settings change only at the answered settings; an edit it cannot prove that of is
+refused, naming the file and the setting, and nothing is written. The bytes of lines an edit does not touch are kept in a file written the writer's way: two-space indent, block
+lists, LF line endings, no byte-order mark. In other forms the writer can rewrite untouched lines (CR LF endings, a
+byte-order mark, a tab before a comment, four-space indent, values over 80 columns, padded flow lists or maps, list items
+at their key's indent, a flow collection's comma spacing); the review shows each such line (queue row 452). An aliased or
+anchored list is read as the config loader reads it, so its entries for channels this probe never served stay admitted;
+an edit through a shared anchor never changes the anchor's other aliases — each one is written out as a copy of its
+original value first. Fleet writes through no YAML merge key: a membership edit whose path
 (the edited list or any mapping above it) takes keys through `<<` is refused at review — it names the
 path and the merge (`<<: *base`), publishes nothing and leaves both overlays byte for byte; inline the
 merged keys into that mapping by hand, then save again.

@@ -31,6 +31,17 @@ tickmarkr/
 │   │   └── gsd.ts                 # GSD .planning/ phase-dir front-end (v1.3)
 │   ├── eval/                     # eval lab: fixture discovery, seeding, and qualification
 │   │   └── fixtures.ts            # checked-in fixture enumeration + isolated temp-repo seeding
+│   ├── fleet/                    # the model behind `tickmarkr fleet`: your team, and what needs you (src/fleet/)
+│   │   ├── model.ts               # buildFleetModel(): sample tasks through route() and the seat resolver; consequence()
+│   │   ├── edits.ts               # applyEdits(), combineEdits(), layerDiff(): YAML edits that keep comments and order
+│   │   ├── rules.ts               # freeSeat(), ruleEdits(): the deny and allow lists; a lift takes a model's own rule only
+│   │   ├── seen.ts                # withFirstSeen(): when each CLI first listed each model
+│   │   ├── draw.ts                # segments measured in terminal cells
+│   │   ├── needs.ts               # needs(): the closed list of yes-or-no items, each a list of config edits
+│   │   ├── hand.ts                # handLines(), handEdits(): the lines a hand can change, and the edits a choice becomes
+│   │   ├── hand-view.ts           # linesView(), pickView(): the two views of a change by hand
+│   │   ├── screen.ts              # frame(), press(), plainScreen(): the screen as pure functions
+│   │   └── load.ts                # loadFleetSource(): the files the screen reads; answers of no
 │   ├── config/
 │   │   └── config.ts              # TickmarkrConfig type, DEFAULT_CONFIG seed table, loadConfig(), configTemplate()
 │   ├── drivers/                  # ExecutorDriver interface + implementations

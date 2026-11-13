@@ -7,6 +7,7 @@ import { promisify } from "node:util";
 import { assertGitTrust, GitTrustRefusal } from "../run/git-trust.js";
 import { shGitOk, type OwnGitOptions } from "../run/git.js";
 import { withoutHostSession } from "../drivers/host-env.js";
+import { agentEnv } from "../drivers/agent-env.js";
 import { renderCodexGitGrant, codex } from "./codex.js";
 import { type AuthHealth, type CodexCommitStatus, shq, type WorkerAdapter } from "./types.js";
 
@@ -64,7 +65,7 @@ export const codexSandboxArgs = (p: CodexCommitProbe, grant = renderCodexGitGran
 ];
 /** Queue row 2 (D-2112): tests may supply a mutant; production renders each fixture. */
 export const codexSandboxFor = (grant?: string): CodexSandbox => async (p) =>
-  (await exec("sh", codexSandboxArgs(p, grant), { cwd: p.worktree, timeout: 20_000, signal: p.signal, env: withoutHostSession() })).stdout;
+  (await exec("sh", codexSandboxArgs(p, grant), { cwd: p.worktree, timeout: 20_000, signal: p.signal, env: agentEnv(withoutHostSession()) })).stdout;
 export const codexSandbox: CodexSandbox = codexSandboxFor();
 
 const holds = (path: string, token: string): boolean => {

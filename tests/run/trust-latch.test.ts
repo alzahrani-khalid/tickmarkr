@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { expect, test } from "vitest";
+import { agentShellCommand } from "../../src/drivers/agent-env.js";
 import { KIMI_TRUST_DIALOG } from "../../src/adapters/kimi.js";
 import {
   KIMI_TRUST_PANE, type InteractiveSeed, type TrustDialog, type WorkerAdapter,
@@ -74,7 +75,7 @@ function makeModalSeedDriver(
     slot: async (cwd, name) => ({ id: "p1", name, cwd }),
     run: async (_s, cmd) => {
       runs.push(cmd);
-      if (cmd.startsWith("launch-tui ")) {
+      if (cmd.startsWith(agentShellCommand("launch-tui "))) {
         phase = "modal";
         modalSince = Date.now();
         pane = KIMI_TRUST_PANE;
@@ -315,7 +316,7 @@ test("runInteractiveSeed sends zero further keys after a dispatched-then-rejecte
   const slot: Slot = { id: "p1", name: ORCA_TITLE, cwd: ORCA_WT };
   const r = await runInteractiveSeed({
     driver: {
-      run: async (_s, cmd) => { if (cmd.startsWith("launch-tui ")) pane = KIMI_TRUST_PANE; },
+      run: async (_s, cmd) => { if (cmd.startsWith(agentShellCommand("launch-tui "))) pane = KIMI_TRUST_PANE; },
       waitOutput: async (_s, pattern, ms) => {
         if (pane.includes(pattern)) return true;
         await new Promise((res) => setTimeout(res, Math.min(ms, 50)));

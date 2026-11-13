@@ -1,4 +1,6 @@
 import { matchesTrustDialog, type Assignment, type WorkerAdapter } from "../adapters/types.js";
+import { paneLaunchCommand } from "../brand.js";
+import { agentShellCommand } from "../drivers/agent-env.js";
 import { DeliveryReadinessError } from "../drivers/herdr.js";
 import type { ExecutorDriver, Slot } from "../drivers/types.js";
 import { answerTrustDialog, type TrustAnswer } from "./trust-dialog.js";
@@ -126,7 +128,9 @@ export async function runInteractiveSeed(opts: {
   onTrustAnswered?: (answer: TrustAnswer) => void;
 }): Promise<InteractiveSeedResult> {
   const seed = opts.adapter.interactiveSeed!;
-  await opts.driver.run(opts.slot, seed.launch(opts.assignment.model));
+  // Queue row 439; D-2187 add.176: the seal travels with the launch, so a terminal created, adopted or recovered starts
+  // the agent without the key; the recorded launch intent keeps a prefixed launch a shell line, never a typed turn.
+  await opts.driver.run(opts.slot, paneLaunchCommand(agentShellCommand(seed.launch(opts.assignment.model))));
 
   // `trustAnswered` rides EVERY return below, including both early ones: the daemon initializes its
   // per-slot latch from it, and an omission there reads as "no key was sent" — the second-Enter defect.

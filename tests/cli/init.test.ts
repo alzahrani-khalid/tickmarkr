@@ -100,8 +100,7 @@ const makeIO = () => {
 };
 
 // Drive the consolidated init: wizard bytes first (buffered until act 1 mounts), then quit the
-// act-3 fleet editor once its browser renders — v1.92 opens on the models view (no preset
-// overlay at launch); Esc is HOME to the preset overlay and Esc there quits.
+// act-3 fleet screen once it has drawn what needs you; q leaves it.
 const driveInit = async (repo: string, wizardBytes: string, ...args: string[]) => {
   const io = makeIO();
   const p = init(
@@ -110,10 +109,8 @@ const driveInit = async (repo: string, wizardBytes: string, ...args: string[]) =
     { input: io.input as unknown as NodeJS.ReadStream, output: io.output as unknown as NodeJS.WriteStream },
   );
   if (wizardBytes) io.input.write(wizardBytes);
-  await io.whenFrame("All models");
-  io.input.write(KEY.esc);
-  await io.whenFrame("routing preset");
-  io.input.write(KEY.esc);
+  await io.whenFrame("NEEDS YOU");
+  io.input.write("q");
   return { out: await p, io };
 };
 
@@ -213,7 +210,7 @@ describe("tickmarkr init doctor.json reuse (T1)", () => {
     let opened = false;
     vi.spyOn(io.output, "write").mockImplementation((chunk) => {
       const result = write(chunk);
-      if (!opened && strip(chunk).includes("All models")) {
+      if (!opened && strip(chunk).includes("NEEDS YOU")) {
         opened = true;
         io.input.write("q");
       }
@@ -577,7 +574,7 @@ describe("tickmarkr init wizard (T4)", () => {
     expect(io.writes.some((w) => strip(w).includes("full matrix: tickmarkr doctor"))).toBe(true);
   });
 
-  test("the act-3 presets overlay raises on m, while Enter on Shapes opens the list", async () => {
+  test("act 3 is the fleet screen — your team and what needs you; the model browser never opens, and q leaves without writing", async () => {
     vi.spyOn(registry, "allAdapters").mockReturnValue([]);
     const repo = makeRepo({ "keep.txt": "x" });
     stampDoctor(repo, 5 * 60 * 1000);
@@ -588,21 +585,16 @@ describe("tickmarkr init wizard (T4)", () => {
       { input: io.input as unknown as NodeJS.ReadStream, output: io.output as unknown as NodeJS.WriteStream },
     );
     io.input.write(KEY.down.repeat(9) + KEY.enter); // act 1: accept every default → act 3
-    await io.whenFrame("All models");
-    // NOT at launch: the browser opened on the models view with no preset overlay anywhere yet
-    expect(io.writes.some((w) => strip(w).includes("routing preset"))).toBe(false);
-    expect(io.writes.some((w) => strip(w).includes("routing mode"))).toBe(false);
-    io.input.write(KEY.left + KEY.down + KEY.enter); // rail → Shapes → FIRST Shapes entry
-    await io.whenFrame("Shapes  routed under");
-    expect(io.writes.some((w) => strip(w).includes("routing mode"))).toBe(false);
-    io.input.write("m");
-    await io.whenFrame("routing mode");
-    io.input.write(KEY.esc); // Esc from it lands in the shapes list — never quits
-    await io.whenFrame("Shapes  routed under");
-    io.input.write(KEY.esc); // browser Esc → HOME preset overlay (init quit-safety)
-    await io.whenFrame("routing preset");
-    io.input.write(KEY.esc); // Esc there quits
-    expect(await p).toContain("fleet: quit without writing");
+    await io.whenFrame("NEEDS YOU");
+    const frames = io.writes.map(strip).join("\n");
+    expect(frames).toContain("WORKERS");
+    expect(frames).toContain("acceptance (judge)");
+    expect(frames).toContain("CONSULT");
+    // the 2.24.0 browser and its preset overlay are not part of a first run any more
+    expect(frames).not.toContain("All models");
+    expect(frames).not.toContain("routing preset");
+    io.input.write("q");
+    expect(await p).toContain("fleet: nothing changed");
   });
 
   test("wizard quit is one line — no probe, no report wall, no fleet act", async () => {
@@ -1079,10 +1071,8 @@ describe("T3 brand banner (TTY gate)", () => {
           { input: io.input as unknown as NodeJS.ReadStream, output: io.output as unknown as NodeJS.WriteStream },
         );
         io.input.write(KEY.down.repeat(9) + KEY.enter);
-        await io.whenFrame("All models"); // v1.92: act 3 opens in the browser, not on presets
-        io.input.write(KEY.esc);
-        await io.whenFrame("routing preset"); // Esc is HOME to the preset overlay
-        io.input.write(KEY.esc);
+        await io.whenFrame("NEEDS YOU"); // act 3 is the fleet screen
+        io.input.write("q");
         await p;
       });
     } finally {
@@ -1217,7 +1207,7 @@ describe("D-1 documentation half: the AA key is advertised where the catalog is 
 });
 
 describe("a judge the repository overlay holds is saved in that overlay", () => {
-  test("fleet and init save a held judge into the repository overlay, keep its comment, leave the user overlay byte-identical, and a second repository stays on the default judge", async () => {
+  test("the fleet editor saves a held judge into the repository overlay, keep its comment, leave the user overlay byte-identical, and a second repository stays on the default judge", async () => {
     const { FakeAdapter } = await import("../../src/adapters/fake.js");
     const { fleet } = await import("../../src/cli/commands/fleet.js");
     const gdir = mkdtempSync(join(tmpdir(), "tickmarkr-init-b2-user-"));
@@ -1263,27 +1253,8 @@ describe("a judge the repository overlay holds is saved in that overlay", () => 
     expect(judgeIn(repoA)).toBe("fake-2");
     expect(judgeIn(second)).toBe("fable");
 
-    // init act 3: this project's overlay holds judge fake-2; the pick fake-1 lands there too
-    const projectC = "concurrency: 3\njudge:\n  adapter: fake\n  model: fake-2\n";
-    const repoC = makeRepo({ ".tickmarkr/config.yaml": projectC });
-    const repoCPath = join(repoC, ".tickmarkr", "config.yaml");
-    const adapterC = probed(repoC);
-    vi.spyOn(registry, "allAdapters").mockReturnValue([adapterC]);
-    const initIO = makeIO();
-    const initDone = init(["--global-dir", gdir], repoC, {
-      input: initIO.input as unknown as NodeJS.ReadStream, output: initIO.output as unknown as NodeJS.WriteStream,
-    });
-    await initIO.whenFrame("All models");
-    initIO.input.write(pickJudge(1));
-    await initIO.whenFrame("the file is tracked");
-    initIO.input.write("y");
-    const initOut = strip(await initDone);
-    expect(initOut).toContain(`kept existing ${userPath}`);
-    expect(initOut).toContain(`fleet: wrote ${repoCPath}`);
-    expect(initOut).not.toContain("repo-shadowed:");
-    expect(readFileSync(userPath, "utf8")).toBe(userBefore);
-    expect(readFileSync(repoCPath, "utf8")).toContain("model: fake-1");
-    expect(judgeIn(repoC)).toBe("fake-1");
+    // init's last act is the fleet screen now: it asks yes-or-no questions and picks no judge by hand,
+    // so the held-judge save has one caller, the editor above.
     expect(judgeIn(second)).toBe("fable");
     expect(existsSync(join(second, ".tickmarkr", "config.yaml"))).toBe(false);
   });

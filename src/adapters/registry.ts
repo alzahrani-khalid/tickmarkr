@@ -1,3 +1,4 @@
+import { FIRST_SEEN_KEY, type FirstSeen, withFirstSeen } from "../fleet/seen.js";
 import { spawnSync } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -15,7 +16,7 @@ import { parseWorkerResult } from "./prompt.js";
 import { KIMI_DOCTOR_TURN_MODEL, KIMI_DOCTOR_TURN_TIMEOUT_MS, type KimiDoctorTurnResult } from "./kimi.js";
 import { sealHerdrEnv } from "../drivers/subprocess.js";
 import { withoutHostSession } from "../drivers/host-env.js";
-import { agentEnv } from "../drivers/agent-env.js";
+import { agentEnv, agentShellCommand } from "../drivers/agent-env.js";
 import {
   catalogEntries, isNativeCliDrive, projectCliEntries, SHIPPED_CLI_CATALOG,
   type CatalogEntriesOptions, type CliEntry, type DeclarativeCliDrive, type ModelIdField,
@@ -92,8 +93,10 @@ export function registeredAdapterBinaries(adapters: WorkerAdapter[] = allAdapter
 
 // OBS-117: worker panes run commands through `bash -lc` (SubprocessDriver + sh()), not bare spawnSync(bin).
 // Doctor must resolve adapter binaries the same way so a shadow install on PATH cannot disagree with dispatch.
+// Queue row 439 (D-2187 add.176): and like that worker shell it runs the command under agentShellCommand, after the
+// profile, so a startup file that exports the Artificial Analysis key cannot hand it to `<adapter> --version` or a listing.
 function shellSpawnSync(cmd: string, cwd: string, timeoutMs = 10000): { code: number; stdout: string; stderr: string } {
-  const r = spawnSync("bash", ["-lc", cmd], {
+  const r = spawnSync("bash", ["-lc", agentShellCommand(cmd)], {
     encoding: "utf8",
     cwd,
     timeout: timeoutMs,
@@ -264,7 +267,7 @@ export function formatCandidateCliRow({ binary, path }: CandidateCliDetection): 
 // so no drift verdict piles onto the existing auth report.
 export function probeHelpText(bin: string): string | undefined {
   try {
-    const r = spawnSync(bin, ["--help"], { encoding: "utf8", timeout: 10000, env: withoutHostSession() });
+    const r = spawnSync(bin, ["--help"], { encoding: "utf8", timeout: 10000, env: agentEnv(withoutHostSession()) });
     if (r.error || r.status !== 0) return undefined;
     return `${r.stdout || ""}\n${r.stderr || ""}`;
   } catch {
@@ -768,11 +771,19 @@ export function writeDoctor(
     health = merged;
   }
   health = contain(health);
+  // The fleet screen calls a model "new" from when a probe first listed it. The record rides in
+  // doctor.json under its own key, so the probe still writes one file and no adapter entry changes.
+  const firstSeen = withFirstSeen(readModelsFirstSeen(repoRoot), health, new Date());
   tickmarkrDir(repoRoot);
   const path = doctorPath(repoRoot);
   const tmp = `${path}.tmp`;
-  writeFileSync(tmp, JSON.stringify(health, null, 2) + "\n");
+  writeFileSync(tmp, JSON.stringify(Object.keys(firstSeen).length ? { ...health, [FIRST_SEEN_KEY]: firstSeen } : health, null, 2) + "\n");
   renameSync(tmp, path);
+}
+
+/** When a probe first listed each model, per adapter; null before any probe recorded it. */
+export function readModelsFirstSeen(repoRoot: string): FirstSeen | null {
+  return (readDoctorFile(repoRoot)?.[FIRST_SEEN_KEY] as FirstSeen | undefined) ?? null;
 }
 
 export function readDoctor(repoRoot: string): Record<string, AuthHealth> | null {
@@ -780,7 +791,7 @@ export function readDoctor(repoRoot: string): Record<string, AuthHealth> | null 
   if (!raw) return null;
   // pre-v1.86 caches may still carry an `autoPrefer` key — strip it; the mechanism is deleted and
   // the key is never read back into health.
-  const { autoPrefer: _, ...health } = raw;
+  const { autoPrefer: _, [FIRST_SEEN_KEY]: _firstSeen, ...health } = raw;
   return health as Record<string, AuthHealth>;
 }
 

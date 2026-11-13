@@ -13,6 +13,7 @@ import {
 import { matchesEmptyInputBox, matchesInputBox } from "../../src/adapters/types.js";
 import type { Assignment } from "../../src/adapters/types.js";
 import type { ExecutorDriver, Slot } from "../../src/drivers/types.js";
+import { agentEnvShellPrefix } from "../../src/drivers/agent-env.js";
 
 const ASSIGNMENT: Assignment = { adapter: "kimi", model: "kimi-code/k3", channel: "sub", tier: "frontier" };
 const FULL_MODEL = "kimi-code/kimi-for-coding";
@@ -56,7 +57,8 @@ function makeKimiSeedDriver(banner: string, opts: { submit?: boolean } = {}) {
     slot: async () => slot,
     run: async (_s: Slot, cmd: string) => {
       runs.push(cmd);
-      if (KIMI_INPUT_BOX.launchCommand?.(cmd)) {
+      // Queue row 439: the delivered launch carries the key seal before the adapter launch.
+      if (cmd.startsWith(agentEnvShellPrefix()) && KIMI_INPUT_BOX.launchCommand?.(cmd.slice(agentEnvShellPrefix().length))) {
         // launch: the TUI banner is already in the pane buffer
       } else if (cmd === seedText) {
         buf += `\n${cmd}\n`;
@@ -219,7 +221,8 @@ describe("kimi TUI seed banner checks", () => {
     expect(r.seedFailed).toBe(true);
     expect(r.seedError).toMatch(/model mismatch/);
     expect(runs).toHaveLength(1);
-    expect(runs[0]).toMatch(/^kimi (?:--auto|-y) -m /);
+    expect(runs[0].startsWith(agentEnvShellPrefix())).toBe(true);
+    expect(runs[0].slice(agentEnvShellPrefix().length)).toMatch(/^kimi (?:--auto|-y) -m /);
     expect(r.output).toContain("Model: kimi-for-coding");
     // Pure confirm on the same banner text — no probe of its own.
     expect(confirmKimiSeedBanner(banner, ASSIGNMENT.model).ok).toBe(false);

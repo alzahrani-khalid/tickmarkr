@@ -1,6 +1,7 @@
 import { chmodSync, existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterAll, describe, expect, test } from "vitest";
+import { agentShellCommand } from "../../src/drivers/agent-env.js";
 import { claudeCode, CLAUDE_TRUST_DIALOG, CLAUDE_TRUST_OPTION_ROWS } from "../../src/adapters/claude-code.js";
 import { CODEX_TRUST_DIALOG } from "../../src/adapters/codex.js";
 import {
@@ -113,7 +114,7 @@ async function seedBoundary(first: string, afterDown?: string, opts: { downThrow
   const slot: Slot = { id: "p1", name: "T1-worker-claude-code-a0-seed", cwd: "/tmp" };
   const error = await runInteractiveSeed({
     driver: {
-      run: async (_s, cmd) => { if (cmd.startsWith("launch-tui ")) frame = first; },
+      run: async (_s, cmd) => { if (cmd.startsWith(agentShellCommand("launch-tui "))) frame = first; },
       waitOutput: async (_s, pattern, ms) => { await sleep(Math.min(ms, 30)); return frame.includes(pattern); },
       read: async (s, n) => {
         if (reads++ === 0 && opts.firstReadDelayMs) await sleep(opts.firstReadDelayMs);

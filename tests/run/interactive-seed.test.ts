@@ -6,6 +6,7 @@ import { FakeAdapter } from "../../src/adapters/fake.js";
 import { kimi, KIMI_TRUST_DIALOG } from "../../src/adapters/kimi.js";
 import { KIMI_TRUST_PANE, matchesTrustDialog } from "../../src/adapters/types.js";
 import type { Assignment, InteractiveSeed, WorkerAdapter } from "../../src/adapters/types.js";
+import { agentShellCommand } from "../../src/drivers/agent-env.js";
 import { SubprocessDriver } from "../../src/drivers/subprocess.js";
 import type { ExecutorDriver, Slot } from "../../src/drivers/types.js";
 import { runDaemon, resetEarlyLaunchLivenessMsForTests, setEarlyLaunchLivenessMsForTests } from "../../src/run/daemon.js";
@@ -51,7 +52,8 @@ function makeSeedDriver(promptFile: string, opts: { ready?: boolean; stick?: boo
   const runs: string[] = [];
   const waits: { pattern: string; regex?: boolean }[] = [];
   let buf = "";
-  const launchCmd = SEED.launch("fake-1");
+  // Queue row 439: the seed launch is delivered sealed.
+  const launchCmd = agentShellCommand(SEED.launch("fake-1"));
   const seedCmd = SEED.seedLine(promptFile);
 
   const driver: ExecutorDriver = {
@@ -185,7 +187,7 @@ function makeKimiModalDriver(
   const driver = {
     run: async (_s: Slot, cmd: string) => {
       log.push(`run:${cmd}`);
-      if (cmd === kimi.interactiveSeed!.launch(model)) {
+      if (cmd === agentShellCommand(kimi.interactiveSeed!.launch(model))) {
         modalAt = Date.now() + (opts.modalAfterMs ?? 0);
         settle();
       } else if (cmd === seedCmd) pane = `${KIMI_READY_PANE}\nworking on the task`;
@@ -315,7 +317,7 @@ describe("runInteractiveSeed launch banner confirmation", () => {
     });
     expect(r.seedFailed).toBe(false);
     expect(runs).toHaveLength(2);
-    expect(runs[0]).toBe(SEED.launch("fake-1"));
+    expect(runs[0]).toBe(agentShellCommand(SEED.launch("fake-1")));
     expect(runs[1]).toBe(seedCmd);
   });
 
@@ -334,7 +336,7 @@ describe("runInteractiveSeed launch banner confirmation", () => {
     expect(r.seedFailed).toBe(true);
     expect(r.seedError).toMatch(/model mismatch/);
     expect(runs).toHaveLength(1);
-    expect(runs[0]).toBe(SEED.launch("fake-1"));
+    expect(runs[0]).toBe(agentShellCommand(SEED.launch("fake-1")));
     expect(r.output).toContain("Model: 2");
   });
 
@@ -368,7 +370,7 @@ describe("daemon interactive seed path (fake adapter, zero tokens)", () => {
 
     const s = await runDaemon(repo, { adapters: [new SeedFakeAdapter(scriptPath)], runId: "run-seed", driver });
     expect(s.done).toEqual(["T1"]);
-    expect(runs[0]).toBe(SEED.launch("fake-1"));
+    expect(runs[0]).toBe(agentShellCommand(SEED.launch("fake-1")));
     expect(runs[1]).toBe(SEED.seedLine(promptFile));
     expect(runs.some((r) => r.startsWith("bash "))).toBe(false);
     expect(waits[0]?.pattern).toBe(SEED.readinessMatch);
@@ -388,7 +390,7 @@ describe("daemon interactive seed path (fake adapter, zero tokens)", () => {
     expect(s.human).toEqual(["T1"]);
     // Every delivery was a launch — the escalation ladder relaunches — and none was the seed line.
     expect(runs.length).toBeGreaterThan(0);
-    expect(runs.every((cmd) => cmd.startsWith("launch-tui "))).toBe(true);
+    expect(runs.every((cmd) => cmd.startsWith(agentShellCommand("launch-tui ")))).toBe(true);
     expect(runs).not.toContain(SEED.seedLine(promptFile));
     expect(waits.some((w) => w.pattern === SEED.readinessMatch)).toBe(true);
     // OBS-1205 add.1: a launch that never became ready never received the brief — no launch, no result.
@@ -409,7 +411,7 @@ describe("daemon interactive seed path (fake adapter, zero tokens)", () => {
     const s = await runDaemon(repo, { adapters: [new SeedFakeAdapter(scriptPath)], runId: "run-stuck", driver });
     expect(s.done).toEqual([]);
     expect(s.human).toEqual(["T1"]);
-    expect(runs).toContain(SEED.launch("fake-1"));
+    expect(runs).toContain(agentShellCommand(SEED.launch("fake-1")));
     expect(runs).toContain(SEED.seedLine(promptFile));
     const wr = Journal.open(repo, "run-stuck").read().find((e) => e.event === "worker-result");
     expect(wr?.data.finished).toBe(false);

@@ -4,8 +4,11 @@ import { shq } from "../adapters/types.js";
 // Queue row 367 (its child-environment clause); D-2187 add.21 (2), cross-read M9. The Artificial Analysis key belongs
 // to the parent: its lookup and in-process catalog fetch read it, and no AGENT child ever receives it — a worker (the
 // subprocess seal and the pane shell prefix), a judge, review or consult seat (an agent or seat shell), doctor's model
-// probes and the Kimi doctor turn. Payload shells (build, test, lint, oracles) run the user's own project, so outside a
-// run they keep the user's environment untouched; inside one the daemon has already dropped the key (row 407, below).
+// probes and the Kimi doctor turn; and (queue row 439, D-2187 add.176) whatever command reaches it, the stated-identity
+// turn, every adapter's version and help probes (the login-shell resolver's included), the model and provider listings,
+// doctor's Codex commit-grant probe and the eval dispatch worker.
+// Payload shells (build, test, lint, oracles) run the user's own project, so outside a run they keep the user's
+// environment untouched; inside one the daemon has already dropped the key (row 407, below).
 // A separate rule from host-env.ts (row 390), so neither list restates the other.
 export const AGENT_WITHHELD_VARS = [ARTIFICIAL_ANALYSIS_KEY_NAME] as const;
 

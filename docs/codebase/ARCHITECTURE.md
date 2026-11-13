@@ -186,6 +186,25 @@ Side modules (CLI-facing, not in the dispatch loop):
 - Depends on: `src/run/git.ts` (`shGitOk`) for temp-repo git plumbing
 - Used by: `src/cli/commands/eval.ts`
 
+**Fleet (`src/fleet/`):**
+- Purpose: the model behind `tickmarkr fleet`'s one screen: who takes each shape of work and who runs each gate, and the closed list of things that need a yes or a no
+- Location, one line per file:
+  - `src/fleet/model.ts` (`buildFleetModel()`, `consequence()`: 400 sample tasks per shape through `route()` and the seat resolver)
+  - `src/fleet/edits.ts` (`applyEdits()`, `combineEdits()`, `layerDiff()`: YAML edits that keep comments and order)
+  - `src/fleet/rules.ts` (`freeSeat()`, `ruleEdits()`: the deny and allow lists; a lift takes away a model's own rule, never a wider one)
+  - `src/fleet/seen.ts` (`withFirstSeen()`: when each CLI first listed each model; `writeDoctor` stores it inside doctor.json)
+  - `src/fleet/draw.ts` (segments measured in terminal cells; outside text drawn without control characters)
+  - `src/fleet/needs.ts` (`needs()`: the closed list of yes-or-no items, each a list of config edits)
+  - `src/fleet/hand.ts` (`handLines()`, `handEdit()`, `handEdits()`: the lines a hand can change with `e` or `--set`, and the edits a choice becomes)
+  - `src/fleet/hand-view.ts` (`linesView()`, `pickView()`: the two views of a change by hand)
+  - `src/fleet/screen.ts` (`frame()`, `press()`, `plainScreen()`: the screen as pure functions)
+  - `src/fleet/load.ts` (`loadFleetSource()`: every file the screen reads; answers of no)
+- Contains: no model call and no write. Only the loader reads files; the model, the items and the screen are pure
+- Depends on: `src/config/config.ts`, `src/route/`, `src/gates/review.ts` (`gateReviewerFloor`), `src/adapters/registry.ts`
+- Used by: `src/adapters/registry.ts` (`writeDoctor` records when a model was first listed)
+- Used by: `src/cli/commands/fleet-screen.ts` (the command and its one guarded write)
+- Used by: `src/tui/ink/fleet-screen.tsx` (the Ink mount)
+
 **TUI (`src/tui/`):**
 - Public entry: `src/cli/commands/ui.ts` lazily imports `runLiveCockpit` from `src/tui/cockpit/live.ts`, which calls `runConsolidatedCockpit` in `src/tui/cockpit/live-runtime.tsx`. That runtime uses Ink 6 / React 19 and mounts `src/tui/cockpit/home-view.tsx`, `src/tui/cockpit/run-view.tsx` and `src/tui/cockpit/evidence-view.tsx` through `CockpitShell` in `src/tui/cockpit/shell.tsx`.
 - Frame: `planShell` in `src/tui/cockpit/layout.ts` budgets display cells using `src/tui/cockpit/width.ts`; `src/tui/cockpit/components.tsx`, `src/tui/cockpit/theme.ts`, `src/tui/cockpit/keys.ts` and `src/tui/cockpit/pointer.ts` own measured content, palette, input and pointer geometry. Only Home 1, Run 4 and Evidence 5 are delivered. `ui --setup <runId>` opens Run Parks; Fleet/Bootstrap and Plan/Health remain follow-ons using existing `fleet`, `init`, `plan` and `doctor` CLI entries. The public demo flag is retired; `src/tui/cockpit/demo.ts` and legacy renderers remain internal fixture/compatibility consumers.

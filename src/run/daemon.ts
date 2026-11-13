@@ -22,7 +22,7 @@ import {
   type ModeResolution, type RoutingMode, type TickmarkrConfig,
 } from "../config/config.js";
 import { HC_SCOPE_ENV, HC_SCOPE_WARNING, hcScopePresent, SEAT_MARKER_ENV } from "../drivers/host-env.js";
-import { stripArtificialAnalysisKeyFromDaemon } from "../drivers/agent-env.js";
+import { agentEnvShellPrefix, stripArtificialAnalysisKeyFromDaemon } from "../drivers/agent-env.js";
 import { DeliveryReadinessError } from "../drivers/herdr.js";
 import { HcReadUnavailableError } from "../drivers/hc-client.js";
 import { driverEvidence, type DriverChoice } from "../drivers/index.js";
@@ -6572,6 +6572,8 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
         "export BASH_SILENCE_DEPRECATION_WARNING=1",
         bannerShell(),
         `printf '%s\\n' 'TICKMARKR_DISPATCH_${nonce}'`,
+        // Queue row 439; D-2187 add.176: the script seals its own agent, on every branch, whatever terminal runs it.
+        agentEnvShellPrefix(),
         workerCmd,
         exitMarkerCmd,
       ].join("\n"));

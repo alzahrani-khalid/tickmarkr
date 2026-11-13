@@ -20,7 +20,8 @@ import { Journal, type JournalEvent } from "../../run/journal.js";
 import { runLockOwner, runLockRunId, runStatusLine } from "../../run/lock.js";
 import { doctor, hostRows, packageManagerFinding } from "./doctor.js";
 import { readinessCard } from "./init-card.js";
-import { assembleFleetEditor } from "./fleet.js";
+import { loadFleetSource } from "../../fleet/load.js";
+import { fleetScreenLoop } from "./fleet-screen.js";
 import { SHIPPED_DIGESTS, SHIPPED_SNAPSHOTS } from "../shipped-skill-files.js";
 import { askArtificialAnalysisKey, type AskKeyOptions } from "../ask-keys.js";
 
@@ -921,25 +922,20 @@ export async function init(argv: string[], cwd = process.cwd(), io: InitIO = {})
   const card = interactive ? [] : initCardRows(cwd, cfg, adapters, (reused ? health : readDoctor(cwd)) ?? {});
   if (!interactive && !reused) doc = "";
 
-  // Act 3 — fleet. The compact discovery surface prints BETWEEN the acts so the operator reads
-  // what the fleet browser (and its presets overlay, raised on the first Shapes entry) ranks
-  // with; the final summary then carries a pointer, not a repeat. Its confirmation is the shared
-  // Fleet actuator's: a preset (routing.mode) lands in the user overlay (gdir), and so does every
-  // choice except a routing.allow/deny membership edit this repo overlay holds — T10 writes that one
-  // where it is effective, and the review names the destination before y.
+  // Act 3 — fleet. The compact discovery surface prints BETWEEN the acts so the operator reads what
+  // was found before the screen opens; the final summary then carries a pointer, not a repeat. The
+  // screen saves through Fleet's one guarded write, and only after its review.
   if (interactive) {
     output.write(`${doc}\n`);
     doc = "discovery shown above — full matrix any time with `tickmarkr doctor`";
-    // Same lazy-Ink seam as fleet.ts: load the editor runtime up front so the assembler's
-    // returned props need no startup-input capture window on this path.
-    const { runFleetInkEditor } = await import("../../tui/ink/fleet-app.js");
-    const editor = await assembleFleetEditor(cwd, allAdapters(), { input, output }, { globalDir: gdir, entry: "presets" });
-    if ("unavailable" in editor) {
-      notes.push(`fleet: ${editor.unavailable}`);
-    } else {
-      const result = await runFleetInkEditor(editor.props);
-      notes.push(editor.commit(result));
-    }
+    // The first run ends where every later `tickmarkr fleet` begins: your team, and what needs you.
+    // On a first install its first item is the team built from the models that just answered.
+    const fleetAdapters = allAdapters();
+    notes.push(await fleetScreenLoop(cwd, {
+      load: () => loadFleetSource(cwd, { globalDir: gdir, adapters: fleetAdapters }),
+      probe: async () => { output.write(`${await doctor([], cwd, fleetAdapters, { banner: false, compact: true, globalDir: gdir })}\n`); },
+      input, output,
+    }));
   }
 
   if (values.agent) await installAgentFiles(cwd, values.force ?? false, values.docs ?? false, notes, env);

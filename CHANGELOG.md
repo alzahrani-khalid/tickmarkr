@@ -2,6 +2,90 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v2.26.0 — the fleet is one screen
+
+**v2.26.0** ships all 13 of its spec's tasks, merged in run-20261112-110617-0000000000004419. Every task passed
+build, lint, evidence and scope, its acceptance criteria, a review by a model from another vendor and the full test suite.
+The spec was amended three times while the run worked; two of the amendments added a task.
+
+- **The Artificial Analysis key now stays out of every agent CLI tickmarkr starts.**
+  - **A correction to 2.24.0.** Its notes said the key never reaches an agent child. In 2.24.0 and 2.25.0 that was not
+    true for every launch:
+    - `doctor` and `init` started each vendor's CLI with the key in its environment, for its version, help and
+      model-list probes;
+    - so did the probes behind `plan`, `verify` and a strict run when no probe record existed;
+    - an agent started in an Orca terminal kept the key;
+    - a command typed later into a worker's or seat's terminal kept it too.
+
+    If you set the key in your environment, rotate it.
+  - Every launch of a vendor CLI now runs without the key: the version, help and model-list probes, the stated-identity
+    turn and the codex sandbox probe; the login-shell resolver; the worker dispatch script and its interactive launch
+    line; and the judge, review, scope and consult scripts. The seal
+    travels with each command, so it holds in any terminal host, including Orca and an adopted terminal.
+  - tickmarkr's own process keeps the key for the catalog refresh. Your build, test and lint commands are unchanged.
+- **`tickmarkr fleet` is one screen.**
+  - **YOUR TEAM** shows who takes each shape of work, the seven gates in order (the judge for acceptance, a reviewer
+    from another vendor), and the consult. Each line ends in `ok` or says what is wrong.
+  - **NEEDS YOU** lists what to answer, one item at a time:
+    - `y` and `n` answer an item;
+    - `n` means "not until something changes";
+    - `u` undoes an answer;
+    - `d` shows the details;
+    - `r` probes again;
+    - `e` changes a line by hand: its models in order, the pool's mode, a shape's floor, the routing mode, the deny lists.
+  - Every line that reads wrong has an item. The item names the actual cause and what to do about it: the CLI to
+    install, the model that did not answer, the deny rule or the allowlist that keeps a model out, a floor, or the
+    shapes' own item.
+  - Nothing is saved until you see the review. It shows every line the save will change, with its +N −M count, and
+    says when the file is your user config, which every repository on the machine reads.
+  - A floor set apart from the routing mode is marked ("ok, floor cheap"), and the review says "the floor moved".
+  - A new model one benchmark places above cheap is offered at that tier, and the item says it rests on one benchmark
+    of two.
+  - Without a terminal, `fleet` prints the same screen as text. `--json` lists the team, the items and the lines.
+    `--yes <id> --save` and `--set <line>=<models> --save` answer from a script, after the same review.
+  - `--pick`, `--print` and `--why` keep their 2.25.0 behaviour. The 2.24.0 model editor is still there as
+    `fleet --edit`. `init` now ends on this screen. `doctor`'s output is unchanged.
+- **A save proves what it writes, or writes nothing.**
+  - Fleet makes a closed set of edits:
+    - a shape's pool;
+    - the judge;
+    - review's and the consult's preference lists;
+    - the deny lists and the allowlist;
+    - the routing mode;
+    - a shape's floor;
+    - a model's tier or vendor.
+
+    Anything else is refused by name.
+  - A save goes through only when both config files still load and their merged settings change exactly where the
+    answers say. Otherwise it is refused, naming the file and the setting, and nothing is written.
+  - A YAML merge key (`<<`) on the edited path is refused, with the 2.24.0 editor's own words. So is a list holding an
+    alias, a nested item or two equal entries.
+  - An edit beneath a `null` in a layer is written to that layer. It no longer replaces a list in your user config that
+    the repository masks (queue row 456).
+  - A config file that is a symbolic link is written through the link (row 443). A link that points to nothing is
+    refused.
+  - A config that does not load names the file the error is in: yours, the repository's, the main checkout's in a
+    linked worktree, or both. The path is shown whole.
+  - The last line after you quit names the file or files that were written, and no other.
+
+Known limits:
+- The config writer (shared with the 2.24.0 editor) can rewrite untouched lines in some file forms:
+  - CR LF line endings;
+  - a byte-order mark;
+  - a tab before a comment;
+  - four-space indent;
+  - values over 80 columns;
+  - padded flow lists or maps;
+  - list items at their key's indent;
+  - an alias (`*name`) of an item in a list that is edited: it is written as a copy, without its comment.
+
+  The review shows every such line before a save. In a file that starts with a `%YAML 1.1` directive, `fleet --edit`
+  can save a new setting that reads back as empty; the one screen refuses that edit. Queue row 452.
+- If an agent CLI's shell cannot run `env` or `grep`, the key seal refuses to start the agent. The caller then waits
+  for its stall or timeout handling and reports a generic reason (row 449), and `doctor` says "not installed" for that
+  CLI (row 447). It fails closed: no agent starts with the key.
+- Nothing re-checks a model placed on one benchmark when the second benchmark lists it later (row 440).
+
 ## v2.25.0 — a run finishes what it starts
 
 **v2.25.0** ships all 19 of its spec's tasks, all merged in run-20261110-182027-0000000000003405. Every task

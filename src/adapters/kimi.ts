@@ -225,7 +225,7 @@ const kimiTuiLaunch = (model: string) => {
   let neverAsk = false;
   try {
     const help = spawnSync("kimi", ["--help"], {
-      encoding: "utf8", timeout: KIMI_HELP_TIMEOUT_MS, stdio: ["ignore", "pipe", "ignore"], env: withoutHostSession(),
+      encoding: "utf8", timeout: KIMI_HELP_TIMEOUT_MS, stdio: ["ignore", "pipe", "ignore"], env: agentEnv(withoutHostSession()),
     });
     neverAsk = !help.error && help.status === 0 && kimiHasNeverAskOption(help.stdout);
   } catch { /* unreadable help keeps the existing launch form */ }
@@ -461,7 +461,7 @@ export const kimi: WorkerAdapter = {
     }
   },
   listModels: async () => {
-    const r = await sh("kimi provider list --json", process.cwd(), 15000);
+    const r = await sh("kimi provider list --json", process.cwd(), 15000, { env: agentEnv() }) // queue row 439 (D-2187 add.176);
     return r.code !== 0 ? [] : parseKimiModels(r.stdout || "");
   },
 };

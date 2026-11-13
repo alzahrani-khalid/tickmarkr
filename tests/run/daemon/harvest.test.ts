@@ -14,6 +14,7 @@ import { shq } from "../../../src/adapters/types.js";
 import { SubprocessDriver } from "../../../src/drivers/subprocess.js";
 import { checkoutProofLine, OrcaDriver } from "../../../src/drivers/orca.js";
 import { HerdrDriver } from "../../../src/drivers/herdr.js";
+import { agentShellCommand } from "../../../src/drivers/agent-env.js";
 import { FakeOrca } from "../../helpers/fake-orca.js";
 import { canonicalizeLegacyName, formatOwnedName, type ExecutorDriver, type Slot } from "../../../src/drivers/types.js";
 import { graphDefinitionHash, loadGraph, tickmarkrDir } from "../../../src/graph/graph.js";
@@ -1068,7 +1069,7 @@ describe("harvest: finished work is gated, never redispatched (OBS-264)", () => 
       expect(evs.filter((e) => e.event === "worker-harvest" && e.taskId === "T1")).toHaveLength(0);
       // the launch really did bypass the dispatch script (the gap is structural, not incidental)
       // and the daemon says so out loud rather than leaving a silent hole in the feature
-      expect(launched).toBe(seedLaunch);
+      expect(launched).toBe(agentShellCommand(seedLaunch)); // queue row 439: delivered sealed
       const unmeasurable = evs.filter((e) => e.event === "worker-harvest-unmeasurable" && e.taskId === "T1");
       expect(unmeasurable).toHaveLength(1); // once per attempt, not once per slice
       expect(unmeasurable[0]!.data.reason).toContain("interactive-seed");

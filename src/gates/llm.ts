@@ -10,6 +10,7 @@ import { answerTrustDialog } from "../run/trust-dialog.js";
 import type { Effort } from "../graph/schema.js";
 import { formatOwnedName, parseOwnedName, type ExecutorDriver, type Slot } from "../drivers/types.js";
 import { SEAT_MARKER_ENV } from "../drivers/host-env.js";
+import { agentEnvShellPrefix } from "../drivers/agent-env.js";
 import { codexSeatCommand } from "../adapters/codex.js";
 import { HcReadUnavailableError } from "../drivers/hc-client.js";
 import { CHECKOUT_MARK, checkoutProofLine, type SeatLaunchCause } from "../drivers/orca.js";
@@ -568,6 +569,8 @@ async function runViaDriverDetailed(
       ...(role ? [`export ${SEAT_MARKER_ENV}=${role}`] : []),
       bannerShell(),
       ...(decode ? ["set -o pipefail"] : []),
+      // Queue row 439; D-2187 add.176: the seat script seals its own agent, whatever terminal runs it.
+      agentEnvShellPrefix(),
       gateSeat ? teePaneSeatCommand(seatCommand, seatLog) : seatCommand,
       gateExitTrailer(nonce),
     ].join("\n"));

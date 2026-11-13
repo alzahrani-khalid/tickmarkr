@@ -11,6 +11,7 @@ import { detectGateCommands } from "../gates/baseline.js";
 import { testFiltered } from "../gates/acceptance.js";
 import { renderAcceptanceItem, type AcceptanceItem, type Task } from "../graph/schema.js";
 import { sh } from "../run/git.js";
+import { agentEnv } from "../drivers/agent-env.js";
 import { seedFixture, type Fixture, type SeededFixture } from "./fixtures.js";
 
 export interface AcceptanceRunResult {
@@ -197,7 +198,9 @@ async function dispatchChannel(
   };
 
   const invocation = adapter.invoke(task, seeded.repo, assignment, { promptFile });
-  const run = await sh(invocation.command, seeded.repo, cfg.taskTimeoutMinutes * 60_000);
+  // Queue row 439 (D-2187 add.176): the worker is an adapter CLI, so it starts without the Artificial Analysis key; the
+  // fixture oracle below is a payload shell and keeps the environment it has.
+  const run = await sh(invocation.command, seeded.repo, cfg.taskTimeoutMinutes * 60_000, { env: agentEnv() });
   const output = `${run.stdout}\n${run.stderr}`.trim();
   const worker = adapter.parse(output, nonce);
 

@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { dirname, join, relative } from "node:path";
@@ -161,23 +161,38 @@ export type FleetWriteHooks = {
   beforeRename?: () => void;
 };
 
-/** Atomic sibling-temp writer. Reading and serializing happen before `${path}.tmp` exists, and
- * any pre-rename interruption unlinks only that exact candidate while the original remains intact. */
+/**
+ * The file a config path is written at. A config that is a symbolic link (a dotfiles folder) is
+ * written THROUGH the link: a rename onto the link would replace it with a regular file and leave
+ * the file it points to stale (queue row 443). A link that points to nothing refuses, naming it.
+ */
+function writeTarget(path: string): string {
+  let link = false;
+  try { link = lstatSync(path).isSymbolicLink(); } catch { return path; }
+  if (!link) return path;
+  try { return realpathSync(path); } catch { throw new Error(`${path} is a symbolic link that points to nothing`); }
+}
+
+/** Atomic sibling-temp writer. Reading and serializing happen before the temporary sibling exists, and
+ * any pre-rename interruption unlinks only that exact candidate while the original remains intact.
+ * The sibling and the rename are beside the real file, so a symlinked config stays a link. */
 export function writeFleetOverlay(
   path: string,
   serialize: (priorBytes: string) => string,
   hooks: FleetWriteHooks = {},
 ): void {
+  // resolved first: a dangling link refuses before a directory or a temporary file is created
+  const target = writeTarget(path);
   const prior = hooks.readPrior
     ? hooks.readPrior(path)
     : (existsSync(path) ? readFileSync(path, "utf8") : "");
   const bytes = serialize(prior);
-  mkdirSync(dirname(path), { recursive: true });
-  const tmp = `${path}.tmp`;
+  mkdirSync(dirname(target), { recursive: true });
+  const tmp = `${target}.tmp`;
   try {
     writeFileSync(tmp, bytes);
     hooks.beforeRename?.();
-    renameSync(tmp, path);
+    renameSync(tmp, target);
   } catch (error) {
     try {
       if (existsSync(tmp)) unlinkSync(tmp);

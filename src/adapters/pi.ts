@@ -7,6 +7,7 @@ import type { TickmarkrConfig } from "../config/config.js";
 import { stateDirName } from "../graph/graph.js";
 import type { Effort, Task } from "../graph/schema.js";
 import { withoutHostSession } from "../drivers/host-env.js";
+import { agentEnv } from "../drivers/agent-env.js";
 import { probeVersion } from "./claude-code.js";
 import { gatewayFamily, type GatewayRecord, servesFamily } from "./cliproxy.js";
 import { CLIPROXY_BASE_URL_ENV, CLIPROXY_MODEL_ENV, CLIPROXY_PROVIDER } from "./pi-cliproxy-extension.js";
@@ -200,7 +201,7 @@ export const pi: WorkerAdapter = {
     // The store is local and independently useful: preserve its advisory even when the network/auth
     // capability call below fails. A failed model listing must not erase evidence of a substitution.
     const drift = servedModelNote();
-    const r = spawnSync("pi", ["--list-models"], { encoding: "utf8", timeout: 15000, env: withoutHostSession() });
+    const r = spawnSync("pi", ["--list-models"], { encoding: "utf8", timeout: 15000, env: agentEnv(withoutHostSession()) });
     if (r.error || r.status !== 0) {
       return drift ? { ...h, note: `${h.note ? `${h.note}; ` : ""}${drift}` } : h;
     }
@@ -250,7 +251,7 @@ export const pi: WorkerAdapter = {
   // v1.5 MODEL-01: fail OPEN to [] (detection is advisory — unlike gates' fail-closed posture).
   // spawnSync mirrors probeVersion; 15s timeout. Live-verified 2026-07-10, pi 0.80.3.
   listModels: async () => {
-    const r = spawnSync("pi", ["--list-models"], { encoding: "utf8", timeout: 15000, env: withoutHostSession() });
+    const r = spawnSync("pi", ["--list-models"], { encoding: "utf8", timeout: 15000, env: agentEnv(withoutHostSession()) });
     return r.error || r.status !== 0 ? [] : parsePiModels(r.stdout || "");
   },
   collectUsage(cwd: string, sinceMs: number): TokenUsage | undefined {

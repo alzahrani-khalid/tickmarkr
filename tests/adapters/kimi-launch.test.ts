@@ -4,6 +4,8 @@ import { join } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
 import { kimi, KIMI_INPUT_BOX, runKimiInteractiveSeed } from "../../src/adapters/kimi.js";
 import type { Assignment } from "../../src/adapters/types.js";
+import { consumePaneLaunchIntent } from "../../src/brand.js";
+import { agentEnvShellPrefix, agentShellCommand } from "../../src/drivers/agent-env.js";
 import { HerdrDriver } from "../../src/drivers/herdr.js";
 import type { ExecutorDriver, Slot } from "../../src/drivers/types.js";
 
@@ -39,14 +41,15 @@ function fakeKimi() {
 
 function seedDriver() {
   const commands: string[] = [];
+  const intents: boolean[] = [];
   const slot: Slot = { id: "p1", name: "T3-worker-kimi-a0", cwd: "/tmp" };
   const banner = "Model: k3\nSend /help for help information.\n";
   const driver: Pick<ExecutorDriver, "run" | "waitOutput" | "read"> = {
-    run: async (_slot, command) => { commands.push(command); },
+    run: async (_slot, command) => { intents.push(consumePaneLaunchIntent()); commands.push(command); },
     waitOutput: async () => true,
     read: async () => banner,
   };
-  return { commands, slot, driver };
+  return { commands, intents, slot, driver };
 }
 
 describe("kimi TUI permission launch", () => {
@@ -56,11 +59,14 @@ describe("kimi TUI permission launch", () => {
     const flags = ["--auto", "-y", "--auto"];
     for (const [index, flag] of flags.entries()) {
       writeFileSync(fake.help, index === 1 ? WITHOUT_AUTO : RECORDED_HELP);
-      const { commands, slot, driver } = seedDriver();
+      const { commands, intents, slot, driver } = seedDriver();
       const result = await runKimiInteractiveSeed({ driver, slot, assignment: ASSIGNMENT, promptFile: "/tmp/prompt.md", taskTimeoutMinutes: 0.1 });
       expect(result.seedFailed).toBe(false);
-      expect(commands).toEqual([`kimi ${flag} -m '${MODEL}'`, SEED_LINE]);
-      expect(KIMI_INPUT_BOX.launchCommand?.(commands[0])).toBe(true);
+      // Queue row 439: the launch is delivered sealed with its recorded launch intent; the seed line is not a launch.
+      expect(commands).toEqual([agentShellCommand(`kimi ${flag} -m '${MODEL}'`), SEED_LINE]);
+      expect(intents).toEqual([true, false]);
+      expect(KIMI_INPUT_BOX.launchCommand?.(commands[0].slice(agentEnvShellPrefix().length))).toBe(true);
+      expect(KIMI_INPUT_BOX.launchCommand?.(commands[0])).toBe(false);
       expect(readFileSync(fake.calls, "utf8").trim().split("\n")).toEqual(Array(index + 1).fill("--help"));
     }
   });
@@ -123,10 +129,22 @@ esac
       writeFileSync(fake.help, help);
       const driver = new HerdrDriver(herdr);
       const slot = await driver.slot(fake.root, slotName);
-      const before = readFileSync(log, "utf8").split("\n").length;
+      // Full seed (queue row 439): the launch is delivered sealed with its recorded launch intent, still a pane command.
+      let before = readFileSync(log, "utf8").split("\n").length;
       const result = await runKimiInteractiveSeed({ driver, slot, assignment: ASSIGNMENT, promptFile: "/tmp/prompt.md", taskTimeoutMinutes: 0.1 });
       expect(result.seedFailed).toBe(false);
-      const calls = readFileSync(log, "utf8").split("\n").slice(before - 1);
+      let calls = readFileSync(log, "utf8").split("\n").slice(before - 1);
+      expect(calls.some((line) => line.startsWith("pane run w1:p9 printf") && line.includes(`kimi ${flag} -m`) && line.includes("typeset +x"))).toBe(true);
+      expect(calls).toContain(`pane send-text w1:p9 ${SEED_LINE}`);
+      expect(calls).toContain("pane send-keys w1:p9 Enter");
+      expect(calls.some((line) => line.startsWith("pane send-text w1:p9 kimi ") || line.startsWith("pane send-text w1:p9 typeset"))).toBe(false);
+      expect(calls.some((line) => line.startsWith("pane run w1:p9 printf") && line.includes(SEED_LINE))).toBe(false);
+      // Direct-driver fallback: the raw adapter launch with NO recorded intent is still recognised by Kimi's anchored
+      // launch matcher as a shell line, and the seed text is then typed.
+      before = readFileSync(log, "utf8").split("\n").length;
+      await driver.run(slot, kimi.interactiveSeed!.launch(MODEL));
+      await driver.run(slot, kimi.interactiveSeed!.seedLine("/tmp/prompt.md"));
+      calls = readFileSync(log, "utf8").split("\n").slice(before - 1);
       expect(calls.some((line) => line.startsWith("pane run w1:p9 printf") && line.includes(`kimi ${flag} -m`))).toBe(true);
       expect(calls).toContain(`pane send-text w1:p9 ${SEED_LINE}`);
       expect(calls).toContain("pane send-keys w1:p9 Enter");
