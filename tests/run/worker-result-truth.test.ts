@@ -281,7 +281,9 @@ test("test: a model-not-found banner that first appears after the startup window
     "taskTimeoutMinutes: 0.05\nvisibility:\n  worker: print\n",
   );
   const earlyInner = new SubprocessDriver();
-  let firstAttemptPolls = 0;
+  // Queue row 466: the bound is on what happens once the banner is on the screen. Counting every poll from launch
+  // made the worker's own start-up time (a slow runner, the key seal's proof before the command) part of a 50 ms bound.
+  let pollsAfterBanner = 0;
   let firstAttemptActive = true;
   let firstLaunch = true;
   const earlyDriver = wrappedDriver(earlyInner, {
@@ -293,8 +295,9 @@ test("test: a model-not-found banner that first appears after the startup window
       }
       return earlyInner.run(slot, command);
     },
-    waitOutput: (slot, pattern, timeoutMs, opts) => {
-      if (firstAttemptActive && slot.name.includes("-worker-")) firstAttemptPolls++;
+    waitOutput: async (slot, pattern, timeoutMs, opts) => {
+      if (firstAttemptActive && slot.name.includes("-worker-")
+        && (await earlyInner.read(slot, 50)).includes("requested model deployment was not found")) pollsAfterBanner++;
       return earlyInner.waitOutput(slot, pattern, Math.min(timeoutMs, 50), opts);
     },
     close: async (slot) => {
@@ -304,7 +307,7 @@ test("test: a model-not-found banner that first appears after the startup window
   });
   const earlySummary = await runDaemon(early.repo, { approvalWindowMs: 1, adapters: [early.fake], runId: "run-early-startup-banner", driver: earlyDriver });
   expect(earlySummary.done).toEqual(["T1"]);
-  expect(firstAttemptPolls).toBeLessThanOrEqual(1);
+  expect(pollsAfterBanner).toBeLessThanOrEqual(1);
   expect(Journal.open(early.repo, "run-early-startup-banner").read()
     .find((event) => event.event === "worker-result")?.data.cause).toBe("startup-failure");
   expect(WORKER_STARTUP_WINDOW_MS).toBeGreaterThanOrEqual(EARLY_LAUNCH_LIVENESS_MS);
