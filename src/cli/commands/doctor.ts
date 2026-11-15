@@ -15,7 +15,7 @@ import { graphPath, loadGraph, tickmarkrDir, stateDirName } from "../../graph/gr
 import { catalogModelAdvisory, catalogTierRanking, declaredModelWindow, hasWindowsConfig, modelLints, modelListingLints, suggestOverlay, ttyVisual } from "../../adapters/model-lints.js";
 import { loadConfig, overlayPreferShapes } from "../../config/config.js";
 import { HerdrDriver } from "../../drivers/herdr.js";
-import { admitHerdrApp, classifyHost, configDriverRefused, herdrAppBinary, hostMarkers, resolveDriver, type DriverChoice } from "../../drivers/index.js";
+import { admitHerdrApp, captureHost, classifyHost, configDriverRefused, herdrAppBinary, hostMarkers, resolveDriver, type DriverChoice } from "../../drivers/index.js";
 import { HcClient, HcError, WINDOW_UNAVAILABLE } from "../../drivers/hc-client.js";
 import { canonicalWorktreePath, ORCA_FIXTURE_VERSION, parseEnvelope, resolveOrcaCliBinary } from "../../drivers/orca.js";
 import { localeFinding, protectedFolderFinding } from "../../drivers/host-env.js";
@@ -1219,8 +1219,12 @@ export function hostRows(env: EnvLike, llm: "pane" | "headless", configDriver: D
   const name = env.CLAUDE_CODE_ENTRYPOINT === "claude-desktop" ? "Claude Desktop" : "no herdr, Herdr app or Orca host";
   // A config naming a host-specific driver here is refused by run and resume: no headless-subprocess claim either.
   const refused = configDriver !== "auto" && configDriver !== "subprocess" ? hostSelection(configDriver, env, configDriver).detail : undefined;
+  // Queue row 391 (D-2187 add.263): a detected Rex pane (read only when the host is none) says so; a refusal keeps its words.
+  const detail = refused === undefined && captureHost(env).rex
+    ? "Rex detected, no Rex driver: running headless on the subprocess driver, with no daemon board"
+    : `${name} — ${refused ?? "seats run headless on the subprocess driver with no daemon board"}`;
   return [
-    { verdict: "pass", key: "host", detail: `${name} — ${refused ?? "seats run headless on the subprocess driver with no daemon board"}` },
+    { verdict: "pass", key: "host", detail },
     ...(llm === "pane"
       ? [{ verdict: "warn" as const, key: "visibility", detail: "visibility.llm is pane, but panes cannot be honored on this host — run under herdr, the Herdr app or Orca, or set visibility.llm: headless" }]
       : []),

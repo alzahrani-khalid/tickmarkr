@@ -3,6 +3,7 @@
 import { isAlias, isMap, isScalar, isSeq, parse, parseDocument, stringify } from "yaml";
 import { DEFAULT_CONFIG, DENY_SCOPES, loadConfigWithMode, ROUTING_MODES } from "../config/config.js";
 import { materializeAliases, overlayDocBytes, refuseMerge, releaseAnchors } from "../config/fleet-overlay.js";
+import { keepingFileForm, setInPlain } from "../config/overlay-form.js";
 import { SHAPES, TIERS } from "../graph/schema.js";
 
 export type Layer = "repo" | "user";
@@ -150,10 +151,10 @@ function assign(doc: Document, text: string, e: Edit, path: string[], value: unk
     for (const [k, v] of Object.entries(value)) assign(doc, text, e, [...path, k], v);
     return;
   }
-  doc.setIn(path, doc.createNode(value));
+  setInPlain(doc, path, doc.createNode(value));
 }
 
-const mask = (doc: Document, path: readonly string[]): void => { if (masks(path)) doc.setIn(path, null); };
+const mask = (doc: Document, path: readonly string[]): void => { if (masks(path)) setInPlain(doc, path, null); };
 /** Under a lifted tombstone, every lower key the edited map does not name stays masked, at every depth. */
 function maskUnder(doc: Document, at: readonly string[], value: unknown, lower: readonly unknown[]): void {
   if (!isObj(value)) return;
@@ -166,7 +167,7 @@ function liftTombstone(doc: Document, path: readonly string[], value: unknown, l
     if (node === undefined) return false;
     if (isMap(node)) continue;
     if (depth === path.length && !isObj(value)) return false;
-    if (depth < path.length) doc.setIn(path.slice(0, depth), doc.createNode({}));
+    if (depth < path.length) setInPlain(doc, path.slice(0, depth), doc.createNode({}));
     for (let d = depth; d < path.length; d++) for (const k of lowerKeys(lower, path.slice(0, d))) if (k !== path[d]) mask(doc, [...path.slice(0, d), k]);
     return true;
   }
@@ -191,6 +192,10 @@ const lowerOf = (layer: Layer, below: string): unknown[] => {
  */
 export function applyLayer(text: string, edits: readonly Edit[], below = ""): string {
   if (!edits.length) return text;
+  // (the form of the file is kept: its line endings and its byte-order mark, as every overlay write keeps them; queue row 452)
+  return keepingFileForm(text, (plain) => applyPlain(plain, edits, below));
+}
+function applyPlain(text: string, edits: readonly Edit[], below: string): string {
   refuseUnmade(edits);
   const doc = parseDocument(text);
   let changed = false;

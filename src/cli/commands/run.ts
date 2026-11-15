@@ -634,7 +634,8 @@ export async function run(argv: string[], cwd = process.cwd()): Promise<{ out: s
     // handed an event and nothing else, and `run-start` carries no run id). `runDaemon` uses the id
     // it is given exactly as it would use the one it would otherwise mint itself.
     const runId = newRunId();
-    const driver = pickDriver(cfg, driverOverride, snapshot.host);
+    // Row 391 (D-2187 add.263): the WHOLE snapshot, so the driver line carries the launch instant's Rex fact.
+    const driver = pickDriver(cfg, driverOverride, snapshot);
     const narrate = await endpointPreflight(driver, narrationSink(runId));
     const s = await runDaemon(cwd, {
       runId,

@@ -114,11 +114,15 @@ function buildLines(M: FleetModel): HandLine[] {
 /**
  * Names for a set of models shown together. A model reached through two CLIs has one name, so where
  * two keys in the set share a name each says which CLI it is: `grok-4.7 (grok)`, `grok-4.7 (omp)`.
+ * Two keys on ONE CLI can be the same model too (an alias and its full id: `claude-code:opus` and
+ * `claude-code:claude-opus-5-5`): the CLI does not tell those apart, so each is shown as its key.
  */
 export function namesOf(M: FleetModel, keys: readonly string[]): string[] {
-  const count = new Map<string, number>();
-  for (const k of keys) count.set(M.name(k), (count.get(M.name(k)) ?? 0) + 1);
-  return keys.map((k) => ((count.get(M.name(k)) ?? 0) > 1 ? `${M.name(k)} (${k.slice(0, k.indexOf(":"))})` : M.name(k)));
+  const tally = (xs: readonly string[]): Map<string, number> => { const n = new Map<string, number>(); for (const x of xs) n.set(x, (n.get(x) ?? 0) + 1); return n; };
+  const count = tally(keys.map((k) => M.name(k)));
+  const byCli = keys.map((k) => ((count.get(M.name(k)) ?? 0) > 1 ? `${M.name(k)} (${k.slice(0, k.indexOf(":"))})` : M.name(k)));
+  const again = tally(byCli);
+  return keys.map((k, i) => ((again.get(byCli[i]) ?? 0) > 1 ? k : byCli[i]));
 }
 
 /** The edit a choice on a line of the team becomes. `chosen` is never empty: a line with nobody on it is not a choice. */

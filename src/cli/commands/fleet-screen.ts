@@ -6,7 +6,7 @@ import type { WorkerAdapter } from "../../adapters/types.js";
 import { globalConfigDir, loadConfigWithMode } from "../../config/config.js";
 import type { Layer, Texts } from "../../fleet/edits.js";
 import { type FloorChoice, floorOf, type HandChoice, handLines } from "../../fleet/hand.js";
-import { dismissNeed, loadFleetSource, restoreNeed } from "../../fleet/load.js";
+import { dismissNeed, loadFleetSource, restoreNeed, UnreadableConfig } from "../../fleet/load.js";
 import { evidenceAgeDays } from "../../fleet/model.js";
 import { derive, errorFiles, errorWhere, initialScreen, type Kept, plainReview, plainScreen, resumeScreen, type ScreenSource, teamRows } from "../../fleet/screen.js";
 import { doctor } from "./doctor.js";
@@ -64,7 +64,8 @@ function handFrom(src: ScreenSource, sets: readonly string[]): { hand: HandChoic
   if (!base) return { hand: [] };
   const lines = handLines(base), hand: HandChoice[] = [];
   for (const set of sets) {
-    const cut = set.indexOf("="), id = set.slice(0, cut), line = lines.find((l) => l.id === id);
+    // (a line is named as the screen and --json name it; a capital or a space around it is not a different line)
+    const cut = set.indexOf("="), id = set.slice(0, cut).trim().toLowerCase(), line = lines.find((l) => l.id === id);
     // <shape>.floor=<tier|mode>: the f key. It joins what the same command sets on that shape's models.
     const shape = id.endsWith(".floor") ? lines.find((l) => l.id === id.slice(0, -6) && l.floor) : undefined;
     if (shape) {
@@ -83,7 +84,11 @@ function handFrom(src: ScreenSource, sets: readonly string[]): { hand: HandChoic
     if (!models.length && !line.deny) return { refused: `${id} needs ${line.setting ? "a value" : "at least one model"}` };
     if (line.one && models.length > 1) return { refused: `${id} is one model, and ${models.length} were given` };
     const not = models.filter((k) => !line.candidates.includes(k));
-    if (not.length) return { refused: `${not.join(", ")} ${not.length === 1 ? "is" : "are"} not ${line.deny || line.setting ? `something ${id} can name` : `a working model that may take ${id}`} — tickmarkr fleet --json lists them under lines` };
+    if (not.length) {
+      // a model's bare name, as the screen draws it, is not its key: when one key here ends in it, that key is offered
+      const meant = [...new Set(not)].map((k) => line.candidates.filter((c) => c.slice(c.indexOf(":") + 1) === k || c.endsWith(`/${k}`))).filter((m) => m.length === 1).map((m) => m[0]);
+      return { refused: `${[...new Set(not)].join(", ")} ${new Set(not).size === 1 ? "is" : "are"} not ${line.deny || line.setting ? `something ${id} can name` : `${new Set(not).size === 1 ? "a working model" : "working models"} that may take ${id}`}${meant.length ? ` — did you mean ${meant.join(", ")}?` : ""} — tickmarkr fleet --json lists them under lines` };
+    }
     const floored = hand.find((x) => x.line === line.id && !x.chosen.length && x.floor);
     if (hand.some((x) => x.line === line.id) && !floored) return { refused: `${id} is set twice` };
     // (a model the line already names stays where it is, kept out as it was: only one that is added needs its rule lifted)
@@ -91,7 +96,7 @@ function handFrom(src: ScreenSource, sets: readonly string[]): { hand: HandChoic
     if (kept) return { refused: `${kept} is kept from ${id} by ${line.barred[kept].why} — change that deny list first (--set ${lines.filter((l) => l.deny).map((l) => l.id).join(", --set ")})` };
     if (new Set(models).size !== models.length) return { refused: `${id} names a model twice` };
     const mode = line.mode && (turned ?? line.mode);
-    if (models.length === line.current.length && models.every((k, i) => k === line.current[i]) && mode === line.mode) return { refused: `${id} already has exactly those models, in that order` };
+    if (models.length === line.current.length && models.every((k, i) => k === line.current[i]) && mode === line.mode) return { refused: line.setting ? `${id} is already ${models[0]}` : `${id} already has exactly those models, in that order` };
     if (floored) Object.assign(floored, { chosen: models, ...(mode ? { mode } : {}) });
     else hand.push({ line: line.id, chosen: models, ...(mode ? { mode } : {}) });
   }
@@ -105,6 +110,7 @@ function answer(load: () => ScreenSource, ids: string[], sets: string[], save: b
   if ("refused" in set) return { out: `tickmarkr fleet --set: ${set.refused}`, code: 1 };
   const d = derive(src, { ...initialScreen(), yes: ids, hand: set.hand });
   if (!d.base) return { out: `tickmarkr fleet: the config does not load — ${d.error}\n${errorWhere(src, d.errorIn)}`, code: 1 };
+  if (ids.some((id) => !id.trim())) return { out: "tickmarkr fleet --yes: an id is missing after --yes — tickmarkr fleet --json lists the ids", code: 1 };
   const unknown = ids.filter((id) => !d.said.some((n) => n.id === id));
   if (unknown.length) return { out: `tickmarkr fleet --yes: ${unknown.join(", ")} ${unknown.length === 1 ? "is" : "are"} not something this fleet asks a yes about — tickmarkr fleet --json lists the ids`, code: 1 };
   const review = plainReview(src, ids, set.hand, 100);
@@ -139,12 +145,18 @@ export async function fleetCommand(argv: string[], cwd = process.cwd(), adapters
   const load = (): ScreenSource => loadFleetSource(cwd, { globalDir, adapters, ...(io.now !== undefined ? { now: io.now } : {}) });
   const input = io.input ?? (process.stdin as FleetInput), output = io.output ?? (process.stdout as FleetOutput);
   const probe = async (): Promise<void> => { output.write(`${await (io.doctor ?? doctor)([], cwd, adapters, { banner: false, compact: true, globalDir })}\n`); };
+  // --json prints the screen and changes nothing: beside an answer it would report as if nothing had been asked
+  if (values.json && (values.yes?.length || values.set?.length || values.save)) return { out: "tickmarkr fleet: --json prints the screen and changes nothing — it does not go with --yes, --set or --save", code: 1 };
   if (values.save && !values.yes?.length && !values.set?.length) return { out: "tickmarkr fleet: --save needs --yes <id> or --set <line>=<models>", code: 1 };
   if (values.fresh) await probe();
   // A config that does not load is an error for a script too: the same text, and a non-zero exit.
   const loads = (src: ScreenSource): boolean => derive(src, initialScreen()).base !== undefined;
   const reported = (src: ScreenSource, out: string): Result => (loads(src) ? out : { out, code: 1 });
-  if (values.json) { const src = load(); return reported(src, jsonScreen(src)); }
+  if (values.json) {
+    // (a config file that cannot be read is an answer in the same form, not a line of text where JSON was asked for)
+    try { const src = load(); return reported(src, jsonScreen(src)); }
+    catch (e) { if (e instanceof UnreadableConfig) return { out: JSON.stringify({ ok: false, error: e.message, in: [e.path] }, null, 2), code: 1 }; throw e; }
+  }
   if (values.yes?.length || values.set?.length) return answer(load, values.yes ?? [], values.set ?? [], values.save ?? false);
   // Without a terminal the screen is printed, never refused: an agent in a pipe reads the same thing.
   if (values.plain || input.isTTY !== true || output.isTTY !== true) { const src = load(); return reported(src, plainScreen(src, 100)); }

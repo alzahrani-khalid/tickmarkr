@@ -1,5 +1,6 @@
 // Fleet-overlay mutation, serialization, and diff rendering for the `tickmarkr fleet` write path.
 import { type Alias, type Node as YamlNode, isAlias, isCollection, isMap, isNode, isScalar, isSeq, parseDocument, stringify, visit } from "yaml";
+import { keepingFileForm, setInPlain, styleOf } from "./overlay-form.js";
 import { ConfigError, DENY_SCOPES, type DenyScope, type FleetEditable, type FleetUniverseRow, type LowerLayerModelOverrides, type MapEntry, type RoutingMode, type Tier, universeCovers, universeEntryMatches } from "./config.js";
 
 // OBS-1099 add.1: the writer ranges over the schema-derived scopes. The flat (all-seats) scopes
@@ -150,8 +151,21 @@ export type FleetFirstTouch = { vendor: string; channel: "sub" | "api" };
 const FIRST_TOUCH_OPEN = "\uE000tickmarkr-fleet-first-touch:";
 const FIRST_TOUCH_CLOSE = "\uE001";
 // OBS-505: marks a scalar-trailing single-line comment for the two-space inline note style at
-// stringify time; applied and consumed inside renderFleetOverlayWrite, never written to disk.
-const INLINE_COMMENT_SENTINEL = "\uE002";
+// stringify time; applied and consumed inside overlayDocBytes, never written to disk.
+// Row 452: yaml writes one space before an inline comment. A gap that began with a space carries the
+// rest of itself after the mark; one that began with a TAB cannot (that space is not its own), so
+// it carries all of itself after a second mark and the space before that mark is taken out again.
+// Both marks are private-use characters the document does not hold (a literal one in a value or a
+// comment is the user's text and is written back as it was).
+function freeMarks(text: string, count: number): string[] {
+  const marks: string[] = [];
+  for (let code = 0xe002; code <= 0xf8ff && marks.length < count; code++) {
+    const mark = String.fromCharCode(code);
+    if (!text.includes(mark)) marks.push(mark);
+  }
+  if (marks.length < count) throw new ConfigError("the overlay holds every private-use character; edit it by hand");
+  return marks;
+}
 
 export function fleetFirstTouchProvenance(note: string, firstTouch: FleetFirstTouch): string {
   return `${FIRST_TOUCH_OPEN}${encodeURIComponent(firstTouch.vendor)}:${firstTouch.channel}${FIRST_TOUCH_CLOSE}${note}`;
@@ -271,7 +285,13 @@ export function releaseAnchors(doc: OverlayDocument, path: OverlayPath): void {
   visit(doc, {
     Alias: (_key, alias) => {
       const target = alias.resolve(doc) as YamlNode | undefined;
-      return target !== undefined && held.has(target) ? detachedCopy(doc, alias, target, new Set()) : undefined;
+      if (target === undefined || !held.has(target)) return undefined;
+      // the copy stands where the alias stood: a comment written on the alias stays on that line
+      const copy = detachedCopy(doc, alias, target, new Set());
+      if (alias.comment !== undefined) copy.comment = alias.comment;
+      if (alias.commentBefore !== undefined) copy.commentBefore = alias.commentBefore;
+      if (alias.spaceBefore) copy.spaceBefore = true;
+      return copy;
     },
   });
 }
@@ -347,13 +367,13 @@ function setAt(doc: OverlayDocument, path: OverlayPath, value: unknown): void {
       if (isScalar(node) && node.value === null) {
         const under = (inner: readonly string[], outer: readonly string[]) => outer.every((key, at) => inner[at] === key);
         for (const masked of [...DENY_SCOPES.map((scope) => scope.path), ["routing", "allow"]]) {
-          if (under(masked, prefix) && !under(masked, path) && !under(path, masked)) doc.setIn(masked, doc.createNode(null));
+          if (under(masked, prefix) && !under(masked, path) && !under(path, masked)) setInPlain(doc, masked, doc.createNode(null));
         }
       }
       break;
     }
   }
-  doc.setIn(path, value);
+  setInPlain(doc, path, value);
 }
 
 // T10 (D-987): Fleet writes through no YAML merge key — a membership write whose edited path (the edited
@@ -424,6 +444,10 @@ export function fleetPoolPrune(write: FleetOverlayWrite): { map: FleetEditable["
 /** Apply only fields fleet authored to the parsed YAML document. Untouched nodes retain their
  * keys, ordering, scalar style, and comments; fresh provenance is written directly on its tier node. */
 export function renderFleetOverlayWrite(priorBytes: string, write: FleetOverlayWrite): string {
+  return keepingFileForm(priorBytes, (plain) => renderPlainWrite(plain, write));
+}
+
+function renderPlainWrite(priorBytes: string, write: FleetOverlayWrite): string {
   const doc = parseDocument(priorBytes);
   if (doc.errors.length) throw doc.errors[0];
 
@@ -716,22 +740,51 @@ export function overlayDocBytes(doc: OverlayDocument, priorBytes: string): strin
   // keeps the exact whitespace it had before its hash sign (yaml itself emits one space, so the
   // sentinel carries the rest); only a comment fleet authored gets the two-space style.
   // T10 (D-936): a flow collection's trailing note (`[codex]  # c`) is inline too, so it keeps its gap.
+  // Row 452: the marks are private-use characters the document does not already hold, so a value
+  // or a comment that carries one as text comes out as it went in.
+  const [inline, tabGap, lineBreak] = freeMarks(doc.toString(), 3);
+  const marked = (gap: string, comment: string): string => gap.startsWith(" ") ? `${inline}${gap.slice(1)}#${comment}` : `${inline}${tabGap}${gap}#${comment}`;
+  // Row 452: the gap is kept wherever the node's own range shows it: after a scalar, a flow
+  // collection and an alias (`gates.test: *cmd<TAB># keep`). A comment in the header of a block map
+  // or list (on its key's line, after `:` of an explicit key, after its anchor or tag) and one after
+  // an implicit null are not kept on the key's line by the YAML document model, so this writer
+  // cannot keep their place or gap (OBSERVER ruling 2 on row 452); nor the gap after a block
+  // scalar's `|` or `>` header, which no node's range holds.
+  // A trailing comment that runs on over the lines below it (`test: done<TAB># keep` then an indented
+  // `# more`) keeps its first line inline with its gap, and the lines below as the file wrote them:
+  // they ride in the one inline comment, joined by a third mark that becomes a line break again.
   visit(doc, (_key, node) => {
-    if ((isScalar(node) || (isCollection(node) && node.flow)) && typeof node.comment === "string" && !node.comment.includes("\n")) {
-      const tail = node.range ? priorBytes.slice(node.range[1], node.range[2]) : "";
-      const gap = /^([ \t]+)#/.exec(tail)?.[1] ?? "  ";
-      node.comment = `${INLINE_COMMENT_SENTINEL}${gap.slice(1)}#${node.comment}`;
+    if (!(isScalar(node) || isAlias(node) || (isCollection(node) && node.flow)) || typeof node.comment !== "string") return;
+    const tail = node.range ? priorBytes.slice(node.range[1], node.range[2]).replace(/\n$/, "") : "";
+    if (!node.comment.includes("\n")) {
+      node.comment = marked(/^([ \t]+)#/.exec(tail)?.[1] ?? "  ", node.comment);
+      return;
     }
+    const gap = /^([ \t]+)#/.exec(tail)?.[1];
+    const lines = tail.split("\n");
+    // only when the source bytes are exactly this comment (else yaml writes it below, as before);
+    // yaml reads a bare `#` line inside a comment that runs on as one space, so compare it so
+    const read = lines.map((line) => /^[ \t]*#(.*)$/.exec(line)?.[1] ?? (line.trim() ? "\0" : "")).map((text) => text || " ");
+    if (gap === undefined || read.join("\n") !== node.comment.split("\n").map((text) => text || " ").join("\n")) return;
+    node.comment = marked(gap, [lines[0].slice(gap.length + 1), ...lines.slice(1)].join(lineBreak));
   });
-  return doc.toString({
-    commentString: (comment) => comment.startsWith(INLINE_COMMENT_SENTINEL)
+  const render = (style: ReturnType<typeof styleOf>): string => doc.toString({
+    commentString: (comment) => comment.startsWith(inline)
       ? comment.slice(1)
       : comment.replace(/^(?!$)(?: $)?/gm, "#"),
     // OBS-518: yaml's default pads flow collections (`[kimi]` → `[ kimi ]`), churning untouched
     // lines on the one confirmation surface an operator reviews. Hand-written overlays use the
-    // unpadded form; emit it.
-    flowCollectionPadding: false,
-  });
+    // unpadded form; emit it, unless this file pads its own.
+    // Row 452: the file's own style is kept on the lines a write does not touch: its indent, its
+    // list items indented under their key or not, and its long lines whole (yaml folds at 80 columns).
+    ...style,
+    // (the mark never reaches the file: where yaml did not put its one space before it, the mark alone goes)
+  }).replaceAll(` ${tabGap}`, "").replaceAll(tabGap, "").replaceAll(lineBreak, "\n");
+  const style = styleOf(priorBytes), out = render(style);
+  // With list items at their key's indent, yaml writes a list emptied under a comment as "[]" at
+  // that same indent, which does not parse. A write never leaves a file that does not parse: such a
+  // file gets its lists indented, the one line of style it loses.
+  return !style.indentSeq && parseDocument(out).errors.length ? render({ ...style, indentSeq: true }) : out;
 }
 
 /** T10: the 1-based line of the key that holds `path` in these overlay bytes — the path's own key, the

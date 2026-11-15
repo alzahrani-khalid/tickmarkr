@@ -3,7 +3,7 @@ import { randomBytes } from "node:crypto";
 import { existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { expect, onTestFinished, test, vi } from "vitest";
+import { describe, expect, onTestFinished, test, vi } from "vitest";
 import { FakeAdapter } from "../../src/adapters/fake.js";
 import { DEFAULT_CONFIG } from "../../src/config/config.js";
 import { captureBaseline, compareToBaseline, type Baseline, type BaselineCommand } from "../../src/gates/baseline.js";
@@ -937,34 +937,61 @@ test("test: OBS-1166 under a real vitest projects config a stranded single-fork 
   expect(runs[1]!.args).toContain("--exclude=tests/a.test.ts");
 }, 90_000);
 
-test("test: a report stranding a whole parallel project or lacking the reporter's scheduling record or starting no file or holding an unexpected lifecycle member or a certificate exit that disagrees with the process or a failed or unfinished started file or a diagnostic other than a worker RPC timeout is never re-run and keeps today's fail-closed verdict, so a retry that launders a runner failure fails", async () => {
-  const mutations = [
-    "delete report.started[all[1]]; delete report.completed[all[1]];",
-    "delete report.scheduling;", "delete report.scheduling[all[0]];",
-    "report.scheduling[all[0]].singleFork = undefined;", "report.scheduling[all[0]].pool = 'threads';",
-    "report.started = {}; report.completed = {};",
-    "report.started['unexpected.test.ts'] = now;", "report.requested.push('unexpected.test.ts');",
-    "report.completed['unexpected.test.ts'] = { at: now, status: 'passed' };",
-    "report.certificate.exitCode = 0;", "code = 0;", "code = 2; report.certificate.exitCode = 2;",
-    "report.completed[all[0]].status = 'failed';", "delete report.completed[all[0]];",
-    "report.certificate.diagnostics.push('Error: spawn EAGAIN'); report.certificate.errors++;",
-    "report.certificate.diagnostics = ['AssertionError: [vitest-worker]: Timeout calling \"onTaskUpdate\"'];",
-    "report.certificate.diagnostics = ['Error: [vitest-api]: Timeout calling \"onTaskUpdate\"'];",
-    "report.certificate.diagnostics = [];", "report.certificate.errors = 2;", "delete report.certificate;",
-    "report.nonce = 'old';", "report.requested.push(all[0]);", "report.duplicateCompletions = [all[0]];",
-    "delete report.started[all[0]];", "report.started[all[2]] = now;",
-  ];
-  for (const mutation of mutations) {
-    const f = strandedFixture(mutation);
-    const row = await round(f);
-    expect(row.pass, mutation).toBe(false);
-    expect(f.runs(), mutation).toHaveLength(1);
-    const run = f.runs()[0]!;
-    const original = verifyManifestReport({ manifest: f.files, nonce: row.meta!.nonce as string,
-      exitCode: row.meta!.processExit as number, report: readTestReport(run.reportPath) });
-    expect(row.details, mutation).toContain(original.details);
-  }
-}, 60_000);
+describe("test: a report stranding a whole parallel project or lacking the reporter's scheduling record or starting no file or holding an unexpected lifecycle member or a certificate exit that disagrees with the process or a failed or unfinished started file or a diagnostic other than a worker RPC timeout is never re-run and keeps today's fail-closed verdict, so a retry that launders a runner failure fails", () => {
+  const assertFailClosed = async (mutations: string[]) => {
+    for (const mutation of mutations) {
+      const f = strandedFixture(mutation);
+      const row = await round(f);
+      expect(row.pass, mutation).toBe(false);
+      expect(f.runs(), mutation).toHaveLength(1);
+      const run = f.runs()[0]!;
+      const original = verifyManifestReport({ manifest: f.files, nonce: row.meta!.nonce as string,
+        exitCode: row.meta!.processExit as number, report: readTestReport(run.reportPath) });
+      expect(row.details, mutation).toContain(original.details);
+    }
+  };
+
+  test("a report stranding a whole parallel project is never re-run and keeps today's fail-closed verdict", async () => {
+    await assertFailClosed(["delete report.started[all[1]]; delete report.completed[all[1]];"]);
+  }, 60_000);
+
+  test("a report lacking the reporter's scheduling record or naming another pool is never re-run and keeps today's fail-closed verdict", async () => {
+    await assertFailClosed([
+      "delete report.scheduling;", "delete report.scheduling[all[0]];",
+      "report.scheduling[all[0]].singleFork = undefined;", "report.scheduling[all[0]].pool = 'threads';",
+    ]);
+  }, 60_000);
+
+  test("a report starting no file is never re-run and keeps today's fail-closed verdict", async () => {
+    await assertFailClosed(["report.started = {}; report.completed = {};"]);
+  }, 60_000);
+
+  test("a report holding an unexpected lifecycle member, a stale nonce or a duplicate is never re-run and keeps today's fail-closed verdict", async () => {
+    await assertFailClosed([
+      "report.started['unexpected.test.ts'] = now;", "report.requested.push('unexpected.test.ts');",
+      "report.completed['unexpected.test.ts'] = { at: now, status: 'passed' };",
+      "report.nonce = 'old';", "report.requested.push(all[0]);", "report.duplicateCompletions = [all[0]];",
+      "delete report.started[all[0]];",
+    ]);
+  }, 60_000);
+
+  test("a certificate exit that disagrees with the process is never re-run and keeps today's fail-closed verdict", async () => {
+    await assertFailClosed(["report.certificate.exitCode = 0;", "code = 0;", "code = 2; report.certificate.exitCode = 2;"]);
+  }, 60_000);
+
+  test("a failed or unfinished started file is never re-run and keeps today's fail-closed verdict", async () => {
+    await assertFailClosed(["report.completed[all[0]].status = 'failed';", "delete report.completed[all[0]];", "report.started[all[2]] = now;"]);
+  }, 60_000);
+
+  test("a diagnostic other than a worker RPC timeout, or none, is never re-run and keeps today's fail-closed verdict", async () => {
+    await assertFailClosed([
+      "report.certificate.diagnostics.push('Error: spawn EAGAIN'); report.certificate.errors++;",
+      "report.certificate.diagnostics = ['AssertionError: [vitest-worker]: Timeout calling \"onTaskUpdate\"'];",
+      "report.certificate.diagnostics = ['Error: [vitest-api]: Timeout calling \"onTaskUpdate\"'];",
+      "report.certificate.diagnostics = [];", "report.certificate.errors = 2;", "delete report.certificate;",
+    ]);
+  }, 60_000);
+});
 
 test("test: a re-run whose own report fails or strands a file fails the gate naming both nonces and launches no second re-run while each invocation keeps its own receipt, so a retry that reports the first run's green or overwrites its evidence fails", async () => {
   const { createHash } = await import("node:crypto");

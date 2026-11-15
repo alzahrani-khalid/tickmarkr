@@ -4,7 +4,7 @@ import { describe, expect, test } from "vitest";
 import { DEFAULT_CONFIG } from "../../src/config/config.js";
 import { buildFleetModel, consequence, verdictOf } from "../../src/fleet/model.js";
 import { needs, needSignature, type NewModel } from "../../src/fleet/needs.js";
-import { derive, errorFiles, errorWhere, frame, initialScreen, plainScreen, press, type ScreenSource, teamRows } from "../../src/fleet/screen.js";
+import { derive, errorFiles, errorRows, errorWhere, frame, initialScreen, plainScreen, press, type ScreenSource, teamRows } from "../../src/fleet/screen.js";
 import { layerDiff } from "../../src/fleet/edits.js";
 import { width } from "../../src/fleet/draw.js";
 import { health, NOW, POOL, source } from "./world.js";
@@ -77,6 +77,28 @@ describe("YOUR TEAM", () => {
     }
     expect(width(" YOUR TEAM  3 on their own floor;")).toBeLessThanOrEqual(40);
   });
+  test("a config that does not load: each problem starts its own row with its path beside it, a long list is counted, and a YAML error keeps its sentence without the frame", () => {
+    // two problems of the schema: two rows, each with its "→ at" path
+    const two = text(source({ repoText: "routing:\n  mode: partner-lead\nconcurrency: many\n" }), initialScreen(), 120, 30).map((l) => l.trim());
+    const rows = two.filter((l) => l.startsWith("✖"));
+    expect(rows).toHaveLength(2);
+    expect(rows.every((l) => l.includes("→ at "))).toBe(true);
+    expect(rows.some((l) => l.endsWith("→ at routing.mode"))).toBe(true);
+    // eight wrong values: six problems are shown and the rest counted, so the file's name stays near
+    const eight = "concurrency: many\ntaskTimeoutMinutes: long\ncontextWarnTokens: lots\ndriver: none\nintegrationBranchPrefix: 1\nrouting:\n  mode: partner-lead\njudge: 1\nreview: 1\n";
+    const wall = text(source({ userText: eight }), initialScreen(), 120, 40).map((l) => l.trim());
+    expect(wall.filter((l) => l.startsWith("✖"))).toHaveLength(6);
+    expect(wall).toContain("… and 2 more");
+    expect(wall).toContain("/u/config.yaml");
+    // a YAML error: its sentence with the line and the column, and no caret from the frame
+    const yaml = text(source({ repoText: "routing:\n  mode: partner-led\nrouting:\n  mode: staff-led\n" }), initialScreen(), 120, 30).map((l) => l.trim());
+    expect(yaml).toContain("Map keys must be unique at line 3, column 1");
+    expect(yaml.some((l) => l.includes("^"))).toBe(false);
+    // the pure function: nothing is dropped from a single problem, and a long one wraps
+    expect(errorRows("one problem only", 80)).toEqual(["one problem only"]);
+    expect(errorRows("✖ a\n  → at x.y\n✖ b\n  → at z", 80)).toEqual(["✖ a → at x.y", "✖ b → at z"]);
+    expect(errorRows(`✖ ${"word ".repeat(30).trim()}`, 40).length).toBeGreaterThan(1);
+  });
   test("a config that does not load draws no team and says where to look", () => {
     const out = text(source({ repoText: "routing:\n  mode: partner-lead\n" })).join("\n");
     expect(out).toContain("THE CONFIG DOES NOT LOAD");
@@ -125,6 +147,12 @@ describe("YOUR TEAM", () => {
         st = press(far, st, "down", { cols, rows }).state;
       }
       const all = seen.map((l) => l.trim()).join("");
+      // the scroll stops at the end: pressed far past it, one "up" moves the screen at once
+      // (where the body is taller than the terminal: at 100 columns this one fits and nothing scrolls)
+      let past = st; for (let i = 0; i < 300; i++) past = press(far, past, "down", { cols, rows }).state;
+      const scrolls = text(far, press(far, initialScreen(), "down", { cols, rows }).state, cols, rows).join("\n") !== text(far, initialScreen(), cols, rows).join("\n");
+      if (scrolls) expect(text(far, press(far, past, "up", { cols, rows }).state, cols, rows).join("\n"), `${n} ${cols}x${rows} up`).not.toBe(text(far, past, cols, rows).join("\n"));
+      if (cols === 60) expect(scrolls, `${n} ${cols}x${rows} scrolls`).toBe(true);
       expect(all, `${n} ${cols}x${rows}`).toContain(long);
       expect(all, `${n} ${cols}x${rows}`).toContain("then open fleet again.A run refuses");
       expect(plainScreen(far, cols).split("\n").map((l) => l.trim()).join(""), `${n} plain ${cols}`).toContain(long);
@@ -504,6 +532,11 @@ describe("NEEDS YOU", () => {
     expect(item.detail[1]).toContain("the deny rule claude-code, which covers the whole claude-code CLI");
     // so no other model of that CLI is let in to judge or review by a yes that named one
     expect(wide.base!.seat("claude-code:opus")!.denied.judge).not.toBeNull();
+    // a bare model id two CLIs serve is wider than the model too: by what it matches, not by its place in a list
+    const bare = derive(source({ repoText: "routing:\n  deny:\n    models: [zai/glm-5.3]\nconsult:\n  prefer: [pi:zai/glm-5.3]\n" }), initialScreen()).items.find((n) => n.id === "consult")!;
+    expect(bare.edits).toBeUndefined();
+    expect(bare.title).toBe("The consult has no model: pi:zai/glm-5.3 is under a wider rule.");
+    expect(bare.detail![1]).toContain("the deny rule zai/glm-5.3, which covers more than this model");
   });
   test("the consult with no consult.prefer set: a yes sets it, because the seat picker reads nothing else", () => {
     // a config that is not a first install, sets no consult.prefer, and denies the pinned consult for every seat

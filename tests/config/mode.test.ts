@@ -195,3 +195,17 @@ describe("v1.51 T1 mode edges", () => {
     expect(out).toMatch(/floors\.migration: mid is below integrity minimum frontier/);
   });
 });
+
+// A layer is a map of settings or nothing. A list or a single value used to REPLACE what was under it:
+// the user's file took every default with it and the schema reported fifteen missing settings.
+test("a config file that is a list or a single value is refused by name, in either layer; an empty, comment-only or null one is nothing", () => {
+  const load = (userOverlayText: string, repoOverlayText: string) => loadConfigWithMode("/", { userOverlayText, repoOverlayText });
+  expect(() => load("- a\n- b\n", "")).toThrow("The user config holds a list, not settings: write it as `key: value` lines");
+  expect(() => load("hello\n", "")).toThrow("The user config holds a single value, not settings");
+  expect(() => load("", "- a\n")).toThrow("The repository config holds a list, not settings");
+  expect(() => load("", "42\n")).toThrow("The repository config holds a single value, not settings");
+  for (const nothing of ["", "# only a comment\n", "~\n", "---\n"]) {
+    expect(() => load(nothing, nothing)).not.toThrow();
+    expect(load(nothing, "").cfg).toEqual(load("", "").cfg);
+  }
+});

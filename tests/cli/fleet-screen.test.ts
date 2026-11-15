@@ -6,33 +6,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { describe, expect, test } from "vitest";
-import { allAdapters, readDoctor, readModelsFirstSeen, writeDoctor } from "../../src/adapters/registry.js";
-import type { AuthHealth } from "../../src/adapters/types.js";
-import { fleetCommand, type FleetScreenIO } from "../../src/cli/commands/fleet-screen.js";
-import { DEFAULT_CONFIG } from "../../src/config/config.js";
+import { readDoctor, readModelsFirstSeen, writeDoctor } from "../../src/adapters/registry.js";
+import { fleetCommand } from "../../src/cli/commands/fleet-screen.js";
 import { lastRunDeaths, loadFleetSource, readDismissed } from "../../src/fleet/load.js";
-import { makeRepo } from "../helpers/tmprepo.js";
 
-const adapters = allAdapters({ operatorYaml: null, operatorPath: false });
-function health(dead: string[] = [], extra: Record<string, string[]> = {}): Record<string, AuthHealth> {
-  const out: Record<string, AuthHealth> = {};
-  for (const [adapter, t] of Object.entries(DEFAULT_CONFIG.tiers)) {
-    const models = [...Object.keys(t.models), ...(extra[adapter] ?? [])];
-    out[adapter] = { installed: true, authed: true, models, modelAuth: Object.fromEntries(models.map((m) => [m, dead.includes(`${adapter}:${m}`)
-      ? { authed: false, reason: "probe timed out (60000ms)", probedAt: new Date().toISOString() } : { authed: true, probedAt: new Date().toISOString() }])) };
-  }
-  return out;
-}
-function setup(opts: { repo?: string; dead?: string[]; probe?: boolean } = {}) {
-  const cwd = makeRepo({ "keep.txt": "x" });
-  const globalDir = mkdtempSync(join(tmpdir(), "tickmarkr-fleet-screen-"));
-  mkdirSync(join(cwd, ".tickmarkr"), { recursive: true });
-  if (opts.repo) writeFileSync(join(cwd, ".tickmarkr", "config.yaml"), opts.repo);
-  if (opts.probe !== false) writeDoctor(cwd, health(opts.dead ?? ["claude-code:fable"]));
-  const run = (argv: string[], io: FleetScreenIO = {}) => fleetCommand([...argv, "--global-dir", globalDir], cwd, adapters, { input: Object.assign(new PassThrough(), { isTTY: false }) as never, output: { isTTY: false, write: () => true }, ...io });
-  return { cwd, globalDir, run, overlay: () => readFileSync(join(cwd, ".tickmarkr", "config.yaml"), "utf8") };
-}
-const tty = { input: Object.assign(new PassThrough(), { isTTY: true }) as never, output: { isTTY: true, write: () => true } };
+import { adapters, health, setup, terminal, tty } from "./fleet-screen-world.js";
+
 
 describe("tickmarkr fleet in a linked worktree with no config of its own", () => {
   test("the review says the save writes a copy here and stops following the main checkout; the main file is never written", async () => {
@@ -137,6 +116,20 @@ describe("tickmarkr fleet without a terminal", () => {
     const { run } = setup();
     expect(await run(["--yes", "nope"])).toMatchObject({ code: 1 });
     expect(await run(["--save"])).toMatchObject({ code: 1 });
+  });
+  test("a config file that is there and cannot be read is said by name and cause, and --json answers in JSON", async () => {
+    const { run, cwd } = setup();
+    const file = join(cwd, ".tickmarkr", "config.yaml");
+    mkdirSync(file, { recursive: true });   // a directory where the file should be
+    await expect(run([])).rejects.toThrow(".tickmarkr/config.yaml cannot be read: it is a directory, not a file. A run refuses to start for the same reason.");
+    await expect(run(["--yes", "setup"])).rejects.toThrow("cannot be read: it is a directory, not a file");
+    const json = await run(["--json"]) as { out: string; code: number };
+    expect(json.code).toBe(1);
+    const said = JSON.parse(json.out) as { ok: boolean; error: string; in: string[] };
+    expect(said.ok).toBe(false);
+    expect(said.in).toHaveLength(1);
+    expect(said.in[0].endsWith(".tickmarkr/config.yaml")).toBe(true);
+    expect(said.error).toBe(`${said.in[0]} cannot be read: it is a directory, not a file. A run refuses to start for the same reason.`);
   });
   test("a config that does not load is reported, never drawn over", async () => {
     const { run, cwd } = setup({ repo: "routing:\n  mode: partner-lead\n" });
@@ -343,150 +336,6 @@ describe("tickmarkr fleet on a terminal", () => {
 
 // The production path: real key bytes into the Ink mount, one key sequence per event (Ink treats a
 // multi-character write as a paste). Frames are collected for assertions; nothing waits on a clock.
-const strip = (t: string) => t.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, "");
-function terminal() {
-  const input = Object.assign(new PassThrough(), { isTTY: true, setRawMode: () => {}, ref: () => input, unref: () => input });
-  const direct = input.write.bind(input);
-  const pending: string[] = [];
-  let pumping = false;
-  const pump = () => { const c = pending.shift(); if (c === undefined) { pumping = false; return; } direct(c); setImmediate(pump); };
-  input.write = ((chunk: string) => { pending.push(...(chunk.match(/\x1b\[[0-9;]*[A-Za-z~]|[\s\S]/g) ?? [])); if (!pumping) { pumping = true; setImmediate(pump); } return true; }) as typeof input.write;
-  const writes: string[] = [];
-  const waiters: Array<{ marker: string; resolve: () => void }> = [];
-  const output = { isTTY: true, columns: 100, rows: 30, on: () => {}, off: () => {}, removeListener: () => {},
-    write: (chunk: string) => {
-      writes.push(chunk);
-      for (let i = waiters.length - 1; i >= 0; i--) if (strip(chunk).includes(waiters[i].marker)) waiters.splice(i, 1)[0].resolve();
-      return true;
-    } };
-  // a frame that never comes fails by name, with the last frame drawn, instead of at the test's timeout
-  /** One chunk, unsplit: what a driver or fast typing delivers. */
-  const burst = (chunk: string) => direct(chunk);
-  const frame = (marker: string) => new Promise<void>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`no frame containing "${marker}"; the last frame was:\n${strip(writes.filter((w) => w.length > 80).at(-1) ?? "")}`)), 8000);
-    waiters.push({ marker, resolve: () => { clearTimeout(timer); resolve(); } });
-  });
-  return { input, output, frame, burst, text: () => writes.map(strip).join("\n") };
-}
-
-describe("the real mount", () => {
-  test("arrow keys, no, details, yes, the review and the save run through the Ink screen to the file", async () => {
-    const { run, overlay, cwd } = setup();
-    const t = terminal();
-    const done = run([], { input: t.input as never, output: t.output as never });
-    await t.frame("NEEDS YOU");
-    // the second item, reached with a real arrow-key sequence, is the model that did not answer: not now
-    let next = t.frame("not asked again");
-    t.input.write("\x1b[Bn");
-    await next;
-    next = t.frame("Yes changes:");
-    t.input.write("d");
-    await next;
-    next = t.frame("answered yes");
-    t.input.write("y");
-    await next;
-    next = t.frame("WHAT CHANGES");
-    t.input.write("\r");
-    await next;
-    next = t.frame("Saved to .tickmarkr/config.yaml.");
-    t.input.write("y");
-    await next;
-    t.input.write("q");
-    expect(await done).toBe("fleet: saved .tickmarkr/config.yaml");
-    expect(overlay()).toContain("pool:");
-    expect(t.text()).toContain("acceptance (judge)");
-    expect(readDismissed(cwd).size).toBe(1);
-  });
-  test("a no is remembered at once and u forgets it at once: the item is asked again", async () => {
-    const { run, cwd } = setup();
-    const t = terminal();
-    const done = run([], { input: t.input as never, output: t.output as never });
-    await t.frame("NEEDS YOU (2)");
-    let next = t.frame("NEEDS YOU (1)");
-    t.input.write("n");
-    await next;
-    expect(readDismissed(cwd).size).toBe(1);
-    next = t.frame("NEEDS YOU (2)");
-    t.input.write("u");
-    await next;
-    expect(readDismissed(cwd).size).toBe(0);
-    t.input.write("q");
-    expect(await done).toBe("fleet: nothing changed");
-  });
-  test("a no that cannot be written down is said in one line and does not end the screen", async () => {
-    const { run, cwd } = setup();
-    const dir = join(cwd, ".tickmarkr");
-    const t = terminal();
-    const done = run([], { input: t.input as never, output: t.output as never });
-    await t.frame("NEEDS YOU (2)");
-    chmodSync(dir, 0o555);
-    try {
-      // the answer holds for this screen, and the screen says the file could not take it
-      let next = t.frame("could not be written down");
-      t.input.write("n");
-      await next;
-      expect(t.text()).toContain("NEEDS YOU (1)");
-      // undoing it is just as safe
-      next = t.frame("NEEDS YOU (2)");
-      t.input.write("u");
-      await next;
-    } finally { chmodSync(dir, 0o755); }
-    t.input.write("q");
-    expect(await done).toBe("fleet: nothing changed");
-    expect(readDismissed(cwd).size).toBe(0);
-  });
-  test("an error inside a key press leaves through the screen's own exit, not as a crash in the key handler", async () => {
-    const { cwd, globalDir } = setup();
-    const source = loadFleetSource(cwd, { globalDir, adapters });
-    // a fault injected where the mount reads the remembered answers, armed after the first frame
-    let armed = false;
-    const ctx = source.ctx;
-    const faulty = { ...source, ctx: new Proxy(ctx, { get: (target, prop, receiver) => { if (armed && prop === "dismissed") throw new Error("injected fault"); return Reflect.get(target, prop, receiver) as unknown; } }) };
-    const t = terminal();
-    const { runFleetScreen } = await import("../../src/tui/ink/fleet-screen.js");
-    // the screen draws as soon as it is mounted, so the wait is set up first
-    const first = t.frame("NEEDS YOU");
-    const done = runFleetScreen({ source: faulty, input: t.input as never, output: t.output as never });
-    await first;
-    armed = true;
-    t.input.write("n");
-    // the promise the command awaits is rejected with the error, so its cleanup runs and the command reports it
-    await expect(done).rejects.toThrow("injected fault");
-  });
-  test("several keys in one chunk are applied in order, and a chunk can never save", async () => {
-    const { run, cwd } = setup();
-    const t = terminal();
-    const done = run([], { input: t.input as never, output: t.output as never });
-    await t.frame("NEEDS YOU");
-    // yes to the first item, open the review, and a y that would save: all in one chunk
-    const next = t.frame("Press y to save.");
-    t.burst("y\ry");
-    await next;
-    expect(t.text()).toContain("WHAT CHANGES");
-    expect(existsSync(join(cwd, ".tickmarkr", "config.yaml"))).toBe(false);
-    // the same y on its own saves
-    const saved = t.frame("Saved to .tickmarkr/config.yaml.");
-    t.input.write("y");
-    await saved;
-    t.input.write("q");
-    expect(await done).toBe("fleet: saved .tickmarkr/config.yaml");
-  });
-  test("q with a yes not yet saved warns once and quits on the second q, writing nothing", async () => {
-    const { run, cwd } = setup();
-    const t = terminal();
-    const done = run([], { input: t.input as never, output: t.output as never });
-    await t.frame("NEEDS YOU");
-    let next = t.frame("answered yes");
-    t.input.write("y");
-    await next;
-    next = t.frame("q again quits without saving");
-    t.input.write("q");
-    await next;
-    t.input.write("q");
-    expect(await done).toBe("fleet: quit; 1 change was not saved");
-    expect(existsSync(join(cwd, ".tickmarkr", "config.yaml"))).toBe(false);
-  });
-});
 
 describe("what the screen reads from disk", () => {
   test("a probe records, inside doctor.json and nowhere else, when each model was first listed", () => {
@@ -579,6 +428,8 @@ describe("what the screen reads from disk", () => {
     expect(offered({ "gpt-6-astra": 100, "gemini-next": 20, "gemini-next-low": 96 }, ["google/gemini-next-low"])).toEqual([{ model: "google/gemini-next-low", score: 96, tier: "frontier", best: 100 }]);
     // an identity without a suffix meets its own row
     expect(offered({ "gpt-6-astra": 100, "gemini-next": 95 }, ["google/gemini-next"])).toEqual([{ model: "google/gemini-next", score: 95, tier: "frontier", best: 100 }]);
+    // between the two bands it is offered as mid, not dropped and not called frontier
+    expect(offered({ "gpt-6-astra": 100, "gemini-next": 80 }, ["google/gemini-next"])).toEqual([{ model: "google/gemini-next", score: 80, tier: "mid", best: 100 }]);
   });
   test("a malformed benchmark table in the catalog cache leaves the screen drawing", async () => {
     const tables: Record<string, unknown> = {
@@ -622,6 +473,11 @@ describe("what the screen reads from disk", () => {
   test("an id that is not one of the screen's questions is refused by name, and --save needs an answer", async () => {
     const { run, cwd } = setup();
     expect(await run(["--yes", "nope"])).toEqual({ out: "tickmarkr fleet --yes: nope is not something this fleet asks a yes about — tickmarkr fleet --json lists the ids", code: 1 });
+    expect(await run(["--yes", ""])).toEqual({ out: "tickmarkr fleet --yes: an id is missing after --yes — tickmarkr fleet --json lists the ids", code: 1 });
+    // --json prints the screen and changes nothing: beside an answer it is refused, never the screen with the answer dropped
+    for (const args of [["--json", "--yes", "nope"], ["--json", "--set", "mode=staff-led", "--save"], ["--json", "--save"]]) {
+      expect(await run(args), args.join(" ")).toEqual({ out: "tickmarkr fleet: --json prints the screen and changes nothing — it does not go with --yes, --set or --save", code: 1 });
+    }
     expect(await run(["--yes", "setup", "--yes", "nope", "--save"])).toMatchObject({ code: 1 });
     expect(await run(["--save"])).toEqual({ out: "tickmarkr fleet: --save needs --yes <id> or --set <line>=<models>", code: 1 });
     expect(existsSync(join(cwd, ".tickmarkr", "config.yaml"))).toBe(false);
@@ -672,6 +528,8 @@ describe("what the screen reads from disk", () => {
     // the routing mode is set the same way, and only to one of its three values
     expect(await run(["--set", "mode=partner-led", "--save"])).toContain("mode: partner-led");
     expect(overlay()).toMatch(/^ {2}mode: partner-led$/m);
+    // the mode it already has is said as a mode, not as a list of models
+    expect(await run(["--set", "mode=partner-led"])).toMatchObject({ code: 1, out: "tickmarkr fleet --set: mode is already partner-led" });
     const wrong = await run(["--set", "mode=fastest", "--save"]);
     expect(wrong).toMatchObject({ code: 1 });
     expect((wrong as { out: string }).out).toContain("fastest is not something mode can name");
@@ -687,6 +545,12 @@ describe("what the screen reads from disk", () => {
       [["--set", "implement=codex:gpt-6-astra,codex:gpt-6-astra"], "implement names a model twice"],
       [["--set", "implement=codex:gpt-6-astra", "--set", "implement=claude-code:opus"], "implement is set twice"],
       [["--set", "implement=codex:gpt-6-astra,claude-code:opus"], "implement already has exactly those models, in that order"],
+      // a capital or a space around the line's name is the same line
+      [["--set", "IMPLEMENT = codex:gpt-6-astra,claude-code:opus"], "implement already has exactly those models, in that order"],
+      // a bare name, as the screen draws it, is not a key: the one key it can mean is offered, once
+      [["--set", "implement=opus"], "opus is not a working model that may take implement — did you mean claude-code:opus? — tickmarkr fleet --json lists them under lines"],
+      [["--set", "implement=opus,opus"], "opus is not a working model that may take implement — did you mean claude-code:opus?"],
+      [["--set", "implement=no-such,opus"], "no-such, opus are not working models that may take implement — did you mean claude-code:opus?"],
     ] as const) {
       const out = await run([...args, "--save"]);
       expect(out, args.join(" ")).toMatchObject({ code: 1 });

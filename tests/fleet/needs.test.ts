@@ -250,11 +250,98 @@ describe("a line that reads wrong and that no yes can change still has an item, 
       for (const ask of asks) expect(ask, reason).toMatch(/^(Press r to probe \S+\.|(Install|Sign in to) \S+, then press r\.|\S+: [^.]+\. [^.]+, then press r\.|No )/);
     }
   });
+  test("a CLI that is signed out is one item, however many of its models the team names", () => {
+    // implement's pool names two codex models: signing in to codex once brings both back
+    const h = health();
+    h.codex = { ...h.codex, authed: false, note: "not signed in" };
+    const fixes = needs(buildFleetModel(source({ repoText: `${POOL}${CONSULT}`, health: h }).inputs)).filter((n) => n.id.startsWith("fix:"));
+    expect(fixes.map((n) => n.id)).toEqual(["fix:codex:signed-out"]);
+    expect(fixes[0].title).toBe("codex is signed out: gpt-6-astra, gpt-5.6-terra do not work.");
+    expect(fixes[0].ask).toBe("Sign in to codex, then press r. You get: 1 shape gets a working model.");
+    // one model that failed on its own keeps an item of its own, named for the model
+    const one = needs(buildFleetModel(source({ repoText: `${POOL}${CONSULT}`, health: health(["codex:gpt-6-astra", "codex:gpt-5.6-terra"]) }).inputs)).filter((n) => n.id.startsWith("fix:"));
+    expect(one.map((n) => n.title)).toEqual(["gpt-6-astra does not work: no answer (codex).", "gpt-5.6-terra does not work: no answer (codex)."]);
+  });
+  test("a key under routing.map or routing.floors that is no shape is said: it loads, does nothing, and the nearest shape is asked about", () => {
+    // 'implment' was meant to give implement a pool: it loads without a word and implement keeps what it had
+    const one = item({ repoText: `routing:\n  map:\n    implment:\n      pool:\n        mode: any\n        channels: [codex:gpt-6-astra]\n${CONSULT}` }, "notshape")!;
+    expect(one.title).toBe("routing.map.implment names no shape: it does nothing.");
+    expect(one.ask).toBe("Did you mean implement? Correct it in the config, then open fleet again.");
+    expect(one.edits).toBeUndefined();
+    // two of them, one in the floors; a name near no shape is answered with the list of shapes
+    const two = item({ repoText: `routing:\n  map:\n    implment:\n      escalate: false\n  floors:\n    tsets: mid\n${CONSULT}` }, "notshape")!;
+    expect(two.title).toBe("routing.map.implment and routing.floors.tsets name no shape: they do nothing.");
+    expect(two.ask).toBe("Did you mean implement and tests? Correct them in the config, then open fleet again.");
+    const far = item({ repoText: `routing:\n  floors:\n    deployment: mid\n${CONSULT}` }, "notshape")!;
+    expect(far.ask).toBe("The shapes are plan, spec, implement, tests, docs, migration, ui, refactor, chore. Correct it in the config, then open fleet again.");
+    // a config that names only shapes has no such item
+    expect(item({ repoText: `${POOL}${CONSULT}` }, "notshape")).toBeUndefined();
+  });
+  test("a pool entry whose id its CLI no longer serves joins the entries to remove, counted apart and named; one its CLI still lists does not", () => {
+    // implement's pool: gpt-6-astra answers; gpt-5.6-terra's probe was told 'unknown model id'
+    const served = (listed: boolean, list = true) => {
+      const h = health();
+      h.codex.modelAuth!["gpt-5.6-terra"] = { authed: false, reason: "unknown model id gpt-5.6-terra", probedAt: "2026-11-10T00:00:00Z" } as never;
+      h.codex = { ...h.codex, models: list ? h.codex.models.filter((m) => listed || m !== "gpt-5.6-terra") : [] };
+      return { repoText: `${POOL}${CONSULT}`, health: h };
+    };
+    // the CLI's own list does not offer it either: retired, and the yes drops it from the pool
+    const gone = item(served(false), "tidy")!;
+    expect(gone.title).toBe("1 pool entry names an id its CLI no longer serves.");
+    expect(gone.ask).toBe("Remove it? No task changes worker.");
+    expect(gone.detail).toContain("codex:gpt-5.6-terra: its CLI answered that it no longer serves this id, and its own list of models does not offer it.");
+    expect(gone.edits).toEqual([expect.objectContaining({ path: ["routing", "map", "implement"], value: { pool: { mode: "any", channels: ["codex:gpt-6-astra"] } }, label: "implement: drop codex:gpt-5.6-terra (no longer served)" })]);
+    // the CLI still lists the id: the probe's word alone is not enough to remove it
+    expect(item(served(true), "tidy")).toBeUndefined();
+    // a CLI that lists no models at all: it counts, and the details say what the verdict rests on
+    expect(item(served(false, false), "tidy")!.detail).toContain("codex:gpt-5.6-terra: its CLI answered that it no longer serves this id; that CLI lists no models, so this rests on the probe's answer alone.");
+    // beside a rule that does nothing, each is counted apart
+    const both = item({ ...served(false), userText: "routing:\n  deny:\n    models: [nosuch:model]\n" }, "tidy")!;
+    expect(both.title).toBe("1 deny rule does nothing; 1 pool entry names an id its CLI no longer serves.");
+    expect(both.ask).toBe("Remove them? No task changes worker.");
+    // a model that only timed out keeps its place: nothing to remove
+    expect(item({ repoText: `${POOL}${CONSULT}`, health: health(["codex:gpt-5.6-terra"]) }, "tidy")).toBeUndefined();
+  });
+  test("an id its CLI no longer serves is never 'remove the id … you get': listed, it is probed again; unlisted, nothing is promised", () => {
+    // implement rests on that one id, so its return would give the shape a working model
+    const only = `routing:\n  map:\n    implement:\n      pool:\n        mode: any\n        channels: [codex:gpt-5.6-terra]\n${CONSULT}`;
+    const served = (listed: boolean) => {
+      const h = health();
+      h.codex.modelAuth!["gpt-5.6-terra"] = { authed: false, reason: "unknown model id gpt-5.6-terra", probedAt: "2026-11-10T00:00:00Z" } as never;
+      h.codex = { ...h.codex, models: h.codex.models.filter((m) => listed || m !== "gpt-5.6-terra") };
+      return needs(buildFleetModel(source({ repoText: only, health: h }).inputs));
+    };
+    // the CLI still lists it: the probe's answer is doubtful, and asking again is what may bring the shape its model
+    const again = served(true).find((n) => n.id.startsWith("fix:"))!;
+    expect(again.title).toBe("gpt-5.6-terra does not work: id no longer served (codex).");
+    expect(again.ask).toBe("Its CLI still lists that id: press r to probe it again. You get: 1 shape gets a working model.");
+    // the CLI does not list it: nothing done there brings it back, so no item says "you get"
+    const gone = served(false);
+    expect(gone.filter((n) => n.id.startsWith("fix:"))).toEqual([]);
+    expect(gone.map((n) => n.ask).join(" ")).not.toMatch(/Remove the id/);
+    // and the shape it left without a model still has an item about it
+    expect(gone.some((n) => ["noseat", "tidy"].includes(n.id))).toBe(true);
+  });
   test("one rule that does nothing is 'it', several are 'them'", () => {
     const one = item({ repoText: CONSULT, userText: "routing:\n  deny:\n    models: [nosuch:model]\n" }, "tidy")!;
     expect(`${one.title} ${one.ask}`).toBe("1 deny rule does nothing. Remove it? No task changes worker.");
     const two = item({ repoText: CONSULT, userText: "routing:\n  deny:\n    models: [nosuch:model, nosuch:other]\n" }, "tidy")!;
     expect(`${two.title} ${two.ask}`).toBe("2 deny rules do nothing. Remove them? No task changes worker.");
+  });
+});
+
+describe("the last run's item asks while the work has nowhere to go, and no longer", () => {
+  const lastRun = [{ runId: "run-1", seat: "codex:gpt-6-astra", shapes: ["implement"], tasks: ["T7"] }] as never;
+  const pool = (channels: string) => `routing:\n  mode: partner-led\n  map:\n    implement:\n      pool:\n        mode: any\n        channels: [${channels}]\n${CONSULT}`;
+  const ids = (over: Parameters<typeof source>[0]) => needs(buildFleetModel(source(over).inputs), { lastRun }).map((n) => n.id);
+  test("the pool's only other model is below the floor: the item offers fallbacks at the floor", () => {
+    expect(ids({ repoText: pool("codex:gpt-6-astra, codex:gpt-5.6-terra") })).toContain("run:run-1:codex:gpt-6-astra");
+  });
+  test("the pool already holds another working model at the floor: nothing is asked, though more models at the floor exist outside it", () => {
+    expect(ids({ repoText: pool("codex:gpt-6-astra, claude-code:fable") })).not.toContain("run:run-1:codex:gpt-6-astra");
+  });
+  test("that other model does not answer: the item is back", () => {
+    expect(ids({ repoText: pool("codex:gpt-6-astra, claude-code:fable"), health: health(["claude-code:fable"]) })).toContain("run:run-1:codex:gpt-6-astra");
   });
 });
 

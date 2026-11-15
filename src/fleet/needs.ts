@@ -251,9 +251,16 @@ const otherVendors = (M: FleetModel, sim: Sample, role: "judge" | "review"): { c
 function restorable(M: FleetModel): Need[] {
   const named = new Set<string>([...SHAPES.flatMap((s) => M.cfg.routing.map[s]?.pool?.channels ?? []), ...(M.cfg.consult.prefer ?? []), ...(M.cfg.review.prefer ?? []),
     channelKey(M.cfg.judge), channelKey(M.cfg.consult), ...SHAPES.flatMap((s) => { const p = M.cfg.routing.map[s]?.pin; return p ? [`${p.via}:${p.model}`] : []; })]);
-  const dead = M.seats.filter((s) => s.status === "dead" && s.verdict.state === "fail" && named.has(s.key));
+  // An id its CLI no longer serves does not come back by anything done in that CLI. Where the CLI's own
+  // list of models still offers the id, the probe's word is worth asking again; where it does not, there
+  // is nothing to get back, and no item promises it (the entries to remove are tidy's).
+  const listed = (s: Seat): boolean => (M.health?.[s.adapter]?.models ?? []).includes(s.model);
+  const dead = M.seats.filter((s) => s.status === "dead" && s.verdict.state === "fail" && named.has(s.key) && !(s.verdict.kind === "retired" && !listed(s)));
   const groups = new Map<string, Seat[]>();
-  for (const s of dead) groups.set(`${s.identity}|${s.verdict.fix}`, [...(groups.get(`${s.identity}|${s.verdict.fix}`) ?? []), s]);
+  // A CLI that is signed out is one thing to do, however many of its models the team names: one item for the CLI.
+  const signedOut = (s: Seat): boolean => M.health?.[s.adapter]?.authed === false;
+  const groupOf = (s: Seat): string => (signedOut(s) ? `cli|${s.adapter}` : `${s.identity}|${s.verdict.fix}`);
+  for (const s of dead) groups.set(groupOf(s), [...(groups.get(groupOf(s)) ?? []), s]);
   const base = M.sample();
   const out: Array<Need & { score: number }> = [];
   for (const seats of groups.values()) {
@@ -268,14 +275,27 @@ function restorable(M: FleetModel): Need[] {
     if (base.noReviewer > sim.noReviewer) gains.push([`${(base.noReviewer - sim.noReviewer).toLocaleString("en-US")} more sample tasks get a reviewer`, (100 * (base.noReviewer - sim.noReviewer)) / base.total]);
     if (base.under > sim.under) gains.push([`${(base.under - sim.under).toLocaleString("en-US")} fewer sample tasks below their floor`, (100 * (base.under - sim.under)) / base.total]);
     if (!gains.length) continue;
-    const s = seats[0], v = s.verdict;
-    out.push({ id: `fix:${s.identity}:${v.kind}`, score: gains.reduce((t, g) => t + g[1], 0),
-      title: `${s.name} does not work: ${v.text} (${[...new Set(seats.map((x) => x.adapter))].join(", ")}).`,
-      ask: `${v.kind === "timeout" ? "Press r to probe it again" : `${cap(v.fix)}, then press r`}. You get: ${gains[0][0]}.`,
+    const s = seats[0], v = s.verdict, names = [...new Set(seats.map((x) => x.name))];
+    out.push({ id: signedOut(s) ? `fix:${s.adapter}:signed-out` : `fix:${s.identity}:${v.kind}`, score: gains.reduce((t, g) => t + g[1], 0),
+      title: signedOut(s) ? `${s.adapter} is signed out: ${names.slice(0, 3).join(", ")}${names.length > 3 ? ` and ${names.length - 3} more` : ""} ${names.length === 1 ? "does" : "do"} not work.`
+        : `${s.name} does not work: ${v.text} (${[...new Set(seats.map((x) => x.adapter))].join(", ")}).`,
+      ask: `${v.kind === "timeout" ? "Press r to probe it again" : v.kind === "retired" ? "Its CLI still lists that id: press r to probe it again" : `${cap(v.fix)}, then press r`}. You get: ${gains[0][0]}.`,
       detail: [...(v.raw ? [`The probe said: ${v.raw.slice(0, 240)}`] : []), ...gains.map((g) => `You get: ${g[0]}.`)] });
   }
   return out.sort((a, b) => b.score - a.score).map(({ score: _score, ...need }) => need);
 }
+
+/** How many single-letter changes turn one word into another: a misspelled shape is one or two away from the shape it was meant for. */
+function distance(a: string, b: string): number {
+  let row = [...Array(b.length + 1).keys()];
+  for (let i = 1; i <= a.length; i++) {
+    const next = [i];
+    for (let j = 1; j <= b.length; j++) next[j] = Math.min(row[j] + 1, next[j - 1] + 1, row[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    row = next;
+  }
+  return row[b.length];
+}
+const nearestShape = (key: string): string | undefined => SHAPES.map((s) => [s, distance(key, s)] as const).filter(([, d]) => d <= 2).sort((x, y) => x[1] - y[1])[0]?.[0];
 
 /** What needs a yes or a no, most urgent first. */
 export function needs(M: FleetModel, ctx: NeedsContext = {}): Need[] {
@@ -455,7 +475,11 @@ export function needs(M: FleetModel, ctx: NeedsContext = {}): Need[] {
       // "at that shape's floor" is the promise: a fallback below the floor would put tasks under it
       const floor = cfg.routing.floors[sh];
       const add = pools[sh].filter((k) => !(slot?.pool?.channels ?? []).includes(k) && (!floor || TIER_RANK[M.seat(k)?.tier ?? "cheap"] >= TIER_RANK[floor]));
-      return slot?.pool && add.length ? [{ layer: holder(["routing", "map", sh]), path: ["routing", "map", sh], value: { pool: { mode: slot.pool.mode, channels: [...slot.pool.channels, ...add] } }, label: `${sh}: add ${add.map((k) => M.name(k)).join(", ")} as fallbacks` }] : [];
+      // The question is whether a task that needs the floor has somewhere to go. With another working
+      // model at the floor already in the pool it has: the item does not keep asking for one more each
+      // time a model joins the machine or the floor moves.
+      const covered = (slot?.pool?.channels ?? []).some((k) => k !== d.seat && !!M.seat(k)?.live.worker && (!floor || TIER_RANK[M.seat(k)?.tier ?? "cheap"] >= TIER_RANK[floor]));
+      return slot?.pool && add.length && !covered ? [{ layer: holder(["routing", "map", sh]), path: ["routing", "map", sh], value: { pool: { mode: slot.pool.mode, channels: [...slot.pool.channels, ...add] } }, label: `${sh}: add ${add.map((k) => M.name(k)).join(", ")} as fallbacks` }] : [];
     });
     if (es.length) out.push({ id: `run:${d.runId}:${d.seat}`, title: `Last run: ${M.name(d.seat)} hit its limit and no other model could take over.`,
       ask: `Add ${es[0].label.replace(/^.*: add /, "").replace(" as fallbacks", "")} as fallbacks for ${list(d.shapes)}?`, edits: es,
@@ -530,26 +554,60 @@ export function needs(M: FleetModel, ctx: NeedsContext = {}): Need[] {
     if (unprobed.length) out.push({ id: `unprobed:${unprobed.map((s) => s.key).join()}`, title: `${plural(unprobed.length, "model")} in the team ${unprobed.length === 1 ? "was" : "were"} never probed: ${unprobed.map((s) => s.name).join(", ")}.`,
       ask: "Press r to probe.", detail: [`${list(unprobed.map((s) => s.key))} ${unprobed.length === 1 ? "is" : "are"} named in a pool and allowed, but no probe has asked ${unprobed.length === 1 ? "it" : "them"} yet.`, "A model takes no work before it has answered a probe."] });
 
+    // A key under routing.map or routing.floors that is no shape is read and never used: a misspelled
+    // shape loads without a word, and the shape it was meant for keeps what it had. Nothing else in the
+    // product says so. No yes: which shape was meant is the user's to say, so the nearest is a question.
+    const notShape = (k: string): boolean => !(SHAPES as readonly string[]).includes(k);
+    const strays = [...Object.keys(cfg.routing.map).filter(notShape).map((k) => `routing.map.${k}`), ...Object.keys(cfg.routing.floors).filter(notShape).map((k) => `routing.floors.${k}`)];
+    if (strays.length) {
+      const meant = [...new Set(strays.map((k) => nearestShape(k.slice(k.lastIndexOf(".") + 1))).filter((s): s is string => !!s))];
+      out.push({ id: "notshape", title: `${list(strays)} ${strays.length === 1 ? "names no shape: it does nothing" : "name no shape: they do nothing"}.`,
+        ask: `${meant.length ? `Did you mean ${list(meant)}?` : `The shapes are ${SHAPES.join(", ")}.`} Correct ${strays.length === 1 ? "it" : "them"} in the config, then open fleet again.`,
+        detail: [`A shape is one of ${SHAPES.join(", ")}.`, "An entry under any other name loads and is never used: the shape it was meant for keeps what it had.", "There is no yes here: which shape was meant is yours to say."] });
+    }
+
     const idle = denyRules(M).filter((r) => r.idle);
     const byPath = new Map<string, Rule[]>();
     for (const r of idle) byPath.set(r.path.join("."), [...(byPath.get(r.path.join(".")) ?? []), r]);
     const es: Edit[] = [...byPath.values()].map((rs) => ({ layer: holder(rs[0].path), path: rs[0].path, value: (valueAt(cfg, rs[0].path) as string[]).filter((e) => !rs.some((r) => r.entry === e)),
       label: `remove ${plural(rs.length, "deny rule")} that ${rs.length === 1 ? "keeps" : "keep"} nothing out` }));
-    let dead = 0;
+    // A pool entry whose id its CLI no longer serves is not a passing outage: it does not come back
+    // (queue row 454). It counts as retired only when the CLI's own list of models does not offer the
+    // id either; where a CLI lists nothing, the verdict rests on the probe's answer alone, and the
+    // details say so.
+    const retiredBy = (c: string): "list" | "probe" | undefined => {
+      const seat = M.seat(c);
+      if (!seat || seat.verdict.kind !== "retired") return undefined;
+      const listed = M.health?.[seat.adapter]?.models ?? [];
+      return listed.includes(seat.model) ? undefined : listed.length ? "list" : "probe";
+    };
+    let dead = 0, retired = 0;
+    const gone = new Map<string, "list" | "probe">();
     for (const s of SHAPES) {
       const slot = cfg.routing.map[s];
       if (!slot?.pool) continue;
       // Dead means the config itself keeps the entry out: it names a model no CLI lists, or one denied
       // for workers. A model that failed its probe (signed out, out of quota, timed out) or was never
       // probed is not dead: it comes back, and a pool's other entries are there for exactly that day.
-      const keep = slot.pool.channels.filter((c) => { const seat = M.seat(c); return !!seat && !seat.denied.worker; });
+      const allowed = slot.pool.channels.filter((c) => { const seat = M.seat(c); return !!seat && !seat.denied.worker; });
+      const keep = allowed.filter((c) => !retiredBy(c));
       if (!keep.some((c) => M.seat(c)?.live.worker) || keep.length === slot.pool.channels.length) continue;
-      dead += slot.pool.channels.length - keep.length;
-      es.push({ layer: holder(["routing", "map", s]), path: ["routing", "map", s], value: { pool: { mode: slot.pool.mode, channels: keep } }, label: `${s}: drop ${plural(slot.pool.channels.length - keep.length, "pool entry", "pool entries")} the config keeps out` });
+      const kept = slot.pool.channels.length - allowed.length, left = allowed.filter((c) => retiredBy(c));
+      dead += kept;
+      retired += left.length;
+      for (const c of left) gone.set(c, retiredBy(c)!);
+      es.push({ layer: holder(["routing", "map", s]), path: ["routing", "map", s], value: { pool: { mode: slot.pool.mode, channels: keep } },
+        label: `${s}: drop ${[kept ? `${plural(kept, "pool entry", "pool entries")} the config keeps out` : "", left.length ? `${left.join(", ")} (no longer served)` : ""].filter(Boolean).join(" and ")}` });
     }
-    if (es.length) out.push({ id: "tidy", title: `${[idle.length ? plural(idle.length, "deny rule") : "", dead ? plural(dead, "pool entry", "pool entries") : ""].filter(Boolean).join(" and ")} ${idle.length + dead === 1 ? "does" : "do"} nothing.`,
-      ask: `Remove ${idle.length + dead === 1 ? "it" : "them"}? No task changes worker.`, edits: es,
-      detail: [...(dead ? [`${plural(dead, "pool entry names", "pool entries name")} a model that the rules keep from all work, or that no CLI lists. A model that only failed its probe keeps its place.`] : []), ...idle.map((r) => `deny ${r.entry}: ${r.why}`)] });
+    // the title counts what merely does nothing apart from what is retired, so the yes says what it removes
+    const idleSays = idle.length + dead ? `${[idle.length ? plural(idle.length, "deny rule") : "", dead ? plural(dead, "pool entry", "pool entries") : ""].filter(Boolean).join(" and ")} ${idle.length + dead === 1 ? "does" : "do"} nothing` : "";
+    const retiredSays = retired ? `${plural(retired, "pool entry names", "pool entries name")} an id its CLI no longer serves` : "";
+    if (es.length) out.push({ id: "tidy", title: `${[idleSays, retiredSays].filter(Boolean).join("; ")}.`,
+      ask: `Remove ${idle.length + dead + retired === 1 ? "it" : "them"}? No task changes worker.`, edits: es,
+      detail: [...(dead ? [`${plural(dead, "pool entry names", "pool entries name")} a model that the rules keep from all work, or that no CLI lists. A model that only failed its probe keeps its place.`] : []),
+        ...[...gone].map(([c, by]) => `${c}: its CLI answered that it no longer serves this id${by === "list" ? ", and its own list of models does not offer it" : "; that CLI lists no models, so this rests on the probe's answer alone"}.`),
+        ...(retired ? ["An id that is no longer served does not come back, unlike a model that is signed out, out of quota or slow: those keep their place."] : []),
+        ...idle.map((r) => `deny ${r.entry}: ${r.why}`)] });
   }
   // Old results come first: every line above and every item below rests on them. Without this the
   // screen could say "Nothing. Every shape … has a working model." on what was true weeks ago.

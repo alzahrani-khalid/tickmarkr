@@ -2,7 +2,7 @@ import { Box, render, Text, useApp, useInput } from "ink";
 import type { ReactNode } from "react";
 import { useRef, useState } from "react";
 import type { InitConfigOverlay } from "../../config/config.js";
-import { classifyHost, resolveDriver } from "../../drivers/index.js";
+import { captureHost, classifyHost, resolveDriver } from "../../drivers/index.js";
 import { ToggleMark } from "./components.js";
 import { clip, INK, inkInput, inkOutput, KeyBar, padCell, Pointer } from "./frame.js";
 
@@ -31,8 +31,11 @@ const DRIVER_DESC: Record<Driver, string> = {
   orca: "orca: visible terminals in the Orca app — picked by auto inside one; name it elsewhere",
 };
 
-export function driverDescription(driver: Driver, host: DetectedHost = detectedHost()): string {
-  if (driver === "auto") return `auto — resolves to ${host} here`;
+// Queue row 391 (D-2187 add.263): inside a detected Rex pane auto still resolves to subprocess, and says why.
+const REX_AUTO_DESC = "auto — resolves to subprocess here (Rex detected, no Rex driver: running headless)";
+
+export function driverDescription(driver: Driver, host: DetectedHost = detectedHost(), rex: boolean = captureHost().rex === true): string {
+  if (driver === "auto") return host === "subprocess" && rex ? REX_AUTO_DESC : `auto — resolves to ${host} here`;
   return DRIVER_DESC[driver];
 }
 const VISIBILITY: readonly VisibilityLlm[] = ["pane", "headless"];
@@ -239,7 +242,10 @@ export function InitWizardApp({ fields, frameColumns = 74 }: { fields: InitWizar
         <Text> </Text>
         {rendered}
       </Box>
-      <Text dimColor>{` ${clip(rows[cursor].desc, width - 2)}`}</Text>
+      {/* Row 391: the Rex sentence wraps rather than clipping; every other description keeps its clip. */}
+      {rows[cursor].desc === REX_AUTO_DESC
+        ? <Text dimColor wrap="wrap">{` ${REX_AUTO_DESC}`}</Text>
+        : <Text dimColor>{` ${clip(rows[cursor].desc, width - 2)}`}</Text>}
       <KeyBar
         binds={[
           { key: "Enter/Space", label: "change" },

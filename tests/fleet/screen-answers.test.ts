@@ -6,12 +6,40 @@ import { DEFAULT_CONFIG } from "../../src/config/config.js";
 import { applyLayer } from "../../src/fleet/edits.js";
 import { buildFleetModel, verdictOf } from "../../src/fleet/model.js";
 import { needSignature, type NewModel, recommendedPools } from "../../src/fleet/needs.js";
-import { derive, frame, initialScreen, plainScreen, press, resumeScreen, type ScreenSource, teamRows } from "../../src/fleet/screen.js";
+import { wrap } from "../../src/fleet/draw.js";
+import { derive, frame, initialScreen, plainReview, plainScreen, press, resumeScreen, type ScreenSource, teamRows } from "../../src/fleet/screen.js";
 import { handLines } from "../../src/fleet/hand.js";
 import { withFirstSeen } from "../../src/fleet/seen.js";
 import { cellWidth } from "../../src/tui/cockpit/width.js";
 import { health, NOW, POOL, source } from "./world.js";
 import { keys, text } from "./drive.js";
+
+const otherTiers = () => `tiers:\n${Object.keys(DEFAULT_CONFIG.tiers).filter((a) => !["claude-code", "codex"].includes(a)).map((a) => `  ${a}: null\n`).join("")}`;
+
+/** Claude-code workers and a codex judge. The allowlist keeps every other reviewer out, so the only
+ *  item is that question, three rows at 80 columns. The pools differ just enough that the team has
+ *  `data` rows: 12 fits a four-row item at 80x24 until a two-row status message, 13 and 14 do not
+ *  while the item is held to two rows. */
+function soleReview(data: 12 | 13 | 14): string {
+  const ui = data === 12 ? "claude-code:opus" : "claude-code:fable";
+  const refactor = data === 14 ? "claude-code:sonnet" : "claude-code:fable";
+  const pool = (ch: string) => `pool: { mode: any, channels: [${ch}] }`;
+  const map = [
+    ["plan", "claude-code:fable"], ["spec", "claude-code:opus"], ["migration", "claude-code:sonnet"],
+    ["implement", "claude-code:haiku"], ["ui", ui], ["refactor", refactor],
+    ["tests", "claude-code:fable"], ["docs", "claude-code:opus"], ["chore", "claude-code:fable"],
+  ].map(([s, ch]) => `    ${s}:\n      ${pool(ch)}\n`).join("");
+  return `${otherTiers()}consult:\n  prefer: [claude-code:fable]\njudge:\n  adapter: codex\n  model: gpt-5.6-terra\nrouting:\n  floors:\n    plan: mid\n    spec: cheap\n    migration: cheap\n    implement: cheap\n    ui: cheap\n  map:\n${map}  allow:\n    adapters: [claude-code]\n    models: [codex:gpt-5.6-terra]\n`;
+}
+
+/** One judge item: a two-row title and the one-row question "Use fable as the judge?". Fourteen team
+ *  rows fill an 80x24 home view down to the title when the item is held to two rows, and the question
+ *  is what falls off the frame. */
+function soleJudge(): string {
+  const sets = ["claude-code:fable", "claude-code:opus", "codex:gpt-6-astra", "codex:gpt-6-sol", "codex:gpt-5.6-sol", "claude-code:fable, codex:gpt-6-astra", "claude-code:opus, codex:gpt-6-sol", "claude-code:fable, codex:gpt-5.6-sol", "claude-code:fable"];
+  const map = ["plan", "spec", "implement", "tests", "docs", "migration", "ui", "refactor", "chore"].map((s, i) => `    ${s}:\n      pool: { mode: any, channels: [${sets[i]}] }\n`).join("");
+  return `${otherTiers()}consult:\n  prefer: [codex:gpt-6-astra]\njudge:\n  adapter: prime-agent\n  model: prime-inference/z-ai/glm-5.2\nrouting:\n  map:\n${map}`;
+}
 
 describe("answers and the one write path", () => {
   test("a list put in a new order keeps the comment above every item it keeps, and the comment moves with its item", () => {
@@ -486,6 +514,128 @@ describe("answers and the one write path", () => {
     const d = derive(source({ repoText: "routing:\n  map:\n    spec:\n      pin: { via: codex, model: gpt-6-astra }\n      pool: { mode: any, channels: [codex:gpt-6-astra] }\n" }), initialScreen());
     expect(d.base).toBeUndefined();
     expect(d.error).toContain("pin and pool are one declaration");
+  });
+  test("a refused review says why in the reason's own words: a config that loads is not told it would not load", () => {
+    // a YAML merge key on the edited path: the config loads, and the write path does not write through the key
+    const merged = source({ repoText: "%YAML 1.1\n---\nbase: &r\n  mode: partner-led\nrouting:\n  <<: *r\nconsult:\n  prefer: [claude-code:fable]\n" });
+    expect(derive(merged, initialScreen()).base).toBeDefined();
+    const out = plainReview(merged, [], [{ line: "mode", chosen: ["staff-led"] }], 100);
+    expect(out).toContain(" REFUSED: nothing can be saved");
+    expect(out).not.toContain("the config would not load");
+    expect(out).toMatch(/routing\.mode takes keys through the YAML merge key/);
+  });
+  test("a question three rows long at 80 columns is shown to its last word: the instruction is not cut", () => {
+    // the allowlist keeps every other vendor's model from reviewing: the item says where to add them, and then what to press
+    const tiers = `tiers:\n${Object.keys(DEFAULT_CONFIG.tiers).filter((a) => !["claude-code", "codex"].includes(a)).map((a) => `  ${a}: null\n`).join("")}`;
+    const repoText = `${tiers}consult:\n  prefer: [claude-code:fable]\nrouting:\n  map:\n    implement:\n      pool:\n        mode: ordered\n        channels: [codex:gpt-5.6-terra]\n  allow:\n    adapters: [claude-code]\n    models: [codex:gpt-6-luna, codex:gpt-5.6-luna, codex:gpt-5.6-terra]\n`;
+    const src = source({ repoText });
+    const d = derive(src, initialScreen());
+    const i = d.items.findIndex((n) => n.id === "review");
+    const ask = d.items[i].ask;
+    expect(ask).toMatch(/Add them to routing\.allow .*then press r\.$/);
+    expect(ask.length).toBeGreaterThan(150);   // more than two rows of an 80-column terminal
+    const rows = text(src, { ...initialScreen(), sel: i }, 80, 40).map((l) => l.trim()).join(" ");
+    expect(rows).toContain(ask);
+    for (const floors of ["    plan: cheap\n", "    plan: cheap\n    spec: cheap\n"]) {
+      const crowded = source({ repoText: repoText.replace("  allow:\n", `  floors:\n${floors}  allow:\n`) });
+      const selected = derive(crowded, initialScreen()).items.findIndex((n) => n.id === "review");
+      const question = derive(crowded, initialScreen()).items[selected].ask;
+      expect(question).toMatch(/then press r\.$/);
+      const screen = text(crowded, { ...initialScreen(), sel: selected }, 80, 24).map((l) => l.trim()).join(" ");
+      expect(screen, floors).toContain(question);
+    }
+    // With a five-row selected item, 10 or 11 team data rows plus three section headers
+    // leave five or four rows after a two-row status message. The team yields the fifth.
+    // An unknown worker vendor keeps the worker rows live but offers no replacement judge.
+    for (const mergeMigration of [true, false]) {
+      const map = mergeMigration ? "  map:\n    migration:\n      pool: { mode: any, channels: [claude-code:fable] }\n" : "  map: {}\n";
+      const crowded = source({ repoText: `tiers:\n  codex:\n    vendor: unknown\n  claude-code:\n    vendor: unknown\nconsult:\n  prefer: [claude-code:fable]\njudge:\n  adapter: prime-agent\n  model: prime-inference/z-ai/glm-5.2\nrouting:\n${map}  allow:\n    adapters: [codex, claude-code]\n` });
+      const cd = derive(crowded, initialScreen());
+      const ci = cd.items.findIndex((it) => it.id === "judge");
+      const state = { ...initialScreen(), sel: ci, msg: "The probe finished and this question still needs your answer; check the allowlist in the config before probing again." };
+      expect(teamRows(cd.base!).length).toBe(mergeMigration ? 10 : 11);
+      expect(cd.items[ci].ask).toMatch(/then press r\.$/);
+      expect(text(crowded, state, 80, 24).map((l) => l.trim()).join(" "), `${mergeMigration ? 13 : 14} team rows`).toContain(cd.items[ci].ask);
+    }
+    // One item keeps two rows unless the reserve is the item's own height. A three-row question is then
+    // cut at 80x24 beside a 13-row team and a 14-row team, and at the heights where the team can shrink
+    // to two rows and the four-row item still fits. Two items and three items keep it whole as well.
+    const shown = (src: ReturnType<typeof source>, sel: number, rows: number, msg = "") => text(src, { ...initialScreen(), sel, ...(msg ? { msg } : {}) }, 80, rows).map((l) => l.trim()).join(" ");
+    for (const data of [13, 14] as const) {
+      const one = source({ repoText: soleReview(data) });
+      const od = derive(one, initialScreen());
+      expect(od.items, `${data} team rows`).toHaveLength(1);
+      expect(teamRows(od.base!).length, `${data} team rows`).toBe(data);
+      const question = od.items[0].ask;
+      expect(wrap(question, 75), `${data} team rows`).toHaveLength(3);
+      expect(question).toMatch(/then press r\.$/);
+      for (const rows of [11, 12, 24]) expect(shown(one, 0, rows), `${data} team rows at 80x${rows}`).toContain(question);
+    }
+    const dozen = source({ repoText: soleReview(12) });
+    const dd = derive(dozen, initialScreen());
+    expect(dd.items).toHaveLength(1);
+    expect(teamRows(dd.base!).length).toBe(12);
+    const q12 = dd.items[0].ask;
+    expect(shown(dozen, 0, 24)).toContain(q12);
+    const msg = "The probe finished and this question still needs your answer; check the allowlist in the config before probing again.";
+    expect(wrap(msg, 76)).toHaveLength(2);
+    expect(shown(dozen, 0, 24, msg), "12 team rows and a two-row message").toContain(q12);
+    const two = source({ repoText: repoText.replace("  allow:\n", "  floors:\n    plan: cheap\n  allow:\n") });
+    const td = derive(two, initialScreen());
+    const tri = td.items.findIndex((n) => n.id === "review");
+    expect(td.items).toHaveLength(2);
+    expect(teamRows(td.base!).length).toBe(13);
+    expect(shown(two, tri, 24), "two items").toContain(td.items[tri].ask);
+    const three = source({ repoText: repoText.replace("routing:\n", "judge:\n  adapter: prime-agent\n  model: prime-inference/z-ai/glm-5.2\nrouting:\n").replace("  allow:\n", "  floors:\n    plan: cheap\n  allow:\n") });
+    const th = derive(three, initialScreen());
+    const ri = th.items.findIndex((n) => n.id === "review");
+    expect(th.items.map((n) => n.id)).toEqual(["noseat", "judge", "review"]);
+    expect(teamRows(th.base!).length).toBe(13);
+    expect(wrap(th.items[ri].ask, 75)).toHaveLength(3);
+    expect(shown(three, ri, 24), "three items").toContain(th.items[ri].ask);
+  });
+  test("a question the rows left cannot hold whole is cut with its mark, never dropped without one", () => {
+    // a two-row title and a three-row question: the team must give up its fifth row at 80x19
+    const src = source({ repoText: "consult:\n  prefer: [claude-code:fable]\njudge:\n  adapter: prime-agent\n  model: prime-inference/z-ai/glm-5.2\n", userText: "routing:\n  allow: {}\n" });
+    const d = derive(src, initialScreen());
+    const i = d.items.findIndex((n) => n.id === "judge");
+    const ask = d.items[i].ask;
+    expect(ask).toMatch(/then press r\.$/);
+    for (const rows of [11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 24, 40]) {
+      const out = text(src, { ...initialScreen(), sel: i }, 80, rows).map((l) => l.trim());
+      const whole = out.join(" ").includes(ask);
+      const marked = out.some((l) => l.endsWith(" …") && ask.includes(l.slice(0, -2).slice(-20)));
+      expect(whole || marked, `80x${rows}`).toBe(true);
+      if (rows >= 12) expect(whole, `80x${rows}`).toBe(true);
+    }
+    expect(text(src, { ...initialScreen(), sel: i }, 80, 11).map((l) => l.trim())).toContain("prime-agent:prime-inference/z-ai/glm-5.2 to routing.allow in the confi …");
+  });
+  test("a sole judge question under a two-row title is shown at 80x24 with a 14-row team, not dropped past the frame", () => {
+    // one item, so the old reserve was two rows: both title rows filled them and the question was sliced off with no " …"
+    const src = source({ repoText: soleJudge() });
+    const d = derive(src, initialScreen());
+    expect(d.items).toHaveLength(1);
+    expect(teamRows(d.base!).length).toBe(14);
+    expect(wrap(d.items[0].title, 75)).toHaveLength(2);
+    expect(d.items[0].ask).toBe("Use fable as the judge?");
+    expect(wrap(d.items[0].ask, 75)).toHaveLength(1);
+    expect(text(src, initialScreen(), 80, 24).map((l) => l.trim()).join(" ")).toContain("Use fable as the judge?");
+  });
+  test("the selected item stays whole in every home frame that can hold it once the team yields its rows, and a frame that cannot ends the cut in …", () => {
+    // four rows of item need h >= 8, which an 80-column home view reaches at 11 rows; 10 rows cannot
+    for (const data of [13, 14] as const) {
+      const src = source({ repoText: soleReview(data) });
+      const ask = derive(src, initialScreen()).items[0].ask;
+      for (let rows = 10; rows <= 24; rows++) {
+        const out = text(src, initialScreen(), 80, rows).map((l) => l.trim());
+        const joined = out.join(" ");
+        if (rows >= 11) expect(joined, `${data} team rows at 80x${rows}`).toContain(ask);
+        else {
+          expect(joined, `${data} team rows at 80x${rows}`).not.toContain(ask);
+          expect(out.some((l) => l.endsWith(" …") && ask.includes(l.slice(0, -2).slice(-20))), `${data} team rows at 80x${rows}`).toBe(true);
+        }
+      }
+    }
   });
   test("the plain screen shows every item whole, the ones wider than the terminal on a second row", () => {
     // a judge and a consult with a long key that do not answer, and a model out of quota that much rests on:

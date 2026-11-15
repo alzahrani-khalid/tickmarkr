@@ -15,13 +15,15 @@ import type { ExecutorDriver } from "./types.js";
 export const DRIVER_CHOICES = ["auto", "herdr", "subprocess", "orca", "herdr-app"] as const;
 export type DriverChoice = (typeof DRIVER_CHOICES)[number];
 export type ClassifiedHost = "herdr" | "herdr-app" | "orca" | "none";
-/** Run/resume's one captured launch instant: the host, and whether an hc scope token was inherited (boolean only). */
-export interface HostSnapshot { readonly host: ClassifiedHost; readonly inheritedScope: boolean }
+/** Run/resume's one captured launch instant: the host, and whether an hc scope token was inherited (boolean only).
+ * `rex` (queue row 391, D-2187 add.263) is present, true, only when the host is none and a Rex pane was detected. */
+export interface HostSnapshot { readonly host: ClassifiedHost; readonly inheritedScope: boolean; readonly rex?: true }
 
 const overrideByDriver = new WeakMap<ExecutorDriver, DriverChoice>();
 // The host snapshot the driver was selected under: driverEvidence reads this, never process.env,
 // so preflight, selection and the journal row all describe the same instant.
 const hostByDriver = new WeakMap<ExecutorDriver, ClassifiedHost>();
+const rexByDriver = new WeakSet<ExecutorDriver>();
 
 /**
  * One host classifier beside the driver chooser reads the launching environment (CASE H, queue row 340; D-2180), in
@@ -60,9 +62,23 @@ export function configDriverRefused(cfgDriver: DriverChoice, host: ClassifiedHos
   return (cfgDriver === "herdr" || cfgDriver === "herdr-app" || cfgDriver === "orca") && cfgDriver !== host;
 }
 
+/**
+ * Queue row 391, phase 0 (D-2187 add.263): a Rex pane, from the environment only and executing nothing — TERM_PROGRAM
+ * rex in any case and at least one of REX_SERVER, REX_SESSION, REX_BLOCK nonblank after trim (REX_BIN_DIR alone only
+ * locates a CLI). Ranked after Orca: read only when classifyHost returns none. Rex is detected, never a ClassifiedHost
+ * or a driver choice: auto still resolves to subprocess, and only the closed set of host lines says Rex was seen.
+ */
+function rexDetected(env: NodeJS.ProcessEnv | Record<string, string | undefined>): boolean {
+  return (env.TERM_PROGRAM ?? "").toLowerCase() === "rex"
+    && (nonblank(env.REX_SERVER) || nonblank(env.REX_SESSION) || nonblank(env.REX_BLOCK));
+}
+
 /** The immutable launch snapshot: later environment mutation (the daemon deletes HC_SCOPE) cannot change it. */
-export function captureHost(env: NodeJS.ProcessEnv = process.env): HostSnapshot {
-  return Object.freeze({ host: classifyHost(env), inheritedScope: hcScopePresent(env) });
+export function captureHost(env: NodeJS.ProcessEnv | Record<string, string | undefined> = process.env): HostSnapshot {
+  const host = classifyHost(env as NodeJS.ProcessEnv);
+  // Row 391: the Rex fact rides the snapshot so no line formed after selection reads process.env.
+  const rex = host === "none" && rexDetected(env);
+  return Object.freeze({ host, inheritedScope: hcScopePresent(env), ...(rex ? { rex: true as const } : {}) });
 }
 
 const UNMANAGED_CHECKOUT = "checkout is not Orca-managed; run from an orca worktree create checkout or pass --driver subprocess";
@@ -202,13 +218,18 @@ export function driverEvidence(cfg: TickmarkrConfig, driver: ExecutorDriver, ove
   if (host === "herdr" && driver.id === "herdr") return "auto → herdr (HERDR_ENV=1)";
   if (host === "herdr-app" && driver.id === "herdr-app") return "auto → herdr-app (HC_TERMINAL_ID+HC_TERMINAL_SOCKET)";
   if (host === "orca" && driver.id === "orca") return "auto → orca (TERM_PROGRAM+ORCA_TERMINAL_HANDLE)";
-  if (host === "none" && driver.id === "subprocess") return "auto → subprocess (HERDR_ENV unset)";
+  if (host === "none" && driver.id === "subprocess") {
+    return rexByDriver.has(driver) ? "auto → subprocess (Rex detected, no Rex driver: running headless)" : "auto → subprocess (HERDR_ENV unset)";
+  }
   return `auto → ${driver.id} (runtime)`;
 }
 
 const herdrAppDriver = () => new HerdrAppDriver({ hcBin: herdrAppBinary("hc"), appBin: herdrAppBinary("herdr-app") });
 
-export function pickDriver(cfg: TickmarkrConfig, override?: string, host: ClassifiedHost = classifyHost()): ExecutorDriver {
+export function pickDriver(cfg: TickmarkrConfig, override?: string, launch: ClassifiedHost | HostSnapshot = captureHost()): ExecutorDriver {
+  // Row 391 (D-2187 add.263): run passes its whole launch snapshot, so the Rex fact is the selection instant's.
+  const snapshot = typeof launch === "string" ? undefined : launch;
+  const host = snapshot?.host ?? (launch as ClassifiedHost);
   const selectedOverride = parseDriverOverride(override);
   const want = selectedOverride ?? cfg.driver;
   // VIS-09 item 2: plumb the per-tab cap into the HerdrDriver — the driver takes it as a constructor
@@ -225,5 +246,6 @@ export function pickDriver(cfg: TickmarkrConfig, override?: string, host: Classi
         : new SubprocessDriver();
   if (selectedOverride !== undefined) overrideByDriver.set(driver, selectedOverride);
   hostByDriver.set(driver, host);
+  if (snapshot?.rex) rexByDriver.add(driver);
   return driver;
 }

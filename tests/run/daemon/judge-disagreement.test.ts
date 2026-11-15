@@ -144,45 +144,56 @@ describe("judge disagreement over identical cited blobs (production daemon, zero
     expect(parked[0]!.data.judgment).toBeUndefined();
   });
 
-  test("the production daemon parks an identical-subject contradiction when a distinct eligible judge or verifiable citation is unavailable versus recording agreeing judgments with both identities, so recycling the primary channel or invented evidence fails", async () => {
-    // No distinct eligible judge: the primary seat is the whole judge pool, and it is never re-asked.
-    const alone = await judgedResume({ runId: "run-jd-alone", singleJudge: true,
-      steps: [write({ "a.txt": "A", "b.txt": "new" }, "n0"), write({ "a.txt": "A2" }, "n1")], primary: [], second: [] });
-    expect(alone.summary.human).toEqual(["T1"]);
-    expect(alone.author.judges).toBe(1);
-    const aloneRows = alone.rows();
-    expect(t1(aloneRows, "task-dispatch")).toHaveLength(1);
-    expect(t1(aloneRows, "judge-disagreement")).toHaveLength(1);
-    expect(String((acceptanceRows(aloneRows)[0]!.data.judgeDisagreement as Record<string, unknown>).outcome)).toContain("no distinct eligible judge");
-    // Invented evidence: the adjudicator cites a line outside every changed hunk — it confirms nothing.
-    const invented = await judgedResume({ runId: "run-jd-invented",
-      steps: [write({ "a.txt": "A", "b.txt": "new" }, "i0"), write({ "a.txt": "A2" }, "i1")],
-      primary: [{ met: false }], second: [{ met: false, line: 99 }] });
-    expect(invented.summary.human).toEqual(["T1"]);
-    expect([invented.primary.calls, invented.second.calls]).toEqual([1, 1]);
-    const inventedRows = invented.rows();
-    expect(t1(inventedRows, "task-dispatch")).toHaveLength(1);
-    expect(acceptanceRows(inventedRows)[0]!.data).toMatchObject({ infra: true, judgeDisagreement: { adjudicator: "judge-b:judge-b" } });
-    expect(String((acceptanceRows(inventedRows)[0]!.data.judgeDisagreement as Record<string, unknown>).outcome)).toContain("no readable verdict");
-    // Inconsistent adjudication: c1 ruled FAIL and PASS in one verdict confirms nothing — parked, never charged.
-    const torn = await judgedResume({ runId: "run-jd-torn",
-      steps: [write({ "a.txt": "A", "b.txt": "new" }, "t0"), write({ "a.txt": "A2" }, "t1")],
-      primary: [{ met: false }], second: [{ met: false, duplicate: true }] });
-    expect(torn.summary.human).toEqual(["T1"]);
-    expect(torn.second.calls).toBe(1);
-    const tornRows = torn.rows();
-    expect(t1(tornRows, "task-dispatch")).toHaveLength(1);
-    expect(tornRows.filter((row) => ["escalation", "consult", "repair-attempt", "task-done"].includes(row.event))).toEqual([]);
-    expect(acceptanceRows(tornRows)[0]!.data).toMatchObject({ infra: true, judgeDisagreement: { adjudicator: "judge-b:judge-b" } });
-    expect(String((acceptanceRows(tornRows)[0]!.data.judgeDisagreement as Record<string, unknown>).outcome)).toContain("no readable verdict");
-    // Agreement: both identities are on the record beside the judgment that stands.
-    const agreed = await judgedResume({ runId: "run-jd-agreed",
-      steps: [write({ "a.txt": "A", "b.txt": "new" }, "g0"), write({ "a.txt": "A2" }, "g1")],
-      primary: [{ met: false }, { met: true }], second: [{ met: false }] });
-    const first = acceptanceRows(agreed.rows())[0]!.data;
-    expect(first.adjudication).toMatchObject({ primary: "judge-a:judge-a", adjudicator: "judge-b:judge-b", criteria: ["c1"], agreed: true });
-    expect(first.judgment).toMatchObject({ judge: "judge-a:judge-a", criteria: [expect.objectContaining({ id: "c1", met: false, paths: ["a.txt"] })] });
-    expect(agreed.primary.calls).toBe(2);
-    expect(agreed.second.calls).toBe(1);
+  describe("the production daemon parks an identical-subject contradiction when a distinct eligible judge or verifiable citation is unavailable versus recording agreeing judgments with both identities, so recycling the primary channel or invented evidence fails", () => {
+    test("with no distinct eligible judge the contradiction parks and the primary seat is never re-asked", async () => {
+      // No distinct eligible judge: the primary seat is the whole judge pool, and it is never re-asked.
+      const alone = await judgedResume({ runId: "run-jd-alone", singleJudge: true,
+        steps: [write({ "a.txt": "A", "b.txt": "new" }, "n0"), write({ "a.txt": "A2" }, "n1")], primary: [], second: [] });
+      expect(alone.summary.human).toEqual(["T1"]);
+      expect(alone.author.judges).toBe(1);
+      const aloneRows = alone.rows();
+      expect(t1(aloneRows, "task-dispatch")).toHaveLength(1);
+      expect(t1(aloneRows, "judge-disagreement")).toHaveLength(1);
+      expect(String((acceptanceRows(aloneRows)[0]!.data.judgeDisagreement as Record<string, unknown>).outcome)).toContain("no distinct eligible judge");
+    });
+
+    test("an adjudicator citing a line outside every changed hunk confirms nothing and the contradiction parks", async () => {
+      // Invented evidence: the adjudicator cites a line outside every changed hunk — it confirms nothing.
+      const invented = await judgedResume({ runId: "run-jd-invented",
+        steps: [write({ "a.txt": "A", "b.txt": "new" }, "i0"), write({ "a.txt": "A2" }, "i1")],
+        primary: [{ met: false }], second: [{ met: false, line: 99 }] });
+      expect(invented.summary.human).toEqual(["T1"]);
+      expect([invented.primary.calls, invented.second.calls]).toEqual([1, 1]);
+      const inventedRows = invented.rows();
+      expect(t1(inventedRows, "task-dispatch")).toHaveLength(1);
+      expect(acceptanceRows(inventedRows)[0]!.data).toMatchObject({ infra: true, judgeDisagreement: { adjudicator: "judge-b:judge-b" } });
+      expect(String((acceptanceRows(inventedRows)[0]!.data.judgeDisagreement as Record<string, unknown>).outcome)).toContain("no readable verdict");
+    });
+
+    test("an adjudication ruling the criterion both ways confirms nothing and parks without charging the worker", async () => {
+      // Inconsistent adjudication: c1 ruled FAIL and PASS in one verdict confirms nothing — parked, never charged.
+      const torn = await judgedResume({ runId: "run-jd-torn",
+        steps: [write({ "a.txt": "A", "b.txt": "new" }, "t0"), write({ "a.txt": "A2" }, "t1")],
+        primary: [{ met: false }], second: [{ met: false, duplicate: true }] });
+      expect(torn.summary.human).toEqual(["T1"]);
+      expect(torn.second.calls).toBe(1);
+      const tornRows = torn.rows();
+      expect(t1(tornRows, "task-dispatch")).toHaveLength(1);
+      expect(tornRows.filter((row) => ["escalation", "consult", "repair-attempt", "task-done"].includes(row.event))).toEqual([]);
+      expect(acceptanceRows(tornRows)[0]!.data).toMatchObject({ infra: true, judgeDisagreement: { adjudicator: "judge-b:judge-b" } });
+      expect(String((acceptanceRows(tornRows)[0]!.data.judgeDisagreement as Record<string, unknown>).outcome)).toContain("no readable verdict");
+    });
+
+    test("agreeing judgments are recorded with both identities beside the judgment that stands", async () => {
+      // Agreement: both identities are on the record beside the judgment that stands.
+      const agreed = await judgedResume({ runId: "run-jd-agreed",
+        steps: [write({ "a.txt": "A", "b.txt": "new" }, "g0"), write({ "a.txt": "A2" }, "g1")],
+        primary: [{ met: false }, { met: true }], second: [{ met: false }] });
+      const first = acceptanceRows(agreed.rows())[0]!.data;
+      expect(first.adjudication).toMatchObject({ primary: "judge-a:judge-a", adjudicator: "judge-b:judge-b", criteria: ["c1"], agreed: true });
+      expect(first.judgment).toMatchObject({ judge: "judge-a:judge-a", criteria: [expect.objectContaining({ id: "c1", met: false, paths: ["a.txt"] })] });
+      expect(agreed.primary.calls).toBe(2);
+      expect(agreed.second.calls).toBe(1);
+    });
   });
 });

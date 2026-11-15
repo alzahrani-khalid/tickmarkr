@@ -554,6 +554,8 @@ describe("answers and the one write path", () => {
     const src = source({ repoText, health: health(["qwen:qwen3.8-max"]) });
     const M = derive(src, initialScreen()).base!;
     expect(namesOf(M, ["pi:zai/glm-5.3", "omp:zai/glm-5.3", "codex:gpt-6-astra"])).toEqual(["glm-5.3 (pi)", "glm-5.3 (omp)", "gpt-6-astra"]);
+    // two keys on one CLI with one name (an alias and its full id) are not told apart by their CLI: each is shown as its key
+    expect(namesOf(M, ["omp:zai/glm-5.3", "omp:other/glm-5.3", "codex:gpt-6-astra"])).toEqual(["omp:zai/glm-5.3", "omp:other/glm-5.3", "gpt-6-astra"]);
     const docs = text(src, { ...initialScreen(), view: "lines" }, 120, 30).find((l) => /^ . docs /.test(l))!;
     expect(docs).toContain("glm-5.3 (pi) · glm-5.3 (omp) · gpt-6-astra · ×qwen3.8-max");
     // the label of a change names the CLI where the name alone would not say which

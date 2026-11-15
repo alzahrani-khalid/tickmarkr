@@ -2,6 +2,97 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v2.26.1 — the fleet says what is so
+
+**v2.26.1** ships all 10 of its spec's tasks, merged in run-20261114-084504-0000000000005254. Every task passed
+build, lint, evidence and scope, its acceptance criteria, a review by a model from another vendor and the full test suite.
+Six of the ten are fixes a second seat wrote and tested against the built 2.26.0 command; this version puts them through
+the gates one at a time. The gates changed two of them. Review rounds on the writer slice fixed four alias cases the
+original got wrong. And a reviewer found, by running it, that the "question shown to its last word" fix still cut the
+question at 80×24; the fix that shipped reserves the selected item's own rows.
+
+- **`tickmarkr fleet` no longer drops an answer.**
+  - `fleet --json` beside `--yes`, `--set` or `--save` exits 1 and writes nothing: "--json prints the screen and changes
+    nothing — it does not go with --yes, --set or --save". In 2.26.0 it printed the screen, exited 0 and saved nothing
+    (queue row 468).
+  - `--help` says what a script must do. A repeated `--yes <id> --save` exits 1, because the item is gone after the
+    first save; a script reads `--json` first and answers only an id that is listed (row 474; FLEET.md, "From a
+    script").
+  - `--set` reads a line's name in any case and with spaces around it. A bare model name is answered with the one key
+    it can mean; it is still refused, never guessed. An empty `--yes` id is "an id is missing after --yes".
+    `--set mode=<the mode it has>` says "mode is already <mode>" (rows 472, 451).
+- **The screen says what is so.**
+  - A refused save is headed "REFUSED: nothing can be saved", and the reason under it says why. A config that loads is
+    no longer told it would not load (row 469).
+  - On the home view the selected item's question is shown to its last word, up to three rows at 80 columns, whenever
+    the terminal can hold it; where it cannot, the cut is marked " …" (row 467).
+  - A config that does not load shows each problem on its own rows with its path beside it: six shown, the rest
+    counted. A YAML error keeps its sentence with the line and column (row 470).
+  - A config file that is there and cannot be read is named by its path and the cause: "it is a directory, not a file",
+    "this user has no permission to read it". `--json` answers `{ ok: false, error, in: [path] }` and exits 1 (row 471).
+  - A config file whose root is a list or a single value is refused in words that name the layer: "The user config
+    holds a list, not settings: write it as `key: value` lines". The fleet commands and `doctor` say so, from the
+    loader they share, where 2.26.0 printed fifteen "received undefined" problems (row 458).
+- **The items say what is so.**
+  - A CLI that is signed out is one item for the CLI, however many of its models the team names (row 451).
+  - A key under `routing.map` or `routing.floors` that names no shape is an item. It says the key does nothing and
+    names the nearest shape when one is at most two letters away; otherwise it lists the shapes (row 453).
+  - An id its CLI no longer serves is no longer "remove the id … you get +1 frontier vendor". While the CLI still lists
+    the id, the item says to probe again. When the CLI does not list it either, the entry joins the tidy item, counted
+    apart from the entries that merely do nothing (rows 454, 473).
+  - Two keys on one CLI with one name are each shown as their key (row 450).
+  - "Last run: … hit its limit and no other model could take over. Add … as fallbacks?" is asked only while the shape's
+    pool holds no other working model at the floor. It no longer comes back after its yes each time one more model
+    qualifies (row 455).
+- **A save keeps the form of the file it found** (row 452). An untouched line keeps its bytes in a file whose lines all
+  end CR LF, that starts with a byte-order mark, that has a tab before a comment, a four-space indent, list items at
+  their key's indent, padded flow lists, or lines over 80 columns. A `%YAML 1.1` file reads back what was saved. A file
+  that is only a document marker, a directive or comments is written to. An alias whose anchor an edit releases is
+  written as a copy that keeps the alias's comment. Both writers (the screen and `fleet --edit`) share the one keeper.
+  FLEET.md's "What a save keeps" lists every rewrite of an untouched line the writer still makes; none changes what
+  the file means or drops a comment's text.
+- **After an upgrade, the first probe dates a model the earlier record did not list** (row 461). 2.26.0's first probe
+  recorded every model already listed as known, so a model that arrived since your last probe on 2.25.0 was not
+  offered as new. From 2.26.1 the first probe compares with the record the earlier version left.
+  - A probe run on 2.26.0 already recorded every model as known, and 2.26.1 cannot recover those arrivals. Add such a
+    model by hand: `tickmarkr fleet --set <line>=<models> --save`, or `e` on the line.
+- **Inside Rex, tickmarkr says it runs headless** (row 391). Rex has no driver yet. Where `run`, `plan`, `doctor` and
+  `init` were silent, they now say so: the driver line reads "auto → subprocess (Rex detected, no Rex driver: running
+  headless)", and doctor's host row reads "Rex detected, no Rex driver: running headless on the subprocess driver, with
+  no daemon board". Detection reads the environment only and changes no behaviour.
+- **FLEET.md** states what a save keeps after this version, and how a script answers the fleet.
+- Two of the repository's own tests that ran near their time limits are split into their independent parts, with every
+  assertion kept and no limit raised (rows 459, 475).
+
+Known limits:
+- A save writes one style a file and can still rewrite an untouched line in small ways: the minority indent or flow
+  padding, an aligned value, trailing spaces and runs of blank lines, a comment that sits on a key's line, on the `---`
+  line or continues under an implicit null, a flow list or map written over several lines, numbers in unusual
+  spellings. FLEET.md lists them all, and the review shows every such line before a save. Queue row 452.
+- Two of those rewrites deserve a warning. An escape the file used for a character that does not print (`\u200B`,
+  `\u202E`, `\x7f`) is written back as the character itself, and a double-quoted value of 40 characters or more that
+  holds `\n` is written over several lines. The value is unchanged in both cases (row 494).
+- On the home view, when the items shown fill the rows exactly, the "… N more below" line can be missing; in a
+  terminal under ten rows a selected item's question can fall off the screen unmarked (row 492).
+- `tickmarkr resume` inside Rex does not yet journal the "Rex detected" line (row 481).
+- `plan`, `fleet --print` and `fleet --pick` still answer a config that does not load with "invalid overlay" and the
+  schema's own words (row 479). A file holding two YAML documents is answered with the YAML library's advice (row 476).
+- `doctor` and `plan` are silent about a key that names no shape; only the fleet screen says it (row 477).
+- The last-run item can name a shape or a model its yes does not change (row 480).
+- In the screen, text that arrives in the terminal all at once (a paste, or a message another program types) is read
+  as key presses (row 483). With Caps Lock on, or on a keyboard layout without Latin letters, the keys do nothing and
+  the screen does not say why (row 487).
+
+Also known, found while this version was built, and not new in it:
+- Stopping a run with SIGTERM can leave its test job and its judge and review seats running; look for them before
+  resuming (row 490).
+- A task repaired by models of three vendors can be left with no reviewer the rules allow; the park names releases
+  that cannot supply one. Add a frontier model of another vendor to the config, then `tickmarkr resume` (row 489).
+- A review still working at `review.timeoutMs` (15 minutes by default) is ended and recorded as "truncated". Raise
+  `review.timeoutMs` for a slow reviewer; the running daemon reads the config once, so resume after the change (row 491).
+- On the Herdr app, one empty answer from its status command can fail a task whose review is running;
+  `tickmarkr approve <run> <task> --recheck` re-gates it, and `--driver subprocess` avoids it (row 460).
+
 ## v2.26.0 — the fleet is one screen
 
 **v2.26.0** ships all 13 of its spec's tasks, merged in run-20261112-110617-0000000000004419. Every task passed

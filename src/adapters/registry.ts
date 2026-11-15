@@ -749,6 +749,9 @@ export function writeDoctor(
   repoRoot: string, health: Record<string, AuthHealth>, scope?: { adapter: string; model: string }[],
   contain: (report: Record<string, AuthHealth>) => Record<string, AuthHealth> = containDoctorReport,
 ): void {
+  // The record as it is on disk before this write: a record with no first-seen key (written before 2.26.0)
+  // dates, by its own models lists, what the first probe after an upgrade lists anew (queue row 461; D-2187 add.256).
+  const priorRecord = readDoctorFile(repoRoot);
   if (scope) {
     const merged = readDoctor(repoRoot) ?? {};
     for (const id of new Set(scope.map((c) => c.adapter))) {
@@ -773,7 +776,7 @@ export function writeDoctor(
   health = contain(health);
   // The fleet screen calls a model "new" from when a probe first listed it. The record rides in
   // doctor.json under its own key, so the probe still writes one file and no adapter entry changes.
-  const firstSeen = withFirstSeen(readModelsFirstSeen(repoRoot), health, new Date());
+  const firstSeen = withFirstSeen(priorRecord?.[FIRST_SEEN_KEY] ?? null, health, new Date(), priorRecord);
   tickmarkrDir(repoRoot);
   const path = doctorPath(repoRoot);
   const tmp = `${path}.tmp`;

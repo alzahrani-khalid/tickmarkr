@@ -102,9 +102,20 @@ function errorWhereRows(src: ScreenSource, layers: readonly Layer[], w: number):
   const words = (t: string): Line[] => wrap(t, w).map((r): Line => [S("  "), S(r)]);
   return [...words(intro), ...files.flatMap((f) => pathRows(f, w).map((r): Line => { const seg = S(r, "bold"); exact.add(seg); return [S("  "), seg]; })), ...words(outro)];
 }
+/**
+ * The loader's message as rows: one problem a row group, at most `max` problems, the rest counted.
+ * The schema's "→ at path" line joins its problem; a YAML error keeps its sentence (it holds the line
+ * and the column) and loses the code frame under it, which no wrapped row can draw.
+ */
+export function errorRows(error: string, w: number, max = 6): string[] {
+  const problems = error.split("\n\n")[0].split("\n").filter((l) => l.trim())
+    .reduce<string[]>((out, l) => (/^\s+→/.test(l) && out.length ? [...out.slice(0, -1), `${out.at(-1)} ${l.trim()}`] : [...out, l.replace(/:$/, "")]), []);
+  const shown = problems.slice(0, max).flatMap((p) => wrap(p, w));
+  return problems.length > max ? [...shown, `… and ${problems.length - max} more`] : shown;
+}
 /** The screen of a config that does not load, every row of it: wrapped, never cut. */
 function errorBody(src: ScreenSource, d: Derived, cols: number): Line[] {
-  return [[S("")], [S(" THE CONFIG DOES NOT LOAD", "fail")], [S("")], ...wrap(d.error ?? "", cols - 4).map((t): Line => [S("  "), S(t, "fail")]), [S("")],
+  return [[S("")], [S(" THE CONFIG DOES NOT LOAD", "fail")], [S("")], ...errorRows(d.error ?? "", cols - 4).map((t): Line => [S("  "), S(t, "fail")]), [S("")],
     // (a long path takes more rows; a body taller than the terminal scrolls)
     ...errorWhereRows(src, d.errorIn ?? [], cols - 4), [S("")],
     ...wrap("A run refuses to start on this config for the same reason. Nothing was changed.", cols - 4).map((t): Line => [S("  "), S(t, "dim")])];
@@ -282,7 +293,8 @@ function review(src: ScreenSource, d: Derived, w: number): Line[] {
     ...(d.hand.length ? [[S(" YOU CHANGED BY HAND", "head")], ...d.hand.flatMap((e) => whole("  ·  ", e.label))] : []),
     [S("")]];
   if (d.refused || !d.base || !d.full || !d.texts) {
-    return [...out, [S(" REFUSED: the config would not load, so nothing can be saved", "fail")], ...wrap(d.refused ?? "", w - 4).map((t) => [S("  "), S(t, "fail")])];
+    // (the reason under it says why: a config that would not load, or a form the write path does not write through)
+    return [...out, [S(" REFUSED: nothing can be saved", "fail")], ...wrap(d.refused ?? "", w - 4).map((t) => [S("  "), S(t, "fail")])];
   }
   const cq = consequence(d.base, d.full);
   // A measure's number, and the word after it, are what the row is for: on a narrow terminal, or
@@ -386,15 +398,22 @@ export function frame(src: ScreenSource, st: ScreenState, cols = 80, rows = 24, 
       keys = [...(item.edits ? [["y", "yes"], ["n", "no"]] as Array<[string, string]> : [["n", "not now"] as [string, string]]), ["Esc", "back"]];
     } else {
       const sel = Math.min(st.sel, Math.max(0, d.items.length - 1));
-      // what needs the user always keeps room for two items, however short the terminal
-      body = [...team(M, cols, h - 2 - Math.min(4, 2 * d.items.length || 1)), [S("")], [S(` NEEDS YOU (${d.items.filter((i) => !st.yes.includes(i.id)).length})`, "head"), ...(pending(d) ? [S(`  ${pending(d)}`, "ok")] : [])]];
-      if (!d.items.length) body.push([S("  Nothing. Every shape, gate and the consult has a working model.", "ok")], [S("  e changes a line by hand: shapes, judge, review, consult, mode, deny lists.", "dim")]);
       // At 80 columns and wider a title too long for its row takes a second one: what is wrong is said to
       // its last word. (Narrower, an item stays two rows so that two items always fit; d shows it whole.)
       const titles = d.items.map((it, i) => { const t = cols >= 80 ? wrap(it.title, cols - 4 - String(i + 1).length) : [it.title]; return t.length > 2 ? [t[0], `${t[1].slice(0, -2)} …`] : t; });
       // ... and so does a question: "Add a, b, c, d as fallbacks for implement?" names every model it adds
-      const asks = d.items.map((it) => { const t = cols >= 80 ? wrap(it.ask, cols - 5) : [it.ask]; return t.length > 2 ? [t[0], `${t[1].slice(0, -2)} …`] : t; });
+      // (up to three rows: an instruction such as "add them to routing.allow …, then press r" is read to its last word)
+      const asks = d.items.map((it) => { const t = cols >= 80 ? wrap(it.ask, cols - 5) : [it.ask]; return t.length > 3 ? [t[0], t[1], `${t[2].slice(0, -2)} …`] : t; });
       const tall = (i: number) => titles[i].length + asks[i].length;
+      // The selected item is shown whole — its title rows and every question row, up to three — in any
+      // frame that can hold it once the team gives up rows, however many items there are. One item used
+      // to keep two rows, so a four-row question was cut. The pending count shares the NEEDS YOU line
+      // (and the footer); it is not a row of its own. A question is cut only when the frame cannot hold
+      // the item even with the team at its smallest, and that cut ends in " …".
+      const reserve = Math.min(4, 2 * d.items.length || 1);
+      const selectedRows = d.items.length ? tall(sel) : 0;
+      body = [...team(M, cols, h - 2 - Math.max(reserve, selectedRows)), [S("")], [S(` NEEDS YOU (${d.items.filter((i) => !st.yes.includes(i.id)).length})`, "head"), ...(pending(d) ? [S(`  ${pending(d)}`, "ok")] : [])]];
+      if (!d.items.length) body.push([S("  Nothing. Every shape, gate and the consult has a working model.", "ok")], [S("  e changes a line by hand: shapes, judge, review, consult, mode, deny lists.", "dim")]);
       const rowsFor = (f: number, avail: number) => { let used = 0, n = 0; for (let i = f; i < d.items.length && used + tall(i) <= avail; i++) { used += tall(i); n++; } return n; };
       const two = Math.max(1, Math.floor((h - body.length) / 2));
       let from = Math.max(0, Math.min(sel - two + 1, d.items.length - two));
@@ -404,12 +423,15 @@ export function frame(src: ScreenSource, st: ScreenState, cols = 80, rows = 24, 
         const i = from + k, on = i === sel && !plain, yes = st.yes.includes(it.id);
         const hint: Line = yes ? [S("          ✓ yes", "ok")] : !on ? [S("")] : it.edits ? [S(" y ", "key"), S(" yes ", "dim"), S(" n ", "key"), S(" no", "dim")] : [S("    "), S(" n ", "key"), S(" not now", "dim")];
         const mark = (line: Line): Line => (on ? line.map((s) => ({ ...s, selected: true })) : line);
+        // a question cut by the rows left keeps the marked cut: its last row shown ends " …", never a silent drop
+        const left = Math.max(1, h - body.length - titles[i].length);
+        const ask = asks[i].length > left ? [...asks[i].slice(0, left - 1), `${asks[i][left - 1].slice(0, -2)} …`] : asks[i];
         body.push(...titles[i].map((t, n) => mark(clip([S(n ? "  " : on ? " ▸" : "  ", "accent"), S(n ? " ".repeat(String(i + 1).length + 2) : `${i + 1}  `, "dim"), S(t, yes ? "dim" : on ? "bold" : undefined)], cols))),
           // only a row that shows its keys or its answer gives up room for them
           // (a question too long to share the row keeps it whole: its keys are named on the screen's last row as
           // well, and an answer of yes is marked before the question instead of after it)
           ...((yes || on) && width(it.ask) + 5 <= cols - 17 ? [mark([...clip([S("     "), S(it.ask, yes ? "dim" : "accent")], cols - 17), ...clip(hint, 17)])]
-            : asks[i].map((t, n) => mark(clip([yes && !n ? S("  ✓  ", "ok") : S("     "), S(t, yes ? "dim" : "accent")], cols)))));
+            : ask.map((t, n) => mark(clip([yes && !n ? S("  ✓  ", "ok") : S("     "), S(t, yes ? "dim" : "accent")], cols)))));
       });
       if (d.items.length > from + room) body.push([S(`     … ${d.items.length - from - room} more below`, "dim")]);
       keys = [...(d.items.length ? [["↑↓", "choose"], ["y", "yes"], ["n", "no"], ["d", "details"]] as Array<[string, string]> : []), ["e", "change a line"], ["r", "probe"],

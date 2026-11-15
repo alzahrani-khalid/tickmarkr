@@ -919,6 +919,15 @@ export function loadConfigWithMode(
   const repoCfg = opts.repoOverlayText === undefined
     ? readYaml(repoOverlayPath(repoRoot))
     : parse(opts.repoOverlayText);
+  // A layer is a map of settings or nothing. A list or a single value would REPLACE everything under
+  // it in the merge (the user's file takes every default with it), and the schema then reports
+  // fifteen missing settings and never the one thing that is wrong.
+  // (named by layer, not by path: a caller may pass candidate bytes for a file that is elsewhere)
+  for (const [layer, name] of [[globalCfg, "The user config"], [repoCfg, "The repository config"]] as const) {
+    if (layer !== undefined && layer !== null && (typeof layer !== "object" || Array.isArray(layer))) {
+      throw new ConfigError(`${name} holds ${Array.isArray(layer) ? "a list" : "a single value"}, not settings: write it as \`key: value\` lines`);
+    }
+  }
   const merged = deepMerge(deepMerge(structuredClone(DEFAULT_CONFIG), globalCfg), repoCfg);
   const r = TickmarkrConfigSchema.safeParse(merged);
   if (!r.success) throw new ConfigError(z.prettifyError(r.error));

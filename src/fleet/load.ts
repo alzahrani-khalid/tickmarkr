@@ -16,6 +16,16 @@ import { type Need, needSignature, type NewModel, type RunDeath } from "./needs.
 import type { ScreenSource } from "./screen.js";
 
 const text = (path: string): string => (existsSync(path) ? readFileSync(path, "utf8") : "");
+/** A config file that is there and cannot be read: said by name and cause, never as a bare errno. */
+export class UnreadableConfig extends Error {
+  constructor(readonly path: string, why: string) { super(`${path} cannot be read: ${why}. A run refuses to start for the same reason.`); this.name = "UnreadableConfig"; }
+}
+const configText = (path: string): string => {
+  try { return text(path); } catch (e) {
+    const code = (e as NodeJS.ErrnoException).code;
+    throw new UnreadableConfig(path, code === "EISDIR" ? "it is a directory, not a file" : code === "EACCES" || code === "EPERM" ? "this user has no permission to read it" : e instanceof Error ? e.message : String(e));
+  }
+};
 const NEW_FOR_DAYS = 30;
 
 /** A need's identity for "do not ask again": its id and its words, so it returns when either changes. */
@@ -172,7 +182,7 @@ export function loadFleetSource(repoRoot: string, opts: FleetSourceOptions): Scr
   const now = opts.now ?? Date.now();
   const userPath = join(globalDir, "config.yaml");
   const own = ownRepoOverlayPath(repoRoot), read = repoOverlayPath(repoRoot);
-  const userText = text(userPath), repoText = text(read);
+  const userText = configText(userPath), repoText = configText(read);
   const health = cleanHealth(readDoctor(repoRoot));
   let cfg: TickmarkrConfig | undefined;
   try { cfg = loadConfigWithMode(repoRoot, { userOverlayText: userText, repoOverlayText: repoText }).cfg; } catch { cfg = undefined; }

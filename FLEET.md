@@ -136,16 +136,51 @@ review, judge and consult seats keep that adapter.
 **What a save keeps.** A save changes only what its answers name, and the review shows every line it will
 change, with its +N −M count, before anything is written. On the one screen (`tickmarkr fleet`, its `--yes` and `--set`)
 the saved files load and their merged settings change only at the answered settings; an edit it cannot prove that of is
-refused, naming the file and the setting, and nothing is written. The bytes of lines an edit does not touch are kept in a file written the writer's way: two-space indent, block
-lists, LF line endings, no byte-order mark. In other forms the writer can rewrite untouched lines (CR LF endings, a
-byte-order mark, a tab before a comment, four-space indent, values over 80 columns, padded flow lists or maps, list items
-at their key's indent, a flow collection's comma spacing); the review shows each such line (queue row 452). An aliased or
+refused, naming the file and the setting, and nothing is written. The bytes of lines an edit does not touch are kept when
+every line ends LF or every line ends CR LF — a file whose lines end both ways has no one form to keep, and the writer can
+rewrite its endings — with or without a byte-order mark, with a tab before a comment, and with its long lines whole when the
+file has a line over 80 columns (a line counts by its value, without a trailing comment). The indent is the file's first indented line's,
+the step from the first nested block map's key to the line under it; a list does not set it, and a file that shows no such
+line is written at two spaces. A line indented otherwise is rewritten to it, even when that first line is the minority.
+The file's style is read once, for the whole file; where it mixes two (padded and unpadded flow collections,
+list items in both places) the fewer are rewritten, maps and lists counted together. Where the two are equal in number, list
+items are written indented and flow collections unpadded. An edit that empties a list in a file whose list items sit at
+their key's indent indents every list in the file only when the writer's first rendering fails to parse,
+such as when that flat list is emptied under a comment, since the other form would not parse.
+Emptying a flat list that still parses does not indent the others: a flat `routing.deny.models`
+emptied while `review.prefer` is also flat writes `models: []` and leaves `review.prefer` flat. An untouched value aligned with
+extra spaces is normalized to one space. An untouched double-quoted value written with an escape for a character that prints
+can be rewritten with the character itself; an escape for a tab stays an escape. A comment on a block map's or
+list's key line moves below that line, and the gap before a comment after an implicit null, or after a `|` or `>` header,
+is written as two spaces (a comment that continues on the next line moves instead, as listed below). A `%YAML 1.1` file gets a real map where a write needs a new one, and a file that holds only
+`---` or comments is written to. What the writer can still rewrite on an untouched line: a flow collection padded unlike
+most of the file's (a padded `{ a: b }` among unpadded ones), a flow list written over several lines, a plain or quoted
+scalar written over several lines (joined onto one; a literal `|` block stays a literal block, and a folded `>` can be reflowed), a
+comment after the last line (it gains a blank line before it), a flow collection's comma spacing; and a file with no
+newline at its end gets one. Also on an untouched line: trailing spaces and runs of blank lines go; a comment on the
+`---` line, a comment line indented unlike the lines around it, and a comment that continues under an implicit null or
+under an alias written out as a copy move; `key : value`, a value after a tab and extra spaces after a list's dash take
+one space; a flow map over several lines is joined, a comma at a flow collection's end and the padding of an empty `[ ]`
+go; a number written `+45`, `.5`, `4.5e1`, `0x2D` or `04` is respelled; a literal block's lines take the file's indent
+when they sit deeper; a double-quoted value of 40 characters or more that holds `\n` is written over several lines; and
+an escape for a character that does not print (`\_`, `\N`, `\u200B`, `\x7f` and the like) is written as that character
+(queue row 494); none of these changes what the file means or drops a comment's text. The review shows each such line
+(queue row 452). An aliased or
 anchored list is read as the config loader reads it, so its entries for channels this probe never served stay admitted;
 an edit through a shared anchor never changes the anchor's other aliases — each one is written out as a copy of its
 original value first. Fleet writes through no YAML merge key: a membership edit whose path
 (the edited list or any mapping above it) takes keys through `<<` is refused at review — it names the
 path and the merge (`<<: *base`), publishes nothing and leaves both overlays byte for byte; inline the
 merged keys into that mapping by hand, then save again.
+
+**From a script.** `tickmarkr fleet --json` prints the screen and changes nothing; beside `--yes`, `--set` or `--save`
+it is refused, so a dropped answer is never read as done. `--yes <id> --save` exits 0 when the answer was saved and 1
+when the fleet does not ask about that id now (an item already answered, say), so a script that repeats the line reads
+`--json` first:
+
+```sh
+tickmarkr fleet --json | grep -q '"id": "setup"' && tickmarkr fleet --yes setup --save
+```
 
 ## Tier and deny provenance (fleet writes)
 
