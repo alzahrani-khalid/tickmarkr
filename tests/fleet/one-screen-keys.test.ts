@@ -8,6 +8,10 @@ import { arrowsTo, keysFrom, moveTo, open, text, toItem } from "./drive.js";
 import { health, source } from "./world.js";
 import { setup, strip, terminal } from "../cli/fleet-screen-world.js";
 
+// queue row 527: a turn of the event loop inside the long key drives, so the test worker answers vitest's RPC (it times
+// out at 60 s) while a drive runs on a slow hosted runner, as the birpc-starver note in vitest.config.ts describes
+const turn = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
+
 const repoText = "routing:\n  deny:\n    # keep this seat out\n    adapters: [agy]\n    models: [codex:gpt-6-luna]\n";
 const world = () => source({ repoText, health: health(["claude-code:fable"]) });
 const BIG = { cols: 120, rows: 80 };
@@ -172,7 +176,7 @@ describe("the one screen's keys", () => {
   });
 
   // The repair of D-2187 add.363's review (row 499): the findings, each through press() and frame().
-  test("Enter opens what the drawn cursor is on, whatever message is drawn above the keys", () => {
+  test("Enter opens what the drawn cursor is on, whatever message is drawn above the keys", async () => {
     // a KEPT OUT comment of 600 characters makes the screen taller than the window, so it scrolls in places
     const long = source({ repoText: `routing:\n  deny:\n    # ${"a long reason ".repeat(43)}\n    adapters: [agy]\n    models: [codex:gpt-6-luna]\n`, health: health(["claude-code:fable"]) });
     const msgs = ["", "Nothing to save.", "Not saved: .tickmarkr/config.yaml changed while this screen was open. This is the new file: answer again, then press s.",
@@ -181,6 +185,7 @@ describe("the one screen's keys", () => {
       frame(src, st, size.cols, size.rows).filter((l) => l.some((x) => x.selected)).map((l) => l.map((x) => x.text).join(""));
     let checked = 0;
     for (const src of [world(), long]) for (const size of [{ cols: 80, rows: 20 }, { cols: 80, rows: 24 }, { cols: 100, rows: 30 }]) {
+      await turn();
       const places = homeTargets(src, initialScreen(), size);
       for (const msg of msgs) for (let sel = 0; sel < places.length; sel++) {
         const st = { ...initialScreen(), sel, msg }, quiet = { ...st, msg: "" }, where = `${size.cols}x${size.rows} ${msg.length} ${sel}`;
@@ -200,7 +205,7 @@ describe("the one screen's keys", () => {
       }
     }
     expect(checked).toBeGreaterThan(100);
-  });
+  }, 120_000); // queue row 527: CI under coverage runs this drive ~4x slower than a laptop
 
   test("below 80 by 20 every view is the one sentence, no key but q does anything, and nothing pending is lost", () => {
     const src = world();
@@ -285,5 +290,5 @@ describe("the one screen's keys", () => {
     }
     expect(blind).toBeGreaterThan(5);
     expect(shown).toBeGreaterThan(50);
-  });
+  }, 60_000); // queue row 527: CI under coverage runs this drive ~4x slower than a laptop
 });

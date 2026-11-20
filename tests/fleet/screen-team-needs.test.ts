@@ -160,7 +160,7 @@ describe("YOUR TEAM", () => {
       expect(all, `${n} ${cols}x${rows}`).toContain("then open fleet again.A run refuses");
       expect(plainScreen(far, cols).split("\n").map((l) => l.trim()).join(""), `${n} plain ${cols}`).toContain(long);
     }
-  });
+  }, 60_000); // queue row 527: CI under coverage runs this drive ~4x slower than a laptop
   test("a file location is shown exactly, never through the word-wrapper: repeated spaces and a path longer than three rows come back byte for byte", () => {
     const bad = "routing:\n  mode: partner-lead\n";
     const spaced = `/Users/someone/${"a  folder/".repeat(7)}tickmarkr/config.yaml`;

@@ -319,5 +319,5 @@ describe("the one screen", () => {
       for (let cursor = 0; cursor < 200; cursor++) for (const r of rows(oneScreen({ ...inp, cursor }, 80, 20))) seen.add(r.replace(/^▸ /, "  "));
       expect(tall.filter((r) => !seen.has(r))).toEqual([]);
     }
-  });
+  }, 60_000); // queue row 527: CI under coverage runs this drive ~4x slower than a laptop
 });

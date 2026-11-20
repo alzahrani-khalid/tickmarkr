@@ -7,8 +7,10 @@ import { lineParts } from "../../src/fleet/line-view.js";
 import { derive, frame, lineHomeTargets, press, type ScreenSource, type ScreenState } from "../../src/fleet/screen.js";
 import { health, source } from "./world.js";
 import { keysFrom, open } from "./drive.js";
-// a named width, so the sync-heavy hygiene check reads no trailing `}, 80);` as an inline timeout (queue row 527)
-const COLS80 = 80;
+
+// queue row 527: a turn of the event loop inside the long key drives, so the test worker answers vitest's RPC (it times
+// out at 60 s) while a drive runs on a slow hosted runner, as the birpc-starver note in vitest.config.ts describes
+const turn = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
 
 const F = "claude-code:claude-fable-5-2", O = "claude-code:claude-opus-5-5", A = "codex:gpt-6-astra", S = "codex:gpt-6.1-sol";
 const EXTRA = { "claude-code": ["claude-fable-5-2", "claude-opus-5-5"], codex: ["gpt-6.1-sol"] };
@@ -221,7 +223,7 @@ describe("a shape's line opened, and its keys", () => {
     const bare = (r: string) => r.replace(/^▸/, " ");
     for (const [name, src] of fixtures) {
       let st = open(src, "implement");
-      const M = derive(src, st).full!, { body, footer } = lineParts({ M, line: lineOf(M, "implement"), project: "r", cursor: 0 }, COLS80);
+      const M = derive(src, st).full!, { body, footer } = lineParts({ M, line: lineOf(M, "implement"), project: "r", cursor: 0 }, 80);
       const keys = footer.at(-1)!.map((x) => x.text).join("").trimEnd(), seen = new Set<string>();
       let last = "";
       for (let i = 0; i < 60; i++) {
@@ -243,7 +245,7 @@ describe("a shape's line opened, and its keys", () => {
       expect(st.line, name).toMatchObject({ at: 0, top: 0 });
     }
   });
-  test("at 80 by 20 a note too long for the foot starts in view and the arrows scroll through it to its end", () => {
+  test("at 80 by 20 a note too long for the foot starts in view and the arrows scroll through it to its end", async () => {
     for (const n of [1400, 1800]) {
       const id = "x".repeat(n), key = `codex:${id}`;
       const src = source({ health: health([], { codex: [id] }), repoText: `tiers:\n  codex:\n    models:\n      ? ${id}\n      : frontier\nrouting:\n  map:\n    implement:\n      prefer: null\n      pool: {mode: ordered, channels: [${key}]}\n` });
@@ -253,13 +255,13 @@ describe("a shape's line opened, and its keys", () => {
       const rows = () => frame(src, st, 80, 20).map((r) => r.map((x) => x.text).join(""));
       expect(rows().join(""), String(n)).toContain("A line never loses its last model:");
       const seen = new Set<string>();
-      for (let i = 0; i < 40; i++) { rows().forEach((r) => seen.add(r)); st = press(src, st, "down", { cols: 80, rows: 20 }).state; }
+      for (let i = 0; i < 40; i++) { rows().forEach((r) => seen.add(r)); st = press(src, st, "down", { cols: 80, rows: 20 }).state; await turn(); }
       expect([...seen].some((r) => r.includes("stays.")), String(n)).toBe(true);
       expect(rows().at(-1)!.trim()).toMatch(/back$/);
     }
-  });
+  }, 180_000); // queue row 527: CI under coverage runs this drive ~4x slower than a laptop
 
-  test("at 80 by 20 after any key, Enter, x, [ and ] change a line only through the row the cursor is drawn on", () => {
+  test("at 80 by 20 after any key, Enter, x, [ and ] change a line only through the row the cursor is drawn on", async () => {
     const SMALL = { cols: 80, rows: 20 };
     const seven = ["claude-code:fable", "claude-code:opus", "claude-code:sonnet", "codex:gpt-6-astra", "codex:gpt-6-sol", "codex:gpt-5.6-terra", "codex:gpt-6-luna"];
     let checked = 0;
@@ -282,8 +284,9 @@ describe("a shape's line opened, and its keys", () => {
           }
         }
         st = press(src, st, "down", SMALL).state;
+        await turn();
       }
     }
     expect(checked).toBeGreaterThan(0);
-  });
+  }, 180_000); // queue row 527: CI under coverage runs this drive ~4x slower than a laptop
 });

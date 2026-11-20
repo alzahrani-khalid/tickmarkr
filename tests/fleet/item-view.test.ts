@@ -403,7 +403,7 @@ describe("an item opened (5.8)", () => {
       }
     }
     expect(kinds).toBeGreaterThan(4);
-  });
+  }, 60_000); // queue row 527: CI under coverage runs this drive ~4x slower than a laptop
 
   // the reviewers' reproducers (D-2187 add.421, second cap): NOW includes the item's own yes; r keeps the staged yes; n remembers what is shown
   const CODEX = "routing:\n  allow:\n    adapters: [codex]\n  deny:\n    adapters: [codex]\n  map:\n    implement:\n      pool: { mode: ordered, channels: [nosuch:gone] }\nconsult:\n  prefer: []\n";

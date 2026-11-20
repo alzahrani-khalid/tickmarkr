@@ -259,7 +259,7 @@ describe("a shape's line opened", () => {
         }
       }
     }
-  });
+  }, 60_000); // queue row 527: CI under coverage runs this drive ~4x slower than a laptop
 
   test("each repeated model position has its own cursor and number in my order and as saved", () => {
     for (const mode of ["ordered", "any"]) {

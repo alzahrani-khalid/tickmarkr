@@ -98,13 +98,7 @@ export const resolveForkCap = (value: string | undefined): number => {
 // Locally the members pool in `suite` under its fork cap instead of paying their ~221 s as a
 // one-fork tail while five forks idle; their generous leaf ceiling moves with them per file
 // (SYNC_HEAVY_LEAF_CEILINGS, applied by tests/setup.ts), and every other file keeps 20 s.
-// 2.27.0 (queue row 527): CI (public) 44719977408 produced 20 s timeouts and onTaskUpdate RPC timeouts in three fleet
-// files whose exhaustive key drives run seconds of synchronous work (fleet-screen on ubuntu AND macOS, one-screen-keys,
-// line-keys); with coverage on they measured 8-15 s locally, against the 20 s default.
-export const SYNC_HEAVY_TESTS = [
-  "tests/cockpit/sweep.test.ts", "tests/docs-truth-testing.test.ts",
-  "tests/cli/fleet-screen.test.ts", "tests/fleet/line-keys.test.ts", "tests/fleet/one-screen-keys.test.ts",
-];
+export const SYNC_HEAVY_TESTS = ["tests/cockpit/sweep.test.ts", "tests/docs-truth-testing.test.ts"];
 export const SYNC_HEAVY_TIMEOUT_MS = 1_200_000; // generous by ruling: these members starve their own RPC under load
 export const SYNC_HEAVY_LEAF_CEILINGS: Record<string, number> = Object.fromEntries(
   SYNC_HEAVY_TESTS.map((file) => [file, SYNC_HEAVY_TIMEOUT_MS]),

@@ -848,7 +848,7 @@ describe("--set asks every model it names, keeps a pin in order, and --plain is 
     expect(items.length).toBeGreaterThan(1);
     for (const it of items) expect(plain.replace(/\n +/g, " "), it.title).toContain(it.title);
     expect(await run([])).toBe(plain);
-  });
+  }, 120_000); // queue row 527: CI under coverage runs this drive ~4x slower than a laptop
 });
 
 // The second repair of T15's review (rows 499, 502; D-2187 add.363): the rules are asked before any probe or

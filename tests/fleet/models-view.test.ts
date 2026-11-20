@@ -418,7 +418,7 @@ describe("allowing a model", () => {
       expect(flat(shown.map((r) => r.slice(r.indexOf("│") + 1)).join(""))).toContain(flat(`${cli} · OpenAI models · sign-in: API key, paid per use`));
       selectedShown(src, st, "gpt-review-new");
     }
-  });
+  }, 60_000); // queue row 527: CI under coverage runs this drive ~4x slower than a laptop
 });
 
 // the review of T11, fourth round (row 498; D-2187 add.409): doctor metadata is never a CLI; the vendor reads the probed identity;
@@ -536,7 +536,7 @@ describe("allowing a model: long names together, and a configured alias's vendor
       const { src, C } = longWorld(c, 20), st = toCli(src, keysFrom(src, models(src), ..."z".repeat(120)), C), all = page(src, st);
       expect(all, `${c}`).toContain(flat(`no model of ${C} has the search in its id`));
     }
-  });
+  }, 60_000); // queue row 527: CI under coverage runs this drive ~4x slower than a laptop
 
   test("a configured alias: the header's vendors read the identity the probe recorded, not the config's vendor", () => {
     const h = health([], { codex: ["new-alias"] }) as Record<string, { modelAuth?: Record<string, unknown> }>;

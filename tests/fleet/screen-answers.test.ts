@@ -179,7 +179,7 @@ describe("answers and the one write path", () => {
       expect(configs.size, `the order of ${subset.join()} changes the result`).toBe(1);
     }
     expect(sequences).toBeGreaterThan(50);
-  });
+  }, 60_000); // queue row 527: CI under coverage runs this drive ~4x slower than a laptop
   test("random keys never break the screen: every frame fits, every yes is for a listed item, a save always loads", () => {
     let seed = 4242;
     const rnd = () => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff;
@@ -211,7 +211,7 @@ describe("answers and the one write path", () => {
     // the run reached the paths it is here for
     expect(saves).toBeGreaterThan(0);
     expect(undone).toBeGreaterThan(0);
-  });
+  }, 60_000); // queue row 527: CI under coverage runs this drive ~4x slower than a laptop
   test("a team line never reads ok, or 0%, on a share that is small but not zero", () => {
     const M = buildFleetModel(source({ repoText: POOL }).inputs);
     const a = M.sample();
