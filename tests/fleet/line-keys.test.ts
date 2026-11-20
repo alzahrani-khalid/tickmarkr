@@ -7,6 +7,8 @@ import { lineParts } from "../../src/fleet/line-view.js";
 import { derive, frame, lineHomeTargets, press, type ScreenSource, type ScreenState } from "../../src/fleet/screen.js";
 import { health, source } from "./world.js";
 import { keysFrom, open } from "./drive.js";
+// a named width, so the sync-heavy hygiene check reads no trailing `}, 80);` as an inline timeout (queue row 527)
+const COLS80 = 80;
 
 const F = "claude-code:claude-fable-5-2", O = "claude-code:claude-opus-5-5", A = "codex:gpt-6-astra", S = "codex:gpt-6.1-sol";
 const EXTRA = { "claude-code": ["claude-fable-5-2", "claude-opus-5-5"], codex: ["gpt-6.1-sol"] };
@@ -219,7 +221,7 @@ describe("a shape's line opened, and its keys", () => {
     const bare = (r: string) => r.replace(/^▸/, " ");
     for (const [name, src] of fixtures) {
       let st = open(src, "implement");
-      const M = derive(src, st).full!, { body, footer } = lineParts({ M, line: lineOf(M, "implement"), project: "r", cursor: 0 }, 80);
+      const M = derive(src, st).full!, { body, footer } = lineParts({ M, line: lineOf(M, "implement"), project: "r", cursor: 0 }, COLS80);
       const keys = footer.at(-1)!.map((x) => x.text).join("").trimEnd(), seen = new Set<string>();
       let last = "";
       for (let i = 0; i < 60; i++) {

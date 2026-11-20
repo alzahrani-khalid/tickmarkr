@@ -111,7 +111,8 @@ describe("review caller verdict cause", () => {
     const script = join(mkdtempSync(join(tmpdir(), "tickmarkr-review-process-")), "script.json");
     writeFileSync(script, JSON.stringify({ tasks: {} }));
     const timed = await runLlmDetailed(new ProcessReviewer(script, "printf banner; sleep 1"), "fake-2", "review", process.cwd(), undefined, 20);
-    const startup = await runLlmDetailed(new ProcessReviewer(script, "printf banner; exit 2"), "fake-2", "review", process.cwd(), undefined, 200);
+    const startup = await runLlmDetailed(new ProcessReviewer(script, "printf banner; exit 2"), "fake-2", "review", process.cwd(), undefined, 5_000);
+    // the startup case exits at once; its ceiling is only a bound, wide enough for a slow hosted runner to start a shell (CI 44719977408 read it as a timeout at 200 ms; queue row 527)
 
     expect(timed.timedOut).toBe(true);
     expect(classifyVerdictCause(timed.output, nonce, "approve", timed)).toBe("timeout");
