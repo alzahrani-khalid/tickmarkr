@@ -33,11 +33,12 @@ export interface PoolExclusionPark { reason: string; details: Record<string, unk
  */
 export function poolExclusionPark(err: unknown, runId: string, task: Task, cfg: TickmarkrConfig, channels: BillingChannel[],
   profile: RoutingProfile | undefined, exclude: ReadonlySet<string>, journal: { events: JournalEvent[]; lines: number[] },
+  graph?: readonly Task[], // rows 501, 502 (D-2187 add.367): the daemon's graph, so the turns match its own call
 ): PoolExclusionPark | undefined {
   if (!(err instanceof RoutingError) || exclude.size === 0) return undefined;
   let pick: { adapter: string; model: string };
   try {
-    pick = route(task, cfg, channels, profile).assignment; // the same call, without the in-run exclusion set
+    pick = route(task, cfg, channels, profile, undefined, undefined, undefined, graph).assignment; // the same call, without the in-run exclusion set
   } catch {
     return undefined;
   }

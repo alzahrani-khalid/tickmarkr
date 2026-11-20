@@ -2,6 +2,55 @@
 
 This changelog documents breaking changes and major releases. **For per-release details, see [GitHub Releases](https://github.com/alzahrani-khalid/tickmarkr/releases).**
 
+## v2.27.0 — work goes out by complexity, and the fleet says what a save writes
+
+**v2.27.0** ships two runs. run-20261115-180142-0000000000005858 merged all 16 tasks of its spec; its tip verify passed.
+Three of its checks stayed owed: the reviews of T11 and T14 found a new edge of the same screens on every round, and
+T8's test gate was waived on measured evidence. A follow-up run, run-20261119-201930-0000000000006853, put the fixes for
+those reviews (queue rows 515, 518) and a prototype-pollution fix (row 522) through the gates as six tasks; all six
+merged, its tip verify passed and it owes nothing. Every task of both runs passed build, lint, evidence and scope, its
+acceptance criteria and a review by a model from another vendor before it merged.
+
+- **A line can give its tasks out by complexity** (rows 501, 502). A pool gains a third mode, `complexity`, beside `any`
+  and `ordered`: the hardest tasks go to the strongest models, and models with similar scores share the rest. Two new
+  keys under `routing`: `hardFrom` (2 to 10, default 8) and `similarWithin` (0 to 100, default 5); a bad value is a
+  config error naming the key. A line saved as `any` or `ordered` routes exactly as in 2.26.1.
+  - Wherever the router chooses again on such a line (a retry, a failover), it chooses the task's own group or a
+    stronger one.
+  - `plan` and the first dispatch of a run name the same model for a task: every caller that holds the graph passes it.
+  - The probe records each model's score, list price and speed, and `plan` says each task's group and why.
+- **`tickmarkr fleet` is one screen.** Workers are drawn in two columns, models kept out are listed with their
+  reasons, and what is not saved is said before the save. One list to move over; Enter opens what the cursor is on.
+  - A shape's line shows how it gives out its tasks (by complexity or in my order), its table, why, and a cost note,
+    and its keys change the choice, remove a model, set what counts as very complex and the bar.
+  - Allowing a model: the CLIs on the left, that CLI's models with their facts on the right, type to search, and a
+    level for it. The header says how the CLI bills its models, both ways when a model override differs.
+  - The judge, the review and the consult are drawn as an order; the mode has its own line.
+  - The save says what it writes before it writes. An opened item says what a yes removes, from where and why, and
+    what it leaves alone. An item answered yes and opened again describes the team with that yes.
+  - No item, view or answering command removes a rule you wrote to keep a model out; that rule is changed only from
+    its own line. The 2.24.0 editor behind `fleet --edit` is unchanged.
+  - Without a terminal: `--plain` prints the one screen, `--yes` and `--set` print the save, and `--set` names how a
+    line is given out.
+- **A name that is also an Object property is an ordinary name** (rows 515, 522). A CLI or a model named `toString`,
+  `valueOf` or `hasOwnProperty` is staged, saved and drawn like any other; `__proto__`, `constructor` and
+  `prototype` are refused by name. No edit writes through an object's prototype.
+- Beside a pending new model, the models view reads the verdict, the facts and each CLI's mark as the probe recorded
+  them; Tab rounds from an answered level; `r` keeps every answer (rows 515, 518).
+- **FLEET.md** says what the screen says: how a line gives out its tasks, and that no item removes a kept-out rule.
+
+Known limits:
+- `fleet --print --why` explains a complexity line with a sample task, so it can name another group and model than
+  `plan` gives a real task (row 520).
+- The fleet's other readers (the line and hand views, the lines model) and the router's identity lookup still read a
+  supplied name through Object's prototype; the views this version fixed guard their own calls (row 525).
+- A setting a run carries only in its uncommitted config (a raised diff cap) does not reach the verify that would pay
+  that run's owed check, so a check owed under such a setting cannot be discharged (row 521).
+
+Also known, found while this version was built, and not new in it:
+- One daemon test measures a deadline from its stand-in's start rather than from the call, and can fail by a few
+  milliseconds on a loaded machine (row 524).
+
 ## v2.26.1 — the fleet says what is so
 
 **v2.26.1** ships all 10 of its spec's tasks, merged in run-20261114-084504-0000000000005254. Every task passed

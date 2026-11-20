@@ -12,8 +12,20 @@ type Document = ReturnType<typeof parseDocument>;
 export interface Edit { layer: Layer; path: string[]; value: unknown; label: string }
 export interface Texts { userText: string; repoText: string }
 
+/**
+ * Keys no edit path may hold: written through, each reaches an object's prototype, not a key of its own
+ * (`__proto__` writes onto Object.prototype, for every object in the process). Refused by name before
+ * anything is written (row 522; D-2187 add.444).
+ */
+export const RESERVED_KEYS: ReadonlySet<string> = new Set(["__proto__", "constructor", "prototype"]);
+/** The first reserved key an edit path holds, if any. */
+export const reservedIn = (path: readonly unknown[]): string | undefined => path.find((s): s is string => typeof s === "string" && RESERVED_KEYS.has(s));
+/** A key of an object's own, never one it inherits: a CLI named toString is a key like any other (row 522). */
+const own = (o: Record<string, unknown>, k: string): unknown => (Object.hasOwn(o, k) ? o[k] : undefined);
+/** Writes `k` as an own key, never through a setter it inherits: an own "__proto__" stays a key, for the refusal to see (row 522). */
+const setOwn = <T>(o: Record<string, unknown>, k: string, v: T): T => { Object.defineProperty(o, k, { value: v, writable: true, enumerable: true, configurable: true }); return v; };
 const valueAt = (obj: unknown, path: readonly string[]): unknown =>
-  path.reduce<unknown>((cur, seg) => (cur !== null && typeof cur === "object" ? (cur as Record<string, unknown>)[seg] : undefined), obj);
+  path.reduce<unknown>((cur, seg) => (cur !== null && typeof cur === "object" ? own(cur as Record<string, unknown>, seg) : undefined), obj);
 /**
  * Several yes answers may touch the same list, map or pool. Each is applied as what it adds and
  * removes against the current config, at every depth, so one answer never undoes another. Only
@@ -37,9 +49,9 @@ function combine(path: readonly string[], base: unknown, a: unknown, b: unknown)
   }
   if (!isObj(a) || !isObj(b)) return b;
   // pin, pool and prefer stay one slot: an answer naming one drops the other answer's others
-  const kept = isSlot(path) && SLOT.some((k) => k in b) ? Object.fromEntries(Object.entries(a).filter(([k]) => !(SLOT as readonly string[]).includes(k) || k in b)) : a;
+  const kept = isSlot(path) && SLOT.some((k) => Object.hasOwn(b, k)) ? Object.fromEntries(Object.entries(a).filter(([k]) => !(SLOT as readonly string[]).includes(k) || Object.hasOwn(b, k))) : a;
   const value: Record<string, unknown> = { ...kept };
-  for (const [k, v] of Object.entries(b)) value[k] = k in kept ? combine([...path, k], isObj(base) ? base[k] : undefined, kept[k], v) : v;
+  for (const [k, v] of Object.entries(b)) setOwn(value, k, Object.hasOwn(kept, k) ? combine([...path, k], isObj(base) ? own(base, k) : undefined, kept[k], v) : v);
   return value;
 }
 
@@ -71,15 +83,18 @@ const masks = (path: readonly string[]) => !(path.length === 3 && path[0] === "t
 function applyData(root: unknown, e: Edit, lower: readonly unknown[]): unknown {
   const top: Record<string, unknown> = isObj(root) ? root : {};
   const at = (path: readonly string[]): unknown => valueAt(top, path);
+  // own properties only: a step never follows an inherited key, and a reserved key is refused before it is written (row 522)
   const put = (path: readonly string[], v: unknown) => {
+    const bad = reservedIn(path);
+    if (bad !== undefined) throw new EditRefused(e.layer, e.path, refusedKey(bad, path));
     let o = top;
-    for (const seg of path.slice(0, -1)) o = (isObj(o[seg]) ? o[seg] : (o[seg] = {})) as Record<string, unknown>;
-    o[path[path.length - 1]] = v;
+    for (const seg of path.slice(0, -1)) { const next = own(o, seg); o = (isObj(next) ? next : setOwn(o, seg, {})) as Record<string, unknown>; }
+    setOwn(o, path[path.length - 1], v);
   };
   const { path, value } = e;
   if (value === undefined) {
     const parent = at(path.slice(0, -1));
-    if (isObj(parent)) delete parent[path[path.length - 1]];
+    if (isObj(parent) && Object.hasOwn(parent, path[path.length - 1])) delete parent[path[path.length - 1]];
     return top;
   }
   let lifted = false;
@@ -96,14 +111,14 @@ function applyData(root: unknown, e: Edit, lower: readonly unknown[]): unknown {
   const assign = (p: readonly string[], v: unknown): void => {
     const cur = at(p);
     if (isObj(v) && isObj(cur)) {
-      if (isSlot(p) && SLOT.some((k) => k in v)) for (const k of SLOT) if (!(k in v)) delete cur[k];
+      if (isSlot(p) && SLOT.some((k) => Object.hasOwn(v, k))) for (const k of SLOT) if (!Object.hasOwn(v, k)) delete cur[k];
       for (const [k, x] of Object.entries(v)) assign([...p, k], x);
     } else put(p, copy(v));
   };
   assign(path, value);
   const maskUnder = (p: readonly string[], v: unknown): void => {
     if (!isObj(v)) return;
-    for (const k of lowerKeys(lower, p)) if (k in v) maskUnder([...p, k], v[k]); else if (masks([...p, k])) put([...p, k], null);
+    for (const k of lowerKeys(lower, p)) if (Object.hasOwn(v, k)) maskUnder([...p, k], v[k]); else if (masks([...p, k])) put([...p, k], null);
   };
   if (lifted) maskUnder(path, value);
   return top;
@@ -114,7 +129,7 @@ function firstDiff(a: unknown, b: unknown, at: readonly string[] = []): string[]
   const empty = (v: unknown) => v === null || v === undefined || (isObj(v) && Object.values(v).every(empty));
   if (empty(a) && empty(b)) return null;
   if (isObj(a) && isObj(b)) {
-    for (const k of [...new Set([...Object.keys(a), ...Object.keys(b)])].sort()) { const d = firstDiff(a[k], b[k], [...at, k]); if (d) return d; }
+    for (const k of [...new Set([...Object.keys(a), ...Object.keys(b)])].sort()) { const d = firstDiff(own(a, k), own(b, k), [...at, k]); if (d) return d; }
     return null;
   }
   if (Array.isArray(a) && Array.isArray(b) && a.length === b.length) {
@@ -147,7 +162,7 @@ function assign(doc: Document, text: string, e: Edit, path: string[], value: unk
   if (isObj(value) && isMap(node)) {
     // A map is edited key by key: a key the edit does not name is not the edit's to remove. The one
     // exception is the loader's own rule: pin, pool and prefer are one declaration per shape.
-    if (isSlot(path) && SLOT.some((k) => k in value)) for (const k of SLOT) if (!(k in value)) node.delete(k);
+    if (isSlot(path) && SLOT.some((k) => Object.hasOwn(value, k))) for (const k of SLOT) if (!Object.hasOwn(value, k)) node.delete(k);
     for (const [k, v] of Object.entries(value)) assign(doc, text, e, [...path, k], v);
     return;
   }
@@ -158,7 +173,7 @@ const mask = (doc: Document, path: readonly string[]): void => { if (masks(path)
 /** Under a lifted tombstone, every lower key the edited map does not name stays masked, at every depth. */
 function maskUnder(doc: Document, at: readonly string[], value: unknown, lower: readonly unknown[]): void {
   if (!isObj(value)) return;
-  for (const k of lowerKeys(lower, at)) if (k in value) maskUnder(doc, [...at, k], value[k], lower); else mask(doc, [...at, k]);
+  for (const k of lowerKeys(lower, at)) if (Object.hasOwn(value, k)) maskUnder(doc, [...at, k], value[k], lower); else mask(doc, [...at, k]);
 }
 /** The tombstone lift of `applyData`, on the document. Returns whether one was lifted. */
 function liftTombstone(doc: Document, path: readonly string[], value: unknown, lower: readonly unknown[]): boolean {
@@ -247,7 +262,7 @@ function named(edits: readonly Edit[]): { leaves: string[][]; whole: string[][] 
   const leaves: string[][] = [], whole: string[][] = [];
   const walk = (p: string[], v: unknown): void => {
     if (!isObj(v)) { leaves.push(p); return; }
-    if (isSlot(p) && SLOT.some((k) => k in v)) for (const k of SLOT) if (!(k in v)) whole.push([...p, k]);
+    if (isSlot(p) && SLOT.some((k) => Object.hasOwn(v, k))) for (const k of SLOT) if (!Object.hasOwn(v, k)) whole.push([...p, k]);
     for (const [k, x] of Object.entries(v)) walk([...p, k], x);
   };
   for (const e of edits) walk(e.path, e.value);
@@ -256,13 +271,14 @@ function named(edits: readonly Edit[]): { leaves: string[][]; whole: string[][] 
 
 const same = (a: readonly string[], b: readonly string[]) => a.length === b.length && isPrefix(a, b);
 const isStrings = (v: unknown): v is string[] => Array.isArray(v) && v.every((x) => typeof x === "string");
-const exactly = (v: unknown, keys: readonly string[]): v is Record<string, unknown> => isObj(v) && Object.keys(v).length === keys.length && keys.every((k) => k in v);
+const exactly = (v: unknown, keys: readonly string[]): v is Record<string, unknown> => isObj(v) && Object.keys(v).length === keys.length && keys.every((k) => Object.hasOwn(v, k));
 const among = (list: readonly unknown[], v: unknown) => list.includes(v);
 const LIST_PATHS: readonly string[][] = [["review", "prefer"], ["consult", "prefer"], ["routing", "allow", "models"], ...DENY_SCOPES.map((sc) => [...sc.path])];
 // the pool modes the schema allows (src/config/config.ts, the pool's mode enum)
-const POOL_MODES = ["any", "ordered"] as const;
+// (rows 501, 502; D-2187 add.363: complexity joins them)
+const POOL_MODES = ["any", "ordered", "complexity"] as const;
 /**
- * Whether an edit is one of the eight the screen's producers emit (D-2187 add.229). The write path's
+ * Whether an edit is one of the nine the screen's producers emit (D-2187 add.229; routing.hardFrom, add.363). The write path's
  * input is closed: any other edit is refused by name before a document is parsed, so no reading of
  * what an unlisted edit "means" is ever needed.
  */
@@ -277,12 +293,28 @@ function fleetMakes(e: Edit): boolean {
   }
   if (LIST_PATHS.some((l) => same(l, path))) return isStrings(v);
   if (same(["routing", "mode"], path)) return among(ROUTING_MODES, v);
+  // rows 501, 502 (D-2187 add.363): what counts as very complex, a whole number from 2 to 10
+  if (same(["routing", "hardFrom"], path)) return Number.isInteger(v) && (v as number) >= 2 && (v as number) <= 10;
   if (path.length === 3 && a === "routing" && b === "floors" && among(SHAPES, c)) return v === undefined || among(TIERS, v);
   if (path.length === 4 && a === "tiers" && c === "models") return among(TIERS, v);
+  // a CLI the settings do not have, back with one model from the models view (row 498; D-2187 add.408)
+  if (path.length === 3 && a === "tiers" && c === "channel") return among(["sub", "api"], v);
+  if (path.length === 3 && a === "tiers" && c === "vendor") return typeof v === "string";
   if (path.length === 5 && a === "tiers" && c === "modelOverrides" && f === "vendor") return typeof v === "string";
   return false;
 }
+const refusedKey = (key: string, path: readonly string[]) =>
+  `${path.join(".")} holds "${key}", a name every object has built in: fleet writes no setting by that name — edit it by hand, then save again`;
 function refuseUnmade(edits: readonly Edit[]): void {
+  // a reserved key anywhere on a path, or in a map value's keys, is refused by name before any other check (row 522; D-2187 add.444)
+  for (const e of edits) {
+    const path = Array.isArray(e.path) ? e.path.map(String) : [];
+    const keysOf = (v: unknown, at: string[]): string[][] => (isObj(v) ? Object.keys(v).flatMap((k) => [[...at, k], ...keysOf(v[k], [...at, k])]) : []);
+    for (const p of [path, ...keysOf(e.value, path)]) {
+      const bad = reservedIn(p);
+      if (bad !== undefined) throw new EditRefused(e.layer === "user" ? "user" : "repo", p, refusedKey(bad, p));
+    }
+  }
   for (const e of edits) if (!fleetMakes(e)) {
     const path = Array.isArray(e.path) ? e.path.map(String) : [];
     throw new EditRefused(e.layer === "user" ? "user" : "repo", path, `fleet does not make this edit (${path.join(".") || "no path"}) — edit it by hand, then save again`);
@@ -304,7 +336,7 @@ function strayLeaf(a: Loaded, b: Loaded, edits: readonly Edit[]): string[] | nul
     if (isObj(x) || isObj(y)) {
       const mx = isObj(x) ? x : empty(x) ? {} : null, my = isObj(y) ? y : empty(y) ? {} : null;
       if (mx && my) {
-        for (const k of [...new Set([...Object.keys(mx), ...Object.keys(my)])].sort()) { const d = walk(mx[k], my[k], [...p, k]); if (d) return d; }
+        for (const k of [...new Set([...Object.keys(mx), ...Object.keys(my)])].sort()) { const d = walk(own(mx, k), own(my, k), [...p, k]); if (d) return d; }
         return null;
       }
     }

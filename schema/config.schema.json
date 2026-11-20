@@ -113,7 +113,8 @@
                     "type": "string",
                     "enum": [
                       "any",
-                      "ordered"
+                      "ordered",
+                      "complexity"
                     ]
                   },
                   "channels": {
@@ -173,6 +174,18 @@
             "on",
             "off"
           ]
+        },
+        "hardFrom": {
+          "default": 8,
+          "type": "integer",
+          "minimum": 2,
+          "maximum": 10
+        },
+        "similarWithin": {
+          "default": 5,
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100
         },
         "learnedTuning": {
           "type": "object",

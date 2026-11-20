@@ -4,8 +4,10 @@ import { describe, expect, test } from "vitest";
 import type { Tier } from "../../src/config/config.js";
 import { applyEdits } from "../../src/fleet/edits.js";
 import { buildFleetModel } from "../../src/fleet/model.js";
-import { handEdits, handLines, liftReach, type HandChoice } from "../../src/fleet/hand.js";
+import { handEdits, handLines, type HandChoice } from "../../src/fleet/hand.js";
 import { POOL, source } from "./world.js";
+import { open } from "./drive.js";
+import { derive, press } from "../../src/fleet/screen.js";
 
 /** A floor choice run through handEdits and applyEdits, then read back from the saved layers. */
 function savedFloor(shape: string, mode: string, user: Tier | null | undefined, repo: Tier | null | undefined, floor: Tier | "mode" = "mode") {
@@ -29,6 +31,26 @@ function savedBatch(userText: string, repoText: string, choices: HandChoice[]) {
 }
 
 describe("the lines a hand can change", () => {
+  test("a choice on the screen becomes the line's own edit in mode complexity or ordered; no choice lifts a rule", () => {
+    const repoText = `${POOL.replace("  mode: partner-led\n", "  mode: partner-led\n  deny:\n    workers:\n      models:\n        - claude-code:fable\n")}consult:\n  prefer: [codex:gpt-6-astra]\n`;
+    const src = source({ repoText }), M = buildFleetModel(src.inputs);
+    const at = (choices: HandChoice[]) => handEdits(M, choices).map((e) => [e.path.join("."), e.value]);
+    // the line's own edit, in the mode chosen; the kept-out model it adds keeps its rule
+    expect(at([{ line: "implement", chosen: ["codex:gpt-6-astra", "claude-code:fable"], mode: "complexity" }]))
+      .toEqual([["routing.map.implement", { pool: { mode: "complexity", channels: ["codex:gpt-6-astra", "claude-code:fable"] } }]]);
+    expect(at([{ line: "implement", chosen: ["claude-code:fable", "codex:gpt-6-astra"], mode: "ordered" }]))
+      .toEqual([["routing.map.implement", { pool: { mode: "ordered", channels: ["claude-code:fable", "codex:gpt-6-astra"] } }]]);
+    // a shape with no line of its own yet gets one by complexity
+    expect(at([{ line: "docs", chosen: ["codex:gpt-6-astra"] }])).toEqual([["routing.map.docs", { pool: { mode: "complexity", channels: ["codex:gpt-6-astra"] } }]]);
+    // through the screen: the line saved as any, By complexity chosen, Esc; the edit writes complexity and no deny list
+    let st = open(src, "implement");
+    st = press(src, st, "enter").state;
+    st = press(src, st, "esc").state;
+    const d = derive(src, st);
+    expect(d.hand.map((e) => [e.path.join("."), e.value])).toEqual([["routing.map.implement", { pool: { mode: "complexity", channels: ["codex:gpt-6-astra", "codex:gpt-5.6-terra"] } }]]);
+    expect(d.edits.some((e) => e.path[1] === "deny")).toBe(false);
+    expect(d.full!.cfg.routing.deny.workers.models).toEqual(["claude-code:fable"]);
+  });
   test("every shape, then the judge, review and consult, then the routing mode, then one line for each deny list", () => {
     const lines = handLines(buildFleetModel(source({ repoText: POOL }).inputs));
     expect(lines.map((l) => l.id)).toEqual(["plan", "spec", "implement", "tests", "docs", "migration", "ui", "refactor", "chore", "judge", "review", "consult", "mode",
@@ -39,18 +61,16 @@ describe("the lines a hand can change", () => {
     expect(lines.find((l) => l.id === "mode")).toMatchObject({ setting: true, one: true, current: ["partner-led"] });
     expect(lines.filter((l) => l.deny).every((l) => l.current.length === 0)).toBe(true);
   });
-  test("a choice becomes edits: the line's own, the rule of a model it adds lifted and no other, a deny list set to what is ticked", () => {
+  test("a choice becomes edits: the line's own and a deny list set to what is ticked; a model it adds lifts no rule", () => {
     const M = buildFleetModel(source({ repoText: "routing:\n  deny:\n    models:\n      - claude-code:opus\n    workers:\n      models:\n        - claude-code:fable\n  map:\n    plan:\n      pool:\n        mode: any\n        channels: [codex:gpt-6-astra]\n" }).inputs);
     const plan = handLines(M).find((l) => l.id === "plan")!;
     expect(plan.barred["claude-code:fable"]).toEqual({ why: "the deny rule claude-code:fable for all work (every shape, plan and spec too)", liftable: true });
-    expect(liftReach(M, plan, "claude-code:opus").seats).toEqual(["judge", "review", "consult"]);
     const edits = handEdits(M, [{ line: "plan", chosen: ["codex:gpt-6-astra", "claude-code:fable"], mode: "ordered" }, { line: "deny.models", chosen: ["claude-code:opus", "claude-code:sonnet"] }]);
     expect(edits.map((e) => [e.path.join("."), e.value])).toEqual([
       ["routing.map.plan", { pool: { mode: "ordered", channels: ["codex:gpt-6-astra", "claude-code:fable"] } }],
       ["routing.deny.models", ["claude-code:opus", "claude-code:sonnet"]],
-      ["routing.deny.workers.models", []],
     ]);
-    expect(edits.map((e) => e.label)).toEqual(["plan: add fable; mode ordered", "claude-code:sonnet: denied for every seat", "claude-code:fable: no longer denied for all work (every shape, plan and spec too)"]);
+    expect(edits.map((e) => e.label)).toEqual(["plan: add fable; mode ordered", "claude-code:sonnet: denied for every seat"]);
     // a floor alone writes the floor and leaves the pool as it is
     expect(handEdits(M, [{ line: "plan", chosen: [], floor: "mid" }]).map((e) => [e.path.join("."), e.value])).toEqual([["routing.floors.plan", "mid"]]);
   });

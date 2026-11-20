@@ -32,7 +32,7 @@ export function addUsage(a: TokenUsage | undefined, b: TokenUsage): TokenUsage {
 
 // OBS-1182: effort rides beside the seat (absent = the CLI's own default); channelKey and the model id never carry it.
 export interface Assignment { adapter: string; model: string; channel: "sub" | "api"; tier: Tier; effort?: Effort }
-export interface BillingChannel { adapter: string; vendor: string; model: string; channel: "sub" | "api"; tier: Tier; identity?: string; effort?: Effort }
+export interface BillingChannel { adapter: string; vendor: string; model: string; channel: "sub" | "api"; tier: Tier; identity?: string; effort?: Effort; score?: number }
 export const MODEL_PROBE_ERRORS = ["EMFILE", "EAGAIN", "ENFILE", "ENOMEM", "ENOSPC"] as const;
 export type ModelProbeError = typeof MODEL_PROBE_ERRORS[number];
 // Queue rows 353, 362 and 367 R3 (D-2187 condition 2): the probe's typed failure class. Every class stays
@@ -48,6 +48,8 @@ export interface ModelListing extends ModelListingOutcome { models: string[] }
 // copied verbatim from the CLI's own cache, never inferred from a model name. `successor` is the CLI's
 // named upgrade target, not a tier claim.
 export interface ModelRetirement { retiresAt: string; successor?: string }
+// Queue row 502; D-2187 add.363: fetched facts belong to the observed identity, never a floating alias.
+export interface ModelFacts { as: string; score?: number; priceIn?: number; priceOut?: number; speed?: number; name?: string }
 export interface AuthHealth {
   installed: boolean; authed: boolean; version?: string; models: string[]; note?: string;
   // v1.5 MODEL-02: ISO timestamp — additive-optional, pre-v1.5 doctor.json lacks it, readers use ?.
@@ -63,6 +65,7 @@ export interface AuthHealth {
   // for routing unless cfg.routing.allowUnverifiedModels restores legacy compatibility.
   modelAuth?: Record<string, ModelAuth>;
   modelIdentities?: Record<string, string>;
+  modelFacts?: Record<string, ModelFacts>;
   // v2.6.4 T2 (B1a): per listed model — null = listed with NO retirement notice (known clean), a record
   // = the CLI's notice; v2.6.9 also records a hidden row's dated notice (never null for a hidden row, D-1526).
   // A missing key is unknown (the CLI's notice was absent or malformed); the whole

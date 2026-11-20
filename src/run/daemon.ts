@@ -4437,10 +4437,10 @@ export async function runDaemon(repoRoot: string, opts: RunOptions = {}): Promis
 
     let r: ReturnType<typeof route>;
     try {
-      r = route(t, cfg, channels, profile, undefined, demotedChannels);
+      r = route(t, cfg, channels, profile, undefined, demotedChannels, undefined, graph.tasks); // rows 501, 502 (D-2187 add.367): the whole graph
     } catch (err) {
       // Queue row 397 (D-2187 add.23): a refusal only the in-run exclusion set caused parks, recoverably.
-      const pooled = poolExclusionPark(err, runId, t, cfg, channels, profile, demotedChannels, journal.readSourced());
+      const pooled = poolExclusionPark(err, runId, t, cfg, channels, profile, demotedChannels, journal.readSourced(), graph.tasks);
       if (!pooled) throw err;
       await park(t, pooled.reason, "infra", null, 0, startMs, 0, 0, undefined, 0, "fresh", pooled.details);
       return;

@@ -3,7 +3,8 @@
 Operator workflow lives in the README's [Choosing your fleet](README.md#choosing-your-fleet-tickmarkr-fleet)
 section. This document is the deep reference for routing-mode semantics, steering syntax,
 tier provenance, and run-time routing flags. Implementation anchors: `src/config/config.ts`
-(mode compilation), `src/route/router.ts` (production routing), `src/fleet/` and
+(mode compilation), `src/route/router.ts` (production routing), `src/route/complexity.ts` (a line given
+out by complexity), `src/fleet/` and
 `src/cli/commands/fleet-screen.ts` (the `tickmarkr fleet` screen: your team, and what needs you),
 `src/cli/commands/fleet.ts` (the editor behind `tickmarkr fleet --edit`, and `--pick`, `--print`),
 `src/cli/commands/run.ts` (run flags).
@@ -51,7 +52,104 @@ Floor provenance recorded at compile time:
 - Shapes still governed by an explicit overlay floor → `"config floors"`
 - Shapes filled from the mode preset → `"mode <name>"` (e.g. `mode partner-led`)
 
+The one screen's header names the mode in words, `mode partner-led (frontier models only)`: that is what the mode asks
+of every shape, not what every line holds. A line that already names a model below the bar keeps it, and that line's
+row says how much of its work runs below the bar: `<n>% below the bar`.
+
+## How a line gives out its tasks
+
+A shape's line is `routing.map.<shape>.pool: { mode, channels }`: the models named for that shape, and the way they
+get its tasks. The way is one of three:
+
+- **By complexity** (`mode: complexity`, new in 2.27): the expensive, strongest models are kept for the very complex
+  tasks, complexity `routing.hardFrom` to 10. Every task gets a complexity from 1 to 10 when its spec is compiled
+  (`tickmarkr compile`). The line's models are put in groups by score, strongest first: models within
+  `routing.similarWithin` points of a group's strongest share that group. The first group takes the very complex
+  tasks; the complexities below are divided among the other groups, strongest first. With one group, it takes every
+  task. The models of a group share its related tasks in stable turns, so the same graph, config and probe give the
+  same picks. A group with no usable model for a task hands its turn on to another group.
+  The exact choice for each task is what `tickmarkr plan` prints. `tickmarkr fleet --print --why` explains a shape,
+  not a task: it reads no graph and asks about one sample task of complexity 3, so it can name another group and model
+  than `tickmarkr plan` gives a task of that shape.
+- **My order** (`mode: ordered`): the first model that works takes every task; the others are backups, in order.
+- **As saved before 2.27** (`mode: any`): see below.
+
+A shape with no line of its own (no pool and no pin) is not given out by complexity: the cheapest model at the bar takes
+each task, unless an explicit prefer list names an order, which ranks before cost.
+
+**The two numbers.** Both are one setting each, for every line given out by complexity:
+
+- `routing.hardFrom` — where very complex starts: a whole number from 2 to 10, default 8 (1 is refused: every other
+  group would get nothing).
+- `routing.similarWithin` — how close two scores must be to share a group: a number from 0 to 100, default 5.
+
+A value outside its range, or of another type, is a config error that names the key. Scores are compared in tenths, so
+64.6 and 59.6 are exactly 5 apart. On the one screen, `c` in an opened line given out by complexity moves `hardFrom` up by one (from 10 back to
+2) as one pending change for every line by complexity; from a script, `tickmarkr fleet --set hardFrom=7`.
+`similarWithin` is set in the config file.
+
+```yaml
+routing:
+  hardFrom: 8          # very complex is 8 to 10
+  similarWithin: 5     # scores within 5 points share tasks
+  map:
+    implement:
+      pool: { mode: complexity, channels: [claude-code:claude-fable-5-2, claude-code:claude-opus-5-5, codex:gpt-6-astra, codex:gpt-6.1-sol] }
+```
+
+**A score and a list price.** A model's score is its Artificial Analysis Intelligence Index, and it comes from the
+model catalogs the probe reads. Its list price is the price in US dollars per million tokens, in and out. The probe
+(`tickmarkr doctor`, `r` on the screen, `tickmarkr fleet --fresh`) records both as `modelFacts` in the doctor record;
+routing reads the score from that record, so a new score reaches routing at the next probe. With no Artificial Analysis
+data the probe still succeeds. When a model a line could use for a task has no score, the line is grouped by level,
+frontier then mid then cheap, and `tickmarkr plan` names the model that has no score.
+
+**A subscription model's list price is shown, not charged.** The price column is the vendor's list price; a model you
+reach through a subscription is billed by that subscription, and no screen calls it free. Giving tasks out by
+complexity reads no price at all. A price appears on the line view and in its cost note, which names a model whose
+output price is at least 3 times the lowest above zero in its group (`gpt-6-astra costs 5 times gpt-6.1-sol for a
+similar score.`); a recorded price of zero is shown as `$0` and compared with nothing.
+
+**Reading it back.** `tickmarkr plan` ends each task's line with how it was given out, for example
+`by complexity: very complex 8-10, group 1 of 2 (config routing.map)` or
+`by complexity: the rest 1-7, group 2 of 2, one of 3 that take turns (config routing.map)`; a task moved to another
+group adds `group 2 has no model that can take it, moved up`, and a line grouped by level adds
+`grouped by level: <cli:model> has no score`. The one screen's WORKERS heads read `VERY COMPLEX 8-10` and `THE REST 1-7`;
+an opened line shows each group's models with their score, price and share, counted over 400 sample tasks, 40 at each
+complexity.
+
+**A line saved before 2.27.** A line written `mode: any` routes exactly as it did in 2.26.1: each task goes to the
+cheapest model by marginal cost, spread over the vendors, and within one vendor the lighter or earlier-written model
+comes first. `any` does not share tasks between every model on the line: a second model of the same vendor at the same
+cost can get no tasks at all. The one screen shows such a row as `<names> share every task` (`<name> does every task` when one model
+takes all of it) and, in the warning style,
+`no tasks: <names>`; the opened line, "As saved before 2.27", gives each model that gets none its one reason (for
+example `<name>, of the same vendor, is written before it` or `it costs more than <name>`). To change it, answer yes to
+the item `complexity` (`<lines> are given out the way they were saved before 2.27. Give them out by complexity?`),
+which sets exactly those lines to by complexity and keeps every model on them; or open the line with Enter and choose
+By complexity or My order; or run `tickmarkr fleet --set <shape>=complexity:<models>`; or write `mode: complexity` in
+the config. A script may still write `--set <shape>=any:<models>`, which does what it did in 2.26.1; only the screen is
+limited to by complexity and my order. `--set <shape>=<models>` with no way keeps the line's way, and a line that has
+none becomes by complexity (in 2.26.1 it became `any`). `tickmarkr fleet --edit` offers only `any` and `ordered`: a
+line by complexity re-pooled there takes the mode chosen there.
+
 ## Where a fleet save lands
+
+**On the one screen (`tickmarkr fleet`).** Its keys are `↑↓ move · Enter change the line · y n answer · s save · u undo ·
+r check again · ? help · q quit`. A yes and a change wait under NOT SAVED, and nothing is written until the save: `s`
+opens it (`Nothing to save.` when nothing is pending). The save lists each change after and before, and under WRITTEN TO
+names every file it writes: `your settings: ~/.config/tickmarkr/config.yaml`, read by every project with no line of its
+own, or `this project's settings: .tickmarkr/config.yaml`, read by this project only. In a linked worktree with no config
+of its own, a save that writes this project's settings says it writes a full copy there, after which a change to the
+file it read no longer reaches that checkout; a save that writes only your settings makes no local copy. `d` shows each file's changed lines with their numbers and its +N −M count, and `d` again returns; Enter saves;
+Esc goes back with nothing written. Each edit goes to the file that holds what it changes: your settings only when they
+hold it and this project's do not; held by both, or by neither, this project's settings. One save may write both files.
+Before either file is touched the save checks that neither changed while the screen was open (if one did, the save is
+refused: answer again) and that the candidate bytes load. `tickmarkr fleet --yes <id>` and `--set` print the same save
+as text and write it only with `--save`.
+
+**In the 2.24.0 editor (`tickmarkr fleet --edit`), unchanged in 2.27, a save follows its own rule.** The rest of this
+section, and the rows, rails, `t`, Space, `w` and `y` keys it names, are that editor's.
 
 Every `w` review writes exactly ONE overlay and names it in the review title (`review · <path>`).
 Before you press `w`, an excluded row's detail line already names where each excluding scope is held,
@@ -133,8 +231,8 @@ press moves that same entry to `routing.deny.workers.adapters`. Only the final s
 written — the intermediate `routing.deny.adapters` entry never reaches the review or the file, so
 review, judge and consult seats keep that adapter.
 
-**What a save keeps.** A save changes only what its answers name, and the review shows every line it will
-change, with its +N −M count, before anything is written. On the one screen (`tickmarkr fleet`, its `--yes` and `--set`)
+**What a save keeps.** A save changes only what its answers name, and the file lines (`d` in the one screen's save,
+the review in the editor) show every line it will change, with its +N −M count, before anything is written. On the one screen (`tickmarkr fleet`, its `--yes` and `--set`)
 the saved files load and their merged settings change only at the answered settings; an edit it cannot prove that of is
 refused, naming the file and the setting, and nothing is written. The bytes of lines an edit does not touch are kept when
 every line ends LF or every line ends CR LF — a file whose lines end both ways has no one form to keep, and the writer can
@@ -182,9 +280,30 @@ when the fleet does not ask about that id now (an item already answered, say), s
 tickmarkr fleet --json | grep -q '"id": "setup"' && tickmarkr fleet --yes setup --save
 ```
 
+## KEPT OUT: what removes a rule
+
+The one screen's KEPT OUT lists every rule of every deny list in force (`routing.deny.*`), in the lists' order. A
+row may show a reason taken from a comment in the config file; a rule with no reason found shows none. An entry of a
+workers' list ends ` · workers only` (with no reason it reads `kept out for workers`).
+
+**No item removes a KEPT OUT rule.** No yes changes, empties, removes or adds to a deny list, with no exception. The
+tidy item removes names from lines only; a judge item may offer a replacement the rules allow, and its yes changes the
+judge only; the consult and judge items, when the model they would pick is kept out by a rule, have no yes: they name the rule and say to remove it from its own line of KEPT OUT or to pick another model.
+The new-model item's yes adds a model to `routing.allow.models` only when the allow list excludes it: that is an
+allowance, not a KEPT OUT rule.
+
+On the screen a rule is removed only from its own line of KEPT OUT: Enter on the rule's row shows the rule, its reason
+and the models it keeps out now, `x` removes it as a pending change, and `s` then Enter saves it. The `+ keep a model or
+a CLI out` row adds a rule, and never removes one that was there when the screen opened. A model added to a line lifts
+no rule: the models view refuses a model a rule keeps out and names the rule. From a script, `tickmarkr fleet --set`
+removes no rule either: naming a model a rule keeps out, or giving a deny list without an entry that is saved, is
+refused by name, exits 1 and writes nothing; `--set` on a deny list may add entries. Outside the one screen and its
+commands, a rule is removed by editing the config file. `tickmarkr fleet --edit`, the 2.24.0 editor, is unchanged and
+still changes a rule from its own rows.
+
 ## Tier and deny provenance (fleet writes)
 
-The fleet editor (`tickmarkr fleet`) persists tier assignments into the overlay chosen above. When you
+The 2.24.0 fleet editor (`tickmarkr fleet --edit`) persists tier assignments into the overlay chosen above. When you
 classify a model that has no tier yet, step 3 requires a typed **benchmark-provenance note**;
 the serializer stores it on the assignment and writes it as a trailing `#` comment beside that
 model line in YAML.
@@ -210,7 +329,7 @@ review:
 
 **Grammar**: review prefer entries may name a bare adapter (inheriting the model from the current channel) or an explicit `adapter:model` pair. Bare adapters rank every diversity-eligible channel for that adapter; explicit pairs rank one diversity-eligible channel.
 
-In the fleet browser's Steering view, both prefer lists are staged with a picker over the discovered channels — space adds or drops an entry, selection order is chain order — so entries are never typed by hand.
+In the editor's (`tickmarkr fleet --edit`) Steering view, both prefer lists are staged with a picker over the discovered channels — space adds or drops an entry, selection order is chain order — so entries are never typed by hand.
 The review picker offers bare adapters and explicit `adapter:model` seats; the consult picker
 offers explicit seats only. A configured entry that is absent from current discovery remains a
 marked picker row until the operator deliberately drops it.

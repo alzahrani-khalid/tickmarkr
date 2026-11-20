@@ -773,6 +773,18 @@ export function writeDoctor(
     }
     health = merged;
   }
+  // Queue row 502; D-2187 add.363: every writer keeps missing facts only for the identity it records.
+  // Iterate this report, not the prior one: a full write still drops absent adapters; a scoped one kept them above.
+  health = Object.fromEntries(Object.entries(health).map(([id, entry]) => {
+    if (!entry || typeof entry !== "object") return [id, entry];
+    const prior = priorRecord?.[id] as AuthHealth | undefined;
+    const candidates = { ...prior?.modelFacts, ...entry.modelFacts };
+    if (!entry.modelFacts && !Object.keys(candidates).length) return [id, entry];
+    const facts = Object.fromEntries(Object.entries(candidates).filter(([model, fact]) =>
+      fact && fact.as === (observedIdentity(health, id, model) ?? model)));
+    const { modelFacts: _, ...rest } = entry;
+    return [id, { ...rest, ...(Object.keys(facts).length ? { modelFacts: facts } : {}) }];
+  }));
   health = contain(health);
   // The fleet screen calls a model "new" from when a probe first listed it. The record rides in
   // doctor.json under its own key, so the probe still writes one file and no adapter entry changes.
@@ -825,7 +837,12 @@ export function discoverChannels(
         .filter((c) => !invalid.has(c.model) && modelAuthed(h, c.model, cfg.routing.allowUnverifiedModels) && (!s || s.includes(c.model)))
         .map((c) => {
           const identity = observedIdentity(health, a.id, c.model);
-          const observed = identity ? { ...c, identity } : c;
+          // Queue row 502; D-2187 add.363: only the recorded identity's finite score travels to routing.
+          const fact = h.modelFacts?.[c.model];
+          const score = fact?.as === (identity ?? c.identity ?? c.model) && typeof fact.score === "number" && Number.isFinite(fact.score)
+            ? fact.score : undefined;
+          const { score: _score, ...channel } = c;
+          const observed = { ...channel, ...(identity ? { identity } : {}), ...(score !== undefined ? { score } : {}) };
           if (c.adapter !== "claude-code") return observed;
           // Behind a confirmed proxy the served family is the recorded vendor; undefined keeps the base reading.
           const served = proxy && proxiedClaudeVendor(c.model, identity);

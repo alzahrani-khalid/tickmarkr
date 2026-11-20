@@ -13,6 +13,7 @@ import { confirmedClaudeProxy, containLines, containReport, type CredentialWithh
 import { BANNER, compactTokens, dim, fail, kvRow, legend, ok, rule, statusRow, title, warn } from "../../brand.js";
 import { graphPath, loadGraph, tickmarkrDir, stateDirName } from "../../graph/graph.js";
 import { catalogModelAdvisory, catalogTierRanking, declaredModelWindow, hasWindowsConfig, modelLints, modelListingLints, suggestOverlay, ttyVisual } from "../../adapters/model-lints.js";
+import { recordModelFacts } from "../../adapters/model-facts.js";
 import { loadConfig, overlayPreferShapes } from "../../config/config.js";
 import { HerdrDriver } from "../../drivers/herdr.js";
 import { admitHerdrApp, captureHost, classifyHost, configDriverRefused, herdrAppBinary, hostMarkers, resolveDriver, type DriverChoice } from "../../drivers/index.js";
@@ -1658,6 +1659,8 @@ export async function doctor(
   const discovery = await checkModelDiscovery({ cwd, cfg, adapters, health, catalog, resolved: resolvedIdentitySnapshot, mayRefresh: !opts.catalog && !catalogRefreshLine && catalogRefreshAllowed, fetcher: opts.catalogFetcher, now: opts.catalogNow });
   catalog = discovery.catalog;
   aliasDriftFindings.push(...discovery.findings);
+  // Queue row 502; D-2187 add.363: snapshot facts after discovery and alias resolution, before the single write.
+  recordModelFacts(cfg, catalog, health);
   const portProbe = await probeLaunchServicesPorts();
   const launchServices = await recordLaunchServices(readDoctor(cwd), health, portProbe.observation);
   // Only scoped runs merge with the prior report. A full refresh must not revive

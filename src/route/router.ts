@@ -1,6 +1,7 @@
 import { type Assignment, type BillingChannel, channelKey, channelsFromConfig } from "../adapters/types.js";
 import { type TickmarkrConfig, TIER_RANK, type Tier } from "../config/config.js";
 import type { Task } from "../graph/schema.js";
+import { HARD_FROM_DEFAULT, pickByComplexity, retryGroups, SIMILAR_WITHIN_DEFAULT } from "./complexity.js";
 import { disallowedBy, routingModelProvider } from "./preference.js";
 import { cellOf, EXPLORE_CAP, explorationBonus, learnedScore, MIN_SAMPLES, type RoutingProfile } from "./profile.js";
 
@@ -132,7 +133,7 @@ function ladderFor(task: Task, entry?: { escalate?: boolean }): LadderStep[] {
 // ponytail: frontier runs only — the ruled scope (ruling §1); spreading mid/cheap ties too = drop
 // the tier guard. Rotation, not utilization: profile-driven spread would be inert exactly where
 // the concentration bites (cold profiles, plan-time static routing, learned:off).
-const spreadOffset = (task: Task): number => {
+export const spreadOffset = (task: Task): number => {
   let h = 0;
   for (const ch of `${task.id}\n${task.goal}`) h = (h * 31 + ch.charCodeAt(0)) >>> 0;
   return h;
@@ -230,7 +231,7 @@ const maybeSlaLint = (
   );
 };
 
-export function route(task: Task, cfg: TickmarkrConfig, channels: BillingChannel[], profile?: RoutingProfile, preferCtx?: RoutingPreferContext, exclude?: ReadonlySet<string>, exploreCtx?: ExploreContext): Route {
+export function route(task: Task, cfg: TickmarkrConfig, channels: BillingChannel[], profile?: RoutingProfile, preferCtx?: RoutingPreferContext, exclude?: ReadonlySet<string>, exploreCtx?: ExploreContext, graph?: readonly Task[]): Route {
   // OBS-1143: deny checks below read the probed identity the offered channels carry — the identity
   // discovery admitted them under. A seat no channel vouches for stays unknown (conservative).
   const observed = new Map(channels.flatMap((c) => (c.identity ? [[channelKey(c), c.identity] as const] : [])));
@@ -238,6 +239,7 @@ export function route(task: Task, cfg: TickmarkrConfig, channels: BillingChannel
     const identity = observed.get(channelKey({ adapter, model }));
     return identity ? { adapter, model, identity } : { adapter, model };
   };
+  const offered = channels; // rows 501, 502: a line by complexity reads its members before the in-run exclusion
   channels = withoutExcluded(channels, exclude);
   const lints: string[] = [];
   const advisoryFloor = cfg.routing.floors[task.shape];
@@ -349,13 +351,31 @@ export function route(task: Task, cfg: TickmarkrConfig, channels: BillingChannel
         `${task.id}: routing.map.${task.shape}.pool has no live channel${taskFloor ? ` at task floor ${taskFloor}` : ""} — declared: ${pool.channels.join(", ")}${skippedNote}; doctor found: ${channels.map(channelKey).join(", ") || "(nothing)"}`,
       );
     }
-    // No learned/explore inside pools: any spreads deterministically; ordered keeps declaration order.
-    const chosen = pool.mode === "ordered"
-      ? live[0]
-      : rankAnyPool(live, task)[0];
+    // No learned/explore inside pools: any spreads deterministically; ordered keeps declaration order;
+    // complexity (rows 501, 502; D-2187 add.363) gives the task's own group its stable turns.
+    let chosen: BillingChannel;
+    let said: string;
+    if (pool.mode === "ordered") {
+      chosen = live[0];
+      said = `pool ordered ${channelKey(chosen)}`;
+    } else if (pool.mode === "any") {
+      chosen = rankAnyPool(live, task)[0];
+      said = `pool any ${channelKey(chosen)}`;
+    } else {
+      const members = admitted
+        .map((id) => offered.find((c) => channelKey(c) === id))
+        .filter((c): c is BillingChannel => c !== undefined && (!taskFloor || TIER_RANK[c.tier] >= TIER_RANK[taskFloor]));
+      const pick = pickByComplexity({
+        task, members, excluded: exclude?.size ? channelExclusion(offered, exclude) : () => false,
+        hardFrom: cfg.routing.hardFrom ?? HARD_FROM_DEFAULT, similarWithin: cfg.routing.similarWithin ?? SIMILAR_WITHIN_DEFAULT,
+        graph, hash: spreadOffset(task),
+      })!; // live is non-empty, so a member can take the task
+      chosen = pick.chosen;
+      said = pick.phrase;
+    }
     lintMapPinFloor(chosen.tier, "pool");
     maybeSlaLint(lints, task, profile, slaMinutes, chosen);
-    return { assignment: toAssignment(chosen), ladder: ladderFor(task, entry), lints, provenance: `${degraded}pool ${pool.mode} ${channelKey(chosen)} (config routing.map${skippedNote})` };
+    return { assignment: toAssignment(chosen), ladder: ladderFor(task, entry), lints, provenance: `${degraded}${said} (config routing.map${skippedNote})` };
   }
 
   const baseTier: Tier = floor ?? "cheap";
@@ -467,6 +487,27 @@ export function route(task: Task, cfg: TickmarkrConfig, channels: BillingChannel
   return { assignment: toAssignment(eligible[0]), ladder: ladderFor(task, entry), lints, provenance: `${degraded}${bound}, marginal-cost auto (${chosenBy})`, ...(deviation ? { deviation } : {}) };
 }
 
+/**
+ * Rule 8 (row 502; D-2187 add.363): on a line by complexity, the groups a later choice may draw from, in
+ * order (own group, then stronger nearest first; else the nearest weaker one). Read from the task and the
+ * line alone — the offered channels before the in-run exclusion, as route() reads its members — never from
+ * the attempt before. Undefined for any other pool and for open routing, which keep their code path.
+ */
+function lineGroups(task: Task, cfg: TickmarkrConfig, channels: BillingChannel[], exclude?: ReadonlySet<string>): BillingChannel[][] | undefined {
+  const pool = taskPool(task, cfg);
+  if (pool?.mode !== "complexity") return undefined;
+  const taskFloor = task.routingHints?.floor;
+  const prefActive = !!(cfg.routing.allow || cfg.routing.deny);
+  const members = pool.channels
+    .map((id) => channels.find((c) => channelKey(c) === id))
+    .filter((c): c is BillingChannel => c !== undefined && (!taskFloor || TIER_RANK[c.tier] >= TIER_RANK[taskFloor])
+      && (!prefActive || disallowedBy(c.identity ? { adapter: c.adapter, model: c.model, identity: c.identity } : { adapter: c.adapter, model: c.model }, cfg.routing) === null));
+  return retryGroups({
+    task, members, excluded: exclude?.size ? channelExclusion(channels, exclude) : () => false,
+    hardFrom: cfg.routing.hardFrom ?? HARD_FROM_DEFAULT, similarWithin: cfg.routing.similarWithin ?? SIMILAR_WITHIN_DEFAULT,
+  });
+}
+
 function candidatePool(
   current: Assignment,
   task: Task,
@@ -475,6 +516,7 @@ function candidatePool(
   tried: string[],
   tierPredicate: (tier: Tier) => boolean,
   exclude?: ReadonlySet<string>,
+  groups?: BillingChannel[][],
 ): BillingChannel[] {
   // D-718: tried/escalated/demoted keys share channelExclusion's meaning, resolved against every offered
   // channel; the provider-outage rule below still reads the raw-key remainder exactly as before.
@@ -487,9 +529,15 @@ function candidatePool(
     && channels.filter((c) => c.adapter === current.adapter).every((c) => triedKeys.has(channelKey(c)));
   const currentChannel = channels.find((c) => c.adapter === current.adapter && c.model === current.model);
   const excludedProvider = currentAdapterExcluded ? routingModelProvider(current.model, currentChannel?.vendor) : undefined;
+  // Rule 8 (row 502; D-2187 add.363): on a line by complexity only the allowed groups' models are candidates —
+  // the task's own group or a stronger one while either can take it. A tried model still counts as able, so an
+  // own group all tried leaves nothing here rather than opening a weaker group. Applied to the RESULT only: the
+  // provider-outage read above keeps the whole pool, so a filtered-out sibling neither fakes nor hides an outage.
+  const allowed = groups && new Set(groups.flat().map(channelKey));
   return channels.filter((c) => !excluded(c)
     && (!excludedProvider || routingModelProvider(c.model, c.vendor) !== excludedProvider)
-    && tierPredicate(c.tier));
+    && tierPredicate(c.tier)
+    && (!allowed || allowed.has(channelKey(c))));
 }
 
 function rankFailoverCandidates(
@@ -497,7 +545,15 @@ function rankFailoverCandidates(
   task: Task,
   cfg: TickmarkrConfig,
   profile?: RoutingProfile,
+  groups?: BillingChannel[][],
 ): BillingChannel[] {
+  if (groups) {
+    // Rule 8 (row 502; D-2187 add.363): the own group first, then the stronger groups nearest first, each
+    // group's models rotated by the task's hash (before the tried are removed), with no learned key.
+    const k = spreadOffset(task);
+    const order = groups.flatMap((g) => [...g.slice(k % g.length), ...g.slice(0, k % g.length)]).map(channelKey);
+    return order.flatMap((key) => pool.filter((c) => channelKey(c) === key));
+  }
   const scores = new Map(pool.map((c) => [channelKey(c), profile ? learnedScore(profile, task.shape, channelKey(c), c.channel, { availWeight: cfg.routing.learnedTuning?.availWeight }) : 0]));
   const scoreOf = (c: BillingChannel) => scores.get(channelKey(c))!;
   return pool.sort((a, b) => TIER_RANK[a.tier] - TIER_RANK[b.tier] || marginalCostRank(a) - marginalCostRank(b) || scoreOf(b) - scoreOf(a));
@@ -519,8 +575,9 @@ export function nextChannel(
   // profile-dependent filter. NO exploration bonus here (route():110 has one; a probe on the
   // failure path would spend a real retry). Absent profile ⇒ every score is 0 ⇒ third key
   // all-ties ⇒ the stable sort preserves the exact v1.7 candidate ORDER.
-  const pool = candidatePool(current, task, cfg, channels, tried, (tier) => TIER_RANK[tier] >= TIER_RANK[current.tier], exclude);
-  const candidates = rankFailoverCandidates(pool, task, cfg, profile);
+  const groups = lineGroups(task, cfg, channels, exclude);
+  const pool = candidatePool(current, task, cfg, channels, tried, (tier) => TIER_RANK[tier] >= TIER_RANK[current.tier], exclude, groups);
+  const candidates = rankFailoverCandidates(pool, task, cfg, profile, groups);
   return candidates.length ? toAssignment(candidates[0]) : null;
 }
 
@@ -580,9 +637,10 @@ export function climbChannel(
     return pick ? makeClimbPick(pick, false, "no higher tier") : null;
   }
 
-  const higherPool = candidatePool(current, task, cfg, channels, tried, (tier) => TIER_RANK[tier] > TIER_RANK[current.tier], exclude);
+  const groups = lineGroups(task, cfg, channels, exclude);
+  const higherPool = candidatePool(current, task, cfg, channels, tried, (tier) => TIER_RANK[tier] > TIER_RANK[current.tier], exclude, groups);
   if (higherPool.length > 0) {
-    const candidates = rankFailoverCandidates(higherPool, task, cfg, profile);
+    const candidates = rankFailoverCandidates(higherPool, task, cfg, profile, groups);
     return makeClimbPick(toAssignment(candidates[0]), true);
   }
 

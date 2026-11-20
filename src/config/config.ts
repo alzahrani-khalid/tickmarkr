@@ -34,7 +34,8 @@ export const INTEGRITY_FLOOR_SHAPES = ["plan", "spec", "migration", "ui"] as con
 // inside it (cost, then tier); mode "ordered" walks the declaration order, first live wins. An
 // exhausted pool fails loud at plan (pin precedent, fail-closed).
 export const PoolSchema = z.object({
-  mode: z.enum(["any", "ordered"]),
+  // rows 501, 502 (D-2187 add.363): complexity — the hardest tasks to the strongest group, the rest by turns.
+  mode: z.enum(["any", "ordered", "complexity"]),
   channels: z.array(z.string().regex(/^[^:\s]+:\S.*$/, "pool channels are adapter:model")).min(1),
 });
 export type PoolEntry = z.infer<typeof PoolSchema>;
@@ -440,6 +441,15 @@ export const TickmarkrConfigSchema = z.object({
     learned: z.enum(["on", "off"]), // v1.6 ROUTE-09 kill switch; a typo (offf) fails loud via safeParse
     // OBS-986 (ES-1): climb one tier on request when untried channels exist in higher tiers.
     escalateTier: z.enum(["on", "off"]).default("on"),
+    // Rows 501, 502 (D-2187 add.363): a line by complexity — hardFrom starts the very complex range
+    // (1 is refused: every other group would idle); similarWithin is how close two scores share a group.
+    hardFrom: z.number({ error: "routing.hardFrom must be a whole number from 2 to 10" })
+      .int({ error: "routing.hardFrom must be a whole number from 2 to 10" })
+      .min(2, { error: "routing.hardFrom must be a whole number from 2 to 10" })
+      .max(10, { error: "routing.hardFrom must be a whole number from 2 to 10" }).default(8),
+    similarWithin: z.number({ error: "routing.similarWithin must be a number from 0 to 100" })
+      .min(0, { error: "routing.similarWithin must be a number from 0 to 100" })
+      .max(100, { error: "routing.similarWithin must be a number from 0 to 100" }).default(5),
     // v1.9 ROUTE-15 — optional overrides for profile.ts HALF_LIFE_RUNS/AVAIL_WEIGHT; absent ⇒ byte-identical defaults.
     // SIBLING of learned (not nested): routing.learned is the on/off enum switch.
     learnedTuning: z.object({
@@ -601,6 +611,8 @@ export const DEFAULT_CONFIG: TickmarkrConfig = {
     // first with `tickmarkr plan` / `tickmarkr report`; flip to "off" to pin exact static routing (the kill switch stands).
     learned: "on",
     escalateTier: "on",
+    hardFrom: 8,
+    similarWithin: 5,
     allowUnverifiedModels: false,
   },
   // Seed table (spec §13). New models = edit this (or your config.yaml), never code.

@@ -548,7 +548,8 @@ export async function plan(
     let row: PlanTaskRow = base;
     try {
       // daemon.ts:3322: the resumed run routes around its replayed worker exclusions.
-      const r = route(t, cfg, channels, dispatchProfile, undefined, demotedWorkers);
+      // Rows 501, 502 (D-2187 add.367): the whole graph, done and pending alike, so turns match the daemon.
+      const r = route(t, cfg, channels, dispatchProfile, undefined, demotedWorkers, undefined, g.tasks);
       routed.push({ taskId: t.id, adapter: r.assignment.adapter, model: r.assignment.model });
       for (const l of r.lints) {
         const suf = exclusionReason(l);
@@ -576,7 +577,7 @@ export async function plan(
       } else if (dispatchProfile !== profile && profile) {
         // learned off: the row above already names the static dispatch pick; the preview keeps its
         // value by naming what learned routing WOULD have picked instead (same scores, same shape).
-        const pv = route(t, cfg, channels, profile);
+        const pv = route(t, cfg, channels, profile, undefined, undefined, undefined, g.tasks);
         if (pv.deviation) {
           deviations++;
           const d = pv.deviation;

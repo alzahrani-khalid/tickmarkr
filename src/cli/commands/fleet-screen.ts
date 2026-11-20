@@ -7,8 +7,12 @@ import { globalConfigDir, loadConfigWithMode } from "../../config/config.js";
 import type { Layer, Texts } from "../../fleet/edits.js";
 import { type FloorChoice, floorOf, type HandChoice, handLines } from "../../fleet/hand.js";
 import { dismissNeed, loadFleetSource, restoreNeed, UnreadableConfig } from "../../fleet/load.js";
+import { keptOut, type Line, lineOf } from "../../fleet/lines.js";
 import { evidenceAgeDays } from "../../fleet/model.js";
-import { derive, errorFiles, errorWhere, initialScreen, type Kept, plainReview, plainScreen, resumeScreen, type ScreenSource, teamRows } from "../../fleet/screen.js";
+import { freeSeat, othersOf } from "../../fleet/rules.js";
+import { disallowedBy, observedSeat, type PreferenceRole } from "../../route/preference.js";
+import { SHAPES, type Shape } from "../../graph/schema.js";
+import { derive, errorFiles, errorWhere, initialScreen, type Kept, plainOne, plainSave, resumeScreen, type ScreenSource, teamRows } from "../../fleet/screen.js";
 import { doctor } from "./doctor.js";
 import { fleet, type FleetIO, type FleetInput, type FleetOutput, writeFleetOverlay } from "./fleet.js";
 
@@ -53,19 +57,49 @@ function jsonScreen(src: ScreenSource): string {
     team: teamRows(d.base).map(({ section, label, models, note, status }) => ({ section, line: label, models, ...(note ? { note } : {}), status })),
     needs: d.items.map((n) => ({ id: n.id, title: n.title, ask: n.ask, answerable: !!n.edits, changes: (n.edits ?? []).map((e) => ({ layer: e.layer, path: e.path.join("."), value: e.value ?? null })) })),
     // what --set takes: each line, the models the config names on it, and the models that may take it
-    // (keptOut: candidates a rule keeps from the line; naming one that is liftable lifts its rule in the same save)
-    lines: handLines(d.base).map((l) => ({ line: l.id, ...(l.layer ? { layer: l.layer } : {}), ...(l.deny ? { deny: true } : {}), ...(l.setting ? { setting: true } : {}), ...(l.mode ? { mode: l.mode } : {}), ...(l.floor ? { floor: l.floor.tier ?? null, floorSetFor: l.floor.own ? "this shape" : "the mode" } : {}), one: l.one, models: l.current, candidates: l.candidates, ...(Object.keys(l.barred).length ? { keptOut: l.barred } : {}) })),
+    // (keptOut: candidates a rule keeps from the line; --set refuses one a KEPT OUT rule keeps out, rule K2; rows 499, 502; D-2187 add.363)
+    // rows 499, 501, 502 (D-2187 add.363): how each shape is given out, and the rules in force
+    hardFrom: d.base.cfg.routing.hardFrom, similarWithin: d.base.cfg.routing.similarWithin,
+    lines: handLines(d.base).map((l) => ({ line: l.id, ...(l.layer ? { layer: l.layer } : {}), ...(l.deny ? { deny: true } : {}), ...(l.setting ? { setting: true } : {}), ...(l.mode ? { mode: l.mode } : {}), ...(l.floor ? { floor: l.floor.tier ?? null, floorSetFor: l.floor.own ? "this shape" : "the mode" } : {}), one: l.one, models: l.current, candidates: l.candidates, ...(Object.keys(l.barred).length ? { keptOut: l.barred } : {}),
+      ...(SHAPES.includes(l.id as Shape) ? givenOut(lineOf(d.base!, l.id as Shape)) : {}) })),
+    keptOut: keptOut(d.base), unsaved: 0,
   }, null, 2);
 }
 
-/** `--set <line>=<models>`: the same change the e key makes, checked the same way. */
+/** A shape's line as --json carries it: a null stands where a fact is not recorded. */
+function givenOut(line: Line): Record<string, unknown> {
+  return {
+    givenOut: line.givenOut,
+    ...(line.groups ? { groups: line.groups.map((g) => ({ range: g.range, by: line.by, noScore: line.noScore,
+      models: g.models.map((m) => ({ model: m.model, cli: m.cli, score: m.score, priceIn: m.priceIn, priceOut: m.priceOut, share: m.share, shareWords: m.shareWords, standIns: m.standIns })) })) } : {}),
+    ...(line.order ? { order: line.order } : {}),
+    ...(line.note.length ? { note: line.note } : {}),
+  };
+}
+
+/**
+ * `--set <line>=<models>`: the same change Enter on a line makes, checked the same way. A shape's line is
+ * named with its way first (`any:`, `ordered:`, `complexity:`), or bare, keeping its way (none: by
+ * complexity); `hardFrom=<2-10>` is the one number. It removes no KEPT OUT rule (rule K2; rows 499, 502;
+ * D-2187 add.363): a model a rule keeps out, or a deny list that leaves out a saved entry, is refused by name.
+ */
 function handFrom(src: ScreenSource, sets: readonly string[]): { hand: HandChoice[] } | { refused: string } {
   const base = derive(src, initialScreen()).base;
   if (!base) return { hand: [] };
   const lines = handLines(base), hand: HandChoice[] = [];
+  const guard = "--set removes no KEPT OUT rule: remove it from its own line of KEPT OUT on the screen (tickmarkr fleet), or in the config file";
   for (const set of sets) {
     // (a line is named as the screen and --json name it; a capital or a space around it is not a different line)
     const cut = set.indexOf("="), id = set.slice(0, cut).trim().toLowerCase(), line = lines.find((l) => l.id === id);
+    // hardFrom=<2-10>: where very complex starts, one number for every line given out by complexity (rows 501, 502)
+    if (cut > 0 && id === "hardfrom") {
+      const to = set.slice(cut + 1).trim(), n = Number(to);
+      if (!/^\d+$/.test(to) || n < 2 || n > 10) return { refused: `hardFrom is a whole number from 2 to 10, and ${JSON.stringify(to)} was given` };
+      if (n === base.cfg.routing.hardFrom) return { refused: `hardFrom is already ${n}` };
+      if (hand.some((x) => x.line === "hardFrom")) return { refused: "hardFrom is set twice" };
+      hand.push({ line: "hardFrom", chosen: [String(n)] });
+      continue;
+    }
     // <shape>.floor=<tier|mode>: the f key. It joins what the same command sets on that shape's models.
     const shape = id.endsWith(".floor") ? lines.find((l) => l.id === id.slice(0, -6) && l.floor) : undefined;
     if (shape) {
@@ -77,11 +111,19 @@ function handFrom(src: ScreenSource, sets: readonly string[]): { hand: HandChoic
       if (mine) mine.floor = to; else hand.push({ line: shape.id, chosen: [], floor: to });
       continue;
     }
-    // a shape may name its pool's mode before its models, as the o key turns it: plan=ordered:codex:a,claude-code:b
-    const turned = line?.mode ? /^(any|ordered):/.exec(set.slice(cut + 1))?.[1] as "any" | "ordered" | undefined : undefined;
+    // a shape may name how its line is given out before its models: plan=complexity:codex:a,claude-code:b (row 502)
+    const turned = line?.mode ? /^(any|ordered|complexity):/.exec(set.slice(cut + 1))?.[1] as "any" | "ordered" | "complexity" | undefined : undefined;
     const models = set.slice(cut + 1 + (turned ? turned.length + 1 : 0)).split(",").map((x) => x.trim()).filter(Boolean);
-    if (cut < 1 || !line) return { refused: `${JSON.stringify(set)} names no line — the lines are ${lines.map((l) => l.id).join(", ")}, written <line>=<adapter:model>[,…]` };
+    if (cut < 1 || !line) return { refused: `${JSON.stringify(set)} names no line — the lines are ${lines.map((l) => l.id).join(", ")}, written <line>=<adapter:model>[,…], and hardFrom=<2 to 10>` };
     if (!models.length && !line.deny) return { refused: `${id} needs ${line.setting ? "a value" : "at least one model"}` };
+    // Rules first, in the contract's closed order, before any probe or working-model check (a rule that keeps it out,
+    // then not allowed yet): every model named, one the line already names or one whose probe failed included, is asked the router's own
+    // rule check: one a deny rule keeps out is refused by the rule's name, and no rule is lifted (K2). One only
+    // not allowed yet is allowed by name, as on the screen.
+    const ruled = line.deny || line.setting ? [] : models.filter((k) => k.indexOf(":") > 0).map((k) => ({ k, ...keptBy(base, k, line.role) })).filter((r) => r.why.length || !r.freed);
+    const kept = ruled.find((r) => !r.freed || r.why.some((w) => w !== "the allowlist"));
+    if (kept) return { refused: `${kept.k} is kept from ${id} by ${kept.why.filter((w) => w !== "the allowlist").join(" and ") || "a rule"} — ${guard}` };
+    // (only after the rules: a model a rule keeps out is refused by that rule, however many are named)
     if (line.one && models.length > 1) return { refused: `${id} is one model, and ${models.length} were given` };
     const not = models.filter((k) => !line.candidates.includes(k));
     if (not.length) {
@@ -91,16 +133,28 @@ function handFrom(src: ScreenSource, sets: readonly string[]): { hand: HandChoic
     }
     const floored = hand.find((x) => x.line === line.id && !x.chosen.length && x.floor);
     if (hand.some((x) => x.line === line.id) && !floored) return { refused: `${id} is set twice` };
-    // (a model the line already names stays where it is, kept out as it was: only one that is added needs its rule lifted)
-    const kept = models.find((k) => line.barred[k] && !line.barred[k].liftable && !line.current.includes(k));
-    if (kept) return { refused: `${kept} is kept from ${id} by ${line.barred[kept].why} — change that deny list first (--set ${lines.filter((l) => l.deny).map((l) => l.id).join(", --set ")})` };
+    const added = ruled.map((r) => r.k).filter((k) => !line.current.includes(k));
+    // a KEPT OUT list may gain entries; one that leaves out a saved entry, or empties the list, is refused by the entry's name (K2)
+    const lost = line.deny ? line.current.filter((k) => !models.includes(k)) : [];
+    if (lost.length) return { refused: `${id} would no longer keep out ${lost.join(", ")}, which ${lost.length === 1 ? "is" : "are"} saved — ${guard}` };
     if (new Set(models).size !== models.length) return { refused: `${id} names a model twice` };
-    const mode = line.mode && (turned ?? line.mode);
-    if (models.length === line.current.length && models.every((k, i) => k === line.current[i]) && mode === line.mode) return { refused: line.setting ? `${id} is already ${models[0]}` : `${id} already has exactly those models, in that order` };
-    if (floored) Object.assign(floored, { chosen: models, ...(mode ? { mode } : {}) });
-    else hand.push({ line: line.id, chosen: models, ...(mode ? { mode } : {}) });
+    // a bare list keeps the line's way; a shape with no line of its own yet is given out by complexity (row 502)
+    // (a pin is given out in order: one model takes every task; contract section 4. A way named on a pin is a change:
+    // the pin becomes a pool of that way, as before)
+    const slot = base.cfg.routing.map[line.id as Shape], way = slot?.pool ? line.mode : slot?.pin ? "ordered" : undefined;
+    const mode = line.mode && (turned ?? way ?? "complexity");
+    const allows = added.length ? { allows: added } : {};
+    if (models.length === line.current.length && models.every((k, i) => k === line.current[i]) && mode === (way ?? line.mode) && !(slot?.pin && turned)) return { refused: line.setting ? `${id} is already ${models[0]}` : `${id} already has exactly those models, in that order` };
+    if (floored) Object.assign(floored, { chosen: models, ...(mode ? { mode } : {}), ...allows });
+    else hand.push({ line: line.id, chosen: models, ...(mode ? { mode } : {}), ...allows });
   }
   return { hand };
+}
+
+/** What keeps `key` from `role` by the router's own rule check, asked on a copy of the rules: nothing is lifted (K2). */
+function keptBy(M: NonNullable<ReturnType<typeof derive>["base"]>, key: string, role: PreferenceRole): { freed: boolean; why: string[] } {
+  const cut = key.indexOf(":"), seat = observedSeat(M.health, key.slice(0, cut), key.slice(cut + 1));
+  return disallowedBy(seat, M.cfg.routing, role) ? freeSeat(structuredClone(M.cfg.routing) as typeof M.cfg.routing, seat, key, role, othersOf(M, key)) : { freed: true, why: [] };
 }
 
 /** `--yes <id>…` and `--set <line>=<models>…`: the review as text; with `--save`, the write. */
@@ -113,7 +167,7 @@ function answer(load: () => ScreenSource, ids: string[], sets: string[], save: b
   if (ids.some((id) => !id.trim())) return { out: "tickmarkr fleet --yes: an id is missing after --yes — tickmarkr fleet --json lists the ids", code: 1 };
   const unknown = ids.filter((id) => !d.said.some((n) => n.id === id));
   if (unknown.length) return { out: `tickmarkr fleet --yes: ${unknown.join(", ")} ${unknown.length === 1 ? "is" : "are"} not something this fleet asks a yes about — tickmarkr fleet --json lists the ids`, code: 1 };
-  const review = plainReview(src, ids, set.hand, 100);
+  const review = plainSave(src, ids, set.hand, 100);
   if (d.refused || !d.texts) return { out: review, code: 1 };
   return save ? `${review}\n\n${saveFleet(src, d.texts, d.texts.touched, load())}` : `${review}\n\nNothing was saved. Add --save to save it.`;
 }
@@ -159,7 +213,7 @@ export async function fleetCommand(argv: string[], cwd = process.cwd(), adapters
   }
   if (values.yes?.length || values.set?.length) return answer(load, values.yes ?? [], values.set ?? [], values.save ?? false);
   // Without a terminal the screen is printed, never refused: an agent in a pipe reads the same thing.
-  if (values.plain || input.isTTY !== true || output.isTTY !== true) { const src = load(); return reported(src, plainScreen(src, 100)); }
+  if (values.plain || input.isTTY !== true || output.isTTY !== true) { const src = load(); return reported(src, plainOne(src, 100)); }
 
   return fleetScreenLoop(cwd, { load, probe, input: input as NodeJS.ReadStream, output: output as NodeJS.WriteStream, runScreen: io.runScreen });
 }

@@ -8,7 +8,10 @@ import { derive, errorFiles, errorRows, errorWhere, frame, initialScreen, plainS
 import { layerDiff } from "../../src/fleet/edits.js";
 import { width } from "../../src/fleet/draw.js";
 import { health, NOW, POOL, source } from "./world.js";
-import { keys, text } from "./drive.js";
+import { keys, keysFrom, text, toItem } from "./drive.js";
+
+/** YOUR TEAM as `fleet --plain` draws it: the one screen replaced it on a terminal (row 499; D-2187 add.363). */
+const team = (src: ScreenSource, cols: number, rows: number) => frame(src, initialScreen(), cols, rows, true).map((l) => l.map((x) => x.text).join(""));
 
 describe("YOUR TEAM", () => {
   test("names the workers by shape, the seven gates in order, and the consult", () => {
@@ -28,7 +31,7 @@ describe("YOUR TEAM", () => {
   });
   test("every frame is exactly the terminal's size, in every view and state", () => {
     const srcs = [source(), source({ health: health(["claude-code:fable"]) }), source({ health: null }), source({ repoText: "routing:\n  mode: partner-lead\n" })];
-    for (const src of srcs) for (const [cols, rows] of [[80, 24], [120, 36], [60, 16]]) for (const ks of [[], ["d"], ["y", "enter"], ["down", "n"]]) {
+    for (const src of srcs) for (const [cols, rows] of [[80, 24], [120, 36], [60, 16]]) for (const ks of [[], ["?"], ["enter"], ["y", "s"], ["down", "n"]]) {
       const lines = text(src, keys(src, ...ks), cols, rows);
       expect(lines).toHaveLength(rows);
       for (const l of lines) expect([...l]).toHaveLength(cols);
@@ -36,14 +39,14 @@ describe("YOUR TEAM", () => {
   });
   test("a short terminal draws only the team lines that are not ok, so what needs you is never pushed off the screen", () => {
     const src = source({ health: health(["claude-code:fable"]) });
-    const small = text(src, initialScreen(), 60, 16).join("\n");
+    const small = team(src, 60, 16).join("\n");
     expect(small).toMatch(/YOUR TEAM {2}\d+ of \d+ lines ok; these are not:/);
     expect(small).toContain("NO MODEL");
     expect(small).toContain("NEEDS YOU (");
     expect(small).toContain("First setup:");
     expect(small).not.toContain("build, test, lint");
     // the full team returns as soon as it fits
-    expect(text(src, initialScreen(), 80, 24).join("\n")).toContain("build, test, lint");
+    expect(team(src, 80, 24).join("\n")).toContain("build, test, lint");
   });
   test("a short terminal keeps a lowered floor's mark: a line ok against its own floor is drawn, never folded into the ok count", () => {
     const repoText = "routing:\n  mode: partner-led\n  floors:\n    implement: cheap\nconsult:\n  prefer: [claude-code:fable]\n";
@@ -51,7 +54,7 @@ describe("YOUR TEAM", () => {
     for (const dead of [[], ["claude-code:fable"]]) for (const [cols, rows] of [[60, 16], [80, 24], [120, 36], [60, 20]]) {
       const src = source({ repoText, health: health(dead) });
       expect(teamRows(derive(src, initialScreen()).base!).some((r) => r.status === "ok, floor cheap")).toBe(true);
-      const out = text(src, initialScreen(), cols, rows).join("\n");
+      const out = team(src, cols, rows).join("\n");
       expect(out, `${dead} ${cols}x${rows}`).toContain("ok, floor cheap");
       expect(out).not.toMatch(/all \d+ lines ok\s*$/m);
     }
@@ -69,7 +72,7 @@ describe("YOUR TEAM", () => {
       expect(rows.filter((r) => !r.status.startsWith("ok")).length, `${L} ${W}`).toBe(W);
       expect(rows.filter((r) => r.status.startsWith("ok,")).length, `${L} ${W}`).toBe(L);
       for (const cols of [40, 60, 80, 120]) for (const h of [10, 16, 24, 40]) {
-        const out = text(src, initialScreen(), cols, h).join("\n"), at = `${L} lowered, ${W} wrong, ${cols}x${h}\n${out}`;
+        const out = team(src, cols, h).join("\n"), at = `${L} lowered, ${W} wrong, ${cols}x${h}\n${out}`;
         const notice = /YOUR TEAM {2}\d+ on (its|their) own floor;/.test(out);
         if (L) expect(notice || /ok, floor cheap/.test(out), at).toBe(true);
         else expect(notice, at).toBe(false);
@@ -127,7 +130,7 @@ describe("YOUR TEAM", () => {
     // a path longer than the terminal is wide takes more rows: every character of it is on the screen, and no row ends in a cut mark
     const long = `/Users/someone/${"a-long-folder-name/".repeat(6)}tickmarkr/config.yaml`;
     const far = { ...source({ userText: bad }), paths: { user: long, repo: "/r/.tickmarkr/config.yaml" } };
-    for (const cols of [60, 80, 100]) {
+    for (const cols of [80, 100, 120]) {
       const rows = text(far, initialScreen(), cols, 24);
       expect(rows.map((l) => l.trim()).join(""), String(cols)).toContain(long);
       expect(rows.filter((l) => l.includes("…")), String(cols)).toEqual([]);
@@ -135,7 +138,7 @@ describe("YOUR TEAM", () => {
   });
   test("a config error taller than the terminal scrolls to its end, and the plain output prints all of it", () => {
     const bad = "routing:\n  mode: partner-lead\n";
-    for (const [n, cols, rows] of [[24, 60, 16], [50, 60, 24], [50, 100, 24]] as const) {
+    for (const [n, cols, rows] of [[40, 80, 20], [50, 80, 24], [50, 100, 24]] as const) {
       const long = `/Users/someone/${"a-long-folder-name/".repeat(n)}tickmarkr/config.yaml`;
       const far = { ...source({ userText: bad }), paths: { user: long, repo: "/r/.tickmarkr/config.yaml" } };
       // every row of every scroll position, in order, each new row once: down until the frame stops changing
@@ -152,7 +155,7 @@ describe("YOUR TEAM", () => {
       let past = st; for (let i = 0; i < 300; i++) past = press(far, past, "down", { cols, rows }).state;
       const scrolls = text(far, press(far, initialScreen(), "down", { cols, rows }).state, cols, rows).join("\n") !== text(far, initialScreen(), cols, rows).join("\n");
       if (scrolls) expect(text(far, press(far, past, "up", { cols, rows }).state, cols, rows).join("\n"), `${n} ${cols}x${rows} up`).not.toBe(text(far, past, cols, rows).join("\n"));
-      if (cols === 60) expect(scrolls, `${n} ${cols}x${rows} scrolls`).toBe(true);
+      if (cols === 80) expect(scrolls, `${n} ${cols}x${rows} scrolls`).toBe(true);
       expect(all, `${n} ${cols}x${rows}`).toContain(long);
       expect(all, `${n} ${cols}x${rows}`).toContain("then open fleet again.A run refuses");
       expect(plainScreen(far, cols).split("\n").map((l) => l.trim()).join(""), `${n} plain ${cols}`).toContain(long);
@@ -168,16 +171,17 @@ describe("YOUR TEAM", () => {
         ["repo", { ...source({ repoText: bad }), paths: { user: "/u/config.yaml", repo: path }, labels: undefined }],
         ["inherited", { ...source({ repoText: bad }), inherited: path }],
       ];
-      for (const [where, src] of worlds) for (const cols of [40, 60, 100]) {
+      // the frame is drawn from 80 columns up (a smaller window is one sentence); plain prints at any width
+      for (const [where, src] of worlds) for (const cols of [40, 60, 80, 100]) {
         // the rows between "It is in:" and the sentence after it, each without its two-cell margin
         const between = (rows: string[]) => { const a = rows.findIndex((l) => l.trim() === "It is in:"), b = rows.findIndex((l) => l.trim().startsWith("Correct it there"));
           return rows.slice(a + 1, b).map((l) => l.slice(2).replace(/ +$/, "")).join(""); };
-        const framed = text(src, initialScreen(), cols, 200);
+        const framed = text(src, initialScreen(), Math.max(80, cols), 200);
         if (path === tall) expect(between(framed).length, `${where} ${cols}`).toBe(path.length);
         expect(framed.findIndex((l) => l.trim() === "It is in:"), `${where} ${cols}`).toBeGreaterThan(0);
         expect(between(framed), `${where} ${cols}`).toBe(path);
         expect(between(plainScreen(src, cols).split("\n")), `${where} plain ${cols}`).toBe(path);
-        if (path === tall && cols === 40) expect(framed.filter((l) => /^ {2}\/Users|^ {2}[a-z ]/.test(l)).length).toBeGreaterThan(3);
+        if (path === tall && cols === 80) expect(framed.filter((l) => /^ {2}\/Users|^ {2}[a-z ]/.test(l)).length).toBeGreaterThan(3);
       }
     }
   });
@@ -230,14 +234,14 @@ describe("NEEDS YOU", () => {
     }
     expect(teamRows(d.full!).every((r) => r.status === "ok")).toBe(true);
     // a file that did not exist is all additions: no row for a line it never had
-    const rows = text(src, { ...initialScreen(), yes: ["setup"], view: "review" }, 100, 80);
+    const rows = text(src, { ...initialScreen(), yes: ["setup"], view: "save", lines: true }, 100, 80);
     const from = rows.findIndex((l) => l.includes("TO BE SAVED IN"));
     const diff = rows.slice(from + 1).filter((l) => l.trim());
     expect(diff.slice(0, -1).every((l) => /^ {5}\+ /.test(l)), diff.join("\n")).toBe(true);
   });
   test("first setup: a yes builds the team from the models that answered, and leaves no line without a model", () => {
     const src = source({ health: health(["claude-code:fable"]) });
-    const d = derive(src, keys(src, "y"));
+    const d = derive(src, keysFrom(src, toItem(src, 0), "y"));
     expect(d.items[0].id).toBe("setup");
     expect(d.full!.sample().noSeat).toEqual([]);
     expect(d.full!.consult).not.toBeNull();
@@ -271,25 +275,24 @@ describe("NEEDS YOU", () => {
   test("the judge: a judge that answers but is kept out by a rule is said to be kept out, not to be silent", () => {
     const barred = derive(source({ repoText: "routing:\n  deny:\n    models: [claude-code:fable]\nreview:\n  required: true\n" }), initialScreen());
     const item = barred.items.find((n) => n.id === "judge")!;
-    expect(item.title).toBe("The judge (acceptance) is kept out by a deny rule: claude-code:fable.");
+    expect(item.title).toBe("The judge (acceptance) is kept out by claude-code:fable: claude-code:fable.");
     expect(item.title).not.toContain("passed");
     expect(item.title.length).toBeLessThanOrEqual(75); // whole on an 80-column row
     expect(teamRows(barred.base!).find((r) => r.label.startsWith("acceptance"))!.status).not.toBe("does not answer");
     const listed = derive(source({ repoText: "routing:\n  allow:\n    adapters: [codex]\nreview:\n  required: true\n" }), initialScreen());
-    expect(listed.items.find((n) => n.id === "judge")!.title).toBe("The judge (acceptance) is not on the allowlist: claude-code:fable.");
+    expect(listed.items.find((n) => n.id === "judge")!.title).toBe("The judge (acceptance) is not allowed yet: claude-code:fable.");
   });
-  test("the consult: a model that answers but is denied for every seat is offered, denied for workers only", () => {
+  test("the consult: a model that answers but is denied for every seat has no yes: the item names the rule and changes no file", () => {
     const repoText = "routing:\n  deny:\n    models:\n      # never writes code\n      - claude-code:fable\nconsult:\n  prefer: [claude-code:fable]\n";
     const src = source({ repoText });
     const d0 = derive(src, initialScreen());
     expect(d0.base!.consult).toBeNull();
     const item = d0.items.find((n) => n.id === "consult")!;
-    expect(item.ask).toBe("Let claude-code:fable consult, judge and review? It still takes no task of any shape.");
+    expect(item.edits).toBeUndefined();
+    expect(item.ask).toBe("Remove claude-code:fable from its own line of KEPT OUT, or pick another model for the consult, then press r.");
     const d = derive(src, { ...initialScreen(), yes: ["consult"] });
-    expect(d.full!.consult).toBe("claude-code:fable");
-    expect(d.full!.seat("claude-code:fable")!.denied.worker).not.toBeNull();
-    expect(d.texts!.repoText).toContain("workers:");
-    expect(d.texts!.repoText).toContain("# never writes code");
+    expect(d.full?.consult ?? null).toBeNull();
+    expect(d.texts?.repoText ?? repoText).toBe(repoText);
   });
   test("the consult: a model that did not answer is not offered; the item says what to do", () => {
     const src = source({ repoText: "consult:\n  prefer: [claude-code:fable]\n", health: health(["claude-code:fable"]) });
@@ -309,7 +312,7 @@ describe("NEEDS YOU", () => {
     const all = derive(ordered, initialScreen()).items.filter((n) => n.edits).map((n) => n.id);
     expect(derive(ordered, { ...initialScreen(), yes: all }).full!.cfg.routing.map.implement!.pool!.mode).toBe("ordered");
   });
-  test("shapes below their floor: a yes keeps only the models at the floor, and no is remembered by its words", () => {
+  test("shapes below their floor: a yes keeps only the models at the floor, and no is remembered by its content", () => {
     const src = source({ repoText: `${POOL}consult:\n  prefer: [claude-code:fable]\n` });
     const d0 = derive(src, initialScreen());
     const floor = d0.items.find((n) => n.id === "floor")!;
@@ -318,9 +321,10 @@ describe("NEEDS YOU", () => {
     expect(d.full!.sample().rows.implement.under).toBe(0);
     expect(d.texts!.repoText).toContain("tier: null");
     expect(d.texts!.repoText).toContain("# the frontier worker");
-    const dismissed = new Set([`${floor.id}\u0000${floor.title}\u0000${floor.ask}`]);
+    const dismissed = new Set([needSignature(floor)]);
     expect(needs(d0.base!, { dismissed }).some((n) => n.id === "floor")).toBe(false);
-    expect(needs(d0.base!, { dismissed: new Set([`${floor.id}\u0000other words\u0000${floor.ask}`]) }).some((n) => n.id === "floor")).toBe(true);
+    // the same words with another change are another question
+    expect(needs(d0.base!, { dismissed: new Set([needSignature({ ...floor, edits: floor.edits!.map((e) => ({ ...e, value: { pool: { mode: "any", channels: [] } } })) })]) }).some((n) => n.id === "floor")).toBe(true);
   });
   test("a new model: a yes gives it a tier and a place in the pools, previewed as if its first probe passes", () => {
     const fresh: NewModel = { id: "gemini-4-carbon", name: "gemini-4-carbon", provider: "google", paths: [{ adapter: "omp", model: "google/gemini-4-carbon", score: 60 }],
@@ -329,7 +333,7 @@ describe("NEEDS YOU", () => {
     const item = derive(src, initialScreen()).items.find((n) => n.id === "new:gemini-4-carbon")!;
     expect(item.ask).toBe("Add it as frontier? That rests on one benchmark of two: Artificial Analysis 60 (your best: 59.1); it has no Terminal-Bench score.");
     // and the details promise no re-check that nothing makes: after the yes the model holds a tier and is not looked at again
-    expect(item.detail.join(" ")).toContain("Nothing looks at its tier again after a yes: frontier stands until you change it.");
+    expect(item.detail.join(" ")).toContain("Nothing looks at its level again after a yes: frontier stands until you change it.");
     expect(item.detail.join(" ")).not.toContain("provisional");
     const d = derive(src, { ...initialScreen(), yes: [item.id] });
     expect(d.full!.seat("omp:google/gemini-4-carbon")).toMatchObject({ tier: "frontier", provider: "google" });
@@ -358,7 +362,8 @@ describe("NEEDS YOU", () => {
     expect(kept).toContain("omp:google/gemini-4-carbon");
     expect(kept).toContain("codex:gpt-5.6-terra");
     expect(kept).not.toContain("grok:grok-4.5");
-    expect(items.find((n) => n.id === "tidy")!.detail[0]).toBe("1 pool entry names a model that the rules keep from all work, or that no CLI lists. A model that only failed its probe keeps its place.");
+    expect(items.find((n) => n.id === "tidy")!.removes).toEqual([{ what: "grok:grok-4.5", from: ["implement"], why: "kept out by grok:grok-4.5" }]);
+    expect(items.find((n) => n.id === "tidy")!.detail).toContain("A model that is signed out, out of credit or slow keeps its place: it comes back.");
     // a pool whose only fault is a model that failed its probe has nothing to tidy
     const failedOnly = source({ repoText: POOL, health: health(["codex:gpt-5.6-terra"]) });
     expect(derive(failedOnly, initialScreen()).items.some((n) => n.id === "tidy")).toBe(false);
@@ -385,7 +390,7 @@ describe("NEEDS YOU", () => {
     expect(d.texts!.userText).toContain("          - codex:gpt-5.6-terra\n          - omp:google/gemini-4-carbon\n");
     // the review says whose file it is, and the count stays on the row however long the path
     const long = { ...user, labels: { user: `/a/very/long/path/${"x".repeat(90)}/tickmarkr/config.yaml`, repo: ".tickmarkr/config.yaml" } };
-    const review = text(long, { ...initialScreen(), yes: ["new:gemini-4-carbon"], view: "review" }, 80, 40);
+    const review = text(long, { ...initialScreen(), yes: ["new:gemini-4-carbon"], view: "save", lines: true }, 80, 40);
     expect(review.find((l) => l.includes("TO BE SAVED IN"))).toMatch(/TO BE SAVED IN ….*tickmarkr\/config\.yaml {2}\+\d+ −0\s*$/);
     expect(review.join("\n")).toContain("Your user config: every repository on this machine reads it.");
     // held by the repository's config: the same answer goes there, as before
@@ -395,10 +400,10 @@ describe("NEEDS YOU", () => {
   });
   test("the review keeps a save's file name and +N −M count on its row, however wide the path's characters", () => {
     // the whole input class: narrow and wide characters, short and long paths, every width the review is drawn at
-    for (const seg of ["/x", "/项目", "/🙂a"]) for (const n of [1, 30, 80]) for (const cols of [60, 80, 120]) {
+    for (const seg of ["/x", "/项目", "/🙂a"]) for (const n of [1, 30, 80]) for (const cols of [80, 100, 120]) {
       const src = source({ health: health(["claude-code:fable"]) });
       const named = { ...src, labels: { user: "~/.config/tickmarkr/config.yaml", repo: `${seg.repeat(n)}/.tickmarkr/config.yaml` } };
-      const st = { ...initialScreen(), yes: ["setup"], view: "review" as const };
+      const st = { ...initialScreen(), yes: ["setup"], view: "save" as const, lines: true };
       const diff = layerDiff(named.inputs.repoText, derive(named, st).texts!.repoText);
       const row = text(named, st, cols, 80).find((l) => l.includes("TO BE SAVED IN"))!;
       expect(row, row).toContain(`config.yaml  +${diff.added} −${diff.removed}`);
@@ -407,9 +412,9 @@ describe("NEEDS YOU", () => {
   });
   test("the review keeps a save's +N −M count on its row whatever the path holds: tabs, control characters, combining marks", () => {
     const paths = [`/${"a".repeat(200)}`, "/项目".repeat(30), "/a\tb".repeat(15), "/\t".repeat(20), "/x\u0001\u001b[31m\u007f".repeat(12), "/e\u0301".repeat(40)];
-    for (const p of paths) for (const cols of [40, 60, 80, 120]) {
+    for (const p of paths) for (const cols of [80, 100, 120]) {
       const src = { ...source({ health: health(["claude-code:fable"]) }), labels: { user: "~/u.yaml", repo: `${p}/.tickmarkr/config.yaml` } };
-      const st = { ...initialScreen(), yes: ["setup"], view: "review" as const };
+      const st = { ...initialScreen(), yes: ["setup"], view: "save" as const, lines: true };
       const diff = layerDiff(src.inputs.repoText, derive(src, st).texts!.repoText);
       const row = frame(src, st, cols, 80).map((l) => l.map((s) => s.text).join("")).find((l) => l.includes("TO BE SAVED IN"))!;
       expect(row.trimEnd(), JSON.stringify({ p, cols, row })).toMatch(new RegExp(`\\+${diff.added} −${diff.removed}$`));
@@ -436,7 +441,7 @@ describe("NEEDS YOU", () => {
     expect(fixed.full!.sample().noSeat).toEqual([]);
     expect(fixed.texts!.repoText).toContain("          - qwen:qwen3.8-max   # the docs writer\n");
   });
-  test("no working model: a pinned model stays first in an ordered pool, and where nothing reaches the floor the question says so", () => {
+  test("no working model: a pinned model stays first on a line given out by complexity, and where nothing reaches the floor the question says so", () => {
     // OBSERVER's world: every frontier model is dead. The repository is not a first install (it sets a consult),
     // plan and spec are pinned to one frontier model by the defaults, implement is pinned to another
     const frontier = Object.entries(DEFAULT_CONFIG.tiers).flatMap(([a, t]) => Object.entries(t.models).filter(([, tier]) => tier === "frontier").map(([m]) => `${a}:${m}`));
@@ -446,43 +451,43 @@ describe("NEEDS YOU", () => {
     expect(item.title).toMatch(/no working model\.$/);
     const impl = item.edits!.find((e) => e.path.join(".") === "routing.map.implement")!;
     const pool = (impl.value as { pool: { mode: string; channels: string[] } }).pool;
-    // F-1: the pin is not replaced: the pinned model is first, the pool is ordered, the working models follow
-    expect(pool.mode).toBe("ordered");
+    // F-1: the pin is not replaced: the pinned model is first, the working models follow; a pool a yes creates is by complexity (row 501; D-2187 add.363)
+    expect(pool.mode).toBe("complexity");
     expect(pool.channels[0]).toBe("codex:gpt-6-astra");
     expect(pool.channels.length).toBeGreaterThan(1);
-    expect(impl.label).toMatch(/^implement: keep gpt-6-astra first; while it does not answer, /);
-    expect(item.detail.join(" ")).toMatch(/pinned to one model: it stays first, in an ordered pool, and takes the work again when it answers\./);
+    expect(impl.label).toMatch(/^implement: keep gpt-6-astra on the line; add /);
+    expect(item.detail.join(" ")).toMatch(/pinned to one model: it stays on the line, written first, given out by complexity, and takes work again when it answers\./);
     // F-2: nothing that works reaches a frontier floor, and the question and the details say it, as the review does
-    expect(item.ask).toMatch(/\? .*below the floor: no working model reaches it\.$/);
-    expect(item.detail.join(" ")).toMatch(/below the floor/);
-    expect(item.detail.join(" ")).not.toContain("Yes gives it the working models at its floor.");
+    expect(item.ask).toMatch(/\? .*below the bar: no working model reaches it\.$/);
+    expect(item.detail.join(" ")).toMatch(/below the bar/);
+    expect(item.detail.join(" ")).not.toContain("Yes gives it the working models at its bar.");
     const yes = derive(src, { ...initialScreen(), yes: ["noseat"] });
     expect(yes.refused).toBeUndefined();
     expect(yes.full!.sample().noSeat).toEqual([]);
     expect(yes.full!.sample().under).toBeGreaterThan(0);
-    // the day the pinned model answers again, on the saved config, it takes every implement task once more
+    // the day the pinned model answers again, on the saved config, it takes implement tasks once more, by complexity
     const back = derive(source({ repoText: yes.texts!.repoText }), initialScreen()).base!;
-    expect(back.sample().rows.implement.shares.map((x) => [x.key, x.n])).toEqual([["codex:gpt-6-astra", 400]]);
+    expect(back.cfg.routing.map.implement!.pool!.mode).toBe("complexity");
+    expect(back.sample().rows.implement.shares.find((x) => x.key === "codex:gpt-6-astra")!.n).toBeGreaterThan(0);
     // a pinned model the config itself keeps out cannot come back: it is not carried into the pool, where it would do nothing
     const denied = derive(source({ health: health(frontier), repoText: `routing:\n  deny:\n    workers:\n      models: [codex:gpt-6-astra]\n${repoText.slice(repoText.indexOf("  map:"))}` }), initialScreen()).items.find((n) => n.id === "noseat")!;
-    expect((denied.edits!.find((e) => e.path.join(".") === "routing.map.implement")!.value as { pool: { mode: string; channels: string[] } }).pool).toMatchObject({ mode: "any" });
+    expect((denied.edits!.find((e) => e.path.join(".") === "routing.map.implement")!.value as { pool: { mode: string; channels: string[] } }).pool).toMatchObject({ mode: "complexity" }); // a line a yes creates is by complexity
     expect((denied.edits!.find((e) => e.path.join(".") === "routing.map.implement")!.value as { pool: { channels: string[] } }).pool.channels).not.toContain("codex:gpt-6-astra");
     // where a working model does reach the floor, nothing is said about being below it
     const fine = derive(source({ health: health(["claude-code:fable"]), repoText: "consult:\n  prefer: [codex:gpt-6-astra]\n" }), initialScreen()).items.find((n) => n.id === "noseat")!;
-    expect(fine.ask).not.toContain("below the floor");
-    expect(fine.detail.join(" ")).toMatch(/Yes gives (it|them) the working models at (its floor|their floors)\./);
+    expect(fine.ask).not.toContain("below the bar");
+    expect(fine.detail.join(" ")).toMatch(/Yes gives (it|them) the working models at (its bar|their bars)\./);
   });
-  test("an item that is not selected uses the whole row for its question", () => {
+  test("an item uses the whole row for its question", () => {
     const src = source({ health: health(["claude-code:fable"]) });
     const second = derive(src, initialScreen()).items[1];
-    const row = (st: ReturnType<typeof initialScreen>) => text(src, st, 80, 30).find((l) => l.includes(second.ask.slice(0, 30)))!;
     expect(second.ask.length).toBeGreaterThan(80 - 17 - 5);
     expect(second.ask.length).toBeLessThanOrEqual(80 - 5);
-    // whole, selected or not: a question too long to share the row with its keys keeps the row, and the last row names the keys
-    expect(row(initialScreen())).toContain(second.ask);
-    expect(row({ ...initialScreen(), sel: 1 })).toContain(second.ask);
-    expect(row({ ...initialScreen(), sel: 1 })).not.toContain("…");
-    expect(text(src, { ...initialScreen(), sel: 1 }, 80, 30).at(-1)).toMatch(/n +no/);
+    // whole in the plain screen, and in the item opened with Enter, whose last row names the keys
+    expect(team(src, 80, 30).find((l) => l.includes(second.ask.slice(0, 30)))).toContain(second.ask);
+    const opened = keysFrom(src, toItem(src, 1), "enter");
+    expect(text(src, opened, 80, 30).find((l) => l.includes(second.ask.slice(0, 30)))).toContain(second.ask);
+    expect(text(src, opened, 80, 30).at(-1)).toMatch(/n +no/);
   });
   test("probe results older than three days are the first item, so the screen never reassures on old news", () => {
     const at = (days: number) => source({ repoText: POOL, now: Date.parse("2026-11-10T00:00:00Z") + days * 86400000 });
@@ -493,50 +498,32 @@ describe("NEEDS YOU", () => {
     expect(derive(at(16), initialScreen()).items[0].title).toBe("The team rests on probe results over 2 weeks old.");
     expect(derive(at(8), initialScreen()).items[0].title).toBe("The team rests on probe results over 1 week old.");
     // the header warns from the same day on
-    expect(frame(at(5), initialScreen(), 100, 30)[0].find((x) => x.text.includes("probed 5 days ago"))!.style).toBe("warn");
+    expect(frame(at(5), initialScreen(), 100, 30)[0].find((x) => x.text.includes("checked 5 days ago"))!.style).toBe("warn");
     // a no is remembered until the age reads differently
     const no = new Set([needSignature(five)]);
     expect(derive({ ...at(5), ctx: { dismissed: no } }, initialScreen()).items.some((n) => n.id === "stale")).toBe(false);
     expect(derive({ ...at(8), ctx: { dismissed: no } }, initialScreen()).items[0].id).toBe("stale");
   });
-  test("the consult: a yes lifts every rule that keeps the model from consulting, and it still never writes code", () => {
-    const after = (repoText: string) => {
+  test("the consult: no yes lifts a rule that keeps its model out: the item names the rule, or says to allow the model, and changes no file", () => {
+    const say = (repoText: string) => {
       const src = source({ repoText });
       const d0 = derive(src, initialScreen());
       expect(d0.base!.consult, repoText).toBeNull();
       const item = d0.items.find((n) => n.id === "consult")!;
-      expect(item.ask, repoText).toBe("Let claude-code:fable consult, judge and review? It still takes no task of any shape.");
+      expect(item.edits, repoText).toBeUndefined();
+      // whole on an 80-column terminal
+      expect(`  4  ${item.title}`.length, repoText).toBeLessThanOrEqual(80);
       const d = derive(src, { ...initialScreen(), yes: ["consult"] });
-      expect(d.full!.consult, repoText).toBe("claude-code:fable");
-      expect(d.full!.seat("claude-code:fable")!.denied.worker, repoText).not.toBeNull();
-      expect(derive(source({ repoText: d.texts!.repoText }), initialScreen()).items.some((n) => n.id === "consult"), repoText).toBe(false);
-      return { item, text: d.texts!.repoText };
+      expect(d.texts?.repoText ?? repoText, repoText).toBe(repoText);
+      return `${item.title} ${item.ask}`;
     };
-    // a deny rule alone
-    expect(after("routing:\n  deny:\n    models: [claude-code:fable]\nconsult:\n  prefer: [claude-code:fable]\n").item.detail[1]).toBe("It is kept out by the deny rule claude-code:fable, which covers every seat.");
-    // the allowlist alone: letting it in would also let it write code, so it is denied as a worker in the same answer
-    const allow = after("routing:\n  allow:\n    adapters: [codex]\nconsult:\n  prefer: [claude-code:fable]\n");
-    expect(allow.item.detail[1]).toBe("It is kept out by the allowlist.");
-    expect(allow.text).toMatch(/allow:\n {4}adapters: \[codex\]\n {4}models:\n {6}- claude-code:fable/);
-    expect(allow.text).toMatch(/workers:\n {6}models:\n {8}- claude-code:fable/);
-    // both at once, and a deny on the whole CLI
-    expect(after("routing:\n  allow:\n    adapters: [codex]\n  deny:\n    models: [claude-code:fable]\nconsult:\n  prefer: [claude-code:fable]\n").item.detail[1]).toBe("It is kept out by the deny rule claude-code:fable, which covers every seat and the allowlist.");
-    // a rule wider than the model (the whole CLI) is not a yes about this model: it is named, and left to the hand
-    const wide = derive(source({ repoText: "routing:\n  deny:\n    adapters: [claude-code]\n    models: [claude-code:fable]\nconsult:\n  prefer: [claude-code:fable]\n" }), initialScreen());
-    const item = wide.items.find((n) => n.id === "consult")!;
-    expect(item.edits).toBeUndefined();
-    expect(item.title).toBe("The consult has no model: claude-code:fable is under a wider rule.");
-    // whole on an 80-column terminal
-    expect(`  4  ${item.title}`.length).toBeLessThanOrEqual(80);
-    expect(item.ask).toBe("Press e and change that rule on its deny line.");
-    expect(item.detail[1]).toContain("the deny rule claude-code, which covers the whole claude-code CLI");
-    // so no other model of that CLI is let in to judge or review by a yes that named one
-    expect(wide.base!.seat("claude-code:opus")!.denied.judge).not.toBeNull();
-    // a bare model id two CLIs serve is wider than the model too: by what it matches, not by its place in a list
-    const bare = derive(source({ repoText: "routing:\n  deny:\n    models: [zai/glm-5.3]\nconsult:\n  prefer: [pi:zai/glm-5.3]\n" }), initialScreen()).items.find((n) => n.id === "consult")!;
-    expect(bare.edits).toBeUndefined();
-    expect(bare.title).toBe("The consult has no model: pi:zai/glm-5.3 is under a wider rule.");
-    expect(bare.detail![1]).toContain("the deny rule zai/glm-5.3, which covers more than this model");
+    const kept = (rule: string, key = "claude-code:fable") => `The consult has no model: ${key} is kept out. Remove ${rule} from its own line of KEPT OUT, or pick another model for the consult, then press r.`;
+    expect(say("routing:\n  deny:\n    models: [claude-code:fable]\nconsult:\n  prefer: [claude-code:fable]\n")).toBe(kept("claude-code:fable"));
+    expect(say("routing:\n  allow:\n    adapters: [codex]\nconsult:\n  prefer: [claude-code:fable]\n"))
+      .toBe("The consult has no model: claude-code:fable is not allowed yet. Allow claude-code:fable (routing.allow in the config), or pick another model for the consult, then press r.");
+    // a rule wider than the model, the whole CLI or a bare id two CLIs serve: named the same, never lifted
+    expect(say("routing:\n  deny:\n    adapters: [claude-code]\n    models: [claude-code:fable]\nconsult:\n  prefer: [claude-code:fable]\n")).toMatch(/^The consult has no model: claude-code:fable is kept out\. Remove claude-code(:fable)? from its own line of KEPT OUT/);
+    expect(say("routing:\n  deny:\n    models: [zai/glm-5.3]\nconsult:\n  prefer: [pi:zai/glm-5.3]\n")).toBe(kept("zai/glm-5.3", "pi:zai/glm-5.3"));
   });
   test("the consult with no consult.prefer set: a yes sets it, because the seat picker reads nothing else", () => {
     // a config that is not a first install, sets no consult.prefer, and denies the pinned consult for every seat

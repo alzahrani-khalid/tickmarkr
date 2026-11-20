@@ -4,6 +4,8 @@ import { describe, expect, test } from "vitest";
 import { parse } from "yaml";
 import { loadConfigWithMode } from "../../src/config/config.js";
 import { applyEdits, applyLayer, combineEdits, type Edit, EditRefused } from "../../src/fleet/edits.js";
+import { handEdits, recordedVendor } from "../../src/fleet/hand.js";
+import { buildFleetModel } from "../../src/fleet/model.js";
 
 describe("answers and the one write path", () => {
   test("several yes answers that touch the same list are combined: one never undoes another", () => {
@@ -252,11 +254,121 @@ describe("the write path's input is closed: eight edit shapes (D-2187 add.229)",
     expect([deny?.models ?? [], deny?.adapters ?? [], deny?.workers?.adapters ?? []]).toEqual([[], [], []]);
   });
 
+  test("the closed set of edits takes the mode complexity and the routing.hardFrom edit, a whole number from 2 to 10", () => {
+    const load = (t: { userText: string; repoText: string }) => loadConfigWithMode("/", { userOverlayText: t.userText, repoOverlayText: t.repoText }).cfg;
+    const texts = { userText: "", repoText: "" };
+    const pooled = applyEdits(texts, [{ layer: "repo", path: ["routing", "map", "implement"], value: { pool: { mode: "complexity", channels: ["codex:gpt-6-astra"] } }, label: "" }]);
+    expect(load(pooled).routing.map.implement?.pool).toEqual({ mode: "complexity", channels: ["codex:gpt-6-astra"] });
+    const hard = applyEdits(texts, [{ layer: "user", path: ["routing", "hardFrom"], value: 9, label: "" }]);
+    expect(load(hard).routing.hardFrom).toBe(9);
+    for (const value of [1, 11, 8.5, "9"]) {
+      expect(() => applyEdits(texts, [{ layer: "user", path: ["routing", "hardFrom"], value, label: "" }]), String(value)).toThrow("fleet does not make this edit");
+    }
+    expect(() => applyEdits(texts, [{ layer: "user", path: ["routing", "similarWithin"], value: 3, label: "" }])).toThrow("fleet does not make this edit");
+  });
+
   test("one path on both layers is refused; one identical layer and path still combines", () => {
     const models = ["routing", "deny", "models"];
     const texts = { userText: "routing:\n  deny:\n    models: [x:1, x:2]\n", repoText: "routing:\n  deny:\n    models: [x:1, x:2]\n" };
     expect(refused(texts, [{ layer: "user", path: models, value: ["x:2"], label: "" }, { layer: "repo", path: models, value: ["x:1", "x:2", "x:4"], label: "" }]).path).toEqual(models);
     const out = applyEdits(texts, [{ layer: "repo", path: models, value: ["x:2"], label: "" }, { layer: "repo", path: models, value: ["x:1", "x:2", "x:4"], label: "" }]);
     expect(load(out.userText, out.repoText).routing.deny?.models).toEqual(["x:2", "x:4"]);
+  });
+});
+
+describe("no edit writes through an object prototype (row 522; D-2187 add.444)", () => {
+  test("an edit path holding a reserved object key is refused by name and writes nothing anywhere", () => {
+    const texts = { userText: "", repoText: "tiers:\n  codex:\n    channel: sub\n" };
+    const protoKeys = () => Object.getOwnPropertyNames(Object.prototype).sort();
+    const keysBefore = protoKeys();
+    for (const bad of ["__proto__", "constructor", "prototype"]) {
+      for (const path of [["tiers", bad, "models", "m"], ["tiers", "codex", "models", bad], ["tiers", bad, "channel"], ["tiers", bad, "vendor"], ["tiers", "codex", "modelOverrides", bad, "vendor"]]) {
+        const value = path.at(-1) === "channel" ? "api" : path.at(-1) === "vendor" ? "openai" : "frontier";
+        const e: Edit = { layer: "repo", path, value, label: "" };
+        let err: unknown;
+        try { applyEdits(texts, [e]); } catch (x) { err = x; }
+        expect(err, path.join(".")).toBeInstanceOf(EditRefused);
+        expect((err as Error).message, path.join(".")).toContain(bad);
+        expect(() => applyLayer(texts.repoText, [e]), path.join(".")).toThrow(EditRefused);
+        expect(() => combineEdits({}, [e, e]), path.join(".")).not.toThrow();
+      }
+    }
+    expect(protoKeys()).toEqual(keysBefore);
+    const probe = {} as Record<string, unknown>;
+    for (const k of ["models", "channel", "vendor", "m", "modelOverrides"]) expect(probe[k], k).toBeUndefined();
+  });
+  test("an answered rule path through any inherited object key modifies no shared object before it is refused", () => {
+    const M = buildFleetModel({ userText: "", repoText: "", health: null, adapters: [], now: 0 });
+    const proto = Object.prototype as unknown as Record<string, Record<string, unknown>>;
+    const keys = Object.getOwnPropertyNames(Object.prototype);
+    const touched: string[] = [];
+    for (const scope of ["allow", "deny"]) for (const key of keys) {
+      const target = proto[key];
+      const isTarget = target !== null && (typeof target === "object" || typeof target === "function");
+      const before = isTarget ? Object.getOwnPropertyDescriptor(target, "models") : undefined;
+      const e: Edit = { layer: "repo", path: ["routing", scope, key, "models"], value: ["codex:gpt-6-astra"], label: "" };
+      try {
+        handEdits(M, [], [e]);
+        if (isTarget && Object.hasOwn(target, "models")) touched.push(e.path.join("."));
+        expect(() => applyEdits(M.inputs, [e]), e.path.join(".")).toThrow(EditRefused);
+      } finally {
+        if (isTarget) { if (before) Object.defineProperty(target, "models", before); else delete target.models; }
+      }
+    }
+    expect(touched).toEqual([]);
+    expect(({} as Record<string, unknown>).models).toBeUndefined();
+  });
+});
+
+describe("names a user or a probe supplies are own keys, read and written (row 522; D-2187 add.444)", () => {
+  const BUILTIN = ["__defineGetter__", "__defineSetter__", "hasOwnProperty", "__lookupGetter__", "__lookupSetter__", "isPrototypeOf", "propertyIsEnumerable", "toString", "valueOf", "toLocaleString"];
+  const layerOf = (M: ReturnType<typeof buildFleetModel>, line: string, path: string) => handEdits(M, [{ line, chosen: ["frontier"] }]).find((e) => e.path.join(".") === path)?.layer;
+  test("combining two answers keeps a value's own __proto__ key, so the combined edit is still refused by name", () => {
+    const protoBefore = Object.getOwnPropertyNames(Object.prototype).sort();
+    const j1: Edit = { layer: "repo", path: ["judge"], value: { adapter: "codex", model: "gpt-6-sol" }, label: "a" };
+    const j2: Edit = { layer: "repo", path: ["judge"], value: JSON.parse('{"adapter":"codex","model":"gpt-6-astra","__proto__":{"polluted":true}}'), label: "b" };
+    const m1: Edit = { layer: "repo", path: ["routing", "map", "implement"], value: { pool: { mode: "any", channels: ["codex:gpt-6-sol"] } }, label: "a" };
+    const m2: Edit = { layer: "repo", path: ["routing", "map", "implement"], value: JSON.parse('{"__proto__":{"x":1},"pool":{"mode":"any","channels":["codex:gpt-6-astra"],"__proto__":{"y":1}}}'), label: "b" };
+    for (const [a, b] of [[j1, j2], [m1, m2]]) {
+      const combined = combineEdits({}, [a, b]);
+      const v = combined[0].value as Record<string, unknown>;
+      expect(Object.getPrototypeOf(v)).toBe(Object.prototype);
+      expect(v.polluted).toBeUndefined();
+      expect(Object.keys(v)).toContain("__proto__");
+      expect(() => applyEdits({ userText: "", repoText: "" }, combined)).toThrow(EditRefused);
+      expect(() => applyLayer("", combined)).toThrow(EditRefused);
+    }
+    expect(Object.getOwnPropertyNames(Object.prototype).sort()).toEqual(protoBefore);
+  });
+  test("a level for a model named like a built-in property goes to the layer that names it, never to one that only inherits it", () => {
+    for (const k of BUILTIN) {
+      const p = `tiers.codex.models.${k}`;
+      const userOnly = buildFleetModel({ userText: "tiers:\n  codex:\n    models:\n      gpt-6-sol: frontier\n", repoText: "", health: null, adapters: [], now: 0 });
+      expect(layerOf(userOnly, `tier:codex:${k}`, p), k).toBe("repo");
+      const userOwns = buildFleetModel({ userText: `tiers:\n  codex:\n    models:\n      ${k}: mid\n`, repoText: "tiers:\n  codex:\n    models:\n      gpt-6-sol: frontier\n", health: null, adapters: [], now: 0 });
+      expect(layerOf(userOwns, `tier:codex:${k}`, p), k).toBe("user");
+      const texts = { userText: "tiers:\n  mygw:\n    vendor: null\n    channel: api\n    models:\n      zai/glm-5.3: frontier\n    modelOverrides:\n      zai/glm-5.3:\n        vendor: zai\n", repoText: "routing:\n  mode: partner-led\n" };
+      const h = { mygw: { installed: true, authed: true, models: [k], modelAuth: { [k]: { authed: true, probedAt: "2026-11-10T00:00:00Z", identity: `openai/${k}` } } } };
+      const M = buildFleetModel({ ...texts, health: h as never, adapters: [], now: 0 });
+      const edits = handEdits(M, [{ line: `tier:mygw:${k}`, chosen: ["frontier"] }]);
+      expect(new Set(edits.map((e) => e.layer)), k).toEqual(new Set(["repo"]));
+      const out = applyEdits(texts, edits);
+      expect(() => loadConfigWithMode("/", { userOverlayText: out.userText, repoOverlayText: "" }), k).not.toThrow();
+    }
+    for (const k of ["__proto__", "constructor"]) {
+      const M = buildFleetModel({ userText: "tiers:\n  codex:\n    models:\n      gpt-6-sol: frontier\n", repoText: "", health: null, adapters: [], now: 0 });
+      let err: unknown;
+      try { applyEdits(M.inputs, handEdits(M, [{ line: `tier:codex:${k}`, chosen: ["frontier"] }])); } catch (x) { err = x; }
+      expect(err, k).toBeInstanceOf(EditRefused);
+      expect((err as EditRefused).layer, k).toBe("repo");
+    }
+  });
+  test("a model the probe recorded identities beside, named like any Object property, reads no identity it inherits", () => {
+    for (const k of [...BUILTIN, "__proto__", "constructor", "prototype"]) {
+      const h = { codex: { installed: true, authed: true, models: [k], modelAuth: {}, modelIdentities: { other: "openai/gpt-6-astra" } } };
+      const M = buildFleetModel({ userText: "", repoText: "", health: h as never, adapters: [], now: 0 });
+      expect(() => recordedVendor(M, "codex", k), k).not.toThrow();
+      expect(() => handEdits(M, [{ line: `tier:codex:${k}`, chosen: ["frontier"] }]), k).not.toThrow();
+    }
   });
 });

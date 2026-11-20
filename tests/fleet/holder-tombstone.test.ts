@@ -101,7 +101,10 @@ function repoWith(text: string | undefined): string {
 }
 const repoFile = (cwd: string) => readFileSync(join(cwd, ".tickmarkr", "config.yaml"), "utf8");
 const adapters = allAdapters({ operatorYaml: null, operatorPath: false });
+// Each save names a true superset of what is saved at P: beneath the tombstone the list in force is empty, so one
+// entry adds to it; without it, the user's four are kept and one is added. A KEPT OUT list loses no entry (rule K2).
 const SET = ["--set", "deny.workers.models=codex:gpt-6-sol", "--save"];
+const ADDED = ["codex:gpt-6-sol", "codex:gpt-6-terra", "claude-code:opus", "claude-code:sonnet", "codex:gpt-6-astra"];
 
 describe("the fleet command beneath a repository tombstone", () => {
   test("fleet set and save beneath a repository tombstone writes the repository file which loads and leaves the user file byte-equal", async () => {
@@ -131,10 +134,19 @@ describe("the fleet command beneath a repository tombstone", () => {
     const cwd = repoWith(silent);
     const { cli, lines, user } = setup();
     expect((await lines(cwd))["deny.workers.models"].layer).toBe("user");
-    const saved = await cli(cwd, SET);
+    // replacing the four saved entries by one, or emptying the list, is refused by name and writes neither file
+    for (const [set, words] of [["deny.workers.models=codex:gpt-6-sol", "codex:gpt-6-terra, claude-code:opus, claude-code:sonnet, which are saved"],
+      ["deny.workers.models=", "codex:gpt-6-sol, codex:gpt-6-terra, claude-code:opus, claude-code:sonnet, which are saved"]] as const) {
+      const r = await cli(cwd, ["--set", set, "--save"]);
+      expect(r.code, r.out).toBe(1);
+      expect(r.out).toContain(`deny.workers.models would no longer keep out ${words} — --set removes no KEPT OUT rule`);
+      expect(repoFile(cwd)).toBe(silent);
+      expect(user()).toBe(USER);
+    }
+    const saved = await cli(cwd, ["--set", `deny.workers.models=${ADDED.join(",")}`, "--save"]);
     expect(saved.code, saved.out).toBe(0);
     expect(repoFile(cwd)).toBe(silent);
-    expect(parse(user()).routing.deny.workers.models).toEqual(["codex:gpt-6-sol"]);
+    expect(parse(user()).routing.deny.workers.models).toEqual(ADDED);
     expect(user()).toContain("# the user's own");
   });
 

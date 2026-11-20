@@ -5,11 +5,14 @@ import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
+import { parse } from "yaml";
 import { describe, expect, test } from "vitest";
 import { readDoctor, readModelsFirstSeen, writeDoctor } from "../../src/adapters/registry.js";
 import { fleetCommand } from "../../src/cli/commands/fleet-screen.js";
 import { lastRunDeaths, loadFleetSource, readDismissed } from "../../src/fleet/load.js";
 
+import { homeTargets, initialScreen } from "../../src/fleet/screen.js";
+import { arrowsTo } from "../fleet/drive.js";
 import { adapters, health, setup, terminal, tty } from "./fleet-screen-world.js";
 
 
@@ -88,7 +91,7 @@ describe("tickmarkr fleet without a terminal", () => {
   test("prints the screen instead of refusing, and --plain prints the same", async () => {
     const { run } = setup();
     const out = await run([]);
-    expect(out).toContain(" WORKERS");
+    expect(out).toContain("\nWORKERS  ");
     expect(out).toContain("acceptance (judge)");
     expect(out).toContain("First setup: nobody for plan, spec, the judge and the consult.");
     expect(await run(["--plain"])).toBe(out);
@@ -101,10 +104,43 @@ describe("tickmarkr fleet without a terminal", () => {
     expect(data.needs[0]).toMatchObject({ id: "setup", answerable: true });
     expect(data.needs[0].changes.length).toBeGreaterThan(0);
   });
+  test("fleet --json keeps every field it had and adds how each shape is given out: its groups; ranges; shares; hardFrom; similarWithin; keptOut", async () => {
+    const repo = "routing:\n  deny:\n    models:\n      # keep this seat out\n      - cursor-agent:composer-2.5\n      - grok:grok-4.5\n    workers:\n      # 2026-11-15 guard rail\n      models: [kimi:kimi-code/k3]\n  map:\n    implement:\n      prefer: null\n      pool:\n        mode: complexity\n        channels: [claude-code:fable, claude-code:opus, codex:gpt-6-astra, codex:gpt-6-sol]\n    docs:\n      pool: {mode: any, channels: [claude-code:fable, claude-code:opus]}\n    chore:\n      pool: {mode: ordered, channels: [codex:gpt-6-sol, codex:gpt-6-astra]}\n";
+    const { run, cwd } = setup({ repo, dead: [] });
+    const h = health([]);
+    const facts = (m: Record<string, number>) => Object.fromEntries(Object.entries(m).map(([k, score]) => [k, { as: k, score }]));
+    writeDoctor(cwd, { ...h, "claude-code": { ...h["claude-code"], modelFacts: facts({ fable: 64.6, opus: 59.1 }) },
+      codex: { ...h.codex, modelFacts: { ...facts({ "gpt-6-astra": 56.9 }), "gpt-6-sol": { as: "gpt-6-sol", score: 54.6, priceIn: 2, priceOut: 10 } } } });
+    const data = JSON.parse(await run(["--json"]) as string);
+    // every field the base had, at the top and on each line
+    for (const k of ["ok", "mode", "working", "probed", "probedDaysAgo", "team", "needs", "lines"]) expect(data, k).toHaveProperty(k);
+    for (const l of data.lines) for (const k of ["line", "one", "models", "candidates"]) expect(l, `${l.line}.${k}`).toHaveProperty(k);
+    expect(data.team.length).toBeGreaterThan(0);
+    expect(data).toMatchObject({ hardFrom: 8, similarWithin: 5, unsaved: 0 });
+    expect(data.keptOut).toEqual([
+      { rule: "cursor-agent:composer-2.5", list: "routing.deny.models", reason: "# keep this seat out" },
+      { rule: "grok:grok-4.5", list: "routing.deny.models", reason: null },
+      { rule: "kimi:kimi-code/k3", list: "routing.deny.workers.models", reason: "# 2026-11-15 guard rail" },
+    ]);
+    const at = (id: string) => data.lines.find((l: { line: string }) => l.line === id);
+    const impl = at("implement");
+    expect(impl).toMatchObject({ mode: "complexity", givenOut: "complexity", models: ["claude-code:fable", "claude-code:opus", "codex:gpt-6-astra", "codex:gpt-6-sol"] });
+    expect(impl.groups.map((g: { range: unknown }) => g.range)).toEqual([[8, 10], [1, 7]]);
+    expect(impl.groups[0]).toMatchObject({ by: "score", noScore: [], models: [{ model: "fable", cli: "claude-code", score: 64.6, priceIn: null, priceOut: null, share: { n: 120, of: 120 }, shareWords: "all of them", standIns: [] }] });
+    expect(impl.groups[1].models.map((m: { share: { n: number; of: number }; shareWords: string }) => [m.share, m.shareWords])).toEqual([
+      [{ n: 94, of: 280 }, "about a third"], [{ n: 93, of: 280 }, "about a third"], [{ n: 93, of: 280 }, "about a third"]]);
+    expect(impl).not.toHaveProperty("note");
+    expect(at("docs")).toMatchObject({ mode: "any", givenOut: "any", order: { gets: [{ key: "claude-code:fable", n: 400 }], none: [{ key: "claude-code:opus", reason: "fable, of the same vendor, is written before it" }] } });
+    expect(at("chore")).toMatchObject({ givenOut: "order", order: { works: "codex:gpt-6-sol", backups: ["codex:gpt-6-astra"] } });
+    expect(at("plan")).toMatchObject({ givenOut: "order", order: { works: "claude-code:fable", backups: [] } });
+    expect(at("tests")).toMatchObject({ givenOut: "open" });
+    expect(at("judge")).not.toHaveProperty("givenOut");
+  });
   test("--yes prints the review and saves nothing; --save writes the repo layer through the guarded writer", async () => {
     const { run, cwd, overlay } = setup();
     const preview = await run(["--yes", "setup"]) as string;
-    expect(preview).toMatch(/shapes with no model\s+2 → 0\s+better/);
+    expect(preview).toContain("YOU ARE SAVING  1 change");
+    expect(preview).toContain("  1  First setup: nobody for plan, spec, the judge and the consult.");
     expect(preview).toContain("Nothing was saved. Add --save to save it.");
     expect(existsSync(join(cwd, ".tickmarkr", "config.yaml"))).toBe(false);
     expect(await run(["--yes", "setup", "--save"])).toContain("Saved to .tickmarkr/config.yaml.");
@@ -211,16 +247,17 @@ describe("tickmarkr fleet on a terminal", () => {
     expect(out).toBe("fleet: quit; 2 changes were not saved");
   });
   test("the printed review is as long as the change: what --save writes is never more than what --yes prints", async () => {
-    // 600 deny rules that keep nothing out: the clean-up removes every one of them
-    const idle = Array.from({ length: 600 }, (_, i) => `      - nosuch:model-${i}`).join("\n");
-    const { run, overlay } = setup({ repo: `routing:\n  deny:\n    models:\n${idle}\n      - claude-code:haiku\nconsult:\n  prefer: [codex:gpt-6-astra]\n` });
+    // 600 names on a line that no CLI lists: the clean-up removes every one of them, and no rule of KEPT OUT (row 500)
+    const idle = Array.from({ length: 600 }, (_, i) => `          - nosuch:model-${i}`).join("\n");
+    const { run, overlay } = setup({ repo: `routing:\n  deny:\n    models: [nosuch:guard]\n  map:\n    docs:\n      pool:\n        mode: ordered\n        channels:\n          - claude-code:haiku\n${idle}\nconsult:\n  prefer: [codex:gpt-6-astra]\n` });
     const printed = await run(["--yes", "tidy"]) as string;
     expect(printed).toContain("TO BE SAVED IN .tickmarkr/config.yaml  +0 −600");
     const removed = printed.split("\n").filter((l) => /^ +\d+ *- +- nosuch:model-\d+$/.test(l));
     expect(removed).toHaveLength(600);
     expect(await run(["--yes", "tidy", "--save"])).toContain("Saved to .tickmarkr/config.yaml.");
-    expect(overlay()).not.toContain("nosuch:");
+    expect(overlay()).not.toContain("nosuch:model-");
     expect(overlay()).toContain("- claude-code:haiku");
+    expect(overlay()).toContain("models: [nosuch:guard]");
   });
   test("a config that cannot be written says so in plain words, and says nothing was saved", async () => {
     const { run, cwd } = setup();
@@ -442,7 +479,7 @@ describe("what the screen reads from disk", () => {
       writeDoctor(cwd, health(["claude-code:fable"], { omp: ["google/x"] }));
       writeFileSync(join(cwd, ".tickmarkr", "catalog-cache.json"), JSON.stringify({ schemaVersion: 1, fetchedAt: new Date().toISOString(), modelsDev: { openai: { models: { "gpt-6-astra": {} } } }, artificialAnalysis: { data } }));
       expect(loadFleetSource(cwd, { adapters }).ctx.newModels, name).toEqual([]);
-      expect(await run(["--plain"]), name).toContain(" WORKERS");
+      expect(await run(["--plain"]), name).toContain("\nWORKERS  ");
     }
   });
   test("the last run's journal: a model that ran out of quota with nothing to take over, and the shapes it was doing", () => {
@@ -498,27 +535,27 @@ describe("what the screen reads from disk", () => {
     expect(lines.find((l) => l.line === "deny.models")).toMatchObject({ deny: true, models: [] });
     // the review first, and nothing saved
     const shown = await run(["--set", "implement=codex:gpt-6-astra,claude-code:opus"]) as string;
-    expect(shown).toContain("YOU CHANGED BY HAND");
-    expect(shown).toContain("implement: add gpt-6-astra, opus");
+    expect(shown).toContain("YOU ARE SAVING");
+    expect(shown).toContain("after    by complexity  gpt-6-astra + opus share every task");
     expect(shown).toContain("Nothing was saved. Add --save to save it.");
     expect(overlay()).toBe("review:\n  required: true\n");
     // two lines and an answer in one save
     expect(await run(["--set", "implement=codex:gpt-6-astra,claude-code:opus", "--set", "judge=codex:gpt-6-astra", "--save"])).toContain("Saved to .tickmarkr/config.yaml.");
-    expect(overlay()).toContain("    implement:\n      pool:\n        mode: any\n        channels:\n          - codex:gpt-6-astra\n          - claude-code:opus\n");
+    expect(overlay()).toContain("    implement:\n      pool:\n        mode: complexity\n        channels:\n          - codex:gpt-6-astra\n          - claude-code:opus\n");
     expect(overlay()).toContain("judge:\n  adapter: codex\n  model: gpt-6-astra\n");
     expect(overlay()).toContain("review:\n  required: true\n");
     // a mode named before the models turns the pool, as the o key does; the same models in the same mode are no change
     const ordered = await run(["--set", "implement=ordered:codex:gpt-6-astra,claude-code:opus", "--save"]) as string;
-    expect(ordered).toContain("implement: mode ordered");
+    expect(ordered).toContain("after    ordered  routing.map.implement.pool.mode");
     expect(overlay()).toContain("    implement:\n      pool:\n        mode: ordered\n        channels:\n          - codex:gpt-6-astra\n          - claude-code:opus\n");
     expect(await run(["--set", "implement=ordered:codex:gpt-6-astra,claude-code:opus"])).toMatchObject({ code: 1 });
-    expect(await run(["--set", "implement=any:codex:gpt-6-astra,claude-code:opus", "--save"])).toContain("implement: mode any");
+    expect(await run(["--set", "implement=any:codex:gpt-6-astra,claude-code:opus", "--save"])).toContain("after    any  routing.map.implement.pool.mode");
     // a shape's floor, as the f key moves it; with the shape's models in the same command it is one change of that line
     const floored = await run(["--set", "docs.floor=mid", "--set", "docs=codex:gpt-6-astra", "--save"]) as string;
-    expect(floored).toContain("docs: floor mid, where mode risk-based said cheap");
-    expect(floored).toContain("docs: add gpt-6-astra; it gets a pool: only these take it");
+    expect(floored).toContain("after    mid  routing.floors.docs");
+    expect(floored).toContain("after    codex:gpt-6-astra  routing.map.docs.pool.channels");
     expect(overlay()).toMatch(/^ {2}floors:\n {4}docs: mid$/m);
-    expect(await run(["--set", "docs.floor=mode", "--save"])).toContain("docs: floor as mode risk-based says, was mid for this shape");
+    expect(await run(["--set", "docs.floor=mode", "--save"])).toContain("before   mid  routing.floors.docs");
     expect(overlay()).not.toContain("docs: mid");
     for (const [arg, words] of [["docs.floor=high", "docs.floor is cheap, mid, frontier or mode"], ["docs.floor=mode", "docs.floor is already what the routing mode says"], ["judge.floor=mid", "names no line"]] as const) {
       const out = await run(["--set", arg, "--save"]);
@@ -559,35 +596,31 @@ describe("what the screen reads from disk", () => {
     expect(overlay()).toBe(before);
     expect(existsSync(join(cwd, ".tickmarkr", "config.yaml.tmp"))).toBe(false);
   });
-  test("--set reaches the deny lists, lifts the rule of a model it names on a line, and refuses a rule wider than the model", async () => {
+  test("--set reaches the deny lists, refuses a kept-out model on a line by its rule's name, and refuses a rule wider than the model", async () => {
     const { run, overlay } = setup({ repo: "routing:\n  deny:\n    workers:\n      models:\n        # benched\n        - claude-code:opus\n        - codex:gpt-5.6-terra\nreview:\n  required: true\n" });
     // --json names what a rule keeps from a line, and whether naming it lifts the rule
     const lines = (JSON.parse(await run(["--json"]) as string) as { lines: Array<{ line: string; models: string[]; candidates: string[]; keptOut?: Record<string, { why: string; liftable: boolean }> }> }).lines;
     expect(lines.find((l) => l.line === "plan")!.keptOut).toMatchObject({ "claude-code:opus": { why: "the deny rule claude-code:opus for all work (every shape, plan and spec too)", liftable: true } });
     expect(lines.find((l) => l.line === "deny.workers.models")).toMatchObject({ models: ["claude-code:opus", "codex:gpt-5.6-terra"] });
-    // naming it on plan lifts its rule in the same review, and only its rule
-    const shown = await run(["--set", "plan=codex:gpt-6-astra,claude-code:opus"]) as string;
-    expect(shown).toContain("plan: add gpt-6-astra, opus");
-    expect(shown).toContain("claude-code:opus: no longer denied for all work (every shape, plan and spec too)");
-    expect(await run(["--set", "plan=codex:gpt-6-astra,claude-code:opus", "--save"])).toContain("Saved to .tickmarkr/config.yaml.");
-    expect(overlay()).toContain("        # benched\n        - codex:gpt-5.6-terra\n");
-    expect(overlay()).not.toContain("        - claude-code:opus\n        - codex");
-    expect(overlay()).toContain("    plan:\n      pool:\n        mode: any\n        channels:\n          - codex:gpt-6-astra\n          - claude-code:opus\n");
-    // a deny list is set to what is named, and to nothing
-    expect(await run(["--set", "deny.workers.models=codex:gpt-5.6-terra,claude-code:fable", "--save"])).toContain("claude-code:fable: denied for all work (every shape, plan and spec too)");
-    expect(overlay()).toContain("        - codex:gpt-5.6-terra\n        - claude-code:fable\n");
-    const emptied = await run(["--set", "deny.workers.models=", "--save"]) as string;
-    // a label longer than the review is wide is whole, on two rows
-    expect(emptied.replace(/\n +/g, " ")).toContain("codex:gpt-5.6-terra, claude-code:fable: no longer denied for all work (every shape, plan and spec too)");
-    expect(emptied).toContain("Saved to .tickmarkr/config.yaml.");
-    expect(overlay()).not.toContain("claude-code:fable");
+    // naming it on plan is refused by the rule's name and lifts no rule (K2)
+    const start = overlay();
+    const shown = await run(["--set", "plan=codex:gpt-6-astra,claude-code:opus", "--save"]) as { out: string; code: number };
+    expect(shown.code).toBe(1);
+    expect(shown.out).toContain("claude-code:opus is kept from plan by the deny rule claude-code:opus for all work (every shape, plan and spec too) — --set removes no KEPT OUT rule");
+    expect(shown.out).not.toContain("no longer denied");
+    expect(overlay()).toBe(start);
+    // a deny list gains what is named, beside every entry it has
+    expect(await run(["--set", "deny.workers.models=claude-code:opus,codex:gpt-5.6-terra,claude-code:fable", "--save"])).toContain("Saved to .tickmarkr/config.yaml.");
+    expect(overlay()).toContain("        # benched\n        - claude-code:opus\n        - codex:gpt-5.6-terra\n        - claude-code:fable\n");
     const now = (JSON.parse(await run(["--json"]) as string) as { lines: Array<{ line: string; models: string[] }> }).lines;
-    expect(now.find((l) => l.line === "deny.workers.models")!.models).toEqual([]);
+    expect(now.find((l) => l.line === "deny.workers.models")!.models).toEqual(["claude-code:opus", "codex:gpt-5.6-terra", "claude-code:fable"]);
     // refusals, by name
     const before = overlay();
     for (const [args, words] of [
       [["--set", "deny.models=no-such-thing"], "no-such-thing is not something deny.models can name"],
-      [["--set", "deny.workers.models="], "deny.workers.models already has exactly those models"],
+      [["--set", "deny.workers.models="], "deny.workers.models would no longer keep out claude-code:opus, codex:gpt-5.6-terra, claude-code:fable, which are saved"],
+      [["--set", "deny.workers.models=codex:gpt-5.6-terra,claude-code:fable"], "deny.workers.models would no longer keep out claude-code:opus, which is saved"],
+      [["--set", "deny.workers.models=claude-code:opus,codex:gpt-5.6-terra,claude-code:fable"], "deny.workers.models already has exactly those models"],
     ] as const) {
       const out = await run([...args, "--save"]);
       expect(out, args.join(" ")).toMatchObject({ code: 1 });
@@ -597,17 +630,17 @@ describe("what the screen reads from disk", () => {
     const wide = setup({ repo: "routing:\n  deny:\n    adapters: [claude-code]\nreview:\n  required: true\n" });
     const out = await wide.run(["--set", "plan=codex:gpt-6-astra,claude-code:opus", "--save"]);
     expect(out).toMatchObject({ code: 1 });
-    expect((out as { out: string }).out).toContain("claude-code:opus is kept from plan by the deny rule claude-code, which covers the whole claude-code CLI — change that deny list first");
+    expect((out as { out: string }).out).toContain("claude-code:opus is kept from plan by the deny rule claude-code, which covers the whole claude-code CLI — --set removes no KEPT OUT rule");
     expect(wide.overlay()).toBe("routing:\n  deny:\n    adapters: [claude-code]\nreview:\n  required: true\n");
   });
   test("r with a yes not yet saved probes and comes back with the yes still there, through the Ink screen", async () => {
-    const { run, cwd } = setup();
+    const { run, cwd, globalDir } = setup();
     const t = terminal();
     let probes = 0;
     const done = run([], { input: t.input as never, output: t.output as never, doctor: (async () => { probes++; return "probed"; }) as never });
     await t.frame("NEEDS YOU");
-    let next = t.frame("answered yes");
-    t.input.write("y");
+    let next = t.frame("NOT SAVED");
+    t.input.write(`${arrowsTo(loadFleetSource(cwd, { globalDir, adapters }), (x) => x.startsWith("item:"))}y`);
     await next;
     // the probe leaves the screen and opens it again: the answer is carried, said, and still counted
     next = t.frame("kept through the probe, not saved yet");
@@ -622,49 +655,239 @@ describe("what the screen reads from disk", () => {
     expect(await done).toBe("fleet: quit; 1 change was not saved");
     expect(existsSync(join(cwd, ".tickmarkr", "config.yaml"))).toBe(false);
   });
-  test("a line changed by hand runs through the Ink screen to the file: a tick, its place in the order, the pool's mode", async () => {
-    const { run, overlay } = setup({ repo: "review:\n  required: true\n", dead: [] });
+  test("a line changed by hand runs through the Ink screen to the file: Enter opens it, a choice, Esc keeps it, the save writes it", async () => {
+    const { run, overlay, cwd, globalDir } = setup({ repo: "review:\n  required: true\n", dead: [] });
     const t = terminal();
     const done = run([], { input: t.input as never, output: t.output as never });
     await t.frame("NEEDS YOU");
-    let next = t.frame("CHANGE A LINE");
-    t.input.write("e");
+    // plan's row of WORKERS, reached with real arrows; Enter opens it (a row of several shapes asks which first, and plan is its first)
+    const row = (x: string) => x.startsWith("shapes:") && x.slice(7).split(",").includes("plan");
+    const source = loadFleetSource(cwd, { globalDir, adapters });
+    const shapes = homeTargets(source, initialScreen(), { cols: 100, rows: 30 }).find(row)!.slice(7).split(",");
+    const choose = shapes.length > 1 ? `${"\x1b[B".repeat(shapes.indexOf("plan"))}\r` : "";
+    // pinned to one model by the defaults: it opens as one row of an order
+    let next = t.frame("How are the tasks given out?");
+    t.input.write(`${arrowsTo(source, row)}\r${choose}`);
     await next;
-    // plan is the first line, pinned to one model by the defaults: it opens with that model ticked
-    next = t.frame("tick the models for it");
+    // Enter on By complexity (the cursor's first place): one real key, and the table is drawn at once
+    next = t.frame("every task 1-10");
     t.input.write("\r");
     await next;
-    // down to the second model, Space ticks it, [ moves it first, o makes the pool ordered: each is one real key
-    next = t.frame("[2]");
-    t.input.write("\x1b[B ");
-    await next;
-    next = t.frame("ordered: the first that works takes every task");
-    t.input.write("[o");
-    await next;
+    // Esc keeps the choice as one pending change of the line
     next = t.frame("plan changed");
-    t.input.write("\r");
+    t.input.write("\x1b");
     await next;
-    next = t.frame("YOU CHANGED BY HAND");
-    t.input.write("\r");
+    next = t.frame("YOU ARE SAVING");
+    t.input.write("s");
     await next;
     next = t.frame("Saved to .tickmarkr/config.yaml.");
-    t.input.write("y");
+    t.input.write("\r");
     await next;
     t.input.write("q");
     expect(await done).toBe("fleet: saved .tickmarkr/config.yaml");
-    expect(overlay()).toMatch(/ {4}plan:\n {6}pool:\n {8}mode: ordered\n {8}channels:\n {10}- claude-code:opus\n {10}- claude-code:fable\n/);
-    expect(t.text()).toContain("the pin becomes a pool");
+    expect(overlay()).toMatch(/ {4}plan:\n {6}pool:\n {8}mode: complexity\n {8}channels:\n {10}- claude-code:fable\n/);
+    expect(t.text()).toMatch(/1 {2}plan\s+after +by complexity/);
   });
-  test("keys: Esc alone is Esc, and an Esc that came with other keys does not swallow them", async () => {
+  test("keys: Esc alone is Esc, and an Esc that came with other keys is Esc alone", async () => {
     const { keysOf } = await import("../../src/tui/ink/fleet-screen.js");
-    const none = { upArrow: false, downArrow: false, return: false, escape: false };
-    expect(keysOf("", { ...none, escape: true })).toEqual(["esc"]);
-    expect(keysOf("yn", { ...none, escape: true })).toEqual(["y", "n"]);
-    expect(keysOf("y\x1b[B\ry", none)).toEqual(["y", "down", "enter", "y"]);
-    expect(keysOf("", { ...none, upArrow: true })).toEqual(["up"]);
-    expect(keysOf("", none)).toEqual([]);
+    expect(keysOf("\x1b")).toEqual(["esc"]);
+    expect(keysOf("y\x1b[B\ry")).toEqual(["y", "down", "enter", "y"]);
+    expect(keysOf("\x1b[A\x1bOB")).toEqual(["up", "down"]);
+    expect(keysOf("")).toEqual([]);
     // the keys of an opened line are plain characters, alone or together
-    expect(keysOf("[", none)).toEqual(["["]);
-    expect(keysOf("] o", none)).toEqual(["]", " ", "o"]);
+    expect(keysOf("[")).toEqual(["["]);
+    expect(keysOf("] o")).toEqual(["]", " ", "o"]);
+    // D-2187 add.400: the key after an Esc is dropped; a chunk with a control byte does nothing; Ctrl+C alone is named
+    for (const raw of ["\x1b\r", "\x1b\n", "\x1bq", "\x1b[1;5A\r", "\x1bOa\r", "\x1b[200~q\x1b[201~", "\x1b[1;5q"]) expect(keysOf(raw), JSON.stringify(raw)).toEqual(["esc"]);
+    // the models view's keys (row 498; D-2187 add.363): left and right, and Tab and Backspace each alone in their chunk
+    expect(keysOf("\x1b[C\x1b[D\x1bOC")).toEqual(["right", "left", "right"]);
+    expect(keysOf("\x1b[C\r")).toEqual(["right", "enter"]);
+    // PgUp and PgDn scroll the models view's detail and legend (D-2187 add.408); a paste bracket is still Esc alone
+    expect(keysOf("\x1b[5~\x1b[6~")).toEqual(["pgup", "pgdown"]);
+    expect([keysOf("\t"), keysOf("\x7f"), keysOf("\b")]).toEqual([["tab"], ["backspace"], ["backspace"]]);
+    expect(keysOf("gpt-6/a:1.x")).toEqual([..."gpt-6/a:1.x"]);
+    for (const raw of ["\x11", "\x11\r", "\x03\r", "\x03q", "\t\r", "\x7fq", "\b\r", "\x00\r", "\r\x11", "\x1b\x11q"]) expect(keysOf(raw), JSON.stringify(raw)).toEqual([]);
+    expect(keysOf("\x03")).toEqual(["ctrl-c"]);
+  });
+});
+
+// Contract section 7 (queue rows 499 and 502; D-2187 add.363): the command without a terminal.
+describe("the command without a terminal prints the one screen and the save", () => {
+  const files = (cwd: string, globalDir: string) => [join(cwd, ".tickmarkr", "config.yaml"), join(globalDir, "config.yaml")].map((f) => (existsSync(f) ? readFileSync(f, "utf8") : null));
+  test("--plain prints the one screen: every section; every item; so does a run that has no terminal", async () => {
+    const { run } = setup({ repo: "routing:\n  deny:\n    workers:\n      # benched\n      models: [codex:gpt-5.6-terra]\n" });
+    const plain = await run(["--plain"]) as string;
+    for (const head of ["WORKERS  ", "GATES  ", "CONSULT  ", "KEPT OUT  ", "NEEDS YOU ("]) expect(plain, head).toMatch(new RegExp(`^${head.replace("(", "\\(")}`, "m"));
+    expect(plain).toContain("codex:gpt-5.6-terra");
+    const items = (JSON.parse(await run(["--json"]) as string) as { needs: Array<{ title: string }> }).needs;
+    expect(items.length).toBeGreaterThan(1);
+    for (const it of items) expect(plain.replace(/\n +/g, " "), it.title).toContain(it.title);
+    // no keys row for a pipe, and no cursor drawn
+    expect(plain).not.toContain("q quit");
+    expect(plain).not.toContain("▸");
+    // a run that has no terminal prints the same; --plain on a terminal too
+    expect(await run([])).toBe(plain);
+    expect(await run(["--plain"], tty)).toBe(plain);
+  });
+  test("--set names how a line is given out: any; ordered; complexity: each is written as asked; a bare list keeps the line's way", async () => {
+    const { run, overlay } = setup({ repo: "review:\n  required: true\n" });
+    const pool = (shape: string) => (parse(overlay()) as { routing: { map: Record<string, { pool: { mode: string; channels: string[] } }> } }).routing.map[shape].pool;
+    expect(await run(["--set", "tests=any:codex:gpt-6-astra,claude-code:opus", "--set", "chore=ordered:codex:gpt-6-astra,claude-code:opus", "--set", "docs=complexity:codex:gpt-6-astra,claude-code:opus", "--save"])).toContain("Saved to");
+    expect(pool("tests")).toEqual({ mode: "any", channels: ["codex:gpt-6-astra", "claude-code:opus"] });
+    expect(pool("chore")).toEqual({ mode: "ordered", channels: ["codex:gpt-6-astra", "claude-code:opus"] });
+    expect(pool("docs")).toEqual({ mode: "complexity", channels: ["codex:gpt-6-astra", "claude-code:opus"] });
+    // a bare list keeps each line's way
+    expect(await run(["--set", "tests=claude-code:opus,codex:gpt-6-astra", "--set", "chore=claude-code:opus,codex:gpt-6-astra", "--set", "docs=claude-code:opus", "--save"])).toContain("Saved to");
+    expect(pool("tests")).toEqual({ mode: "any", channels: ["claude-code:opus", "codex:gpt-6-astra"] });
+    expect(pool("chore")).toEqual({ mode: "ordered", channels: ["claude-code:opus", "codex:gpt-6-astra"] });
+    expect(pool("docs")).toEqual({ mode: "complexity", channels: ["claude-code:opus"] });
+    // and a line that has none is given out by complexity
+    expect(await run(["--set", "refactor=codex:gpt-6-astra", "--save"])).toContain("Saved to");
+    expect(pool("refactor")).toEqual({ mode: "complexity", channels: ["codex:gpt-6-astra"] });
+  });
+  test("--set hardFrom sets what counts as very complex; a value outside 2 to 10 is refused by name", async () => {
+    const { run, cwd, globalDir, overlay } = setup({ repo: "review:\n  required: true\n" });
+    const before = files(cwd, globalDir);
+    for (const v of ["1", "11", "0", "x", "7.5", ""]) {
+      expect(await run(["--set", `hardFrom=${v}`, "--save"]), v).toEqual({ out: `tickmarkr fleet --set: hardFrom is a whole number from 2 to 10, and ${JSON.stringify(v)} was given`, code: 1 });
+    }
+    expect(await run(["--set", "hardFrom=8"])).toEqual({ out: "tickmarkr fleet --set: hardFrom is already 8", code: 1 });
+    expect(files(cwd, globalDir)).toEqual(before);
+    const saved = await run(["--set", "hardFrom=6", "--save"]) as string;
+    expect(saved).toContain("starts at 6, for every line given out by complexity");
+    expect(parse(overlay()).routing.hardFrom).toBe(6);
+    expect(JSON.parse(await run(["--json"]) as string)).toMatchObject({ hardFrom: 6 });
+    expect(await run(["--set", "hardfrom=10", "--save"])).toContain("Saved to");
+    expect(parse(overlay()).routing.hardFrom).toBe(10);
+  });
+  test("--yes and --set print the save as text; nothing is written without --save", async () => {
+    const { run, cwd, globalDir } = setup();
+    const before = files(cwd, globalDir);
+    for (const args of [["--yes", "setup"], ["--set", "hardFrom=5"], ["--set", "implement=complexity:codex:gpt-6-astra"], ["--yes", "setup", "--set", "hardFrom=5"]]) {
+      const out = await run(args) as string;
+      expect(out, args.join(" ")).toContain("YOU ARE SAVING");
+      expect(out, args.join(" ")).toContain("nothing is written yet");
+      expect(out, args.join(" ")).toContain("WRITTEN TO   this project's settings: .tickmarkr/config.yaml");
+      expect(out, args.join(" ")).toContain(" TO BE SAVED IN .tickmarkr/config.yaml");
+      expect(out, args.join(" ")).toMatch(/Nothing was saved\. Add --save to save it\.$/);
+      expect(files(cwd, globalDir), args.join(" ")).toEqual(before);
+    }
+    const saved = await run(["--yes", "setup", "--set", "hardFrom=5", "--save"]) as string;
+    expect(saved).toContain("YOU ARE SAVING  2 changes");
+    expect(saved).toMatch(/Saved to \.tickmarkr\/config\.yaml\.$/);
+    expect(parse(readFileSync(join(cwd, ".tickmarkr", "config.yaml"), "utf8")).routing.hardFrom).toBe(5);
+  });
+  test("a --set that would remove a saved kept out rule is refused by name and changes no file: a model a rule keeps out; an omitted entry; an emptied list", async () => {
+    const repo = "routing:\n  deny:\n    workers:\n      models:\n        # benched\n        - claude-code:opus\n        - codex:gpt-5.6-terra\n";
+    const { run, cwd, globalDir } = setup({ repo });
+    writeFileSync(join(globalDir, "config.yaml"), "routing:\n  deny:\n    adapters: [grok]\n");
+    const before = files(cwd, globalDir);
+    for (const [args, words] of [
+      [["--set", "plan=codex:gpt-6-astra,claude-code:opus"], "claude-code:opus is kept from plan by the deny rule claude-code:opus for all work (every shape, plan and spec too) — --set removes no KEPT OUT rule"],
+      [["--set", "implement=grok:grok-4.5"], "grok:grok-4.5 is kept from implement by the deny rule grok, which covers the whole grok CLI — --set removes no KEPT OUT rule"],
+      [["--set", "deny.workers.models=codex:gpt-5.6-terra"], "deny.workers.models would no longer keep out claude-code:opus, which is saved — --set removes no KEPT OUT rule"],
+      [["--set", "deny.workers.models=codex:gpt-5.6-terra,claude-code:fable"], "deny.workers.models would no longer keep out claude-code:opus, which is saved"],
+      [["--set", "deny.workers.models="], "deny.workers.models would no longer keep out claude-code:opus, codex:gpt-5.6-terra, which are saved"],
+      [["--set", "deny.adapters="], "deny.adapters would no longer keep out grok, which is saved"],
+    ] as const) {
+      for (const save of [[], ["--save"]]) {
+        const out = await run([...args, ...save]) as { out: string; code: number };
+        expect(out.code, args.join(" ")).toBe(1);
+        expect(out.out, args.join(" ")).toContain(words);
+        expect(files(cwd, globalDir), args.join(" ")).toEqual(before);
+      }
+    }
+    // a deny list may still gain entries, beside every entry it has
+    expect(await run(["--set", "deny.workers.models=claude-code:opus,codex:gpt-5.6-terra,claude-code:fable", "--save"])).toContain("Saved to");
+    expect(parse(readFileSync(join(cwd, ".tickmarkr", "config.yaml"), "utf8")).routing.deny.workers.models).toEqual(["claude-code:opus", "codex:gpt-5.6-terra", "claude-code:fable"]);
+  });
+});
+
+// The repair of T15's review (rows 499, 502; D-2187 add.363): the whole class of each finding, through the command.
+describe("--set asks every model it names, keeps a pin in order, and --plain is never cut", () => {
+  const files = (cwd: string, globalDir: string) => [join(cwd, ".tickmarkr", "config.yaml"), join(globalDir, "config.yaml")].map((f) => (existsSync(f) ? readFileSync(f, "utf8") : null));
+  test("a model a deny rule keeps out is refused by the rule's name on every line and in every form, when the line already names it and when its probe failed", async () => {
+    const denied = "routing:\n  deny:\n    workers:\n      models: [claude-code:opus, claude-code:fable]\n    models: [codex:gpt-5.6-terra]\n";
+    const cases: Array<[string, string, string]> = [
+      ["  map:\n    plan:\n      pool:\n        mode: complexity\n        channels: [claude-code:opus]\n", "plan=complexity:claude-code:opus,codex:gpt-6-astra", "claude-code:opus is kept from plan by the deny rule claude-code:opus"],
+      ["  map:\n    plan:\n      pool:\n        mode: complexity\n        channels: [claude-code:opus]\n", "plan=ordered:codex:gpt-6-astra,claude-code:opus", "claude-code:opus is kept from plan by the deny rule claude-code:opus"],
+      ["  map:\n    plan:\n      pool:\n        mode: complexity\n        channels: [claude-code:opus]\n", "plan=claude-code:opus,codex:gpt-6-astra", "claude-code:opus is kept from plan by the deny rule claude-code:opus"],
+      ["  map:\n    plan:\n      pool:\n        mode: complexity\n        channels: [claude-code:fable]\n", "plan=complexity:claude-code:fable,codex:gpt-6-astra", "claude-code:fable is kept from plan by the deny rule claude-code:fable"],
+      ["  map:\n    plan:\n      pin: { via: claude-code, model: opus }\n", "plan=any:claude-code:opus", "claude-code:opus is kept from plan by the deny rule claude-code:opus"],
+      ["", "review=codex:gpt-5.6-terra,codex:gpt-6-astra", "codex:gpt-5.6-terra is kept from review by the deny rule codex:gpt-5.6-terra, which covers every seat"],
+      ["", "consult=codex:gpt-5.6-terra,codex:gpt-6-astra", "codex:gpt-5.6-terra is kept from consult by the deny rule codex:gpt-5.6-terra, which covers every seat"],
+      ["", "judge=codex:gpt-5.6-terra", "codex:gpt-5.6-terra is kept from judge by the deny rule codex:gpt-5.6-terra, which covers every seat"],
+    ];
+    for (const [map, set, words] of cases) {
+      const tail = set.startsWith("review") ? "review:\n  prefer: [codex:gpt-5.6-terra]\n" : set.startsWith("consult") ? "consult:\n  prefer: [codex:gpt-5.6-terra]\n" : "";
+      const { run, cwd, globalDir } = setup({ repo: `${denied}${map}${tail}` });
+      const before = files(cwd, globalDir);
+      for (const save of [[], ["--save"]]) {
+        const out = await run(["--set", set, ...save]) as { out: string; code: number };
+        expect(out.code, set).toBe(1);
+        expect(out.out, set).toContain(`${words}`);
+        expect(out.out, set).toContain("— --set removes no KEPT OUT rule");
+        expect(files(cwd, globalDir), set).toEqual(before);
+      }
+    }
+  });
+  test("a bare list on a pinned line keeps it in order, and the pin's own model alone is no change", async () => {
+    const { run, overlay } = setup({ repo: "routing:\n  map:\n    plan:\n      pin: { via: codex, model: gpt-6-astra }\n" });
+    expect(await run(["--set", "plan=codex:gpt-6-astra"])).toMatchObject({ code: 1, out: "tickmarkr fleet --set: plan already has exactly those models, in that order" });
+    expect(await run(["--set", "plan=codex:gpt-6-astra,claude-code:opus", "--save"])).toContain("Saved to");
+    expect((parse(overlay()) as { routing: { map: { plan: { pool: unknown } } } }).routing.map.plan.pool).toEqual({ mode: "ordered", channels: ["codex:gpt-6-astra", "claude-code:opus"] });
+    const line = (JSON.parse(await run(["--json"]) as string) as { lines: Array<{ line: string; mode?: string }> }).lines.find((l) => l.line === "plan");
+    expect(line?.mode).toBe("ordered");
+  });
+  test("--plain prints every section and every item however long a KEPT OUT reason is, with and without a terminal", async () => {
+    const { run } = setup({ repo: `routing:\n  deny:\n    workers:\n      # ${"a reason ".repeat(24000)}\n      models: [codex:gpt-5.6-terra]\n` });
+    const plain = await run(["--plain"]) as string;
+    expect(plain).not.toMatch(/more below/);
+    for (const head of ["WORKERS  ", "GATES  ", "CONSULT  ", "KEPT OUT  ", "NEEDS YOU ("]) expect(plain, head).toMatch(new RegExp(`^${head.replace("(", "\\(")}`, "m"));
+    const items = (JSON.parse(await run(["--json"]) as string) as { needs: Array<{ title: string }> }).needs;
+    expect(items.length).toBeGreaterThan(1);
+    for (const it of items) expect(plain.replace(/\n +/g, " "), it.title).toContain(it.title);
+    expect(await run([])).toBe(plain);
+  });
+});
+
+// The second repair of T15's review (rows 499, 502; D-2187 add.363): the rules are asked before any probe or
+// working-model check, so a failed or never-probed model is still refused by its rule's name; and an explicit way on a pin is a change.
+describe("--set asks the rules before the probe, and a way named on a pin writes", () => {
+  const files = (cwd: string, globalDir: string) => [join(cwd, ".tickmarkr", "config.yaml"), join(globalDir, "config.yaml")].map((f) => (existsSync(f) ? readFileSync(f, "utf8") : null));
+  test("a model a rule keeps out is refused by the rule's name whatever its probe says, on every line and for every rule scope", async () => {
+    // claude-code:fable's probe failed in setup(); probe: false leaves every model never probed
+    const cases: Array<[{ repo: string; probe?: boolean }, string, string]> = [
+      [{ repo: "routing:\n  deny:\n    models: [claude-code:fable]\n" }, "review=claude-code:fable,codex:gpt-6-astra", "claude-code:fable is kept from review by the deny rule claude-code:fable"],
+      [{ repo: "routing:\n  deny:\n    models: [claude-code:fable]\n" }, "consult=claude-code:fable", "claude-code:fable is kept from consult by the deny rule claude-code:fable"],
+      [{ repo: "routing:\n  deny:\n    models: [claude-code:fable]\n" }, "judge=claude-code:fable", "claude-code:fable is kept from judge by the deny rule claude-code:fable"],
+      [{ repo: "routing:\n  deny:\n    workers:\n      models: [claude-code:fable]\n" }, "docs=ordered:claude-code:fable", "claude-code:fable is kept from docs by the deny rule claude-code:fable"],
+      [{ repo: "routing:\n  deny:\n    workers:\n      models: [claude-code:fable]\n" }, "plan=claude-code:fable,codex:gpt-6-astra", "claude-code:fable is kept from plan by the deny rule claude-code:fable"],
+      [{ repo: "routing:\n  deny:\n    adapters: [claude-code]\n", probe: false }, "plan=any:claude-code:opus", "claude-code:opus is kept from plan by the deny rule claude-code, which covers the whole claude-code CLI"],
+      [{ repo: "routing:\n  deny:\n    adapters: [claude-code]\n", probe: false }, "review=claude-code:opus", "claude-code:opus is kept from review by the deny rule claude-code, which covers the whole claude-code CLI"],
+      [{ repo: "routing:\n  deny:\n    models: [codex:gpt-6-astra]\n", probe: false }, "consult=codex:gpt-6-astra", "codex:gpt-6-astra is kept from consult by the deny rule codex:gpt-6-astra"],
+      // the judge is one model: two named, one a rule keeps out, is refused by the rule, not by the count
+      [{ repo: "routing:\n  deny:\n    models: [claude-code:fable]\n" }, "judge=claude-code:fable,codex:gpt-6-astra", "claude-code:fable is kept from judge by the deny rule claude-code:fable"],
+      [{ repo: "routing:\n  deny:\n    adapters: [claude-code]\n", probe: false }, "judge=claude-code:opus,codex:gpt-6-astra", "claude-code:opus is kept from judge by the deny rule claude-code, which covers the whole claude-code CLI"],
+    ];
+    for (const [opts, set, words] of cases) {
+      const { run, cwd, globalDir } = setup(opts);
+      const before = files(cwd, globalDir);
+      for (const save of [[], ["--save"]]) {
+        const out = await run(["--set", set, ...save]) as { out: string; code: number };
+        expect(out.code, set).toBe(1);
+        expect(out.out, set).toContain(`${words}`);
+        expect(out.out, set).toContain("— --set removes no KEPT OUT rule");
+        expect(out.out, set).not.toContain("working model");
+        expect(out.out, set).not.toContain("is one model");
+        expect(files(cwd, globalDir), set).toEqual(before);
+      }
+    }
+  });
+  test("an explicit ordered on a pin's own model turns the pin into an ordered pool; a bare list on it is no change", async () => {
+    const { run, overlay } = setup({ repo: "routing:\n  map:\n    plan:\n      pin: { via: codex, model: gpt-6-astra }\n" });
+    expect(await run(["--set", "plan=codex:gpt-6-astra", "--save"])).toMatchObject({ code: 1, out: "tickmarkr fleet --set: plan already has exactly those models, in that order" });
+    expect(await run(["--set", "plan=ordered:codex:gpt-6-astra", "--save"])).toContain("Saved to");
+    expect((parse(overlay()) as { routing: { map: { plan: unknown } } }).routing.map.plan).toEqual({ pool: { mode: "ordered", channels: ["codex:gpt-6-astra"] } });
   });
 });

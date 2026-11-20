@@ -622,7 +622,7 @@ export async function run(argv: string[], cwd = process.cwd()): Promise<{ out: s
       const channels = discoverChannels(cfg, adapters, health);
       // no preview: the strict pre-flight routes through exactly what the daemon will use (honors the switch)
       const profile = loadRoutingProfile(cwd, cfg);
-      const lints = graph.tasks.flatMap((t) => route(t, cfg, channels, profile, undefined, undefined, exploreCtx).lints);
+      const lints = graph.tasks.flatMap((t) => route(t, cfg, channels, profile, undefined, undefined, exploreCtx, graph.tasks).lints);
       if (lints.length) throw new Error(`--route-strict: routing lints present, refusing to dispatch:\n${lints.join("\n")}`);
     }
     await assertRefsWritable(cwd, "run");

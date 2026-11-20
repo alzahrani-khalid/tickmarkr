@@ -104,8 +104,11 @@ export interface FleetModel {
   working: number;
 }
 
+// Rows 501, 502 (D-2187 add.363): task i has complexity (i mod 10) + 1, 40 at each; any, ordered, pins and
+// open routing do not read it, so their counts do not move.
+export const sampleComplexity = (i: number): number => (i % 10) + 1;
 const sampleTask = (shape: Shape, i: number): Task => ({
-  id: `T${i + 1}`, title: shape, goal: `simulated ${shape} task ${i * 7919}`, shape, complexity: 3, acceptance: ["simulated"], deps: [], files: [], context: [],
+  id: `T${i + 1}`, title: shape, goal: `simulated ${shape} task ${i * 7919}`, shape, complexity: sampleComplexity(i), acceptance: ["simulated"], deps: [], files: [], context: [],
   gates: ["build", "test", "lint", "evidence", "scope", "acceptance", "review"], humanGate: false, status: "pending", evidence: { commits: [], artifacts: [], gateResults: [] },
 });
 
@@ -203,9 +206,11 @@ function routeSample(M: FleetModel): Sample {
     const counts = new Map<string, number>();
     const picks: ShapeRow["picks"] = [];
     let none = 0, error = "";
+    // the shape's sample is passed as the graph, so a line by complexity is counted by real turns
+    const graph = Array.from({ length: SAMPLE }, (_, i) => sampleTask(shape, i));
     for (let i = 0; i < SAMPLE; i++) {
       let k: string;
-      try { k = channelKey(route(sampleTask(shape, i), cfg, worker).assignment); } catch (e) { none++; error ||= e instanceof Error ? e.message : String(e); picks.push(["none", "none", "none"]); continue; }
+      try { k = channelKey(route(graph[i], cfg, worker, undefined, undefined, undefined, undefined, graph).assignment); } catch (e) { none++; error ||= e instanceof Error ? e.message : String(e); picks.push(["none", "none", "none"]); continue; }
       bump(counts, k);
       const c = channel.get(k);
       const ch = c ? (memo.get(k) ?? memo.set(k, checkers(M, c)).get(k)!) : { judge: null, independent: false, reviewer: null };

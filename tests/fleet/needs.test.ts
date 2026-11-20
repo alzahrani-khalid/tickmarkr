@@ -1,10 +1,13 @@
 // The closed list of items, called directly: what is asked, and what a yes would change.
+import { readFileSync } from "node:fs";
+import ts from "typescript";
 import { describe, expect, test } from "vitest";
 import { DEFAULT_CONFIG } from "../../src/config/config.js";
 import { SHAPES } from "../../src/graph/schema.js";
 import { buildFleetModel } from "../../src/fleet/model.js";
-import { needs, recommendedPools } from "../../src/fleet/needs.js";
-import { teamRows } from "../../src/fleet/screen.js";
+import { applyEdits } from "../../src/fleet/edits.js";
+import { needs, needSignature, recommendedPools } from "../../src/fleet/needs.js";
+import { derive, initialScreen, teamRows } from "../../src/fleet/screen.js";
 import { health, POOL, source } from "./world.js";
 
 /** The probe results of a machine where only these CLIs are installed. */
@@ -23,12 +26,58 @@ describe("NEEDS YOU", () => {
     expect(M.consult).toBe("claude-code:fable");
     expect(needs(M)).toEqual([]);
   });
-  test("a consult.prefer model that answers and still cannot take the seat is said so, in words that read", () => {
-    const M = buildFleetModel(source({ repoText: "consult:\n  prefer: [codex:gpt-6-astra]\n" }).inputs);
-    const item = needs({ ...M, consult: null } as typeof M).find((n) => n.id === "consult")!;
-    expect(item.title).toBe("The consult has no model: codex:gpt-6-astra answers but cannot take the consult seat.");
+  test("the consult item names a model that answers but its CLI cannot serve as the consult's model", () => {
+    const h = health();
+    h.codex.servable = ["gpt-6-luna"];
+    const M = buildFleetModel(source({ repoText: "consult:\n  prefer: [codex:gpt-6-astra]\n", health: h }).inputs);
+    expect(M.seat("codex:gpt-6-astra")!.verdict.state).toBe("pass");
+    expect(M.consult).toBeNull();
+    const item = needs(M).find((n) => n.id === "consult")!;
+    expect(item.title).toBe("The consult has no model: codex:gpt-6-astra answers but cannot be the consult's model.");
     expect(item.ask).toBe("Name another model in consult.prefer, then press r.");
+    expect(item.edits).toBeUndefined();
     expect(`${item.title} ${item.ask}`).not.toMatch(/passed|^, | , then/);
+  });
+});
+
+// Contract K8 / 5.1 (rows 500, 501; D-2187 add.363, add.384): the whole class of item producers,
+// including the fresh/non-fresh, editable/no-yes, and answering-but-not-served consult branches.
+describe("item vocabulary", () => {
+  test.each([
+    { name: "a fresh config with no installed CLI names the consult's model in its no-yes detail", repoText: "", installed: false, editable: false },
+    { name: "a config requiring review with working CLIs names the consult's model in its editable detail", repoText: "review:\n  required: true\n", installed: true, editable: true },
+    { name: "a config requiring review with no installed CLI names the consult's model in its no-yes detail", repoText: "review:\n  required: true\n", installed: false, editable: false },
+  ])("$name", ({ repoText, installed, editable }) => {
+    const M = buildFleetModel(source({ repoText, health: installed ? health() : only([]) }).inputs);
+    expect(M.cfg.consult.prefer).toBeUndefined();
+    expect(M.consult).toBeNull();
+    const item = needs(M).find((n) => n.id === "consult")!;
+    expect(item.detail[0]).toBe("The consult's model is picked from consult.prefer, and no config sets it.");
+    expect(Boolean(item.edits?.length)).toBe(editable);
+    if (editable) expect(item.edits!.map((e) => e.path)).toEqual([["consult", "prefer"]]);
+  });
+
+  test("the module's own written text follows section 5.1 in every item-producing branch, with verbatim config keys set aside", () => {
+    // This is the module-written-text oracle, not a sample of runtime branches. Visit every literal
+    // and template fragment, including shared helpers, so titles, asks, details and edit labels on
+    // unvisited branches are covered too. Interpolated model/CLI ids, rule entries/comments and probe
+    // diagnostics are verbatim input, not words written here. Config keys inside literals stay verbatim.
+    const file = ts.createSourceFile("needs.ts", readFileSync(new URL("../../src/fleet/needs.ts", import.meta.url), "utf8"), ts.ScriptTarget.Latest, true);
+    const banned = /\b(?:pool|tier|floor|seat|channel|allowlist)\b|\bany\s+pool\b|\bmode\s+any\b|\(any\)|\bpress e\b/i;
+    const violations: Array<{ line: number; text: string }> = [];
+    const visit = (node: ts.Node): void => {
+      if (ts.isStringLiteralLike(node) || ts.isTemplateHead(node) || ts.isTemplateMiddle(node) || ts.isTemplateTail(node)) {
+        // Item ids and cause-group tags (e.g. 5|floor) are internal data; none is printed.
+        const internal = ts.isLiteralTypeNode(node.parent)
+          || (ts.isPropertyAssignment(node.parent) && node.parent.name.getText(file) === "id")
+          || /^[1-6]\|\w+$/.test(node.text);
+        const written = node.text.replace(/\b(?:routing|review|consult)(?:\.[a-zA-Z_]\w*)+\b/g, "<config key>");
+        if (!internal && banned.test(written)) violations.push({ line: file.getLineAndCharacterOfPosition(node.getStart(file)).line + 1, text: node.text });
+      }
+      ts.forEachChild(node, visit);
+    };
+    visit(file);
+    expect(violations).toEqual([]);
   });
 });
 
@@ -52,8 +101,10 @@ describe("a line that reads wrong and that no yes can change still has an item, 
   });
   test("no CLI installed: every shape has its item, which says to install one; the judge's item names its CLI", () => {
     for (const over of [{ repoText: POOL, health: only([]) }, { health: only([]) }]) {
-      const items = needs(buildFleetModel(source(over).inputs));
-      expect(items.map((n) => n.id)).toEqual(["noseat", "judge", "review", "consult"]);
+      const all = needs(buildFleetModel(source(over).inputs));
+      // (POOL saves implement as any: the complexity item, last of the items that edit a line, offers to change its way: the one yes here)
+      expect(all.map((n) => n.id)).toEqual(over.repoText ? ["noseat", "judge", "review", "consult", "complexity"] : ["noseat", "judge", "review", "consult"]);
+      const items = all.filter((n) => n.id !== "complexity");
       expect(items.every((n) => !n.edits)).toBe(true);
       expect(items[0]).toMatchObject({ title: "every shape: no working model.", ask: "No agent CLI is installed. Install one, then press r." });
       expect(items[1].ask).toBe("No other working model may judge. Install claude-code, then press r.");
@@ -68,10 +119,10 @@ describe("a line that reads wrong and that no yes can change still has an item, 
     const items = needs(buildFleetModel(source(denied).inputs));
     const ask = (id: string) => items.find((n) => n.id === id)!.ask;
     // (the instruction comes from the cause: the deny rules that keep the models out, named, and where to change them)
-    expect(ask("noseat")).toMatch(/^No working model may take them\. \d+ models that could take this: the deny rules [^.]+ keep them out\. Press e and change them on their deny lines\.$/);
-    expect(ask("review")).toMatch(/^No working model of another vendor may review\. \d+ models that could take this: the deny rules [^.]+ keep them out\. Press e and change them on their deny lines\.$/);
-    expect(ask("consult")).toMatch(/^No working model may consult\. \d+ models that could take this: the deny rules [^.]+ keep them out\. Press e and change them on their deny lines\.$/);
-    expect(ask("judge")).toBe("No other working model may judge. The deny rule claude-code keeps it out: press e and change it on that deny line.");
+    expect(ask("noseat")).toMatch(/^No working model may take them\. \d+ models that could take this: the KEPT OUT rules [^.]+ keep them out: remove them from their own lines of KEPT OUT, then press r\.$/);
+    expect(ask("review")).toMatch(/^No working model of another vendor may review\. \d+ models that could take this: the KEPT OUT rules [^.]+ keep them out: remove them from their own lines of KEPT OUT, then press r\.$/);
+    expect(ask("consult")).toMatch(/^No working model may consult\. \d+ models that could take this: the KEPT OUT rules [^.]+ keep them out: remove them from their own lines of KEPT OUT, then press r\.$/);
+    expect(ask("judge")).toBe("No other working model may judge. Remove claude-code from its own line of KEPT OUT, or pick another model for the judge, then press r.");
     expect(items.map((n) => n.ask).join(" ")).not.toMatch(/Fix one|Fix it/);
   });
   test("every model timed out: the items name the model to probe, never 'it' for a model the title does not name", () => {
@@ -146,12 +197,12 @@ describe("a line that reads wrong and that no yes can change still has an item, 
     // a one-vendor CLI is still named
     expect(item({ repoText: `${POOL}${CONSULT}`, health: only(["claude-code"]) }, "review")!.ask).toContain("Install codex");
   });
-  test("every model answers and the allowlist keeps the judge out: the item says to add it to routing.allow, never to change a deny line", () => {
+  test("every model answers and the judge is not allowed yet: the item says to add it to routing.allow, never to change a rule of KEPT OUT", () => {
     const items = needs(buildFleetModel(source({ repoText: CONSULT, userText: "routing:\n  allow: {}\n" }).inputs));
     const judge = items.find((n) => n.id === "judge")!;
-    expect(judge.title).toBe("The judge (acceptance) is not on the allowlist: claude-code:fable.");
-    expect(judge.ask).not.toContain("deny line");
-    expect(judge.ask).toBe("No other working model may judge. It is not on the allowlist: add claude-code:fable to routing.allow in the config, then press r.");
+    expect(judge.title).toBe("The judge (acceptance) is not allowed yet: claude-code:fable.");
+    expect(judge.ask).not.toContain("KEPT OUT");
+    expect(judge.ask).toBe("No other working model may judge. Allow claude-code:fable (routing.allow in the config), or pick another model for the judge, then press r.");
   });
   test("a judge that answers while no shape has a worker: the acceptance line reads NO MODEL and has an item that says it follows the workers", () => {
     const M = buildFleetModel(source({ repoText: CONSULT, userText: `routing:\n  deny:\n    workers:\n      adapters: [${Object.keys(health()).join(", ")}]\n` }).inputs);
@@ -179,16 +230,16 @@ describe("a line that reads wrong and that no yes can change still has an item, 
     const only1 = only(["claude-code"]);
     // [world, a word its wrong lines' items must say, a word none may say]
     const grid: Array<[Parameters<typeof source>[0], RegExp, RegExp]> = [
-      [{ repoText: `${POOL}${CONSULT}`, health: only1 }, /Install codex|install a second vendor/, /open review|deny rule|allowlist/],
-      [{ repoText: POOL, health: health(everyModel) }, /probe/, /deny rule|allowlist/],
-      [{ repoText: CONSULT, userText: `routing:\n  deny:\n    adapters: [${all}]\n` }, /deny rule/, /open review|open judge|allowlist|Install/],
-      [{ repoText: CONSULT, userText: "routing:\n  allow: {}\n" }, /allow/, /deny line|Install/],
-      [{ repoText: CONSULT, userText: `routing:\n  deny:\n    workers:\n      adapters: [${all}]\n` }, /follows the workers|deny rule/, /open review|Install/],
+      [{ repoText: `${POOL}${CONSULT}`, health: only1 }, /Install codex|install a second vendor/, /open review|KEPT OUT|allow/],
+      [{ repoText: POOL, health: health(everyModel) }, /probe/, /KEPT OUT|allow/],
+      [{ repoText: CONSULT, userText: `routing:\n  deny:\n    adapters: [${all}]\n` }, /KEPT OUT rule/, /open review|open judge|allow|Install/],
+      [{ repoText: CONSULT, userText: "routing:\n  allow: {}\n" }, /allow/, /KEPT OUT|Install/],
+      [{ repoText: CONSULT, userText: `routing:\n  deny:\n    workers:\n      adapters: [${all}]\n` }, /follows the workers|KEPT OUT rule/, /open review|Install/],
       [{ repoText: `${pinned}${CONSULT}` }, /follows the workers|missing-model|Use /, /open review|Install/],
       // the reviewer's three worlds: only claude-code installed, every other CLI also kept out by a rule
-      [{ repoText: `${POOL}${CONSULT}`, health: only1, userText: `routing:\n  deny:\n    adapters: [${others.join(", ")}]\n` }, /deny rule/, /open review|open judge|editor/],
-      [{ repoText: `${POOL}${CONSULT}`, health: only1, userText: `routing:\n  deny:\n    models: [${everyModel.filter((k) => !k.startsWith("claude-code:")).map((k) => JSON.stringify(k)).join(", ")}]\n` }, /deny rule/, /open review|open judge/],
-      [{ repoText: `${POOL}${CONSULT}`, health: only1, userText: "routing:\n  allow:\n    adapters: [claude-code]\n" }, /routing\.allow/, /open review|open judge|deny line/],
+      [{ repoText: `${POOL}${CONSULT}`, health: only1, userText: `routing:\n  deny:\n    adapters: [${others.join(", ")}]\n` }, /KEPT OUT rule/, /open review|open judge|editor/],
+      [{ repoText: `${POOL}${CONSULT}`, health: only1, userText: `routing:\n  deny:\n    models: [${everyModel.filter((k) => !k.startsWith("claude-code:")).map((k) => JSON.stringify(k)).join(", ")}]\n` }, /KEPT OUT rule/, /open review|open judge/],
+      [{ repoText: `${POOL}${CONSULT}`, health: only1, userText: "routing:\n  allow:\n    adapters: [claude-code]\n" }, /routing\.allow/, /open review|open judge|KEPT OUT/],
     ];
     for (const [i, [over, must, never]] of grid.entries()) {
       const M = buildFleetModel(source(over).inputs), items = needs(M);
@@ -205,8 +256,8 @@ describe("a line that reads wrong and that no yes can change still has an item, 
     const tiers = `tiers:\n${Object.keys(DEFAULT_CONFIG.tiers).filter((a) => !["claude-code", "codex"].includes(a)).map((a) => `  ${a}: null\n`).join("")}`;
     const base = `${tiers}${CONSULT}routing:\n  map:\n    implement:\n      pool:\n        mode: ordered\n        channels: [codex:gpt-5.6-terra]\n`;
     const rules: Array<[string, RegExp]> = [
-      ["  deny:\n    models: [codex:gpt-6-astra, codex:gpt-6-sol, codex:gpt-5.6-sol]\n", /the deny rules codex:gpt-6-astra, codex:gpt-6-sol and codex:gpt-5\.6-sol keep them out\. Press e and change them on their deny lines\./],
-      ["  allow:\n    adapters: [claude-code]\n    models: [codex:gpt-6-luna, codex:gpt-5.6-luna, codex:gpt-5.6-terra]\n", /the allowlist keeps them out\. Add them to routing\.allow/],
+      ["  deny:\n    models: [codex:gpt-6-astra, codex:gpt-6-sol, codex:gpt-5.6-sol]\n", /the KEPT OUT rules codex:gpt-6-astra, codex:gpt-6-sol and codex:gpt-5\.6-sol keep them out: remove them from their own lines of KEPT OUT, then press r\./],
+      ["  allow:\n    adapters: [claude-code]\n    models: [codex:gpt-6-luna, codex:gpt-5.6-luna, codex:gpt-5.6-terra]\n", /they are not among the models your settings allow\. Add them to routing\.allow/],
     ];
     for (const [rule, says] of rules) {
       const M = buildFleetModel(source({ repoText: base + rule }).inputs);
@@ -218,7 +269,7 @@ describe("a line that reads wrong and that no yes can change still has an item, 
       expect(ask).not.toMatch(/no model of another vendor|Install/);
     }
   });
-  test("a vendor that works and sits below the review floor of the tasks that lack a reviewer: the item names the floor, never 'no model of another vendor'", () => {
+  test("a vendor that works and sits below the review's bar of the tasks that lack a reviewer: the item names the bar, never 'no model of another vendor'", () => {
     for (const adapter of ["grok", "codex"]) {
       const prune = Object.keys(DEFAULT_CONFIG.tiers).filter((a) => !["claude-code", adapter].includes(a)).map((a) => `  ${a}: null\n`).join("");
       const models = Object.keys(DEFAULT_CONFIG.tiers[adapter].models);
@@ -226,7 +277,7 @@ describe("a line that reads wrong and that no yes can change still has an item, 
       const M = buildFleetModel(source({ repoText: cfg(false) }).inputs);
       expect(M.sample().noReviewer, adapter).toBe(1200);
       const ask = needs(M).find((n) => n.id === "review")!.ask;
-      expect(ask, adapter).toMatch(/below these tasks' review floor, frontier .*at frontier or above/);
+      expect(ask, adapter).toMatch(/below these tasks' review bar, frontier .*at frontier or above/);
       expect(ask, adapter).not.toMatch(/no model of another vendor|Install|install a second vendor/);
       // raising one of that vendor's models to the floor reviews every task: the floor was the cause
       expect(buildFleetModel(source({ repoText: cfg(true) }).inputs).sample().noReviewer, adapter).toBe(0);
@@ -287,18 +338,18 @@ describe("a line that reads wrong and that no yes can change still has an item, 
     };
     // the CLI's own list does not offer it either: retired, and the yes drops it from the pool
     const gone = item(served(false), "tidy")!;
-    expect(gone.title).toBe("1 pool entry names an id its CLI no longer serves.");
-    expect(gone.ask).toBe("Remove it? No task changes worker.");
-    expect(gone.detail).toContain("codex:gpt-5.6-terra: its CLI answered that it no longer serves this id, and its own list of models does not offer it.");
-    expect(gone.edits).toEqual([expect.objectContaining({ path: ["routing", "map", "implement"], value: { pool: { mode: "any", channels: ["codex:gpt-6-astra"] } }, label: "implement: drop codex:gpt-5.6-terra (no longer served)" })]);
+    expect(gone.title).toBe("1 model named on your lines cannot take work now.");
+    expect(gone.ask).toBe("Remove it from that line? No task changes worker.");
+    expect(gone.removes).toEqual([{ what: "codex:gpt-5.6-terra", from: ["implement"], why: "its CLI no longer serves this id, and its own list of models does not offer it" }]);
+    expect(gone.edits).toEqual([expect.objectContaining({ path: ["routing", "map", "implement"], value: { pool: { mode: "any", channels: ["codex:gpt-6-astra"] } }, label: "implement: remove codex:gpt-5.6-terra" })]);
     // the CLI still lists the id: the probe's word alone is not enough to remove it
     expect(item(served(true), "tidy")).toBeUndefined();
     // a CLI that lists no models at all: it counts, and the details say what the verdict rests on
-    expect(item(served(false, false), "tidy")!.detail).toContain("codex:gpt-5.6-terra: its CLI answered that it no longer serves this id; that CLI lists no models, so this rests on the probe's answer alone.");
-    // beside a rule that does nothing, each is counted apart
+    expect(item(served(false, false), "tidy")!.removes![0].why).toBe("its CLI answered that it no longer serves this id; that CLI lists no models, so this rests on the probe's answer alone");
+    // beside a rule that keeps nothing out, only the name is offered: the rule is a guard (row 500)
     const both = item({ ...served(false), userText: "routing:\n  deny:\n    models: [nosuch:model]\n" }, "tidy")!;
-    expect(both.title).toBe("1 deny rule does nothing; 1 pool entry names an id its CLI no longer serves.");
-    expect(both.ask).toBe("Remove them? No task changes worker.");
+    expect(both.title).toBe("1 model named on your lines cannot take work now.");
+    expect(both.edits!.every((e) => e.path[1] !== "deny")).toBe(true);
     // a model that only timed out keeps its place: nothing to remove
     expect(item({ repoText: `${POOL}${CONSULT}`, health: health(["codex:gpt-5.6-terra"]) }, "tidy")).toBeUndefined();
   });
@@ -322,11 +373,175 @@ describe("a line that reads wrong and that no yes can change still has an item, 
     // and the shape it left without a model still has an item about it
     expect(gone.some((n) => ["noseat", "tidy"].includes(n.id))).toBe(true);
   });
-  test("one rule that does nothing is 'it', several are 'them'", () => {
-    const one = item({ repoText: CONSULT, userText: "routing:\n  deny:\n    models: [nosuch:model]\n" }, "tidy")!;
-    expect(`${one.title} ${one.ask}`).toBe("1 deny rule does nothing. Remove it? No task changes worker.");
-    const two = item({ repoText: CONSULT, userText: "routing:\n  deny:\n    models: [nosuch:model, nosuch:other]\n" }, "tidy")!;
-    expect(`${two.title} ${two.ask}`).toBe("2 deny rules do nothing. Remove them? No task changes worker.");
+});
+
+// Rows 500, 501; D-2187 add.363 (contract section 6, K1 to K8): no item removes a rule of KEPT OUT; every
+// item says what a yes changes by name; a no is remembered by content.
+describe("items and KEPT OUT", () => {
+  const all = (over: Parameters<typeof source>[0]) => needs(buildFleetModel(source(over).inputs));
+  const writesDeny = (items: ReturnType<typeof needs>) => items.flatMap((n) => n.edits ?? []).filter((e) => e.path[0] === "routing" && e.path[1] === "deny");
+  // the row 500 world: guard rules that keep nothing out today, a dated comment above them
+  const GUARD = "routing:\n  deny:\n    # 2026-11-15 guard: Antigravity stays out the day it lands\n    models: [nosuch:model, \"omp:google-antigravity/*\"]\n    workers:\n      models: [nosuch:other]\n";
+  test("no item's yes writes under routing.deny: not the tidy item for rules that keep nothing out today; not the consult item for a model a rule keeps out", () => {
+    const guard = all({ repoText: `${POOL}${CONSULT}`, userText: GUARD });
+    expect(guard.some((n) => n.id === "tidy")).toBe(false);
+    expect(guard.map((n) => `${n.title} ${n.ask} ${n.detail.join(" ")}`).join(" ")).not.toMatch(/nosuch|antigravity/);
+    expect(writesDeny(guard)).toEqual([]);
+    // the consult model its own rule keeps out: an item with no yes, naming the rule and where it is removed
+    for (const [userText, rule] of [["routing:\n  deny:\n    models: [codex:gpt-6-astra]\n", "codex:gpt-6-astra"], ["routing:\n  deny:\n    adapters: [codex]\n", "codex"]] as const) {
+      const M = buildFleetModel(source({ repoText: "consult:\n  prefer: [codex:gpt-6-astra]\n", userText }).inputs);
+      expect(M.consult).toBeNull();
+      const items = needs(M), consult = items.find((n) => n.id === "consult")!;
+      expect(consult.edits).toBeUndefined();
+      expect(consult.title).toBe("The consult has no model: codex:gpt-6-astra is kept out.");
+      expect(consult.ask).toBe(`Remove ${rule} from its own line of KEPT OUT, or pick another model for the consult, then press r.`);
+      expect(writesDeny(items)).toEqual([]);
+    }
+    // not allowed yet: allow it or pick another
+    const shut = all({ repoText: "consult:\n  prefer: [codex:gpt-6-astra]\n", userText: "routing:\n  allow:\n    adapters: [claude-code]\n" }).find((n) => n.id === "consult")!;
+    expect(shut).toMatchObject({ title: "The consult has no model: codex:gpt-6-astra is not allowed yet.", ask: "Allow codex:gpt-6-astra (routing.allow in the config), or pick another model for the consult, then press r." });
+    expect(shut.edits).toBeUndefined();
+  });
+  test("the tidy item names each model it removes; the lines it leaves; why it cannot work; it removes none for a passing outage", () => {
+    const line = (s: string) => `    ${s}:\n      pool:\n        mode: any\n        channels: [codex:gpt-6-astra, codex:gpt-5.6-terra, codex:nosuch, claude-code:opus]\n`;
+    const repoText = `routing:\n  deny:\n    workers:\n      models: [claude-code:opus]\n  map:\n${line("implement")}${line("tests")}${CONSULT}`;
+    // gpt-5.6-terra timed out: a passing outage keeps its place
+    const tidy = all({ repoText, health: health(["codex:gpt-5.6-terra"]) }).find((n) => n.id === "tidy")!;
+    expect(tidy.title).toBe("2 models named on your lines cannot take work now.");
+    expect(tidy.ask).toBe("Remove them from those lines? No task changes worker.");
+    expect(tidy.removes).toEqual([
+      { what: "codex:nosuch", from: ["implement", "tests"], why: "no CLI in your settings lists it" },
+      { what: "claude-code:opus", from: ["implement", "tests"], why: "kept out by claude-code:opus" },
+    ]);
+    expect(tidy.edits!.map((e) => [e.path.join("."), e.value])).toEqual([
+      ["routing.map.implement", { pool: { mode: "any", channels: ["codex:gpt-6-astra", "codex:gpt-5.6-terra"] } }],
+      ["routing.map.tests", { pool: { mode: "any", channels: ["codex:gpt-6-astra", "codex:gpt-5.6-terra"] } }],
+    ]);
+    expect(tidy.detail).toContain("codex:nosuch, from implement and tests: no CLI in your settings lists it.");
+    // signed out, out of credit, slow: nothing to remove
+    const h = health(["codex:gpt-5.6-terra"]);
+    h.codex.modelAuth!["gpt-6-astra"] = { authed: false, reason: "insufficient balance", probedAt: "2026-11-10T00:00:00Z" } as never;
+    const outage = `routing:\n  map:\n    implement:\n      pool:\n        mode: any\n        channels: [claude-code:fable, codex:gpt-6-astra, codex:gpt-5.6-terra]\n${CONSULT}`;
+    expect(all({ repoText: outage, health: h }).some((n) => n.id === "tidy")).toBe(false);
+  });
+  test("lines saved as any get one item that names them; a yes sets their mode to complexity and changes no member", () => {
+    const repoText = `routing:\n  map:\n    implement:\n      pool:\n        mode: any\n        channels: [codex:gpt-6-astra, codex:gpt-5.6-terra]\n    tests:\n      pool:\n        mode: any\n        channels: [claude-code:fable, claude-code:opus]\n    docs:\n      pool:\n        mode: ordered\n        channels: [codex:gpt-6-astra]\n${CONSULT}`;
+    const items = all({ repoText }), mine = items.filter((n) => n.id === "complexity");
+    expect(mine).toHaveLength(1);
+    const [item] = mine;
+    expect(item.title).toBe("implement and tests are given out the way they were saved before 2.27.");
+    expect(item.ask).toBe("Give them out by complexity?");
+    expect(`${item.title} ${item.ask}`).not.toMatch(/\bany\b|cheapest|pool/);
+    expect(item.edits!.map((e) => [e.path.join("."), e.value])).toEqual([
+      ["routing.map.implement", { pool: { mode: "complexity", channels: ["codex:gpt-6-astra", "codex:gpt-5.6-terra"] } }],
+      ["routing.map.tests", { pool: { mode: "complexity", channels: ["claude-code:fable", "claude-code:opus"] } }],
+    ]);
+    // its data: who gets each line's tasks, and who gets none with the reason
+    expect(item.given!.map((g) => g.line)).toEqual(["implement", "tests"]);
+    expect(item.given![1].none).toEqual([{ key: "claude-code:opus", reason: "fable, of the same vendor, is written before it" }]);
+    // the yes, saved and loaded: the mode changes, every member stays in its place
+    const after = buildFleetModel(source({ repoText: applyEdits({ userText: "", repoText }, item.edits!).repoText }).inputs);
+    expect(after.cfg.routing.map.implement!.pool).toEqual({ mode: "complexity", channels: ["codex:gpt-6-astra", "codex:gpt-5.6-terra"] });
+    expect(after.cfg.routing.map.tests!.pool).toEqual({ mode: "complexity", channels: ["claude-code:fable", "claude-code:opus"] });
+    expect(after.cfg.routing.map.docs!.pool).toEqual({ mode: "ordered", channels: ["codex:gpt-6-astra"] });
+    expect(needs(after).some((n) => n.id === "complexity")).toBe(false);
+    // a yes beside the tidy item's yes on the same line: the tidy's names go, the mode is complexity, in either order
+    const both = `routing:\n  map:\n    implement:\n      pool:\n        mode: any\n        channels: [codex:gpt-6-astra, nosuch:gone]\n${CONSULT}`;
+    for (const yes of [["tidy", "complexity"], ["complexity", "tidy"]]) {
+      expect(derive(source({ repoText: both }), { ...initialScreen(), yes }).full!.cfg.routing.map.implement!.pool, yes.join()).toEqual({ mode: "complexity", channels: ["codex:gpt-6-astra"] });
+    }
+  });
+  test("a model a rule keeps out is named with its rule whether or not it answers, for the judge and the consult; a legacy consult model is never named as what consult.prefer names", () => {
+    // every way a probe can fail, and a pass: the rule is named in each, and no item writes a file
+    const signedOut = health();
+    signedOut.codex.modelAuth!["gpt-6-astra"] = { authed: false, reason: "not signed in", probedAt: "2026-11-10T00:00:00Z" } as never;
+    const broke = health();
+    broke.codex.modelAuth!["gpt-6-astra"] = { authed: false, reason: "insufficient balance", probedAt: "2026-11-10T00:00:00Z" } as never;
+    const probes: Array<[string, ReturnType<typeof health> | undefined]> = [["answers", undefined], ["timed out", health(["codex:gpt-6-astra"])], ["no CLI", only(["claude-code"])], ["signed out", signedOut], ["out of credit", broke]];
+    const rules: Array<[string, RegExp]> = [
+      ["routing:\n  deny:\n    models: [codex:gpt-6-astra]\n", /^Remove codex:gpt-6-astra from its own line of KEPT OUT, or pick another model for the consult, then press r\./],
+      ["routing:\n  deny:\n    adapters: [codex]\n", /^Remove codex from its own line of KEPT OUT, or pick another model for the consult, then press r\./],
+      ["routing:\n  allow:\n    adapters: [claude-code]\n", /^Allow codex:gpt-6-astra \(routing\.allow in the config\), or pick another model for the consult, then press r\./],
+    ];
+    for (const [rule, says] of rules) for (const [how, h] of probes) {
+      const items = all({ repoText: "consult:\n  prefer: [codex:gpt-6-astra]\n", userText: rule, ...(h ? { health: h } : {}) });
+      const consult = items.find((n) => n.id === "consult")!;
+      expect(consult.ask, `${how}: ${rule}`).toMatch(says);
+      expect(consult.edits, how).toBeUndefined();
+      if (how !== "answers") expect(consult.ask, how).toMatch(/It does not answer either: .+\.$/);
+      expect(writesDeny(items)).toEqual([]);
+    }
+    // the judge: kept out and silent, by a deny rule or by the allowlist; the rule is named and the silence said
+    for (const [userText, says] of [[`routing:\n  deny:\n    adapters: [${Object.keys(health()).join(", ")}]\n`, /Remove claude-code from its own line of KEPT OUT, or pick another model for the judge, then press r\. It does not answer either: /],
+      ["routing:\n  allow: {}\n", /Allow claude-code:fable \(routing\.allow in the config\), or pick another model for the judge, then press r\. It does not answer either: /]] as const) {
+      const judge = all({ repoText: CONSULT, userText, health: health(["claude-code:fable"]) }).find((n) => n.id === "judge")!;
+      expect(judge.ask).toMatch(says);
+      expect(judge.edits).toBeUndefined();
+    }
+    // consult.prefer names a model that timed out; a legacy consult model has its own rule: that rule is not named
+    const legacy = all({ repoText: "consult:\n  adapter: claude-code\n  model: fable\n  prefer: [codex:gpt-6-astra]\n", userText: "routing:\n  deny:\n    models: [claude-code:fable]\n", health: health(["codex:gpt-6-astra"]) }).find((n) => n.id === "consult")!;
+    expect(legacy.title).toMatch(/^The consult has no model: codex:gpt-6-astra, /);
+    expect(`${legacy.title} ${legacy.ask} ${legacy.detail.join(" ")}`).not.toContain("claude-code:fable");
+  });
+  test("a model the config has no seat for is still named with the rule that keeps it out, for the consult and the judge", () => {
+    // tiers remove the seat (the whole CLI, or the one model); the rule is read from the key itself
+    const noSeat = ["tiers:\n  codex: null\n", "tiers:\n  codex:\n    models:\n      gpt-6-astra: null\n"];
+    const rules: Array<[string, string]> = [
+      ["routing:\n  deny:\n    models: [codex:gpt-6-astra]\n", "Remove codex:gpt-6-astra from its own line of KEPT OUT, or pick another model for the consult, then press r."],
+      ["routing:\n  deny:\n    adapters: [codex]\n", "Remove codex from its own line of KEPT OUT, or pick another model for the consult, then press r."],
+      ["routing:\n  allow:\n    adapters: [claude-code]\n", "Allow codex:gpt-6-astra (routing.allow in the config), or pick another model for the consult, then press r."],
+    ];
+    for (const tiers of noSeat) for (const [userText, says] of rules) {
+      const M = buildFleetModel(source({ repoText: `${tiers}consult:\n  prefer: [codex:gpt-6-astra]\n`, userText }).inputs);
+      expect(M.seat("codex:gpt-6-astra"), tiers).toBeUndefined();
+      const items = needs(M), consult = items.find((n) => n.id === "consult")!;
+      expect(consult.ask, `${tiers}${userText}`).toBe(`${says} It is not in the config either: give it a level under tiers.`);
+      expect(consult.edits).toBeUndefined();
+      expect(writesDeny(items)).toEqual([]);
+    }
+    // the judge: no seat, and every CLI denied or nothing allowed: no yes, the rule named with its remedy
+    const judgeWorlds: Array<[string, string, string]> = [
+      ["tiers:\n  claude-code: null\n", `routing:\n  deny:\n    adapters: [${Object.keys(health()).join(", ")}]\n`, "Remove claude-code from its own line of KEPT OUT, or pick another model for the judge, then press r."],
+      ["tiers:\n  claude-code:\n    models:\n      fable: null\n", "routing:\n  allow: {}\n", "Allow claude-code:fable (routing.allow in the config), or pick another model for the judge, then press r."],
+    ];
+    for (const [tiers, userText, says] of judgeWorlds) {
+      const M = buildFleetModel(source({ repoText: `${tiers}${CONSULT}`, userText }).inputs);
+      expect(M.seat("claude-code:fable")).toBeUndefined();
+      const judge = needs(M).find((n) => n.id === "judge")!;
+      expect(judge.ask, tiers).toBe(`No other working model may judge. ${says} It is not in the config either: give it a level under tiers.`);
+      expect(judge.edits).toBeUndefined();
+    }
+  });
+  test("a line a yes creates is by complexity, a pinned line's included; a pool that is there keeps its mode", () => {
+    const dead = Object.entries(DEFAULT_CONFIG.tiers).flatMap(([a, t]) => Object.keys(t.models).filter((m) => m === "gpt-6-astra" || t.models[m] === "frontier").map((m) => `${a}:${m}`));
+    const lines: Array<[string, string]> = [["implement:\n      pin: { via: codex, model: gpt-6-astra }\n", "complexity"], ["implement:\n      pool:\n        mode: ordered\n        channels: [codex:gpt-6-astra]\n", "ordered"], ["", "complexity"]];
+    for (const [line, mode] of lines) {
+      const noseat = all({ health: health(dead), repoText: `${line ? `routing:\n  map:\n    ${line}` : ""}consult:\n  prefer: [codex:gpt-5.6-terra]\n` }).find((n) => n.id === "noseat")!;
+      const pools = noseat.edits!.map((e) => (e.value as { pool: { mode: string } }).pool.mode);
+      expect(pools.length, line).toBeGreaterThan(0);
+      const impl = noseat.edits!.find((e) => e.path.join(".") === "routing.map.implement");
+      if (line) expect((impl!.value as { pool: { mode: string } }).pool.mode, line).toBe(mode);
+      if (!line) expect(new Set(pools), line).toEqual(new Set(["complexity"]));
+    }
+  });
+  test("the probe item is remembered by its content like any other, and asked again after undo", () => {
+    const M = buildFleetModel(source({ health: null }).inputs);
+    const [item] = needs(M);
+    expect(item.id).toBe("probe");
+    expect(needs(M, { dismissed: new Set([needSignature(item)]) })).toEqual([]);
+    expect(needs(M, { dismissed: new Set() }).map((n) => n.id)).toEqual(["probe"]);
+  });
+  test("a no is remembered for the same content; it is asked again when the content changes under the same count", () => {
+    const world = (gone: string) => ({ repoText: `routing:\n  map:\n    implement:\n      pool:\n        mode: ordered\n        channels: [codex:gpt-6-astra, ${gone}]\n${CONSULT}` });
+    const a = all(world("codex:nosuch-a")).find((n) => n.id === "tidy")!, b = all(world("codex:nosuch-b")).find((n) => n.id === "tidy")!;
+    // the same count, the same words: only the names differ
+    expect(a.title).toBe(b.title);
+    const dismissed = new Set([needSignature(a)]);
+    expect(needs(buildFleetModel(source(world("codex:nosuch-a")).inputs), { dismissed }).some((n) => n.id === "tidy")).toBe(false);
+    expect(needs(buildFleetModel(source(world("codex:nosuch-b")).inputs), { dismissed }).some((n) => n.id === "tidy")).toBe(true);
+    // an item with no yes is remembered by its words
+    const consult = all({ repoText: "consult:\n  prefer: [codex:gpt-6-astra]\n", userText: "routing:\n  deny:\n    models: [codex:gpt-6-astra]\n" }).find((n) => n.id === "consult")!;
+    expect(needSignature(consult)).toBe(`consult\u0000${consult.title}\u0000${consult.ask}`);
   });
 });
 

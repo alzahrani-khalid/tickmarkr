@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, writeFile
 import { homedir } from "node:os";
 import { dirname, join, relative } from "node:path";
 import { readCachedCatalog } from "../adapters/catalog-remote.js";
+import { artificialAnalysisFacts, MODEL_FACT_EFFORT as EFFORT } from "../adapters/model-facts.js";
 import { readDoctor, readModelsFirstSeen } from "../adapters/registry.js";
 import type { AuthHealth, WorkerAdapter } from "../adapters/types.js";
 import { globalConfigDir, loadConfigWithMode, ownRepoOverlayPath, repoOverlayPath, type TickmarkrConfig } from "../config/config.js";
@@ -28,7 +29,7 @@ const configText = (path: string): string => {
 };
 const NEW_FOR_DAYS = 30;
 
-/** A need's identity for "do not ask again": its id and its words, so it returns when either changes. */
+/** A need's identity for "do not ask again": its id and its content (rows 500, 501; D-2187 add.363), so it returns when either changes. */
 export { needSignature };
 const answersPath = (repoRoot: string): string => join(repoRoot, stateDirName(repoRoot), "fleet-answers.json");
 export function readDismissed(repoRoot: string): Set<string> {
@@ -40,7 +41,7 @@ function writeDismissed(repoRoot: string, no: string[]): void {
   writeFileSync(`${path}.tmp`, `${JSON.stringify({ no }, null, 1)}\n`);
   renameSync(`${path}.tmp`, path);
 }
-export function dismissNeed(repoRoot: string, need: Pick<Need, "id" | "title" | "ask">): void {
+export function dismissNeed(repoRoot: string, need: Pick<Need, "id" | "title" | "ask" | "edits" | "removes">): void {
   writeDismissed(repoRoot, [...new Set([...readDismissed(repoRoot), needSignature(need)])]);
 }
 /** `u` after a no: the item is asked again. */
@@ -72,10 +73,22 @@ export function cleanHealth(raw: unknown): Record<string, AuthHealth> | null {
       auth[model] = { ...rest, ...(typeof reason === "string" ? { reason } : {}), ...(typeof probedAt === "string" && !Number.isNaN(Date.parse(probedAt)) ? { probedAt } : {}),
         ...(typeof identity === "string" ? { identity } : {}), ...(typeof failure === "string" ? { failure } : {}) };
     }
-    const { servable, modelIdentities, ...rest } = e;
+    // Queue row 502; D-2187 add.363: malformed optional facts never become a screen's score.
+    const { servable, modelIdentities, modelFacts, ...rest } = e;
+    const facts = Object.fromEntries(Object.entries(record(modelFacts) ?? {}).flatMap(([model, value]) => {
+      const fact = record(value);
+      if (!fact || typeof fact.as !== "string") return [];
+      if (["score", "priceIn", "priceOut", "speed"].some((key) => fact[key] !== undefined
+        && (typeof fact[key] !== "number" || !Number.isFinite(fact[key])))) return [];
+      if (fact.name !== undefined && typeof fact.name !== "string") return [];
+      return [[model, { as: fact.as,
+        ...Object.fromEntries(["score", "priceIn", "priceOut", "speed", "name"].filter((key) => fact[key] !== undefined).map((key) => [key, fact[key]])),
+      }]];
+    }));
     const identities = record(modelIdentities);
     out[id] = { ...rest, installed: e.installed === true, authed: e.authed === true, models: strings(e.models), ...(record(e.modelAuth) ? { modelAuth: auth } : {}),
       ...(Array.isArray(servable) ? { servable: strings(servable) } : {}),
+      ...(Object.keys(facts).length ? { modelFacts: facts } : {}),
       ...(identities ? { modelIdentities: Object.fromEntries(Object.entries(identities).filter(([, x]) => typeof x === "string")) } : {}) };
   }
   return out as Record<string, AuthHealth>;
@@ -117,36 +130,13 @@ export function lastRunDeaths(repoRoot: string): RunDeath[] {
   return [...out.values()].filter((d) => d.shapes.length);
 }
 
-// ponytail: a slug match on the Artificial Analysis table in the catalog cache. The catalog's own
-// resolver joins through models.dev, which lags a new model by days; switch when the classifier is wired.
-function intelligence(catalog: unknown): (id: string) => { score: number; name: string } | undefined {
-  // optional evidence read defensively: a malformed table, row or field is skipped, never thrown on
-  const data = record(record(catalog)?.artificialAnalysis)?.data;
-  const rows: unknown[] = Array.isArray(data) ? data : [];
-  const bySlug = new Map(rows.flatMap((raw) => {
-    const r = record(raw), s = record(r?.evaluations)?.artificial_analysis_intelligence_index;
-    if (!r || typeof r.slug !== "string" || !r.slug || typeof s !== "number" || !Number.isFinite(s)) return [];
-    return [[r.slug, { score: s, name: (typeof r.name === "string" ? r.name : r.slug).replace(/\s*\(.*$/, "") }] as const];
-  }));
-  const slug = (id: string): string => id.slice(id.lastIndexOf("/") + 1).replace(/\./g, "-");
-  // rowOf, the one way a model meets its row: (1) the row of the identity exactly, effort suffix
-  // included; else (2) with no suffix or a "high" one, the row of the base identity; else (3) none
-  return (id) => {
-    const exact = bySlug.get(slug(id));
-    if (exact) return exact;
-    const eff = EFFORT.exec(slug(id));
-    return eff && eff[1] === "high" ? bySlug.get(slug(id).slice(0, eff.index)) : undefined;
-  };
-}
-const EFFORT = /-(low|medium|high|xhigh|max)(-fast)?$/;
-
 /** Models a CLI began to list within the last 30 days that hold no tier, with the tier one benchmark gives them. */
 export function newModels(repoRoot: string, cfg: TickmarkrConfig, health: Record<string, AuthHealth> | null, now: number): NewModel[] {
   if (!health) return [];
   // the record is read as defensively as the results: only a model with a date string counts
   const seen = Object.entries(record(readModelsFirstSeen(repoRoot)) ?? {}).flatMap(([adapter, models]) =>
     Object.entries(record(models) ?? {}).flatMap(([model, at]) => (typeof at === "string" && !Number.isNaN(Date.parse(at)) ? [[adapter, model, at] as const] : [])));
-  const score = intelligence(readCachedCatalog(repoRoot).catalog);
+  const score = artificialAnalysisFacts(readCachedCatalog(repoRoot).catalog, true);
   let best = { score: 0, model: "" };
   for (const [adapter, t] of Object.entries(cfg.tiers)) for (const model of Object.keys(t.models)) {
     const id = health[adapter]?.modelAuth?.[model]?.identity ?? model;
